@@ -1,0 +1,112 @@
+root = true
+
+############################
+# Global editor basics
+############################
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{json,yml,yaml}]
+indent_size = 2
+
+############################
+# C# formatting & style
+############################
+[*.cs]
+
+# Braces always
+csharp_prefer_braces = true:warning
+
+# using organisation
+dotnet_sort_system_directives_first = true
+dotnet_separate_import_directive_groups = true
+
+# File-scoped namespaces
+csharp_style_namespace_declarations = file_scoped:warning
+
+# Expression bodies only when single-line
+csharp_style_expression_bodied_methods = when_on_single_line:suggestion
+csharp_style_expression_bodied_properties = when_on_single_line:suggestion
+
+# No this. unless needed
+dotnet_style_qualification_for_field = false:suggestion
+dotnet_style_qualification_for_property = false:suggestion
+dotnet_style_qualification_for_method = false:suggestion
+dotnet_style_qualification_for_event = false:suggestion
+
+# Pattern matching, switch expressions
+csharp_style_pattern_matching_over_is_with_cast_check = true:suggestion
+csharp_style_pattern_matching_over_as_with_null_check = true:suggestion
+csharp_style_prefer_switch_expression = true:suggestion
+csharp_style_prefer_tuple_swap = true:suggestion
+
+# Always explicit accessibility
+dotnet_style_require_accessibility_modifiers = always:warning
+
+# Prefer readonly
+dotnet_style_readonly_field = true:suggestion
+
+############################
+# Analyzer severities
+############################
+dotnet_diagnostic.IDE0011.severity = warning
+dotnet_diagnostic.IDE0041.severity = suggestion
+dotnet_diagnostic.CA1848.severity = none
+dotnet_diagnostic.CA1822.severity = none
+
+# Naming: interfaces start with I
+dotnet_naming_rule.interfaces_should_be_prefixed.severity = warning
+dotnet_naming_rule.interfaces_should_be_prefixed.symbols = interfaces
+dotnet_naming_rule.interfaces_should_be_prefixed.style = prefix_I
+
+dotnet_naming_symbols.interfaces.applicable_kinds = interface
+dotnet_naming_symbols.interfaces.applicable_accessibilities = public, internal, protected, protected_internal, private_protected
+dotnet_naming_symbols.interfaces.required_modifiers =
+
+dotnet_naming_style.prefix_I.required_prefix = I
+dotnet_naming_style.prefix_I.capitalization = pascal_case
+
+# Private const: PascalCase
+dotnet_naming_rule.private_const_fields_pascal.severity = warning
+dotnet_naming_rule.private_const_fields_pascal.symbols = private_const_fields
+dotnet_naming_rule.private_const_fields_pascal.style = pascal_case_style
+
+dotnet_naming_symbols.private_const_fields.applicable_kinds = field
+dotnet_naming_symbols.private_const_fields.applicable_accessibilities = private
+dotnet_naming_symbols.private_const_fields.required_modifiers = const
+
+dotnet_naming_style.pascal_case_style.capitalization = pascal_case
+
+# Private fields: _camelCase
+dotnet_naming_rule.private_fields_underscore.severity = warning
+dotnet_naming_rule.private_fields_underscore.symbols = private_fields
+dotnet_naming_rule.private_fields_underscore.style = underscore_camel
+
+dotnet_naming_symbols.private_fields.applicable_kinds = field
+dotnet_naming_symbols.private_fields.applicable_accessibilities = private
+dotnet_naming_symbols.private_fields.required_modifiers =
+
+dotnet_naming_style.underscore_camel.required_prefix = _
+dotnet_naming_style.underscore_camel.capitalization = camel_case
+
+# Errors — these MUST be clean
+dotnet_diagnostic.IDE0005.severity = error
+dotnet_diagnostic.IDE0051.severity = error
+dotnet_diagnostic.IDE0052.severity = error
+dotnet_diagnostic.IDE0060.severity = error
+dotnet_diagnostic.CA1801.severity = error
+dotnet_diagnostic.CA1811.severity = error
+
+############################
+# EF-generated migrations — relax style rules (the tool owns the format)
+############################
+[**/Migrations/*.cs]
+dotnet_diagnostic.IDE0005.severity = none
+dotnet_diagnostic.IDE0161.severity = none
+csharp_style_namespace_declarations = block_scoped:none
+generated_code = true

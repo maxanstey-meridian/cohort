@@ -1,0 +1,9 @@
+# Infrastructure layer — placeholder.
+#
+# Empty in the skeleton. Fills up in Milestone A with raw-SQL sweep strategies
+# (PurgeSweepStrategy, etc.) and in Milestone B with EF-backed default
+# implementations of the holds repo and audit writer.
+#
+# Anything here may depend on Application + Domain. Anything here may use raw SQL,
+# Npgsql-specific types, and EF query expressions. Nothing in Application/ or
+# Domain/ may depend back on this folder.

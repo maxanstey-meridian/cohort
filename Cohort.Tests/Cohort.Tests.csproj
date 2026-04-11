@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="FluentAssertions" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Cohort\Cohort.csproj" />
+  </ItemGroup>
+
+  <!--
+    Deliberately absent: NSubstitute, Moq, FakeItEasy, Testcontainers, Respawn.
+    The mock ban is structural, not policy. See CLAUDE.md.
+  -->
+
+</Project>

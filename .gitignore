@@ -1,12 +1,47 @@
-.build/
-.swiftpm/
-Perch.app/
+## .NET
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Bb]uild/
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+[Ll]og/
+[Ll]ogs/
+*.pdb
+
+## Test results
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+coverage*.json
+coverage*.xml
+coverage*.info
+
+## Rider / VS / VS Code
+.idea/
+.vs/
+.vscode/
+*.swp
+
+## NuGet
+*.nupkg
+*.snupkg
+.nuget/
+
+## OS
 .DS_Store
-*.xcodeproj
-.DS_Store
-.orch
-.plans
-.orchrc.json
-node_modules
-.task
-screenpipe.log
+Thumbs.db
+
+## Local secrets
+appsettings.Development.json
+appsettings.Local.json
+secrets.json

@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="Cohort/Cohort.csproj" />
+  <Project Path="Cohort.Tests/Cohort.Tests.csproj" />
+  <Project Path="Cohort.Sample/Cohort.Sample.csproj" />
+  <Project Path="Cohort.Sample.Tests/Cohort.Sample.Tests.csproj" />
+</Solution>

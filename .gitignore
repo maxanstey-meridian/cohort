@@ -1,0 +1,12 @@
+.build/
+.swiftpm/
+Perch.app/
+.DS_Store
+*.xcodeproj
+.DS_Store
+.orch
+.plans
+.orchrc.json
+node_modules
+.task
+screenpipe.log

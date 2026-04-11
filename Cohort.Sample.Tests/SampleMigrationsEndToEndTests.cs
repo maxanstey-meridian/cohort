@@ -60,9 +60,10 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
     }
 
     [Fact]
-    public async Task Add_Note_Tenant_Migration_Drops_Legacy_Notes_Instead_Of_Backfilling_Guid_Empty()
+    public async Task Add_Note_Tenant_Migration_Preserves_Legacy_Notes_And_Leaves_Tenant_Null()
     {
         var options = CreateOptions();
+        var noteId = Guid.NewGuid();
 
         await using (var db = new SampleDbContext(options))
         {
@@ -74,7 +75,7 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
                 INSERT INTO "notes" ("Id", "CreatedAt", "Body")
                 VALUES ({0}, {1}, {2})
                 """,
-                Guid.NewGuid(),
+                noteId,
                 new DateTimeOffset(2026, 4, 10, 12, 0, 0, TimeSpan.Zero),
                 "legacy-note"
             );
@@ -83,9 +84,10 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
         }
 
         await using var verify = new SampleDbContext(options);
-        var legacyCount = await verify.Notes.CountAsync();
+        var legacyNote = await verify.Notes.SingleAsync(note => note.Id == noteId);
 
-        legacyCount.Should().Be(0);
+        legacyNote.Body.Should().Be("legacy-note");
+        legacyNote.TenantId.Should().BeNull();
     }
 
     private DbContextOptions<SampleDbContext> CreateOptions()

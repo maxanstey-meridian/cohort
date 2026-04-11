@@ -42,6 +42,7 @@ public sealed class RegistryScanTests
             .ContainSingle(kvp =>
                 kvp.Key == typeof(Note)
                 && kvp.Value.Category == "short-lived"
+                && kvp.Value.TableName == "notes"
                 && kvp.Value.AnchorMember == nameof(Note.CreatedAt)
                 && kvp.Value.EntityType == typeof(Note)
             );
@@ -61,6 +62,7 @@ public sealed class RegistryScanTests
 
         var entry = new RetentionRegistry(db).Scan()[typeof(RetentionReadyRecord)];
 
+        entry.TableName.Should().Be("retention_ready_records");
         entry.AnchorMember.Should().Be(nameof(RetentionReadyRecord.RetainedAt));
         entry.AnchorColumn.Should().Be("retained_at_utc");
         entry.AnonymiseFields.Should().ContainSingle();

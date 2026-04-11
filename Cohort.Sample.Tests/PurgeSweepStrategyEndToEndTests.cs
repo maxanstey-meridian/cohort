@@ -89,6 +89,8 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
         var strategy = new PurgeSweepStrategy();
         var connection = new RecordingDbConnection();
         var transaction = connection.BeginTransaction();
+        var tenantId = Guid.NewGuid();
+        var now = new DateTimeOffset(2026, 4, 11, 12, 0, 0, TimeSpan.Zero);
         var entry = new RetentionEntry(
             typeof(PurgeCandidateRecord),
             "purge_candidate_records",
@@ -102,8 +104,8 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
         var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge);
         var context = new RetentionResolutionContext(
             "short-lived",
-            new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
-            new DateTimeOffset(2026, 4, 11, 12, 0, 0, TimeSpan.Zero),
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            now,
             []
         );
 
@@ -119,6 +121,13 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
         affected.Should().Be(1);
         connection.LastCommand.Should().NotBeNull();
         connection.LastCommand!.AssignedTransaction.Should().BeSameAs(transaction);
+        connection.LastCommand.CommandText.Should().Contain("@cutoff");
+        connection.LastCommand.CommandText.Should().Contain("@tenantId");
+        connection.LastCommand.Parameters.Count.Should().Be(2);
+        connection.LastCommand.Parameters.Contains("cutoff").Should().BeTrue();
+        connection.LastCommand.Parameters.Contains("tenantId").Should().BeTrue();
+        connection.LastCommand.Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
+        connection.LastCommand.Parameters["tenantId"].Value.Should().Be(tenantId);
     }
 
     private static async Task InsertRecordAsync(

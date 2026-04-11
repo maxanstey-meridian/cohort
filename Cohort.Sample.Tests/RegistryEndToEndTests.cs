@@ -29,7 +29,7 @@ public sealed class RegistryEndToEndTests(PostgresFixture fixture) : Integration
     [Fact]
     public async Task Startup_Path_Validates_And_Returns_Only_Retained_Entities_Against_Real_Postgres()
     {
-        // Arrange — seed two real rows through the real DbContext
+        // Arrange — seed retained and exempt rows through the real DbContext
         await using (var db = Host.CreateDbContext())
         {
             db.Notes.Add(
@@ -46,6 +46,14 @@ public sealed class RegistryEndToEndTests(PostgresFixture fixture) : Integration
                     Id = Guid.NewGuid(),
                     CreatedAt = DateTimeOffset.UtcNow.AddDays(-1),
                     Body = "two",
+                }
+            );
+            db.ExemptDocuments.Add(
+                new ExemptDocument
+                {
+                    Id = Guid.NewGuid(),
+                    CreatedAt = DateTimeOffset.UtcNow.AddDays(-30),
+                    Title = "archived",
                 }
             );
             await db.SaveChangesAsync();
@@ -68,11 +76,14 @@ public sealed class RegistryEndToEndTests(PostgresFixture fixture) : Integration
         entries.Values.Should().NotContain(e => e.Category == "long-lived");
         entries.Should().NotContainKey(typeof(ExemptDocument));
 
-        // Sanity — the rows we seeded actually landed in Postgres, not just in
-        // the EF model. Catches the "test passed but the writes were silently
-        // dropped" failure mode.
+        // Sanity — the sample host model contains the exempt entity and the row
+        // we seeded actually landed in Postgres. Catches the "registry excludes
+        // it because the host forgot to map it" failure mode.
         await using var verify = Host.CreateDbContext();
+        verify.Model.FindEntityType(typeof(ExemptDocument)).Should().NotBeNull();
         var count = await verify.Notes.CountAsync();
         count.Should().Be(2);
+        var exemptCount = await verify.ExemptDocuments.CountAsync();
+        exemptCount.Should().Be(1);
     }
 }

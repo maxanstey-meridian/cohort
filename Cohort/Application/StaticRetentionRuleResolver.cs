@@ -7,7 +7,7 @@ namespace Cohort.Application;
 /// how much code it contains.
 public sealed class StaticRetentionRuleResolver(RetentionRule rule) : IRetentionRuleResolver
 {
-    public Task<RetentionRule> ResolveAsync(string category, CancellationToken ct) =>
+    public Task<RetentionRule> ResolveAsync(RetentionResolutionContext ctx, CancellationToken ct) =>
         Task.FromResult(rule);
 
     public RetentionRule? TryResolveAtStartup() => rule;

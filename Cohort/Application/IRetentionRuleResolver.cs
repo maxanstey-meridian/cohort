@@ -4,7 +4,7 @@ namespace Cohort.Application;
 
 public interface IRetentionRuleResolver
 {
-    public Task<RetentionRule> ResolveAsync(string category, CancellationToken ct);
+    public Task<RetentionRule> ResolveAsync(RetentionResolutionContext ctx, CancellationToken ct);
 
     /// <summary>
     /// Optional startup hook. Static resolvers return their rule immediately so the

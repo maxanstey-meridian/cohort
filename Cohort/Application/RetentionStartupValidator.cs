@@ -68,7 +68,16 @@ public sealed class RetentionStartupValidator(
                 continue;
             }
 
-            _ = resolver.TryResolveAtStartup();
+            try
+            {
+                _ = resolver.TryResolveAtStartup();
+            }
+            catch (Exception ex)
+            {
+                errors.Add(
+                    $"Retention category '{entry.Category}' for entity {clrType.FullName} failed startup validation: {ex.Message}"
+                );
+            }
         }
 
         if (errors.Count > 0)

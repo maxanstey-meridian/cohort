@@ -183,6 +183,38 @@ public sealed class RetentionStartupValidatorTests
         exception.Which.Message.Should().Contain(typeof(MissingCategoryRecord).FullName);
     }
 
+    [Fact]
+    public async Task ValidateAsync_Aggregates_Throwing_Startup_Resolvers_With_Other_Failures()
+    {
+        var options = new DbContextOptionsBuilder<ThrowingResolverAggregateDbContext>()
+            .UseInMemoryDatabase($"startup-validator-throwing-resolver-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new ThrowingResolverAggregateDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["throwing-category"] = new ThrowingStartupRuleResolver("resolver exploded"),
+            }
+        );
+
+        var act = async () => await new RetentionStartupValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().HaveCount(2);
+        exception
+            .Which.Errors.Should()
+            .Contain(
+                $"Retention category 'throwing-category' for entity {typeof(ThrowingResolverRecord).FullName} failed startup validation: resolver exploded"
+            );
+        exception
+            .Which.Errors.Should()
+            .Contain(
+                $"Entity {typeof(UnannotatedRecord).FullName} must declare exactly one of [Retain] or [ExemptFromRetention]."
+            );
+        exception.Which.Message.Should().Contain("throwing-category");
+        exception.Which.Message.Should().Contain(typeof(UnannotatedRecord).FullName);
+    }
+
     private sealed class InMemoryCategoryRepository(
         IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
     ) : IRetentionCategoryRepository
@@ -202,6 +234,14 @@ public sealed class RetentionStartupValidatorTests
     {
         public Task<RetentionRule> ResolveAsync(RetentionResolutionContext ctx, CancellationToken ct) =>
             Task.FromResult(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge));
+    }
+
+    private sealed class ThrowingStartupRuleResolver(string message) : IRetentionRuleResolver
+    {
+        public Task<RetentionRule> ResolveAsync(RetentionResolutionContext ctx, CancellationToken ct) =>
+            Task.FromResult(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge));
+
+        public RetentionRule? TryResolveAtStartup() => throw new InvalidOperationException(message);
     }
 
     private sealed class MissingAttributeDbContext(DbContextOptions<MissingAttributeDbContext> options)
@@ -281,6 +321,27 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
+    private sealed class ThrowingResolverAggregateDbContext(
+        DbContextOptions<ThrowingResolverAggregateDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<ThrowingResolverRecord>(entity =>
+            {
+                entity.ToTable("throwing_resolver_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+            });
+            modelBuilder.Entity<UnannotatedRecord>(entity =>
+            {
+                entity.ToTable("throwing_resolver_unannotated_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+            });
+        }
+    }
+
     private sealed class UnannotatedRecord
     {
         public Guid Id { get; init; }
@@ -312,6 +373,13 @@ public sealed class RetentionStartupValidatorTests
 
     [Retain("valid-category", nameof(CreatedAt))]
     private sealed class ValidRetainedRecord
+    {
+        public Guid Id { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    [Retain("throwing-category", nameof(CreatedAt))]
+    private sealed class ThrowingResolverRecord
     {
         public Guid Id { get; init; }
         public DateTimeOffset CreatedAt { get; init; }

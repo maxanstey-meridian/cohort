@@ -7,7 +7,13 @@ public sealed record RetentionEntry(
     string AnchorMember,
     string AnchorColumn,
     IReadOnlyList<AnonymiseField> AnonymiseFields,
+    TenantConvention? Tenant,
     SoftDeleteConvention? SoftDelete
+);
+
+public sealed record TenantConvention(
+    string TenantMember,
+    string TenantColumn
 );
 
 public sealed record SoftDeleteConvention(

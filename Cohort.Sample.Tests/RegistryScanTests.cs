@@ -65,6 +65,9 @@ public sealed class RegistryScanTests
         entry.TableName.Should().Be("retention_ready_records");
         entry.AnchorMember.Should().Be(nameof(RetentionReadyRecord.RetainedAt));
         entry.AnchorColumn.Should().Be("retained_at_utc");
+        entry.Tenant.Should().Be(
+            new TenantConvention(nameof(RetentionReadyRecord.TenantId), "tenant_uuid")
+        );
         entry.AnonymiseFields.Should().ContainSingle();
         entry.AnonymiseFields[0].Should().Be(
             new AnonymiseField(
@@ -130,6 +133,7 @@ public sealed class RegistryScanTests
     private sealed class RetentionReadyRecord
     {
         public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
         public DateTimeOffset RetainedAt { get; init; }
 
         [Anonymise(AnonymiseMethod.FixedLiteral, "[redacted]")]
@@ -157,6 +161,7 @@ public sealed class RegistryScanTests
             {
                 entity.ToTable("retention_ready_records");
                 entity.HasKey(record => record.Id);
+                entity.Property(record => record.TenantId).HasColumnName("tenant_uuid");
                 entity.Property(record => record.RetainedAt).HasColumnName("retained_at_utc");
                 entity.Property(record => record.EmailAddress).HasColumnName("email_address");
                 entity.Property(record => record.IsDeleted).HasColumnName("is_deleted");

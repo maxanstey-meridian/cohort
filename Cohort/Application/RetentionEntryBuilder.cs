@@ -75,6 +75,7 @@ public sealed class RetentionEntryBuilder
             retain.AnchorMember,
             anchorColumn,
             BuildAnonymiseFields(clrType, entityType, storeObject),
+            BuildTenantConvention(entityType, storeObject),
             BuildSoftDeleteConvention(entityType, storeObject)
         );
     }
@@ -111,6 +112,33 @@ public sealed class RetentionEntryBuilder
         }
 
         return fields.ToArray();
+    }
+
+    private static TenantConvention? BuildTenantConvention(
+        IEntityType entityType,
+        StoreObjectIdentifier storeObject
+    )
+    {
+        var clrType = entityType.ClrType;
+        var tenantMember = clrType.GetProperty("TenantId", BindingFlags.Public | BindingFlags.Instance);
+        if (tenantMember is null)
+        {
+            return null;
+        }
+
+        var tenantProperty =
+            entityType.FindProperty(tenantMember.Name)
+            ?? throw new InvalidOperationException(
+                $"Tenant convention on {clrType.FullName}: TenantId is not mapped by EF."
+            );
+
+        var tenantColumn =
+            tenantProperty.GetColumnName(storeObject)
+            ?? throw new InvalidOperationException(
+                $"Tenant convention on {clrType.FullName}: TenantId has no mapped table column."
+            );
+
+        return new TenantConvention(tenantProperty.Name, tenantColumn);
     }
 
     private static SoftDeleteConvention? BuildSoftDeleteConvention(

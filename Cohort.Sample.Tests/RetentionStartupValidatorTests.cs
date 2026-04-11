@@ -15,14 +15,7 @@ public sealed class RetentionStartupValidatorTests
             .UseInMemoryDatabase($"startup-validator-static-{Guid.NewGuid()}")
             .Options;
         await using var db = new SampleDbContext(options);
-        var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
-            {
-                ["short-lived"] = new StaticRetentionRuleResolver(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
-                ),
-            }
-        );
+        var repository = new GuardedSampleCategoryRepository();
 
         var act = async () => await new RetentionStartupValidator(db, repository).ValidateAsync();
 
@@ -36,12 +29,7 @@ public sealed class RetentionStartupValidatorTests
             .UseInMemoryDatabase($"startup-validator-deferred-{Guid.NewGuid()}")
             .Options;
         await using var db = new SampleDbContext(options);
-        var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
-            {
-                ["short-lived"] = new DeferredRuleResolver(),
-            }
-        );
+        var repository = new DeferredSampleCategoryRepository();
 
         var act = async () => await new RetentionStartupValidator(db, repository).ValidateAsync();
 
@@ -49,15 +37,15 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
-    public async Task ValidateAsync_Allows_Exempt_Entities_Without_Category_Resolution()
+    public async Task ValidateAsync_Allows_Exempt_Sample_Entities_Without_Category_Resolution()
     {
-        var options = new DbContextOptionsBuilder<ExemptEntityDbContext>()
+        var options = new DbContextOptionsBuilder<SampleDbContext>()
             .UseInMemoryDatabase($"startup-validator-exempt-{Guid.NewGuid()}")
             .Options;
-        await using var db = new ExemptEntityDbContext(options);
+        await using var db = new SampleDbContext(options);
 
         var act = async () =>
-            await new RetentionStartupValidator(db, new ThrowingCategoryRepository()).ValidateAsync();
+            await new RetentionStartupValidator(db, new GuardedSampleCategoryRepository()).ValidateAsync();
 
         await act.Should().NotThrowAsync();
     }
@@ -109,14 +97,14 @@ public sealed class RetentionStartupValidatorTests
     [Fact]
     public async Task ValidateAsync_Rejects_Invalid_Retention_Anchor_Metadata()
     {
-        var options = new DbContextOptionsBuilder<InvalidAnchorDbContext>()
+        var options = new DbContextOptionsBuilder<BrokenAnnotationDbContext>()
             .UseInMemoryDatabase($"startup-validator-invalid-anchor-{Guid.NewGuid()}")
             .Options;
-        await using var db = new InvalidAnchorDbContext(options);
+        await using var db = new BrokenAnnotationDbContext(options);
         var repository = new InMemoryCategoryRepository(
             new Dictionary<string, IRetentionRuleResolver>
             {
-                ["invalid-anchor"] = new StaticRetentionRuleResolver(
+                ["broken-sample"] = new StaticRetentionRuleResolver(
                     new RetentionRule(TimeSpan.FromDays(90), Strategy.Purge)
                 ),
             }
@@ -130,9 +118,9 @@ public sealed class RetentionStartupValidatorTests
             .Which.Errors[0]
             .Should()
             .Be(
-                $"[Retain] on {typeof(InvalidAnchorRecord).FullName}: anchor '{nameof(InvalidAnchorRecord.Body)}' must be DateTime or DateTimeOffset (nullable allowed), got String."
+                $"[Retain] on {typeof(BrokenAnnotationEntity).FullName}: anchor '{nameof(BrokenAnnotationEntity.Body)}' must be DateTime or DateTimeOffset (nullable allowed), got String."
             );
-        exception.Which.Message.Should().Contain(nameof(InvalidAnchorRecord.Body));
+        exception.Which.Message.Should().Contain(nameof(BrokenAnnotationEntity.Body));
     }
 
     [Fact]
@@ -185,7 +173,7 @@ public sealed class RetentionStartupValidatorTests
         exception
             .Which.Errors.Should()
             .Contain(
-                $"[Retain] on {typeof(InvalidAnchorRecord).FullName}: anchor '{nameof(InvalidAnchorRecord.Body)}' must be DateTime or DateTimeOffset (nullable allowed), got String."
+                $"[Retain] on {typeof(BrokenAnnotationEntity).FullName}: anchor '{nameof(BrokenAnnotationEntity.Body)}' must be DateTime or DateTimeOffset (nullable allowed), got String."
             );
         exception
             .Which.Errors.Should()
@@ -193,7 +181,7 @@ public sealed class RetentionStartupValidatorTests
                 $"Retention category 'missing-category' for entity {typeof(MissingCategoryRecord).FullName} could not be resolved."
             );
         exception.Which.Message.Should().Contain(typeof(UnannotatedRecord).FullName);
-        exception.Which.Message.Should().Contain(typeof(InvalidAnchorRecord).FullName);
+        exception.Which.Message.Should().Contain(typeof(BrokenAnnotationEntity).FullName);
         exception.Which.Message.Should().Contain(typeof(MissingCategoryRecord).FullName);
     }
 
@@ -232,14 +220,14 @@ public sealed class RetentionStartupValidatorTests
     [Fact]
     public async Task Startup_Service_Validates_Before_Scanning_Registry_Metadata()
     {
-        var options = new DbContextOptionsBuilder<InvalidAnchorDbContext>()
+        var options = new DbContextOptionsBuilder<BrokenAnnotationDbContext>()
             .UseInMemoryDatabase($"startup-service-invalid-anchor-{Guid.NewGuid()}")
             .Options;
-        await using var db = new InvalidAnchorDbContext(options);
+        await using var db = new BrokenAnnotationDbContext(options);
         var repository = new InMemoryCategoryRepository(
             new Dictionary<string, IRetentionRuleResolver>
             {
-                ["invalid-anchor"] = new StaticRetentionRuleResolver(
+                ["broken-sample"] = new StaticRetentionRuleResolver(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                 ),
             }
@@ -257,7 +245,7 @@ public sealed class RetentionStartupValidatorTests
             .Which.Errors[0]
             .Should()
             .Be(
-                $"[Retain] on {typeof(InvalidAnchorRecord).FullName}: anchor '{nameof(InvalidAnchorRecord.Body)}' must be DateTime or DateTimeOffset (nullable allowed), got String."
+                $"[Retain] on {typeof(BrokenAnnotationEntity).FullName}: anchor '{nameof(BrokenAnnotationEntity.Body)}' must be DateTime or DateTimeOffset (nullable allowed), got String."
             );
     }
 
@@ -282,18 +270,44 @@ public sealed class RetentionStartupValidatorTests
             Task.FromResult(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge));
     }
 
+    private sealed class GuardedSampleCategoryRepository : IRetentionCategoryRepository
+    {
+        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        {
+            if (category == "short-lived")
+            {
+                return Task.FromResult<IRetentionRuleResolver?>(
+                    new StaticRetentionRuleResolver(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge))
+                );
+            }
+
+            throw new InvalidOperationException(
+                $"Unexpected category lookup for '{category}'. Exempt sample entities must not resolve categories."
+            );
+        }
+    }
+
+    private sealed class DeferredSampleCategoryRepository : IRetentionCategoryRepository
+    {
+        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        {
+            if (category == "short-lived")
+            {
+                return Task.FromResult<IRetentionRuleResolver?>(new DeferredRuleResolver());
+            }
+
+            throw new InvalidOperationException(
+                $"Unexpected category lookup for '{category}'. Exempt sample entities must not resolve categories."
+            );
+        }
+    }
+
     private sealed class ThrowingStartupRuleResolver(string message) : IRetentionRuleResolver
     {
         public Task<RetentionRule> ResolveAsync(RetentionResolutionContext ctx, CancellationToken ct) =>
             Task.FromResult(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge));
 
         public RetentionRule? TryResolveAtStartup() => throw new InvalidOperationException(message);
-    }
-
-    private sealed class ThrowingCategoryRepository : IRetentionCategoryRepository
-    {
-        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct) =>
-            throw new InvalidOperationException("Category lookup should not be called for exempt entities.");
     }
 
     private sealed class MissingAttributeDbContext(DbContextOptions<MissingAttributeDbContext> options)
@@ -304,20 +318,6 @@ public sealed class RetentionStartupValidatorTests
             modelBuilder.Entity<UnannotatedRecord>(entity =>
             {
                 entity.ToTable("unannotated_records");
-                entity.HasKey(record => record.Id);
-                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
-            });
-        }
-    }
-
-    private sealed class ExemptEntityDbContext(DbContextOptions<ExemptEntityDbContext> options)
-        : DbContext(options)
-    {
-        protected override void OnModelCreating(ModelBuilder modelBuilder)
-        {
-            modelBuilder.Entity<ExemptRecord>(entity =>
-            {
-                entity.ToTable("exempt_records");
                 entity.HasKey(record => record.Id);
                 entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
             });
@@ -339,14 +339,14 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
-    private sealed class InvalidAnchorDbContext(DbContextOptions<InvalidAnchorDbContext> options)
+    private sealed class BrokenAnnotationDbContext(DbContextOptions<BrokenAnnotationDbContext> options)
         : DbContext(options)
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
-            modelBuilder.Entity<InvalidAnchorRecord>(entity =>
+            modelBuilder.Entity<BrokenAnnotationEntity>(entity =>
             {
-                entity.ToTable("invalid_anchor_records");
+                entity.ToTable("broken_annotation_entities");
                 entity.HasKey(record => record.Id);
                 entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
                 entity.Property(record => record.Body).HasColumnName("body");
@@ -365,7 +365,7 @@ public sealed class RetentionStartupValidatorTests
                 entity.HasKey(record => record.Id);
                 entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
             });
-            modelBuilder.Entity<InvalidAnchorRecord>(entity =>
+            modelBuilder.Entity<BrokenAnnotationEntity>(entity =>
             {
                 entity.ToTable("aggregate_invalid_anchor_records");
                 entity.HasKey(record => record.Id);
@@ -414,27 +414,12 @@ public sealed class RetentionStartupValidatorTests
         public DateTimeOffset CreatedAt { get; init; }
     }
 
-    [ExemptFromRetention("regulated archive")]
-    private sealed class ExemptRecord
-    {
-        public Guid Id { get; init; }
-        public DateTimeOffset CreatedAt { get; init; }
-    }
-
     [Retain("conflict-category", nameof(CreatedAt))]
     [ExemptFromRetention("covered by statutory retention")]
     private sealed class ConflictingRecord
     {
         public Guid Id { get; init; }
         public DateTimeOffset CreatedAt { get; init; }
-    }
-
-    [Retain("invalid-anchor", nameof(Body))]
-    private sealed class InvalidAnchorRecord
-    {
-        public Guid Id { get; init; }
-        public DateTimeOffset CreatedAt { get; init; }
-        public string Body { get; init; } = "";
     }
 
     [Retain("missing-category", nameof(CreatedAt))]

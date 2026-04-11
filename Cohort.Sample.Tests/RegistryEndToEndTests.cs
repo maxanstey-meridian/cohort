@@ -1,4 +1,3 @@
-using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Sample.Entities;
 
@@ -28,7 +27,7 @@ namespace Cohort.Sample.Tests;
 public sealed class RegistryEndToEndTests(PostgresFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
-    public async Task Registry_Scan_Finds_Annotated_Entity_Against_Real_Postgres()
+    public async Task Startup_Path_Validates_And_Returns_Only_Retained_Entities_Against_Real_Postgres()
     {
         // Arrange — seed two real rows through the real DbContext
         await using (var db = Host.CreateDbContext())
@@ -52,14 +51,12 @@ public sealed class RegistryEndToEndTests(PostgresFixture fixture) : Integration
             await db.SaveChangesAsync();
         }
 
-        // Act — run the registry against the same real DbContext
+        // Act — run the real startup path against the same real DbContext
         IReadOnlyDictionary<Type, RetentionEntry> entries;
-        await using (var db = Host.CreateDbContext())
-        {
-            entries = new RetentionRegistry(db).Scan();
-        }
+        entries = await Host.RunStartupAsync();
 
-        // Assert — positive AND negative
+        // Assert — the retained sample entity is present and the exempt sample
+        // fixture is ignored by the registry surface.
         entries
             .Should()
             .ContainSingle(kvp =>
@@ -69,6 +66,7 @@ public sealed class RegistryEndToEndTests(PostgresFixture fixture) : Integration
                 && kvp.Value.EntityType == typeof(Note)
             );
         entries.Values.Should().NotContain(e => e.Category == "long-lived");
+        entries.Should().NotContainKey(typeof(ExemptDocument));
 
         // Sanity — the rows we seeded actually landed in Postgres, not just in
         // the EF model. Catches the "test passed but the writes were silently

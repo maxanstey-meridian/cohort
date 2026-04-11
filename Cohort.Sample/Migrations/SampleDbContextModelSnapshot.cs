@@ -22,6 +22,24 @@ namespace Cohort.Sample.Migrations
 
             NpgsqlModelBuilderExtensions.UseIdentityByDefaultColumns(modelBuilder);
 
+            modelBuilder.Entity("Cohort.Sample.Entities.ExemptDocument", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("Title")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("exempt_documents", (string)null);
+                });
+
             modelBuilder.Entity("Cohort.Sample.Entities.Note", b =>
                 {
                     b.Property<Guid>("Id")

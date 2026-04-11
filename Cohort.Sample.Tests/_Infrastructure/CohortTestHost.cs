@@ -55,11 +55,8 @@ public sealed class CohortTestHost(
     )
     {
         await using var scope = _services.CreateAsyncScope();
-        var validator = scope.ServiceProvider.GetRequiredService<RetentionStartupValidator>();
-        var preview = scope.ServiceProvider.GetRequiredService<IRetentionPreview>();
-
-        await validator.ValidateAsync(ct);
-        return await preview.PreviewAsync(tenant, now, ct);
+        var startup = scope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
+        return await startup.RunPreviewAsync(tenant, now, ct);
     }
 
     public void Dispose()

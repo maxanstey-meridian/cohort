@@ -1,4 +1,5 @@
 using Cohort.Application;
+using Cohort.Domain;
 using Cohort.Infrastructure.Sweep;
 using Cohort.Sample;
 
@@ -38,8 +39,14 @@ var host = builder.Build();
 using var scope = host.Services.CreateScope();
 var logger = scope.ServiceProvider.GetRequiredService<ILogger<Program>>();
 var startup = scope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
+var previewTenant = new TenantContext(
+    Guid.Parse("11111111-1111-1111-1111-111111111111"),
+    "sample",
+    new Dictionary<string, string>()
+);
 
 var entries = await startup.RunAsync();
+var preview = await startup.RunPreviewAsync(previewTenant, DateTimeOffset.UtcNow);
 
 logger.LogInformation("Found {Count} retention entries", entries.Count);
 foreach (var entry in entries.Values)
@@ -50,5 +57,17 @@ foreach (var entry in entries.Values)
         entry.TableName,
         entry.Category,
         entry.AnchorMember
+    );
+}
+
+foreach (var count in preview.Counts)
+{
+    logger.LogInformation(
+        "Preview {EntityType} → category={Category} strategy={Strategy} tenant={TenantId} candidates={Candidates}",
+        count.EntityType.Name,
+        count.Category,
+        count.Strategy,
+        count.TenantId,
+        count.Affected
     );
 }

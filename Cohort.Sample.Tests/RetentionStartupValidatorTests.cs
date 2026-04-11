@@ -241,6 +241,11 @@ public sealed class RetentionStartupValidatorTests
                 new RetentionRegistry(db),
                 repository,
                 new PurgeSweepStrategy()
+            ),
+            new RetentionPreviewService(
+                db,
+                new RetentionRegistry(db),
+                repository
             )
         );
 
@@ -253,6 +258,81 @@ public sealed class RetentionStartupValidatorTests
             .Should()
             .Be(
                 $"[Retain] on {typeof(BrokenAnnotationEntity).FullName}: anchor '{nameof(BrokenAnnotationEntity.Body)}' must be DateTime or DateTimeOffset (nullable allowed), got String."
+            );
+    }
+
+    [Fact]
+    public async Task Startup_Service_Validates_Before_Previewing_Sweep_Candidates()
+    {
+        var options = new DbContextOptionsBuilder<BrokenAnnotationDbContext>()
+            .UseInMemoryDatabase($"startup-service-preview-invalid-anchor-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new BrokenAnnotationDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["broken-sample"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                ),
+            }
+        );
+        var startup = new SampleRetentionStartupService(
+            new RetentionRegistry(db),
+            new RetentionStartupValidator(db, repository),
+            new RetentionSweepEngine(
+                db,
+                new RetentionRegistry(db),
+                repository,
+                new PurgeSweepStrategy()
+            ),
+            new RetentionPreviewService(
+                db,
+                new RetentionRegistry(db),
+                repository
+            )
+        );
+
+        var act = async () =>
+            await startup.RunPreviewAsync(
+                new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
+                DateTimeOffset.UtcNow
+            );
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"[Retain] on {typeof(BrokenAnnotationEntity).FullName}: anchor '{nameof(BrokenAnnotationEntity.Body)}' must be DateTime or DateTimeOffset (nullable allowed), got String."
+            );
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Rejects_Invalid_Tenant_Metadata()
+    {
+        var options = new DbContextOptionsBuilder<InvalidTenantDbContext>()
+            .UseInMemoryDatabase($"startup-validator-invalid-tenant-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new InvalidTenantDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["tenant-category"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                ),
+            }
+        );
+
+        var act = async () => await new RetentionStartupValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Tenant convention on {typeof(InvalidTenantRecord).FullName}: TenantId must be Guid or nullable Guid, got String."
             );
     }
 
@@ -415,6 +495,21 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
+    private sealed class InvalidTenantDbContext(DbContextOptions<InvalidTenantDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<InvalidTenantRecord>(entity =>
+            {
+                entity.ToTable("invalid_tenant_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+                entity.Property(record => record.TenantId).HasColumnName("tenant_id");
+            });
+        }
+    }
+
     private sealed class UnannotatedRecord
     {
         public Guid Id { get; init; }
@@ -447,6 +542,14 @@ public sealed class RetentionStartupValidatorTests
     private sealed class ThrowingResolverRecord
     {
         public Guid Id { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    [Retain("tenant-category", nameof(CreatedAt))]
+    private sealed class InvalidTenantRecord
+    {
+        public Guid Id { get; init; }
+        public string TenantId { get; init; } = "";
         public DateTimeOffset CreatedAt { get; init; }
     }
 }

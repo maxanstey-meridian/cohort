@@ -16,6 +16,7 @@ public sealed class RetentionEntryBuilder
         typeof(DateTimeOffset),
         typeof(DateTimeOffset?),
     ];
+    private static readonly Type[] AllowedTenantTypes = [typeof(Guid), typeof(Guid?)];
 
     public RetentionEntry? TryBuild(IEntityType entityType)
     {
@@ -124,6 +125,13 @@ public sealed class RetentionEntryBuilder
         if (tenantMember is null)
         {
             return null;
+        }
+
+        if (!AllowedTenantTypes.Contains(tenantMember.PropertyType))
+        {
+            throw new InvalidOperationException(
+                $"Tenant convention on {clrType.FullName}: TenantId must be Guid or nullable Guid, got {tenantMember.PropertyType.Name}."
+            );
         }
 
         var tenantProperty =

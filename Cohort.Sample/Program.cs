@@ -1,5 +1,4 @@
 using Cohort.Application;
-using Cohort.Domain;
 using Cohort.Sample;
 
 using Microsoft.EntityFrameworkCore;
@@ -23,19 +22,20 @@ builder.Services.AddDbContext<SampleDbContext>(
         opts.UseNpgsql(cohort.ConnectionString);
     }
 );
+builder.Services.AddScoped<DbContext>(sp => sp.GetRequiredService<SampleDbContext>());
 
-builder.Services.AddSingleton<IRetentionRuleResolver>(
-    new StaticRetentionRuleResolver(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge))
-);
+builder.Services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+builder.Services.AddScoped<RetentionRegistry>();
+builder.Services.AddScoped<RetentionStartupValidator>();
+builder.Services.AddScoped<SampleRetentionStartupService>();
 
 var host = builder.Build();
 
 using var scope = host.Services.CreateScope();
-var db = scope.ServiceProvider.GetRequiredService<SampleDbContext>();
 var logger = scope.ServiceProvider.GetRequiredService<ILogger<Program>>();
+var startup = scope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
 
-var registry = new RetentionRegistry(db);
-var entries = registry.Scan();
+var entries = await startup.RunAsync();
 
 logger.LogInformation("Found {Count} retention entries", entries.Count);
 foreach (var entry in entries.Values)

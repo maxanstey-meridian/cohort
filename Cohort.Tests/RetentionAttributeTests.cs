@@ -68,6 +68,16 @@ public sealed class RetentionAttributeTests
         attribute.Literal.Should().BeNull();
     }
 
+    [Theory]
+    [InlineData(AnonymiseMethod.Null)]
+    [InlineData(AnonymiseMethod.EmptyString)]
+    public void Anonymise_Attribute_Rejects_A_Literal_For_Non_Fixed_Methods(AnonymiseMethod method)
+    {
+        var act = () => new AnonymiseAttribute(method, "[redacted]");
+
+        act.Should().Throw<ArgumentException>().WithParameterName("literal");
+    }
+
     [Fact]
     public void Exempt_From_Retention_Attribute_Is_Class_Targeted_Single_Instance_And_Not_Inherited()
     {
@@ -87,6 +97,18 @@ public sealed class RetentionAttributeTests
         var attribute = new ExemptFromRetentionAttribute("Statutory record outside retention sweep.");
 
         attribute.Reason.Should().Be("Statutory record outside retention sweep.");
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData(" ")]
+    [InlineData("   ")]
+    public void Exempt_From_Retention_Attribute_Rejects_A_Blank_Reason(string? reason)
+    {
+        var act = () => new ExemptFromRetentionAttribute(reason!);
+
+        act.Should().Throw<ArgumentException>().WithParameterName("reason");
     }
 
     private sealed class SampleEntity

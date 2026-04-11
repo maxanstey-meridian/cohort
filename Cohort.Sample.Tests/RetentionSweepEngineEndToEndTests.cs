@@ -3,7 +3,10 @@ using Cohort.Domain;
 using Cohort.Infrastructure.Sweep;
 using Cohort.Sample.Entities;
 
+using System.Data.Common;
+
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 
 namespace Cohort.Sample.Tests;
 
@@ -177,6 +180,50 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task SweepAsync_Passes_The_Active_Db_Transaction_To_The_Strategy()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 11, 12, 0, 0, TimeSpan.Zero);
+
+        await using var db = Host.CreateDbContext();
+        db.Notes.Add(
+            new Note
+            {
+                Id = Guid.NewGuid(),
+                TenantId = tenantId,
+                CreatedAt = asOf.AddDays(-120),
+                Body = "track-transaction",
+            }
+        );
+        await db.SaveChangesAsync();
+
+        var strategy = new TransactionCapturingSweepStrategy(db);
+        var engine = new RetentionSweepEngine(
+            db,
+            new RetentionRegistry(db),
+            new StaticCategoryRepository(
+                new Dictionary<string, IRetentionRuleResolver>
+                {
+                    ["short-lived"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    ),
+                }
+            ),
+            strategy
+        );
+
+        var result = await engine.SweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        strategy.ReceivedTransaction.Should().NotBeNull();
+        strategy.ReceivedTransaction.Should().BeSameAs(strategy.CurrentEfTransactionAtExecution);
+        result.Counts.Should().ContainSingle();
+        result.Counts[0].Affected.Should().Be(0);
+    }
+
+    [Fact]
     public async Task Shared_Host_Sweep_Path_Rejects_Unsupported_Runtime_Strategies()
     {
         var tenantId = Guid.NewGuid();
@@ -253,6 +300,28 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         public RetentionRule? TryResolveAtStartup()
         {
             return rule;
+        }
+    }
+
+    private sealed class TransactionCapturingSweepStrategy(
+        SampleDbContext db
+    ) : IRetentionSweepStrategy
+    {
+        public DbTransaction? ReceivedTransaction { get; private set; }
+        public DbTransaction? CurrentEfTransactionAtExecution { get; private set; }
+
+        public Task<int> SweepAsync(
+            RetentionEntry entry,
+            RetentionRule rule,
+            RetentionResolutionContext ctx,
+            DbConnection conn,
+            DbTransaction transaction,
+            CancellationToken ct
+        )
+        {
+            ReceivedTransaction = transaction;
+            CurrentEfTransactionAtExecution = db.Database.CurrentTransaction?.GetDbTransaction();
+            return Task.FromResult(0);
         }
     }
 

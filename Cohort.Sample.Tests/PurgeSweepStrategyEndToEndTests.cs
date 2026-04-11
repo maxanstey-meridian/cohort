@@ -1,7 +1,10 @@
-using System.Data;
-
 using Cohort.Domain;
 using Cohort.Infrastructure.Sweep;
+
+using System.Collections;
+using System.Data;
+using System.Data.Common;
+using System.Diagnostics.CodeAnalysis;
 
 using Npgsql;
 
@@ -58,8 +61,17 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
             now,
             []
         );
+        await using var transaction = await connection.BeginTransactionAsync();
 
-        var affected = await strategy.SweepAsync(entry, rule, context, connection, CancellationToken.None);
+        var affected = await strategy.SweepAsync(
+            entry,
+            rule,
+            context,
+            connection,
+            transaction,
+            CancellationToken.None
+        );
+        await transaction.CommitAsync();
 
         affected.Should().Be(1);
         var remainingRows = await GetRemainingRowsAsync(connection);
@@ -69,6 +81,44 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
                 new RemainingRow(tenantB, "keep-other-tenant"),
             ]
         );
+    }
+
+    [Fact]
+    public async Task SweepAsync_Assigns_The_Provided_Transaction_To_The_Raw_Command()
+    {
+        var strategy = new PurgeSweepStrategy();
+        var connection = new RecordingDbConnection();
+        var transaction = connection.BeginTransaction();
+        var entry = new RetentionEntry(
+            typeof(PurgeCandidateRecord),
+            "purge_candidate_records",
+            "short-lived",
+            nameof(PurgeCandidateRecord.CreatedAt),
+            "CreatedAt",
+            [],
+            new TenantConvention(nameof(PurgeCandidateRecord.TenantId), "TenantId"),
+            null
+        );
+        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge);
+        var context = new RetentionResolutionContext(
+            "short-lived",
+            new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
+            new DateTimeOffset(2026, 4, 11, 12, 0, 0, TimeSpan.Zero),
+            []
+        );
+
+        var affected = await strategy.SweepAsync(
+            entry,
+            rule,
+            context,
+            connection,
+            transaction,
+            CancellationToken.None
+        );
+
+        affected.Should().Be(1);
+        connection.LastCommand.Should().NotBeNull();
+        connection.LastCommand!.AssignedTransaction.Should().BeSameAs(transaction);
     }
 
     private static async Task InsertRecordAsync(
@@ -112,7 +162,7 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
         return rows;
     }
 
-    private static IDbDataParameter CreateParameter(
+    private static NpgsqlParameter CreateParameter(
         NpgsqlCommand command,
         string name,
         object value
@@ -131,4 +181,267 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
     }
 
     private sealed record RemainingRow(Guid TenantId, string Body);
+
+    private sealed class RecordingDbConnection : DbConnection
+    {
+        private ConnectionState state = ConnectionState.Closed;
+        private string connectionString = "Host=recording";
+
+        public RecordingDbCommand? LastCommand { get; private set; }
+
+        [AllowNull]
+        public override string ConnectionString
+        {
+            get => connectionString;
+            set => connectionString = value ?? "";
+        }
+
+        public override string Database => "recording";
+
+        public override string DataSource => "recording";
+
+        public override string ServerVersion => "1.0";
+
+        public override ConnectionState State => state;
+
+        public override void ChangeDatabase(string databaseName) { }
+
+        public override void Close()
+        {
+            state = ConnectionState.Closed;
+        }
+
+        public override void Open()
+        {
+            state = ConnectionState.Open;
+        }
+
+        protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
+        {
+            state = ConnectionState.Open;
+            return new RecordingDbTransaction(this);
+        }
+
+        protected override DbCommand CreateDbCommand()
+        {
+            LastCommand = new RecordingDbCommand(this);
+            return LastCommand;
+        }
+    }
+
+    private sealed class RecordingDbTransaction(RecordingDbConnection connection) : DbTransaction
+    {
+        public override IsolationLevel IsolationLevel => IsolationLevel.ReadCommitted;
+
+        protected override DbConnection? DbConnection => connection;
+
+        public override void Commit() { }
+
+        public override void Rollback() { }
+    }
+
+    private sealed class RecordingDbCommand(RecordingDbConnection connection) : DbCommand
+    {
+        private readonly RecordingDbParameterCollection parameters = new();
+        private string commandText = "";
+
+        public DbTransaction? AssignedTransaction { get; private set; }
+
+        [AllowNull]
+        public override string CommandText
+        {
+            get => commandText;
+            set => commandText = value ?? "";
+        }
+
+        public override int CommandTimeout { get; set; }
+
+        public override CommandType CommandType { get; set; } = CommandType.Text;
+
+        protected override DbConnection? DbConnection { get; set; } = connection;
+
+        protected override DbParameterCollection DbParameterCollection => parameters;
+
+        protected override DbTransaction? DbTransaction
+        {
+            get => AssignedTransaction;
+            set => AssignedTransaction = value;
+        }
+
+        public override bool DesignTimeVisible { get; set; }
+
+        public override UpdateRowSource UpdatedRowSource { get; set; }
+
+        public override void Cancel() { }
+
+        public override int ExecuteNonQuery()
+        {
+            return 1;
+        }
+
+        public override object? ExecuteScalar()
+        {
+            return null;
+        }
+
+        public override void Prepare() { }
+
+        protected override DbParameter CreateDbParameter()
+        {
+            return new RecordingDbParameter();
+        }
+
+        protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
+        {
+            throw new NotSupportedException();
+        }
+
+        public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
+        {
+            return Task.FromResult(1);
+        }
+    }
+
+    private sealed class RecordingDbParameter : DbParameter
+    {
+        private string parameterName = "";
+        private string sourceColumn = "";
+
+        public override DbType DbType { get; set; }
+
+        public override ParameterDirection Direction { get; set; } = ParameterDirection.Input;
+
+        public override bool IsNullable { get; set; }
+
+        [AllowNull]
+        public override string ParameterName
+        {
+            get => parameterName;
+            set => parameterName = value ?? "";
+        }
+
+        [AllowNull]
+        public override string SourceColumn
+        {
+            get => sourceColumn;
+            set => sourceColumn = value ?? "";
+        }
+
+        public override object? Value { get; set; }
+
+        public override bool SourceColumnNullMapping { get; set; }
+
+        public override int Size { get; set; }
+
+        public override void ResetDbType() { }
+    }
+
+    private sealed class RecordingDbParameterCollection : DbParameterCollection
+    {
+        private readonly List<DbParameter> items = [];
+
+        public override int Count => items.Count;
+
+        public override object SyncRoot => this;
+
+        public override int Add(object value)
+        {
+            items.Add((DbParameter)value);
+            return items.Count - 1;
+        }
+
+        public override void AddRange(Array values)
+        {
+            foreach (var value in values)
+            {
+                Add(value!);
+            }
+        }
+
+        public override void Clear()
+        {
+            items.Clear();
+        }
+
+        public override bool Contains(object value)
+        {
+            return items.Contains((DbParameter)value);
+        }
+
+        public override bool Contains(string value)
+        {
+            return items.Any(parameter => parameter.ParameterName == value);
+        }
+
+        public override void CopyTo(Array array, int index)
+        {
+            items.ToArray().CopyTo(array, index);
+        }
+
+        public override IEnumerator GetEnumerator()
+        {
+            return items.GetEnumerator();
+        }
+
+        public override int IndexOf(object value)
+        {
+            return items.IndexOf((DbParameter)value);
+        }
+
+        public override int IndexOf(string parameterName)
+        {
+            return items.FindIndex(parameter => parameter.ParameterName == parameterName);
+        }
+
+        public override void Insert(int index, object value)
+        {
+            items.Insert(index, (DbParameter)value);
+        }
+
+        public override void Remove(object value)
+        {
+            items.Remove((DbParameter)value);
+        }
+
+        public override void RemoveAt(int index)
+        {
+            items.RemoveAt(index);
+        }
+
+        public override void RemoveAt(string parameterName)
+        {
+            var index = IndexOf(parameterName);
+            if (index >= 0)
+            {
+                RemoveAt(index);
+            }
+        }
+
+        protected override DbParameter GetParameter(int index)
+        {
+            return items[index];
+        }
+
+        protected override DbParameter GetParameter(string parameterName)
+        {
+            return items[IndexOf(parameterName)];
+        }
+
+        protected override void SetParameter(int index, DbParameter value)
+        {
+            items[index] = value;
+        }
+
+        protected override void SetParameter(string parameterName, DbParameter value)
+        {
+            var index = IndexOf(parameterName);
+            if (index >= 0)
+            {
+                items[index] = value;
+                return;
+            }
+
+            items.Add(value);
+        }
+    }
 }

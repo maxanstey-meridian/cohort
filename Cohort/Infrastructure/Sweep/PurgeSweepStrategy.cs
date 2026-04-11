@@ -12,7 +12,8 @@ public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
         RetentionEntry entry,
         RetentionRule rule,
         RetentionResolutionContext ctx,
-        IDbConnection conn,
+        DbConnection conn,
+        DbTransaction transaction,
         CancellationToken ct
     )
     {
@@ -20,6 +21,7 @@ public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
         ArgumentNullException.ThrowIfNull(rule);
         ArgumentNullException.ThrowIfNull(ctx);
         ArgumentNullException.ThrowIfNull(conn);
+        ArgumentNullException.ThrowIfNull(transaction);
 
         if (rule.Strategy != Strategy.Purge)
         {
@@ -33,19 +35,13 @@ public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
                 $"Retention entry for {entry.EntityType.FullName} must expose tenant metadata for purge sweeps."
             );
 
-        if (conn is not DbConnection dbConnection)
+        if (conn.State != ConnectionState.Open)
         {
-            throw new InvalidOperationException(
-                "PurgeSweepStrategy requires a DbConnection-backed IDbConnection."
-            );
+            await conn.OpenAsync(ct);
         }
 
-        if (dbConnection.State != ConnectionState.Open)
-        {
-            await dbConnection.OpenAsync(ct);
-        }
-
-        await using var command = dbConnection.CreateCommand();
+        await using var command = conn.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText =
             $"""
             DELETE FROM {QuoteIdentifier(entry.TableName)}

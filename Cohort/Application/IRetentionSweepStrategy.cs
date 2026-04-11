@@ -1,4 +1,4 @@
-using System.Data;
+using System.Data.Common;
 
 using Cohort.Domain;
 
@@ -10,7 +10,8 @@ public interface IRetentionSweepStrategy
         RetentionEntry entry,
         RetentionRule rule,
         RetentionResolutionContext ctx,
-        IDbConnection conn,
+        DbConnection conn,
+        DbTransaction transaction,
         CancellationToken ct
     );
 }

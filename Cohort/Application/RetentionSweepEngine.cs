@@ -4,6 +4,7 @@ using System.Diagnostics;
 using Cohort.Domain;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 
 namespace Cohort.Application;
 
@@ -68,6 +69,7 @@ public sealed class RetentionSweepEngine(
         try
         {
             await using var transaction = await db.Database.BeginTransactionAsync(ct);
+            var dbTransaction = transaction.GetDbTransaction();
 
             foreach (var (entry, context, rule) in executionPlan)
             {
@@ -78,6 +80,7 @@ public sealed class RetentionSweepEngine(
                         rule,
                         context,
                         connection,
+                        dbTransaction,
                         ct
                     ),
                     Strategy.Exempt => 0,

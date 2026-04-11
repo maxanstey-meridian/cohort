@@ -49,6 +49,20 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
+    public async Task ValidateAsync_Allows_Exempt_Entities_Without_Category_Resolution()
+    {
+        var options = new DbContextOptionsBuilder<ExemptEntityDbContext>()
+            .UseInMemoryDatabase($"startup-validator-exempt-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new ExemptEntityDbContext(options);
+
+        var act = async () =>
+            await new RetentionStartupValidator(db, new ThrowingCategoryRepository()).ValidateAsync();
+
+        await act.Should().NotThrowAsync();
+    }
+
+    [Fact]
     public async Task ValidateAsync_Rejects_Entities_Without_Retention_Or_Exemption_Metadata()
     {
         var options = new DbContextOptionsBuilder<MissingAttributeDbContext>()
@@ -276,6 +290,12 @@ public sealed class RetentionStartupValidatorTests
         public RetentionRule? TryResolveAtStartup() => throw new InvalidOperationException(message);
     }
 
+    private sealed class ThrowingCategoryRepository : IRetentionCategoryRepository
+    {
+        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct) =>
+            throw new InvalidOperationException("Category lookup should not be called for exempt entities.");
+    }
+
     private sealed class MissingAttributeDbContext(DbContextOptions<MissingAttributeDbContext> options)
         : DbContext(options)
     {
@@ -284,6 +304,20 @@ public sealed class RetentionStartupValidatorTests
             modelBuilder.Entity<UnannotatedRecord>(entity =>
             {
                 entity.ToTable("unannotated_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+            });
+        }
+    }
+
+    private sealed class ExemptEntityDbContext(DbContextOptions<ExemptEntityDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<ExemptRecord>(entity =>
+            {
+                entity.ToTable("exempt_records");
                 entity.HasKey(record => record.Id);
                 entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
             });
@@ -375,6 +409,13 @@ public sealed class RetentionStartupValidatorTests
     }
 
     private sealed class UnannotatedRecord
+    {
+        public Guid Id { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    [ExemptFromRetention("regulated archive")]
+    private sealed class ExemptRecord
     {
         public Guid Id { get; init; }
         public DateTimeOffset CreatedAt { get; init; }

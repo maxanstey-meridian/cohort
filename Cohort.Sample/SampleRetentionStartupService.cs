@@ -12,8 +12,7 @@ public sealed class SampleRetentionStartupService(
         CancellationToken ct = default
     )
     {
-        var entries = registry.Scan();
         await validator.ValidateAsync(ct);
-        return entries;
+        return registry.Scan();
     }
 }

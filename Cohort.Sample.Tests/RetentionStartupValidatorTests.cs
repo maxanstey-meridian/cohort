@@ -215,6 +215,38 @@ public sealed class RetentionStartupValidatorTests
         exception.Which.Message.Should().Contain(typeof(UnannotatedRecord).FullName);
     }
 
+    [Fact]
+    public async Task Startup_Service_Validates_Before_Scanning_Registry_Metadata()
+    {
+        var options = new DbContextOptionsBuilder<InvalidAnchorDbContext>()
+            .UseInMemoryDatabase($"startup-service-invalid-anchor-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new InvalidAnchorDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["invalid-anchor"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                ),
+            }
+        );
+        var startup = new SampleRetentionStartupService(
+            new RetentionRegistry(db),
+            new RetentionStartupValidator(db, repository)
+        );
+
+        var act = async () => await startup.RunAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"[Retain] on {typeof(InvalidAnchorRecord).FullName}: anchor '{nameof(InvalidAnchorRecord.Body)}' must be DateTime or DateTimeOffset (nullable allowed), got String."
+            );
+    }
+
     private sealed class InMemoryCategoryRepository(
         IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
     ) : IRetentionCategoryRepository

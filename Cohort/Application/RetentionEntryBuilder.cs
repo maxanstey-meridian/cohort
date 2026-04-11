@@ -138,8 +138,20 @@ public sealed class RetentionEntryBuilder
             );
 
         var deletedAtMember = clrType.GetProperty("DeletedAt", BindingFlags.Public | BindingFlags.Instance);
-        var deletedAtProperty = deletedAtMember is null ? null : entityType.FindProperty(deletedAtMember.Name);
-        var deletedAtColumn = deletedAtProperty?.GetColumnName(storeObject);
+        var deletedAtProperty =
+            deletedAtMember is null
+                ? null
+                : entityType.FindProperty(deletedAtMember.Name)
+                    ?? throw new InvalidOperationException(
+                        $"Soft-delete convention on {clrType.FullName}: DeletedAt is not mapped by EF."
+                    );
+        var deletedAtColumn =
+            deletedAtProperty?.GetColumnName(storeObject)
+            ?? (deletedAtProperty is null
+                ? null
+                : throw new InvalidOperationException(
+                    $"Soft-delete convention on {clrType.FullName}: DeletedAt has no mapped table column."
+                ));
 
         return new SoftDeleteConvention(
             isDeletedProperty.Name,

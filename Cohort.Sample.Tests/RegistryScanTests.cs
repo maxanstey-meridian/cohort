@@ -92,6 +92,23 @@ public sealed class RegistryScanTests
     }
 
     [Fact]
+    public void Scan_Rejects_Unmapped_Deleted_At_Soft_Delete_Members()
+    {
+        var options = new DbContextOptionsBuilder<UnmappedDeletedAtDbContext>()
+            .UseInMemoryDatabase($"registry-unmapped-deleted-at-{Guid.NewGuid()}")
+            .Options;
+        using var db = new UnmappedDeletedAtDbContext(options);
+
+        var act = () => new RetentionRegistry(db).Scan();
+
+        act.Should()
+            .Throw<InvalidOperationException>()
+            .WithMessage(
+                $"Soft-delete convention on *{nameof(SoftDeleteEntityWithUnmappedDeletedAt)}: DeletedAt is not mapped by EF."
+            );
+    }
+
+    [Fact]
     public void Scan_Caches_The_Immutable_Lookup_Per_Registry_Instance()
     {
         var options = new DbContextOptionsBuilder<RegistryMetadataDbContext>()
@@ -120,6 +137,15 @@ public sealed class RegistryScanTests
         public DateTimeOffset? DeletedAt { get; init; }
     }
 
+    [Retain("long-lived", nameof(SoftDeleteEntityWithUnmappedDeletedAt.RetainedAt))]
+    private sealed class SoftDeleteEntityWithUnmappedDeletedAt
+    {
+        public Guid Id { get; init; }
+        public DateTimeOffset RetainedAt { get; init; }
+        public bool IsDeleted { get; init; }
+        public DateTimeOffset? DeletedAt { get; init; }
+    }
+
     private sealed class RegistryMetadataDbContext(DbContextOptions<RegistryMetadataDbContext> options)
         : DbContext(options)
     {
@@ -133,6 +159,22 @@ public sealed class RegistryScanTests
                 entity.Property(record => record.EmailAddress).HasColumnName("email_address");
                 entity.Property(record => record.IsDeleted).HasColumnName("is_deleted");
                 entity.Property(record => record.DeletedAt).HasColumnName("deleted_at_utc");
+            });
+        }
+    }
+
+    private sealed class UnmappedDeletedAtDbContext(DbContextOptions<UnmappedDeletedAtDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<SoftDeleteEntityWithUnmappedDeletedAt>(entity =>
+            {
+                entity.ToTable("retention_ready_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.RetainedAt).HasColumnName("retained_at_utc");
+                entity.Property(record => record.IsDeleted).HasColumnName("is_deleted");
+                entity.Ignore(record => record.DeletedAt);
             });
         }
     }

@@ -199,6 +199,66 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
         noteBodies.Should().Equal("preview-count-legal-min", "preview-keep-legal-min");
     }
 
+    [Fact]
+    public async Task Preview_Path_Ignores_Legacy_Notes_With_Null_TenantId_For_Targeted_Runs()
+    {
+        var tenantA = Guid.NewGuid();
+        var tenantB = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantA,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "preview-count-target-tenant",
+                },
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantB,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "preview-ignore-other-tenant",
+                },
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = null,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "preview-ignore-null-tenant",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        var result = await Host.RunPreviewAsync(
+            new TenantContext(tenantA, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        result.Counts.Should().ContainSingle();
+        result.Counts[0].Should().Be(
+            new EntitySweepCount(
+                typeof(Note),
+                "short-lived",
+                tenantA,
+                Strategy.Purge,
+                1
+            )
+        );
+
+        await using var verify = Host.CreateDbContext();
+        var noteBodies = await verify.Notes.OrderBy(note => note.Body).Select(note => note.Body).ToListAsync();
+        noteBodies.Should().Equal(
+            "preview-count-target-tenant",
+            "preview-ignore-null-tenant",
+            "preview-ignore-other-tenant"
+        );
+    }
+
     private sealed class StaticCategoryRepository(
         IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
     ) : IRetentionCategoryRepository

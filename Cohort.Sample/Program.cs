@@ -25,7 +25,7 @@ builder.Services.AddDbContext<SampleDbContext>(
 );
 
 builder.Services.AddSingleton<IRetentionRuleResolver>(
-    new StaticRetentionRuleResolver(new RetentionRule(TimeSpan.FromDays(30)))
+    new StaticRetentionRuleResolver(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge))
 );
 
 var host = builder.Build();

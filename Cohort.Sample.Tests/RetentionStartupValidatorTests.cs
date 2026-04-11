@@ -1,5 +1,6 @@
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Infrastructure.Sweep;
 using Cohort.Sample.Entities;
 
 using Microsoft.EntityFrameworkCore;
@@ -234,7 +235,13 @@ public sealed class RetentionStartupValidatorTests
         );
         var startup = new SampleRetentionStartupService(
             new RetentionRegistry(db),
-            new RetentionStartupValidator(db, repository)
+            new RetentionStartupValidator(db, repository),
+            new RetentionSweepEngine(
+                db,
+                new RetentionRegistry(db),
+                repository,
+                new PurgeSweepStrategy()
+            )
         );
 
         var act = async () => await startup.RunAsync();

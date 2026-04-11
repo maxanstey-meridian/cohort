@@ -15,6 +15,7 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
         {
             b.ToTable("notes");
             b.HasKey(n => n.Id);
+            b.Property(n => n.TenantId).IsRequired();
             b.Property(n => n.CreatedAt).IsRequired();
             b.Property(n => n.Body).IsRequired();
         });

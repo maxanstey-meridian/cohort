@@ -36,6 +36,7 @@ public sealed class RegistryEndToEndTests(PostgresFixture fixture) : Integration
                 new Note
                 {
                     Id = Guid.NewGuid(),
+                    TenantId = Guid.NewGuid(),
                     CreatedAt = DateTimeOffset.UtcNow.AddDays(-10),
                     Body = "one",
                 }
@@ -44,6 +45,7 @@ public sealed class RegistryEndToEndTests(PostgresFixture fixture) : Integration
                 new Note
                 {
                     Id = Guid.NewGuid(),
+                    TenantId = Guid.NewGuid(),
                     CreatedAt = DateTimeOffset.UtcNow.AddDays(-1),
                     Body = "two",
                 }
@@ -71,6 +73,7 @@ public sealed class RegistryEndToEndTests(PostgresFixture fixture) : Integration
                 kvp.Key == typeof(Note)
                 && kvp.Value.Category == "short-lived"
                 && kvp.Value.AnchorMember == nameof(Note.CreatedAt)
+                && kvp.Value.Tenant != null
                 && kvp.Value.EntityType == typeof(Note)
             );
         entries.Values.Should().NotContain(e => e.Category == "long-lived");

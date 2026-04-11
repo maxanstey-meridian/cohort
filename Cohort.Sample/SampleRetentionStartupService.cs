@@ -5,7 +5,8 @@ namespace Cohort.Sample;
 
 public sealed class SampleRetentionStartupService(
     RetentionRegistry registry,
-    RetentionStartupValidator validator
+    RetentionStartupValidator validator,
+    RetentionSweepEngine sweepEngine
 )
 {
     public async Task<IReadOnlyDictionary<Type, RetentionEntry>> RunAsync(
@@ -14,5 +15,15 @@ public sealed class SampleRetentionStartupService(
     {
         await validator.ValidateAsync(ct);
         return registry.Scan();
+    }
+
+    public async Task<RetentionSweepResult> RunSweepAsync(
+        TenantContext tenant,
+        DateTimeOffset now,
+        CancellationToken ct = default
+    )
+    {
+        await validator.ValidateAsync(ct);
+        return await sweepEngine.SweepAsync(tenant, now, ct);
     }
 }

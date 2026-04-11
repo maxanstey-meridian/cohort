@@ -1,4 +1,5 @@
 using Cohort.Application;
+using Cohort.Infrastructure.Sweep;
 using Cohort.Sample;
 
 using Microsoft.EntityFrameworkCore;
@@ -25,8 +26,10 @@ builder.Services.AddDbContext<SampleDbContext>(
 builder.Services.AddScoped<DbContext>(sp => sp.GetRequiredService<SampleDbContext>());
 
 builder.Services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+builder.Services.AddScoped<IRetentionSweepStrategy, PurgeSweepStrategy>();
 builder.Services.AddScoped<RetentionRegistry>();
 builder.Services.AddScoped<RetentionStartupValidator>();
+builder.Services.AddScoped<RetentionSweepEngine>();
 builder.Services.AddScoped<SampleRetentionStartupService>();
 
 var host = builder.Build();

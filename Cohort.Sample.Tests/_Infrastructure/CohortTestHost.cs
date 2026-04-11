@@ -1,4 +1,6 @@
 using Cohort.Application;
+using Cohort.Domain;
+using Cohort.Infrastructure.Sweep;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -35,6 +37,17 @@ public sealed class CohortTestHost(
         return await startup.RunAsync(ct);
     }
 
+    public async Task<RetentionSweepResult> RunSweepAsync(
+        TenantContext tenant,
+        DateTimeOffset now,
+        CancellationToken ct = default
+    )
+    {
+        await using var scope = _services.CreateAsyncScope();
+        var startup = scope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
+        return await startup.RunSweepAsync(tenant, now, ct);
+    }
+
     public void Dispose()
     {
         _services.Dispose();
@@ -49,8 +62,10 @@ public sealed class CohortTestHost(
 
         services.AddDbContext<SampleDbContext>(options => options.UseNpgsql(connectionString));
         services.AddScoped<DbContext>(sp => sp.GetRequiredService<SampleDbContext>());
+        services.AddScoped<IRetentionSweepStrategy, PurgeSweepStrategy>();
         services.AddScoped<RetentionRegistry>();
         services.AddScoped<RetentionStartupValidator>();
+        services.AddScoped<RetentionSweepEngine>();
         services.AddScoped<SampleRetentionStartupService>();
         services.AddSingleton<IRetentionCategoryRepository>(
             categoryRepository ?? new SampleCategoryRepository()

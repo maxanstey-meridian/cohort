@@ -38,7 +38,7 @@ var registry = new RetentionRegistry(db);
 var entries = registry.Scan();
 
 logger.LogInformation("Found {Count} retention entries", entries.Count);
-foreach (var entry in entries)
+foreach (var entry in entries.Values)
 {
     logger.LogInformation(
         "  {EntityType} → table={Table} category={Category} anchor={Anchor}",

@@ -53,7 +53,7 @@ public sealed class RegistryEndToEndTests(PostgresFixture fixture) : Integration
         }
 
         // Act — run the registry against the same real DbContext
-        IReadOnlyList<RetentionEntry> entries;
+        IReadOnlyDictionary<Type, RetentionEntry> entries;
         await using (var db = Host.CreateDbContext())
         {
             entries = new RetentionRegistry(db).Scan();
@@ -62,12 +62,13 @@ public sealed class RegistryEndToEndTests(PostgresFixture fixture) : Integration
         // Assert — positive AND negative
         entries
             .Should()
-            .ContainSingle(e =>
-                e.Category == "short-lived"
-                && e.AnchorMember == nameof(Note.CreatedAt)
-                && e.EntityType == typeof(Note)
+            .ContainSingle(kvp =>
+                kvp.Key == typeof(Note)
+                && kvp.Value.Category == "short-lived"
+                && kvp.Value.AnchorMember == nameof(Note.CreatedAt)
+                && kvp.Value.EntityType == typeof(Note)
             );
-        entries.Should().NotContain(e => e.Category == "long-lived");
+        entries.Values.Should().NotContain(e => e.Category == "long-lived");
 
         // Sanity — the rows we seeded actually landed in Postgres, not just in
         // the EF model. Catches the "test passed but the writes were silently

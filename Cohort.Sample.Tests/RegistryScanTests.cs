@@ -1,4 +1,5 @@
 using Cohort.Application;
+using Cohort.Domain;
 using Cohort.Sample.Entities;
 
 using Microsoft.EntityFrameworkCore;
@@ -38,14 +39,101 @@ public sealed class RegistryScanTests
         // Positive — the one annotated entity is found, with the right shape
         entries
             .Should()
-            .ContainSingle(e =>
-                e.Category == "short-lived"
-                && e.AnchorMember == nameof(Note.CreatedAt)
-                && e.EntityType == typeof(Note)
+            .ContainSingle(kvp =>
+                kvp.Key == typeof(Note)
+                && kvp.Value.Category == "short-lived"
+                && kvp.Value.AnchorMember == nameof(Note.CreatedAt)
+                && kvp.Value.EntityType == typeof(Note)
             );
 
         // Negative — nothing else sneaks in
-        entries.Should().NotContain(e => e.Category == "long-lived");
+        entries.Values.Should().NotContain(e => e.Category == "long-lived");
         entries.Should().HaveCount(1);
+    }
+
+    [Fact]
+    public void Scan_Derives_Anchor_And_Anonymise_Columns_From_Ef_Model_Metadata()
+    {
+        var options = new DbContextOptionsBuilder<RegistryMetadataDbContext>()
+            .UseInMemoryDatabase($"registry-metadata-{Guid.NewGuid()}")
+            .Options;
+        using var db = new RegistryMetadataDbContext(options);
+
+        var entry = new RetentionRegistry(db).Scan()[typeof(RetentionReadyRecord)];
+
+        entry.AnchorMember.Should().Be(nameof(RetentionReadyRecord.RetainedAt));
+        entry.AnchorColumn.Should().Be("retained_at_utc");
+        entry.AnonymiseFields.Should().ContainSingle();
+        entry.AnonymiseFields[0].Should().Be(
+            new AnonymiseField(
+                nameof(RetentionReadyRecord.EmailAddress),
+                "email_address",
+                AnonymiseMethod.FixedLiteral,
+                "[redacted]"
+            )
+        );
+    }
+
+    [Fact]
+    public void Scan_Captures_Soft_Delete_Convention_Metadata()
+    {
+        var options = new DbContextOptionsBuilder<RegistryMetadataDbContext>()
+            .UseInMemoryDatabase($"registry-soft-delete-{Guid.NewGuid()}")
+            .Options;
+        using var db = new RegistryMetadataDbContext(options);
+
+        var entry = new RetentionRegistry(db).Scan()[typeof(RetentionReadyRecord)];
+
+        entry.SoftDelete.Should().NotBeNull();
+        entry.SoftDelete!.IsDeletedMember.Should().Be(nameof(RetentionReadyRecord.IsDeleted));
+        entry.SoftDelete.IsDeletedColumn.Should().Be("is_deleted");
+        entry.SoftDelete.DeletedAtMember.Should().Be(nameof(RetentionReadyRecord.DeletedAt));
+        entry.SoftDelete.DeletedAtColumn.Should().Be("deleted_at_utc");
+    }
+
+    [Fact]
+    public void Scan_Caches_The_Immutable_Lookup_Per_Registry_Instance()
+    {
+        var options = new DbContextOptionsBuilder<RegistryMetadataDbContext>()
+            .UseInMemoryDatabase($"registry-cache-{Guid.NewGuid()}")
+            .Options;
+        using var db = new RegistryMetadataDbContext(options);
+        var registry = new RetentionRegistry(db);
+
+        var firstScan = registry.Scan();
+        var secondScan = registry.Scan();
+
+        secondScan.Should().BeSameAs(firstScan);
+        secondScan.Should().ContainKey(typeof(RetentionReadyRecord));
+    }
+
+    [Retain("long-lived", nameof(RetentionReadyRecord.RetainedAt))]
+    private sealed class RetentionReadyRecord
+    {
+        public Guid Id { get; init; }
+        public DateTimeOffset RetainedAt { get; init; }
+
+        [Anonymise(AnonymiseMethod.FixedLiteral, "[redacted]")]
+        public string EmailAddress { get; init; } = "";
+
+        public bool IsDeleted { get; init; }
+        public DateTimeOffset? DeletedAt { get; init; }
+    }
+
+    private sealed class RegistryMetadataDbContext(DbContextOptions<RegistryMetadataDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<RetentionReadyRecord>(entity =>
+            {
+                entity.ToTable("retention_ready_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.RetainedAt).HasColumnName("retained_at_utc");
+                entity.Property(record => record.EmailAddress).HasColumnName("email_address");
+                entity.Property(record => record.IsDeleted).HasColumnName("is_deleted");
+                entity.Property(record => record.DeletedAt).HasColumnName("deleted_at_utc");
+            });
+        }
     }
 }

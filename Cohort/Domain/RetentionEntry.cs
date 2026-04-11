@@ -4,5 +4,15 @@ public sealed record RetentionEntry(
     Type EntityType,
     string TableName,
     string Category,
-    string AnchorMember
+    string AnchorMember,
+    string AnchorColumn,
+    IReadOnlyList<AnonymiseField> AnonymiseFields,
+    SoftDeleteConvention? SoftDelete
+);
+
+public sealed record SoftDeleteConvention(
+    string IsDeletedMember,
+    string IsDeletedColumn,
+    string? DeletedAtMember,
+    string? DeletedAtColumn
 );

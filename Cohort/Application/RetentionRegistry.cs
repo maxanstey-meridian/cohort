@@ -1,13 +1,11 @@
-using System.Reflection;
-
-using Cohort.Domain;
+using System.Collections.Frozen;
 
 using Microsoft.EntityFrameworkCore;
 
 namespace Cohort.Application;
 
 /// Walks an EF Core model, reads `[Retain]` attributes, validates anchors, and returns
-/// an immutable list of `RetentionEntry` records.
+/// an immutable lookup of `RetentionEntry` records keyed by CLR type.
 ///
 /// Takes `DbContext` as a port-shaped dependency: it's the host's "here is my model"
 /// contract. The registry never touches `DbSet`, never issues SQL — it only reads
@@ -17,53 +15,16 @@ namespace Cohort.Application;
 /// Multi-error aggregation via `RetentionConfigurationException` is Milestone A.
 public sealed class RetentionRegistry(DbContext db)
 {
-    private static readonly Type[] AllowedAnchorTypes =
-    [
-        typeof(DateTime),
-        typeof(DateTime?),
-        typeof(DateTimeOffset),
-        typeof(DateTimeOffset?),
-    ];
+    private readonly RetentionEntryBuilder entryBuilder = new();
+    private FrozenDictionary<Type, Domain.RetentionEntry>? cachedEntries;
 
-    public IReadOnlyList<RetentionEntry> Scan()
+    public IReadOnlyDictionary<Type, Domain.RetentionEntry> Scan()
     {
-        var entries = new List<RetentionEntry>();
-
-        foreach (var entityType in db.Model.GetEntityTypes())
-        {
-            var clrType = entityType.ClrType;
-            var retain = clrType.GetCustomAttribute<RetainAttribute>(inherit: false);
-            if (retain is null)
-            {
-                continue;
-            }
-
-            var anchor = clrType.GetProperty(
-                retain.AnchorMember,
-                BindingFlags.Public | BindingFlags.Instance
-            );
-            if (anchor is null)
-            {
-                throw new InvalidOperationException(
-                    $"[Retain] on {clrType.FullName}: anchor member '{retain.AnchorMember}' not found as a public instance property."
-                );
-            }
-            if (!AllowedAnchorTypes.Contains(anchor.PropertyType))
-            {
-                throw new InvalidOperationException(
-                    $"[Retain] on {clrType.FullName}: anchor '{retain.AnchorMember}' must be DateTime or DateTimeOffset (nullable allowed), got {anchor.PropertyType.Name}."
-                );
-            }
-
-            var tableName =
-                entityType.GetTableName()
-                ?? throw new InvalidOperationException(
-                    $"[Retain] on {clrType.FullName}: EF entity has no mapped table name."
-                );
-
-            entries.Add(new RetentionEntry(clrType, tableName, retain.Category, retain.AnchorMember));
-        }
-
-        return entries;
+        return cachedEntries ??= db
+            .Model.GetEntityTypes()
+            .Select(entityType => entryBuilder.TryBuild(entityType))
+            .Where(entry => entry is not null)
+            .Cast<Domain.RetentionEntry>()
+            .ToFrozenDictionary(entry => entry.EntityType);
     }
 }

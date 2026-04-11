@@ -309,6 +309,53 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
+    public async Task Startup_Service_Validates_Before_Sweeping_Retained_Entities()
+    {
+        var options = new DbContextOptionsBuilder<BrokenAnnotationDbContext>()
+            .UseInMemoryDatabase($"startup-service-sweep-invalid-anchor-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new BrokenAnnotationDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["broken-sample"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                ),
+            }
+        );
+        var startup = new SampleRetentionStartupService(
+            new RetentionRegistry(db),
+            new RetentionStartupValidator(db, repository),
+            new RetentionSweepEngine(
+                db,
+                new RetentionRegistry(db),
+                repository,
+                new PurgeSweepStrategy()
+            ),
+            new RetentionPreviewService(
+                db,
+                new RetentionRegistry(db),
+                repository
+            )
+        );
+
+        var act = async () =>
+            await startup.RunSweepAsync(
+                new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
+                DateTimeOffset.UtcNow
+            );
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"[Retain] on {typeof(BrokenAnnotationEntity).FullName}: anchor '{nameof(BrokenAnnotationEntity.Body)}' must be DateTime or DateTimeOffset (nullable allowed), got String."
+            );
+    }
+
+    [Fact]
     public async Task ValidateAsync_Rejects_Invalid_Tenant_Metadata()
     {
         var options = new DbContextOptionsBuilder<InvalidTenantDbContext>()

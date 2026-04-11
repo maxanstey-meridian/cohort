@@ -135,6 +135,70 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
         noteBodies.Should().Equal("preview-exempt-note");
     }
 
+    [Fact]
+    public async Task Preview_Path_Uses_The_Greater_Of_Period_And_Legal_Min_Without_Deleting_Rows()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-45),
+                    Body = "preview-keep-legal-min",
+                },
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "preview-count-legal-min",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var previewHost = new CohortTestHost(
+            GetConnectionString(),
+            new StaticCategoryRepository(
+                new Dictionary<string, IRetentionRuleResolver>
+                {
+                    ["short-lived"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(
+                            TimeSpan.FromDays(30),
+                            Strategy.Purge,
+                            TimeSpan.FromDays(90)
+                        )
+                    ),
+                }
+            )
+        );
+
+        var result = await previewHost.RunPreviewAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        result.Counts.Should().ContainSingle();
+        result.Counts[0].Should().Be(
+            new EntitySweepCount(
+                typeof(Note),
+                "short-lived",
+                tenantId,
+                Strategy.Purge,
+                1
+            )
+        );
+
+        await using var verify = Host.CreateDbContext();
+        var noteBodies = await verify.Notes.OrderBy(note => note.Body).Select(note => note.Body).ToListAsync();
+        noteBodies.Should().Equal("preview-count-legal-min", "preview-keep-legal-min");
+    }
+
     private sealed class StaticCategoryRepository(
         IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
     ) : IRetentionCategoryRepository

@@ -86,6 +86,7 @@ public sealed class RetentionSweepEngine(
             foreach (var (entry, context, rule) in executionPlan)
             {
                 var eventAt = DateTimeOffset.UtcNow;
+                var resolvedPeriod = CutoffCalculator.ResolveEffectivePeriod(rule.Period, rule.LegalMin);
                 var execution = rule.Strategy switch
                 {
                     Strategy.Exempt => new SweepExecutionResult([], 0),
@@ -114,7 +115,7 @@ public sealed class RetentionSweepEngine(
                         entry.Category,
                         tenant.Id,
                         rule.Strategy,
-                        rule.Period,
+                        resolvedPeriod,
                         execution.AffectedRecordIds.Count,
                         execution.HeldCount
                     ),

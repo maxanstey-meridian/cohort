@@ -255,7 +255,8 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
                 }
-            )
+            ),
+            new NoOpHoldsRepository()
         );
 
         var act = () =>
@@ -280,6 +281,29 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
         {
             resolvers.TryGetValue(category, out var resolver);
             return Task.FromResult(resolver);
+        }
+    }
+
+    private sealed class NoOpHoldsRepository : IRetentionHoldsRepository
+    {
+        public Task CreateAsync(RetentionHoldRequest request, CancellationToken ct) => Task.CompletedTask;
+
+        public Task RemoveAsync(Guid holdId, DateTimeOffset removedAt, CancellationToken ct) => Task.CompletedTask;
+
+        public Task<IReadOnlyList<RetentionHold>> ListActiveAsync(DateTimeOffset asOf, CancellationToken ct)
+        {
+            return Task.FromResult<IReadOnlyList<RetentionHold>>([]);
+        }
+
+        public Task<bool> HasActiveHoldAsync(
+            string tableName,
+            Guid recordId,
+            Guid tenantId,
+            DateTimeOffset asOf,
+            CancellationToken ct
+        )
+        {
+            return Task.FromResult(false);
         }
     }
 }

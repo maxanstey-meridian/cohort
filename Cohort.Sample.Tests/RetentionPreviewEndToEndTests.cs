@@ -3,6 +3,7 @@ using Cohort.Domain;
 using Cohort.Sample.Entities;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Sample.Tests;
 
@@ -456,6 +457,143 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
                 Notes = "preview-ignore-other-tenant",
             }
         );
+    }
+
+    [Fact]
+    public async Task Preview_Path_Excludes_Active_Holds_From_Candidate_Counts()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var heldNoteId = Guid.NewGuid();
+        var heldSoftDeleteId = Guid.NewGuid();
+        var heldAnonymisedContactId = Guid.NewGuid();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "preview-unheld-note",
+                },
+                new Note
+                {
+                    Id = heldNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "preview-held-note",
+                }
+            );
+            db.SoftDeleteRecords.AddRange(
+                new SoftDeleteRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "preview-unheld-soft-delete",
+                    IsDeleted = false,
+                },
+                new SoftDeleteRecord
+                {
+                    Id = heldSoftDeleteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "preview-held-soft-delete",
+                    IsDeleted = false,
+                }
+            );
+            db.AnonymisedContacts.AddRange(
+                new AnonymisedContact
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    EmailAddress = "preview-unheld@example.com",
+                    GivenName = "Preview",
+                    Surname = "Unheld",
+                    Notes = "keep",
+                },
+                new AnonymisedContact
+                {
+                    Id = heldAnonymisedContactId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    EmailAddress = "preview-held@example.com",
+                    GivenName = "Preview",
+                    Surname = "Held",
+                    Notes = "keep",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        await CreateHoldAsync("notes", heldNoteId, tenantId, asOf);
+        await CreateHoldAsync("soft_delete_records", heldSoftDeleteId, tenantId, asOf);
+        await CreateHoldAsync("anonymised_contacts", heldAnonymisedContactId, tenantId, asOf);
+
+        var result = await Host.RunPreviewAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        result.Counts.Should().Contain(
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(SoftDeleteRecord),
+                "soft-delete",
+                tenantId,
+                Strategy.SoftDelete,
+                1
+            )
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(AnonymisedContact),
+                "anonymise",
+                tenantId,
+                Strategy.Anonymise,
+                1
+            )
+        );
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.OrderBy(note => note.Body).Select(note => note.Body).ToListAsync())
+            .Should()
+            .Equal("preview-held-note", "preview-unheld-note");
+        (await verify.SoftDeleteRecords.OrderBy(record => record.Body).Select(record => record.Body).ToListAsync())
+            .Should()
+            .Equal("preview-held-soft-delete", "preview-unheld-soft-delete");
+        (await verify.AnonymisedContacts.OrderBy(contact => contact.EmailAddress).Select(contact => contact.EmailAddress).ToListAsync())
+            .Should()
+            .Equal("preview-held@example.com", "preview-unheld@example.com");
+    }
+
+    private async Task CreateHoldAsync(
+        string tableName,
+        Guid recordId,
+        Guid tenantId,
+        DateTimeOffset asOf
+    )
+    {
+        await Host.RunWithServicesAsync(async services =>
+        {
+            var repository = services.GetRequiredService<IRetentionHoldsRepository>();
+            await repository.CreateAsync(
+                new RetentionHoldRequest(
+                    Guid.NewGuid(),
+                    tableName,
+                    recordId,
+                    tenantId,
+                    "preview-hold",
+                    asOf.AddDays(-1)
+                ),
+                CancellationToken.None
+            );
+        });
     }
 
     private sealed class StaticCategoryRepository(

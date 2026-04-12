@@ -11,7 +11,8 @@ namespace Cohort.Application;
 public sealed class RetentionPreviewService(
     DbContext db,
     RetentionRegistry registry,
-    IRetentionCategoryRepository categoryRepository
+    IRetentionCategoryRepository categoryRepository,
+    IRetentionHoldsRepository holdsRepository
 ) : IRetentionPreview
 {
     private static readonly MethodInfo DbContextSetMethod = typeof(DbContext)
@@ -22,10 +23,10 @@ public sealed class RetentionPreviewService(
             && method.GetParameters().Length == 0
         );
 
-    private static readonly MethodInfo CountAsyncMethod = typeof(EntityFrameworkQueryableExtensions)
+    private static readonly MethodInfo ToListAsyncMethod = typeof(EntityFrameworkQueryableExtensions)
         .GetMethods(BindingFlags.Public | BindingFlags.Static)
         .Single(method =>
-            method.Name == nameof(EntityFrameworkQueryableExtensions.CountAsync)
+            method.Name == nameof(EntityFrameworkQueryableExtensions.ToListAsync)
             && method.IsGenericMethodDefinition
             && method.GetParameters().Length == 2
             && method.GetParameters()[1].ParameterType == typeof(CancellationToken)
@@ -41,6 +42,9 @@ public sealed class RetentionPreviewService(
 
         var startedAt = DateTimeOffset.UtcNow;
         var counts = new List<EntitySweepCount>();
+        var activeHoldKeys = (await holdsRepository.ListActiveAsync(now, ct))
+            .Select(hold => new ActiveHoldKey(hold.TableName, hold.TenantId, hold.RecordId))
+            .ToHashSet();
 
         foreach (
             var entry in registry
@@ -72,9 +76,9 @@ public sealed class RetentionPreviewService(
 
             var affected = rule.Strategy switch
             {
-                Strategy.Purge => await CountCandidatesAsync(entry, rule, context, ct),
-                Strategy.Anonymise => await CountCandidatesAsync(entry, rule, context, ct),
-                Strategy.SoftDelete => await CountCandidatesAsync(entry, rule, context, ct),
+                Strategy.Purge => await CountCandidatesAsync(entry, rule, context, activeHoldKeys, ct),
+                Strategy.Anonymise => await CountCandidatesAsync(entry, rule, context, activeHoldKeys, ct),
+                Strategy.SoftDelete => await CountCandidatesAsync(entry, rule, context, activeHoldKeys, ct),
                 Strategy.Exempt => 0,
                 _ => throw new UnreachableException(
                     "Preview execution should only contain supported strategies."
@@ -99,6 +103,7 @@ public sealed class RetentionPreviewService(
         RetentionEntry entry,
         RetentionRule rule,
         RetentionResolutionContext context,
+        HashSet<ActiveHoldKey> activeHoldKeys,
         CancellationToken ct
     )
     {
@@ -126,6 +131,7 @@ public sealed class RetentionPreviewService(
         var predicate = BuildEligibilityPredicate(
             entry.EntityType,
             entry.AnchorMember,
+            entry.RecordId.RecordIdMember,
             tenant.TenantMember,
             context.Tenant.Id,
             CutoffCalculator.Compute(context.Now, rule.Period, rule.LegalMin),
@@ -140,11 +146,29 @@ public sealed class RetentionPreviewService(
                 predicate
             )
         );
+        var selector = BuildRecordIdSelector(entry.EntityType, entry.RecordId.RecordIdMember);
+        var projected = filtered.Provider.CreateQuery(
+            Expression.Call(
+                typeof(Queryable),
+                nameof(Queryable.Select),
+                [entry.EntityType, typeof(Guid)],
+                filtered.Expression,
+                selector
+            )
+        );
 
-        var countTask = (Task<int>)
-            CountAsyncMethod.MakeGenericMethod(entry.EntityType).Invoke(null, [filtered, ct])!;
+        var candidateTask = (Task<List<Guid>>)
+            ToListAsyncMethod.MakeGenericMethod(typeof(Guid)).Invoke(null, [projected, ct])!;
+        var candidateRecordIds = await candidateTask;
 
-        return await countTask;
+        if (activeHoldKeys.Count == 0)
+        {
+            return candidateRecordIds.Count;
+        }
+
+        return candidateRecordIds.Count(recordId =>
+            !activeHoldKeys.Contains(new ActiveHoldKey(entry.TableName, context.Tenant.Id, recordId))
+        );
     }
 
     private static string GetSoftDeleteEligibilityMember(RetentionEntry entry)
@@ -171,6 +195,7 @@ public sealed class RetentionPreviewService(
     private static LambdaExpression BuildEligibilityPredicate(
         Type entityType,
         string anchorMember,
+        string recordIdMember,
         string tenantMember,
         Guid tenantId,
         DateTimeOffset cutoff,
@@ -180,6 +205,7 @@ public sealed class RetentionPreviewService(
         var entity = Expression.Parameter(entityType, "entity");
         var tenantAccess = Expression.Property(entity, tenantMember);
         var anchorAccess = Expression.Property(entity, anchorMember);
+        EnsureRecordIdIsGuid(entityType, recordIdMember);
 
         var tenantPredicate = Expression.Equal(
             tenantAccess,
@@ -200,6 +226,31 @@ public sealed class RetentionPreviewService(
         }
 
         return Expression.Lambda(predicate, entity);
+    }
+
+    private static LambdaExpression BuildRecordIdSelector(Type entityType, string recordIdMember)
+    {
+        EnsureRecordIdIsGuid(entityType, recordIdMember);
+
+        var entity = Expression.Parameter(entityType, "entity");
+        var recordIdAccess = Expression.Property(entity, recordIdMember);
+
+        return Expression.Lambda(recordIdAccess, entity);
+    }
+
+    private static void EnsureRecordIdIsGuid(Type entityType, string recordIdMember)
+    {
+        var recordIdProperty = entityType.GetProperty(
+            recordIdMember,
+            BindingFlags.Public | BindingFlags.Instance
+        );
+
+        if (recordIdProperty?.PropertyType != typeof(Guid))
+        {
+            throw new InvalidOperationException(
+                $"Retention entry for {entityType.FullName} must expose a public Guid {recordIdMember} property for retention previews."
+            );
+        }
     }
 
     private static Expression CreateCutoffPredicate(
@@ -243,4 +294,6 @@ public sealed class RetentionPreviewService(
             $"Anchor member '{anchorAccess.Member.Name}' must be DateTime or DateTimeOffset (nullable allowed), got {anchorAccess.Type.Name}."
         );
     }
+
+    private readonly record struct ActiveHoldKey(string TableName, Guid TenantId, Guid RecordId);
 }

@@ -373,6 +373,68 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
             .Be("held@example.com");
     }
 
+    [Fact]
+    public async Task Sweep_Audit_Persists_The_Effective_Resolved_Period_When_Legal_Min_Exceeds_The_Base_Period()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "audit-effective-period-note",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var auditHost = new CohortTestHost(
+            GetConnectionString(),
+            new StaticCategoryRepository(
+                new Dictionary<string, IRetentionRuleResolver>
+                {
+                    ["short-lived"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(
+                            TimeSpan.FromDays(30),
+                            Strategy.Purge,
+                            TimeSpan.FromDays(90)
+                        )
+                    ),
+                    ["soft-delete"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    ),
+                    ["anonymise"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
+                }
+            )
+        );
+
+        var result = await auditHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+        var summaries = await LoadSummariesAsync(result.SweepId);
+
+        summaries.Should().Contain(
+            new SweepRunEntitySummaryRow(
+                result.SweepId,
+                typeof(Note).FullName!,
+                "short-lived",
+                tenantId,
+                Strategy.Purge,
+                TimeSpan.FromDays(90),
+                1,
+                0
+            )
+        );
+    }
+
     private async Task CreateHoldAsync(
         string tableName,
         Guid recordId,

@@ -442,6 +442,71 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         }
     }
 
+    [Fact]
+    public async Task Erasure_Audit_Persists_The_Effective_Resolved_Period_When_Legal_Min_Exceeds_The_Base_Period()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "erasure-effective-period-note",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var erasureHost = new CohortTestHost(
+            GetConnectionString(),
+            new StaticCategoryRepository(
+                new Dictionary<string, IRetentionRuleResolver>
+                {
+                    ["short-lived"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(
+                            TimeSpan.FromDays(30),
+                            Strategy.Purge,
+                            TimeSpan.FromDays(90)
+                        )
+                    ),
+                    ["soft-delete"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    ),
+                    ["anonymise"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
+                }
+            )
+        );
+
+        var result = await erasureHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
+            asOf
+        );
+        var summaries = await LoadSummariesAsync(result.SweepId);
+
+        summaries.Should().Contain(
+            new SweepRunEntitySummaryRow(
+                result.SweepId,
+                typeof(Note).FullName!,
+                "short-lived",
+                tenantId,
+                Strategy.Purge,
+                TimeSpan.FromDays(90),
+                1,
+                0
+            )
+        );
+    }
+
     private async Task CreateHoldAsync(
         string tableName,
         Guid recordId,

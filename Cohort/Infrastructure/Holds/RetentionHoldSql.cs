@@ -14,7 +14,7 @@ internal static class RetentionHoldSql
                 SELECT 1
                 FROM {QuoteIdentifier(TableName)} AS hold
                 WHERE hold."TableName" = @holdTableName
-                  AND hold."RecordId" = {targetAlias}.{QuoteIdentifier(recordIdColumn)}
+                  AND hold."RecordId" = CAST({targetAlias}.{QuoteIdentifier(recordIdColumn)} AS text)
                   AND hold."TenantId" = @tenantId
                   AND hold."CreatedAt" <= @holdAsOf
                   AND (hold."ExpiresAt" IS NULL OR hold."ExpiresAt" > @holdAsOf)

@@ -586,7 +586,7 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
                 new RetentionHoldRequest(
                     Guid.NewGuid(),
                     tableName,
-                    recordId,
+                    recordId.ToString(),
                     tenantId,
                     "preview-hold",
                     asOf.AddDays(-1)

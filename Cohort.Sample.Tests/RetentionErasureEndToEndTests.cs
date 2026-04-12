@@ -281,7 +281,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             new SweepRunRowDetailRow(
                 result.SweepId,
                 typeof(Note).FullName!,
-                noteId,
+                noteId.ToString(),
                 "short-lived",
                 Strategy.Purge,
                 tenantId
@@ -521,7 +521,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                 new RetentionHoldRequest(
                     Guid.NewGuid(),
                     tableName,
-                    recordId,
+                    recordId.ToString(),
                     tenantId,
                     "erasure-hold",
                     asOf.AddDays(-1)
@@ -610,7 +610,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                 new SweepRunRowDetailRow(
                     reader.GetGuid(0),
                     reader.GetString(1),
-                    reader.GetGuid(2),
+                    reader.GetString(2),
                     reader.GetString(3),
                     (Strategy)reader.GetInt32(4),
                     reader.GetGuid(5)
@@ -679,7 +679,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     private sealed record SweepRunRowDetailRow(
         Guid SweepId,
         string EntityType,
-        Guid EntityId,
+        string EntityId,
         string Category,
         Strategy Strategy,
         Guid TenantId

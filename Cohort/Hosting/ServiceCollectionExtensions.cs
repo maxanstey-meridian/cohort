@@ -50,7 +50,12 @@ public static class ServiceCollectionExtensions
     {
         public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
         {
-            return Task.FromResult<IRetentionRuleResolver?>(null);
+            throw new InvalidOperationException(
+                $"No IRetentionCategoryRepository has been registered. "
+                + $"Register one before calling AddCohort<TContext>() via "
+                + $"services.AddSingleton<IRetentionCategoryRepository, YourRepository>(). "
+                + $"(Attempted to resolve category '{category}'.)"
+            );
         }
     }
 }

@@ -99,7 +99,7 @@ public static class CohortModelBuilder
     {
         builder.Property<Guid>("HoldId").ValueGeneratedNever();
         builder.Property<string>("TableName").IsRequired();
-        builder.Property<Guid>("RecordId").IsRequired();
+        builder.Property<string>("RecordId").IsRequired();
         builder.Property<Guid>("TenantId").IsRequired();
         builder.Property<string>("Reason").IsRequired();
         builder.Property<DateTimeOffset>("CreatedAt").IsRequired();
@@ -142,7 +142,7 @@ public static class CohortModelBuilder
         builder.Property<Guid>("SweepId").ValueGeneratedNever();
         builder.Property<DateTimeOffset>("At").IsRequired();
         builder.Property<string>("EntityType").IsRequired();
-        builder.Property<Guid>("EntityId").IsRequired();
+        builder.Property<string>("EntityId").IsRequired();
         builder.Property<string>("Category").IsRequired();
         builder.Property<int>("Strategy").IsRequired();
         builder.Property<Guid>("TenantId").IsRequired();

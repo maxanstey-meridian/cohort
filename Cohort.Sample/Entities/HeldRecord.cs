@@ -7,7 +7,7 @@ public sealed class HeldRecord
 {
     public Guid HoldId { get; set; }
     public string TableName { get; set; } = "";
-    public Guid RecordId { get; set; }
+    public string RecordId { get; set; } = "";
     public Guid TenantId { get; set; }
     public string Reason { get; set; } = "";
     public DateTimeOffset CreatedAt { get; set; }

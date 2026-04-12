@@ -14,7 +14,8 @@ public sealed record RetentionEntry(
 
 public sealed record RecordIdConvention(
     string RecordIdMember,
-    string RecordIdColumn
+    string RecordIdColumn,
+    Type RecordIdType
 );
 
 public sealed record TenantConvention(

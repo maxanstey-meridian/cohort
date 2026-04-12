@@ -149,7 +149,7 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
             .Which.Errors[0]
             .Should()
             .Be(
-                $"Soft-delete convention on {typeof(Note).FullName}: retained SoftDelete categories require a public bool IsDeleted CLR property."
+                $"Soft-delete convention on {typeof(Note).FullName}: retained SoftDelete categories require a public bool soft-delete flag property (named IsDeleted by convention, or marked with [RetentionSoftDelete]) mapped by EF."
             );
     }
 
@@ -271,7 +271,7 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
             .Should()
             .ThrowAsync<RetentionConfigurationException>()
             .WithMessage(
-                $"*Soft-delete convention on {typeof(Note).FullName}: retained SoftDelete categories require a public bool IsDeleted CLR property.*"
+                $"*Soft-delete convention on {typeof(Note).FullName}: retained SoftDelete categories require a public bool soft-delete flag property (named IsDeleted by convention, or marked with [RetentionSoftDelete]) mapped by EF.*"
             );
     }
 
@@ -304,7 +304,7 @@ public sealed class SoftDeleteSweepStrategyCommandTests
             "soft-delete",
             nameof(SoftDeleteRecord.CreatedAt),
             "CreatedAt",
-            new RecordIdConvention(nameof(SoftDeleteRecord.Id), "Id"),
+            new RecordIdConvention(nameof(SoftDeleteRecord.Id), "Id", typeof(Guid)),
             [],
             new TenantConvention(nameof(SoftDeleteRecord.TenantId), "TenantId"),
             new SoftDeleteConvention(
@@ -366,7 +366,7 @@ public sealed class SoftDeleteSweepStrategyCommandTests
             "soft-delete",
             nameof(SoftDeleteRecord.CreatedAt),
             "CreatedAt",
-            new RecordIdConvention(nameof(SoftDeleteRecord.Id), "Id"),
+            new RecordIdConvention(nameof(SoftDeleteRecord.Id), "Id", typeof(Guid)),
             [],
             new TenantConvention(nameof(SoftDeleteRecord.TenantId), "TenantId"),
             new SoftDeleteConvention(
@@ -393,13 +393,13 @@ public sealed class SoftDeleteSweepStrategyCommandTests
             CancellationToken.None
         );
 
-        affected.AffectedRecordIds.Should().Equal(selectedId);
+        affected.AffectedRecordIds.Should().Equal(selectedId.ToString());
         affected.HeldCount.Should().Be(1);
         connection.Commands.Should().HaveCount(2);
         connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
         connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
         connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
-            new[] { selectedId, heldId }
+            new[] { selectedId.ToString(), heldId.ToString() }
         );
     }
 
@@ -419,7 +419,7 @@ public sealed class SoftDeleteSweepStrategyCommandTests
             "soft-delete",
             nameof(SoftDeleteRecord.CreatedAt),
             "CreatedAt",
-            new RecordIdConvention(nameof(SoftDeleteRecord.Id), "record_id"),
+            new RecordIdConvention(nameof(SoftDeleteRecord.Id), "record_id", typeof(Guid)),
             [],
             new TenantConvention(nameof(SoftDeleteRecord.TenantId), "TenantId"),
             new SoftDeleteConvention(
@@ -449,7 +449,7 @@ public sealed class SoftDeleteSweepStrategyCommandTests
         affected.AffectedRecordIds.Should().ContainSingle();
         affected.HeldCount.Should().Be(0);
         connection.LastCommand.Should().NotBeNull();
-        connection.LastCommand!.CommandText.Should().Contain("hold.\"RecordId\" = target.\"record_id\"");
+        connection.LastCommand!.CommandText.Should().Contain("hold.\"RecordId\" = CAST(target.\"record_id\" AS text)");
     }
 
     private sealed class RecordingDbConnection : DbConnection

@@ -149,7 +149,7 @@ public sealed class EfRetentionHoldsRepository(DbContext db) : IRetentionHoldsRe
                     new RetentionHold(
                         reader.GetGuid(0),
                         reader.GetString(1),
-                        reader.GetGuid(2),
+                        reader.GetString(2),
                         reader.GetGuid(3),
                         reader.GetString(4),
                         reader.GetFieldValue<DateTimeOffset>(5),
@@ -172,7 +172,7 @@ public sealed class EfRetentionHoldsRepository(DbContext db) : IRetentionHoldsRe
 
     public async Task<bool> HasActiveHoldAsync(
         string tableName,
-        Guid recordId,
+        string recordId,
         Guid tenantId,
         DateTimeOffset asOf,
         CancellationToken ct

@@ -3,7 +3,7 @@ namespace Cohort.Domain;
 public sealed record RetentionHoldRequest(
     Guid HoldId,
     string TableName,
-    Guid RecordId,
+    string RecordId,
     Guid TenantId,
     string Reason,
     DateTimeOffset CreatedAt,

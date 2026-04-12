@@ -51,7 +51,7 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
             "short-lived",
             nameof(PurgeCandidateRecord.CreatedAt),
             "CreatedAt",
-            new RecordIdConvention(nameof(PurgeCandidateRecord.Id), "Id"),
+            new RecordIdConvention(nameof(PurgeCandidateRecord.Id), "Id", typeof(Guid)),
             [],
             new TenantConvention(nameof(PurgeCandidateRecord.TenantId), "TenantId"),
             null
@@ -102,7 +102,7 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
             "short-lived",
             nameof(PurgeCandidateRecord.CreatedAt),
             "CreatedAt",
-            new RecordIdConvention(nameof(PurgeCandidateRecord.Id), "Id"),
+            new RecordIdConvention(nameof(PurgeCandidateRecord.Id), "Id", typeof(Guid)),
             [],
             new TenantConvention(nameof(PurgeCandidateRecord.TenantId), "TenantId"),
             null
@@ -142,7 +142,7 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
         connection.LastCommand.Parameters.Contains("holdAsOf").Should().BeTrue();
         connection.LastCommand.Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.LastCommand.Parameters["tenantId"].Value.Should().Be(tenantId);
-        connection.LastCommand.Parameters["candidateIds"].Value.Should().BeOfType<Guid[]>();
+        connection.LastCommand.Parameters["candidateIds"].Value.Should().BeOfType<string[]>();
         connection.LastCommand.Parameters["holdTableName"].Value.Should().Be("purge_candidate_records");
         connection.LastCommand.Parameters["holdAsOf"].Value.Should().Be(now);
     }
@@ -163,7 +163,7 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
             "short-lived",
             nameof(PurgeCandidateRecord.CreatedAt),
             "CreatedAt",
-            new RecordIdConvention(nameof(PurgeCandidateRecord.Id), "record_id"),
+            new RecordIdConvention(nameof(PurgeCandidateRecord.Id), "record_id", typeof(Guid)),
             [],
             new TenantConvention(nameof(PurgeCandidateRecord.TenantId), "TenantId"),
             null
@@ -188,7 +188,7 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
         affected.AffectedRecordIds.Should().ContainSingle();
         affected.HeldCount.Should().Be(0);
         connection.LastCommand.Should().NotBeNull();
-        connection.LastCommand!.CommandText.Should().Contain("hold.\"RecordId\" = target.\"record_id\"");
+        connection.LastCommand!.CommandText.Should().Contain("hold.\"RecordId\" = CAST(target.\"record_id\" AS text)");
     }
 
     [Fact]
@@ -209,7 +209,7 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
             "short-lived",
             nameof(PurgeCandidateRecord.CreatedAt),
             "CreatedAt",
-            new RecordIdConvention(nameof(PurgeCandidateRecord.Id), "Id"),
+            new RecordIdConvention(nameof(PurgeCandidateRecord.Id), "Id", typeof(Guid)),
             [],
             new TenantConvention(nameof(PurgeCandidateRecord.TenantId), "TenantId"),
             null
@@ -231,13 +231,13 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
             CancellationToken.None
         );
 
-        affected.AffectedRecordIds.Should().Equal(selectedId);
+        affected.AffectedRecordIds.Should().Equal(selectedId.ToString());
         affected.HeldCount.Should().Be(1);
         connection.Commands.Should().HaveCount(2);
         connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
         connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
         connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
-            new[] { selectedId, heldId }
+            new[] { selectedId.ToString(), heldId.ToString() }
         );
     }
 
@@ -254,7 +254,7 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
             "short-lived",
             nameof(PurgeCandidateRecord.CreatedAt),
             "CreatedAt",
-            new RecordIdConvention(nameof(PurgeCandidateRecord.Id), "Id"),
+            new RecordIdConvention(nameof(PurgeCandidateRecord.Id), "Id", typeof(Guid)),
             [],
             new TenantConvention(nameof(PurgeCandidateRecord.TenantId), "TenantId"),
             null
@@ -310,7 +310,7 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
             "short-lived",
             nameof(PurgeCandidateRecord.CreatedAt),
             "CreatedAt",
-            new RecordIdConvention(nameof(PurgeCandidateRecord.Id), "Id"),
+            new RecordIdConvention(nameof(PurgeCandidateRecord.Id), "Id", typeof(Guid)),
             [],
             new TenantConvention(nameof(PurgeCandidateRecord.TenantId), "TenantId"),
             null
@@ -328,14 +328,14 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
             CancellationToken.None
         );
 
-        affected.AffectedRecordIds.Should().Equal(selectedId);
+        affected.AffectedRecordIds.Should().Equal(selectedId.ToString());
         affected.HeldCount.Should().Be(1);
         connection.Commands.Should().HaveCount(2);
         connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
         connection.Commands[1].CommandText.Should().Contain("\"SubjectId\" = @subjectValue");
         connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
         connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
-            new[] { selectedId, heldId }
+            new[] { selectedId.ToString(), heldId.ToString() }
         );
     }
 

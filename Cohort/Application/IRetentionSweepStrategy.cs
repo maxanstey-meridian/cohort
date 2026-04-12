@@ -37,6 +37,6 @@ public interface IRetentionSweepStrategy
     );
 }
 
-public sealed record SweepExecutionResult(IReadOnlyList<Guid> AffectedRecordIds, int HeldCount);
+public sealed record SweepExecutionResult(IReadOnlyList<string> AffectedRecordIds, int HeldCount);
 
 public sealed record ErasureSubjectMatch(string SubjectMember, string SubjectColumn, object SubjectValue);

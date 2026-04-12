@@ -28,7 +28,7 @@ public abstract record SweepEvent
         Guid SweepId,
         DateTimeOffset At,
         Type EntityType,
-        Guid EntityId,
+        string EntityId,
         string Category,
         Strategy Strategy,
         Guid TenantId

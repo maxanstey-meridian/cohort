@@ -1,9 +1,184 @@
 # Cohort
 
-Annotation-driven, category-tagged retention for .NET / EF Core. A standalone library that hosts (casebridge, perch, …) consume to declare GDPR retention rules on their entities and have a sweep engine purge / soft-delete / anonymise rows past their retention period.
+Annotation-driven GDPR retention for .NET / EF Core. Declare retention rules on your entities, and Cohort sweeps rows past their retention period — purge, soft-delete, or anonymise. Postgres-only.
 
-This is the **pre-Milestone-A skeleton** — only the bare bones (`[Retain]` attribute, registry scan, static resolver, pure cutoff helper) plus the three exemplar test patterns. No sweep engine yet.
+## Quick start
 
-- **Plan: full library** — [`.plans/COHORT1.md`](.plans/COHORT1.md) (three milestones A/B/C)
-- **Plan: this skeleton** — [`.plans/COHORT0.md`](.plans/COHORT0.md)
-- **Agent instructions** — [`CLAUDE.md`](CLAUDE.md) (read before writing tests)
+### 1. Annotate your entities
+
+```csharp
+[Retain("short-lived", nameof(CreatedAt))]
+public sealed class Note
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+    public string Body { get; set; } = "";
+}
+```
+
+Unannotated entities are implicitly exempt. Use `[ExemptFromRetention("reason")]` if you want to document the exemption explicitly.
+
+### 2. Map categories to rules
+
+```csharp
+public sealed class MyCategoryRepository : IRetentionCategoryRepository
+{
+    public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+    {
+        IRetentionRuleResolver? resolver = category switch
+        {
+            "short-lived" => new StaticRetentionRuleResolver(
+                new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)),
+            "pii" => new StaticRetentionRuleResolver(
+                new RetentionRule(TimeSpan.FromDays(90), Strategy.Anonymise)),
+            _ => null,
+        };
+        return Task.FromResult(resolver);
+    }
+}
+```
+
+### 3. Wire it up
+
+```csharp
+// Register your category repository BEFORE AddCohort
+builder.Services.AddSingleton<IRetentionCategoryRepository, MyCategoryRepository>();
+builder.Services.AddSingleton(new TenantContext(tenantId, "uk", new Dictionary<string, string>()));
+builder.Services.AddCohort<MyDbContext>();
+```
+
+Call `ConfigureCohortTables()` in your `OnModelCreating` to add Cohort's infrastructure tables (`retention_holds`, `sweep_run`, etc.) to your migration history:
+
+```csharp
+protected override void OnModelCreating(ModelBuilder modelBuilder)
+{
+    // your entity config...
+    modelBuilder.ConfigureCohortTables();
+}
+```
+
+## Strategies
+
+| Strategy | Behaviour | Entity requirements |
+|---|---|---|
+| `Purge` | `DELETE` rows past cutoff | `[Retain]`, anchor property, `Id`, `TenantId` |
+| `SoftDelete` | `SET IsDeleted = true` | Above + `bool IsDeleted` property |
+| `Anonymise` | Scrub `[Anonymise]`-marked fields | Above + at least one `[Anonymise]` field |
+| `Exempt` | Skip entirely | `[ExemptFromRetention]` or no annotation |
+
+## Anonymise methods
+
+```csharp
+[Retain("pii", nameof(CreatedAt))]
+public sealed class Contact
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+
+    [Anonymise(AnonymiseMethod.Null)]
+    public string? Email { get; set; }
+
+    [Anonymise(AnonymiseMethod.EmptyString)]
+    public string Name { get; set; } = "";
+
+    [Anonymise(AnonymiseMethod.FixedLiteral, "[redacted]")]
+    public string Phone { get; set; } = "";
+}
+```
+
+## Convention overrides
+
+Property names are resolved by convention (`Id`, `TenantId`, `IsDeleted`, `DeletedAt`). Override with marker attributes when your entity uses different names:
+
+```csharp
+[Retain("orders", nameof(PlacedAt))]
+public sealed class Order
+{
+    [RetentionRecordId]
+    public Guid OrderId { get; set; }
+
+    [RetentionTenant]
+    public Guid OrganisationId { get; set; }
+
+    public DateTimeOffset PlacedAt { get; set; }
+}
+```
+
+Available markers: `[RetentionRecordId]`, `[RetentionTenant]`, `[RetentionSoftDelete]`, `[RetentionDeletedAt]`.
+
+## Right-to-erasure (Art. 17)
+
+Mark the subject identifier with `[ErasureSubject]`:
+
+```csharp
+[Retain("user-data", nameof(CreatedAt))]
+public sealed class UserRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+
+    [ErasureSubject]
+    public Guid UserId { get; set; }
+}
+```
+
+Then trigger erasure:
+
+```csharp
+var result = await erasureService.EraseAsync(tenant, new ErasureScope(userId), DateTimeOffset.UtcNow);
+```
+
+Cohort walks every entity with a matching `[ErasureSubject]` and applies the category's strategy. Held records are respected. The full sweep is audited.
+
+## Configuration
+
+```json
+{
+  "Cohort": {
+    "Schedule": "0 2 * * *",
+    "DryRun": false,
+    "KillSwitch": false,
+    "ApplyMigrations": false
+  }
+}
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `Schedule` | `null` | Cron expression (5 or 6 fields). `null` = worker disabled. |
+| `DryRun` | `false` | Run sweeps as `SELECT COUNT(*)` instead of `DELETE`/`UPDATE`. Audit events still fire. |
+| `KillSwitch` | `false` | Finish current iteration, skip all subsequent ticks. Hot-reloadable. |
+| `ApplyMigrations` | `false` | Run `MigrateAsync()` on startup. Cannot combine with `DryRun` or `KillSwitch`. |
+
+## Legal holds
+
+```csharp
+await holdsRepo.CreateAsync(new RetentionHoldRequest(
+    HoldId: Guid.NewGuid(),
+    TableName: "notes",
+    RecordId: noteId.ToString(),
+    TenantId: tenantId,
+    Reason: "Litigation hold — case #12345",
+    CreatedAt: DateTimeOffset.UtcNow,
+    ExpiresAt: DateTimeOffset.UtcNow.AddYears(1)
+));
+```
+
+Held records survive all strategies. Holds are checked at SQL level via a `NOT EXISTS` subquery — no per-row C# check.
+
+## Audit trail
+
+Every sweep writes to three tables (created by `ConfigureCohortTables()`):
+
+- `sweep_run` — one row per sweep (timestamps, trigger, dry-run flag, total affected)
+- `sweep_run_entity_summary` — per-entity counts (category, strategy, affected, held)
+- `sweep_run_row_detail` — per-row detail (opt-in via `AuditRowDetail.PerRow` on the rule)
+
+## Plans
+
+- [`.plans/COHORT1.md`](.plans/COHORT1.md) — three-milestone library plan
+- [`.plans/COHORT0.md`](.plans/COHORT0.md) — original scaffolding plan
+- [`CLAUDE.md`](CLAUDE.md) — agent instructions (read before writing tests)

@@ -84,7 +84,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
-    public async Task ValidateAsync_Rejects_Entities_Without_Retention_Or_Exemption_Metadata()
+    public async Task ValidateAsync_Passes_For_Unannotated_Entities_As_Implicitly_Exempt()
     {
         var options = new DbContextOptionsBuilder<MissingAttributeDbContext>()
             .UseInMemoryDatabase($"startup-validator-missing-attribute-{Guid.NewGuid()}")
@@ -94,15 +94,7 @@ public sealed class RetentionStartupValidatorTests
         var act = async () =>
             await new RetentionStartupValidator(db, InMemoryCategoryRepository.Empty).ValidateAsync();
 
-        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().ContainSingle();
-        exception
-            .Which.Errors[0]
-            .Should()
-            .Be(
-                $"Entity {typeof(UnannotatedRecord).FullName} must declare exactly one of [Retain] or [ExemptFromRetention]."
-            );
-        exception.Which.Message.Should().Contain(typeof(UnannotatedRecord).FullName);
+        await act.Should().NotThrowAsync();
     }
 
     [Fact]
@@ -122,7 +114,7 @@ public sealed class RetentionStartupValidatorTests
             .Which.Errors[0]
             .Should()
             .Be(
-                $"Entity {typeof(ConflictingRecord).FullName} must declare exactly one of [Retain] or [ExemptFromRetention]."
+                $"Entity {typeof(ConflictingRecord).FullName} must declare exactly one of [Retain] or [ExemptFromRetention], not both."
             );
         exception.Which.Message.Should().Contain(typeof(ConflictingRecord).FullName);
     }
@@ -208,12 +200,7 @@ public sealed class RetentionStartupValidatorTests
         var act = async () => await new RetentionStartupValidator(db, repository).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().HaveCount(3);
-        exception
-            .Which.Errors.Should()
-            .Contain(
-                $"Entity {typeof(UnannotatedRecord).FullName} must declare exactly one of [Retain] or [ExemptFromRetention]."
-            );
+        exception.Which.Errors.Should().HaveCount(2);
         exception
             .Which.Errors.Should()
             .Contain(
@@ -224,7 +211,6 @@ public sealed class RetentionStartupValidatorTests
             .Contain(
                 $"Retention category 'missing-category' for entity {typeof(MissingCategoryRecord).FullName} could not be resolved."
             );
-        exception.Which.Message.Should().Contain(typeof(UnannotatedRecord).FullName);
         exception.Which.Message.Should().Contain(typeof(BrokenAnnotationEntity).FullName);
         exception.Which.Message.Should().Contain(typeof(MissingCategoryRecord).FullName);
     }
@@ -246,19 +232,13 @@ public sealed class RetentionStartupValidatorTests
         var act = async () => await new RetentionStartupValidator(db, repository).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().HaveCount(2);
+        exception.Which.Errors.Should().ContainSingle();
         exception
             .Which.Errors.Should()
             .Contain(
                 $"Retention category 'throwing-category' for entity {typeof(ThrowingResolverRecord).FullName} failed startup validation: resolver exploded"
             );
-        exception
-            .Which.Errors.Should()
-            .Contain(
-                $"Entity {typeof(UnannotatedRecord).FullName} must declare exactly one of [Retain] or [ExemptFromRetention]."
-            );
         exception.Which.Message.Should().Contain("throwing-category");
-        exception.Which.Message.Should().Contain(typeof(UnannotatedRecord).FullName);
     }
 
     [Fact]
@@ -521,7 +501,7 @@ public sealed class RetentionStartupValidatorTests
             .Which.Errors[0]
             .Should()
             .Be(
-                $"Soft-delete convention on {typeof(InvalidSoftDeleteIsDeletedRecord).FullName}: retained SoftDelete categories require a public bool IsDeleted CLR property."
+                $"Soft-delete convention on {typeof(InvalidSoftDeleteIsDeletedRecord).FullName}: soft-delete flag 'IsDeleted' must be a public bool CLR property."
             );
     }
 
@@ -549,7 +529,7 @@ public sealed class RetentionStartupValidatorTests
             .Which.Errors[0]
             .Should()
             .Be(
-                $"Soft-delete convention on {typeof(InvalidSoftDeleteDeletedAtRecord).FullName}: DeletedAt must be DateTime or DateTimeOffset (nullable allowed), got String."
+                $"Soft-delete convention on {typeof(InvalidSoftDeleteDeletedAtRecord).FullName}: 'DeletedAt' must be DateTime or DateTimeOffset (nullable allowed), got String."
             );
     }
 
@@ -1054,12 +1034,6 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
-            modelBuilder.Entity<UnannotatedRecord>(entity =>
-            {
-                entity.ToTable("aggregate_unannotated_records");
-                entity.HasKey(record => record.Id);
-                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
-            });
             modelBuilder.Entity<BrokenAnnotationEntity>(entity =>
             {
                 entity.ToTable("aggregate_invalid_anchor_records");
@@ -1091,12 +1065,6 @@ public sealed class RetentionStartupValidatorTests
             modelBuilder.Entity<ThrowingResolverRecord>(entity =>
             {
                 entity.ToTable("throwing_resolver_records");
-                entity.HasKey(record => record.Id);
-                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
-            });
-            modelBuilder.Entity<UnannotatedRecord>(entity =>
-            {
-                entity.ToTable("throwing_resolver_unannotated_records");
                 entity.HasKey(record => record.Id);
                 entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
             });

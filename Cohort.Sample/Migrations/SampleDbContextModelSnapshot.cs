@@ -114,8 +114,9 @@ namespace Cohort.Sample.Migrations
                         .IsRequired()
                         .HasColumnType("text");
 
-                    b.Property<Guid>("RecordId")
-                        .HasColumnType("uuid");
+                    b.Property<string>("RecordId")
+                        .IsRequired()
+                        .HasColumnType("text");
 
                     b.Property<DateTimeOffset?>("RemovedAt")
                         .HasColumnType("timestamp with time zone");
@@ -263,8 +264,8 @@ namespace Cohort.Sample.Migrations
                     b.Property<string>("EntityType")
                         .HasColumnType("text");
 
-                    b.Property<Guid>("EntityId")
-                        .HasColumnType("uuid");
+                    b.Property<string>("EntityId")
+                        .HasColumnType("text");
 
                     b.Property<string>("Category")
                         .HasColumnType("text");

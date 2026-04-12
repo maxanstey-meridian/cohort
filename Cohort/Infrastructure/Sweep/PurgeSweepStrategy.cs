@@ -116,7 +116,7 @@ public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
             DELETE FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               AND target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
-              AND target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} = ANY(@candidateIds)
+              AND CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) = ANY(@candidateIds)
               AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn)}
             RETURNING target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
             """;
@@ -126,11 +126,11 @@ public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
         command.Parameters.Add(CreateParameter(command, "holdAsOf", ctx.Now));
 
-        var affectedRecordIds = new List<Guid>();
+        var affectedRecordIds = new List<string>();
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
         {
-            affectedRecordIds.Add(reader.GetGuid(0));
+            affectedRecordIds.Add(reader.GetValue(0).ToString()!);
         }
 
         return new SweepExecutionResult(
@@ -196,7 +196,7 @@ public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
             DELETE FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE target.{QuoteIdentifier(tenantConvention.TenantColumn)} = @tenantId
               AND target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
-              AND target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} = ANY(@candidateIds)
+              AND CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) = ANY(@candidateIds)
               AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn)}
             RETURNING target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
             """;
@@ -206,11 +206,11 @@ public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
         command.Parameters.Add(CreateParameter(command, "holdAsOf", now));
 
-        var affectedRecordIds = new List<Guid>();
+        var affectedRecordIds = new List<string>();
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
         {
-            affectedRecordIds.Add(reader.GetGuid(0));
+            affectedRecordIds.Add(reader.GetValue(0).ToString()!);
         }
 
         return new SweepExecutionResult(
@@ -219,7 +219,7 @@ public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
         );
     }
 
-    private static async Task<IReadOnlyList<Guid>> SelectCandidateRecordIdsAsync(
+    private static async Task<IReadOnlyList<string>> SelectCandidateRecordIdsAsync(
         RetentionEntry entry,
         TenantConvention tenant,
         RetentionResolutionContext ctx,
@@ -242,17 +242,17 @@ public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
 
-        var candidateRecordIds = new List<Guid>();
+        var candidateRecordIds = new List<string>();
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
         {
-            candidateRecordIds.Add(reader.GetGuid(0));
+            candidateRecordIds.Add(reader.GetValue(0).ToString()!);
         }
 
         return candidateRecordIds;
     }
 
-    private static async Task<IReadOnlyList<Guid>> SelectErasureCandidateRecordIdsAsync(
+    private static async Task<IReadOnlyList<string>> SelectErasureCandidateRecordIdsAsync(
         RetentionEntry entry,
         TenantConvention tenant,
         ErasureSubjectMatch match,
@@ -275,11 +275,11 @@ public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
         command.Parameters.Add(CreateParameter(command, "tenantId", erasureTenant.Id));
         command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
 
-        var candidateRecordIds = new List<Guid>();
+        var candidateRecordIds = new List<string>();
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
         {
-            candidateRecordIds.Add(reader.GetGuid(0));
+            candidateRecordIds.Add(reader.GetValue(0).ToString()!);
         }
 
         return candidateRecordIds;

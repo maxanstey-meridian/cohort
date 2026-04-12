@@ -12,7 +12,7 @@ public interface IRetentionHoldsRepository
 
     public Task<bool> HasActiveHoldAsync(
         string tableName,
-        Guid recordId,
+        string recordId,
         Guid tenantId,
         DateTimeOffset asOf,
         CancellationToken ct

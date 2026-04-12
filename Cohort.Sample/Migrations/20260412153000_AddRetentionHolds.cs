@@ -21,7 +21,7 @@ namespace Cohort.Sample.Migrations
                 {
                     HoldId = table.Column<Guid>(type: "uuid", nullable: false),
                     TableName = table.Column<string>(type: "text", nullable: false),
-                    RecordId = table.Column<Guid>(type: "uuid", nullable: false),
+                    RecordId = table.Column<string>(type: "text", nullable: false),
                     TenantId = table.Column<Guid>(type: "uuid", nullable: false),
                     Reason = table.Column<string>(type: "text", nullable: false),
                     CreatedAt = table.Column<DateTimeOffset>(

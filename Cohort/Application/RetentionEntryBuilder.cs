@@ -88,27 +88,30 @@ public sealed class RetentionEntryBuilder
     )
     {
         var clrType = entityType.ClrType;
-        var recordIdMember = clrType.GetProperty("Id", BindingFlags.Public | BindingFlags.Instance);
-        if (recordIdMember is null || (recordIdMember.PropertyType != typeof(Guid) && recordIdMember.PropertyType != typeof(Guid?)))
+        var recordIdMember = clrType
+                .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(p => p.GetCustomAttribute<RetentionRecordIdAttribute>() is not null)
+            ?? clrType.GetProperty("Id", BindingFlags.Public | BindingFlags.Instance);
+        if (recordIdMember is null)
         {
             throw new InvalidOperationException(
-                $"Record-id convention on {clrType.FullName}: Id must be Guid or nullable Guid to support legal holds, got {recordIdMember?.PropertyType.Name ?? "<missing>"}."
+                $"Record-id convention on {clrType.FullName}: no public Id property found and no property marked with [RetentionRecordId]."
             );
         }
 
         var recordIdProperty =
             entityType.FindProperty(recordIdMember.Name)
             ?? throw new InvalidOperationException(
-                $"Record-id convention on {clrType.FullName}: Id is not mapped by EF."
+                $"Record-id convention on {clrType.FullName}: '{recordIdMember.Name}' is not mapped by EF."
             );
 
         var recordIdColumn =
             recordIdProperty.GetColumnName(storeObject)
             ?? throw new InvalidOperationException(
-                $"Record-id convention on {clrType.FullName}: Id has no mapped table column."
+                $"Record-id convention on {clrType.FullName}: '{recordIdMember.Name}' has no mapped table column."
             );
 
-        return new RecordIdConvention(recordIdProperty.Name, recordIdColumn);
+        return new RecordIdConvention(recordIdProperty.Name, recordIdColumn, recordIdMember.PropertyType);
     }
 
     private static IReadOnlyList<AnonymiseField> BuildAnonymiseFields(
@@ -151,7 +154,10 @@ public sealed class RetentionEntryBuilder
     )
     {
         var clrType = entityType.ClrType;
-        var tenantMember = clrType.GetProperty("TenantId", BindingFlags.Public | BindingFlags.Instance);
+        var tenantMember = clrType
+                .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(p => p.GetCustomAttribute<RetentionTenantAttribute>() is not null)
+            ?? clrType.GetProperty("TenantId", BindingFlags.Public | BindingFlags.Instance);
         if (tenantMember is null)
         {
             return null;
@@ -185,7 +191,10 @@ public sealed class RetentionEntryBuilder
     )
     {
         var clrType = entityType.ClrType;
-        var isDeletedMember = clrType.GetProperty("IsDeleted", BindingFlags.Public | BindingFlags.Instance);
+        var isDeletedMember = clrType
+                .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(p => p.GetCustomAttribute<RetentionSoftDeleteAttribute>() is not null)
+            ?? clrType.GetProperty("IsDeleted", BindingFlags.Public | BindingFlags.Instance);
         if (isDeletedMember is null)
         {
             return null;
@@ -203,7 +212,10 @@ public sealed class RetentionEntryBuilder
                 $"Soft-delete convention on {clrType.FullName}: IsDeleted has no mapped table column."
             );
 
-        var deletedAtMember = clrType.GetProperty("DeletedAt", BindingFlags.Public | BindingFlags.Instance);
+        var deletedAtMember = clrType
+                .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(p => p.GetCustomAttribute<RetentionDeletedAtAttribute>() is not null)
+            ?? clrType.GetProperty("DeletedAt", BindingFlags.Public | BindingFlags.Instance);
         var deletedAtProperty =
             deletedAtMember is null
                 ? null

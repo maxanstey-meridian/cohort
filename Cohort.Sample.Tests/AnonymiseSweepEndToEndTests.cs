@@ -307,7 +307,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "anonymise",
             nameof(AnonymisedContact.CreatedAt),
             "CreatedAt",
-            new RecordIdConvention(nameof(AnonymisedContact.Id), "Id"),
+            new RecordIdConvention(nameof(AnonymisedContact.Id), "Id", typeof(Guid)),
             [
                 new AnonymiseField(nameof(AnonymisedContact.EmailAddress), "EmailAddress", AnonymiseMethod.Null),
                 new AnonymiseField(nameof(AnonymisedContact.GivenName), "GivenName", AnonymiseMethod.EmptyString),
@@ -370,7 +370,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "anonymise",
             nameof(AnonymisedContact.CreatedAt),
             "CreatedAt",
-            new RecordIdConvention(nameof(AnonymisedContact.Id), "Id"),
+            new RecordIdConvention(nameof(AnonymisedContact.Id), "Id", typeof(Guid)),
             [
                 new AnonymiseField(nameof(AnonymisedContact.EmailAddress), "EmailAddress", AnonymiseMethod.Null),
                 new AnonymiseField(nameof(AnonymisedContact.GivenName), "GivenName", AnonymiseMethod.EmptyString),
@@ -428,7 +428,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
         connection.LastCommand.Parameters["value2"].Value.Should().Be("[redacted]");
         connection.LastCommand.Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.LastCommand.Parameters["tenantId"].Value.Should().Be(tenantId);
-        connection.LastCommand.Parameters["candidateIds"].Value.Should().BeOfType<Guid[]>();
+        connection.LastCommand.Parameters["candidateIds"].Value.Should().BeOfType<string[]>();
         connection.LastCommand.Parameters["holdTableName"].Value.Should().Be("anonymised_contacts");
         connection.LastCommand.Parameters["holdAsOf"].Value.Should().Be(now);
     }
@@ -451,7 +451,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "anonymise",
             nameof(AnonymisedContact.CreatedAt),
             "CreatedAt",
-            new RecordIdConvention(nameof(AnonymisedContact.Id), "Id"),
+            new RecordIdConvention(nameof(AnonymisedContact.Id), "Id", typeof(Guid)),
             [
                 new AnonymiseField(nameof(AnonymisedContact.EmailAddress), "EmailAddress", AnonymiseMethod.Null),
                 new AnonymiseField(nameof(AnonymisedContact.GivenName), "GivenName", AnonymiseMethod.EmptyString),
@@ -482,13 +482,13 @@ public sealed class AnonymiseSweepStrategyCommandTests
             CancellationToken.None
         );
 
-        affected.AffectedRecordIds.Should().Equal(selectedId);
+        affected.AffectedRecordIds.Should().Equal(selectedId.ToString());
         affected.HeldCount.Should().Be(1);
         connection.Commands.Should().HaveCount(2);
         connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
         connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
         connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
-            new[] { selectedId, heldId }
+            new[] { selectedId.ToString(), heldId.ToString() }
         );
     }
 
@@ -508,7 +508,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "anonymise",
             nameof(AnonymisedContact.CreatedAt),
             "CreatedAt",
-            new RecordIdConvention(nameof(AnonymisedContact.Id), "record_id"),
+            new RecordIdConvention(nameof(AnonymisedContact.Id), "record_id", typeof(Guid)),
             [
                 new AnonymiseField(nameof(AnonymisedContact.EmailAddress), "EmailAddress", AnonymiseMethod.Null),
                 new AnonymiseField(nameof(AnonymisedContact.GivenName), "GivenName", AnonymiseMethod.EmptyString),
@@ -542,7 +542,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
         affected.AffectedRecordIds.Should().ContainSingle();
         affected.HeldCount.Should().Be(0);
         connection.LastCommand.Should().NotBeNull();
-        connection.LastCommand!.CommandText.Should().Contain("hold.\"RecordId\" = target.\"record_id\"");
+        connection.LastCommand!.CommandText.Should().Contain("hold.\"RecordId\" = CAST(target.\"record_id\" AS text)");
     }
 
     private sealed class RecordingDbConnection : DbConnection

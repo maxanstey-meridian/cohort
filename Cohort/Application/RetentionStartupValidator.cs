@@ -37,23 +37,15 @@ public sealed class RetentionStartupValidator(
             var retain = clrType.GetCustomAttribute<RetainAttribute>(inherit: false);
             var exempt = clrType.GetCustomAttribute<ExemptFromRetentionAttribute>(inherit: false);
 
-            if (retain is null && exempt is null)
-            {
-                errors.Add(
-                    $"Entity {clrType.FullName} must declare exactly one of [Retain] or [ExemptFromRetention]."
-                );
-                continue;
-            }
-
             if (retain is not null && exempt is not null)
             {
                 errors.Add(
-                    $"Entity {clrType.FullName} must declare exactly one of [Retain] or [ExemptFromRetention]."
+                    $"Entity {clrType.FullName} must declare exactly one of [Retain] or [ExemptFromRetention], not both."
                 );
                 continue;
             }
 
-            if (exempt is not null)
+            if (retain is null)
             {
                 continue;
             }
@@ -152,36 +144,39 @@ public sealed class RetentionStartupValidator(
     )
     {
         var errors = new List<string>();
-        var clrType = entry.EntityType;
 
         ValidateSoftDeleteTenantConvention(entry, errors, messagePrefix);
-
-        var isDeletedMember = clrType.GetProperty("IsDeleted", BindingFlags.Public | BindingFlags.Instance);
-        if (isDeletedMember is null || isDeletedMember.PropertyType != typeof(bool))
-        {
-            errors.Add(
-                $"{messagePrefix} retained SoftDelete categories require a public bool IsDeleted CLR property."
-            );
-            return errors;
-        }
 
         if (entry.SoftDelete is null)
         {
             errors.Add(
-                $"{messagePrefix} retained SoftDelete categories require IsDeleted to be mapped by EF."
+                $"{messagePrefix} retained SoftDelete categories require a public bool soft-delete flag property (named IsDeleted by convention, or marked with [RetentionSoftDelete]) mapped by EF."
             );
             return errors;
         }
 
-        var deletedAtMember = clrType.GetProperty("DeletedAt", BindingFlags.Public | BindingFlags.Instance);
-        if (
-            deletedAtMember is not null
-            && !AllowedSoftDeleteTimestampTypes.Contains(deletedAtMember.PropertyType)
-        )
+        var clrType = entry.EntityType;
+        var isDeletedMember = clrType.GetProperty(entry.SoftDelete.IsDeletedMember, BindingFlags.Public | BindingFlags.Instance);
+        if (isDeletedMember is null || isDeletedMember.PropertyType != typeof(bool))
         {
             errors.Add(
-                $"{messagePrefix} DeletedAt must be DateTime or DateTimeOffset (nullable allowed), got {deletedAtMember.PropertyType.Name}."
+                $"{messagePrefix} soft-delete flag '{entry.SoftDelete.IsDeletedMember}' must be a public bool CLR property."
             );
+            return errors;
+        }
+
+        if (entry.SoftDelete.DeletedAtMember is not null)
+        {
+            var deletedAtMember = clrType.GetProperty(entry.SoftDelete.DeletedAtMember, BindingFlags.Public | BindingFlags.Instance);
+            if (
+                deletedAtMember is not null
+                && !AllowedSoftDeleteTimestampTypes.Contains(deletedAtMember.PropertyType)
+            )
+            {
+                errors.Add(
+                    $"{messagePrefix} '{entry.SoftDelete.DeletedAtMember}' must be DateTime or DateTimeOffset (nullable allowed), got {deletedAtMember.PropertyType.Name}."
+                );
+            }
         }
 
         return errors;

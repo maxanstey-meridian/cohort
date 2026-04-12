@@ -27,7 +27,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
             new RetentionHoldRequest(
                 activeHoldId,
                 "notes",
-                activeRecordId,
+                activeRecordId.ToString(),
                 tenantId,
                 "investigation",
                 createdAt
@@ -37,7 +37,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
             new RetentionHoldRequest(
                 expiredHoldId,
                 "notes",
-                expiredRecordId,
+                expiredRecordId.ToString(),
                 tenantId,
                 "expired investigation",
                 createdAt,
@@ -48,7 +48,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
             new RetentionHoldRequest(
                 removedHoldId,
                 "notes",
-                removedRecordId,
+                removedRecordId.ToString(),
                 tenantId,
                 "removed investigation",
                 createdAt
@@ -80,7 +80,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
             new RetentionHold(
                 activeHoldId,
                 "notes",
-                activeRecordId,
+                activeRecordId.ToString(),
                 tenantId,
                 "investigation",
                 createdAt,
@@ -92,7 +92,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
             new RetentionHold(
                 removedHoldId,
                 "notes",
-                removedRecordId,
+                removedRecordId.ToString(),
                 tenantId,
                 "removed investigation",
                 createdAt,
@@ -106,7 +106,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
             new RetentionHold(
                 activeHoldId,
                 "notes",
-                activeRecordId,
+                activeRecordId.ToString(),
                 tenantId,
                 "investigation",
                 createdAt,
@@ -181,7 +181,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
             new RetentionHoldRequest(
                 Guid.NewGuid(),
                 "notes",
-                heldId,
+                heldId.ToString(),
                 tenantA,
                 "legal hold",
                 asOf.AddDays(-10)
@@ -191,7 +191,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
             new RetentionHoldRequest(
                 Guid.NewGuid(),
                 "notes",
-                expiredHoldId,
+                expiredHoldId.ToString(),
                 tenantA,
                 "expired hold",
                 asOf.AddDays(-10),
@@ -203,7 +203,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
             new RetentionHoldRequest(
                 removedHoldMarker,
                 "notes",
-                removedHoldId,
+                removedHoldId.ToString(),
                 tenantA,
                 "removed hold",
                 asOf.AddDays(-10)
@@ -288,7 +288,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
             new RetentionHoldRequest(
                 Guid.NewGuid(),
                 "soft_delete_records",
-                heldId,
+                heldId.ToString(),
                 tenantA,
                 "legal hold",
                 asOf.AddDays(-10)
@@ -298,7 +298,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
             new RetentionHoldRequest(
                 Guid.NewGuid(),
                 "soft_delete_records",
-                expiredHoldId,
+                expiredHoldId.ToString(),
                 tenantA,
                 "expired hold",
                 asOf.AddDays(-10),
@@ -310,7 +310,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
             new RetentionHoldRequest(
                 removedHoldMarker,
                 "soft_delete_records",
-                removedHoldId,
+                removedHoldId.ToString(),
                 tenantA,
                 "removed hold",
                 asOf.AddDays(-10)
@@ -437,7 +437,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
             new RetentionHoldRequest(
                 Guid.NewGuid(),
                 "anonymised_contacts",
-                heldId,
+                heldId.ToString(),
                 tenantA,
                 "legal hold",
                 asOf.AddDays(-10)
@@ -447,7 +447,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
             new RetentionHoldRequest(
                 Guid.NewGuid(),
                 "anonymised_contacts",
-                expiredHoldId,
+                expiredHoldId.ToString(),
                 tenantA,
                 "expired hold",
                 asOf.AddDays(-10),
@@ -459,7 +459,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
             new RetentionHoldRequest(
                 removedHoldMarker,
                 "anonymised_contacts",
-                removedHoldId,
+                removedHoldId.ToString(),
                 tenantA,
                 "removed hold",
                 asOf.AddDays(-10)
@@ -565,7 +565,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
             var repository = services.GetRequiredService<IRetentionHoldsRepository>();
             return await repository.HasActiveHoldAsync(
                 tableName,
-                recordId,
+                recordId.ToString(),
                 tenantId,
                 asOf,
                 CancellationToken.None

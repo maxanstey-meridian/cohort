@@ -84,7 +84,7 @@ public sealed class RegistryScanTests
         entry.AnchorMember.Should().Be(nameof(RetentionReadyRecord.RetainedAt));
         entry.AnchorColumn.Should().Be("retained_at_utc");
         entry.RecordId.Should().Be(
-            new RecordIdConvention(nameof(RetentionReadyRecord.Id), "record_id")
+            new RecordIdConvention(nameof(RetentionReadyRecord.Id), "record_id", typeof(Guid))
         );
         entry.Tenant.Should().Be(
             new TenantConvention(nameof(RetentionReadyRecord.TenantId), "tenant_uuid")

@@ -4,7 +4,7 @@ Project-specific agent instructions. Read this before writing tests or adding fe
 
 ## What Cohort is
 
-Standalone .NET 9 class library. Annotation-driven retention for EF Core consumers. Hosts annotate entities with `[Retain(category, anchor)]`, register an `IRetentionRuleResolver`, and Cohort sweeps rows past their cutoff. Three milestones A/B/C — see [`.plans/COHORT1.md`](.plans/COHORT1.md). This skeleton is pre-A, see [`.plans/COHORT0.md`](.plans/COHORT0.md).
+Standalone .NET 9 class library. Annotation-driven retention for EF Core consumers (Postgres-only SQL). Hosts annotate entities with `[Retain(category, anchor)]`, register an `IRetentionCategoryRepository`, and Cohort sweeps rows past their cutoff via configurable strategies (Purge, SoftDelete, Anonymise, Exempt). All three milestones (A/B/C) are implemented — see [`.plans/COHORT1.md`](.plans/COHORT1.md) for the milestone sequence.
 
 ## Test-writing rules — READ BEFORE WRITING ANY TEST
 
@@ -38,8 +38,12 @@ Start in `Cohort.Sample.Tests/` with a red end-to-end test. Then make it pass. T
 Cohort/                 — the library. No tests of its own.
 ├── Domain/             — pure types. Depends on NOTHING (not even EF Core).
 ├── Application/        — ports + orchestration. Depends on Domain only.
-└── Infrastructure/     — EF defaults, raw SQL adapters. Depends on Application + Domain.
-                          Empty in skeleton — fills up in Milestone A/B.
+├── Infrastructure/     — EF defaults, raw SQL adapters. Depends on Application + Domain.
+│   ├── Sweep/          — PurgeSweepStrategy, SoftDeleteSweepStrategy, AnonymiseSweepStrategy
+│   ├── Holds/          — EfRetentionHoldsRepository, RetentionHoldSql
+│   ├── Audit/          — EfRetentionAuditWriter
+│   └── Migrations/     — CohortModelBuilder (ConfigureCohortTables extension)
+└── Hosting/            — CohortOptions, RetentionWorker, AddCohort<TContext>()
 Cohort.Tests/           — fast unit suite. No Docker. No NSubstitute.
 Cohort.Sample/          — dogfood console consumer. The thing the e2e tests exercise.
 Cohort.Sample.Tests/    — e2e suite. Testcontainers Postgres. The default test home.
@@ -53,7 +57,8 @@ The dependency rule is enforced by `using` statements, not project boundaries. R
 
 - **`Domain/`** depends on nothing. If a type needs `using Microsoft.EntityFrameworkCore;`, it isn't Domain. Pure functions, attributes, value records.
 - **`Application/`** depends on Domain only. Defines ports as interfaces. Orchestrates. May reference `DbContext` as a port-shaped dependency (it's the host's "here is my model" contract), but never `DbSet<T>.FromSqlRaw`, never raw SQL, never Npgsql-specific types.
-- **`Infrastructure/`** depends on Application + Domain. Implements ports. Owns raw SQL, EF query expressions, provider-specific types. Empty until Milestone A's strategies and Milestone B's EF defaults land.
+- **`Infrastructure/`** depends on Application + Domain. Implements ports. Owns raw SQL, EF query expressions, provider-specific types. Contains sweep strategies, holds repository, audit writer, and model builder.
+- **`Hosting/`** depends on Application + Infrastructure. The DI entry point (`AddCohort<TContext>`), options, and the background worker. Consumer-facing.
 
 **Layer placement test**: if a type has no dependency on a port, an external system's shape, or a framework — it's Domain. If it does — it's Application (defines/orchestrates the port) or Infrastructure (implements one).
 
@@ -68,18 +73,37 @@ The dependency rule is enforced by `using` statements, not project boundaries. R
 - `Directory.Packages.props` is the package allowlist. Adding a package requires justification in the PR description.
 - No MediatR, no AutoMapper, no ceremony.
 
+## Convention override attributes
+
+Property names for record ID, tenant, soft-delete flag, and deletion timestamp are resolved by convention (`Id`, `TenantId`, `IsDeleted`, `DeletedAt`). Override any of them with a property-level marker attribute:
+
+- `[RetentionRecordId]` — marks the record ID property (replaces `Id` convention)
+- `[RetentionTenant]` — marks the tenant property (replaces `TenantId` convention)
+- `[RetentionSoftDelete]` — marks the soft-delete flag (replaces `IsDeleted` convention)
+- `[RetentionDeletedAt]` — marks the deletion timestamp (replaces `DeletedAt` convention)
+
+These follow the same pattern as `[Anonymise]` — property-level, discovered by reflection, attribute wins over convention.
+
+## Record ID types
+
+Cohort is PK-type-agnostic. Entity record IDs can be `Guid`, `int`, `long`, `string`, or any other type. Cohort stores record IDs as `text` in its own infrastructure tables (`retention_holds.RecordId`, `sweep_run_row_detail.EntityId`) and returns them as `string` in `SweepExecutionResult.AffectedRecordIds`. SQL comparisons use `CAST(target."pk_col" AS text)` for type-safe joins against the holds table.
+
+## Entity annotation
+
+- Entities annotated with `[Retain]` are subject to retention sweeps.
+- Entities annotated with `[ExemptFromRetention]` are explicitly documented as exempt (optional sugar).
+- **Unannotated entities are implicitly exempt.** No annotation required to opt out.
+- Entities with **both** `[Retain]` and `[ExemptFromRetention]` fail startup validation.
+
 ## What is NOT in this repo yet
 
-The skeleton is a trellis. None of the following exist — do not hallucinate code to edit them:
+All three milestones (A/B/C) are implemented. The following are explicitly out of scope for v1:
 
-- No `RetentionSweepEngine`, no strategies (`PurgeSweepStrategy`, `SoftDeleteSweepStrategy`, `AnonymiseSweepStrategy`) — Milestone A/B
-- No `IRetentionHoldsRepository`, no `retention_holds` table — Milestone B
-- No `IRetentionAuditWriter`, no `sweep_run*` tables — Milestone B
-- No `RetentionStartupValidator`, no `RetentionConfigurationException` — Milestone A
-- No `IRetentionPreview`, no dry-run path — Milestone A
-- No `RetentionWorker`, no `CohortOptions`, no `AddCohort<TContext>()` — Milestone C
-- No `IRetentionErasureService`, no `[ErasureSubject]` attribute — Milestone C
-- No `ConfigureCohortTables(ModelBuilder)` — Milestone C
-- No `ExemptFromRetentionAttribute` — Milestone A
+- No `ConditionalRetentionRuleResolver`, `AliasRetentionRuleResolver`, `CachingRetentionRuleResolver` — hosts build these when needed
+- No hash/format-preserving anonymisation — v1 is `Null`/`EmptyString`/`FixedLiteral` only (see `.plans/COHORT1.md` anti-scope)
+- No SQL Server or SQLite support — Postgres-only SQL (`RETURNING`, `= ANY()`, `FOR UPDATE`)
+- No source generator — reflection is fine for a daily sweep
+- No OneTrust/Purview adapters
+- No GitHub Actions CI workflow
 
-Pointer: `.plans/COHORT1.md` for the milestone sequence. `.plans/COHORT0.md` for what this skeleton does (and doesn't) ship.
+Pointer: `.plans/COHORT1.md` for the milestone sequence and anti-scope. `.plans/COHORT0.md` for the original scaffolding plan.

@@ -53,7 +53,7 @@ namespace Cohort.Sample.Migrations
                 {
                     SweepId = table.Column<Guid>(type: "uuid", nullable: false),
                     EntityType = table.Column<string>(type: "text", nullable: false),
-                    EntityId = table.Column<Guid>(type: "uuid", nullable: false),
+                    EntityId = table.Column<string>(type: "text", nullable: false),
                     Category = table.Column<string>(type: "text", nullable: false),
                     Strategy = table.Column<int>(type: "integer", nullable: false),
                     TenantId = table.Column<Guid>(type: "uuid", nullable: false),

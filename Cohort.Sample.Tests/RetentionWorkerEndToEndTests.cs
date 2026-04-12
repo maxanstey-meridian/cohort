@@ -519,7 +519,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
 
         public Task<bool> HasActiveHoldAsync(
             string tableName,
-            Guid recordId,
+            string recordId,
             Guid tenantId,
             DateTimeOffset asOf,
             CancellationToken ct

@@ -61,6 +61,18 @@ public sealed class CohortTestHost(
         return await startup.RunPreviewAsync(tenant, now, ct);
     }
 
+    public async Task<ErasureResult> RunErasureAsync(
+        TenantContext tenant,
+        ErasureScope scope,
+        DateTimeOffset now,
+        CancellationToken ct = default
+    )
+    {
+        await using var scopeServices = _services.CreateAsyncScope();
+        var erasureService = scopeServices.ServiceProvider.GetRequiredService<IRetentionErasureService>();
+        return await erasureService.EraseAsync(tenant, scope, now, ct);
+    }
+
     public async Task<TResult> RunWithServicesAsync<TResult>(
         Func<IServiceProvider, Task<TResult>> action
     )
@@ -95,6 +107,7 @@ public sealed class CohortTestHost(
         services.AddScoped<IRetentionSweepStrategy, SoftDeleteSweepStrategy>();
         services.AddScoped<IRetentionSweepStrategy, AnonymiseSweepStrategy>();
         services.AddScoped<IRetentionPreview, RetentionPreviewService>();
+        services.AddScoped<IRetentionErasureService, RetentionErasureService>();
         services.AddScoped<RetentionRegistry>();
         services.AddScoped<RetentionStartupValidator>();
         services.AddScoped<RetentionSweepEngine>();

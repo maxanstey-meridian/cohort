@@ -16,6 +16,19 @@ public interface IRetentionSweepStrategy
         DbTransaction transaction,
         CancellationToken ct
     );
+
+    public Task<SweepExecutionResult> EraseAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        ErasureSubjectMatch match,
+        TenantContext tenant,
+        DateTimeOffset now,
+        DbConnection conn,
+        DbTransaction transaction,
+        CancellationToken ct
+    );
 }
 
 public sealed record SweepExecutionResult(IReadOnlyList<Guid> AffectedRecordIds, int HeldCount);
+
+public sealed record ErasureSubjectMatch(string SubjectMember, string SubjectColumn, object SubjectValue);

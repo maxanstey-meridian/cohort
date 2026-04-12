@@ -11,6 +11,7 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
     public DbSet<ExemptDocument> ExemptDocuments => Set<ExemptDocument>();
     public DbSet<SoftDeleteRecord> SoftDeleteRecords => Set<SoftDeleteRecord>();
     public DbSet<AnonymisedContact> AnonymisedContacts => Set<AnonymisedContact>();
+    public DbSet<ErasureSubjectRecord> ErasureSubjectRecords => Set<ErasureSubjectRecord>();
     public DbSet<HeldRecord> HeldRecords => Set<HeldRecord>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
@@ -20,6 +21,7 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
             b.ToTable("notes");
             b.HasKey(n => n.Id);
             b.Property(n => n.TenantId);
+            b.Property(n => n.SubjectId);
             b.Property(n => n.CreatedAt).IsRequired();
             b.Property(n => n.Body).IsRequired();
         });
@@ -37,6 +39,7 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
             b.ToTable("soft_delete_records");
             b.HasKey(record => record.Id);
             b.Property(record => record.TenantId);
+            b.Property(record => record.SubjectId);
             b.Property(record => record.CreatedAt).IsRequired();
             b.Property(record => record.Body).IsRequired();
             b.Property(record => record.IsDeleted).IsRequired();
@@ -48,11 +51,22 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
             b.ToTable("anonymised_contacts");
             b.HasKey(contact => contact.Id);
             b.Property(contact => contact.TenantId);
+            b.Property(contact => contact.SubjectId);
             b.Property(contact => contact.CreatedAt).IsRequired();
             b.Property(contact => contact.EmailAddress);
             b.Property(contact => contact.GivenName).IsRequired();
             b.Property(contact => contact.Surname).IsRequired();
             b.Property(contact => contact.Notes).IsRequired();
+        });
+
+        modelBuilder.Entity<ErasureSubjectRecord>(b =>
+        {
+            b.ToTable("erasure_subject_records");
+            b.HasKey(record => record.Id);
+            b.Property(record => record.TenantId).IsRequired();
+            b.Property(record => record.SubjectId);
+            b.Property(record => record.CreatedAt).IsRequired();
+            b.Property(record => record.Body).IsRequired();
         });
 
         modelBuilder.Entity<HeldRecord>(b =>

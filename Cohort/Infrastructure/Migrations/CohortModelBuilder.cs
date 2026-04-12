@@ -115,6 +115,7 @@ public static class CohortModelBuilder
         builder.Property<DateTimeOffset>("StartedAt").IsRequired();
         builder.Property<DateTimeOffset?>("CompletedAt");
         builder.Property<TimeSpan?>("Duration");
+        builder.Property<int>("TriggerKind").IsRequired();
         builder.Property<bool>("DryRun").IsRequired();
         builder.Property<Guid>("TenantId").IsRequired();
         builder.Property<int?>("TotalAffected");

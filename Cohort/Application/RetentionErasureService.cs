@@ -1,34 +1,43 @@
 using System.Data;
+using System.Reflection;
 
 using Cohort.Domain;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Storage;
 
 namespace Cohort.Application;
 
-public sealed class RetentionSweepEngine(
+public sealed class RetentionErasureService(
     DbContext db,
     RetentionRegistry registry,
     IRetentionCategoryRepository categoryRepository,
     IRetentionAuditWriter auditWriter,
     IEnumerable<IRetentionSweepStrategy> sweepStrategies
-)
+) : IRetentionErasureService
 {
     private readonly IReadOnlyDictionary<Strategy, IRetentionSweepStrategy> strategies = sweepStrategies
         .ToDictionary(strategy => strategy.HandlesStrategy);
 
-    public async Task<RetentionSweepResult> SweepAsync(
+    public async Task<ErasureResult> EraseAsync(
         TenantContext tenant,
+        ErasureScope scope,
         DateTimeOffset now,
         CancellationToken ct = default
     )
     {
         ArgumentNullException.ThrowIfNull(tenant);
+        ArgumentNullException.ThrowIfNull(scope);
 
         var sweepId = Guid.NewGuid();
         var startedAt = DateTimeOffset.UtcNow;
-        var executionPlan = new List<(RetentionEntry Entry, RetentionResolutionContext Context, RetentionRule Rule)>();
+        var executionPlan = new List<(
+            RetentionEntry Entry,
+            RetentionResolutionContext Context,
+            RetentionRule Rule,
+            ErasureSubjectMatch Match
+        )>();
         var auditEvents = new List<SweepEvent>();
 
         foreach (
@@ -37,6 +46,12 @@ public sealed class RetentionSweepEngine(
                 .Values.OrderBy(entry => entry.EntityType.FullName, StringComparer.Ordinal)
         )
         {
+            var match = ResolveMatch(entry, scope);
+            if (match is null)
+            {
+                continue;
+            }
+
             var resolver = await categoryRepository.GetAsync(entry.Category, ct);
             if (resolver is null)
             {
@@ -47,16 +62,14 @@ public sealed class RetentionSweepEngine(
 
             var context = new RetentionResolutionContext(entry.Category, tenant, now, []);
             var rule = await resolver.ResolveAsync(context, ct);
-            if (
-                rule.Strategy != Strategy.Exempt && !strategies.ContainsKey(rule.Strategy)
-            )
+            if (rule.Strategy != Strategy.Exempt && !strategies.ContainsKey(rule.Strategy))
             {
                 throw new InvalidOperationException(
-                    $"Retention strategy '{rule.Strategy}' is not registered for sweep execution."
+                    $"Retention strategy '{rule.Strategy}' is not registered for erasure execution."
                 );
             }
 
-            executionPlan.Add((entry, context, rule));
+            executionPlan.Add((entry, context, rule, match));
         }
 
         var connection = db.Database.GetDbConnection();
@@ -75,7 +88,7 @@ public sealed class RetentionSweepEngine(
                 new SweepEvent.Started(
                     sweepId,
                     startedAt,
-                    SweepTriggerKind.Scheduled,
+                    SweepTriggerKind.Erasure,
                     DryRun: false,
                     tenant.Id
                 ),
@@ -83,16 +96,18 @@ public sealed class RetentionSweepEngine(
                 ct
             );
 
-            foreach (var (entry, context, rule) in executionPlan)
+            foreach (var (entry, context, rule, match) in executionPlan)
             {
                 var eventAt = DateTimeOffset.UtcNow;
                 var execution = rule.Strategy switch
                 {
                     Strategy.Exempt => new SweepExecutionResult([], 0),
-                    _ => await strategies[rule.Strategy].SweepAsync(
+                    _ => await strategies[rule.Strategy].EraseAsync(
                         entry,
                         rule,
-                        context,
+                        match,
+                        tenant,
+                        now,
                         connection,
                         dbTransaction,
                         ct
@@ -161,7 +176,68 @@ public sealed class RetentionSweepEngine(
             }
         }
 
-        return CreateResult(auditEvents);
+        return CreateResult(auditEvents, scope);
+    }
+
+    private ErasureSubjectMatch? ResolveMatch(RetentionEntry entry, ErasureScope scope)
+    {
+        var subjectProperties = entry.EntityType
+            .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+            .Where(property => property.IsDefined(typeof(ErasureSubjectAttribute), inherit: false))
+            .ToArray();
+
+        if (subjectProperties.Length == 0)
+        {
+            return null;
+        }
+
+        if (subjectProperties.Length > 1)
+        {
+            throw new InvalidOperationException(
+                $"Entity {entry.EntityType.FullName} defines multiple [ErasureSubject] properties. Exactly one is required."
+            );
+        }
+
+        var subjectProperty = subjectProperties[0];
+        var entityType =
+            db.Model.FindEntityType(entry.EntityType)
+            ?? throw new InvalidOperationException(
+                $"Entity {entry.EntityType.FullName} is not mapped by the current EF model."
+            );
+        var storeObject =
+            StoreObjectIdentifier.Create(entityType, StoreObjectType.Table)
+            ?? throw new InvalidOperationException(
+                $"Entity {entry.EntityType.FullName} does not have a mapped table for erasure."
+            );
+        var efProperty =
+            entityType.FindProperty(subjectProperty.Name)
+            ?? throw new InvalidOperationException(
+                $"[ErasureSubject] on {entry.EntityType.FullName}.{subjectProperty.Name}: property is not mapped by EF."
+            );
+        var subjectColumn =
+            efProperty.GetColumnName(storeObject)
+            ?? throw new InvalidOperationException(
+                $"[ErasureSubject] on {entry.EntityType.FullName}.{subjectProperty.Name}: property has no mapped table column."
+            );
+
+        return new ErasureSubjectMatch(
+            subjectProperty.Name,
+            subjectColumn,
+            ConvertSubjectValue(entry.EntityType, subjectProperty, scope.Subject)
+        );
+    }
+
+    private static object ConvertSubjectValue(Type entityType, PropertyInfo property, object subject)
+    {
+        var targetType = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
+        if (targetType.IsInstanceOfType(subject))
+        {
+            return subject;
+        }
+
+        throw new InvalidOperationException(
+            $"Erasure scope subject value of type {subject.GetType().Name} cannot be expressed against [ErasureSubject] property '{property.Name}' on {entityType.FullName}, which expects {targetType.Name}."
+        );
     }
 
     private async Task WriteAuditEventAsync(
@@ -174,7 +250,10 @@ public sealed class RetentionSweepEngine(
         auditEvents.Add(evt);
     }
 
-    private static RetentionSweepResult CreateResult(IEnumerable<SweepEvent> auditEvents)
+    private static ErasureResult CreateResult(
+        IEnumerable<SweepEvent> auditEvents,
+        ErasureScope scope
+    )
     {
         var started = auditEvents.OfType<SweepEvent.Started>().Single();
         var completed = auditEvents.OfType<SweepEvent.Completed>().Single();
@@ -191,6 +270,6 @@ public sealed class RetentionSweepEngine(
             )
             .ToArray();
 
-        return new RetentionSweepResult(started.SweepId, started.At, completed.At, counts);
+        return new ErasureResult(started.SweepId, started.At, completed.At, scope, counts);
     }
 }

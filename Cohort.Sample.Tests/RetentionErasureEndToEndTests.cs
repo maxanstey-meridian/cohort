@@ -9,15 +9,18 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Sample.Tests;
 
-public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
+public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     : IntegrationTestBase(fixture)
 {
     [Fact]
-    public async Task Sweep_Path_Persists_Run_Summary_And_OptIn_Row_Detail_Events_And_Returns_Result_From_The_Same_Aggregate()
+    public async Task Erasure_Path_Matches_Subject_Across_Entities_Respects_Holds_And_Persists_Auditable_Counts()
     {
         var tenantId = Guid.NewGuid();
+        var otherTenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var otherSubjectId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
-        var deletedNoteId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
         var heldNoteId = Guid.NewGuid();
         var softDeleteId = Guid.NewGuid();
         var heldSoftDeleteId = Guid.NewGuid();
@@ -29,17 +32,35 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
             db.Notes.AddRange(
                 new Note
                 {
-                    Id = deletedNoteId,
+                    Id = noteId,
                     TenantId = tenantId,
-                    CreatedAt = asOf.AddDays(-120),
-                    Body = "purge-me",
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "erase-note",
                 },
                 new Note
                 {
                     Id = heldNoteId,
                     TenantId = tenantId,
-                    CreatedAt = asOf.AddDays(-120),
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
                     Body = "held-note",
+                },
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectId = otherSubjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "other-subject-note",
+                },
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = otherTenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "other-tenant-note",
                 }
             );
             db.SoftDeleteRecords.AddRange(
@@ -47,16 +68,36 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                 {
                     Id = softDeleteId,
                     TenantId = tenantId,
-                    CreatedAt = asOf.AddDays(-120),
-                    Body = "soft-delete-me",
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "erase-soft-delete",
                     IsDeleted = false,
                 },
                 new SoftDeleteRecord
                 {
                     Id = heldSoftDeleteId,
                     TenantId = tenantId,
-                    CreatedAt = asOf.AddDays(-120),
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
                     Body = "held-soft-delete",
+                    IsDeleted = false,
+                },
+                new SoftDeleteRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectId = otherSubjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "other-subject-soft-delete",
+                    IsDeleted = false,
+                },
+                new SoftDeleteRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = otherTenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "other-tenant-soft-delete",
                     IsDeleted = false,
                 }
             );
@@ -65,21 +106,45 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                 {
                     Id = anonymisedContactId,
                     TenantId = tenantId,
-                    CreatedAt = asOf.AddDays(-120),
-                    EmailAddress = "contact@example.com",
-                    GivenName = "Jane",
-                    Surname = "Doe",
-                    Notes = "keep this",
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    EmailAddress = "subject@example.com",
+                    GivenName = "Target",
+                    Surname = "Contact",
+                    Notes = "keep-notes",
                 },
                 new AnonymisedContact
                 {
                     Id = heldAnonymisedContactId,
                     TenantId = tenantId,
-                    CreatedAt = asOf.AddDays(-120),
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
                     EmailAddress = "held@example.com",
                     GivenName = "Held",
-                    Surname = "Person",
-                    Notes = "held",
+                    Surname = "Contact",
+                    Notes = "held-notes",
+                },
+                new AnonymisedContact
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectId = otherSubjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    EmailAddress = "other@example.com",
+                    GivenName = "Other",
+                    Surname = "Subject",
+                    Notes = "other-notes",
+                },
+                new AnonymisedContact
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = otherTenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    EmailAddress = "tenant@example.com",
+                    GivenName = "Other",
+                    Surname = "Tenant",
+                    Notes = "tenant-notes",
                 }
             );
             await db.SaveChangesAsync();
@@ -89,7 +154,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         await CreateHoldAsync("soft_delete_records", heldSoftDeleteId, tenantId, asOf);
         await CreateHoldAsync("anonymised_contacts", heldAnonymisedContactId, tenantId, asOf);
 
-        using var auditHost = new CohortTestHost(
+        using var erasureHost = new CohortTestHost(
             GetConnectionString(),
             new StaticCategoryRepository(
                 new Dictionary<string, IRetentionRuleResolver>
@@ -111,8 +176,9 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
             )
         );
 
-        var result = await auditHost.RunSweepAsync(
+        var result = await erasureHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
             asOf
         );
 
@@ -142,17 +208,9 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         var summaries = await LoadSummariesAsync(result.SweepId);
         var rowDetails = await LoadRowDetailsAsync(result.SweepId);
 
-        run.SweepId.Should().Be(result.SweepId);
-        run.StartedAt.Should().Be(result.StartedAt);
-        run.CompletedAt.Should().Be(result.CompletedAt);
-        run.Trigger.Should().Be(SweepTriggerKind.Scheduled);
-        run.DryRun.Should().BeFalse();
-        run.TenantId.Should().Be(tenantId);
+        run.Trigger.Should().Be(SweepTriggerKind.Erasure);
         run.TotalAffected.Should().Be(3);
-        run.Duration.Should().NotBeNull();
-        run.Duration.Should().BePositive();
-
-        summaries.Should().HaveCount(3);
+        run.TenantId.Should().Be(tenantId);
         summaries.Should().Contain(
             new SweepRunEntitySummaryRow(
                 result.SweepId,
@@ -189,19 +247,17 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                 1
             )
         );
-
         rowDetails.Should().ContainSingle();
         rowDetails[0].Should().Be(
             new SweepRunRowDetailRow(
                 result.SweepId,
                 typeof(Note).FullName!,
-                deletedNoteId,
+                noteId,
                 "short-lived",
                 Strategy.Purge,
                 tenantId
             )
         );
-
         result.Counts.Should().BeEquivalentTo(
             summaries.Select(summary =>
                 new EntitySweepCount(
@@ -215,22 +271,60 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         );
 
         await using var verify = Host.CreateDbContext();
-        (await verify.Notes.Select(note => note.Body).ToListAsync()).Should().Equal("held-note");
+        (await verify.Notes.OrderBy(note => note.Body).Select(note => note.Body).ToListAsync())
+            .Should()
+            .Equal("held-note", "other-subject-note", "other-tenant-note");
 
         var softDeleteRecords = await verify.SoftDeleteRecords.OrderBy(record => record.Body).ToListAsync();
-        softDeleteRecords.Should().HaveCount(2);
         softDeleteRecords.Single(record => record.Id == softDeleteId).IsDeleted.Should().BeTrue();
         softDeleteRecords.Single(record => record.Id == heldSoftDeleteId).IsDeleted.Should().BeFalse();
+        softDeleteRecords.Single(record => record.Body == "other-subject-soft-delete").IsDeleted.Should().BeFalse();
+        softDeleteRecords.Single(record => record.Body == "other-tenant-soft-delete").IsDeleted.Should().BeFalse();
 
-        var contacts = await verify.AnonymisedContacts.OrderBy(contact => contact.Id).ToListAsync();
-        contacts.Should().HaveCount(2);
+        var contacts = await verify.AnonymisedContacts.OrderBy(contact => contact.EmailAddress).ToListAsync();
         contacts.Single(contact => contact.Id == anonymisedContactId).EmailAddress.Should().BeNull();
         contacts.Single(contact => contact.Id == anonymisedContactId).GivenName.Should().BeEmpty();
         contacts.Single(contact => contact.Id == anonymisedContactId).Surname.Should().Be("[redacted]");
-        contacts.Single(contact => contact.Id == anonymisedContactId).Notes.Should().Be("keep this");
+        contacts.Single(contact => contact.Id == anonymisedContactId).Notes.Should().Be("keep-notes");
         contacts.Single(contact => contact.Id == heldAnonymisedContactId)
             .EmailAddress.Should()
             .Be("held@example.com");
+        contacts.Single(contact => contact.EmailAddress == "other@example.com").GivenName.Should().Be("Other");
+        contacts.Single(contact => contact.EmailAddress == "tenant@example.com").GivenName.Should().Be("Other");
+    }
+
+    [Fact]
+    public async Task Erasure_Path_Fails_When_The_Scope_Subject_Cannot_Be_Expressed_Against_The_Marked_Property()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectId = Guid.NewGuid(),
+                    CreatedAt = asOf,
+                    Body = "mismatch",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        var act = () =>
+            Host.RunErasureAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                new ErasureScope("not-a-guid"),
+                asOf
+            );
+
+        await act
+            .Should()
+            .ThrowAsync<InvalidOperationException>()
+            .WithMessage("*SubjectId*expects Guid*");
     }
 
     private async Task CreateHoldAsync(
@@ -249,7 +343,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                     tableName,
                     recordId,
                     tenantId,
-                    "audit-hold",
+                    "erasure-hold",
                     asOf.AddDays(-1)
                 ),
                 CancellationToken.None

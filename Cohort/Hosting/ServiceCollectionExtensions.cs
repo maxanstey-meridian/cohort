@@ -37,6 +37,7 @@ public static class ServiceCollectionExtensions
             ServiceDescriptor.Scoped<IRetentionSweepStrategy, AnonymiseSweepStrategy>()
         );
         services.TryAddScoped<IRetentionPreview, RetentionPreviewService>();
+        services.TryAddScoped<IRetentionErasureService, RetentionErasureService>();
         services.TryAddScoped<RetentionRegistry>();
         services.TryAddScoped<RetentionStartupValidator>();
         services.TryAddScoped<RetentionSweepEngine>();

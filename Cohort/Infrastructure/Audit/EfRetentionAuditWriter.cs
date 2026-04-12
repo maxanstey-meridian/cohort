@@ -36,6 +36,7 @@ public sealed class EfRetentionAuditWriter(DbContext db) : IRetentionAuditWriter
                 "StartedAt",
                 "CompletedAt",
                 "Duration",
+                "TriggerKind",
                 "DryRun",
                 "TenantId",
                 "TotalAffected"
@@ -45,6 +46,7 @@ public sealed class EfRetentionAuditWriter(DbContext db) : IRetentionAuditWriter
                 @startedAt,
                 NULL,
                 NULL,
+                @triggerKind,
                 @dryRun,
                 @tenantId,
                 NULL
@@ -54,6 +56,9 @@ public sealed class EfRetentionAuditWriter(DbContext db) : IRetentionAuditWriter
             {
                 command.Parameters.Add(CreateParameter(command, "sweepId", started.SweepId));
                 command.Parameters.Add(CreateParameter(command, "startedAt", started.At));
+                command.Parameters.Add(
+                    CreateParameter(command, "triggerKind", (int)started.Trigger)
+                );
                 command.Parameters.Add(CreateParameter(command, "dryRun", started.DryRun));
                 command.Parameters.Add(CreateParameter(command, "tenantId", started.TenantId));
             },

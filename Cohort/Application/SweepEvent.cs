@@ -4,8 +4,13 @@ namespace Cohort.Application;
 
 public abstract record SweepEvent
 {
-    public sealed record Started(Guid SweepId, DateTimeOffset At, bool DryRun, Guid TenantId)
-        : SweepEvent;
+    public sealed record Started(
+        Guid SweepId,
+        DateTimeOffset At,
+        SweepTriggerKind Trigger,
+        bool DryRun,
+        Guid TenantId
+    ) : SweepEvent;
 
     public sealed record EntitySummary(
         Guid SweepId,
@@ -35,4 +40,10 @@ public abstract record SweepEvent
         TimeSpan Duration,
         int TotalAffected
     ) : SweepEvent;
+}
+
+public enum SweepTriggerKind
+{
+    Scheduled,
+    Erasure,
 }

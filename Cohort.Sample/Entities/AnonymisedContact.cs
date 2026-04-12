@@ -7,6 +7,8 @@ public sealed class AnonymisedContact
 {
     public Guid Id { get; set; }
     public Guid TenantId { get; set; }
+    [ErasureSubject]
+    public Guid? SubjectId { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
 
     [Anonymise(AnonymiseMethod.Null)]

@@ -79,6 +79,82 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         return new SweepExecutionResult(affectedRecordIds, eligibleCount - affectedRecordIds.Count);
     }
 
+    public async Task<SweepExecutionResult> EraseAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        ErasureSubjectMatch match,
+        TenantContext tenant,
+        DateTimeOffset now,
+        DbConnection conn,
+        DbTransaction transaction,
+        CancellationToken ct
+    )
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+        ArgumentNullException.ThrowIfNull(rule);
+        ArgumentNullException.ThrowIfNull(match);
+        ArgumentNullException.ThrowIfNull(tenant);
+        ArgumentNullException.ThrowIfNull(conn);
+        ArgumentNullException.ThrowIfNull(transaction);
+
+        if (rule.Strategy != Strategy.Anonymise)
+        {
+            throw new InvalidOperationException(
+                $"AnonymiseSweepStrategy cannot execute {rule.Strategy} rules."
+            );
+        }
+
+        var tenantConvention = entry.Tenant
+            ?? throw new InvalidOperationException(
+                $"Retention entry for {entry.EntityType.FullName} must expose tenant metadata for anonymise erasure."
+            );
+
+        if (entry.AnonymiseFields.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"Retention entry for {entry.EntityType.FullName} must expose anonymise metadata for anonymise erasure."
+            );
+        }
+
+        if (conn.State != ConnectionState.Open)
+        {
+            await conn.OpenAsync(ct);
+        }
+
+        var eligibleCount = await CountEligibleErasureRowsAsync(
+            entry,
+            tenantConvention,
+            match,
+            tenant,
+            conn,
+            transaction,
+            ct
+        );
+
+        await using var command = conn.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = BuildErasureCommandText(
+            entry,
+            tenantConvention,
+            match,
+            command,
+            entry.RecordId.RecordIdColumn
+        );
+        command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
+        command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
+        command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
+        command.Parameters.Add(CreateParameter(command, "holdAsOf", now));
+
+        var affectedRecordIds = new List<Guid>();
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            affectedRecordIds.Add(reader.GetGuid(0));
+        }
+
+        return new SweepExecutionResult(affectedRecordIds, eligibleCount - affectedRecordIds.Count);
+    }
+
     private static string BuildCommandText(
         RetentionEntry entry,
         TenantConvention tenant,
@@ -109,6 +185,37 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             """;
     }
 
+    private static string BuildErasureCommandText(
+        RetentionEntry entry,
+        TenantConvention tenant,
+        ErasureSubjectMatch match,
+        DbCommand command,
+        string recordIdColumn
+    )
+    {
+        var assignments = new List<string>(entry.AnonymiseFields.Count);
+
+        for (var index = 0; index < entry.AnonymiseFields.Count; index++)
+        {
+            var field = entry.AnonymiseFields[index];
+            var parameterName = $"value{index}";
+            assignments.Add($"{QuoteIdentifier(field.ColumnName)} = @{parameterName}");
+            command.Parameters.Add(
+                CreateParameter(command, parameterName, CreateAssignmentValue(field))
+            );
+        }
+
+        return
+            $"""
+            UPDATE {QuoteIdentifier(entry.TableName)} AS target
+            SET {string.Join(", ", assignments)}
+            WHERE target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
+              AND target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn)}
+            RETURNING target.{QuoteIdentifier(recordIdColumn)}
+            """;
+    }
+
     private static async Task<int> CountEligibleRowsAsync(
         RetentionEntry entry,
         TenantConvention tenant,
@@ -130,6 +237,32 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             """;
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
+
+        var result = await command.ExecuteScalarAsync(ct);
+        return Convert.ToInt32(result);
+    }
+
+    private static async Task<int> CountEligibleErasureRowsAsync(
+        RetentionEntry entry,
+        TenantConvention tenant,
+        ErasureSubjectMatch match,
+        TenantContext erasureTenant,
+        DbConnection conn,
+        DbTransaction transaction,
+        CancellationToken ct
+    )
+    {
+        await using var command = conn.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            $"""
+            SELECT COUNT(*)
+            FROM {QuoteIdentifier(entry.TableName)} AS target
+            WHERE target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
+              AND target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+            """;
+        command.Parameters.Add(CreateParameter(command, "tenantId", erasureTenant.Id));
+        command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
 
         var result = await command.ExecuteScalarAsync(ct);
         return Convert.ToInt32(result);

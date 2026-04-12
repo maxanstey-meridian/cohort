@@ -1,6 +1,12 @@
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Infrastructure.Sweep;
 using Cohort.Sample.Entities;
+
+using System.Collections;
+using System.Data;
+using System.Data.Common;
+using System.Diagnostics.CodeAnalysis;
 
 using Microsoft.EntityFrameworkCore;
 
@@ -274,6 +280,319 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
         {
             resolvers.TryGetValue(category, out var resolver);
             return Task.FromResult(resolver);
+        }
+    }
+}
+
+[Collection("Integration")]
+public sealed class SoftDeleteSweepStrategyCommandTests
+{
+    [Fact]
+    public async Task SweepAsync_Uses_The_Mapped_Record_Id_Column_In_Hold_Filtering()
+    {
+        var strategy = new SoftDeleteSweepStrategy();
+        var connection = new RecordingDbConnection();
+        var transaction = connection.BeginTransaction();
+        var tenantId = Guid.NewGuid();
+        var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var entry = new RetentionEntry(
+            typeof(SoftDeleteRecord),
+            "soft_delete_records",
+            "soft-delete",
+            nameof(SoftDeleteRecord.CreatedAt),
+            "CreatedAt",
+            new RecordIdConvention(nameof(SoftDeleteRecord.Id), "record_id"),
+            [],
+            new TenantConvention(nameof(SoftDeleteRecord.TenantId), "TenantId"),
+            new SoftDeleteConvention(
+                nameof(SoftDeleteRecord.IsDeleted),
+                "IsDeleted",
+                nameof(SoftDeleteRecord.DeletedAt),
+                "DeletedAt"
+            )
+        );
+        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete);
+        var context = new RetentionResolutionContext(
+            "soft-delete",
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            now,
+            []
+        );
+
+        var affected = await strategy.SweepAsync(
+            entry,
+            rule,
+            context,
+            connection,
+            transaction,
+            CancellationToken.None
+        );
+
+        affected.Should().Be(1);
+        connection.LastCommand.Should().NotBeNull();
+        connection.LastCommand!.CommandText.Should().Contain("hold.\"RecordId\" = target.\"record_id\"");
+    }
+
+    private sealed class RecordingDbConnection : DbConnection
+    {
+        private ConnectionState state = ConnectionState.Closed;
+        private string connectionString = "Host=recording";
+
+        public RecordingDbCommand? LastCommand { get; private set; }
+
+        [AllowNull]
+        public override string ConnectionString
+        {
+            get => connectionString;
+            set => connectionString = value ?? "";
+        }
+
+        public override string Database => "recording";
+
+        public override string DataSource => "recording";
+
+        public override string ServerVersion => "1.0";
+
+        public override ConnectionState State => state;
+
+        public override void ChangeDatabase(string databaseName) { }
+
+        public override void Close()
+        {
+            state = ConnectionState.Closed;
+        }
+
+        public override void Open()
+        {
+            state = ConnectionState.Open;
+        }
+
+        protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
+        {
+            state = ConnectionState.Open;
+            return new RecordingDbTransaction(this);
+        }
+
+        protected override DbCommand CreateDbCommand()
+        {
+            LastCommand = new RecordingDbCommand(this);
+            return LastCommand;
+        }
+    }
+
+    private sealed class RecordingDbTransaction(RecordingDbConnection connection) : DbTransaction
+    {
+        public override IsolationLevel IsolationLevel => IsolationLevel.ReadCommitted;
+
+        protected override DbConnection? DbConnection => connection;
+
+        public override void Commit() { }
+
+        public override void Rollback() { }
+    }
+
+    private sealed class RecordingDbCommand(RecordingDbConnection connection) : DbCommand
+    {
+        private readonly RecordingDbParameterCollection parameters = new();
+        private string commandText = "";
+
+        public DbTransaction? AssignedTransaction { get; private set; }
+
+        [AllowNull]
+        public override string CommandText
+        {
+            get => commandText;
+            set => commandText = value ?? "";
+        }
+
+        public override int CommandTimeout { get; set; }
+
+        public override CommandType CommandType { get; set; } = CommandType.Text;
+
+        protected override DbConnection? DbConnection { get; set; } = connection;
+
+        protected override DbParameterCollection DbParameterCollection => parameters;
+
+        protected override DbTransaction? DbTransaction
+        {
+            get => AssignedTransaction;
+            set => AssignedTransaction = value;
+        }
+
+        public override bool DesignTimeVisible { get; set; }
+
+        public override UpdateRowSource UpdatedRowSource { get; set; }
+
+        public override void Cancel() { }
+
+        public override int ExecuteNonQuery()
+        {
+            return 1;
+        }
+
+        public override object? ExecuteScalar()
+        {
+            return null;
+        }
+
+        public override void Prepare() { }
+
+        protected override DbParameter CreateDbParameter()
+        {
+            return new RecordingDbParameter();
+        }
+
+        protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
+        {
+            throw new NotSupportedException();
+        }
+
+        public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
+        {
+            return Task.FromResult(1);
+        }
+    }
+
+    private sealed class RecordingDbParameter : DbParameter
+    {
+        private string parameterName = "";
+        private string sourceColumn = "";
+
+        public override DbType DbType { get; set; }
+
+        public override ParameterDirection Direction { get; set; } = ParameterDirection.Input;
+
+        public override bool IsNullable { get; set; }
+
+        [AllowNull]
+        public override string ParameterName
+        {
+            get => parameterName;
+            set => parameterName = value ?? "";
+        }
+
+        [AllowNull]
+        public override string SourceColumn
+        {
+            get => sourceColumn;
+            set => sourceColumn = value ?? "";
+        }
+
+        public override object? Value { get; set; }
+
+        public override bool SourceColumnNullMapping { get; set; }
+
+        public override int Size { get; set; }
+
+        public override void ResetDbType() { }
+    }
+
+    private sealed class RecordingDbParameterCollection : DbParameterCollection
+    {
+        private readonly List<DbParameter> items = [];
+
+        public override int Count => items.Count;
+
+        public override object SyncRoot => this;
+
+        public override int Add(object value)
+        {
+            items.Add((DbParameter)value);
+            return items.Count - 1;
+        }
+
+        public override void AddRange(Array values)
+        {
+            foreach (var value in values)
+            {
+                Add(value!);
+            }
+        }
+
+        public override void Clear()
+        {
+            items.Clear();
+        }
+
+        public override bool Contains(object value)
+        {
+            return items.Contains((DbParameter)value);
+        }
+
+        public override bool Contains(string value)
+        {
+            return items.Any(parameter => parameter.ParameterName == value);
+        }
+
+        public override void CopyTo(Array array, int index)
+        {
+            items.ToArray().CopyTo(array, index);
+        }
+
+        public override IEnumerator GetEnumerator()
+        {
+            return items.GetEnumerator();
+        }
+
+        public override int IndexOf(object value)
+        {
+            return items.IndexOf((DbParameter)value);
+        }
+
+        public override int IndexOf(string parameterName)
+        {
+            return items.FindIndex(parameter => parameter.ParameterName == parameterName);
+        }
+
+        public override void Insert(int index, object value)
+        {
+            items.Insert(index, (DbParameter)value);
+        }
+
+        public override void Remove(object value)
+        {
+            items.Remove((DbParameter)value);
+        }
+
+        public override void RemoveAt(int index)
+        {
+            items.RemoveAt(index);
+        }
+
+        public override void RemoveAt(string parameterName)
+        {
+            var index = IndexOf(parameterName);
+            if (index >= 0)
+            {
+                items.RemoveAt(index);
+            }
+        }
+
+        protected override DbParameter GetParameter(int index)
+        {
+            return items[index];
+        }
+
+        protected override DbParameter GetParameter(string parameterName)
+        {
+            return items[IndexOf(parameterName)];
+        }
+
+        protected override void SetParameter(int index, DbParameter value)
+        {
+            items[index] = value;
+        }
+
+        protected override void SetParameter(string parameterName, DbParameter value)
+        {
+            var index = IndexOf(parameterName);
+            if (index >= 0)
+            {
+                items[index] = value;
+                return;
+            }
+
+            items.Add(value);
         }
     }
 }

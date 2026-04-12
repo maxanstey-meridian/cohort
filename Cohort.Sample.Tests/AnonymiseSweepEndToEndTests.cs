@@ -367,6 +367,56 @@ public sealed class AnonymiseSweepStrategyCommandTests
         connection.LastCommand.Parameters["holdAsOf"].Value.Should().Be(now);
     }
 
+    [Fact]
+    public async Task SweepAsync_Uses_The_Mapped_Record_Id_Column_In_Hold_Filtering()
+    {
+        var strategy = new AnonymiseSweepStrategy();
+        var connection = new RecordingDbConnection();
+        var transaction = connection.BeginTransaction();
+        var tenantId = Guid.NewGuid();
+        var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var entry = new RetentionEntry(
+            typeof(AnonymisedContact),
+            "anonymised_contacts",
+            "anonymise",
+            nameof(AnonymisedContact.CreatedAt),
+            "CreatedAt",
+            new RecordIdConvention(nameof(AnonymisedContact.Id), "record_id"),
+            [
+                new AnonymiseField(nameof(AnonymisedContact.EmailAddress), "EmailAddress", AnonymiseMethod.Null),
+                new AnonymiseField(nameof(AnonymisedContact.GivenName), "GivenName", AnonymiseMethod.EmptyString),
+                new AnonymiseField(
+                    nameof(AnonymisedContact.Surname),
+                    "Surname",
+                    AnonymiseMethod.FixedLiteral,
+                    "[redacted]"
+                ),
+            ],
+            new TenantConvention(nameof(AnonymisedContact.TenantId), "TenantId"),
+            null
+        );
+        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise);
+        var context = new RetentionResolutionContext(
+            "anonymise",
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            now,
+            []
+        );
+
+        var affected = await strategy.SweepAsync(
+            entry,
+            rule,
+            context,
+            connection,
+            transaction,
+            CancellationToken.None
+        );
+
+        affected.Should().Be(1);
+        connection.LastCommand.Should().NotBeNull();
+        connection.LastCommand!.CommandText.Should().Contain("hold.\"RecordId\" = target.\"record_id\"");
+    }
+
     private sealed class RecordingDbConnection : DbConnection
     {
         private ConnectionState state = ConnectionState.Closed;

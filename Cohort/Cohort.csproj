@@ -2,6 +2,16 @@
 
   <PropertyGroup>
     <RootNamespace>Cohort</RootNamespace>
+    <PackageId>Cohort</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>Max Anstey</Authors>
+    <Description>Annotation-driven GDPR retention for EF Core. Purge, soft-delete, or anonymise rows past their retention period.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/maxanstey-meridian/cohort</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/maxanstey-meridian/cohort</RepositoryUrl>
+    <PackageTags>dotnet;efcore;gdpr;data-retention;postgresql</PackageTags>
+    <IsPackable>true</IsPackable>
   </PropertyGroup>
 
   <ItemGroup>
@@ -14,6 +24,10 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="Cohort.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../README.md" Pack="true" PackagePath="/" />
   </ItemGroup>
 
 </Project>

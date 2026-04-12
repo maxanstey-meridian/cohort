@@ -1,7 +1,10 @@
 using Cohort.Application;
+using Cohort.Hosting;
 using Cohort.Sample.Entities;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 
 namespace Cohort.Sample.Tests;
 
@@ -80,6 +83,21 @@ public sealed class StartupValidationEndToEndTests(PostgresFixture fixture) : In
             .Contain(
                 $"Retention category 'anonymise' for entity {typeof(AnonymisedContact).FullName} could not be resolved."
             );
+    }
+
+    [Fact]
+    public async Task Shared_Test_Host_Uses_The_Cohort_Di_Entry_Point()
+    {
+        await Host.RunWithServicesAsync(
+            serviceProvider =>
+            {
+                serviceProvider.GetServices<IHostedService>()
+                    .Should()
+                    .ContainSingle(service => service.GetType() == typeof(RetentionWorker));
+
+                return Task.CompletedTask;
+            }
+        );
     }
 
     private sealed class EmptyCategoryRepository : IRetentionCategoryRepository

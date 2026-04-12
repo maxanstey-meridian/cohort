@@ -1,10 +1,9 @@
 using Cohort.Application;
 using Cohort.Domain;
-using Cohort.Infrastructure.Audit;
-using Cohort.Infrastructure.Holds;
-using Cohort.Infrastructure.Sweep;
+using Cohort.Hosting;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Sample.Tests;
@@ -98,23 +97,16 @@ public sealed class CohortTestHost(
     )
     {
         var services = new ServiceCollection();
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection().Build();
 
+        services.AddSingleton<IConfiguration>(configuration);
+        services.AddLogging();
         services.AddDbContext<SampleDbContext>(options => options.UseNpgsql(connectionString));
-        services.AddScoped<DbContext>(sp => sp.GetRequiredService<SampleDbContext>());
-        services.AddScoped<IRetentionAuditWriter, EfRetentionAuditWriter>();
-        services.AddScoped<IRetentionHoldsRepository, EfRetentionHoldsRepository>();
-        services.AddScoped<IRetentionSweepStrategy, PurgeSweepStrategy>();
-        services.AddScoped<IRetentionSweepStrategy, SoftDeleteSweepStrategy>();
-        services.AddScoped<IRetentionSweepStrategy, AnonymiseSweepStrategy>();
-        services.AddScoped<IRetentionPreview, RetentionPreviewService>();
-        services.AddScoped<IRetentionErasureService, RetentionErasureService>();
-        services.AddScoped<RetentionRegistry>();
-        services.AddScoped<RetentionStartupValidator>();
-        services.AddScoped<RetentionSweepEngine>();
-        services.AddScoped<SampleRetentionStartupService>();
         services.AddSingleton<IRetentionCategoryRepository>(
             categoryRepository ?? new SampleCategoryRepository()
         );
+        services.AddCohort<SampleDbContext>();
+        services.AddScoped<SampleRetentionStartupService>();
 
         return services.BuildServiceProvider(validateScopes: true);
     }

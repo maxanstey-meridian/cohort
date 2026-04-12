@@ -38,6 +38,28 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
+    public async Task ValidateAsync_Rejects_Opaque_Deferred_Resolvers_On_Entities_Without_SoftDelete_Convention()
+    {
+        var options = new DbContextOptionsBuilder<SampleDbContext>()
+            .UseInMemoryDatabase($"startup-validator-opaque-deferred-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new SampleDbContext(options);
+
+        var act = async () =>
+            await new RetentionStartupValidator(db, new OpaqueDeferredSampleCategoryRepository())
+                .ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Retention category 'short-lived' for entity {typeof(Note).FullName} uses a deferred resolver that does not declare its possible strategies at startup. Opaque deferred resolvers must either advertise their strategies or target entities with a valid soft-delete convention."
+            );
+    }
+
+    [Fact]
     public async Task ValidateAsync_Allows_Exempt_Sample_Entities_Without_Category_Resolution()
     {
         var options = new DbContextOptionsBuilder<SampleDbContext>()
@@ -461,8 +483,19 @@ public sealed class RetentionStartupValidatorTests
 
     private sealed class DeferredRuleResolver : IRetentionRuleResolver
     {
+        public IReadOnlySet<Strategy>? GetPossibleStrategiesAtStartup() => new HashSet<Strategy>
+        {
+            Strategy.Purge,
+        };
+
         public Task<RetentionRule> ResolveAsync(RetentionResolutionContext ctx, CancellationToken ct) =>
             Task.FromResult(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge));
+    }
+
+    private sealed class OpaqueDeferredRuleResolver(RetentionRule rule) : IRetentionRuleResolver
+    {
+        public Task<RetentionRule> ResolveAsync(RetentionResolutionContext ctx, CancellationToken ct) =>
+            Task.FromResult(rule);
     }
 
     private sealed class GuardedSampleCategoryRepository : IRetentionCategoryRepository
@@ -517,6 +550,29 @@ public sealed class RetentionStartupValidatorTests
             Task.FromResult(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge));
 
         public RetentionRule? TryResolveAtStartup() => throw new InvalidOperationException(message);
+    }
+
+    private sealed class OpaqueDeferredSampleCategoryRepository : IRetentionCategoryRepository
+    {
+        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        {
+            return category switch
+            {
+                "short-lived" => Task.FromResult<IRetentionRuleResolver?>(
+                    new OpaqueDeferredRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    )
+                ),
+                "soft-delete" => Task.FromResult<IRetentionRuleResolver?>(
+                    new OpaqueDeferredRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    )
+                ),
+                _ => throw new InvalidOperationException(
+                    $"Unexpected category lookup for '{category}'."
+                ),
+            };
+        }
     }
 
     private sealed class MissingAttributeDbContext(DbContextOptions<MissingAttributeDbContext> options)

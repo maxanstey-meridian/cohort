@@ -29,6 +29,18 @@ public sealed class StaticRetentionRuleResolverTests
     }
 
     [Fact]
+    public void Get_Possible_Strategies_At_Startup_Returns_Configured_Strategy()
+    {
+        var resolver = new StaticRetentionRuleResolver(
+            new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+        );
+
+        var strategies = resolver.GetPossibleStrategiesAtStartup();
+
+        strategies.Should().Equal(Strategy.SoftDelete);
+    }
+
+    [Fact]
     public void Try_Resolve_At_Startup_Remains_Optional_For_Effectful_Resolvers()
     {
         IRetentionRuleResolver resolver = new DeferredResolver(
@@ -38,6 +50,18 @@ public sealed class StaticRetentionRuleResolverTests
         var resolved = resolver.TryResolveAtStartup();
 
         resolved.Should().BeNull();
+    }
+
+    [Fact]
+    public void Get_Possible_Strategies_At_Startup_Remains_Optional_For_Effectful_Resolvers()
+    {
+        IRetentionRuleResolver resolver = new DeferredResolver(
+            new RetentionRule(TimeSpan.FromDays(90), Strategy.Exempt)
+        );
+
+        var strategies = resolver.GetPossibleStrategiesAtStartup();
+
+        strategies.Should().BeNull();
     }
 
     [Fact]

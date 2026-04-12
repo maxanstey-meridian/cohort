@@ -79,9 +79,19 @@ public sealed class RetentionStartupValidator(
             try
             {
                 var startupRule = resolver.TryResolveAtStartup();
-                if (startupRule?.Strategy == Strategy.SoftDelete)
+                var possibleStrategies =
+                    startupRule is null ? resolver.GetPossibleStrategiesAtStartup() : null;
+
+                if (
+                    startupRule?.Strategy == Strategy.SoftDelete
+                    || possibleStrategies?.Contains(Strategy.SoftDelete) == true
+                )
                 {
                     ValidateSoftDeleteConvention(entry, errors);
+                }
+                else if (startupRule is null && possibleStrategies is null)
+                {
+                    ValidateOpaqueDeferredResolverCompatibility(entry, errors);
                 }
             }
             catch (Exception ex)
@@ -126,6 +136,50 @@ public sealed class RetentionStartupValidator(
         {
             errors.Add(
                 $"Soft-delete convention on {clrType.FullName}: DeletedAt must be DateTime or DateTimeOffset (nullable allowed), got {deletedAtMember.PropertyType.Name}."
+            );
+        }
+    }
+
+    private static void ValidateOpaqueDeferredResolverCompatibility(
+        RetentionEntry entry,
+        List<string> errors
+    )
+    {
+        var clrType = entry.EntityType;
+        var isDeletedMember = clrType.GetProperty("IsDeleted", BindingFlags.Public | BindingFlags.Instance);
+        var deletedAtMember = clrType.GetProperty("DeletedAt", BindingFlags.Public | BindingFlags.Instance);
+
+        if (isDeletedMember is null && deletedAtMember is null)
+        {
+            errors.Add(
+                $"Retention category '{entry.Category}' for entity {clrType.FullName} uses a deferred resolver that does not declare its possible strategies at startup. Opaque deferred resolvers must either advertise their strategies or target entities with a valid soft-delete convention."
+            );
+            return;
+        }
+
+        if (isDeletedMember is null || isDeletedMember.PropertyType != typeof(bool))
+        {
+            errors.Add(
+                $"Retention category '{entry.Category}' for entity {clrType.FullName} uses a deferred resolver that does not declare its possible strategies at startup. Opaque deferred resolvers must either advertise their strategies or target entities with a public bool IsDeleted CLR property."
+            );
+            return;
+        }
+
+        if (entry.SoftDelete is null)
+        {
+            errors.Add(
+                $"Retention category '{entry.Category}' for entity {clrType.FullName} uses a deferred resolver that does not declare its possible strategies at startup. Opaque deferred resolvers must either advertise their strategies or target entities whose IsDeleted convention is mapped by EF."
+            );
+            return;
+        }
+
+        if (
+            deletedAtMember is not null
+            && !AllowedSoftDeleteTimestampTypes.Contains(deletedAtMember.PropertyType)
+        )
+        {
+            errors.Add(
+                $"Retention category '{entry.Category}' for entity {clrType.FullName} uses a deferred resolver that does not declare its possible strategies at startup. Opaque deferred resolvers must either advertise their strategies or target entities whose DeletedAt property is DateTime or DateTimeOffset (nullable allowed), got {deletedAtMember.PropertyType.Name}."
             );
         }
     }

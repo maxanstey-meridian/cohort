@@ -115,6 +115,9 @@ public sealed class RetentionPreviewService(
             ?? throw new InvalidOperationException(
                 $"Retention entry for {entry.EntityType.FullName} must expose tenant metadata for purge previews."
             );
+        var isDeletedMember = rule.Strategy == Strategy.SoftDelete
+            ? GetSoftDeleteEligibilityMember(entry)
+            : null;
 
         var query = (IQueryable)
             DbContextSetMethod.MakeGenericMethod(entry.EntityType).Invoke(db, null)!;
@@ -124,7 +127,7 @@ public sealed class RetentionPreviewService(
             tenant.TenantMember,
             context.Tenant.Id,
             CutoffCalculator.Compute(context.Now, rule.Period, rule.LegalMin),
-            rule.Strategy == Strategy.SoftDelete ? entry.SoftDelete?.IsDeletedMember : null
+            isDeletedMember
         );
         var filtered = query.Provider.CreateQuery(
             Expression.Call(
@@ -140,6 +143,27 @@ public sealed class RetentionPreviewService(
             CountAsyncMethod.MakeGenericMethod(entry.EntityType).Invoke(null, [filtered, ct])!;
 
         return await countTask;
+    }
+
+    private static string GetSoftDeleteEligibilityMember(RetentionEntry entry)
+    {
+        var softDelete = entry.SoftDelete
+            ?? throw new InvalidOperationException(
+                $"Retention entry for {entry.EntityType.FullName} must expose soft-delete metadata for soft-delete previews."
+            );
+        var isDeletedMember = entry.EntityType.GetProperty(
+            softDelete.IsDeletedMember,
+            BindingFlags.Public | BindingFlags.Instance
+        );
+
+        if (isDeletedMember is null || isDeletedMember.PropertyType != typeof(bool))
+        {
+            throw new InvalidOperationException(
+                $"Retention entry for {entry.EntityType.FullName} must expose a public bool {softDelete.IsDeletedMember} property for soft-delete previews."
+            );
+        }
+
+        return softDelete.IsDeletedMember;
     }
 
     private static LambdaExpression BuildEligibilityPredicate(

@@ -226,6 +226,40 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
         );
     }
 
+    [Fact]
+    public async Task Preview_Path_Rejects_SoftDelete_Rules_When_The_Entity_Lacks_SoftDelete_Metadata()
+    {
+        await using var db = Host.CreateDbContext();
+        var preview = new RetentionPreviewService(
+            db,
+            new RetentionRegistry(db),
+            new StaticCategoryRepository(
+                new Dictionary<string, IRetentionRuleResolver>
+                {
+                    ["short-lived"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    ),
+                    ["soft-delete"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    ),
+                }
+            )
+        );
+
+        var act = () =>
+            preview.PreviewAsync(
+                new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
+                new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero)
+            );
+
+        await act
+            .Should()
+            .ThrowAsync<InvalidOperationException>()
+            .WithMessage(
+                $"Retention entry for {typeof(Note).FullName} must expose soft-delete metadata for soft-delete previews."
+            );
+    }
+
     private sealed class StaticCategoryRepository(
         IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
     ) : IRetentionCategoryRepository

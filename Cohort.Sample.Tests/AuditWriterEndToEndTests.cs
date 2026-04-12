@@ -1,10 +1,13 @@
+using System.Collections.Concurrent;
 using System.Data.Common;
 
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Hosting;
 using Cohort.Sample.Entities;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Sample.Tests;
@@ -12,6 +15,143 @@ namespace Cohort.Sample.Tests;
 public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
     : IntegrationTestBase(fixture)
 {
+    [Fact]
+    public async Task Sweep_Engine_Streams_Started_EntitySummary_RowDetail_And_Completed_To_The_Live_Audit_Writer_In_Order()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var deletedNoteId = Guid.NewGuid();
+        var auditWriter = new RecordingAuditWriter();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = deletedNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "streamed-note",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        await using var services = BuildRecordingAuditProvider(
+            GetConnectionString(),
+            new StaticCategoryRepository(
+                new Dictionary<string, IRetentionRuleResolver>
+                {
+                    ["short-lived"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(
+                            TimeSpan.FromDays(30),
+                            Strategy.Purge,
+                            AuditRowDetail: AuditRowDetail.PerRow
+                        )
+                    ),
+                    ["soft-delete"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    ),
+                    ["anonymise"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
+                }
+            ),
+            auditWriter
+        );
+
+        RetentionSweepResult result;
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var startup = scope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
+            result = await startup.RunSweepAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                asOf
+            );
+        }
+
+        auditWriter.Events.Should().HaveCount(6);
+
+        auditWriter.Events[0].Should().BeOfType<SweepEvent.Started>();
+        var started = (SweepEvent.Started)auditWriter.Events[0];
+        started.Trigger.Should().Be(SweepTriggerKind.Scheduled);
+        started.DryRun.Should().BeFalse();
+        started.TenantId.Should().Be(tenantId);
+
+        auditWriter.Events[1].Should().Be(
+            new SweepEvent.EntitySummary(
+                started.SweepId,
+                ((SweepEvent.EntitySummary)auditWriter.Events[1]).At,
+                typeof(AnonymisedContact),
+                "anonymise",
+                tenantId,
+                Strategy.Anonymise,
+                TimeSpan.FromDays(30),
+                0,
+                0
+            )
+        );
+        auditWriter.Events[2].Should().Be(
+            new SweepEvent.EntitySummary(
+                started.SweepId,
+                ((SweepEvent.EntitySummary)auditWriter.Events[2]).At,
+                typeof(Note),
+                "short-lived",
+                tenantId,
+                Strategy.Purge,
+                TimeSpan.FromDays(30),
+                1,
+                0
+            )
+        );
+        auditWriter.Events[3].Should().Be(
+            new SweepEvent.RowDetail(
+                started.SweepId,
+                ((SweepEvent.RowDetail)auditWriter.Events[3]).At,
+                typeof(Note),
+                deletedNoteId,
+                "short-lived",
+                Strategy.Purge,
+                tenantId
+            )
+        );
+        auditWriter.Events[4].Should().Be(
+            new SweepEvent.EntitySummary(
+                started.SweepId,
+                ((SweepEvent.EntitySummary)auditWriter.Events[4]).At,
+                typeof(SoftDeleteRecord),
+                "soft-delete",
+                tenantId,
+                Strategy.SoftDelete,
+                TimeSpan.FromDays(30),
+                0,
+                0
+            )
+        );
+
+        auditWriter.Events[5].Should().BeOfType<SweepEvent.Completed>();
+        var completed = (SweepEvent.Completed)auditWriter.Events[5];
+        completed.SweepId.Should().Be(started.SweepId);
+        completed.TotalAffected.Should().Be(1);
+
+        result.SweepId.Should().Be(started.SweepId);
+        result.StartedAt.Should().Be(started.At);
+        result.CompletedAt.Should().Be(completed.At);
+        result.Counts.Should().BeEquivalentTo(
+            auditWriter.Events
+                .OfType<SweepEvent.EntitySummary>()
+                .Select(summary =>
+                    new EntitySweepCount(
+                        summary.EntityType,
+                        summary.Category,
+                        summary.TenantId,
+                        summary.Strategy,
+                        summary.Affected
+                    )
+                )
+        );
+    }
+
     [Fact]
     public async Task Sweep_Path_Persists_Run_Summary_And_OptIn_Row_Detail_Events_And_Returns_Result_From_The_Same_Aggregate()
     {
@@ -369,6 +509,27 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
             ?? throw new InvalidOperationException($"Could not resolve entity type '{entityType}'.");
     }
 
+    private static ServiceProvider BuildRecordingAuditProvider(
+        string connectionString,
+        IRetentionCategoryRepository categoryRepository,
+        RecordingAuditWriter auditWriter
+    )
+    {
+        var services = new ServiceCollection();
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection().Build();
+
+        services.AddSingleton<IConfiguration>(configuration);
+        services.AddLogging();
+        services.AddDbContext<SampleDbContext>(options => options.UseNpgsql(connectionString));
+        services.AddSingleton(categoryRepository);
+        services.AddSingleton(auditWriter);
+        services.AddScoped<IRetentionAuditWriter>(sp => sp.GetRequiredService<RecordingAuditWriter>());
+        services.AddCohort<SampleDbContext>();
+        services.AddScoped<SampleRetentionStartupService>();
+
+        return services.BuildServiceProvider(validateScopes: true);
+    }
+
     private sealed class StaticCategoryRepository(
         IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
     ) : IRetentionCategoryRepository
@@ -377,6 +538,19 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         {
             resolvers.TryGetValue(category, out var resolver);
             return Task.FromResult(resolver);
+        }
+    }
+
+    private sealed class RecordingAuditWriter : IRetentionAuditWriter
+    {
+        private readonly ConcurrentQueue<SweepEvent> events = new();
+
+        public IReadOnlyList<SweepEvent> Events => events.ToArray();
+
+        public Task WriteAsync(SweepEvent evt, CancellationToken ct)
+        {
+            events.Enqueue(evt);
+            return Task.CompletedTask;
         }
     }
 

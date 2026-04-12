@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Threading.Channels;
 
 using Cohort.Application;
 using Cohort.Domain;
@@ -259,6 +260,67 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
     }
 
     [Fact]
+    public async Task Worker_Finishes_The_Current_Sweep_Before_The_KillSwitch_Pauses_Later_Iterations()
+    {
+        var tenant = CreateTenant();
+        var settings = CreateSettings(
+            fixture.ConnectionString,
+            schedule: "*/1 * * * * *",
+            dryRun: false,
+            killSwitch: false
+        );
+        var optionsMonitor = new MutableCohortOptionsMonitor(
+            new CohortOptions
+            {
+                Schedule = "*/1 * * * * *",
+                DryRun = false,
+                KillSwitch = false,
+                ApplyMigrations = false,
+            }
+        );
+        var blockingWriterState = new BlockingAuditWriterState();
+        using var host = BuildHost(
+            settings,
+            tenant,
+            services =>
+            {
+                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+                services.AddSingleton<IOptionsMonitor<CohortOptions>>(optionsMonitor);
+                services.AddSingleton(blockingWriterState);
+                services.AddScoped<IRetentionAuditWriter>(sp =>
+                    new BlockingAuditWriter(sp.GetRequiredService<BlockingAuditWriterState>())
+                );
+            }
+        );
+        await SeedOldNoteAsync(tenant.Id, "in-flight-note");
+
+        await host.Host.StartAsync();
+        await blockingWriterState.CompletedReached.Task.WaitAsync(TimeSpan.FromSeconds(8));
+
+        optionsMonitor.Update(
+            new CohortOptions
+            {
+                Schedule = "*/1 * * * * *",
+                DryRun = false,
+                KillSwitch = true,
+                ApplyMigrations = false,
+            }
+        );
+        blockingWriterState.ReleaseCurrentIteration();
+
+        await WaitUntilAsync(
+            async () => !await NoteExistsAsync("in-flight-note"),
+            TimeSpan.FromSeconds(8)
+        );
+        await Task.Delay(TimeSpan.FromSeconds(2));
+
+        await host.Host.StopAsync();
+
+        (await NoteExistsAsync("in-flight-note")).Should().BeFalse();
+        blockingWriterState.StartedCount.Should().Be(1);
+    }
+
+    [Fact]
     public async Task Worker_Applies_Migrations_At_Startup_When_Configured()
     {
         await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
@@ -426,6 +488,24 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         }
     }
 
+    private sealed class BlockingAuditWriter(BlockingAuditWriterState state) : IRetentionAuditWriter
+    {
+        public async Task WriteAsync(SweepEvent evt, CancellationToken ct)
+        {
+            if (evt is SweepEvent.Started)
+            {
+                state.RecordStarted();
+                return;
+            }
+
+            if (evt is SweepEvent.Completed && state.TryBlockCurrentIteration())
+            {
+                state.CompletedReached.TrySetResult(true);
+                await state.WaitForReleaseAsync(ct);
+            }
+        }
+    }
+
     private sealed class CustomHoldsRepository : IRetentionHoldsRepository
     {
         public Task CreateAsync(RetentionHoldRequest request, CancellationToken ct) => Task.CompletedTask;
@@ -476,6 +556,38 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         public void Update(CohortOptions next)
         {
             options = next;
+        }
+    }
+
+    private sealed class BlockingAuditWriterState
+    {
+        private readonly Channel<bool> releaseChannel = Channel.CreateBounded<bool>(1);
+        private int startedCount;
+        private int blocked;
+
+        public TaskCompletionSource<bool> CompletedReached { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public int StartedCount => startedCount;
+
+        public void RecordStarted()
+        {
+            Interlocked.Increment(ref startedCount);
+        }
+
+        public bool TryBlockCurrentIteration()
+        {
+            return Interlocked.CompareExchange(ref blocked, 1, 0) == 0;
+        }
+
+        public void ReleaseCurrentIteration()
+        {
+            releaseChannel.Writer.TryWrite(true);
+        }
+
+        public async Task WaitForReleaseAsync(CancellationToken ct)
+        {
+            await releaseChannel.Reader.ReadAsync(ct);
         }
     }
 

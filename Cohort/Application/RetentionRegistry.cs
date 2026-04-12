@@ -13,9 +13,8 @@ namespace Cohort.Application;
 ///
 /// Crude error handling: throws `InvalidOperationException` on the first failure.
 /// Multi-error aggregation via `RetentionConfigurationException` is Milestone A.
-public sealed class RetentionRegistry(DbContext db)
+public sealed class RetentionRegistry(DbContext db, RetentionEntryBuilder entryBuilder)
 {
-    private readonly RetentionEntryBuilder entryBuilder = new();
     private FrozenDictionary<Type, Domain.RetentionEntry>? cachedEntries;
 
     public IReadOnlyDictionary<Type, Domain.RetentionEntry> Scan()

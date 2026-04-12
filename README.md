@@ -62,10 +62,12 @@ protected override void OnModelCreating(ModelBuilder modelBuilder)
 
 | Strategy | Behaviour | Entity requirements |
 |---|---|---|
-| `Purge` | `DELETE` rows past cutoff | `[Retain]`, anchor property, `Id`, `TenantId` |
+| `Purge` | `DELETE` rows past cutoff | `[Retain]`, anchor property, record ID |
 | `SoftDelete` | `SET IsDeleted = true` | Above + `bool IsDeleted` property |
 | `Anonymise` | Scrub `[Anonymise]`-marked fields | Above + at least one `[Anonymise]` field |
 | `Exempt` | Skip entirely | `[ExemptFromRetention]` or no annotation |
+
+`TenantId` is optional. Single-tenant apps work without it — the sweep SQL simply omits the tenant filter. Multi-tenant apps get `AND "TenantId" = @tenantId` in every query automatically when the property exists.
 
 ## Anonymise methods
 
@@ -90,7 +92,24 @@ public sealed class Contact
 
 ## Convention overrides
 
-Property names are resolved by convention (`Id`, `TenantId`, `IsDeleted`, `DeletedAt`). Override with marker attributes when your entity uses different names:
+Property names are resolved by convention (`Id`, `TenantId`, `IsDeleted`, `DeletedAt`). Override globally via config, or per-entity with marker attributes.
+
+**Global** — applies to all entities:
+
+```json
+{
+  "Cohort": {
+    "Conventions": {
+      "RecordIdPropertyName": "Id",
+      "TenantPropertyName": "OrganisationId",
+      "SoftDeletePropertyName": "IsDeleted",
+      "DeletedAtPropertyName": "DeletedAt"
+    }
+  }
+}
+```
+
+**Per-entity** — attribute wins over global config:
 
 ```csharp
 [Retain("orders", nameof(PlacedAt))]
@@ -107,6 +126,8 @@ public sealed class Order
 ```
 
 Available markers: `[RetentionRecordId]`, `[RetentionTenant]`, `[RetentionSoftDelete]`, `[RetentionDeletedAt]`.
+
+Priority: attribute > global config > built-in default.
 
 ## Right-to-erasure (Art. 17)
 
@@ -175,4 +196,4 @@ Every sweep writes to three tables (created by `ConfigureCohortTables()`):
 
 - `sweep_run` — one row per sweep (timestamps, trigger, dry-run flag, total affected)
 - `sweep_run_entity_summary` — per-entity counts (category, strategy, affected, held)
-- `sweep_run_row_detail` — per-row detail (opt-in via `AuditRowDetail.PerRow` on the rule)
+- `sweep_run_row_detail` — per-row detail, opt-in per category (`AuditRowDetail.PerRow` on the rule) or per entity (`[Retain("cat", nameof(Anchor), AuditRowDetail = AuditRowDetail.PerRow)]`). Entity-level wins over category-level.

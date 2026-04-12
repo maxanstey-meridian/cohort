@@ -11,4 +11,6 @@ public sealed class CohortOptions
     public bool KillSwitch { get; init; }
 
     public bool ApplyMigrations { get; init; }
+
+    public CohortConventions Conventions { get; init; } = new();
 }

@@ -33,10 +33,6 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
             );
         }
 
-        var tenant = entry.Tenant
-            ?? throw new InvalidOperationException(
-                $"Retention entry for {entry.EntityType.FullName} must expose tenant metadata for soft-delete previews."
-            );
         var softDelete = entry.SoftDelete
             ?? throw new InvalidOperationException(
                 $"Retention entry for {entry.EntityType.FullName} must expose soft-delete metadata for soft-delete previews."
@@ -48,6 +44,9 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
         }
 
         var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);
+        var tenantClause = entry.Tenant is not null
+            ? $"AND target.{QuoteIdentifier(entry.Tenant.TenantColumn)} = @tenantId"
+            : "";
 
         await using var command = conn.CreateCommand();
         command.CommandText =
@@ -55,12 +54,15 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
             SELECT COUNT(*)
             FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
-              AND target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
+              {tenantClause}
               AND target.{QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
-              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn)}
+              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn, entry.Tenant?.TenantColumn)}
             """;
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
-        command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
+        if (entry.Tenant is not null)
+        {
+            command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
+        }
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
         command.Parameters.Add(CreateParameter(command, "holdAsOf", ctx.Now));
 
@@ -89,10 +91,6 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
             );
         }
 
-        var tenant = entry.Tenant
-            ?? throw new InvalidOperationException(
-                $"Retention entry for {entry.EntityType.FullName} must expose tenant metadata for soft-delete sweeps."
-            );
         var softDelete = entry.SoftDelete
             ?? throw new InvalidOperationException(
                 $"Retention entry for {entry.EntityType.FullName} must expose soft-delete metadata for soft-delete sweeps."
@@ -106,7 +104,7 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
         var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);
         var candidateRecordIds = await SelectCandidateRecordIdsAsync(
             entry,
-            tenant,
+            entry.Tenant?.TenantColumn,
             softDelete,
             ctx,
             conn,
@@ -122,9 +120,12 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
 
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = BuildCommandText(entry, tenant, softDelete, entry.RecordId.RecordIdColumn);
+        command.CommandText = BuildCommandText(entry, entry.Tenant?.TenantColumn, softDelete, entry.RecordId.RecordIdColumn);
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
-        command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
+        if (entry.Tenant is not null)
+        {
+            command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
+        }
         command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
         command.Parameters.Add(CreateParameter(command, "holdAsOf", ctx.Now));
@@ -174,10 +175,6 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
             );
         }
 
-        var tenantConvention = entry.Tenant
-            ?? throw new InvalidOperationException(
-                $"Retention entry for {entry.EntityType.FullName} must expose tenant metadata for soft-delete erasure."
-            );
         var softDelete = entry.SoftDelete
             ?? throw new InvalidOperationException(
                 $"Retention entry for {entry.EntityType.FullName} must expose soft-delete metadata for soft-delete erasure."
@@ -190,7 +187,7 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
 
         var candidateRecordIds = await SelectErasureCandidateRecordIdsAsync(
             entry,
-            tenantConvention,
+            entry.Tenant?.TenantColumn,
             softDelete,
             match,
             tenant,
@@ -208,12 +205,15 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
         command.Transaction = transaction;
         command.CommandText = BuildErasureCommandText(
             entry,
-            tenantConvention,
+            entry.Tenant?.TenantColumn,
             softDelete,
             match,
             entry.RecordId.RecordIdColumn
         );
-        command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
+        if (entry.Tenant is not null)
+        {
+            command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
+        }
         command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
         command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
@@ -241,7 +241,7 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
 
     private static string BuildCommandText(
         RetentionEntry entry,
-        TenantConvention tenant,
+        string? tenantColumn,
         SoftDeleteConvention softDelete,
         string recordIdColumn
     )
@@ -250,22 +250,26 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
             ? ""
             : $", {QuoteIdentifier(softDelete.DeletedAtColumn)} = @deletedAt";
 
+        var tenantClause = tenantColumn is not null
+            ? $"AND target.{QuoteIdentifier(tenantColumn)} = @tenantId"
+            : "";
+
         return
             $"""
             UPDATE {QuoteIdentifier(entry.TableName)} AS target
             SET {QuoteIdentifier(softDelete.IsDeletedColumn)} = TRUE{deletedAtAssignment}
             WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
-              AND target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
+              {tenantClause}
               AND target.{QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
               AND CAST(target.{QuoteIdentifier(recordIdColumn)} AS text) = ANY(@candidateIds)
-              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn)}
+              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn, tenantColumn)}
             RETURNING target.{QuoteIdentifier(recordIdColumn)}
             """;
     }
 
     private static string BuildErasureCommandText(
         RetentionEntry entry,
-        TenantConvention tenant,
+        string? tenantColumn,
         SoftDeleteConvention softDelete,
         ErasureSubjectMatch match,
         string recordIdColumn
@@ -275,22 +279,26 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
             ? ""
             : $", {QuoteIdentifier(softDelete.DeletedAtColumn)} = @deletedAt";
 
+        var tenantClause = tenantColumn is not null
+            ? $"AND target.{QuoteIdentifier(tenantColumn)} = @tenantId"
+            : "";
+
         return
             $"""
             UPDATE {QuoteIdentifier(entry.TableName)} AS target
             SET {QuoteIdentifier(softDelete.IsDeletedColumn)} = TRUE{deletedAtAssignment}
-            WHERE target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
-              AND target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+            WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+              {tenantClause}
               AND target.{QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
               AND CAST(target.{QuoteIdentifier(recordIdColumn)} AS text) = ANY(@candidateIds)
-              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn)}
+              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn, tenantColumn)}
             RETURNING target.{QuoteIdentifier(recordIdColumn)}
             """;
     }
 
     private static async Task<IReadOnlyList<string>> SelectCandidateRecordIdsAsync(
         RetentionEntry entry,
-        TenantConvention tenant,
+        string? tenantColumn,
         SoftDeleteConvention softDelete,
         RetentionResolutionContext ctx,
         DbConnection conn,
@@ -299,6 +307,10 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
         CancellationToken ct
     )
     {
+        var tenantClause = tenantColumn is not null
+            ? $"AND target.{QuoteIdentifier(tenantColumn)} = @tenantId"
+            : "";
+
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
         command.CommandText =
@@ -306,12 +318,15 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
             SELECT target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
             FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
-              AND target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
+              {tenantClause}
               AND target.{QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
             FOR UPDATE
             """;
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
-        command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
+        if (tenantColumn is not null)
+        {
+            command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
+        }
 
         var candidateRecordIds = new List<string>();
         await using var reader = await command.ExecuteReaderAsync(ct);
@@ -325,7 +340,7 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
 
     private static async Task<IReadOnlyList<string>> SelectErasureCandidateRecordIdsAsync(
         RetentionEntry entry,
-        TenantConvention tenant,
+        string? tenantColumn,
         SoftDeleteConvention softDelete,
         ErasureSubjectMatch match,
         TenantContext erasureTenant,
@@ -334,18 +349,25 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
         CancellationToken ct
     )
     {
+        var tenantClause = tenantColumn is not null
+            ? $"AND target.{QuoteIdentifier(tenantColumn)} = @tenantId"
+            : "";
+
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
         command.CommandText =
             $"""
             SELECT target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
             FROM {QuoteIdentifier(entry.TableName)} AS target
-            WHERE target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
-              AND target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+            WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+              {tenantClause}
               AND target.{QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
             FOR UPDATE
             """;
-        command.Parameters.Add(CreateParameter(command, "tenantId", erasureTenant.Id));
+        if (tenantColumn is not null)
+        {
+            command.Parameters.Add(CreateParameter(command, "tenantId", erasureTenant.Id));
+        }
         command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
 
         var candidateRecordIds = new List<string>();

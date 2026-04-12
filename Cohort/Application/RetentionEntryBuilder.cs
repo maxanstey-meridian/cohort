@@ -1,13 +1,14 @@
 using System.Reflection;
 
 using Cohort.Domain;
+using Cohort.Hosting;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata;
 
 namespace Cohort.Application;
 
-public sealed class RetentionEntryBuilder
+public sealed class RetentionEntryBuilder(CohortConventions conventions)
 {
     private static readonly Type[] AllowedAnchorTypes =
     [
@@ -78,11 +79,12 @@ public sealed class RetentionEntryBuilder
             BuildRecordIdConvention(entityType, storeObject),
             BuildAnonymiseFields(clrType, entityType, storeObject),
             BuildTenantConvention(entityType, storeObject),
-            BuildSoftDeleteConvention(entityType, storeObject)
+            BuildSoftDeleteConvention(entityType, storeObject),
+            retain.AuditRowDetail
         );
     }
 
-    private static RecordIdConvention BuildRecordIdConvention(
+    private RecordIdConvention BuildRecordIdConvention(
         IEntityType entityType,
         StoreObjectIdentifier storeObject
     )
@@ -91,7 +93,7 @@ public sealed class RetentionEntryBuilder
         var recordIdMember = clrType
                 .GetProperties(BindingFlags.Public | BindingFlags.Instance)
                 .FirstOrDefault(p => p.GetCustomAttribute<RetentionRecordIdAttribute>() is not null)
-            ?? clrType.GetProperty("Id", BindingFlags.Public | BindingFlags.Instance);
+            ?? clrType.GetProperty(conventions.RecordIdPropertyName, BindingFlags.Public | BindingFlags.Instance);
         if (recordIdMember is null)
         {
             throw new InvalidOperationException(
@@ -148,7 +150,7 @@ public sealed class RetentionEntryBuilder
         return fields.ToArray();
     }
 
-    private static TenantConvention? BuildTenantConvention(
+    private TenantConvention? BuildTenantConvention(
         IEntityType entityType,
         StoreObjectIdentifier storeObject
     )
@@ -157,7 +159,7 @@ public sealed class RetentionEntryBuilder
         var tenantMember = clrType
                 .GetProperties(BindingFlags.Public | BindingFlags.Instance)
                 .FirstOrDefault(p => p.GetCustomAttribute<RetentionTenantAttribute>() is not null)
-            ?? clrType.GetProperty("TenantId", BindingFlags.Public | BindingFlags.Instance);
+            ?? clrType.GetProperty(conventions.TenantPropertyName, BindingFlags.Public | BindingFlags.Instance);
         if (tenantMember is null)
         {
             return null;
@@ -185,7 +187,7 @@ public sealed class RetentionEntryBuilder
         return new TenantConvention(tenantProperty.Name, tenantColumn);
     }
 
-    private static SoftDeleteConvention? BuildSoftDeleteConvention(
+    private SoftDeleteConvention? BuildSoftDeleteConvention(
         IEntityType entityType,
         StoreObjectIdentifier storeObject
     )
@@ -194,7 +196,7 @@ public sealed class RetentionEntryBuilder
         var isDeletedMember = clrType
                 .GetProperties(BindingFlags.Public | BindingFlags.Instance)
                 .FirstOrDefault(p => p.GetCustomAttribute<RetentionSoftDeleteAttribute>() is not null)
-            ?? clrType.GetProperty("IsDeleted", BindingFlags.Public | BindingFlags.Instance);
+            ?? clrType.GetProperty(conventions.SoftDeletePropertyName, BindingFlags.Public | BindingFlags.Instance);
         if (isDeletedMember is null)
         {
             return null;
@@ -215,7 +217,7 @@ public sealed class RetentionEntryBuilder
         var deletedAtMember = clrType
                 .GetProperties(BindingFlags.Public | BindingFlags.Instance)
                 .FirstOrDefault(p => p.GetCustomAttribute<RetentionDeletedAtAttribute>() is not null)
-            ?? clrType.GetProperty("DeletedAt", BindingFlags.Public | BindingFlags.Instance);
+            ?? clrType.GetProperty(conventions.DeletedAtPropertyName, BindingFlags.Public | BindingFlags.Instance);
         var deletedAtProperty =
             deletedAtMember is null
                 ? null

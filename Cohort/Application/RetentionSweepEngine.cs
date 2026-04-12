@@ -125,7 +125,8 @@ public sealed class RetentionSweepEngine(
                     ct
                 );
 
-                if (rule.AuditRowDetail == AuditRowDetail.PerRow)
+                var effectiveAuditDetail = entry.AuditRowDetail ?? rule.AuditRowDetail;
+                if (effectiveAuditDetail == AuditRowDetail.PerRow)
                 {
                     foreach (var recordId in execution.AffectedRecordIds)
                     {

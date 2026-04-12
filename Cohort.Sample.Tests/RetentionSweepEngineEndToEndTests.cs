@@ -1,5 +1,6 @@
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Hosting;
 using Cohort.Infrastructure.Sweep;
 using Cohort.Sample.Entities;
 
@@ -222,9 +223,9 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         );
         var engine = new RetentionSweepEngine(
             db,
-            new RetentionRegistry(db),
+            new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())),
             repository,
-            new RetentionStartupValidator(db, repository),
+            new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())),
             new NoOpRetentionAuditWriter(),
             [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
         );
@@ -278,9 +279,9 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         );
         var engine = new RetentionSweepEngine(
             db,
-            new RetentionRegistry(db),
+            new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())),
             repository,
-            new RetentionStartupValidator(db, repository),
+            new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())),
             new NoOpRetentionAuditWriter(),
             [strategy, new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
         );
@@ -334,9 +335,9 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         );
         var engine = new RetentionSweepEngine(
             db,
-            new RetentionRegistry(db),
+            new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())),
             repository,
-            new RetentionStartupValidator(db, repository),
+            new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())),
             new NoOpRetentionAuditWriter(),
             [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy()]
         );

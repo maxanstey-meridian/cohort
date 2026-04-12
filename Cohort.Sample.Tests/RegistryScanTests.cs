@@ -1,5 +1,6 @@
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Hosting;
 using Cohort.Sample.Entities;
 
 using Microsoft.EntityFrameworkCore;
@@ -34,7 +35,7 @@ public sealed class RegistryScanTests
             .Options;
         using var db = new SampleDbContext(options);
 
-        var entries = new RetentionRegistry(db).Scan();
+        var entries = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())).Scan();
 
         // Positive — the one annotated entity is found, with the right shape
         entries
@@ -78,7 +79,7 @@ public sealed class RegistryScanTests
             .Options;
         using var db = new RegistryMetadataDbContext(options);
 
-        var entry = new RetentionRegistry(db).Scan()[typeof(RetentionReadyRecord)];
+        var entry = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())).Scan()[typeof(RetentionReadyRecord)];
 
         entry.TableName.Should().Be("retention_ready_records");
         entry.AnchorMember.Should().Be(nameof(RetentionReadyRecord.RetainedAt));
@@ -108,7 +109,7 @@ public sealed class RegistryScanTests
             .Options;
         using var db = new RegistryMetadataDbContext(options);
 
-        var entry = new RetentionRegistry(db).Scan()[typeof(RetentionReadyRecord)];
+        var entry = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())).Scan()[typeof(RetentionReadyRecord)];
 
         entry.SoftDelete.Should().NotBeNull();
         entry.SoftDelete!.IsDeletedMember.Should().Be(nameof(RetentionReadyRecord.IsDeleted));
@@ -125,7 +126,7 @@ public sealed class RegistryScanTests
             .Options;
         using var db = new UnmappedDeletedAtDbContext(options);
 
-        var act = () => new RetentionRegistry(db).Scan();
+        var act = () => new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())).Scan();
 
         act.Should()
             .Throw<InvalidOperationException>()
@@ -141,7 +142,7 @@ public sealed class RegistryScanTests
             .UseInMemoryDatabase($"registry-cache-{Guid.NewGuid()}")
             .Options;
         using var db = new RegistryMetadataDbContext(options);
-        var registry = new RetentionRegistry(db);
+        var registry = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions()));
 
         var firstScan = registry.Scan();
         var secondScan = registry.Scan();

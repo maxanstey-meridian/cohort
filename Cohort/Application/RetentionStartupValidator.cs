@@ -8,7 +8,8 @@ namespace Cohort.Application;
 
 public sealed class RetentionStartupValidator(
     DbContext db,
-    IRetentionCategoryRepository categoryRepository
+    IRetentionCategoryRepository categoryRepository,
+    RetentionEntryBuilder entryBuilder
 )
 {
     private static readonly NullabilityInfoContext NullabilityInfoContext = new();
@@ -19,8 +20,6 @@ public sealed class RetentionStartupValidator(
         typeof(DateTimeOffset),
         typeof(DateTimeOffset?),
     ];
-
-    private readonly RetentionEntryBuilder entryBuilder = new();
 
     public async Task ValidateAsync(CancellationToken ct = default)
     {
@@ -119,20 +118,6 @@ public sealed class RetentionStartupValidator(
         errors.AddRange(GetAnonymiseConventionErrors(entry, messagePrefix));
     }
 
-    private static void ValidateSoftDeleteTenantConvention(
-        RetentionEntry entry,
-        List<string> errors,
-        string messagePrefix
-    )
-    {
-        if (entry.Tenant is null)
-        {
-            errors.Add(
-                $"{messagePrefix} retained SoftDelete categories require tenant metadata via a public Guid or nullable Guid TenantId property mapped by EF."
-            );
-        }
-    }
-
     private static bool IsNonNullableValueType(Type type)
     {
         return type.IsValueType && Nullable.GetUnderlyingType(type) is null;
@@ -144,8 +129,6 @@ public sealed class RetentionStartupValidator(
     )
     {
         var errors = new List<string>();
-
-        ValidateSoftDeleteTenantConvention(entry, errors, messagePrefix);
 
         if (entry.SoftDelete is null)
         {
@@ -188,13 +171,6 @@ public sealed class RetentionStartupValidator(
     )
     {
         var errors = new List<string>();
-
-        if (entry.Tenant is null)
-        {
-            errors.Add(
-                $"{messagePrefix} retained Anonymise categories require tenant metadata via a public Guid or nullable Guid TenantId property mapped by EF."
-            );
-        }
 
         if (entry.AnonymiseFields.Count == 0)
         {

@@ -32,11 +32,6 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             );
         }
 
-        var tenant = entry.Tenant
-            ?? throw new InvalidOperationException(
-                $"Retention entry for {entry.EntityType.FullName} must expose tenant metadata for anonymise previews."
-            );
-
         if (entry.AnonymiseFields.Count == 0)
         {
             throw new InvalidOperationException(
@@ -50,6 +45,9 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         }
 
         var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);
+        var tenantClause = entry.Tenant is not null
+            ? $"AND target.{QuoteIdentifier(entry.Tenant.TenantColumn)} = @tenantId"
+            : "";
 
         await using var command = conn.CreateCommand();
         command.CommandText =
@@ -57,11 +55,14 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             SELECT COUNT(*)
             FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
-              AND target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
-              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn)}
+              {tenantClause}
+              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn, entry.Tenant?.TenantColumn)}
             """;
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
-        command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
+        if (entry.Tenant is not null)
+        {
+            command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
+        }
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
         command.Parameters.Add(CreateParameter(command, "holdAsOf", ctx.Now));
 
@@ -90,11 +91,6 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             );
         }
 
-        var tenant = entry.Tenant
-            ?? throw new InvalidOperationException(
-                $"Retention entry for {entry.EntityType.FullName} must expose tenant metadata for anonymise sweeps."
-            );
-
         if (entry.AnonymiseFields.Count == 0)
         {
             throw new InvalidOperationException(
@@ -110,7 +106,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);
         var candidateRecordIds = await SelectCandidateRecordIdsAsync(
             entry,
-            tenant,
+            entry.Tenant?.TenantColumn,
             ctx,
             conn,
             transaction,
@@ -125,9 +121,12 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
 
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = BuildCommandText(entry, tenant, command, entry.RecordId.RecordIdColumn);
+        command.CommandText = BuildCommandText(entry, entry.Tenant?.TenantColumn, command, entry.RecordId.RecordIdColumn);
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
-        command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
+        if (entry.Tenant is not null)
+        {
+            command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
+        }
         command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
         command.Parameters.Add(CreateParameter(command, "holdAsOf", ctx.Now));
@@ -170,11 +169,6 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             );
         }
 
-        var tenantConvention = entry.Tenant
-            ?? throw new InvalidOperationException(
-                $"Retention entry for {entry.EntityType.FullName} must expose tenant metadata for anonymise erasure."
-            );
-
         if (entry.AnonymiseFields.Count == 0)
         {
             throw new InvalidOperationException(
@@ -189,7 +183,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
 
         var candidateRecordIds = await SelectErasureCandidateRecordIdsAsync(
             entry,
-            tenantConvention,
+            entry.Tenant?.TenantColumn,
             match,
             tenant,
             conn,
@@ -206,12 +200,15 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         command.Transaction = transaction;
         command.CommandText = BuildErasureCommandText(
             entry,
-            tenantConvention,
+            entry.Tenant?.TenantColumn,
             match,
             command,
             entry.RecordId.RecordIdColumn
         );
-        command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
+        if (entry.Tenant is not null)
+        {
+            command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
+        }
         command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
         command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
@@ -232,7 +229,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
 
     private static string BuildCommandText(
         RetentionEntry entry,
-        TenantConvention tenant,
+        string? tenantColumn,
         DbCommand command,
         string recordIdColumn
     )
@@ -249,21 +246,25 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             );
         }
 
+        var tenantClause = tenantColumn is not null
+            ? $"AND target.{QuoteIdentifier(tenantColumn)} = @tenantId"
+            : "";
+
         return
             $"""
             UPDATE {QuoteIdentifier(entry.TableName)} AS target
             SET {string.Join(", ", assignments)}
             WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
-              AND target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
+              {tenantClause}
               AND CAST(target.{QuoteIdentifier(recordIdColumn)} AS text) = ANY(@candidateIds)
-              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn)}
+              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn, tenantColumn)}
             RETURNING target.{QuoteIdentifier(recordIdColumn)}
             """;
     }
 
     private static string BuildErasureCommandText(
         RetentionEntry entry,
-        TenantConvention tenant,
+        string? tenantColumn,
         ErasureSubjectMatch match,
         DbCommand command,
         string recordIdColumn
@@ -281,21 +282,25 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             );
         }
 
+        var tenantClause = tenantColumn is not null
+            ? $"AND target.{QuoteIdentifier(tenantColumn)} = @tenantId"
+            : "";
+
         return
             $"""
             UPDATE {QuoteIdentifier(entry.TableName)} AS target
             SET {string.Join(", ", assignments)}
-            WHERE target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
-              AND target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+            WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+              {tenantClause}
               AND CAST(target.{QuoteIdentifier(recordIdColumn)} AS text) = ANY(@candidateIds)
-              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn)}
+              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn, tenantColumn)}
             RETURNING target.{QuoteIdentifier(recordIdColumn)}
             """;
     }
 
     private static async Task<IReadOnlyList<string>> SelectCandidateRecordIdsAsync(
         RetentionEntry entry,
-        TenantConvention tenant,
+        string? tenantColumn,
         RetentionResolutionContext ctx,
         DbConnection conn,
         DbTransaction transaction,
@@ -303,6 +308,10 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         CancellationToken ct
     )
     {
+        var tenantClause = tenantColumn is not null
+            ? $"AND target.{QuoteIdentifier(tenantColumn)} = @tenantId"
+            : "";
+
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
         command.CommandText =
@@ -310,11 +319,14 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             SELECT target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
             FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
-              AND target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
+              {tenantClause}
             FOR UPDATE
             """;
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
-        command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
+        if (tenantColumn is not null)
+        {
+            command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
+        }
 
         var candidateRecordIds = new List<string>();
         await using var reader = await command.ExecuteReaderAsync(ct);
@@ -328,7 +340,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
 
     private static async Task<IReadOnlyList<string>> SelectErasureCandidateRecordIdsAsync(
         RetentionEntry entry,
-        TenantConvention tenant,
+        string? tenantColumn,
         ErasureSubjectMatch match,
         TenantContext erasureTenant,
         DbConnection conn,
@@ -336,17 +348,24 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         CancellationToken ct
     )
     {
+        var tenantClause = tenantColumn is not null
+            ? $"AND target.{QuoteIdentifier(tenantColumn)} = @tenantId"
+            : "";
+
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
         command.CommandText =
             $"""
             SELECT target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
             FROM {QuoteIdentifier(entry.TableName)} AS target
-            WHERE target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
-              AND target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+            WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+              {tenantClause}
             FOR UPDATE
             """;
-        command.Parameters.Add(CreateParameter(command, "tenantId", erasureTenant.Id));
+        if (tenantColumn is not null)
+        {
+            command.Parameters.Add(CreateParameter(command, "tenantId", erasureTenant.Id));
+        }
         command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
 
         var candidateRecordIds = new List<string>();

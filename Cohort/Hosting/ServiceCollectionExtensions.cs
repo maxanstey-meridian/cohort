@@ -23,6 +23,9 @@ public static class ServiceCollectionExtensions
             ServiceDescriptor.Singleton<IValidateOptions<CohortOptions>, CohortOptionsValidator>()
         );
 
+        services.TryAddSingleton(sp =>
+            new RetentionEntryBuilder(sp.GetRequiredService<IOptions<CohortOptions>>().Value.Conventions));
+
         services.TryAddScoped<DbContext>(sp => sp.GetRequiredService<TContext>());
         services.TryAddSingleton<IRetentionCategoryRepository, MissingRetentionCategoryRepository>();
         services.TryAddScoped<IRetentionAuditWriter, EfRetentionAuditWriter>();

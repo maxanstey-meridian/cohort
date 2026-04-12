@@ -1,5 +1,6 @@
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Hosting;
 using Cohort.Infrastructure.Sweep;
 using Cohort.Sample.Entities;
 
@@ -255,9 +256,9 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
         );
         var preview = new RetentionPreviewService(
             db,
-            new RetentionRegistry(db),
+            new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())),
             repository,
-            new RetentionStartupValidator(db, repository),
+            new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())),
             [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
         );
 

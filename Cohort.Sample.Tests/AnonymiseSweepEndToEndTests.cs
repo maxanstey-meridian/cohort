@@ -308,6 +308,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "anonymise",
             nameof(AnonymisedContact.CreatedAt),
             "CreatedAt",
+            new RecordIdConvention(nameof(AnonymisedContact.Id), "Id"),
             [
                 new AnonymiseField(nameof(AnonymisedContact.EmailAddress), "EmailAddress", AnonymiseMethod.Null),
                 new AnonymiseField(nameof(AnonymisedContact.GivenName), "GivenName", AnonymiseMethod.EmptyString),

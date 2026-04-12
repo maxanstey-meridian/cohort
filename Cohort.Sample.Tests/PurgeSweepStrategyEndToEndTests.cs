@@ -50,6 +50,7 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
             "short-lived",
             nameof(PurgeCandidateRecord.CreatedAt),
             "CreatedAt",
+            new RecordIdConvention(nameof(PurgeCandidateRecord.Id), "Id"),
             [],
             new TenantConvention(nameof(PurgeCandidateRecord.TenantId), "TenantId"),
             null
@@ -97,6 +98,7 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
             "short-lived",
             nameof(PurgeCandidateRecord.CreatedAt),
             "CreatedAt",
+            new RecordIdConvention(nameof(PurgeCandidateRecord.Id), "Id"),
             [],
             new TenantConvention(nameof(PurgeCandidateRecord.TenantId), "TenantId"),
             null
@@ -135,6 +137,47 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
         connection.LastCommand.Parameters["tenantId"].Value.Should().Be(tenantId);
         connection.LastCommand.Parameters["holdTableName"].Value.Should().Be("purge_candidate_records");
         connection.LastCommand.Parameters["holdAsOf"].Value.Should().Be(now);
+    }
+
+    [Fact]
+    public async Task SweepAsync_Uses_The_Mapped_Record_Id_Column_In_Hold_Filtering()
+    {
+        var strategy = new PurgeSweepStrategy();
+        var connection = new RecordingDbConnection();
+        var transaction = connection.BeginTransaction();
+        var tenantId = Guid.NewGuid();
+        var now = new DateTimeOffset(2026, 4, 11, 12, 0, 0, TimeSpan.Zero);
+        var entry = new RetentionEntry(
+            typeof(PurgeCandidateRecord),
+            "purge_candidate_records",
+            "short-lived",
+            nameof(PurgeCandidateRecord.CreatedAt),
+            "CreatedAt",
+            new RecordIdConvention(nameof(PurgeCandidateRecord.Id), "record_id"),
+            [],
+            new TenantConvention(nameof(PurgeCandidateRecord.TenantId), "TenantId"),
+            null
+        );
+        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge);
+        var context = new RetentionResolutionContext(
+            "short-lived",
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            now,
+            []
+        );
+
+        var affected = await strategy.SweepAsync(
+            entry,
+            rule,
+            context,
+            connection,
+            transaction,
+            CancellationToken.None
+        );
+
+        affected.Should().Be(1);
+        connection.LastCommand.Should().NotBeNull();
+        connection.LastCommand!.CommandText.Should().Contain("hold.\"RecordId\" = target.\"record_id\"");
     }
 
     private static async Task InsertRecordAsync(

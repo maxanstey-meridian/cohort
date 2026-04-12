@@ -48,11 +48,9 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
             await conn.OpenAsync(ct);
         }
 
-        var recordIdColumn = RetentionHoldSql.GetRecordIdColumn(entry);
-
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = BuildCommandText(entry, tenant, softDelete, recordIdColumn);
+        command.CommandText = BuildCommandText(entry, tenant, softDelete, entry.RecordId.RecordIdColumn);
 
         var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));

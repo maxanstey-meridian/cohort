@@ -13,45 +13,74 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
     [Fact]
     public async Task Repository_Path_Can_Create_List_Check_And_Remove_Holds_Through_The_Default_Ef_Repository()
     {
-        var holdId = Guid.NewGuid();
-        var recordId = Guid.NewGuid();
+        var activeHoldId = Guid.NewGuid();
+        var expiredHoldId = Guid.NewGuid();
+        var removedHoldId = Guid.NewGuid();
+        var activeRecordId = Guid.NewGuid();
+        var expiredRecordId = Guid.NewGuid();
+        var removedRecordId = Guid.NewGuid();
         var tenantId = Guid.NewGuid();
         var createdAt = new DateTimeOffset(2026, 4, 10, 12, 0, 0, TimeSpan.Zero);
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
 
         await CreateHoldAsync(
             new RetentionHoldRequest(
-                holdId,
+                activeHoldId,
                 "notes",
-                recordId,
+                activeRecordId,
                 tenantId,
                 "investigation",
                 createdAt
             )
         );
+        await CreateHoldAsync(
+            new RetentionHoldRequest(
+                expiredHoldId,
+                "notes",
+                expiredRecordId,
+                tenantId,
+                "expired investigation",
+                createdAt,
+                asOf.AddHours(-1)
+            )
+        );
+        await CreateHoldAsync(
+            new RetentionHoldRequest(
+                removedHoldId,
+                "notes",
+                removedRecordId,
+                tenantId,
+                "removed investigation",
+                createdAt
+            )
+        );
 
-        var activeBeforeRemoval = await HasActiveHoldAsync("notes", recordId, tenantId, asOf);
+        var activeBeforeRemoval = await HasActiveHoldAsync("notes", activeRecordId, tenantId, asOf);
         var activeBeforeCreation = await HasActiveHoldAsync(
             "notes",
-            recordId,
+            activeRecordId,
             tenantId,
             createdAt.AddMinutes(-1)
         );
+        var expiredAtQueryTime = await HasActiveHoldAsync("notes", expiredRecordId, tenantId, asOf);
+        var removedAtQueryTime = await HasActiveHoldAsync("notes", removedRecordId, tenantId, asOf);
         var listedBeforeRemoval = await ListActiveAsync(asOf);
 
-        await RemoveHoldAsync(holdId, asOf.AddMinutes(-30));
+        await RemoveHoldAsync(removedHoldId, asOf.AddMinutes(-30));
 
-        var activeAfterRemoval = await HasActiveHoldAsync("notes", recordId, tenantId, asOf);
+        var activeAfterRemoval = await HasActiveHoldAsync("notes", removedRecordId, tenantId, asOf);
         var listedAfterRemoval = await ListActiveAsync(asOf);
 
         activeBeforeRemoval.Should().BeTrue();
         activeBeforeCreation.Should().BeFalse();
-        listedBeforeRemoval.Should().ContainSingle();
-        listedBeforeRemoval[0].Should().Be(
+        expiredAtQueryTime.Should().BeFalse();
+        removedAtQueryTime.Should().BeTrue();
+        listedBeforeRemoval.Should().HaveCount(2);
+        listedBeforeRemoval.Should().Contain(
             new RetentionHold(
-                holdId,
+                activeHoldId,
                 "notes",
-                recordId,
+                activeRecordId,
                 tenantId,
                 "investigation",
                 createdAt,
@@ -59,18 +88,44 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
                 null
             )
         );
+        listedBeforeRemoval.Should().Contain(
+            new RetentionHold(
+                removedHoldId,
+                "notes",
+                removedRecordId,
+                tenantId,
+                "removed investigation",
+                createdAt,
+                null,
+                null
+            )
+        );
         activeAfterRemoval.Should().BeFalse();
-        listedAfterRemoval.Should().BeEmpty();
+        listedAfterRemoval.Should().ContainSingle();
+        listedAfterRemoval[0].Should().Be(
+            new RetentionHold(
+                activeHoldId,
+                "notes",
+                activeRecordId,
+                tenantId,
+                "investigation",
+                createdAt,
+                null,
+                null
+            )
+        );
 
         await using var verify = Host.CreateDbContext();
-        var stored = await verify.HeldRecords.SingleAsync();
-        stored.HoldId.Should().Be(holdId);
-        stored.TableName.Should().Be("notes");
-        stored.RecordId.Should().Be(recordId);
-        stored.TenantId.Should().Be(tenantId);
-        stored.Reason.Should().Be("investigation");
-        stored.CreatedAt.Should().Be(createdAt);
-        stored.RemovedAt.Should().Be(asOf.AddMinutes(-30));
+        var stored = await verify.HeldRecords.OrderBy(record => record.Reason).ToListAsync();
+        stored.Should().HaveCount(3);
+        stored.Select(record => record.Reason)
+            .Should()
+            .Equal("expired investigation", "investigation", "removed investigation");
+        stored.Single(record => record.HoldId == activeHoldId).RemovedAt.Should().BeNull();
+        stored.Single(record => record.HoldId == expiredHoldId).ExpiresAt.Should().Be(asOf.AddHours(-1));
+        stored.Single(record => record.HoldId == removedHoldId)
+            .RemovedAt.Should()
+            .Be(asOf.AddMinutes(-30));
     }
 
     [Fact]

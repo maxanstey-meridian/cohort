@@ -43,8 +43,6 @@ public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
             await conn.OpenAsync(ct);
         }
 
-        var recordIdColumn = RetentionHoldSql.GetRecordIdColumn(entry);
-
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
         command.CommandText =
@@ -52,7 +50,7 @@ public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
             DELETE FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               AND target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
-              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn)}
+              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn)}
             """;
 
         var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);

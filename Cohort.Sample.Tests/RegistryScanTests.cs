@@ -83,6 +83,9 @@ public sealed class RegistryScanTests
         entry.TableName.Should().Be("retention_ready_records");
         entry.AnchorMember.Should().Be(nameof(RetentionReadyRecord.RetainedAt));
         entry.AnchorColumn.Should().Be("retained_at_utc");
+        entry.RecordId.Should().Be(
+            new RecordIdConvention(nameof(RetentionReadyRecord.Id), "record_id")
+        );
         entry.Tenant.Should().Be(
             new TenantConvention(nameof(RetentionReadyRecord.TenantId), "tenant_uuid")
         );
@@ -179,6 +182,7 @@ public sealed class RegistryScanTests
             {
                 entity.ToTable("retention_ready_records");
                 entity.HasKey(record => record.Id);
+                entity.Property(record => record.Id).HasColumnName("record_id");
                 entity.Property(record => record.TenantId).HasColumnName("tenant_uuid");
                 entity.Property(record => record.RetainedAt).HasColumnName("retained_at_utc");
                 entity.Property(record => record.EmailAddress).HasColumnName("email_address");

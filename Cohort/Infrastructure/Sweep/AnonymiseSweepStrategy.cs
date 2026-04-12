@@ -50,11 +50,9 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             await conn.OpenAsync(ct);
         }
 
-        var recordIdColumn = RetentionHoldSql.GetRecordIdColumn(entry);
-
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = BuildCommandText(entry, tenant, command, recordIdColumn);
+        command.CommandText = BuildCommandText(entry, tenant, command, entry.RecordId.RecordIdColumn);
 
         var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));

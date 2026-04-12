@@ -75,10 +75,40 @@ public sealed class RetentionEntryBuilder
             retain.Category,
             retain.AnchorMember,
             anchorColumn,
+            BuildRecordIdConvention(entityType, storeObject),
             BuildAnonymiseFields(clrType, entityType, storeObject),
             BuildTenantConvention(entityType, storeObject),
             BuildSoftDeleteConvention(entityType, storeObject)
         );
+    }
+
+    private static RecordIdConvention BuildRecordIdConvention(
+        IEntityType entityType,
+        StoreObjectIdentifier storeObject
+    )
+    {
+        var clrType = entityType.ClrType;
+        var recordIdMember = clrType.GetProperty("Id", BindingFlags.Public | BindingFlags.Instance);
+        if (recordIdMember is null || (recordIdMember.PropertyType != typeof(Guid) && recordIdMember.PropertyType != typeof(Guid?)))
+        {
+            throw new InvalidOperationException(
+                $"Record-id convention on {clrType.FullName}: Id must be Guid or nullable Guid to support legal holds, got {recordIdMember?.PropertyType.Name ?? "<missing>"}."
+            );
+        }
+
+        var recordIdProperty =
+            entityType.FindProperty(recordIdMember.Name)
+            ?? throw new InvalidOperationException(
+                $"Record-id convention on {clrType.FullName}: Id is not mapped by EF."
+            );
+
+        var recordIdColumn =
+            recordIdProperty.GetColumnName(storeObject)
+            ?? throw new InvalidOperationException(
+                $"Record-id convention on {clrType.FullName}: Id has no mapped table column."
+            );
+
+        return new RecordIdConvention(recordIdProperty.Name, recordIdColumn);
     }
 
     private static IReadOnlyList<AnonymiseField> BuildAnonymiseFields(

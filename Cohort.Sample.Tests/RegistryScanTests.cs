@@ -39,17 +39,26 @@ public sealed class RegistryScanTests
         // Positive — the one annotated entity is found, with the right shape
         entries
             .Should()
-            .ContainSingle(kvp =>
+            .Contain(kvp =>
                 kvp.Key == typeof(Note)
                 && kvp.Value.Category == "short-lived"
                 && kvp.Value.TableName == "notes"
                 && kvp.Value.AnchorMember == nameof(Note.CreatedAt)
                 && kvp.Value.EntityType == typeof(Note)
             );
+        entries
+            .Should()
+            .Contain(kvp =>
+                kvp.Key == typeof(SoftDeleteRecord)
+                && kvp.Value.Category == "soft-delete"
+                && kvp.Value.TableName == "soft_delete_records"
+                && kvp.Value.AnchorMember == nameof(SoftDeleteRecord.CreatedAt)
+                && kvp.Value.EntityType == typeof(SoftDeleteRecord)
+            );
 
         // Negative — nothing else sneaks in
         entries.Values.Should().NotContain(e => e.Category == "long-lived");
-        entries.Should().HaveCount(1);
+        entries.Should().HaveCount(2);
     }
 
     [Fact]

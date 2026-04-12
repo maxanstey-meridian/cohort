@@ -11,6 +11,14 @@ public sealed class RetentionStartupValidator(
     IRetentionCategoryRepository categoryRepository
 )
 {
+    private static readonly Type[] AllowedSoftDeleteTimestampTypes =
+    [
+        typeof(DateTime),
+        typeof(DateTime?),
+        typeof(DateTimeOffset),
+        typeof(DateTimeOffset?),
+    ];
+
     private readonly RetentionEntryBuilder entryBuilder = new();
 
     public async Task ValidateAsync(CancellationToken ct = default)
@@ -70,7 +78,11 @@ public sealed class RetentionStartupValidator(
 
             try
             {
-                _ = resolver.TryResolveAtStartup();
+                var startupRule = resolver.TryResolveAtStartup();
+                if (startupRule?.Strategy == Strategy.SoftDelete)
+                {
+                    ValidateSoftDeleteConvention(entry, errors);
+                }
             }
             catch (Exception ex)
             {
@@ -83,6 +95,38 @@ public sealed class RetentionStartupValidator(
         if (errors.Count > 0)
         {
             throw new RetentionConfigurationException(errors);
+        }
+    }
+
+    private static void ValidateSoftDeleteConvention(RetentionEntry entry, List<string> errors)
+    {
+        var clrType = entry.EntityType;
+        var isDeletedMember = clrType.GetProperty("IsDeleted", BindingFlags.Public | BindingFlags.Instance);
+        if (isDeletedMember is null || isDeletedMember.PropertyType != typeof(bool))
+        {
+            errors.Add(
+                $"Soft-delete convention on {clrType.FullName}: retained SoftDelete categories require a public bool IsDeleted CLR property."
+            );
+            return;
+        }
+
+        if (entry.SoftDelete is null)
+        {
+            errors.Add(
+                $"Soft-delete convention on {clrType.FullName}: retained SoftDelete categories require IsDeleted to be mapped by EF."
+            );
+            return;
+        }
+
+        var deletedAtMember = clrType.GetProperty("DeletedAt", BindingFlags.Public | BindingFlags.Instance);
+        if (
+            deletedAtMember is not null
+            && !AllowedSoftDeleteTimestampTypes.Contains(deletedAtMember.PropertyType)
+        )
+        {
+            errors.Add(
+                $"Soft-delete convention on {clrType.FullName}: DeletedAt must be DateTime or DateTimeOffset (nullable allowed), got {deletedAtMember.PropertyType.Name}."
+            );
         }
     }
 }

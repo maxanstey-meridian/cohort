@@ -57,14 +57,23 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().ContainSingle();
-        result.Counts[0].Should().Be(
+        result.Counts.Should().HaveCount(2);
+        result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
                 "short-lived",
                 tenantA,
                 Strategy.Purge,
                 1
+            )
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(SoftDeleteRecord),
+                "soft-delete",
+                tenantA,
+                Strategy.SoftDelete,
+                0
             )
         );
 
@@ -110,6 +119,9 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
                     ["short-lived"] = new StaticRetentionRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
                     ),
+                    ["soft-delete"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    ),
                 }
             )
         );
@@ -119,13 +131,22 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().ContainSingle();
-        result.Counts[0].Should().Be(
+        result.Counts.Should().HaveCount(2);
+        result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
                 "short-lived",
                 tenantId,
                 Strategy.Exempt,
+                0
+            )
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(SoftDeleteRecord),
+                "soft-delete",
+                tenantId,
+                Strategy.SoftDelete,
                 0
             )
         );
@@ -174,6 +195,9 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
                             TimeSpan.FromDays(90)
                         )
                     ),
+                    ["soft-delete"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    ),
                 }
             )
         );
@@ -183,14 +207,23 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().ContainSingle();
-        result.Counts[0].Should().Be(
+        result.Counts.Should().HaveCount(2);
+        result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
                 "short-lived",
                 tenantId,
                 Strategy.Purge,
                 1
+            )
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(SoftDeleteRecord),
+                "soft-delete",
+                tenantId,
+                Strategy.SoftDelete,
+                0
             )
         );
 
@@ -239,14 +272,23 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().ContainSingle();
-        result.Counts[0].Should().Be(
+        result.Counts.Should().HaveCount(2);
+        result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
                 "short-lived",
                 tenantA,
                 Strategy.Purge,
                 1
+            )
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(SoftDeleteRecord),
+                "soft-delete",
+                tenantA,
+                Strategy.SoftDelete,
+                0
             )
         );
 

@@ -58,16 +58,21 @@ public sealed class RetentionPreviewService(
 
             var context = new RetentionResolutionContext(entry.Category, tenant, now, []);
             var rule = await resolver.ResolveAsync(context, ct);
-            if (rule.Strategy is not Strategy.Purge and not Strategy.Exempt)
+            if (
+                rule.Strategy is not Strategy.Purge
+                    and not Strategy.SoftDelete
+                    and not Strategy.Exempt
+            )
             {
                 throw new InvalidOperationException(
-                    $"Retention strategy '{rule.Strategy}' is not supported by the Milestone A preview path."
+                    $"Retention strategy '{rule.Strategy}' is not supported by the preview path."
                 );
             }
 
             var affected = rule.Strategy switch
             {
                 Strategy.Purge => await CountCandidatesAsync(entry, rule, context, ct),
+                Strategy.SoftDelete => await CountCandidatesAsync(entry, rule, context, ct),
                 Strategy.Exempt => 0,
                 _ => throw new UnreachableException(
                     "Preview execution should only contain supported strategies."
@@ -99,7 +104,7 @@ public sealed class RetentionPreviewService(
         ArgumentNullException.ThrowIfNull(rule);
         ArgumentNullException.ThrowIfNull(context);
 
-        if (rule.Strategy != Strategy.Purge)
+        if (rule.Strategy is not Strategy.Purge and not Strategy.SoftDelete)
         {
             throw new InvalidOperationException(
                 $"RetentionPreviewService cannot preview {rule.Strategy} rules."
@@ -118,7 +123,8 @@ public sealed class RetentionPreviewService(
             entry.AnchorMember,
             tenant.TenantMember,
             context.Tenant.Id,
-            CutoffCalculator.Compute(context.Now, rule.Period, rule.LegalMin)
+            CutoffCalculator.Compute(context.Now, rule.Period, rule.LegalMin),
+            rule.Strategy == Strategy.SoftDelete ? entry.SoftDelete?.IsDeletedMember : null
         );
         var filtered = query.Provider.CreateQuery(
             Expression.Call(
@@ -141,7 +147,8 @@ public sealed class RetentionPreviewService(
         string anchorMember,
         string tenantMember,
         Guid tenantId,
-        DateTimeOffset cutoff
+        DateTimeOffset cutoff,
+        string? isDeletedMember
     )
     {
         var entity = Expression.Parameter(entityType, "entity");
@@ -155,8 +162,18 @@ public sealed class RetentionPreviewService(
                 : Expression.Constant(tenantId)
         );
         var cutoffPredicate = CreateCutoffPredicate(anchorAccess, cutoff);
+        var predicate = Expression.AndAlso(cutoffPredicate, tenantPredicate);
 
-        return Expression.Lambda(Expression.AndAlso(cutoffPredicate, tenantPredicate), entity);
+        if (isDeletedMember is not null)
+        {
+            var isDeletedAccess = Expression.Property(entity, isDeletedMember);
+            predicate = Expression.AndAlso(
+                predicate,
+                Expression.Equal(isDeletedAccess, Expression.Constant(false))
+            );
+        }
+
+        return Expression.Lambda(predicate, entity);
     }
 
     private static Expression CreateCutoffPredicate(

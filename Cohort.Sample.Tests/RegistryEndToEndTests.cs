@@ -69,12 +69,22 @@ public sealed class RegistryEndToEndTests(PostgresFixture fixture) : Integration
         // fixture is ignored by the registry surface.
         entries
             .Should()
-            .ContainSingle(kvp =>
+            .Contain(kvp =>
                 kvp.Key == typeof(Note)
                 && kvp.Value.Category == "short-lived"
                 && kvp.Value.AnchorMember == nameof(Note.CreatedAt)
                 && kvp.Value.Tenant != null
                 && kvp.Value.EntityType == typeof(Note)
+            );
+        entries
+            .Should()
+            .Contain(kvp =>
+                kvp.Key == typeof(SoftDeleteRecord)
+                && kvp.Value.Category == "soft-delete"
+                && kvp.Value.AnchorMember == nameof(SoftDeleteRecord.CreatedAt)
+                && kvp.Value.Tenant != null
+                && kvp.Value.SoftDelete != null
+                && kvp.Value.EntityType == typeof(SoftDeleteRecord)
             );
         entries.Values.Should().NotContain(e => e.Category == "long-lived");
         entries.Should().NotContainKey(typeof(ExemptDocument));

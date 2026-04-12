@@ -60,6 +60,33 @@ namespace Cohort.Sample.Migrations
 
                     b.ToTable("notes", (string)null);
                 });
+
+            modelBuilder.Entity("Cohort.Sample.Entities.SoftDeleteRecord", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("Body")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset?>("DeletedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<bool>("IsDeleted")
+                        .HasColumnType("boolean");
+
+                    b.Property<Guid>("TenantId")
+                        .HasColumnType("uuid");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("soft_delete_records", (string)null);
+                });
 #pragma warning restore 612, 618
         }
     }

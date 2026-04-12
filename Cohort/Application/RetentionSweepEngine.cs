@@ -1,5 +1,4 @@
 using System.Data;
-using System.Diagnostics;
 
 using Cohort.Domain;
 
@@ -12,9 +11,12 @@ public sealed class RetentionSweepEngine(
     DbContext db,
     RetentionRegistry registry,
     IRetentionCategoryRepository categoryRepository,
-    IRetentionSweepStrategy purgeSweepStrategy
+    IEnumerable<IRetentionSweepStrategy> sweepStrategies
 )
 {
+    private readonly IReadOnlyDictionary<Strategy, IRetentionSweepStrategy> strategies = sweepStrategies
+        .ToDictionary(strategy => strategy.HandlesStrategy);
+
     public async Task<RetentionSweepResult> SweepAsync(
         TenantContext tenant,
         DateTimeOffset now,
@@ -42,10 +44,12 @@ public sealed class RetentionSweepEngine(
 
             var context = new RetentionResolutionContext(entry.Category, tenant, now, []);
             var rule = await resolver.ResolveAsync(context, ct);
-            if (rule.Strategy is not Strategy.Purge and not Strategy.Exempt)
+            if (
+                rule.Strategy != Strategy.Exempt && !strategies.ContainsKey(rule.Strategy)
+            )
             {
                 throw new InvalidOperationException(
-                    $"Retention strategy '{rule.Strategy}' is not supported by the Milestone A sweep engine."
+                    $"Retention strategy '{rule.Strategy}' is not registered for sweep execution."
                 );
             }
 
@@ -75,7 +79,8 @@ public sealed class RetentionSweepEngine(
             {
                 var affected = rule.Strategy switch
                 {
-                    Strategy.Purge => await purgeSweepStrategy.SweepAsync(
+                    Strategy.Exempt => 0,
+                    _ => await strategies[rule.Strategy].SweepAsync(
                         entry,
                         rule,
                         context,
@@ -83,8 +88,6 @@ public sealed class RetentionSweepEngine(
                         dbTransaction,
                         ct
                     ),
-                    Strategy.Exempt => 0,
-                    _ => throw new UnreachableException("Execution plan should only contain supported strategies."),
                 };
 
                 counts.Add(

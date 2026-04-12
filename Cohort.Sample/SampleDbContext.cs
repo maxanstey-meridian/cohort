@@ -8,6 +8,7 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
 {
     public DbSet<Note> Notes => Set<Note>();
     public DbSet<ExemptDocument> ExemptDocuments => Set<ExemptDocument>();
+    public DbSet<SoftDeleteRecord> SoftDeleteRecords => Set<SoftDeleteRecord>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -26,6 +27,17 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
             b.HasKey(document => document.Id);
             b.Property(document => document.CreatedAt).IsRequired();
             b.Property(document => document.Title).IsRequired();
+        });
+
+        modelBuilder.Entity<SoftDeleteRecord>(b =>
+        {
+            b.ToTable("soft_delete_records");
+            b.HasKey(record => record.Id);
+            b.Property(record => record.TenantId);
+            b.Property(record => record.CreatedAt).IsRequired();
+            b.Property(record => record.Body).IsRequired();
+            b.Property(record => record.IsDeleted).IsRequired();
+            b.Property(record => record.DeletedAt);
         });
     }
 }

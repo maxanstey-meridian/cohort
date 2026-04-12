@@ -43,13 +43,22 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().ContainSingle();
-        result.Counts[0].Should().Be(
+        result.Counts.Should().HaveCount(2);
+        result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
                 "short-lived",
                 tenantId,
                 Strategy.Purge,
+                0
+            )
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(SoftDeleteRecord),
+                "soft-delete",
+                tenantId,
+                Strategy.SoftDelete,
                 0
             )
         );
@@ -82,7 +91,14 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
         public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
         {
             return Task.FromResult<IRetentionRuleResolver?>(
-                category == "short-lived" ? resolver : null
+                category switch
+                {
+                    "short-lived" => resolver,
+                    "soft-delete" => new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    ),
+                    _ => null,
+                }
             );
         }
     }
@@ -113,6 +129,9 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
             resolvers = new Dictionary<string, IRetentionRuleResolver>
             {
                 ["short-lived"] = new AliasResolver(this, "policy-a"),
+                ["soft-delete"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                ),
                 ["policy-a"] = new AliasResolver(this, "policy-b"),
                 ["policy-b"] = new AliasResolver(this, "policy-a"),
             };

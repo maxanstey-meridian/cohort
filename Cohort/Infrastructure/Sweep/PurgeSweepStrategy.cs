@@ -8,6 +8,8 @@ namespace Cohort.Infrastructure.Sweep;
 
 public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
 {
+    public Strategy HandlesStrategy => Strategy.Purge;
+
     public async Task<int> SweepAsync(
         RetentionEntry entry,
         RetentionRule rule,

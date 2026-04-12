@@ -136,14 +136,19 @@ public sealed class RetentionStartupValidatorTests
             await new RetentionStartupValidator(db, InMemoryCategoryRepository.Empty).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().ContainSingle();
+        exception.Which.Errors.Should().HaveCount(2);
         exception
-            .Which.Errors[0]
-            .Should()
-            .Be(
+            .Which.Errors.Should()
+            .Contain(
                 $"Retention category 'short-lived' for entity {typeof(Note).FullName} could not be resolved."
             );
+        exception
+            .Which.Errors.Should()
+            .Contain(
+                $"Retention category 'soft-delete' for entity {typeof(SoftDeleteRecord).FullName} could not be resolved."
+            );
         exception.Which.Message.Should().Contain("short-lived");
+        exception.Which.Message.Should().Contain("soft-delete");
     }
 
     [Fact]
@@ -240,7 +245,7 @@ public sealed class RetentionStartupValidatorTests
                 db,
                 new RetentionRegistry(db),
                 repository,
-                new PurgeSweepStrategy()
+                [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy()]
             ),
             new RetentionPreviewService(
                 db,
@@ -283,7 +288,7 @@ public sealed class RetentionStartupValidatorTests
                 db,
                 new RetentionRegistry(db),
                 repository,
-                new PurgeSweepStrategy()
+                [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy()]
             ),
             new RetentionPreviewService(
                 db,
@@ -330,7 +335,7 @@ public sealed class RetentionStartupValidatorTests
                 db,
                 new RetentionRegistry(db),
                 repository,
-                new PurgeSweepStrategy()
+                [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy()]
             ),
             new RetentionPreviewService(
                 db,
@@ -383,6 +388,62 @@ public sealed class RetentionStartupValidatorTests
             );
     }
 
+    [Fact]
+    public async Task ValidateAsync_Rejects_SoftDelete_Categories_Without_A_Public_Bool_IsDeleted_Property()
+    {
+        var options = new DbContextOptionsBuilder<InvalidSoftDeleteIsDeletedDbContext>()
+            .UseInMemoryDatabase($"startup-validator-invalid-soft-delete-flag-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new InvalidSoftDeleteIsDeletedDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["invalid-soft-delete"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                ),
+            }
+        );
+
+        var act = async () => await new RetentionStartupValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Soft-delete convention on {typeof(InvalidSoftDeleteIsDeletedRecord).FullName}: retained SoftDelete categories require a public bool IsDeleted CLR property."
+            );
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Rejects_SoftDelete_Categories_With_Invalid_DeletedAt_Types()
+    {
+        var options = new DbContextOptionsBuilder<InvalidSoftDeleteDeletedAtDbContext>()
+            .UseInMemoryDatabase($"startup-validator-invalid-soft-delete-deleted-at-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new InvalidSoftDeleteDeletedAtDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["invalid-soft-delete"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                ),
+            }
+        );
+
+        var act = async () => await new RetentionStartupValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Soft-delete convention on {typeof(InvalidSoftDeleteDeletedAtRecord).FullName}: DeletedAt must be DateTime or DateTimeOffset (nullable allowed), got String."
+            );
+    }
+
     private sealed class InMemoryCategoryRepository(
         IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
     ) : IRetentionCategoryRepository
@@ -415,6 +476,15 @@ public sealed class RetentionStartupValidatorTests
                 );
             }
 
+            if (category == "soft-delete")
+            {
+                return Task.FromResult<IRetentionRuleResolver?>(
+                    new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    )
+                );
+            }
+
             throw new InvalidOperationException(
                 $"Unexpected category lookup for '{category}'. Exempt sample entities must not resolve categories."
             );
@@ -426,6 +496,11 @@ public sealed class RetentionStartupValidatorTests
         public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
         {
             if (category == "short-lived")
+            {
+                return Task.FromResult<IRetentionRuleResolver?>(new DeferredRuleResolver());
+            }
+
+            if (category == "soft-delete")
             {
                 return Task.FromResult<IRetentionRuleResolver?>(new DeferredRuleResolver());
             }
@@ -557,6 +632,41 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
+    private sealed class InvalidSoftDeleteIsDeletedDbContext(
+        DbContextOptions<InvalidSoftDeleteIsDeletedDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<InvalidSoftDeleteIsDeletedRecord>(entity =>
+            {
+                entity.ToTable("invalid_soft_delete_is_deleted_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+                entity.Property(record => record.TenantId).HasColumnName("tenant_id");
+                entity.Property(record => record.IsDeleted).HasColumnName("is_deleted");
+            });
+        }
+    }
+
+    private sealed class InvalidSoftDeleteDeletedAtDbContext(
+        DbContextOptions<InvalidSoftDeleteDeletedAtDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<InvalidSoftDeleteDeletedAtRecord>(entity =>
+            {
+                entity.ToTable("invalid_soft_delete_deleted_at_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+                entity.Property(record => record.TenantId).HasColumnName("tenant_id");
+                entity.Property(record => record.IsDeleted).HasColumnName("is_deleted");
+                entity.Property(record => record.DeletedAt).HasColumnName("deleted_at_utc");
+            });
+        }
+    }
+
     private sealed class UnannotatedRecord
     {
         public Guid Id { get; init; }
@@ -598,5 +708,24 @@ public sealed class RetentionStartupValidatorTests
         public Guid Id { get; init; }
         public string TenantId { get; init; } = "";
         public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    [Retain("invalid-soft-delete", nameof(InvalidSoftDeleteIsDeletedRecord.CreatedAt))]
+    private sealed class InvalidSoftDeleteIsDeletedRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+        public string IsDeleted { get; init; } = "";
+    }
+
+    [Retain("invalid-soft-delete", nameof(InvalidSoftDeleteDeletedAtRecord.CreatedAt))]
+    private sealed class InvalidSoftDeleteDeletedAtRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+        public bool IsDeleted { get; init; }
+        public string DeletedAt { get; init; } = "";
     }
 }

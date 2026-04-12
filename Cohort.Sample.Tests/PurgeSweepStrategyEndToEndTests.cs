@@ -1,3 +1,4 @@
+using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure.Sweep;
 
@@ -90,6 +91,8 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
     {
         var strategy = new PurgeSweepStrategy();
         var connection = new RecordingDbConnection();
+        connection.EnqueueResultSet(Guid.NewGuid());
+        connection.EnqueueResultSet(Guid.NewGuid());
         var transaction = connection.BeginTransaction();
         var tenantId = Guid.NewGuid();
         var now = new DateTimeOffset(2026, 4, 11, 12, 0, 0, TimeSpan.Zero);
@@ -127,16 +130,19 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
         connection.LastCommand!.AssignedTransaction.Should().BeSameAs(transaction);
         connection.LastCommand.CommandText.Should().Contain("@cutoff");
         connection.LastCommand.CommandText.Should().Contain("@tenantId");
+        connection.LastCommand.CommandText.Should().Contain("@candidateIds");
         connection.LastCommand.CommandText.Should().Contain("@holdTableName");
         connection.LastCommand.CommandText.Should().Contain("@holdAsOf");
         connection.LastCommand.CommandText.Should().Contain("NOT EXISTS");
-        connection.LastCommand.Parameters.Count.Should().Be(4);
+        connection.LastCommand.Parameters.Count.Should().Be(5);
         connection.LastCommand.Parameters.Contains("cutoff").Should().BeTrue();
         connection.LastCommand.Parameters.Contains("tenantId").Should().BeTrue();
+        connection.LastCommand.Parameters.Contains("candidateIds").Should().BeTrue();
         connection.LastCommand.Parameters.Contains("holdTableName").Should().BeTrue();
         connection.LastCommand.Parameters.Contains("holdAsOf").Should().BeTrue();
         connection.LastCommand.Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.LastCommand.Parameters["tenantId"].Value.Should().Be(tenantId);
+        connection.LastCommand.Parameters["candidateIds"].Value.Should().BeOfType<Guid[]>();
         connection.LastCommand.Parameters["holdTableName"].Value.Should().Be("purge_candidate_records");
         connection.LastCommand.Parameters["holdAsOf"].Value.Should().Be(now);
     }
@@ -146,6 +152,8 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
     {
         var strategy = new PurgeSweepStrategy();
         var connection = new RecordingDbConnection();
+        connection.EnqueueResultSet(Guid.NewGuid());
+        connection.EnqueueResultSet(Guid.NewGuid());
         var transaction = connection.BeginTransaction();
         var tenantId = Guid.NewGuid();
         var now = new DateTimeOffset(2026, 4, 11, 12, 0, 0, TimeSpan.Zero);
@@ -181,6 +189,103 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
         affected.HeldCount.Should().Be(0);
         connection.LastCommand.Should().NotBeNull();
         connection.LastCommand!.CommandText.Should().Contain("hold.\"RecordId\" = target.\"record_id\"");
+    }
+
+    [Fact]
+    public async Task SweepAsync_Computes_HeldCount_From_Selected_Candidates_And_Targets_Only_Those_Ids()
+    {
+        var selectedId = Guid.NewGuid();
+        var heldId = Guid.NewGuid();
+        var strategy = new PurgeSweepStrategy();
+        var connection = new RecordingDbConnection();
+        connection.EnqueueResultSet(selectedId, heldId);
+        connection.EnqueueResultSet(selectedId);
+        var transaction = connection.BeginTransaction();
+        var tenantId = Guid.NewGuid();
+        var now = new DateTimeOffset(2026, 4, 11, 12, 0, 0, TimeSpan.Zero);
+        var entry = new RetentionEntry(
+            typeof(PurgeCandidateRecord),
+            "purge_candidate_records",
+            "short-lived",
+            nameof(PurgeCandidateRecord.CreatedAt),
+            "CreatedAt",
+            new RecordIdConvention(nameof(PurgeCandidateRecord.Id), "Id"),
+            [],
+            new TenantConvention(nameof(PurgeCandidateRecord.TenantId), "TenantId"),
+            null
+        );
+        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge);
+        var context = new RetentionResolutionContext(
+            "short-lived",
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            now,
+            []
+        );
+
+        var affected = await strategy.SweepAsync(
+            entry,
+            rule,
+            context,
+            connection,
+            transaction,
+            CancellationToken.None
+        );
+
+        affected.AffectedRecordIds.Should().Equal(selectedId);
+        affected.HeldCount.Should().Be(1);
+        connection.Commands.Should().HaveCount(2);
+        connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
+        connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
+        connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
+            new[] { selectedId, heldId }
+        );
+    }
+
+    [Fact]
+    public async Task EraseAsync_Computes_HeldCount_From_Selected_Candidates_And_Targets_Only_Those_Ids()
+    {
+        var selectedId = Guid.NewGuid();
+        var heldId = Guid.NewGuid();
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var strategy = new PurgeSweepStrategy();
+        var connection = new RecordingDbConnection();
+        connection.EnqueueResultSet(selectedId, heldId);
+        connection.EnqueueResultSet(selectedId);
+        var transaction = connection.BeginTransaction();
+        var entry = new RetentionEntry(
+            typeof(PurgeCandidateRecord),
+            "purge_candidate_records",
+            "short-lived",
+            nameof(PurgeCandidateRecord.CreatedAt),
+            "CreatedAt",
+            new RecordIdConvention(nameof(PurgeCandidateRecord.Id), "Id"),
+            [],
+            new TenantConvention(nameof(PurgeCandidateRecord.TenantId), "TenantId"),
+            null
+        );
+        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge);
+
+        var affected = await strategy.EraseAsync(
+            entry,
+            rule,
+            new ErasureSubjectMatch(nameof(PurgeCandidateRecord.Id), "SubjectId", subjectId),
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new DateTimeOffset(2026, 4, 11, 12, 0, 0, TimeSpan.Zero),
+            connection,
+            transaction,
+            CancellationToken.None
+        );
+
+        affected.AffectedRecordIds.Should().Equal(selectedId);
+        affected.HeldCount.Should().Be(1);
+        connection.Commands.Should().HaveCount(2);
+        connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
+        connection.Commands[1].CommandText.Should().Contain("\"SubjectId\" = @subjectValue");
+        connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
+        connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
+            new[] { selectedId, heldId }
+        );
     }
 
     private static async Task InsertRecordAsync(
@@ -249,8 +354,15 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
     {
         private ConnectionState state = ConnectionState.Closed;
         private string connectionString = "Host=recording";
+        private readonly Queue<Guid[]> queuedResultSets = new();
 
         public RecordingDbCommand? LastCommand { get; private set; }
+        public List<RecordingDbCommand> Commands { get; } = [];
+
+        public void EnqueueResultSet(params Guid[] values)
+        {
+            queuedResultSets.Enqueue(values);
+        }
 
         [AllowNull]
         public override string ConnectionString
@@ -288,7 +400,13 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
         protected override DbCommand CreateDbCommand()
         {
             LastCommand = new RecordingDbCommand(this);
+            Commands.Add(LastCommand);
             return LastCommand;
+        }
+
+        public Guid[] DequeueResultSet()
+        {
+            return queuedResultSets.Count > 0 ? queuedResultSets.Dequeue() : [Guid.NewGuid()];
         }
     }
 
@@ -356,7 +474,7 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
 
         protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
         {
-            return new SingleGuidDbDataReader(Guid.NewGuid());
+            return new GuidSequenceDbDataReader(connection.DequeueResultSet());
         }
 
         public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
@@ -365,13 +483,13 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
         }
     }
 
-    private sealed class SingleGuidDbDataReader(Guid value) : DbDataReader
+    private sealed class GuidSequenceDbDataReader(IReadOnlyList<Guid> values) : DbDataReader
     {
-        private bool hasRead;
+        private int index = -1;
 
         public override int FieldCount => 1;
 
-        public override bool HasRows => true;
+        public override bool HasRows => values.Count > 0;
 
         public override bool IsClosed => false;
 
@@ -385,12 +503,12 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
 
         public override bool Read()
         {
-            if (hasRead)
+            if (index + 1 >= values.Count)
             {
                 return false;
             }
 
-            hasRead = true;
+            index++;
             return true;
         }
 
@@ -411,17 +529,17 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
 
         public override Guid GetGuid(int ordinal)
         {
-            return value;
+            return values[index];
         }
 
         public override object GetValue(int ordinal)
         {
-            return value;
+            return values[index];
         }
 
-        public override int GetValues(object[] values)
+        public override int GetValues(object[] items)
         {
-            values[0] = value;
+            items[0] = values[index];
             return 1;
         }
 
@@ -452,7 +570,7 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
 
         public override IEnumerator GetEnumerator()
         {
-            yield return value;
+            return values.GetEnumerator();
         }
 
         public override bool GetBoolean(int ordinal) => throw new NotSupportedException();

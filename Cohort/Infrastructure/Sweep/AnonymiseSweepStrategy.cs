@@ -51,7 +51,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         }
 
         var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);
-        var eligibleCount = await CountEligibleRowsAsync(
+        var candidateRecordIds = await SelectCandidateRecordIdsAsync(
             entry,
             tenant,
             ctx,
@@ -61,11 +61,17 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             ct
         );
 
+        if (candidateRecordIds.Count == 0)
+        {
+            return new SweepExecutionResult([], 0);
+        }
+
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = BuildCommandText(entry, tenant, command, entry.RecordId.RecordIdColumn);
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
+        command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
         command.Parameters.Add(CreateParameter(command, "holdAsOf", ctx.Now));
 
@@ -76,7 +82,10 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             affectedRecordIds.Add(reader.GetGuid(0));
         }
 
-        return new SweepExecutionResult(affectedRecordIds, eligibleCount - affectedRecordIds.Count);
+        return new SweepExecutionResult(
+            affectedRecordIds,
+            candidateRecordIds.Count - affectedRecordIds.Count
+        );
     }
 
     public async Task<SweepExecutionResult> EraseAsync(
@@ -121,7 +130,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             await conn.OpenAsync(ct);
         }
 
-        var eligibleCount = await CountEligibleErasureRowsAsync(
+        var candidateRecordIds = await SelectErasureCandidateRecordIdsAsync(
             entry,
             tenantConvention,
             match,
@@ -130,6 +139,11 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             transaction,
             ct
         );
+
+        if (candidateRecordIds.Count == 0)
+        {
+            return new SweepExecutionResult([], 0);
+        }
 
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
@@ -142,6 +156,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         );
         command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
         command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
+        command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
         command.Parameters.Add(CreateParameter(command, "holdAsOf", now));
 
@@ -152,7 +167,10 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             affectedRecordIds.Add(reader.GetGuid(0));
         }
 
-        return new SweepExecutionResult(affectedRecordIds, eligibleCount - affectedRecordIds.Count);
+        return new SweepExecutionResult(
+            affectedRecordIds,
+            candidateRecordIds.Count - affectedRecordIds.Count
+        );
     }
 
     private static string BuildCommandText(
@@ -180,6 +198,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             SET {string.Join(", ", assignments)}
             WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               AND target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
+              AND target.{QuoteIdentifier(recordIdColumn)} = ANY(@candidateIds)
               AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn)}
             RETURNING target.{QuoteIdentifier(recordIdColumn)}
             """;
@@ -211,12 +230,13 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             SET {string.Join(", ", assignments)}
             WHERE target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
               AND target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+              AND target.{QuoteIdentifier(recordIdColumn)} = ANY(@candidateIds)
               AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn)}
             RETURNING target.{QuoteIdentifier(recordIdColumn)}
             """;
     }
 
-    private static async Task<int> CountEligibleRowsAsync(
+    private static async Task<IReadOnlyList<Guid>> SelectCandidateRecordIdsAsync(
         RetentionEntry entry,
         TenantConvention tenant,
         RetentionResolutionContext ctx,
@@ -230,19 +250,26 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         command.Transaction = transaction;
         command.CommandText =
             $"""
-            SELECT COUNT(*)
+            SELECT target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
             FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               AND target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
+            FOR UPDATE
             """;
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
 
-        var result = await command.ExecuteScalarAsync(ct);
-        return Convert.ToInt32(result);
+        var candidateRecordIds = new List<Guid>();
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            candidateRecordIds.Add(reader.GetGuid(0));
+        }
+
+        return candidateRecordIds;
     }
 
-    private static async Task<int> CountEligibleErasureRowsAsync(
+    private static async Task<IReadOnlyList<Guid>> SelectErasureCandidateRecordIdsAsync(
         RetentionEntry entry,
         TenantConvention tenant,
         ErasureSubjectMatch match,
@@ -256,16 +283,23 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         command.Transaction = transaction;
         command.CommandText =
             $"""
-            SELECT COUNT(*)
+            SELECT target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
             FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
               AND target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+            FOR UPDATE
             """;
         command.Parameters.Add(CreateParameter(command, "tenantId", erasureTenant.Id));
         command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
 
-        var result = await command.ExecuteScalarAsync(ct);
-        return Convert.ToInt32(result);
+        var candidateRecordIds = new List<Guid>();
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            candidateRecordIds.Add(reader.GetGuid(0));
+        }
+
+        return candidateRecordIds;
     }
 
     private static object CreateAssignmentValue(AnonymiseField field)

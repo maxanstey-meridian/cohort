@@ -288,10 +288,67 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
 public sealed class SoftDeleteSweepStrategyCommandTests
 {
     [Fact]
+    public async Task SweepAsync_Computes_HeldCount_From_Selected_Candidates_And_Targets_Only_Those_Ids()
+    {
+        var selectedId = Guid.NewGuid();
+        var heldId = Guid.NewGuid();
+        var strategy = new SoftDeleteSweepStrategy();
+        var connection = new RecordingDbConnection();
+        connection.EnqueueResultSet(selectedId, heldId);
+        connection.EnqueueResultSet(selectedId);
+        var transaction = connection.BeginTransaction();
+        var tenantId = Guid.NewGuid();
+        var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var entry = new RetentionEntry(
+            typeof(SoftDeleteRecord),
+            "soft_delete_records",
+            "soft-delete",
+            nameof(SoftDeleteRecord.CreatedAt),
+            "CreatedAt",
+            new RecordIdConvention(nameof(SoftDeleteRecord.Id), "Id"),
+            [],
+            new TenantConvention(nameof(SoftDeleteRecord.TenantId), "TenantId"),
+            new SoftDeleteConvention(
+                nameof(SoftDeleteRecord.IsDeleted),
+                "IsDeleted",
+                nameof(SoftDeleteRecord.DeletedAt),
+                "DeletedAt"
+            )
+        );
+        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete);
+        var context = new RetentionResolutionContext(
+            "soft-delete",
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            now,
+            []
+        );
+
+        var affected = await strategy.SweepAsync(
+            entry,
+            rule,
+            context,
+            connection,
+            transaction,
+            CancellationToken.None
+        );
+
+        affected.AffectedRecordIds.Should().Equal(selectedId);
+        affected.HeldCount.Should().Be(1);
+        connection.Commands.Should().HaveCount(2);
+        connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
+        connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
+        connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
+            new[] { selectedId, heldId }
+        );
+    }
+
+    [Fact]
     public async Task SweepAsync_Uses_The_Mapped_Record_Id_Column_In_Hold_Filtering()
     {
         var strategy = new SoftDeleteSweepStrategy();
         var connection = new RecordingDbConnection();
+        connection.EnqueueResultSet(Guid.NewGuid());
+        connection.EnqueueResultSet(Guid.NewGuid());
         var transaction = connection.BeginTransaction();
         var tenantId = Guid.NewGuid();
         var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
@@ -338,8 +395,15 @@ public sealed class SoftDeleteSweepStrategyCommandTests
     {
         private ConnectionState state = ConnectionState.Closed;
         private string connectionString = "Host=recording";
+        private readonly Queue<Guid[]> queuedResultSets = new();
 
         public RecordingDbCommand? LastCommand { get; private set; }
+        public List<RecordingDbCommand> Commands { get; } = [];
+
+        public void EnqueueResultSet(params Guid[] values)
+        {
+            queuedResultSets.Enqueue(values);
+        }
 
         [AllowNull]
         public override string ConnectionString
@@ -377,7 +441,13 @@ public sealed class SoftDeleteSweepStrategyCommandTests
         protected override DbCommand CreateDbCommand()
         {
             LastCommand = new RecordingDbCommand(this);
+            Commands.Add(LastCommand);
             return LastCommand;
+        }
+
+        public Guid[] DequeueResultSet()
+        {
+            return queuedResultSets.Count > 0 ? queuedResultSets.Dequeue() : [Guid.NewGuid()];
         }
     }
 
@@ -445,7 +515,7 @@ public sealed class SoftDeleteSweepStrategyCommandTests
 
         protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
         {
-            return new SingleGuidDbDataReader(Guid.NewGuid());
+            return new GuidSequenceDbDataReader(connection.DequeueResultSet());
         }
 
         public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
@@ -454,12 +524,12 @@ public sealed class SoftDeleteSweepStrategyCommandTests
         }
     }
 
-    private sealed class SingleGuidDbDataReader(Guid value) : DbDataReader
+    private sealed class GuidSequenceDbDataReader(IReadOnlyList<Guid> values) : DbDataReader
     {
-        private bool hasRead;
+        private int index = -1;
 
         public override int FieldCount => 1;
-        public override bool HasRows => true;
+        public override bool HasRows => values.Count > 0;
         public override bool IsClosed => false;
         public override int RecordsAffected => 1;
         public override int Depth => 0;
@@ -468,23 +538,23 @@ public sealed class SoftDeleteSweepStrategyCommandTests
 
         public override bool Read()
         {
-            if (hasRead)
+            if (index + 1 >= values.Count)
             {
                 return false;
             }
 
-            hasRead = true;
+            index++;
             return true;
         }
 
         public override Task<bool> ReadAsync(CancellationToken cancellationToken) => Task.FromResult(Read());
         public override bool NextResult() => false;
         public override Task<bool> NextResultAsync(CancellationToken cancellationToken) => Task.FromResult(false);
-        public override Guid GetGuid(int ordinal) => value;
-        public override object GetValue(int ordinal) => value;
-        public override int GetValues(object[] values)
+        public override Guid GetGuid(int ordinal) => values[index];
+        public override object GetValue(int ordinal) => values[index];
+        public override int GetValues(object[] items)
         {
-            values[0] = value;
+            items[0] = values[index];
             return 1;
         }
 
@@ -493,10 +563,7 @@ public sealed class SoftDeleteSweepStrategyCommandTests
         public override Type GetFieldType(int ordinal) => typeof(Guid);
         public override int GetOrdinal(string name) => 0;
         public override bool IsDBNull(int ordinal) => false;
-        public override IEnumerator GetEnumerator()
-        {
-            yield return value;
-        }
+        public override IEnumerator GetEnumerator() => values.GetEnumerator();
 
         public override bool GetBoolean(int ordinal) => throw new NotSupportedException();
         public override byte GetByte(int ordinal) => throw new NotSupportedException();

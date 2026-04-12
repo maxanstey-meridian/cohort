@@ -299,6 +299,8 @@ public sealed class AnonymiseSweepStrategyCommandTests
     {
         var strategy = new AnonymiseSweepStrategy();
         var connection = new RecordingDbConnection();
+        connection.EnqueueResultSet(Guid.NewGuid());
+        connection.EnqueueResultSet(Guid.NewGuid());
         var transaction = connection.BeginTransaction();
         var tenantId = Guid.NewGuid();
         var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
@@ -348,15 +350,17 @@ public sealed class AnonymiseSweepStrategyCommandTests
         connection.LastCommand.CommandText.Should().Contain("\"Surname\" = @value2");
         connection.LastCommand.CommandText.Should().Contain("@cutoff");
         connection.LastCommand.CommandText.Should().Contain("@tenantId");
+        connection.LastCommand.CommandText.Should().Contain("@candidateIds");
         connection.LastCommand.CommandText.Should().Contain("@holdTableName");
         connection.LastCommand.CommandText.Should().Contain("@holdAsOf");
         connection.LastCommand.CommandText.Should().Contain("NOT EXISTS");
-        connection.LastCommand.Parameters.Count.Should().Be(7);
+        connection.LastCommand.Parameters.Count.Should().Be(8);
         connection.LastCommand.Parameters.Contains("value0").Should().BeTrue();
         connection.LastCommand.Parameters.Contains("value1").Should().BeTrue();
         connection.LastCommand.Parameters.Contains("value2").Should().BeTrue();
         connection.LastCommand.Parameters.Contains("cutoff").Should().BeTrue();
         connection.LastCommand.Parameters.Contains("tenantId").Should().BeTrue();
+        connection.LastCommand.Parameters.Contains("candidateIds").Should().BeTrue();
         connection.LastCommand.Parameters.Contains("holdTableName").Should().BeTrue();
         connection.LastCommand.Parameters.Contains("holdAsOf").Should().BeTrue();
         connection.LastCommand.Parameters["value0"].Value.Should().Be(DBNull.Value);
@@ -364,8 +368,68 @@ public sealed class AnonymiseSweepStrategyCommandTests
         connection.LastCommand.Parameters["value2"].Value.Should().Be("[redacted]");
         connection.LastCommand.Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.LastCommand.Parameters["tenantId"].Value.Should().Be(tenantId);
+        connection.LastCommand.Parameters["candidateIds"].Value.Should().BeOfType<Guid[]>();
         connection.LastCommand.Parameters["holdTableName"].Value.Should().Be("anonymised_contacts");
         connection.LastCommand.Parameters["holdAsOf"].Value.Should().Be(now);
+    }
+
+    [Fact]
+    public async Task SweepAsync_Computes_HeldCount_From_Selected_Candidates_And_Targets_Only_Those_Ids()
+    {
+        var selectedId = Guid.NewGuid();
+        var heldId = Guid.NewGuid();
+        var strategy = new AnonymiseSweepStrategy();
+        var connection = new RecordingDbConnection();
+        connection.EnqueueResultSet(selectedId, heldId);
+        connection.EnqueueResultSet(selectedId);
+        var transaction = connection.BeginTransaction();
+        var tenantId = Guid.NewGuid();
+        var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var entry = new RetentionEntry(
+            typeof(AnonymisedContact),
+            "anonymised_contacts",
+            "anonymise",
+            nameof(AnonymisedContact.CreatedAt),
+            "CreatedAt",
+            new RecordIdConvention(nameof(AnonymisedContact.Id), "Id"),
+            [
+                new AnonymiseField(nameof(AnonymisedContact.EmailAddress), "EmailAddress", AnonymiseMethod.Null),
+                new AnonymiseField(nameof(AnonymisedContact.GivenName), "GivenName", AnonymiseMethod.EmptyString),
+                new AnonymiseField(
+                    nameof(AnonymisedContact.Surname),
+                    "Surname",
+                    AnonymiseMethod.FixedLiteral,
+                    "[redacted]"
+                ),
+            ],
+            new TenantConvention(nameof(AnonymisedContact.TenantId), "TenantId"),
+            null
+        );
+        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise);
+        var context = new RetentionResolutionContext(
+            "anonymise",
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            now,
+            []
+        );
+
+        var affected = await strategy.SweepAsync(
+            entry,
+            rule,
+            context,
+            connection,
+            transaction,
+            CancellationToken.None
+        );
+
+        affected.AffectedRecordIds.Should().Equal(selectedId);
+        affected.HeldCount.Should().Be(1);
+        connection.Commands.Should().HaveCount(2);
+        connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
+        connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
+        connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
+            new[] { selectedId, heldId }
+        );
     }
 
     [Fact]
@@ -373,6 +437,8 @@ public sealed class AnonymiseSweepStrategyCommandTests
     {
         var strategy = new AnonymiseSweepStrategy();
         var connection = new RecordingDbConnection();
+        connection.EnqueueResultSet(Guid.NewGuid());
+        connection.EnqueueResultSet(Guid.NewGuid());
         var transaction = connection.BeginTransaction();
         var tenantId = Guid.NewGuid();
         var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
@@ -423,8 +489,15 @@ public sealed class AnonymiseSweepStrategyCommandTests
     {
         private ConnectionState state = ConnectionState.Closed;
         private string connectionString = "Host=recording";
+        private readonly Queue<Guid[]> queuedResultSets = new();
 
         public RecordingDbCommand? LastCommand { get; private set; }
+        public List<RecordingDbCommand> Commands { get; } = [];
+
+        public void EnqueueResultSet(params Guid[] values)
+        {
+            queuedResultSets.Enqueue(values);
+        }
 
         [AllowNull]
         public override string ConnectionString
@@ -462,7 +535,13 @@ public sealed class AnonymiseSweepStrategyCommandTests
         protected override DbCommand CreateDbCommand()
         {
             LastCommand = new RecordingDbCommand(this);
+            Commands.Add(LastCommand);
             return LastCommand;
+        }
+
+        public Guid[] DequeueResultSet()
+        {
+            return queuedResultSets.Count > 0 ? queuedResultSets.Dequeue() : [Guid.NewGuid()];
         }
     }
 
@@ -530,7 +609,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
 
         protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
         {
-            return new SingleGuidDbDataReader(Guid.NewGuid());
+            return new GuidSequenceDbDataReader(connection.DequeueResultSet());
         }
 
         public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
@@ -539,12 +618,12 @@ public sealed class AnonymiseSweepStrategyCommandTests
         }
     }
 
-    private sealed class SingleGuidDbDataReader(Guid value) : DbDataReader
+    private sealed class GuidSequenceDbDataReader(IReadOnlyList<Guid> values) : DbDataReader
     {
-        private bool hasRead;
+        private int index = -1;
 
         public override int FieldCount => 1;
-        public override bool HasRows => true;
+        public override bool HasRows => values.Count > 0;
         public override bool IsClosed => false;
         public override int RecordsAffected => 1;
         public override int Depth => 0;
@@ -553,23 +632,23 @@ public sealed class AnonymiseSweepStrategyCommandTests
 
         public override bool Read()
         {
-            if (hasRead)
+            if (index + 1 >= values.Count)
             {
                 return false;
             }
 
-            hasRead = true;
+            index++;
             return true;
         }
 
         public override Task<bool> ReadAsync(CancellationToken cancellationToken) => Task.FromResult(Read());
         public override bool NextResult() => false;
         public override Task<bool> NextResultAsync(CancellationToken cancellationToken) => Task.FromResult(false);
-        public override Guid GetGuid(int ordinal) => value;
-        public override object GetValue(int ordinal) => value;
-        public override int GetValues(object[] values)
+        public override Guid GetGuid(int ordinal) => values[index];
+        public override object GetValue(int ordinal) => values[index];
+        public override int GetValues(object[] items)
         {
-            values[0] = value;
+            items[0] = values[index];
             return 1;
         }
 
@@ -578,10 +657,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
         public override Type GetFieldType(int ordinal) => typeof(Guid);
         public override int GetOrdinal(string name) => 0;
         public override bool IsDBNull(int ordinal) => false;
-        public override IEnumerator GetEnumerator()
-        {
-            yield return value;
-        }
+        public override IEnumerator GetEnumerator() => values.GetEnumerator();
 
         public override bool GetBoolean(int ordinal) => throw new NotSupportedException();
         public override byte GetByte(int ordinal) => throw new NotSupportedException();

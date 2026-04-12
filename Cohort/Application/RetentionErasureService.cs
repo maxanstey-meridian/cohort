@@ -13,6 +13,7 @@ public sealed class RetentionErasureService(
     DbContext db,
     RetentionRegistry registry,
     IRetentionCategoryRepository categoryRepository,
+    RetentionStartupValidator validator,
     IRetentionAuditWriter auditWriter,
     IEnumerable<IRetentionSweepStrategy> sweepStrategies
 ) : IRetentionErasureService
@@ -29,6 +30,7 @@ public sealed class RetentionErasureService(
     {
         ArgumentNullException.ThrowIfNull(tenant);
         ArgumentNullException.ThrowIfNull(scope);
+        await validator.ValidateAsync(ct);
 
         var sweepId = Guid.NewGuid();
         var startedAt = DateTimeOffset.UtcNow;

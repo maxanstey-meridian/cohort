@@ -85,27 +85,14 @@ public sealed class RetentionStartupValidator(
             try
             {
                 var startupRule = resolver.TryResolveAtStartup();
-                var possibleStrategies =
-                    startupRule is null ? resolver.GetPossibleStrategiesAtStartup() : null;
-
-                if (
-                    startupRule?.Strategy == Strategy.SoftDelete
-                    || possibleStrategies?.Contains(Strategy.SoftDelete) == true
-                )
+                if (startupRule?.Strategy == Strategy.SoftDelete)
                 {
                     ValidateSoftDeleteConvention(entry, errors, $"Soft-delete convention on {clrType.FullName}:");
                 }
 
-                if (
-                    startupRule?.Strategy == Strategy.Anonymise
-                    || possibleStrategies?.Contains(Strategy.Anonymise) == true
-                )
+                if (startupRule?.Strategy == Strategy.Anonymise)
                 {
                     ValidateAnonymiseConvention(entry, errors, $"Anonymise convention on {clrType.FullName}:");
-                }
-                else if (startupRule is null && possibleStrategies is null)
-                {
-                    ValidateOpaqueDeferredResolverCompatibility(entry, errors);
                 }
             }
             catch (Exception ex)
@@ -129,40 +116,6 @@ public sealed class RetentionStartupValidator(
     )
     {
         errors.AddRange(GetSoftDeleteConventionErrors(entry, messagePrefix));
-    }
-
-    private static void ValidateOpaqueDeferredResolverCompatibility(
-        RetentionEntry entry,
-        List<string> errors
-    )
-    {
-        var clrType = entry.EntityType;
-        var messagePrefix =
-            $"Retention category '{entry.Category}' for entity {clrType.FullName} uses a deferred resolver that does not declare its possible strategies at startup.";
-        var softDeleteErrors = GetSoftDeleteConventionErrors(entry, messagePrefix);
-        var anonymiseErrors = GetAnonymiseConventionErrors(entry, messagePrefix);
-        var hasSoftDeleteSignals =
-            clrType.GetProperty("IsDeleted", BindingFlags.Public | BindingFlags.Instance) is not null
-            || clrType.GetProperty("DeletedAt", BindingFlags.Public | BindingFlags.Instance) is not null
-            || entry.SoftDelete is not null;
-        var hasAnonymiseSignals = entry.AnonymiseFields.Count > 0;
-
-        if (!hasSoftDeleteSignals && !hasAnonymiseSignals)
-        {
-            errors.Add(
-                $"{messagePrefix} Opaque deferred resolvers must either advertise their strategies or target entities with a valid soft-delete or anonymise convention."
-            );
-            return;
-        }
-
-        if (softDeleteErrors.Count == 0 && anonymiseErrors.Count == 0)
-        {
-            return;
-        }
-
-        errors.Add(
-            $"{messagePrefix} Opaque deferred resolvers must advertise their possible strategies at startup unless the target entity is valid for both soft-delete and anonymise conventions."
-        );
     }
 
     private static void ValidateAnonymiseConvention(

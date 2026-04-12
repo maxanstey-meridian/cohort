@@ -117,11 +117,6 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
 
     private sealed class TenantAwareResolver : IRetentionRuleResolver
     {
-        public IReadOnlySet<Strategy>? GetPossibleStrategiesAtStartup() => new HashSet<Strategy>
-        {
-            Strategy.Purge,
-        };
-
         public Task<RetentionRule> ResolveAsync(RetentionResolutionContext ctx, CancellationToken ct)
         {
             var isLenient =
@@ -169,11 +164,6 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
         string nextCategory
     ) : IRetentionRuleResolver
     {
-        public IReadOnlySet<Strategy>? GetPossibleStrategiesAtStartup() => new HashSet<Strategy>
-        {
-            Strategy.Purge,
-        };
-
         public async Task<RetentionRule> ResolveAsync(
             RetentionResolutionContext ctx,
             CancellationToken ct

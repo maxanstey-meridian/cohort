@@ -208,21 +208,23 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             db,
             new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
         );
+        var repository = new StaticCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["short-lived"] = resolver,
+                ["soft-delete"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                ),
+                ["anonymise"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                ),
+            }
+        );
         var engine = new RetentionSweepEngine(
             db,
             new RetentionRegistry(db),
-            new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
-                {
-                    ["short-lived"] = resolver,
-                    ["soft-delete"] = new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
-                    ),
-                    ["anonymise"] = new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
-                    ),
-                }
-            ),
+            repository,
+            new RetentionStartupValidator(db, repository),
             new NoOpRetentionAuditWriter(),
             [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
         );
@@ -260,23 +262,25 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         await db.SaveChangesAsync();
 
         var strategy = new TransactionCapturingSweepStrategy(db);
+        var repository = new StaticCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["short-lived"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                ),
+                ["soft-delete"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                ),
+                ["anonymise"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                ),
+            }
+        );
         var engine = new RetentionSweepEngine(
             db,
             new RetentionRegistry(db),
-            new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
-                {
-                    ["short-lived"] = new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
-                    ),
-                    ["soft-delete"] = new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
-                    ),
-                    ["anonymise"] = new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
-                    ),
-                }
-            ),
+            repository,
+            new RetentionStartupValidator(db, repository),
             new NoOpRetentionAuditWriter(),
             [strategy, new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
         );
@@ -314,23 +318,25 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         );
         await db.SaveChangesAsync();
 
+        var repository = new StaticCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["short-lived"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                ),
+                ["soft-delete"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                ),
+                ["anonymise"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                ),
+            }
+        );
         var engine = new RetentionSweepEngine(
             db,
             new RetentionRegistry(db),
-            new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
-                {
-                    ["short-lived"] = new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
-                    ),
-                    ["soft-delete"] = new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
-                    ),
-                    ["anonymise"] = new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
-                    ),
-                }
-            ),
+            repository,
+            new RetentionStartupValidator(db, repository),
             new NoOpRetentionAuditWriter(),
             [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy()]
         );

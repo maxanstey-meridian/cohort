@@ -11,6 +11,7 @@ public sealed class RetentionSweepEngine(
     DbContext db,
     RetentionRegistry registry,
     IRetentionCategoryRepository categoryRepository,
+    RetentionStartupValidator validator,
     IRetentionAuditWriter auditWriter,
     IEnumerable<IRetentionSweepStrategy> sweepStrategies
 )
@@ -25,6 +26,7 @@ public sealed class RetentionSweepEngine(
     )
     {
         ArgumentNullException.ThrowIfNull(tenant);
+        await validator.ValidateAsync(ct);
 
         var sweepId = Guid.NewGuid();
         var startedAt = DateTimeOffset.UtcNow;

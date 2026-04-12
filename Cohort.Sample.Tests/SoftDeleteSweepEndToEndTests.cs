@@ -239,23 +239,25 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
     public async Task Preview_Path_Rejects_SoftDelete_Rules_When_The_Entity_Lacks_SoftDelete_Metadata()
     {
         await using var db = Host.CreateDbContext();
+        var repository = new StaticCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["short-lived"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                ),
+                ["soft-delete"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                ),
+                ["anonymise"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                ),
+            }
+        );
         var preview = new RetentionPreviewService(
             db,
             new RetentionRegistry(db),
-            new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
-                {
-                    ["short-lived"] = new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
-                    ),
-                    ["soft-delete"] = new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
-                    ),
-                    ["anonymise"] = new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
-                    ),
-                }
-            ),
+            repository,
+            new RetentionStartupValidator(db, repository),
             [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
         );
 
@@ -267,9 +269,9 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
 
         await act
             .Should()
-            .ThrowAsync<InvalidOperationException>()
+            .ThrowAsync<RetentionConfigurationException>()
             .WithMessage(
-                $"Retention entry for {typeof(Note).FullName} must expose soft-delete metadata for soft-delete previews."
+                $"*Soft-delete convention on {typeof(Note).FullName}: retained SoftDelete categories require a public bool IsDeleted CLR property.*"
             );
     }
 

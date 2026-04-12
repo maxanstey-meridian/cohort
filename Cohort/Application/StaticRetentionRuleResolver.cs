@@ -11,9 +11,4 @@ public sealed class StaticRetentionRuleResolver(RetentionRule rule) : IRetention
         Task.FromResult(rule);
 
     public RetentionRule? TryResolveAtStartup() => rule;
-
-    public IReadOnlySet<Strategy>? GetPossibleStrategiesAtStartup() => new HashSet<Strategy>
-    {
-        rule.Strategy,
-    };
 }

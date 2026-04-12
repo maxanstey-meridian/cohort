@@ -10,6 +10,7 @@ public sealed class RetentionPreviewService(
     DbContext db,
     RetentionRegistry registry,
     IRetentionCategoryRepository categoryRepository,
+    RetentionStartupValidator validator,
     IEnumerable<IRetentionSweepStrategy> sweepStrategies
 ) : IRetentionPreview
 {
@@ -23,6 +24,7 @@ public sealed class RetentionPreviewService(
     )
     {
         ArgumentNullException.ThrowIfNull(tenant);
+        await validator.ValidateAsync(ct);
 
         var startedAt = DateTimeOffset.UtcNow;
         var counts = new List<EntitySweepCount>();

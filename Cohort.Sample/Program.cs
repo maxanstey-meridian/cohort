@@ -1,8 +1,6 @@
 using Cohort.Application;
-using Cohort.Infrastructure.Audit;
 using Cohort.Domain;
-using Cohort.Infrastructure.Holds;
-using Cohort.Infrastructure.Sweep;
+using Cohort.Hosting;
 using Cohort.Sample;
 
 using Microsoft.EntityFrameworkCore;
@@ -12,6 +10,11 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 var builder = Host.CreateApplicationBuilder(args);
+var previewTenant = new TenantContext(
+    Guid.Parse("11111111-1111-1111-1111-111111111111"),
+    "sample",
+    new Dictionary<string, string>()
+);
 
 builder
     .Services.AddOptions<SampleOptions>()
@@ -26,18 +29,10 @@ builder.Services.AddDbContext<SampleDbContext>(
         opts.UseNpgsql(cohort.ConnectionString);
     }
 );
-builder.Services.AddScoped<DbContext>(sp => sp.GetRequiredService<SampleDbContext>());
 
 builder.Services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
-builder.Services.AddScoped<IRetentionAuditWriter, EfRetentionAuditWriter>();
-builder.Services.AddScoped<IRetentionHoldsRepository, EfRetentionHoldsRepository>();
-builder.Services.AddScoped<IRetentionSweepStrategy, PurgeSweepStrategy>();
-builder.Services.AddScoped<IRetentionSweepStrategy, SoftDeleteSweepStrategy>();
-builder.Services.AddScoped<IRetentionSweepStrategy, AnonymiseSweepStrategy>();
-builder.Services.AddScoped<IRetentionPreview, RetentionPreviewService>();
-builder.Services.AddScoped<RetentionRegistry>();
-builder.Services.AddScoped<RetentionStartupValidator>();
-builder.Services.AddScoped<RetentionSweepEngine>();
+builder.Services.AddSingleton(previewTenant);
+builder.Services.AddCohort<SampleDbContext>();
 builder.Services.AddScoped<SampleRetentionStartupService>();
 
 var host = builder.Build();
@@ -45,11 +40,6 @@ var host = builder.Build();
 using var scope = host.Services.CreateScope();
 var logger = scope.ServiceProvider.GetRequiredService<ILogger<Program>>();
 var startup = scope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
-var previewTenant = new TenantContext(
-    Guid.Parse("11111111-1111-1111-1111-111111111111"),
-    "sample",
-    new Dictionary<string, string>()
-);
 
 var entries = await startup.RunAsync();
 var preview = await startup.RunPreviewAsync(previewTenant, DateTimeOffset.UtcNow);

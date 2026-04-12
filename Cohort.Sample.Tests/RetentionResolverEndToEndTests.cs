@@ -43,7 +43,7 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(2);
+        result.Counts.Should().HaveCount(3);
         result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
@@ -59,6 +59,15 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
                 "soft-delete",
                 tenantId,
                 Strategy.SoftDelete,
+                0
+            )
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(AnonymisedContact),
+                "anonymise",
+                tenantId,
+                Strategy.Anonymise,
                 0
             )
         );
@@ -96,6 +105,9 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
                     "short-lived" => resolver,
                     "soft-delete" => new StaticRetentionRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    ),
+                    "anonymise" => new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
                     _ => null,
                 }
@@ -136,6 +148,9 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
                 ["short-lived"] = new AliasResolver(this, "policy-a"),
                 ["soft-delete"] = new StaticRetentionRuleResolver(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                ),
+                ["anonymise"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                 ),
                 ["policy-a"] = new AliasResolver(this, "policy-b"),
                 ["policy-b"] = new AliasResolver(this, "policy-a"),

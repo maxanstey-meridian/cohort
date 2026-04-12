@@ -45,6 +45,13 @@ public sealed class StartupValidationEndToEndTests(PostgresFixture fixture) : In
                 && kvp.Value.Category == "soft-delete"
                 && kvp.Value.AnchorMember == nameof(SoftDeleteRecord.CreatedAt)
             );
+        entries
+            .Should()
+            .Contain(kvp =>
+                kvp.Key == typeof(AnonymisedContact)
+                && kvp.Value.Category == "anonymise"
+                && kvp.Value.AnchorMember == nameof(AnonymisedContact.CreatedAt)
+            );
     }
 
     [Fact]
@@ -57,7 +64,7 @@ public sealed class StartupValidationEndToEndTests(PostgresFixture fixture) : In
         var act = async () => await host.RunStartupAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().HaveCount(2);
+        exception.Which.Errors.Should().HaveCount(3);
         exception
             .Which.Errors.Should()
             .Contain(
@@ -67,6 +74,11 @@ public sealed class StartupValidationEndToEndTests(PostgresFixture fixture) : In
             .Which.Errors.Should()
             .Contain(
                 $"Retention category 'soft-delete' for entity {typeof(SoftDeleteRecord).FullName} could not be resolved."
+            );
+        exception
+            .Which.Errors.Should()
+            .Contain(
+                $"Retention category 'anonymise' for entity {typeof(AnonymisedContact).FullName} could not be resolved."
             );
     }
 

@@ -63,6 +63,9 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
                     ["soft-delete"] = new StaticRetentionRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     ),
+                    ["anonymise"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
                 }
             )
         );
@@ -72,7 +75,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(2);
+        result.Counts.Should().HaveCount(3);
         result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
@@ -88,6 +91,15 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
                 "soft-delete",
                 tenantA,
                 Strategy.SoftDelete,
+                0
+            )
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(AnonymisedContact),
+                "anonymise",
+                tenantA,
+                Strategy.Anonymise,
                 0
             )
         );
@@ -128,6 +140,9 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
                     ["soft-delete"] = new StaticRetentionRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     ),
+                    ["anonymise"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
                 }
             )
         );
@@ -137,7 +152,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(2);
+        result.Counts.Should().HaveCount(3);
         result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
@@ -153,6 +168,15 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
                 "soft-delete",
                 tenantId,
                 Strategy.SoftDelete,
+                0
+            )
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(AnonymisedContact),
+                "anonymise",
+                tenantId,
+                Strategy.Anonymise,
                 0
             )
         );
@@ -194,9 +218,12 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
                     ["soft-delete"] = new StaticRetentionRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     ),
+                    ["anonymise"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
                 }
             ),
-            [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy()]
+            [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
         );
 
         var result = await engine.SweepAsync(
@@ -244,9 +271,12 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
                     ["soft-delete"] = new StaticRetentionRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     ),
+                    ["anonymise"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
                 }
             ),
-            [strategy, new SoftDeleteSweepStrategy()]
+            [strategy, new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
         );
 
         var result = await engine.SweepAsync(
@@ -265,41 +295,44 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task Shared_Host_Sweep_Path_Rejects_Runtime_Strategies_Without_A_Registered_Sweep_Implementation()
+    public async Task Sweep_Engine_Rejects_Runtime_Strategies_Without_A_Registered_Sweep_Implementation()
     {
         var tenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 11, 12, 0, 0, TimeSpan.Zero);
 
-        await using (var db = Host.CreateDbContext())
-        {
-            db.Notes.Add(
-                new Note
-                {
-                    Id = Guid.NewGuid(),
-                    TenantId = tenantId,
-                    CreatedAt = asOf.AddDays(-120),
-                    Body = "must-remain",
-                }
-            );
-            await db.SaveChangesAsync();
-        }
+        await using var db = Host.CreateDbContext();
+        db.Notes.Add(
+            new Note
+            {
+                Id = Guid.NewGuid(),
+                TenantId = tenantId,
+                CreatedAt = asOf.AddDays(-120),
+                Body = "must-remain",
+            }
+        );
+        await db.SaveChangesAsync();
 
-        using var sweepHost = new CohortTestHost(
-            GetConnectionString(),
+        var engine = new RetentionSweepEngine(
+            db,
+            new RetentionRegistry(db),
             new StaticCategoryRepository(
                 new Dictionary<string, IRetentionRuleResolver>
                 {
                     ["short-lived"] = new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                     ),
                     ["soft-delete"] = new StaticRetentionRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
-                    )
+                    ),
+                    ["anonymise"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
                 }
-            )
+            ),
+            [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy()]
         );
 
-        var act = () => sweepHost.RunSweepAsync(
+        var act = () => engine.SweepAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
             asOf
         );

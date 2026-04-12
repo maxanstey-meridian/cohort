@@ -75,6 +75,7 @@ public sealed class CohortTestHost(
         services.AddScoped<DbContext>(sp => sp.GetRequiredService<SampleDbContext>());
         services.AddScoped<IRetentionSweepStrategy, PurgeSweepStrategy>();
         services.AddScoped<IRetentionSweepStrategy, SoftDeleteSweepStrategy>();
+        services.AddScoped<IRetentionSweepStrategy, AnonymiseSweepStrategy>();
         services.AddScoped<IRetentionPreview, RetentionPreviewService>();
         services.AddScoped<RetentionRegistry>();
         services.AddScoped<RetentionStartupValidator>();

@@ -55,10 +55,19 @@ public sealed class RegistryScanTests
                 && kvp.Value.AnchorMember == nameof(SoftDeleteRecord.CreatedAt)
                 && kvp.Value.EntityType == typeof(SoftDeleteRecord)
             );
+        entries
+            .Should()
+            .Contain(kvp =>
+                kvp.Key == typeof(AnonymisedContact)
+                && kvp.Value.Category == "anonymise"
+                && kvp.Value.TableName == "anonymised_contacts"
+                && kvp.Value.AnchorMember == nameof(AnonymisedContact.CreatedAt)
+                && kvp.Value.EntityType == typeof(AnonymisedContact)
+            );
 
         // Negative — nothing else sneaks in
         entries.Values.Should().NotContain(e => e.Category == "long-lived");
-        entries.Should().HaveCount(2);
+        entries.Should().HaveCount(3);
     }
 
     [Fact]

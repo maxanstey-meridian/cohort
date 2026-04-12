@@ -55,7 +55,7 @@ public sealed class RetentionStartupValidatorTests
             .Which.Errors[0]
             .Should()
             .Be(
-                $"Retention category 'short-lived' for entity {typeof(Note).FullName} uses a deferred resolver that does not declare its possible strategies at startup. Opaque deferred resolvers must either advertise their strategies or target entities with a valid soft-delete convention."
+                $"Retention category 'short-lived' for entity {typeof(Note).FullName} uses a deferred resolver that does not declare its possible strategies at startup. Opaque deferred resolvers must either advertise their strategies or target entities with a valid soft-delete or anonymise convention."
             );
     }
 
@@ -158,7 +158,7 @@ public sealed class RetentionStartupValidatorTests
             await new RetentionStartupValidator(db, InMemoryCategoryRepository.Empty).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().HaveCount(2);
+        exception.Which.Errors.Should().HaveCount(3);
         exception
             .Which.Errors.Should()
             .Contain(
@@ -169,8 +169,14 @@ public sealed class RetentionStartupValidatorTests
             .Contain(
                 $"Retention category 'soft-delete' for entity {typeof(SoftDeleteRecord).FullName} could not be resolved."
             );
+        exception
+            .Which.Errors.Should()
+            .Contain(
+                $"Retention category 'anonymise' for entity {typeof(AnonymisedContact).FullName} could not be resolved."
+            );
         exception.Which.Message.Should().Contain("short-lived");
         exception.Which.Message.Should().Contain("soft-delete");
+        exception.Which.Message.Should().Contain("anonymise");
     }
 
     [Fact]
@@ -495,6 +501,111 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
+    public async Task ValidateAsync_Rejects_Anonymise_Categories_Without_Annotated_Fields()
+    {
+        var options = new DbContextOptionsBuilder<SampleDbContext>()
+            .UseInMemoryDatabase($"startup-validator-missing-anonymise-fields-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new SampleDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["short-lived"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                ),
+                ["soft-delete"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                ),
+                ["anonymise"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                ),
+            }
+        );
+
+        var act = async () => await new RetentionStartupValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Anonymise convention on {typeof(Note).FullName}: retained Anonymise categories require at least one [Anonymise]-annotated property mapped by EF."
+            );
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Rejects_Anonymise_Categories_With_Invalid_Method_Type_Mismatches()
+    {
+        var options = new DbContextOptionsBuilder<InvalidAnonymiseMethodDbContext>()
+            .UseInMemoryDatabase($"startup-validator-invalid-anonymise-methods-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new InvalidAnonymiseMethodDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["invalid-null-anonymise"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                ),
+                ["invalid-empty-string-anonymise"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                ),
+                ["invalid-fixed-literal-anonymise"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                ),
+            }
+        );
+
+        var act = async () => await new RetentionStartupValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().HaveCount(3);
+        exception
+            .Which.Errors.Should()
+            .Contain(
+                $"Anonymise convention on {typeof(InvalidNullAnonymiseRecord).FullName}: [Anonymise] member Age uses Null but Int32 is not nullable."
+            );
+        exception
+            .Which.Errors.Should()
+            .Contain(
+                $"Anonymise convention on {typeof(InvalidEmptyStringAnonymiseRecord).FullName}: [Anonymise] member ExternalId uses EmptyString but Guid is not string."
+            );
+        exception
+            .Which.Errors.Should()
+            .Contain(
+                $"Anonymise convention on {typeof(InvalidFixedLiteralAnonymiseRecord).FullName}: [Anonymise] member LastSeenAt uses FixedLiteral but DateTimeOffset is not string."
+            );
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Rejects_Anonymise_Categories_Without_Tenant_Metadata()
+    {
+        var options = new DbContextOptionsBuilder<MissingAnonymiseTenantDbContext>()
+            .UseInMemoryDatabase($"startup-validator-missing-anonymise-tenant-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new MissingAnonymiseTenantDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["missing-anonymise-tenant"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                ),
+            }
+        );
+
+        var act = async () => await new RetentionStartupValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Anonymise convention on {typeof(MissingAnonymiseTenantRecord).FullName}: retained Anonymise categories require tenant metadata via a public Guid or nullable Guid TenantId property mapped by EF."
+            );
+    }
+
+    [Fact]
     public async Task ValidateAsync_Rejects_Opaque_Deferred_SoftDelete_Categories_Without_Tenant_Metadata()
     {
         var options = new DbContextOptionsBuilder<MissingSoftDeleteTenantDbContext>()
@@ -537,15 +648,15 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
-    private sealed class DeferredRuleResolver : IRetentionRuleResolver
+    private sealed class DeferredRuleResolver(RetentionRule rule) : IRetentionRuleResolver
     {
         public IReadOnlySet<Strategy>? GetPossibleStrategiesAtStartup() => new HashSet<Strategy>
         {
-            Strategy.Purge,
+            rule.Strategy,
         };
 
         public Task<RetentionRule> ResolveAsync(RetentionResolutionContext ctx, CancellationToken ct) =>
-            Task.FromResult(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge));
+            Task.FromResult(rule);
     }
 
     private sealed class OpaqueDeferredRuleResolver(RetentionRule rule) : IRetentionRuleResolver
@@ -574,6 +685,15 @@ public sealed class RetentionStartupValidatorTests
                 );
             }
 
+            if (category == "anonymise")
+            {
+                return Task.FromResult<IRetentionRuleResolver?>(
+                    new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    )
+                );
+            }
+
             throw new InvalidOperationException(
                 $"Unexpected category lookup for '{category}'. Exempt sample entities must not resolve categories."
             );
@@ -586,12 +706,27 @@ public sealed class RetentionStartupValidatorTests
         {
             if (category == "short-lived")
             {
-                return Task.FromResult<IRetentionRuleResolver?>(new DeferredRuleResolver());
+                return Task.FromResult<IRetentionRuleResolver?>(
+                    new DeferredRuleResolver(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge))
+                );
             }
 
             if (category == "soft-delete")
             {
-                return Task.FromResult<IRetentionRuleResolver?>(new DeferredRuleResolver());
+                return Task.FromResult<IRetentionRuleResolver?>(
+                    new DeferredRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    )
+                );
+            }
+
+            if (category == "anonymise")
+            {
+                return Task.FromResult<IRetentionRuleResolver?>(
+                    new DeferredRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    )
+                );
             }
 
             throw new InvalidOperationException(
@@ -622,6 +757,11 @@ public sealed class RetentionStartupValidatorTests
                 "soft-delete" => Task.FromResult<IRetentionRuleResolver?>(
                     new OpaqueDeferredRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    )
+                ),
+                "anonymise" => Task.FromResult<IRetentionRuleResolver?>(
+                    new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     )
                 ),
                 _ => throw new InvalidOperationException(
@@ -796,6 +936,55 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
+    private sealed class InvalidAnonymiseMethodDbContext(
+        DbContextOptions<InvalidAnonymiseMethodDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<InvalidNullAnonymiseRecord>(entity =>
+            {
+                entity.ToTable("invalid_null_anonymise_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+                entity.Property(record => record.TenantId).HasColumnName("tenant_id");
+                entity.Property(record => record.Age).HasColumnName("age");
+            });
+            modelBuilder.Entity<InvalidEmptyStringAnonymiseRecord>(entity =>
+            {
+                entity.ToTable("invalid_empty_string_anonymise_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+                entity.Property(record => record.TenantId).HasColumnName("tenant_id");
+                entity.Property(record => record.ExternalId).HasColumnName("external_id");
+            });
+            modelBuilder.Entity<InvalidFixedLiteralAnonymiseRecord>(entity =>
+            {
+                entity.ToTable("invalid_fixed_literal_anonymise_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+                entity.Property(record => record.TenantId).HasColumnName("tenant_id");
+                entity.Property(record => record.LastSeenAt).HasColumnName("last_seen_at");
+            });
+        }
+    }
+
+    private sealed class MissingAnonymiseTenantDbContext(
+        DbContextOptions<MissingAnonymiseTenantDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<MissingAnonymiseTenantRecord>(entity =>
+            {
+                entity.ToTable("missing_anonymise_tenant_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+                entity.Property(record => record.EmailAddress).HasColumnName("email_address");
+            });
+        }
+    }
+
     private sealed class UnannotatedRecord
     {
         public Guid Id { get; init; }
@@ -865,5 +1054,48 @@ public sealed class RetentionStartupValidatorTests
         public DateTimeOffset CreatedAt { get; init; }
         public bool IsDeleted { get; init; }
         public DateTimeOffset? DeletedAt { get; init; }
+    }
+
+    [Retain("invalid-null-anonymise", nameof(InvalidNullAnonymiseRecord.CreatedAt))]
+    private sealed class InvalidNullAnonymiseRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+
+        [Anonymise(AnonymiseMethod.Null)]
+        public int Age { get; init; }
+    }
+
+    [Retain("invalid-empty-string-anonymise", nameof(InvalidEmptyStringAnonymiseRecord.CreatedAt))]
+    private sealed class InvalidEmptyStringAnonymiseRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+
+        [Anonymise(AnonymiseMethod.EmptyString)]
+        public Guid ExternalId { get; init; }
+    }
+
+    [Retain("invalid-fixed-literal-anonymise", nameof(InvalidFixedLiteralAnonymiseRecord.CreatedAt))]
+    private sealed class InvalidFixedLiteralAnonymiseRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+
+        [Anonymise(AnonymiseMethod.FixedLiteral, "[redacted]")]
+        public DateTimeOffset LastSeenAt { get; init; }
+    }
+
+    [Retain("missing-anonymise-tenant", nameof(MissingAnonymiseTenantRecord.CreatedAt))]
+    private sealed class MissingAnonymiseTenantRecord
+    {
+        public Guid Id { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+
+        [Anonymise(AnonymiseMethod.Null)]
+        public string? EmailAddress { get; init; }
     }
 }

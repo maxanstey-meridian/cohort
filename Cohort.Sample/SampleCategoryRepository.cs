@@ -14,6 +14,9 @@ public sealed class SampleCategoryRepository : IRetentionCategoryRepository
             ["soft-delete"] = new StaticRetentionRuleResolver(
                 new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
             ),
+            ["anonymise"] = new StaticRetentionRuleResolver(
+                new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+            ),
         };
 
     public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)

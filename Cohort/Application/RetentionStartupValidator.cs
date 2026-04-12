@@ -89,6 +89,14 @@ public sealed class RetentionStartupValidator(
                 {
                     ValidateSoftDeleteConvention(entry, errors, $"Soft-delete convention on {clrType.FullName}:");
                 }
+
+                if (
+                    startupRule?.Strategy == Strategy.Anonymise
+                    || possibleStrategies?.Contains(Strategy.Anonymise) == true
+                )
+                {
+                    ValidateAnonymiseConvention(entry, errors, $"Anonymise convention on {clrType.FullName}:");
+                }
                 else if (startupRule is null && possibleStrategies is null)
                 {
                     ValidateOpaqueDeferredResolverCompatibility(entry, errors);
@@ -164,7 +172,7 @@ public sealed class RetentionStartupValidator(
         if (isDeletedMember is null && deletedAtMember is null)
         {
             errors.Add(
-                $"Retention category '{entry.Category}' for entity {clrType.FullName} uses a deferred resolver that does not declare its possible strategies at startup. Opaque deferred resolvers must either advertise their strategies or target entities with a valid soft-delete convention."
+                $"Retention category '{entry.Category}' for entity {clrType.FullName} uses a deferred resolver that does not declare its possible strategies at startup. Opaque deferred resolvers must either advertise their strategies or target entities with a valid soft-delete or anonymise convention."
             );
             return;
         }
@@ -196,6 +204,59 @@ public sealed class RetentionStartupValidator(
         }
     }
 
+    private static void ValidateAnonymiseConvention(
+        RetentionEntry entry,
+        List<string> errors,
+        string messagePrefix
+    )
+    {
+        if (entry.Tenant is null)
+        {
+            errors.Add(
+                $"{messagePrefix} retained Anonymise categories require tenant metadata via a public Guid or nullable Guid TenantId property mapped by EF."
+            );
+        }
+
+        if (entry.AnonymiseFields.Count == 0)
+        {
+            errors.Add(
+                $"{messagePrefix} retained Anonymise categories require at least one [Anonymise]-annotated property mapped by EF."
+            );
+            return;
+        }
+
+        foreach (var field in entry.AnonymiseFields)
+        {
+            var property = entry.EntityType.GetProperty(field.MemberName, BindingFlags.Public | BindingFlags.Instance);
+            if (property is null)
+            {
+                errors.Add(
+                    $"{messagePrefix} could not find public CLR property '{field.MemberName}' for anonymise metadata."
+                );
+                continue;
+            }
+
+            switch (field.Method)
+            {
+                case AnonymiseMethod.Null when IsNonNullableValueType(property.PropertyType):
+                    errors.Add(
+                        $"{messagePrefix} [Anonymise] member {property.Name} uses Null but {property.PropertyType.Name} is not nullable."
+                    );
+                    break;
+                case AnonymiseMethod.EmptyString when property.PropertyType != typeof(string):
+                    errors.Add(
+                        $"{messagePrefix} [Anonymise] member {property.Name} uses EmptyString but {property.PropertyType.Name} is not string."
+                    );
+                    break;
+                case AnonymiseMethod.FixedLiteral when property.PropertyType != typeof(string):
+                    errors.Add(
+                        $"{messagePrefix} [Anonymise] member {property.Name} uses FixedLiteral but {property.PropertyType.Name} is not string."
+                    );
+                    break;
+            }
+        }
+    }
+
     private static void ValidateSoftDeleteTenantConvention(
         RetentionEntry entry,
         List<string> errors,
@@ -208,5 +269,10 @@ public sealed class RetentionStartupValidator(
                 $"{messagePrefix} retained SoftDelete categories require tenant metadata via a public Guid or nullable Guid TenantId property mapped by EF."
             );
         }
+    }
+
+    private static bool IsNonNullableValueType(Type type)
+    {
+        return type.IsValueType && Nullable.GetUnderlyingType(type) is null;
     }
 }

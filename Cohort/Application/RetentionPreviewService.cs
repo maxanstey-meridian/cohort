@@ -60,6 +60,7 @@ public sealed class RetentionPreviewService(
             var rule = await resolver.ResolveAsync(context, ct);
             if (
                 rule.Strategy is not Strategy.Purge
+                    and not Strategy.Anonymise
                     and not Strategy.SoftDelete
                     and not Strategy.Exempt
             )
@@ -72,6 +73,7 @@ public sealed class RetentionPreviewService(
             var affected = rule.Strategy switch
             {
                 Strategy.Purge => await CountCandidatesAsync(entry, rule, context, ct),
+                Strategy.Anonymise => await CountCandidatesAsync(entry, rule, context, ct),
                 Strategy.SoftDelete => await CountCandidatesAsync(entry, rule, context, ct),
                 Strategy.Exempt => 0,
                 _ => throw new UnreachableException(
@@ -104,7 +106,7 @@ public sealed class RetentionPreviewService(
         ArgumentNullException.ThrowIfNull(rule);
         ArgumentNullException.ThrowIfNull(context);
 
-        if (rule.Strategy is not Strategy.Purge and not Strategy.SoftDelete)
+        if (rule.Strategy is not Strategy.Purge and not Strategy.Anonymise and not Strategy.SoftDelete)
         {
             throw new InvalidOperationException(
                 $"RetentionPreviewService cannot preview {rule.Strategy} rules."
@@ -113,7 +115,7 @@ public sealed class RetentionPreviewService(
 
         var tenant = entry.Tenant
             ?? throw new InvalidOperationException(
-                $"Retention entry for {entry.EntityType.FullName} must expose tenant metadata for purge previews."
+                $"Retention entry for {entry.EntityType.FullName} must expose tenant metadata for retention previews."
             );
         var isDeletedMember = rule.Strategy == Strategy.SoftDelete
             ? GetSoftDeleteEligibilityMember(entry)

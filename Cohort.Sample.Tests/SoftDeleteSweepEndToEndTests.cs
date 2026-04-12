@@ -128,6 +128,9 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
                     ["soft-delete"] = new StaticRetentionRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     ),
+                    ["anonymise"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
                 }
             )
         );
@@ -241,6 +244,9 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
                     ),
                     ["soft-delete"] = new StaticRetentionRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    ),
+                    ["anonymise"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
                 }
             )

@@ -9,6 +9,7 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
     public DbSet<Note> Notes => Set<Note>();
     public DbSet<ExemptDocument> ExemptDocuments => Set<ExemptDocument>();
     public DbSet<SoftDeleteRecord> SoftDeleteRecords => Set<SoftDeleteRecord>();
+    public DbSet<AnonymisedContact> AnonymisedContacts => Set<AnonymisedContact>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -38,6 +39,18 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
             b.Property(record => record.Body).IsRequired();
             b.Property(record => record.IsDeleted).IsRequired();
             b.Property(record => record.DeletedAt);
+        });
+
+        modelBuilder.Entity<AnonymisedContact>(b =>
+        {
+            b.ToTable("anonymised_contacts");
+            b.HasKey(contact => contact.Id);
+            b.Property(contact => contact.TenantId);
+            b.Property(contact => contact.CreatedAt).IsRequired();
+            b.Property(contact => contact.EmailAddress);
+            b.Property(contact => contact.GivenName).IsRequired();
+            b.Property(contact => contact.Surname).IsRequired();
+            b.Property(contact => contact.Notes).IsRequired();
         });
     }
 }

@@ -29,6 +29,7 @@ builder.Services.AddScoped<DbContext>(sp => sp.GetRequiredService<SampleDbContex
 builder.Services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
 builder.Services.AddScoped<IRetentionSweepStrategy, PurgeSweepStrategy>();
 builder.Services.AddScoped<IRetentionSweepStrategy, SoftDeleteSweepStrategy>();
+builder.Services.AddScoped<IRetentionSweepStrategy, AnonymiseSweepStrategy>();
 builder.Services.AddScoped<IRetentionPreview, RetentionPreviewService>();
 builder.Services.AddScoped<RetentionRegistry>();
 builder.Services.AddScoped<RetentionStartupValidator>();

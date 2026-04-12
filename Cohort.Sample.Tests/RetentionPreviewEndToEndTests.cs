@@ -57,7 +57,7 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(2);
+        result.Counts.Should().HaveCount(3);
         result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
@@ -73,6 +73,15 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
                 "soft-delete",
                 tenantA,
                 Strategy.SoftDelete,
+                0
+            )
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(AnonymisedContact),
+                "anonymise",
+                tenantA,
+                Strategy.Anonymise,
                 0
             )
         );
@@ -122,6 +131,9 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
                     ["soft-delete"] = new StaticRetentionRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     ),
+                    ["anonymise"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
                 }
             )
         );
@@ -131,7 +143,7 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(2);
+        result.Counts.Should().HaveCount(3);
         result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
@@ -147,6 +159,15 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
                 "soft-delete",
                 tenantId,
                 Strategy.SoftDelete,
+                0
+            )
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(AnonymisedContact),
+                "anonymise",
+                tenantId,
+                Strategy.Anonymise,
                 0
             )
         );
@@ -198,6 +219,9 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
                     ["soft-delete"] = new StaticRetentionRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     ),
+                    ["anonymise"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
                 }
             )
         );
@@ -207,7 +231,7 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(2);
+        result.Counts.Should().HaveCount(3);
         result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
@@ -223,6 +247,15 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
                 "soft-delete",
                 tenantId,
                 Strategy.SoftDelete,
+                0
+            )
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(AnonymisedContact),
+                "anonymise",
+                tenantId,
+                Strategy.Anonymise,
                 0
             )
         );
@@ -272,7 +305,7 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(2);
+        result.Counts.Should().HaveCount(3);
         result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
@@ -288,6 +321,15 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
                 "soft-delete",
                 tenantA,
                 Strategy.SoftDelete,
+                0
+            )
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(AnonymisedContact),
+                "anonymise",
+                tenantA,
+                Strategy.Anonymise,
                 0
             )
         );

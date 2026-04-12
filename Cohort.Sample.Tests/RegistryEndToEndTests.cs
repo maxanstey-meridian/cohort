@@ -86,6 +86,16 @@ public sealed class RegistryEndToEndTests(PostgresFixture fixture) : Integration
                 && kvp.Value.SoftDelete != null
                 && kvp.Value.EntityType == typeof(SoftDeleteRecord)
             );
+        entries
+            .Should()
+            .Contain(kvp =>
+                kvp.Key == typeof(AnonymisedContact)
+                && kvp.Value.Category == "anonymise"
+                && kvp.Value.AnchorMember == nameof(AnonymisedContact.CreatedAt)
+                && kvp.Value.Tenant != null
+                && kvp.Value.AnonymiseFields.Count == 3
+                && kvp.Value.EntityType == typeof(AnonymisedContact)
+            );
         entries.Values.Should().NotContain(e => e.Category == "long-lived");
         entries.Should().NotContainKey(typeof(ExemptDocument));
 

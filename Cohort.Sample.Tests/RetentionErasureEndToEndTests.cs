@@ -2,10 +2,15 @@ using System.Data.Common;
 
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Hosting;
+using Cohort.Infrastructure.Migrations;
 using Cohort.Sample.Entities;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+
+using Npgsql;
 
 namespace Cohort.Sample.Tests;
 
@@ -355,6 +360,88 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             .WithMessage("*SubjectId*expects Guid*");
     }
 
+    [Fact]
+    public async Task Erasure_Path_Matches_Using_The_Marked_Clr_Property_Instead_Of_A_Hardcoded_SubjectId_Name()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        await using var services = BuildAliasSubjectServiceProvider(database.ConnectionString);
+
+        var tenantId = Guid.NewGuid();
+        var otherTenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var otherSubjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var matchingId = Guid.NewGuid();
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AliasSubjectDbContext>();
+            await db.Database.EnsureCreatedAsync();
+
+            db.AliasSubjectFixtureRecords.AddRange(
+                new AliasSubjectFixtureRecord
+                {
+                    Id = matchingId,
+                    TenantId = tenantId,
+                    CustomerReference = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "alias-match",
+                },
+                new AliasSubjectFixtureRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CustomerReference = otherSubjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "alias-other-subject",
+                },
+                new AliasSubjectFixtureRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = otherTenantId,
+                    CustomerReference = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "alias-other-tenant",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        ErasureResult result;
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var erasureService = scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
+            result = await erasureService.EraseAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                new ErasureScope(subjectId),
+                asOf
+            );
+        }
+
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(AliasSubjectFixtureRecord),
+                "short-lived",
+                tenantId,
+                Strategy.Purge,
+                1
+            )
+        );
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var verify = scope.ServiceProvider.GetRequiredService<AliasSubjectDbContext>();
+            (await verify.AliasSubjectFixtureRecords.Select(record => record.Body)
+                    .OrderBy(body => body)
+                    .ToListAsync())
+                .Should()
+                .Equal("alias-other-subject", "alias-other-tenant");
+            (await verify.AliasSubjectFixtureRecords.AnyAsync(record => record.Id == matchingId))
+                .Should()
+                .BeFalse();
+        }
+    }
+
     private async Task CreateHoldAsync(
         string tableName,
         Guid recordId,
@@ -537,5 +624,123 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     {
         using var db = Host.CreateDbContext();
         return db.Database.GetConnectionString()!;
+    }
+
+    private static ServiceProvider BuildAliasSubjectServiceProvider(string connectionString)
+    {
+        var services = new ServiceCollection();
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection().Build();
+
+        services.AddSingleton<IConfiguration>(configuration);
+        services.AddLogging();
+        services.AddDbContext<AliasSubjectDbContext>(options => options.UseNpgsql(connectionString));
+        services.AddSingleton<IRetentionCategoryRepository>(
+            new StaticCategoryRepository(
+                new Dictionary<string, IRetentionRuleResolver>
+                {
+                    ["short-lived"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    ),
+                }
+            )
+        );
+        services.AddCohort<AliasSubjectDbContext>();
+
+        return services.BuildServiceProvider(validateScopes: true);
+    }
+}
+
+internal sealed class AliasSubjectDbContext(DbContextOptions<AliasSubjectDbContext> options)
+    : DbContext(options)
+{
+    public DbSet<AliasSubjectFixtureRecord> AliasSubjectFixtureRecords => Set<AliasSubjectFixtureRecord>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<AliasSubjectFixtureRecord>(builder =>
+        {
+            builder.ToTable("alias_subject_fixture_records");
+            builder.HasKey(record => record.Id);
+            builder.Property(record => record.TenantId).IsRequired();
+            builder.Property(record => record.CustomerReference).HasColumnName("external_subject_key");
+            builder.Property(record => record.CreatedAt).IsRequired();
+            builder.Property(record => record.Body).IsRequired();
+        });
+
+        modelBuilder.ConfigureCohortTables();
+    }
+}
+
+[Retain("short-lived", nameof(CreatedAt))]
+internal sealed class AliasSubjectFixtureRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+
+    [ErasureSubject]
+    public Guid? CustomerReference { get; set; }
+
+    public DateTimeOffset CreatedAt { get; set; }
+    public string Body { get; set; } = "";
+}
+
+internal sealed class TemporaryDatabase(string connectionString, string databaseName) : IAsyncDisposable
+{
+    public string ConnectionString => connectionString;
+
+    public static async Task<TemporaryDatabase> CreateAsync(string baseConnectionString)
+    {
+        var databaseName = $"cohort_erasure_{Guid.NewGuid():N}";
+        var adminConnectionString = CreateAdminConnectionString(baseConnectionString);
+
+        await using var connection = new NpgsqlConnection(adminConnectionString);
+        await connection.OpenAsync();
+
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = $"CREATE DATABASE \"{databaseName}\"";
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var builder = new NpgsqlConnectionStringBuilder(baseConnectionString)
+        {
+            Database = databaseName,
+        };
+
+        return new TemporaryDatabase(builder.ConnectionString, databaseName);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        var adminConnectionString = CreateAdminConnectionString(connectionString);
+
+        await using var connection = new NpgsqlConnection(adminConnectionString);
+        await connection.OpenAsync();
+
+        await using (var terminate = connection.CreateCommand())
+        {
+            terminate.CommandText =
+                $"""
+                SELECT pg_terminate_backend(pid)
+                FROM pg_stat_activity
+                WHERE datname = '{databaseName}'
+                  AND pid <> pg_backend_pid()
+                """;
+            await terminate.ExecuteNonQueryAsync();
+        }
+
+        await using var drop = connection.CreateCommand();
+        drop.CommandText = $"DROP DATABASE IF EXISTS \"{databaseName}\"";
+        await drop.ExecuteNonQueryAsync();
+    }
+
+    private static string CreateAdminConnectionString(string originalConnectionString)
+    {
+        var builder = new NpgsqlConnectionStringBuilder(originalConnectionString)
+        {
+            Database = "postgres",
+        };
+
+        return builder.ConnectionString;
     }
 }

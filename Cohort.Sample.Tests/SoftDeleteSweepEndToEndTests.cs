@@ -256,7 +256,7 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
                     ),
                 }
             ),
-            new NoOpHoldsRepository()
+            [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
         );
 
         var act = () =>
@@ -284,33 +284,68 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
         }
     }
 
-    private sealed class NoOpHoldsRepository : IRetentionHoldsRepository
-    {
-        public Task CreateAsync(RetentionHoldRequest request, CancellationToken ct) => Task.CompletedTask;
-
-        public Task RemoveAsync(Guid holdId, DateTimeOffset removedAt, CancellationToken ct) => Task.CompletedTask;
-
-        public Task<IReadOnlyList<RetentionHold>> ListActiveAsync(DateTimeOffset asOf, CancellationToken ct)
-        {
-            return Task.FromResult<IReadOnlyList<RetentionHold>>([]);
-        }
-
-        public Task<bool> HasActiveHoldAsync(
-            string tableName,
-            Guid recordId,
-            Guid tenantId,
-            DateTimeOffset asOf,
-            CancellationToken ct
-        )
-        {
-            return Task.FromResult(false);
-        }
-    }
 }
 
 [Collection("Integration")]
 public sealed class SoftDeleteSweepStrategyCommandTests
 {
+    [Fact]
+    public async Task PreviewAsync_Uses_A_Hold_Aware_Count_Query()
+    {
+        var strategy = new SoftDeleteSweepStrategy();
+        var connection = new RecordingDbConnection();
+        var tenantId = Guid.NewGuid();
+        var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var entry = new RetentionEntry(
+            typeof(SoftDeleteRecord),
+            "soft_delete_records",
+            "soft-delete",
+            nameof(SoftDeleteRecord.CreatedAt),
+            "CreatedAt",
+            new RecordIdConvention(nameof(SoftDeleteRecord.Id), "Id"),
+            [],
+            new TenantConvention(nameof(SoftDeleteRecord.TenantId), "TenantId"),
+            new SoftDeleteConvention(
+                nameof(SoftDeleteRecord.IsDeleted),
+                "IsDeleted",
+                nameof(SoftDeleteRecord.DeletedAt),
+                "DeletedAt"
+            )
+        );
+        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete);
+        var context = new RetentionResolutionContext(
+            "soft-delete",
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            now,
+            []
+        );
+
+        var affected = await strategy.PreviewAsync(
+            entry,
+            rule,
+            context,
+            connection,
+            CancellationToken.None
+        );
+
+        affected.Should().Be(1);
+        connection.Commands.Should().ContainSingle();
+        connection.LastCommand.Should().NotBeNull();
+        connection.LastCommand!.AssignedTransaction.Should().BeNull();
+        connection.LastCommand.CommandText.Should().Contain("SELECT COUNT(*)");
+        connection.LastCommand.CommandText.Should().Contain("\"IsDeleted\" = FALSE");
+        connection.LastCommand.CommandText.Should().Contain("@cutoff");
+        connection.LastCommand.CommandText.Should().Contain("@tenantId");
+        connection.LastCommand.CommandText.Should().Contain("@holdTableName");
+        connection.LastCommand.CommandText.Should().Contain("@holdAsOf");
+        connection.LastCommand.CommandText.Should().Contain("NOT EXISTS");
+        connection.LastCommand.Parameters.Count.Should().Be(4);
+        connection.LastCommand.Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
+        connection.LastCommand.Parameters["tenantId"].Value.Should().Be(tenantId);
+        connection.LastCommand.Parameters["holdTableName"].Value.Should().Be("soft_delete_records");
+        connection.LastCommand.Parameters["holdAsOf"].Value.Should().Be(now);
+    }
+
     [Fact]
     public async Task SweepAsync_Computes_HeldCount_From_Selected_Candidates_And_Targets_Only_Those_Ids()
     {

@@ -295,6 +295,66 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
 public sealed class AnonymiseSweepStrategyCommandTests
 {
     [Fact]
+    public async Task PreviewAsync_Uses_A_Hold_Aware_Count_Query()
+    {
+        var strategy = new AnonymiseSweepStrategy();
+        var connection = new RecordingDbConnection();
+        var tenantId = Guid.NewGuid();
+        var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var entry = new RetentionEntry(
+            typeof(AnonymisedContact),
+            "anonymised_contacts",
+            "anonymise",
+            nameof(AnonymisedContact.CreatedAt),
+            "CreatedAt",
+            new RecordIdConvention(nameof(AnonymisedContact.Id), "Id"),
+            [
+                new AnonymiseField(nameof(AnonymisedContact.EmailAddress), "EmailAddress", AnonymiseMethod.Null),
+                new AnonymiseField(nameof(AnonymisedContact.GivenName), "GivenName", AnonymiseMethod.EmptyString),
+                new AnonymiseField(
+                    nameof(AnonymisedContact.Surname),
+                    "Surname",
+                    AnonymiseMethod.FixedLiteral,
+                    "[redacted]"
+                ),
+            ],
+            new TenantConvention(nameof(AnonymisedContact.TenantId), "TenantId"),
+            null
+        );
+        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise);
+        var context = new RetentionResolutionContext(
+            "anonymise",
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            now,
+            []
+        );
+
+        var affected = await strategy.PreviewAsync(
+            entry,
+            rule,
+            context,
+            connection,
+            CancellationToken.None
+        );
+
+        affected.Should().Be(1);
+        connection.Commands.Should().ContainSingle();
+        connection.LastCommand.Should().NotBeNull();
+        connection.LastCommand!.AssignedTransaction.Should().BeNull();
+        connection.LastCommand.CommandText.Should().Contain("SELECT COUNT(*)");
+        connection.LastCommand.CommandText.Should().Contain("@cutoff");
+        connection.LastCommand.CommandText.Should().Contain("@tenantId");
+        connection.LastCommand.CommandText.Should().Contain("@holdTableName");
+        connection.LastCommand.CommandText.Should().Contain("@holdAsOf");
+        connection.LastCommand.CommandText.Should().Contain("NOT EXISTS");
+        connection.LastCommand.Parameters.Count.Should().Be(4);
+        connection.LastCommand.Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
+        connection.LastCommand.Parameters["tenantId"].Value.Should().Be(tenantId);
+        connection.LastCommand.Parameters["holdTableName"].Value.Should().Be("anonymised_contacts");
+        connection.LastCommand.Parameters["holdAsOf"].Value.Should().Be(now);
+    }
+
+    [Fact]
     public async Task SweepAsync_Uses_Parameterized_Assignments_For_All_Anonymise_Methods()
     {
         var strategy = new AnonymiseSweepStrategy();

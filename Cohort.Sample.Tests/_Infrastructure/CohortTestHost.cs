@@ -68,8 +68,8 @@ public sealed class CohortTestHost(
     )
     {
         await using var scopeServices = _services.CreateAsyncScope();
-        var erasureService = scopeServices.ServiceProvider.GetRequiredService<IRetentionErasureService>();
-        return await erasureService.EraseAsync(tenant, scope, now, ct);
+        var startup = scopeServices.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
+        return await startup.RunErasureAsync(tenant, scope, now, ct);
     }
 
     public async Task<TResult> RunWithServicesAsync<TResult>(

@@ -8,6 +8,14 @@ public interface IRetentionSweepStrategy
 {
     public Strategy HandlesStrategy { get; }
 
+    public Task<int> PreviewAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        RetentionResolutionContext ctx,
+        DbConnection conn,
+        CancellationToken ct
+    );
+
     public Task<SweepExecutionResult> SweepAsync(
         RetentionEntry entry,
         RetentionRule rule,

@@ -392,6 +392,17 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         public DbTransaction? ReceivedTransaction { get; private set; }
         public DbTransaction? CurrentEfTransactionAtExecution { get; private set; }
 
+        public Task<int> PreviewAsync(
+            RetentionEntry entry,
+            RetentionRule rule,
+            RetentionResolutionContext ctx,
+            DbConnection conn,
+            CancellationToken ct
+        )
+        {
+            throw new NotSupportedException();
+        }
+
         public Task<SweepExecutionResult> SweepAsync(
             RetentionEntry entry,
             RetentionRule rule,

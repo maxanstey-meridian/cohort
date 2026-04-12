@@ -1,5 +1,6 @@
 using System.Data;
 using System.Data.Common;
+using System.Globalization;
 
 using Cohort.Application;
 using Cohort.Domain;
@@ -10,6 +11,62 @@ namespace Cohort.Infrastructure.Sweep;
 public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
 {
     public Strategy HandlesStrategy => Strategy.Anonymise;
+
+    public async Task<int> PreviewAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        RetentionResolutionContext ctx,
+        DbConnection conn,
+        CancellationToken ct
+    )
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+        ArgumentNullException.ThrowIfNull(rule);
+        ArgumentNullException.ThrowIfNull(ctx);
+        ArgumentNullException.ThrowIfNull(conn);
+
+        if (rule.Strategy != Strategy.Anonymise)
+        {
+            throw new InvalidOperationException(
+                $"AnonymiseSweepStrategy cannot execute {rule.Strategy} rules."
+            );
+        }
+
+        var tenant = entry.Tenant
+            ?? throw new InvalidOperationException(
+                $"Retention entry for {entry.EntityType.FullName} must expose tenant metadata for anonymise previews."
+            );
+
+        if (entry.AnonymiseFields.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"Retention entry for {entry.EntityType.FullName} must expose anonymise metadata for anonymise previews."
+            );
+        }
+
+        if (conn.State != ConnectionState.Open)
+        {
+            await conn.OpenAsync(ct);
+        }
+
+        var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);
+
+        await using var command = conn.CreateCommand();
+        command.CommandText =
+            $"""
+            SELECT COUNT(*)
+            FROM {QuoteIdentifier(entry.TableName)} AS target
+            WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
+              AND target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
+              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn)}
+            """;
+        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
+        command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
+        command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
+        command.Parameters.Add(CreateParameter(command, "holdAsOf", ctx.Now));
+
+        return Convert.ToInt32(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
+    }
 
     public async Task<SweepExecutionResult> SweepAsync(
         RetentionEntry entry,

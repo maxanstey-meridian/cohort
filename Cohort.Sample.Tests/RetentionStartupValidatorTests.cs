@@ -308,7 +308,14 @@ public sealed class RetentionStartupValidatorTests
                 db,
                 new RetentionRegistry(db),
                 repository,
-                new NoOpHoldsRepository()
+                [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
+            ),
+            new RetentionErasureService(
+                db,
+                new RetentionRegistry(db),
+                repository,
+                new NoOpRetentionAuditWriter(),
+                [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
             )
         );
 
@@ -353,7 +360,14 @@ public sealed class RetentionStartupValidatorTests
                 db,
                 new RetentionRegistry(db),
                 repository,
-                new NoOpHoldsRepository()
+                [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
+            ),
+            new RetentionErasureService(
+                db,
+                new RetentionRegistry(db),
+                repository,
+                new NoOpRetentionAuditWriter(),
+                [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
             )
         );
 
@@ -402,13 +416,77 @@ public sealed class RetentionStartupValidatorTests
                 db,
                 new RetentionRegistry(db),
                 repository,
-                new NoOpHoldsRepository()
+                [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
+            ),
+            new RetentionErasureService(
+                db,
+                new RetentionRegistry(db),
+                repository,
+                new NoOpRetentionAuditWriter(),
+                [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
             )
         );
 
         var act = async () =>
             await startup.RunSweepAsync(
                 new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
+                DateTimeOffset.UtcNow
+            );
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"[Retain] on {typeof(BrokenAnnotationEntity).FullName}: anchor '{nameof(BrokenAnnotationEntity.Body)}' must be DateTime or DateTimeOffset (nullable allowed), got String."
+            );
+    }
+
+    [Fact]
+    public async Task Startup_Service_Validates_Before_Erasing_Subject_Matched_Entities()
+    {
+        var options = new DbContextOptionsBuilder<BrokenAnnotationDbContext>()
+            .UseInMemoryDatabase($"startup-service-erasure-invalid-anchor-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new BrokenAnnotationDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["broken-sample"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                ),
+            }
+        );
+        var startup = new SampleRetentionStartupService(
+            new RetentionRegistry(db),
+            new RetentionStartupValidator(db, repository),
+            new RetentionSweepEngine(
+                db,
+                new RetentionRegistry(db),
+                repository,
+                new NoOpRetentionAuditWriter(),
+                [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy()]
+            ),
+            new RetentionPreviewService(
+                db,
+                new RetentionRegistry(db),
+                repository,
+                [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
+            ),
+            new RetentionErasureService(
+                db,
+                new RetentionRegistry(db),
+                repository,
+                new NoOpRetentionAuditWriter(),
+                [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
+            )
+        );
+
+        var act = async () =>
+            await startup.RunErasureAsync(
+                new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
+                new ErasureScope(Guid.NewGuid()),
                 DateTimeOffset.UtcNow
             );
 
@@ -710,28 +788,6 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
-    private sealed class NoOpHoldsRepository : IRetentionHoldsRepository
-    {
-        public Task CreateAsync(RetentionHoldRequest request, CancellationToken ct) => Task.CompletedTask;
-
-        public Task RemoveAsync(Guid holdId, DateTimeOffset removedAt, CancellationToken ct) => Task.CompletedTask;
-
-        public Task<IReadOnlyList<RetentionHold>> ListActiveAsync(DateTimeOffset asOf, CancellationToken ct)
-        {
-            return Task.FromResult<IReadOnlyList<RetentionHold>>([]);
-        }
-
-        public Task<bool> HasActiveHoldAsync(
-            string tableName,
-            Guid recordId,
-            Guid tenantId,
-            DateTimeOffset asOf,
-            CancellationToken ct
-        )
-        {
-            return Task.FromResult(false);
-        }
-    }
 
     private sealed class DeferredRuleResolver(RetentionRule rule) : IRetentionRuleResolver
     {

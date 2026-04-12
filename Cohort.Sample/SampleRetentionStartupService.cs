@@ -7,7 +7,8 @@ public sealed class SampleRetentionStartupService(
     RetentionRegistry registry,
     RetentionStartupValidator validator,
     RetentionSweepEngine sweepEngine,
-    IRetentionPreview previewService
+    IRetentionPreview previewService,
+    IRetentionErasureService erasureService
 )
 {
     public async Task<IReadOnlyDictionary<Type, RetentionEntry>> RunAsync(
@@ -36,5 +37,16 @@ public sealed class SampleRetentionStartupService(
     {
         await validator.ValidateAsync(ct);
         return await previewService.PreviewAsync(tenant, now, ct);
+    }
+
+    public async Task<ErasureResult> RunErasureAsync(
+        TenantContext tenant,
+        ErasureScope scope,
+        DateTimeOffset now,
+        CancellationToken ct = default
+    )
+    {
+        await validator.ValidateAsync(ct);
+        return await erasureService.EraseAsync(tenant, scope, now, ct);
     }
 }

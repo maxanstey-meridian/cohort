@@ -1,5 +1,6 @@
 using System.Data;
 using System.Data.Common;
+using System.Globalization;
 using System.Reflection;
 
 using Cohort.Application;
@@ -11,6 +12,60 @@ namespace Cohort.Infrastructure.Sweep;
 public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
 {
     public Strategy HandlesStrategy => Strategy.SoftDelete;
+
+    public async Task<int> PreviewAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        RetentionResolutionContext ctx,
+        DbConnection conn,
+        CancellationToken ct
+    )
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+        ArgumentNullException.ThrowIfNull(rule);
+        ArgumentNullException.ThrowIfNull(ctx);
+        ArgumentNullException.ThrowIfNull(conn);
+
+        if (rule.Strategy != Strategy.SoftDelete)
+        {
+            throw new InvalidOperationException(
+                $"SoftDeleteSweepStrategy cannot execute {rule.Strategy} rules."
+            );
+        }
+
+        var tenant = entry.Tenant
+            ?? throw new InvalidOperationException(
+                $"Retention entry for {entry.EntityType.FullName} must expose tenant metadata for soft-delete previews."
+            );
+        var softDelete = entry.SoftDelete
+            ?? throw new InvalidOperationException(
+                $"Retention entry for {entry.EntityType.FullName} must expose soft-delete metadata for soft-delete previews."
+            );
+
+        if (conn.State != ConnectionState.Open)
+        {
+            await conn.OpenAsync(ct);
+        }
+
+        var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);
+
+        await using var command = conn.CreateCommand();
+        command.CommandText =
+            $"""
+            SELECT COUNT(*)
+            FROM {QuoteIdentifier(entry.TableName)} AS target
+            WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
+              AND target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
+              AND target.{QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
+              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn)}
+            """;
+        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
+        command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
+        command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
+        command.Parameters.Add(CreateParameter(command, "holdAsOf", ctx.Now));
+
+        return Convert.ToInt32(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
+    }
 
     public async Task<SweepExecutionResult> SweepAsync(
         RetentionEntry entry,

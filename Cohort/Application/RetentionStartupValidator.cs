@@ -28,6 +28,11 @@ public sealed class RetentionStartupValidator(
 
         foreach (var entityType in db.Model.GetEntityTypes())
         {
+            if (entityType.ClrType == typeof(Dictionary<string, object>))
+            {
+                continue;
+            }
+
             var clrType = entityType.ClrType;
             var retain = clrType.GetCustomAttribute<RetainAttribute>(inherit: false);
             var exempt = clrType.GetCustomAttribute<ExemptFromRetentionAttribute>(inherit: false);

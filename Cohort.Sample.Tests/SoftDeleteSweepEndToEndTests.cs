@@ -328,7 +328,8 @@ public sealed class SoftDeleteSweepStrategyCommandTests
             CancellationToken.None
         );
 
-        affected.Should().Be(1);
+        affected.AffectedRecordIds.Should().ContainSingle();
+        affected.HeldCount.Should().Be(0);
         connection.LastCommand.Should().NotBeNull();
         connection.LastCommand!.CommandText.Should().Contain("hold.\"RecordId\" = target.\"record_id\"");
     }
@@ -432,7 +433,7 @@ public sealed class SoftDeleteSweepStrategyCommandTests
 
         public override object? ExecuteScalar()
         {
-            return null;
+            return 1;
         }
 
         public override void Prepare() { }
@@ -444,13 +445,72 @@ public sealed class SoftDeleteSweepStrategyCommandTests
 
         protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
         {
-            throw new NotSupportedException();
+            return new SingleGuidDbDataReader(Guid.NewGuid());
         }
 
         public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
         {
             return Task.FromResult(1);
         }
+    }
+
+    private sealed class SingleGuidDbDataReader(Guid value) : DbDataReader
+    {
+        private bool hasRead;
+
+        public override int FieldCount => 1;
+        public override bool HasRows => true;
+        public override bool IsClosed => false;
+        public override int RecordsAffected => 1;
+        public override int Depth => 0;
+        public override object this[int ordinal] => GetValue(ordinal);
+        public override object this[string name] => GetValue(GetOrdinal(name));
+
+        public override bool Read()
+        {
+            if (hasRead)
+            {
+                return false;
+            }
+
+            hasRead = true;
+            return true;
+        }
+
+        public override Task<bool> ReadAsync(CancellationToken cancellationToken) => Task.FromResult(Read());
+        public override bool NextResult() => false;
+        public override Task<bool> NextResultAsync(CancellationToken cancellationToken) => Task.FromResult(false);
+        public override Guid GetGuid(int ordinal) => value;
+        public override object GetValue(int ordinal) => value;
+        public override int GetValues(object[] values)
+        {
+            values[0] = value;
+            return 1;
+        }
+
+        public override string GetName(int ordinal) => "Id";
+        public override string GetDataTypeName(int ordinal) => nameof(Guid);
+        public override Type GetFieldType(int ordinal) => typeof(Guid);
+        public override int GetOrdinal(string name) => 0;
+        public override bool IsDBNull(int ordinal) => false;
+        public override IEnumerator GetEnumerator()
+        {
+            yield return value;
+        }
+
+        public override bool GetBoolean(int ordinal) => throw new NotSupportedException();
+        public override byte GetByte(int ordinal) => throw new NotSupportedException();
+        public override long GetBytes(int ordinal, long dataOffset, byte[]? buffer, int bufferOffset, int length) => throw new NotSupportedException();
+        public override char GetChar(int ordinal) => throw new NotSupportedException();
+        public override long GetChars(int ordinal, long dataOffset, char[]? buffer, int bufferOffset, int length) => throw new NotSupportedException();
+        public override string GetString(int ordinal) => throw new NotSupportedException();
+        public override short GetInt16(int ordinal) => throw new NotSupportedException();
+        public override int GetInt32(int ordinal) => throw new NotSupportedException();
+        public override long GetInt64(int ordinal) => throw new NotSupportedException();
+        public override float GetFloat(int ordinal) => throw new NotSupportedException();
+        public override double GetDouble(int ordinal) => throw new NotSupportedException();
+        public override decimal GetDecimal(int ordinal) => throw new NotSupportedException();
+        public override DateTime GetDateTime(int ordinal) => throw new NotSupportedException();
     }
 
     private sealed class RecordingDbParameter : DbParameter

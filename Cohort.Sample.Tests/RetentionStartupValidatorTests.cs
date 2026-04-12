@@ -301,6 +301,7 @@ public sealed class RetentionStartupValidatorTests
                 db,
                 new RetentionRegistry(db),
                 repository,
+                new NoOpRetentionAuditWriter(),
                 [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy()]
             ),
             new RetentionPreviewService(
@@ -344,6 +345,7 @@ public sealed class RetentionStartupValidatorTests
                 db,
                 new RetentionRegistry(db),
                 repository,
+                new NoOpRetentionAuditWriter(),
                 [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy()]
             ),
             new RetentionPreviewService(
@@ -391,6 +393,7 @@ public sealed class RetentionStartupValidatorTests
                 db,
                 new RetentionRegistry(db),
                 repository,
+                new NoOpRetentionAuditWriter(),
                 [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy()]
             ),
             new RetentionPreviewService(

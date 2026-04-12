@@ -12,7 +12,7 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
 {
     public Strategy HandlesStrategy => Strategy.SoftDelete;
 
-    public async Task<int> SweepAsync(
+    public async Task<SweepExecutionResult> SweepAsync(
         RetentionEntry entry,
         RetentionRule rule,
         RetentionResolutionContext ctx,
@@ -48,11 +48,21 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
             await conn.OpenAsync(ct);
         }
 
+        var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);
+        var eligibleCount = await CountEligibleRowsAsync(
+            entry,
+            tenant,
+            softDelete,
+            ctx,
+            conn,
+            transaction,
+            cutoff,
+            ct
+        );
+
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = BuildCommandText(entry, tenant, softDelete, entry.RecordId.RecordIdColumn);
-
-        var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
@@ -65,7 +75,14 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
             );
         }
 
-        return await command.ExecuteNonQueryAsync(ct);
+        var affectedRecordIds = new List<Guid>();
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            affectedRecordIds.Add(reader.GetGuid(0));
+        }
+
+        return new SweepExecutionResult(affectedRecordIds, eligibleCount - affectedRecordIds.Count);
     }
 
     private static string BuildCommandText(
@@ -87,7 +104,36 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
               AND target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
               AND target.{QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
               AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn)}
+            RETURNING target.{QuoteIdentifier(recordIdColumn)}
             """;
+    }
+
+    private static async Task<int> CountEligibleRowsAsync(
+        RetentionEntry entry,
+        TenantConvention tenant,
+        SoftDeleteConvention softDelete,
+        RetentionResolutionContext ctx,
+        DbConnection conn,
+        DbTransaction transaction,
+        DateTimeOffset cutoff,
+        CancellationToken ct
+    )
+    {
+        await using var command = conn.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            $"""
+            SELECT COUNT(*)
+            FROM {QuoteIdentifier(entry.TableName)} AS target
+            WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
+              AND target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
+              AND target.{QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
+            """;
+        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
+        command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
+
+        var result = await command.ExecuteScalarAsync(ct);
+        return Convert.ToInt32(result);
     }
 
     private static object CreateDeletedAtValue(

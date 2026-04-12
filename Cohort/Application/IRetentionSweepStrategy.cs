@@ -8,7 +8,7 @@ public interface IRetentionSweepStrategy
 {
     public Strategy HandlesStrategy { get; }
 
-    public Task<int> SweepAsync(
+    public Task<SweepExecutionResult> SweepAsync(
         RetentionEntry entry,
         RetentionRule rule,
         RetentionResolutionContext ctx,
@@ -17,3 +17,5 @@ public interface IRetentionSweepStrategy
         CancellationToken ct
     );
 }
+
+public sealed record SweepExecutionResult(IReadOnlyList<Guid> AffectedRecordIds, int HeldCount);

@@ -11,7 +11,7 @@ public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
 {
     public Strategy HandlesStrategy => Strategy.Purge;
 
-    public async Task<int> SweepAsync(
+    public async Task<SweepExecutionResult> SweepAsync(
         RetentionEntry entry,
         RetentionRule rule,
         RetentionResolutionContext ctx,
@@ -43,6 +43,9 @@ public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
             await conn.OpenAsync(ct);
         }
 
+        var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);
+        var eligibleCount = await CountEligibleRowsAsync(entry, tenant, ctx, conn, transaction, cutoff, ct);
+
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
         command.CommandText =
@@ -51,15 +54,47 @@ public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
             WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               AND target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
               AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn)}
+            RETURNING target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
             """;
-
-        var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
         command.Parameters.Add(CreateParameter(command, "holdAsOf", ctx.Now));
 
-        return await command.ExecuteNonQueryAsync(ct);
+        var affectedRecordIds = new List<Guid>();
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            affectedRecordIds.Add(reader.GetGuid(0));
+        }
+
+        return new SweepExecutionResult(affectedRecordIds, eligibleCount - affectedRecordIds.Count);
+    }
+
+    private static async Task<int> CountEligibleRowsAsync(
+        RetentionEntry entry,
+        TenantConvention tenant,
+        RetentionResolutionContext ctx,
+        DbConnection conn,
+        DbTransaction transaction,
+        DateTimeOffset cutoff,
+        CancellationToken ct
+    )
+    {
+        await using var command = conn.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            $"""
+            SELECT COUNT(*)
+            FROM {QuoteIdentifier(entry.TableName)} AS target
+            WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
+              AND target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
+            """;
+        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
+        command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
+
+        var result = await command.ExecuteScalarAsync(ct);
+        return Convert.ToInt32(result);
     }
 
     private static DbParameter CreateParameter(DbCommand command, string name, object value)

@@ -1,4 +1,5 @@
 using Cohort.Sample.Entities;
+using Cohort.Infrastructure.Migrations;
 
 using Microsoft.EntityFrameworkCore;
 
@@ -67,5 +68,7 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
             b.Property(record => record.RemovedAt);
             b.HasIndex(record => new { record.TableName, record.TenantId, record.RecordId });
         });
+
+        modelBuilder.ConfigureCohortTables();
     }
 }

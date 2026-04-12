@@ -223,6 +223,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
                     ),
                 }
             ),
+            new NoOpRetentionAuditWriter(),
             [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
         );
 
@@ -276,6 +277,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
                     ),
                 }
             ),
+            new NoOpRetentionAuditWriter(),
             [strategy, new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
         );
 
@@ -329,6 +331,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
                     ),
                 }
             ),
+            new NoOpRetentionAuditWriter(),
             [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy()]
         );
 
@@ -389,7 +392,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         public DbTransaction? ReceivedTransaction { get; private set; }
         public DbTransaction? CurrentEfTransactionAtExecution { get; private set; }
 
-        public Task<int> SweepAsync(
+        public Task<SweepExecutionResult> SweepAsync(
             RetentionEntry entry,
             RetentionRule rule,
             RetentionResolutionContext ctx,
@@ -400,7 +403,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         {
             ReceivedTransaction = transaction;
             CurrentEfTransactionAtExecution = db.Database.CurrentTransaction?.GetDbTransaction();
-            return Task.FromResult(0);
+            return Task.FromResult<SweepExecutionResult>(new([], 0));
         }
     }
 

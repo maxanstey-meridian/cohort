@@ -11,6 +11,7 @@ public sealed class RetentionSweepEngine(
     DbContext db,
     RetentionRegistry registry,
     IRetentionCategoryRepository categoryRepository,
+    IRetentionAuditWriter auditWriter,
     IEnumerable<IRetentionSweepStrategy> sweepStrategies
 )
 {
@@ -25,8 +26,10 @@ public sealed class RetentionSweepEngine(
     {
         ArgumentNullException.ThrowIfNull(tenant);
 
+        var sweepId = Guid.NewGuid();
         var startedAt = DateTimeOffset.UtcNow;
         var executionPlan = new List<(RetentionEntry Entry, RetentionResolutionContext Context, RetentionRule Rule)>();
+        var auditEvents = new List<SweepEvent>();
 
         foreach (
             var entry in registry
@@ -56,12 +59,6 @@ public sealed class RetentionSweepEngine(
             executionPlan.Add((entry, context, rule));
         }
 
-        var counts = new List<EntitySweepCount>();
-        if (executionPlan.Count == 0)
-        {
-            return new RetentionSweepResult(Guid.NewGuid(), startedAt, DateTimeOffset.UtcNow, counts);
-        }
-
         var connection = db.Database.GetDbConnection();
         var shouldCloseConnection = connection.State != ConnectionState.Open;
 
@@ -74,12 +71,18 @@ public sealed class RetentionSweepEngine(
         {
             await using var transaction = await db.Database.BeginTransactionAsync(ct);
             var dbTransaction = transaction.GetDbTransaction();
+            await WriteAuditEventAsync(
+                new SweepEvent.Started(sweepId, startedAt, DryRun: false, tenant.Id),
+                auditEvents,
+                ct
+            );
 
             foreach (var (entry, context, rule) in executionPlan)
             {
-                var affected = rule.Strategy switch
+                var eventAt = DateTimeOffset.UtcNow;
+                var execution = rule.Strategy switch
                 {
-                    Strategy.Exempt => 0,
+                    Strategy.Exempt => new SweepExecutionResult([], 0),
                     _ => await strategies[rule.Strategy].SweepAsync(
                         entry,
                         rule,
@@ -90,16 +93,57 @@ public sealed class RetentionSweepEngine(
                     ),
                 };
 
-                counts.Add(
-                    new EntitySweepCount(
+                if (execution.HeldCount < 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Retention strategy '{rule.Strategy}' produced an invalid held-count for entity {entry.EntityType.FullName}."
+                    );
+                }
+
+                await WriteAuditEventAsync(
+                    new SweepEvent.EntitySummary(
+                        sweepId,
+                        eventAt,
                         entry.EntityType,
                         entry.Category,
                         tenant.Id,
                         rule.Strategy,
-                        affected
-                    )
+                        rule.Period,
+                        execution.AffectedRecordIds.Count,
+                        execution.HeldCount
+                    ),
+                    auditEvents,
+                    ct
                 );
+
+                if (rule.AuditRowDetail == AuditRowDetail.PerRow)
+                {
+                    foreach (var recordId in execution.AffectedRecordIds)
+                    {
+                        await WriteAuditEventAsync(
+                            new SweepEvent.RowDetail(
+                                sweepId,
+                                eventAt,
+                                entry.EntityType,
+                                recordId,
+                                entry.Category,
+                                rule.Strategy,
+                                tenant.Id
+                            ),
+                            auditEvents,
+                            ct
+                        );
+                    }
+                }
             }
+
+            var completedAt = DateTimeOffset.UtcNow;
+            var totalAffected = auditEvents.OfType<SweepEvent.EntitySummary>().Sum(summary => summary.Affected);
+            await WriteAuditEventAsync(
+                new SweepEvent.Completed(sweepId, completedAt, completedAt - startedAt, totalAffected),
+                auditEvents,
+                ct
+            );
 
             await transaction.CommitAsync(ct);
         }
@@ -111,6 +155,36 @@ public sealed class RetentionSweepEngine(
             }
         }
 
-        return new RetentionSweepResult(Guid.NewGuid(), startedAt, DateTimeOffset.UtcNow, counts);
+        return CreateResult(auditEvents);
+    }
+
+    private async Task WriteAuditEventAsync(
+        SweepEvent evt,
+        ICollection<SweepEvent> auditEvents,
+        CancellationToken ct
+    )
+    {
+        await auditWriter.WriteAsync(evt, ct);
+        auditEvents.Add(evt);
+    }
+
+    private static RetentionSweepResult CreateResult(IEnumerable<SweepEvent> auditEvents)
+    {
+        var started = auditEvents.OfType<SweepEvent.Started>().Single();
+        var completed = auditEvents.OfType<SweepEvent.Completed>().Single();
+        var counts = auditEvents
+            .OfType<SweepEvent.EntitySummary>()
+            .Select(summary =>
+                new EntitySweepCount(
+                    summary.EntityType,
+                    summary.Category,
+                    summary.TenantId,
+                    summary.Strategy,
+                    summary.Affected
+                )
+            )
+            .ToArray();
+
+        return new RetentionSweepResult(started.SweepId, started.At, completed.At, counts);
     }
 }

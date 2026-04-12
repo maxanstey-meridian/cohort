@@ -1,4 +1,5 @@
 using Cohort.Application;
+using Cohort.Infrastructure.Audit;
 using Cohort.Domain;
 using Cohort.Infrastructure.Holds;
 using Cohort.Infrastructure.Sweep;
@@ -28,6 +29,7 @@ builder.Services.AddDbContext<SampleDbContext>(
 builder.Services.AddScoped<DbContext>(sp => sp.GetRequiredService<SampleDbContext>());
 
 builder.Services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+builder.Services.AddScoped<IRetentionAuditWriter, EfRetentionAuditWriter>();
 builder.Services.AddScoped<IRetentionHoldsRepository, EfRetentionHoldsRepository>();
 builder.Services.AddScoped<IRetentionSweepStrategy, PurgeSweepStrategy>();
 builder.Services.AddScoped<IRetentionSweepStrategy, SoftDeleteSweepStrategy>();

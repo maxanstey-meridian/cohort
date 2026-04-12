@@ -1,5 +1,6 @@
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Infrastructure.Audit;
 using Cohort.Infrastructure.Holds;
 using Cohort.Infrastructure.Sweep;
 
@@ -88,6 +89,7 @@ public sealed class CohortTestHost(
 
         services.AddDbContext<SampleDbContext>(options => options.UseNpgsql(connectionString));
         services.AddScoped<DbContext>(sp => sp.GetRequiredService<SampleDbContext>());
+        services.AddScoped<IRetentionAuditWriter, EfRetentionAuditWriter>();
         services.AddScoped<IRetentionHoldsRepository, EfRetentionHoldsRepository>();
         services.AddScoped<IRetentionSweepStrategy, PurgeSweepStrategy>();
         services.AddScoped<IRetentionSweepStrategy, SoftDeleteSweepStrategy>();

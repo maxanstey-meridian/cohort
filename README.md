@@ -176,9 +176,3 @@ Every sweep writes to three tables (created by `ConfigureCohortTables()`):
 - `sweep_run` — one row per sweep (timestamps, trigger, dry-run flag, total affected)
 - `sweep_run_entity_summary` — per-entity counts (category, strategy, affected, held)
 - `sweep_run_row_detail` — per-row detail (opt-in via `AuditRowDetail.PerRow` on the rule)
-
-## Plans
-
-- [`.plans/COHORT1.md`](.plans/COHORT1.md) — three-milestone library plan
-- [`.plans/COHORT0.md`](.plans/COHORT0.md) — original scaffolding plan
-- [`CLAUDE.md`](CLAUDE.md) — agent instructions (read before writing tests)

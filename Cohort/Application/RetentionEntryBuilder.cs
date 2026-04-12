@@ -40,10 +40,7 @@ public sealed class RetentionEntryBuilder(CohortConventions conventions)
                 $"[Retain] on {clrType.FullName}: EF entity has no mapped table name."
             );
 
-        var anchor = clrType.GetProperty(
-            retain.AnchorMember,
-            BindingFlags.Public | BindingFlags.Instance
-        );
+        var anchor = ReflectionMemberResolver.FindPropertyByName(clrType, retain.AnchorMember);
         if (anchor is null)
         {
             throw new InvalidOperationException(
@@ -93,7 +90,7 @@ public sealed class RetentionEntryBuilder(CohortConventions conventions)
         var recordIdMember = clrType
                 .GetProperties(BindingFlags.Public | BindingFlags.Instance)
                 .FirstOrDefault(p => p.GetCustomAttribute<RetentionRecordIdAttribute>() is not null)
-            ?? clrType.GetProperty(conventions.RecordIdPropertyName, BindingFlags.Public | BindingFlags.Instance);
+            ?? ReflectionMemberResolver.FindPropertyByName(clrType, conventions.RecordIdPropertyName);
         if (recordIdMember is null)
         {
             throw new InvalidOperationException(
@@ -159,7 +156,7 @@ public sealed class RetentionEntryBuilder(CohortConventions conventions)
         var tenantMember = clrType
                 .GetProperties(BindingFlags.Public | BindingFlags.Instance)
                 .FirstOrDefault(p => p.GetCustomAttribute<RetentionTenantAttribute>() is not null)
-            ?? clrType.GetProperty(conventions.TenantPropertyName, BindingFlags.Public | BindingFlags.Instance);
+            ?? ReflectionMemberResolver.FindPropertyByName(clrType, conventions.TenantPropertyName);
         if (tenantMember is null)
         {
             return null;
@@ -196,7 +193,7 @@ public sealed class RetentionEntryBuilder(CohortConventions conventions)
         var isDeletedMember = clrType
                 .GetProperties(BindingFlags.Public | BindingFlags.Instance)
                 .FirstOrDefault(p => p.GetCustomAttribute<RetentionSoftDeleteAttribute>() is not null)
-            ?? clrType.GetProperty(conventions.SoftDeletePropertyName, BindingFlags.Public | BindingFlags.Instance);
+            ?? ReflectionMemberResolver.FindPropertyByName(clrType, conventions.SoftDeletePropertyName);
         if (isDeletedMember is null)
         {
             return null;
@@ -217,7 +214,7 @@ public sealed class RetentionEntryBuilder(CohortConventions conventions)
         var deletedAtMember = clrType
                 .GetProperties(BindingFlags.Public | BindingFlags.Instance)
                 .FirstOrDefault(p => p.GetCustomAttribute<RetentionDeletedAtAttribute>() is not null)
-            ?? clrType.GetProperty(conventions.DeletedAtPropertyName, BindingFlags.Public | BindingFlags.Instance);
+            ?? ReflectionMemberResolver.FindPropertyByName(clrType, conventions.DeletedAtPropertyName);
         var deletedAtProperty =
             deletedAtMember is null
                 ? null

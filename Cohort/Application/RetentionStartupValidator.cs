@@ -139,7 +139,7 @@ public sealed class RetentionStartupValidator(
         }
 
         var clrType = entry.EntityType;
-        var isDeletedMember = clrType.GetProperty(entry.SoftDelete.IsDeletedMember, BindingFlags.Public | BindingFlags.Instance);
+        var isDeletedMember = ReflectionMemberResolver.FindPropertyByName(clrType, entry.SoftDelete.IsDeletedMember);
         if (isDeletedMember is null || isDeletedMember.PropertyType != typeof(bool))
         {
             errors.Add(
@@ -150,7 +150,7 @@ public sealed class RetentionStartupValidator(
 
         if (entry.SoftDelete.DeletedAtMember is not null)
         {
-            var deletedAtMember = clrType.GetProperty(entry.SoftDelete.DeletedAtMember, BindingFlags.Public | BindingFlags.Instance);
+            var deletedAtMember = ReflectionMemberResolver.FindPropertyByName(clrType, entry.SoftDelete.DeletedAtMember);
             if (
                 deletedAtMember is not null
                 && !AllowedSoftDeleteTimestampTypes.Contains(deletedAtMember.PropertyType)
@@ -182,7 +182,7 @@ public sealed class RetentionStartupValidator(
 
         foreach (var field in entry.AnonymiseFields)
         {
-            var property = entry.EntityType.GetProperty(field.MemberName, BindingFlags.Public | BindingFlags.Instance);
+            var property = ReflectionMemberResolver.FindPropertyByName(entry.EntityType, field.MemberName);
             if (property is null)
             {
                 errors.Add(

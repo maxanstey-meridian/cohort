@@ -151,6 +151,57 @@ public sealed class RegistryScanTests
         secondScan.Should().ContainKey(typeof(RetentionReadyRecord));
     }
 
+    // Regression: the consumer uses `new` to shadow an inherited generic `Id` property
+    // (e.g. ASP.NET Identity's `IdentityUser<TKey>.Id`). Prior to the reflection-safe
+    // resolver, `Type.GetProperty("Id", ...)` would throw `AmbiguousMatchException` because
+    // reflection sees both the base and the derived property and cannot pick one. The registry
+    // must resolve the most-derived match and scan cleanly.
+    [Fact]
+    public void Scan_Handles_Entity_With_Shadowed_Generic_Id_Property_Without_Crashing()
+    {
+        var options = new DbContextOptionsBuilder<ShadowedIdDbContext>()
+            .UseInMemoryDatabase($"shadowed-id-{Guid.NewGuid()}")
+            .Options;
+        using var db = new ShadowedIdDbContext(options);
+
+        var registry = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions()));
+
+        var act = () => registry.Scan();
+
+        var entries = act.Should().NotThrow().Subject;
+        entries.Should().ContainKey(typeof(ShadowedIdRecord));
+        var entry = entries[typeof(ShadowedIdRecord)];
+        entry.RecordId.RecordIdMember.Should().Be(nameof(ShadowedIdRecord.Id));
+        entry.RecordId.RecordIdType.Should().Be<Guid>();
+    }
+
+    private abstract class IdentityLikeBase<TKey>
+        where TKey : IEquatable<TKey>
+    {
+        public virtual TKey Id { get; set; } = default!;
+    }
+
+    [Retain("long-lived", nameof(ShadowedIdRecord.RetainedAt))]
+    private sealed class ShadowedIdRecord : IdentityLikeBase<Guid>
+    {
+        public new Guid Id { get => base.Id; set => base.Id = value; }
+        public DateTimeOffset RetainedAt { get; init; }
+    }
+
+    private sealed class ShadowedIdDbContext(DbContextOptions<ShadowedIdDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<ShadowedIdRecord>(entity =>
+            {
+                entity.ToTable("shadowed_id_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.RetainedAt);
+            });
+        }
+    }
+
     [Retain("long-lived", nameof(RetentionReadyRecord.RetainedAt))]
     private sealed class RetentionReadyRecord
     {

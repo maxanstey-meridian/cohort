@@ -4,9 +4,10 @@ Annotation-driven GDPR retention for .NET / EF Core. Declare retention rules on 
 
 ## Quick start
 
-### 1. Annotate your entities
+### 1. Tag entities and define what happens to them
 
 ```csharp
+// The entity — [Retain] declares the category and the age anchor
 [Retain("short-lived", nameof(CreatedAt))]
 public sealed class Note
 {
@@ -15,13 +16,8 @@ public sealed class Note
     public DateTimeOffset CreatedAt { get; set; }
     public string Body { get; set; } = "";
 }
-```
 
-Unannotated entities are implicitly exempt. Use `[ExemptFromRetention("reason")]` if you want to document the exemption explicitly.
-
-### 2. Map categories to rules
-
-```csharp
+// The rules — map each category to a strategy and retention period
 public sealed class MyCategoryRepository : IRetentionCategoryRepository
 {
     public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
@@ -39,7 +35,11 @@ public sealed class MyCategoryRepository : IRetentionCategoryRepository
 }
 ```
 
-### 3. Wire it up
+`[Retain("short-lived", nameof(CreatedAt))]` says "this entity belongs to the `short-lived` category, age it by `CreatedAt`." The category repository says "`short-lived` means purge after 30 days." Neither piece does anything without the other.
+
+Unannotated entities are implicitly exempt — no annotation needed to opt out. Use `[ExemptFromRetention("reason")]` if you want to document the exemption explicitly.
+
+### 2. Wire it up
 
 ```csharp
 // Register your category repository BEFORE AddCohort

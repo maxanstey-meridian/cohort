@@ -1,6 +1,7 @@
 using Cohort.Application;
 using Cohort.Domain;
 
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -18,6 +19,8 @@ public sealed class RetentionWorker(
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        await ApplyMigrationsIfConfiguredAsync(stoppingToken);
+
         while (!stoppingToken.IsCancellationRequested)
         {
             var currentOptions = options.CurrentValue;
@@ -103,6 +106,20 @@ public sealed class RetentionWorker(
             tenant.Id,
             result.Counts.Count
         );
+    }
+
+    private async Task ApplyMigrationsIfConfiguredAsync(CancellationToken ct)
+    {
+        if (!options.CurrentValue.ApplyMigrations)
+        {
+            return;
+        }
+
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<DbContext>();
+        await db.Database.MigrateAsync(ct);
+
+        logger.LogInformation("Cohort worker applied database migrations at startup.");
     }
 
     private static Task DelayUntilNextPollAsync(CancellationToken ct)

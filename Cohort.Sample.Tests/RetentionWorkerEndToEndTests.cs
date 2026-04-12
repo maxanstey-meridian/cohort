@@ -11,6 +11,8 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 
+using Npgsql;
+
 using Xunit.Sdk;
 
 namespace Cohort.Sample.Tests;
@@ -85,6 +87,54 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             .Should()
             .ThrowAsync<OptionsValidationException>()
             .WithMessage("*schedule*invalid*");
+    }
+
+    [Fact]
+    public async Task AddCohort_Rejects_Applying_Migrations_During_DryRun_At_Startup()
+    {
+        var tenant = CreateTenant();
+        var settings = CreateSettings(
+            fixture.ConnectionString,
+            schedule: "*/1 * * * * *",
+            dryRun: true,
+            killSwitch: false,
+            applyMigrations: true
+        );
+        using var host = BuildHost(settings, tenant, services =>
+        {
+            services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+        });
+
+        var act = async () => await host.Host.StartAsync();
+
+        await act
+            .Should()
+            .ThrowAsync<OptionsValidationException>()
+            .WithMessage("*apply migrations*DryRun*");
+    }
+
+    [Fact]
+    public async Task AddCohort_Rejects_Applying_Migrations_When_KillSwitch_Is_Enabled_At_Startup()
+    {
+        var tenant = CreateTenant();
+        var settings = CreateSettings(
+            fixture.ConnectionString,
+            schedule: "*/1 * * * * *",
+            dryRun: false,
+            killSwitch: true,
+            applyMigrations: true
+        );
+        using var host = BuildHost(settings, tenant, services =>
+        {
+            services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+        });
+
+        var act = async () => await host.Host.StartAsync();
+
+        await act
+            .Should()
+            .ThrowAsync<OptionsValidationException>()
+            .WithMessage("*apply migrations*KillSwitch*");
     }
 
     [Fact]
@@ -208,16 +258,48 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         (await NoteExistsAsync("paused-note")).Should().BeFalse();
     }
 
+    [Fact]
+    public async Task Worker_Applies_Migrations_At_Startup_When_Configured()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        var tenant = CreateTenant();
+        var settings = CreateSettings(
+            database.ConnectionString,
+            schedule: null,
+            dryRun: false,
+            killSwitch: false,
+            applyMigrations: true
+        );
+        using var host = BuildHost(
+            settings,
+            tenant,
+            services =>
+            {
+                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+            }
+        );
+
+        await host.Host.StartAsync();
+        await WaitUntilAsync(
+            () => TableExistsAsync(database.ConnectionString, "notes"),
+            TimeSpan.FromSeconds(8)
+        );
+        await host.Host.StopAsync();
+
+        (await TableExistsAsync(database.ConnectionString, "notes")).Should().BeTrue();
+    }
+
     private WorkerTestHost BuildHost(
         IReadOnlyDictionary<string, string?> settings,
         TenantContext tenant,
         Action<IServiceCollection> configureServices
     )
     {
+        var connectionString = settings[$"{CohortOptions.SectionName}:ConnectionString"]!;
         var builder = Host.CreateApplicationBuilder();
         builder.Configuration.AddInMemoryCollection(settings);
 
-        builder.Services.AddDbContext<SampleDbContext>(options => options.UseNpgsql(fixture.ConnectionString));
+        builder.Services.AddDbContext<SampleDbContext>(options => options.UseNpgsql(connectionString));
         builder.Services.AddSingleton(tenant);
         builder.Services.AddCohort<SampleDbContext>();
         configureServices(builder.Services);
@@ -229,7 +311,8 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         string connectionString,
         string? schedule,
         bool dryRun,
-        bool killSwitch
+        bool killSwitch,
+        bool applyMigrations = false
     )
     {
         return new Dictionary<string, string?>
@@ -238,7 +321,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             [$"{CohortOptions.SectionName}:Schedule"] = schedule,
             [$"{CohortOptions.SectionName}:DryRun"] = dryRun.ToString(),
             [$"{CohortOptions.SectionName}:KillSwitch"] = killSwitch.ToString(),
-            [$"{CohortOptions.SectionName}:ApplyMigrations"] = bool.FalseString,
+            [$"{CohortOptions.SectionName}:ApplyMigrations"] = applyMigrations.ToString(),
         };
     }
 
@@ -274,6 +357,26 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
 
         await using var db = new SampleDbContext(options);
         return await db.Notes.AnyAsync(note => note.Body == body);
+    }
+
+    private static async Task<bool> TableExistsAsync(string connectionString, string tableName)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name = @tableName
+            )
+            """;
+        command.Parameters.AddWithValue("tableName", tableName);
+
+        return (bool)(await command.ExecuteScalarAsync())!;
     }
 
     private static async Task WaitUntilAsync(Func<Task<bool>> predicate, TimeSpan timeout)
@@ -373,6 +476,67 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         public void Update(CohortOptions next)
         {
             options = next;
+        }
+    }
+
+    private sealed class TemporaryDatabase(string connectionString, string databaseName) : IAsyncDisposable
+    {
+        public string ConnectionString => connectionString;
+
+        public static async Task<TemporaryDatabase> CreateAsync(string baseConnectionString)
+        {
+            var databaseName = $"cohort_worker_{Guid.NewGuid():N}";
+            var adminConnectionString = CreateAdminConnectionString(baseConnectionString);
+
+            await using var connection = new NpgsqlConnection(adminConnectionString);
+            await connection.OpenAsync();
+
+            await using (var command = connection.CreateCommand())
+            {
+                command.CommandText = $"CREATE DATABASE \"{databaseName}\"";
+                await command.ExecuteNonQueryAsync();
+            }
+
+            var builder = new NpgsqlConnectionStringBuilder(baseConnectionString)
+            {
+                Database = databaseName,
+            };
+
+            return new TemporaryDatabase(builder.ConnectionString, databaseName);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            var adminConnectionString = CreateAdminConnectionString(connectionString);
+
+            await using var connection = new NpgsqlConnection(adminConnectionString);
+            await connection.OpenAsync();
+
+            await using (var terminate = connection.CreateCommand())
+            {
+                terminate.CommandText =
+                    $"""
+                    SELECT pg_terminate_backend(pid)
+                    FROM pg_stat_activity
+                    WHERE datname = '{databaseName}'
+                      AND pid <> pg_backend_pid()
+                    """;
+                await terminate.ExecuteNonQueryAsync();
+            }
+
+            await using var drop = connection.CreateCommand();
+            drop.CommandText = $"DROP DATABASE IF EXISTS \"{databaseName}\"";
+            await drop.ExecuteNonQueryAsync();
+        }
+
+        private static string CreateAdminConnectionString(string originalConnectionString)
+        {
+            var builder = new NpgsqlConnectionStringBuilder(originalConnectionString)
+            {
+                Database = "postgres",
+            };
+
+            return builder.ConnectionString;
         }
     }
 }

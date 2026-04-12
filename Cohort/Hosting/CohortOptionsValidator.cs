@@ -10,22 +10,35 @@ public sealed class CohortOptionsValidator : IValidateOptions<CohortOptions>
     {
         ArgumentNullException.ThrowIfNull(options);
 
+        var errors = new List<string>();
+
         if (string.IsNullOrWhiteSpace(options.Schedule))
         {
-            return ValidateOptionsResult.Success;
+            // Scheduling is opt-in. An empty schedule disables the worker loop.
+        }
+        else
+        {
+            try
+            {
+                CohortScheduleParser.Parse(options.Schedule);
+            }
+            catch (Exception ex)
+            {
+                errors.Add($"Cohort schedule '{options.Schedule}' is invalid: {ex.Message}");
+            }
         }
 
-        try
+        if (options.DryRun && options.ApplyMigrations)
         {
-            CohortScheduleParser.Parse(options.Schedule);
-            return ValidateOptionsResult.Success;
+            errors.Add("Cohort cannot apply migrations while DryRun is enabled.");
         }
-        catch (Exception ex)
+
+        if (options.KillSwitch && options.ApplyMigrations)
         {
-            return ValidateOptionsResult.Fail(
-                $"Cohort schedule '{options.Schedule}' is invalid: {ex.Message}"
-            );
+            errors.Add("Cohort cannot apply migrations while KillSwitch is enabled.");
         }
+
+        return errors.Count == 0 ? ValidateOptionsResult.Success : ValidateOptionsResult.Fail(errors);
     }
 }
 

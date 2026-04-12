@@ -36,34 +36,42 @@ builder.Services.AddCohort<SampleDbContext>();
 builder.Services.AddScoped<SampleRetentionStartupService>();
 
 var host = builder.Build();
+await host.StartAsync();
 
-using var scope = host.Services.CreateScope();
-var logger = scope.ServiceProvider.GetRequiredService<ILogger<Program>>();
-var startup = scope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
-
-var entries = await startup.RunAsync();
-var preview = await startup.RunPreviewAsync(previewTenant, DateTimeOffset.UtcNow);
-
-logger.LogInformation("Found {Count} retention entries", entries.Count);
-foreach (var entry in entries.Values)
+try
 {
-    logger.LogInformation(
-        "  {EntityType} → table={Table} category={Category} anchor={Anchor}",
-        entry.EntityType.Name,
-        entry.TableName,
-        entry.Category,
-        entry.AnchorMember
-    );
+    using var scope = host.Services.CreateScope();
+    var logger = scope.ServiceProvider.GetRequiredService<ILogger<Program>>();
+    var startup = scope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
+
+    var entries = await startup.RunAsync();
+    var preview = await startup.RunPreviewAsync(previewTenant, DateTimeOffset.UtcNow);
+
+    logger.LogInformation("Found {Count} retention entries", entries.Count);
+    foreach (var entry in entries.Values)
+    {
+        logger.LogInformation(
+            "  {EntityType} → table={Table} category={Category} anchor={Anchor}",
+            entry.EntityType.Name,
+            entry.TableName,
+            entry.Category,
+            entry.AnchorMember
+        );
+    }
+
+    foreach (var count in preview.Counts)
+    {
+        logger.LogInformation(
+            "Preview {EntityType} → category={Category} strategy={Strategy} tenant={TenantId} candidates={Candidates}",
+            count.EntityType.Name,
+            count.Category,
+            count.Strategy,
+            count.TenantId,
+            count.Affected
+        );
+    }
 }
-
-foreach (var count in preview.Counts)
+finally
 {
-    logger.LogInformation(
-        "Preview {EntityType} → category={Category} strategy={Strategy} tenant={TenantId} candidates={Candidates}",
-        count.EntityType.Name,
-        count.Category,
-        count.Strategy,
-        count.TenantId,
-        count.Affected
-    );
+    await host.StopAsync();
 }

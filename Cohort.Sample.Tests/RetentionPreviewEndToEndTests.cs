@@ -343,6 +343,121 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
         );
     }
 
+    [Fact]
+    public async Task Preview_Path_Counts_Anonymise_Candidates_Without_Modifying_Rows()
+    {
+        var tenantA = Guid.NewGuid();
+        var tenantB = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.AnonymisedContacts.AddRange(
+                new AnonymisedContact
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantA,
+                    CreatedAt = asOf.AddDays(-45),
+                    EmailAddress = "preview-expired@example.com",
+                    GivenName = "Expired",
+                    Surname = "Candidate",
+                    Notes = "preview-count-target-tenant",
+                },
+                new AnonymisedContact
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantA,
+                    CreatedAt = asOf.AddDays(-5),
+                    EmailAddress = "preview-current@example.com",
+                    GivenName = "Current",
+                    Surname = "Candidate",
+                    Notes = "preview-ignore-current-row",
+                },
+                new AnonymisedContact
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantB,
+                    CreatedAt = asOf.AddDays(-45),
+                    EmailAddress = "preview-other-tenant@example.com",
+                    GivenName = "Other",
+                    Surname = "Tenant",
+                    Notes = "preview-ignore-other-tenant",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        var result = await Host.RunPreviewAsync(
+            new TenantContext(tenantA, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        result.Counts.Should().HaveCount(3);
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(Note),
+                "short-lived",
+                tenantA,
+                Strategy.Purge,
+                0
+            )
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(SoftDeleteRecord),
+                "soft-delete",
+                tenantA,
+                Strategy.SoftDelete,
+                0
+            )
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(AnonymisedContact),
+                "anonymise",
+                tenantA,
+                Strategy.Anonymise,
+                1
+            )
+        );
+
+        await using var verify = Host.CreateDbContext();
+        var contacts = await verify
+            .AnonymisedContacts.OrderBy(contact => contact.Notes)
+            .Select(contact => new
+            {
+                contact.EmailAddress,
+                contact.GivenName,
+                contact.Surname,
+                contact.Notes,
+            })
+            .ToListAsync();
+
+        contacts.Should().Equal(
+            new
+            {
+                EmailAddress = (string?)"preview-expired@example.com",
+                GivenName = "Expired",
+                Surname = "Candidate",
+                Notes = "preview-count-target-tenant",
+            },
+            new
+            {
+                EmailAddress = (string?)"preview-current@example.com",
+                GivenName = "Current",
+                Surname = "Candidate",
+                Notes = "preview-ignore-current-row",
+            },
+            new
+            {
+                EmailAddress = (string?)"preview-other-tenant@example.com",
+                GivenName = "Other",
+                Surname = "Tenant",
+                Notes = "preview-ignore-other-tenant",
+            }
+        );
+    }
+
     private sealed class StaticCategoryRepository(
         IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
     ) : IRetentionCategoryRepository

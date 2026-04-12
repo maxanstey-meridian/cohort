@@ -123,11 +123,18 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
         connection.LastCommand!.AssignedTransaction.Should().BeSameAs(transaction);
         connection.LastCommand.CommandText.Should().Contain("@cutoff");
         connection.LastCommand.CommandText.Should().Contain("@tenantId");
-        connection.LastCommand.Parameters.Count.Should().Be(2);
+        connection.LastCommand.CommandText.Should().Contain("@holdTableName");
+        connection.LastCommand.CommandText.Should().Contain("@holdAsOf");
+        connection.LastCommand.CommandText.Should().Contain("NOT EXISTS");
+        connection.LastCommand.Parameters.Count.Should().Be(4);
         connection.LastCommand.Parameters.Contains("cutoff").Should().BeTrue();
         connection.LastCommand.Parameters.Contains("tenantId").Should().BeTrue();
+        connection.LastCommand.Parameters.Contains("holdTableName").Should().BeTrue();
+        connection.LastCommand.Parameters.Contains("holdAsOf").Should().BeTrue();
         connection.LastCommand.Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.LastCommand.Parameters["tenantId"].Value.Should().Be(tenantId);
+        connection.LastCommand.Parameters["holdTableName"].Value.Should().Be("purge_candidate_records");
+        connection.LastCommand.Parameters["holdAsOf"].Value.Should().Be(now);
     }
 
     private static async Task InsertRecordAsync(
@@ -185,6 +192,7 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
 
     private sealed class PurgeCandidateRecord
     {
+        public Guid Id { get; init; }
         public Guid TenantId { get; init; }
         public DateTimeOffset CreatedAt { get; init; }
     }

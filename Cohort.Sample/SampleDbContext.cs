@@ -10,6 +10,7 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
     public DbSet<ExemptDocument> ExemptDocuments => Set<ExemptDocument>();
     public DbSet<SoftDeleteRecord> SoftDeleteRecords => Set<SoftDeleteRecord>();
     public DbSet<AnonymisedContact> AnonymisedContacts => Set<AnonymisedContact>();
+    public DbSet<HeldRecord> HeldRecords => Set<HeldRecord>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -51,6 +52,20 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
             b.Property(contact => contact.GivenName).IsRequired();
             b.Property(contact => contact.Surname).IsRequired();
             b.Property(contact => contact.Notes).IsRequired();
+        });
+
+        modelBuilder.Entity<HeldRecord>(b =>
+        {
+            b.ToTable("retention_holds");
+            b.HasKey(record => record.HoldId);
+            b.Property(record => record.TableName).IsRequired();
+            b.Property(record => record.RecordId).IsRequired();
+            b.Property(record => record.TenantId).IsRequired();
+            b.Property(record => record.Reason).IsRequired();
+            b.Property(record => record.CreatedAt).IsRequired();
+            b.Property(record => record.ExpiresAt);
+            b.Property(record => record.RemovedAt);
+            b.HasIndex(record => new { record.TableName, record.TenantId, record.RecordId });
         });
     }
 }

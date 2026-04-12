@@ -93,6 +93,42 @@ namespace Cohort.Sample.Migrations
                     b.ToTable("notes", (string)null);
                 });
 
+            modelBuilder.Entity("Cohort.Sample.Entities.HeldRecord", b =>
+                {
+                    b.Property<Guid>("HoldId")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset?>("ExpiresAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<Guid>("RecordId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTimeOffset?>("RemovedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("Reason")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("TableName")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<Guid>("TenantId")
+                        .HasColumnType("uuid");
+
+                    b.HasKey("HoldId");
+
+                    b.HasIndex("TableName", "TenantId", "RecordId");
+
+                    b.ToTable("retention_holds", (string)null);
+                });
+
             modelBuilder.Entity("Cohort.Sample.Entities.SoftDeleteRecord", b =>
                 {
                     b.Property<Guid>("Id")

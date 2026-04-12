@@ -3,6 +3,7 @@ using System.Data.Common;
 
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Infrastructure.Holds;
 
 namespace Cohort.Infrastructure.Sweep;
 
@@ -49,13 +50,17 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             await conn.OpenAsync(ct);
         }
 
+        var recordIdColumn = RetentionHoldSql.GetRecordIdColumn(entry);
+
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = BuildCommandText(entry, tenant, command);
+        command.CommandText = BuildCommandText(entry, tenant, command, recordIdColumn);
 
         var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
+        command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
+        command.Parameters.Add(CreateParameter(command, "holdAsOf", ctx.Now));
 
         return await command.ExecuteNonQueryAsync(ct);
     }
@@ -63,7 +68,8 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
     private static string BuildCommandText(
         RetentionEntry entry,
         TenantConvention tenant,
-        DbCommand command
+        DbCommand command,
+        string recordIdColumn
     )
     {
         var assignments = new List<string>(entry.AnonymiseFields.Count);
@@ -80,10 +86,11 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
 
         return
             $"""
-            UPDATE {QuoteIdentifier(entry.TableName)}
+            UPDATE {QuoteIdentifier(entry.TableName)} AS target
             SET {string.Join(", ", assignments)}
-            WHERE {QuoteIdentifier(entry.AnchorColumn)} < @cutoff
-              AND {QuoteIdentifier(tenant.TenantColumn)} = @tenantId
+            WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
+              AND target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
+              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn)}
             """;
     }
 

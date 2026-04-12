@@ -4,6 +4,7 @@ using System.Reflection;
 
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Infrastructure.Holds;
 
 namespace Cohort.Infrastructure.Sweep;
 
@@ -47,13 +48,17 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
             await conn.OpenAsync(ct);
         }
 
+        var recordIdColumn = RetentionHoldSql.GetRecordIdColumn(entry);
+
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = BuildCommandText(entry, tenant, softDelete);
+        command.CommandText = BuildCommandText(entry, tenant, softDelete, recordIdColumn);
 
         var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
+        command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
+        command.Parameters.Add(CreateParameter(command, "holdAsOf", ctx.Now));
 
         if (softDelete.DeletedAtColumn is not null)
         {
@@ -68,7 +73,8 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
     private static string BuildCommandText(
         RetentionEntry entry,
         TenantConvention tenant,
-        SoftDeleteConvention softDelete
+        SoftDeleteConvention softDelete,
+        string recordIdColumn
     )
     {
         var deletedAtAssignment = softDelete.DeletedAtColumn is null
@@ -77,11 +83,12 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
 
         return
             $"""
-            UPDATE {QuoteIdentifier(entry.TableName)}
+            UPDATE {QuoteIdentifier(entry.TableName)} AS target
             SET {QuoteIdentifier(softDelete.IsDeletedColumn)} = TRUE{deletedAtAssignment}
-            WHERE {QuoteIdentifier(entry.AnchorColumn)} < @cutoff
-              AND {QuoteIdentifier(tenant.TenantColumn)} = @tenantId
-              AND {QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
+            WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
+              AND target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
+              AND target.{QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
+              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn)}
             """;
     }
 

@@ -3,6 +3,7 @@ using System.Data.Common;
 
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Infrastructure.Holds;
 
 namespace Cohort.Infrastructure.Sweep;
 
@@ -42,18 +43,23 @@ public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
             await conn.OpenAsync(ct);
         }
 
+        var recordIdColumn = RetentionHoldSql.GetRecordIdColumn(entry);
+
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
         command.CommandText =
             $"""
-            DELETE FROM {QuoteIdentifier(entry.TableName)}
-            WHERE {QuoteIdentifier(entry.AnchorColumn)} < @cutoff
-              AND {QuoteIdentifier(tenant.TenantColumn)} = @tenantId
+            DELETE FROM {QuoteIdentifier(entry.TableName)} AS target
+            WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
+              AND target.{QuoteIdentifier(tenant.TenantColumn)} = @tenantId
+              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn)}
             """;
 
         var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
+        command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
+        command.Parameters.Add(CreateParameter(command, "holdAsOf", ctx.Now));
 
         return await command.ExecuteNonQueryAsync(ct);
     }

@@ -346,17 +346,24 @@ public sealed class AnonymiseSweepStrategyCommandTests
         connection.LastCommand.CommandText.Should().Contain("\"Surname\" = @value2");
         connection.LastCommand.CommandText.Should().Contain("@cutoff");
         connection.LastCommand.CommandText.Should().Contain("@tenantId");
-        connection.LastCommand.Parameters.Count.Should().Be(5);
+        connection.LastCommand.CommandText.Should().Contain("@holdTableName");
+        connection.LastCommand.CommandText.Should().Contain("@holdAsOf");
+        connection.LastCommand.CommandText.Should().Contain("NOT EXISTS");
+        connection.LastCommand.Parameters.Count.Should().Be(7);
         connection.LastCommand.Parameters.Contains("value0").Should().BeTrue();
         connection.LastCommand.Parameters.Contains("value1").Should().BeTrue();
         connection.LastCommand.Parameters.Contains("value2").Should().BeTrue();
         connection.LastCommand.Parameters.Contains("cutoff").Should().BeTrue();
         connection.LastCommand.Parameters.Contains("tenantId").Should().BeTrue();
+        connection.LastCommand.Parameters.Contains("holdTableName").Should().BeTrue();
+        connection.LastCommand.Parameters.Contains("holdAsOf").Should().BeTrue();
         connection.LastCommand.Parameters["value0"].Value.Should().Be(DBNull.Value);
         connection.LastCommand.Parameters["value1"].Value.Should().Be(string.Empty);
         connection.LastCommand.Parameters["value2"].Value.Should().Be("[redacted]");
         connection.LastCommand.Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.LastCommand.Parameters["tenantId"].Value.Should().Be(tenantId);
+        connection.LastCommand.Parameters["holdTableName"].Value.Should().Be("anonymised_contacts");
+        connection.LastCommand.Parameters["holdAsOf"].Value.Should().Be(now);
     }
 
     private sealed class RecordingDbConnection : DbConnection

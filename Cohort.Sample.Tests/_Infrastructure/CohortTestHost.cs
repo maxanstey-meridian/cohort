@@ -1,5 +1,6 @@
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Infrastructure.Holds;
 using Cohort.Infrastructure.Sweep;
 
 using Microsoft.EntityFrameworkCore;
@@ -59,6 +60,20 @@ public sealed class CohortTestHost(
         return await startup.RunPreviewAsync(tenant, now, ct);
     }
 
+    public async Task<TResult> RunWithServicesAsync<TResult>(
+        Func<IServiceProvider, Task<TResult>> action
+    )
+    {
+        await using var scope = _services.CreateAsyncScope();
+        return await action(scope.ServiceProvider);
+    }
+
+    public async Task RunWithServicesAsync(Func<IServiceProvider, Task> action)
+    {
+        await using var scope = _services.CreateAsyncScope();
+        await action(scope.ServiceProvider);
+    }
+
     public void Dispose()
     {
         _services.Dispose();
@@ -73,6 +88,7 @@ public sealed class CohortTestHost(
 
         services.AddDbContext<SampleDbContext>(options => options.UseNpgsql(connectionString));
         services.AddScoped<DbContext>(sp => sp.GetRequiredService<SampleDbContext>());
+        services.AddScoped<IRetentionHoldsRepository, EfRetentionHoldsRepository>();
         services.AddScoped<IRetentionSweepStrategy, PurgeSweepStrategy>();
         services.AddScoped<IRetentionSweepStrategy, SoftDeleteSweepStrategy>();
         services.AddScoped<IRetentionSweepStrategy, AnonymiseSweepStrategy>();

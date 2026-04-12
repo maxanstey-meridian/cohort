@@ -136,12 +136,6 @@ public sealed class RetentionStartupValidator(
             $"Retention category '{entry.Category}' for entity {clrType.FullName} uses a deferred resolver that does not declare its possible strategies at startup.";
         var softDeleteErrors = GetSoftDeleteConventionErrors(entry, messagePrefix);
         var anonymiseErrors = GetAnonymiseConventionErrors(entry, messagePrefix);
-
-        if (softDeleteErrors.Count == 0 || anonymiseErrors.Count == 0)
-        {
-            return;
-        }
-
         var hasSoftDeleteSignals =
             clrType.GetProperty("IsDeleted", BindingFlags.Public | BindingFlags.Instance) is not null
             || clrType.GetProperty("DeletedAt", BindingFlags.Public | BindingFlags.Instance) is not null
@@ -156,15 +150,14 @@ public sealed class RetentionStartupValidator(
             return;
         }
 
-        if (hasSoftDeleteSignals)
+        if (softDeleteErrors.Count == 0 && anonymiseErrors.Count == 0)
         {
-            errors.AddRange(softDeleteErrors);
+            return;
         }
 
-        if (hasAnonymiseSignals)
-        {
-            errors.AddRange(anonymiseErrors);
-        }
+        errors.Add(
+            $"{messagePrefix} Opaque deferred resolvers must advertise their possible strategies at startup unless the target entity is valid for both soft-delete and anonymise conventions."
+        );
     }
 
     private static void ValidateAnonymiseConvention(

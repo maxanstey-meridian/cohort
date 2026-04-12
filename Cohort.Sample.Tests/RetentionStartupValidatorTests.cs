@@ -50,17 +50,21 @@ public sealed class RetentionStartupValidatorTests
                 .ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().ContainSingle();
+        exception.Which.Errors.Should().HaveCount(2);
         exception
-            .Which.Errors[0]
-            .Should()
-            .Be(
+            .Which.Errors.Should()
+            .Contain(
                 $"Retention category 'short-lived' for entity {typeof(Note).FullName} uses a deferred resolver that does not declare its possible strategies at startup. Opaque deferred resolvers must either advertise their strategies or target entities with a valid soft-delete or anonymise convention."
+            );
+        exception
+            .Which.Errors.Should()
+            .Contain(
+                $"Retention category 'soft-delete' for entity {typeof(SoftDeleteRecord).FullName} uses a deferred resolver that does not declare its possible strategies at startup. Opaque deferred resolvers must advertise their possible strategies at startup unless the target entity is valid for both soft-delete and anonymise conventions."
             );
     }
 
     [Fact]
-    public async Task ValidateAsync_Allows_Opaque_Deferred_Resolvers_On_Entities_With_Valid_Anonymise_Convention()
+    public async Task ValidateAsync_Rejects_Opaque_Deferred_Resolvers_On_Entities_With_Only_Anonymise_Convention()
     {
         var options = new DbContextOptionsBuilder<SampleDbContext>()
             .UseInMemoryDatabase($"startup-validator-opaque-anonymise-{Guid.NewGuid()}")
@@ -73,7 +77,14 @@ public sealed class RetentionStartupValidatorTests
                 new OpaqueDeferredAnonymiseSampleCategoryRepository()
             ).ValidateAsync();
 
-        await act.Should().NotThrowAsync();
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Retention category 'anonymise' for entity {typeof(AnonymisedContact).FullName} uses a deferred resolver that does not declare its possible strategies at startup. Opaque deferred resolvers must advertise their possible strategies at startup unless the target entity is valid for both soft-delete and anonymise conventions."
+            );
     }
 
     [Fact]
@@ -674,7 +685,7 @@ public sealed class RetentionStartupValidatorTests
             .Which.Errors[0]
             .Should()
             .Be(
-                $"Retention category 'missing-soft-delete-tenant' for entity {typeof(MissingSoftDeleteTenantRecord).FullName} uses a deferred resolver that does not declare its possible strategies at startup. retained SoftDelete categories require tenant metadata via a public Guid or nullable Guid TenantId property mapped by EF."
+                $"Retention category 'missing-soft-delete-tenant' for entity {typeof(MissingSoftDeleteTenantRecord).FullName} uses a deferred resolver that does not declare its possible strategies at startup. Opaque deferred resolvers must advertise their possible strategies at startup unless the target entity is valid for both soft-delete and anonymise conventions."
             );
     }
 

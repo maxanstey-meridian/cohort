@@ -19,6 +19,7 @@ public sealed class MigrationModelEndToEndTests(PostgresFixture fixture)
         tables.Should().Contain("sweep_run");
         tables.Should().Contain("sweep_run_entity_summary");
         tables.Should().Contain("sweep_run_row_detail");
+        tables.Should().Contain("erasure_subject_records");
 
         var sweepRunEntity = db.Model.GetEntityTypes().Single(entityType =>
             string.Equals(entityType.GetTableName(), "sweep_run", StringComparison.Ordinal)

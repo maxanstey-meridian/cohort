@@ -26,6 +26,8 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         var heldSoftDeleteId = Guid.NewGuid();
         var anonymisedContactId = Guid.NewGuid();
         var heldAnonymisedContactId = Guid.NewGuid();
+        var exemptErasureSubjectRecordId = Guid.NewGuid();
+        var inputScope = new ErasureScope(subjectId);
 
         await using (var db = Host.CreateDbContext())
         {
@@ -147,6 +149,24 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Notes = "tenant-notes",
                 }
             );
+            db.ErasureSubjectRecords.AddRange(
+                new ErasureSubjectRecord
+                {
+                    Id = exemptErasureSubjectRecordId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "exempt-erasure-subject-record",
+                },
+                new ErasureSubjectRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectId = otherSubjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "other-exempt-erasure-subject-record",
+                }
+            );
             await db.SaveChangesAsync();
         }
 
@@ -178,7 +198,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
         var result = await erasureHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId),
+            inputScope,
             asOf
         );
 
@@ -211,6 +231,10 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         run.Trigger.Should().Be(SweepTriggerKind.Erasure);
         run.TotalAffected.Should().Be(3);
         run.TenantId.Should().Be(tenantId);
+        result.Scope.Should().Be(inputScope);
+        result.StartedAt.Should().Be(run.StartedAt);
+        result.CompletedAt.Should().Be(run.CompletedAt);
+        result.CompletedAt.Should().BeOnOrAfter(result.StartedAt);
         summaries.Should().Contain(
             new SweepRunEntitySummaryRow(
                 result.SweepId,
@@ -291,6 +315,10 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             .Be("held@example.com");
         contacts.Single(contact => contact.EmailAddress == "other@example.com").GivenName.Should().Be("Other");
         contacts.Single(contact => contact.EmailAddress == "tenant@example.com").GivenName.Should().Be("Other");
+        verify.ErasureSubjectRecords.Single(record => record.Id == exemptErasureSubjectRecordId)
+            .Body.Should()
+            .Be("exempt-erasure-subject-record");
+        verify.ErasureSubjectRecords.Should().HaveCount(2);
     }
 
     [Fact]

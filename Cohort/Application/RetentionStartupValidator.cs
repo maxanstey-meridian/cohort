@@ -87,7 +87,7 @@ public sealed class RetentionStartupValidator(
                     || possibleStrategies?.Contains(Strategy.SoftDelete) == true
                 )
                 {
-                    ValidateSoftDeleteConvention(entry, errors);
+                    ValidateSoftDeleteConvention(entry, errors, $"Soft-delete convention on {clrType.FullName}:");
                 }
                 else if (startupRule is null && possibleStrategies is null)
                 {
@@ -108,14 +108,20 @@ public sealed class RetentionStartupValidator(
         }
     }
 
-    private static void ValidateSoftDeleteConvention(RetentionEntry entry, List<string> errors)
+    private static void ValidateSoftDeleteConvention(
+        RetentionEntry entry,
+        List<string> errors,
+        string messagePrefix
+    )
     {
         var clrType = entry.EntityType;
+        ValidateSoftDeleteTenantConvention(entry, errors, messagePrefix);
+
         var isDeletedMember = clrType.GetProperty("IsDeleted", BindingFlags.Public | BindingFlags.Instance);
         if (isDeletedMember is null || isDeletedMember.PropertyType != typeof(bool))
         {
             errors.Add(
-                $"Soft-delete convention on {clrType.FullName}: retained SoftDelete categories require a public bool IsDeleted CLR property."
+                $"{messagePrefix} retained SoftDelete categories require a public bool IsDeleted CLR property."
             );
             return;
         }
@@ -123,7 +129,7 @@ public sealed class RetentionStartupValidator(
         if (entry.SoftDelete is null)
         {
             errors.Add(
-                $"Soft-delete convention on {clrType.FullName}: retained SoftDelete categories require IsDeleted to be mapped by EF."
+                $"{messagePrefix} retained SoftDelete categories require IsDeleted to be mapped by EF."
             );
             return;
         }
@@ -135,7 +141,7 @@ public sealed class RetentionStartupValidator(
         )
         {
             errors.Add(
-                $"Soft-delete convention on {clrType.FullName}: DeletedAt must be DateTime or DateTimeOffset (nullable allowed), got {deletedAtMember.PropertyType.Name}."
+                $"{messagePrefix} DeletedAt must be DateTime or DateTimeOffset (nullable allowed), got {deletedAtMember.PropertyType.Name}."
             );
         }
     }
@@ -146,6 +152,12 @@ public sealed class RetentionStartupValidator(
     )
     {
         var clrType = entry.EntityType;
+        ValidateSoftDeleteTenantConvention(
+            entry,
+            errors,
+            $"Retention category '{entry.Category}' for entity {clrType.FullName} uses a deferred resolver that does not declare its possible strategies at startup."
+        );
+
         var isDeletedMember = clrType.GetProperty("IsDeleted", BindingFlags.Public | BindingFlags.Instance);
         var deletedAtMember = clrType.GetProperty("DeletedAt", BindingFlags.Public | BindingFlags.Instance);
 
@@ -180,6 +192,20 @@ public sealed class RetentionStartupValidator(
         {
             errors.Add(
                 $"Retention category '{entry.Category}' for entity {clrType.FullName} uses a deferred resolver that does not declare its possible strategies at startup. Opaque deferred resolvers must either advertise their strategies or target entities whose DeletedAt property is DateTime or DateTimeOffset (nullable allowed), got {deletedAtMember.PropertyType.Name}."
+            );
+        }
+    }
+
+    private static void ValidateSoftDeleteTenantConvention(
+        RetentionEntry entry,
+        List<string> errors,
+        string messagePrefix
+    )
+    {
+        if (entry.Tenant is null)
+        {
+            errors.Add(
+                $"{messagePrefix} retained SoftDelete categories require tenant metadata via a public Guid or nullable Guid TenantId property mapped by EF."
             );
         }
     }

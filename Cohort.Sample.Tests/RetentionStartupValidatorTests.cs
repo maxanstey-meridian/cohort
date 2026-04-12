@@ -466,6 +466,62 @@ public sealed class RetentionStartupValidatorTests
             );
     }
 
+    [Fact]
+    public async Task ValidateAsync_Rejects_SoftDelete_Categories_Without_Tenant_Metadata()
+    {
+        var options = new DbContextOptionsBuilder<MissingSoftDeleteTenantDbContext>()
+            .UseInMemoryDatabase($"startup-validator-missing-soft-delete-tenant-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new MissingSoftDeleteTenantDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["missing-soft-delete-tenant"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                ),
+            }
+        );
+
+        var act = async () => await new RetentionStartupValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Soft-delete convention on {typeof(MissingSoftDeleteTenantRecord).FullName}: retained SoftDelete categories require tenant metadata via a public Guid or nullable Guid TenantId property mapped by EF."
+            );
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Rejects_Opaque_Deferred_SoftDelete_Categories_Without_Tenant_Metadata()
+    {
+        var options = new DbContextOptionsBuilder<MissingSoftDeleteTenantDbContext>()
+            .UseInMemoryDatabase($"startup-validator-opaque-soft-delete-missing-tenant-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new MissingSoftDeleteTenantDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["missing-soft-delete-tenant"] = new OpaqueDeferredRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                ),
+            }
+        );
+
+        var act = async () => await new RetentionStartupValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Retention category 'missing-soft-delete-tenant' for entity {typeof(MissingSoftDeleteTenantRecord).FullName} uses a deferred resolver that does not declare its possible strategies at startup. retained SoftDelete categories require tenant metadata via a public Guid or nullable Guid TenantId property mapped by EF."
+            );
+    }
+
     private sealed class InMemoryCategoryRepository(
         IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
     ) : IRetentionCategoryRepository
@@ -723,6 +779,23 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
+    private sealed class MissingSoftDeleteTenantDbContext(
+        DbContextOptions<MissingSoftDeleteTenantDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<MissingSoftDeleteTenantRecord>(entity =>
+            {
+                entity.ToTable("missing_soft_delete_tenant_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+                entity.Property(record => record.IsDeleted).HasColumnName("is_deleted");
+                entity.Property(record => record.DeletedAt).HasColumnName("deleted_at_utc");
+            });
+        }
+    }
+
     private sealed class UnannotatedRecord
     {
         public Guid Id { get; init; }
@@ -783,5 +856,14 @@ public sealed class RetentionStartupValidatorTests
         public DateTimeOffset CreatedAt { get; init; }
         public bool IsDeleted { get; init; }
         public string DeletedAt { get; init; } = "";
+    }
+
+    [Retain("missing-soft-delete-tenant", nameof(MissingSoftDeleteTenantRecord.CreatedAt))]
+    private sealed class MissingSoftDeleteTenantRecord
+    {
+        public Guid Id { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+        public bool IsDeleted { get; init; }
+        public DateTimeOffset? DeletedAt { get; init; }
     }
 }

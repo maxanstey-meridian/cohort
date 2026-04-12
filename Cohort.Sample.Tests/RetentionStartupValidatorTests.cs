@@ -60,6 +60,23 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
+    public async Task ValidateAsync_Allows_Opaque_Deferred_Resolvers_On_Entities_With_Valid_Anonymise_Convention()
+    {
+        var options = new DbContextOptionsBuilder<SampleDbContext>()
+            .UseInMemoryDatabase($"startup-validator-opaque-anonymise-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new SampleDbContext(options);
+
+        var act = async () =>
+            await new RetentionStartupValidator(
+                db,
+                new OpaqueDeferredAnonymiseSampleCategoryRepository()
+            ).ValidateAsync();
+
+        await act.Should().NotThrowAsync();
+    }
+
+    [Fact]
     public async Task ValidateAsync_Allows_Exempt_Sample_Entities_Without_Category_Resolution()
     {
         var options = new DbContextOptionsBuilder<SampleDbContext>()
@@ -578,6 +595,34 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
+    public async Task ValidateAsync_Rejects_Null_Anonymise_On_NonNullable_Reference_Types()
+    {
+        var options = new DbContextOptionsBuilder<InvalidNullReferenceAnonymiseDbContext>()
+            .UseInMemoryDatabase($"startup-validator-invalid-null-reference-anonymise-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new InvalidNullReferenceAnonymiseDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["invalid-null-reference-anonymise"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                ),
+            }
+        );
+
+        var act = async () => await new RetentionStartupValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Anonymise convention on {typeof(InvalidNullReferenceAnonymiseRecord).FullName}: [Anonymise] member DisplayName uses Null but String is not nullable."
+            );
+    }
+
+    [Fact]
     public async Task ValidateAsync_Rejects_Anonymise_Categories_Without_Tenant_Metadata()
     {
         var options = new DbContextOptionsBuilder<MissingAnonymiseTenantDbContext>()
@@ -761,6 +806,35 @@ public sealed class RetentionStartupValidatorTests
                 ),
                 "anonymise" => Task.FromResult<IRetentionRuleResolver?>(
                     new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    )
+                ),
+                _ => throw new InvalidOperationException(
+                    $"Unexpected category lookup for '{category}'."
+                ),
+            };
+        }
+    }
+
+    private sealed class OpaqueDeferredAnonymiseSampleCategoryRepository
+        : IRetentionCategoryRepository
+    {
+        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        {
+            return category switch
+            {
+                "short-lived" => Task.FromResult<IRetentionRuleResolver?>(
+                    new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    )
+                ),
+                "soft-delete" => Task.FromResult<IRetentionRuleResolver?>(
+                    new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    )
+                ),
+                "anonymise" => Task.FromResult<IRetentionRuleResolver?>(
+                    new OpaqueDeferredRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     )
                 ),
@@ -985,6 +1059,23 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
+    private sealed class InvalidNullReferenceAnonymiseDbContext(
+        DbContextOptions<InvalidNullReferenceAnonymiseDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<InvalidNullReferenceAnonymiseRecord>(entity =>
+            {
+                entity.ToTable("invalid_null_reference_anonymise_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+                entity.Property(record => record.TenantId).HasColumnName("tenant_id");
+                entity.Property(record => record.DisplayName).HasColumnName("display_name");
+            });
+        }
+    }
+
     private sealed class UnannotatedRecord
     {
         public Guid Id { get; init; }
@@ -1097,5 +1188,16 @@ public sealed class RetentionStartupValidatorTests
 
         [Anonymise(AnonymiseMethod.Null)]
         public string? EmailAddress { get; init; }
+    }
+
+    [Retain("invalid-null-reference-anonymise", nameof(InvalidNullReferenceAnonymiseRecord.CreatedAt))]
+    private sealed class InvalidNullReferenceAnonymiseRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+
+        [Anonymise(AnonymiseMethod.Null)]
+        public string DisplayName { get; init; } = "";
     }
 }

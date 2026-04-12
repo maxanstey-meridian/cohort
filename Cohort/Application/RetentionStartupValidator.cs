@@ -11,6 +11,7 @@ public sealed class RetentionStartupValidator(
     IRetentionCategoryRepository categoryRepository
 )
 {
+    private static readonly NullabilityInfoContext NullabilityInfoContext = new();
     private static readonly Type[] AllowedSoftDeleteTimestampTypes =
     [
         typeof(DateTime),
@@ -122,36 +123,7 @@ public sealed class RetentionStartupValidator(
         string messagePrefix
     )
     {
-        var clrType = entry.EntityType;
-        ValidateSoftDeleteTenantConvention(entry, errors, messagePrefix);
-
-        var isDeletedMember = clrType.GetProperty("IsDeleted", BindingFlags.Public | BindingFlags.Instance);
-        if (isDeletedMember is null || isDeletedMember.PropertyType != typeof(bool))
-        {
-            errors.Add(
-                $"{messagePrefix} retained SoftDelete categories require a public bool IsDeleted CLR property."
-            );
-            return;
-        }
-
-        if (entry.SoftDelete is null)
-        {
-            errors.Add(
-                $"{messagePrefix} retained SoftDelete categories require IsDeleted to be mapped by EF."
-            );
-            return;
-        }
-
-        var deletedAtMember = clrType.GetProperty("DeletedAt", BindingFlags.Public | BindingFlags.Instance);
-        if (
-            deletedAtMember is not null
-            && !AllowedSoftDeleteTimestampTypes.Contains(deletedAtMember.PropertyType)
-        )
-        {
-            errors.Add(
-                $"{messagePrefix} DeletedAt must be DateTime or DateTimeOffset (nullable allowed), got {deletedAtMember.PropertyType.Name}."
-            );
-        }
+        errors.AddRange(GetSoftDeleteConventionErrors(entry, messagePrefix));
     }
 
     private static void ValidateOpaqueDeferredResolverCompatibility(
@@ -160,47 +132,38 @@ public sealed class RetentionStartupValidator(
     )
     {
         var clrType = entry.EntityType;
-        ValidateSoftDeleteTenantConvention(
-            entry,
-            errors,
-            $"Retention category '{entry.Category}' for entity {clrType.FullName} uses a deferred resolver that does not declare its possible strategies at startup."
-        );
+        var messagePrefix =
+            $"Retention category '{entry.Category}' for entity {clrType.FullName} uses a deferred resolver that does not declare its possible strategies at startup.";
+        var softDeleteErrors = GetSoftDeleteConventionErrors(entry, messagePrefix);
+        var anonymiseErrors = GetAnonymiseConventionErrors(entry, messagePrefix);
 
-        var isDeletedMember = clrType.GetProperty("IsDeleted", BindingFlags.Public | BindingFlags.Instance);
-        var deletedAtMember = clrType.GetProperty("DeletedAt", BindingFlags.Public | BindingFlags.Instance);
+        if (softDeleteErrors.Count == 0 || anonymiseErrors.Count == 0)
+        {
+            return;
+        }
 
-        if (isDeletedMember is null && deletedAtMember is null)
+        var hasSoftDeleteSignals =
+            clrType.GetProperty("IsDeleted", BindingFlags.Public | BindingFlags.Instance) is not null
+            || clrType.GetProperty("DeletedAt", BindingFlags.Public | BindingFlags.Instance) is not null
+            || entry.SoftDelete is not null;
+        var hasAnonymiseSignals = entry.AnonymiseFields.Count > 0;
+
+        if (!hasSoftDeleteSignals && !hasAnonymiseSignals)
         {
             errors.Add(
-                $"Retention category '{entry.Category}' for entity {clrType.FullName} uses a deferred resolver that does not declare its possible strategies at startup. Opaque deferred resolvers must either advertise their strategies or target entities with a valid soft-delete or anonymise convention."
+                $"{messagePrefix} Opaque deferred resolvers must either advertise their strategies or target entities with a valid soft-delete or anonymise convention."
             );
             return;
         }
 
-        if (isDeletedMember is null || isDeletedMember.PropertyType != typeof(bool))
+        if (hasSoftDeleteSignals)
         {
-            errors.Add(
-                $"Retention category '{entry.Category}' for entity {clrType.FullName} uses a deferred resolver that does not declare its possible strategies at startup. Opaque deferred resolvers must either advertise their strategies or target entities with a public bool IsDeleted CLR property."
-            );
-            return;
+            errors.AddRange(softDeleteErrors);
         }
 
-        if (entry.SoftDelete is null)
+        if (hasAnonymiseSignals)
         {
-            errors.Add(
-                $"Retention category '{entry.Category}' for entity {clrType.FullName} uses a deferred resolver that does not declare its possible strategies at startup. Opaque deferred resolvers must either advertise their strategies or target entities whose IsDeleted convention is mapped by EF."
-            );
-            return;
-        }
-
-        if (
-            deletedAtMember is not null
-            && !AllowedSoftDeleteTimestampTypes.Contains(deletedAtMember.PropertyType)
-        )
-        {
-            errors.Add(
-                $"Retention category '{entry.Category}' for entity {clrType.FullName} uses a deferred resolver that does not declare its possible strategies at startup. Opaque deferred resolvers must either advertise their strategies or target entities whose DeletedAt property is DateTime or DateTimeOffset (nullable allowed), got {deletedAtMember.PropertyType.Name}."
-            );
+            errors.AddRange(anonymiseErrors);
         }
     }
 
@@ -210,51 +173,7 @@ public sealed class RetentionStartupValidator(
         string messagePrefix
     )
     {
-        if (entry.Tenant is null)
-        {
-            errors.Add(
-                $"{messagePrefix} retained Anonymise categories require tenant metadata via a public Guid or nullable Guid TenantId property mapped by EF."
-            );
-        }
-
-        if (entry.AnonymiseFields.Count == 0)
-        {
-            errors.Add(
-                $"{messagePrefix} retained Anonymise categories require at least one [Anonymise]-annotated property mapped by EF."
-            );
-            return;
-        }
-
-        foreach (var field in entry.AnonymiseFields)
-        {
-            var property = entry.EntityType.GetProperty(field.MemberName, BindingFlags.Public | BindingFlags.Instance);
-            if (property is null)
-            {
-                errors.Add(
-                    $"{messagePrefix} could not find public CLR property '{field.MemberName}' for anonymise metadata."
-                );
-                continue;
-            }
-
-            switch (field.Method)
-            {
-                case AnonymiseMethod.Null when IsNonNullableValueType(property.PropertyType):
-                    errors.Add(
-                        $"{messagePrefix} [Anonymise] member {property.Name} uses Null but {property.PropertyType.Name} is not nullable."
-                    );
-                    break;
-                case AnonymiseMethod.EmptyString when property.PropertyType != typeof(string):
-                    errors.Add(
-                        $"{messagePrefix} [Anonymise] member {property.Name} uses EmptyString but {property.PropertyType.Name} is not string."
-                    );
-                    break;
-                case AnonymiseMethod.FixedLiteral when property.PropertyType != typeof(string):
-                    errors.Add(
-                        $"{messagePrefix} [Anonymise] member {property.Name} uses FixedLiteral but {property.PropertyType.Name} is not string."
-                    );
-                    break;
-            }
-        }
+        errors.AddRange(GetAnonymiseConventionErrors(entry, messagePrefix));
     }
 
     private static void ValidateSoftDeleteTenantConvention(
@@ -274,5 +193,112 @@ public sealed class RetentionStartupValidator(
     private static bool IsNonNullableValueType(Type type)
     {
         return type.IsValueType && Nullable.GetUnderlyingType(type) is null;
+    }
+
+    private static List<string> GetSoftDeleteConventionErrors(
+        RetentionEntry entry,
+        string messagePrefix
+    )
+    {
+        var errors = new List<string>();
+        var clrType = entry.EntityType;
+
+        ValidateSoftDeleteTenantConvention(entry, errors, messagePrefix);
+
+        var isDeletedMember = clrType.GetProperty("IsDeleted", BindingFlags.Public | BindingFlags.Instance);
+        if (isDeletedMember is null || isDeletedMember.PropertyType != typeof(bool))
+        {
+            errors.Add(
+                $"{messagePrefix} retained SoftDelete categories require a public bool IsDeleted CLR property."
+            );
+            return errors;
+        }
+
+        if (entry.SoftDelete is null)
+        {
+            errors.Add(
+                $"{messagePrefix} retained SoftDelete categories require IsDeleted to be mapped by EF."
+            );
+            return errors;
+        }
+
+        var deletedAtMember = clrType.GetProperty("DeletedAt", BindingFlags.Public | BindingFlags.Instance);
+        if (
+            deletedAtMember is not null
+            && !AllowedSoftDeleteTimestampTypes.Contains(deletedAtMember.PropertyType)
+        )
+        {
+            errors.Add(
+                $"{messagePrefix} DeletedAt must be DateTime or DateTimeOffset (nullable allowed), got {deletedAtMember.PropertyType.Name}."
+            );
+        }
+
+        return errors;
+    }
+
+    private static List<string> GetAnonymiseConventionErrors(
+        RetentionEntry entry,
+        string messagePrefix
+    )
+    {
+        var errors = new List<string>();
+
+        if (entry.Tenant is null)
+        {
+            errors.Add(
+                $"{messagePrefix} retained Anonymise categories require tenant metadata via a public Guid or nullable Guid TenantId property mapped by EF."
+            );
+        }
+
+        if (entry.AnonymiseFields.Count == 0)
+        {
+            errors.Add(
+                $"{messagePrefix} retained Anonymise categories require at least one [Anonymise]-annotated property mapped by EF."
+            );
+            return errors;
+        }
+
+        foreach (var field in entry.AnonymiseFields)
+        {
+            var property = entry.EntityType.GetProperty(field.MemberName, BindingFlags.Public | BindingFlags.Instance);
+            if (property is null)
+            {
+                errors.Add(
+                    $"{messagePrefix} could not find public CLR property '{field.MemberName}' for anonymise metadata."
+                );
+                continue;
+            }
+
+            switch (field.Method)
+            {
+                case AnonymiseMethod.Null when !CanAssignNull(property):
+                    errors.Add(
+                        $"{messagePrefix} [Anonymise] member {property.Name} uses Null but {property.PropertyType.Name} is not nullable."
+                    );
+                    break;
+                case AnonymiseMethod.EmptyString when property.PropertyType != typeof(string):
+                    errors.Add(
+                        $"{messagePrefix} [Anonymise] member {property.Name} uses EmptyString but {property.PropertyType.Name} is not string."
+                    );
+                    break;
+                case AnonymiseMethod.FixedLiteral when property.PropertyType != typeof(string):
+                    errors.Add(
+                        $"{messagePrefix} [Anonymise] member {property.Name} uses FixedLiteral but {property.PropertyType.Name} is not string."
+                    );
+                    break;
+            }
+        }
+
+        return errors;
+    }
+
+    private static bool CanAssignNull(PropertyInfo property)
+    {
+        if (!property.PropertyType.IsValueType)
+        {
+            return NullabilityInfoContext.Create(property).ReadState == NullabilityState.Nullable;
+        }
+
+        return !IsNonNullableValueType(property.PropertyType);
     }
 }

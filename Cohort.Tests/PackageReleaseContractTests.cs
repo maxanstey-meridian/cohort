@@ -7,6 +7,7 @@ namespace Cohort.Tests;
 public sealed class PackageReleaseContractTests
 {
     private static readonly Lazy<PackedArtifact> Artifact = new(BuildPackedArtifact);
+    private static readonly Lazy<string> Changelog = new(BuildChangelog);
 
     [Fact]
     public void Packed_Package_Uses_A_Version_Greater_Than_0_1_1()
@@ -29,6 +30,38 @@ public sealed class PackageReleaseContractTests
         Artifact.Value.Readme.Should().Contain("matches the requested `[ErasureSubject]`");
         Artifact.Value.Readme.Should().Contain("effective retention cutoff");
         Artifact.Value.Readme.Should().Contain("max(Period, LegalMin)");
+    }
+
+    [Fact]
+    public void Packed_Readme_Points_To_Release_Notes_With_A_Package_Safe_Link()
+    {
+        Artifact.Value.Readme.Should().Contain("## Upgrade from `0.1.1`");
+        Artifact.Value.Readme.Should().Contain("regenerate and apply your Cohort migration before booting `0.2.0`");
+        Artifact.Value.Readme.Should().Contain("https://github.com/maxanstey-meridian/cohort/blob/main/CHANGELOG.md");
+        Artifact.Value.Readme.Should().Contain("AnonymiseWithAttribute");
+        Artifact.Value.Readme.Should().Contain("PreviewEraseAsync(...)");
+        Artifact.Value.Readme.Should().Contain("row-dispatch surface");
+    }
+
+    [Fact]
+    public void Changelog_Release_Notes_Cover_The_Runtime_Upgrade_Contract()
+    {
+        Changelog.Value.Should().Contain("Startup tenant enforcement is now fail-closed");
+        Changelog.Value.Should().Contain("effective retention cutoff");
+        Changelog.Value.Should().Contain("must refresh their Cohort-owned table migrations before booting this package version");
+        Changelog.Value.Should().Contain("RetentionRowDispatcher");
+    }
+
+    [Fact]
+    public void Changelog_Release_Checklist_Covers_Pack_And_Clean_Consumer_Restore()
+    {
+        Changelog.Value.Should().Contain("dotnet pack Cohort/Cohort.csproj");
+        Changelog.Value.Should().Contain("Restore the packed version into a clean consumer.");
+        Changelog.Value.Should().Contain("AnonymiseWithAttribute");
+        Changelog.Value.Should().Contain("IRetentionSweepStrategy.PreviewEraseAsync(...)");
+        Changelog.Value.Should().Contain("IRetentionRowDispatcher");
+        Changelog.Value.Should().Contain("Regenerate your host migration against the `0.2.0` package");
+        Changelog.Value.Should().Contain("Apply that migration before booting the new package version");
     }
 
     private static string FindRepoRoot()
@@ -123,6 +156,16 @@ public sealed class PackageReleaseContractTests
                 Directory.Delete(outputDirectory, recursive: true);
             }
         }
+    }
+
+    private static string BuildChangelog()
+    {
+        var repoRoot = FindRepoRoot();
+        var changelogPath = Path.Combine(repoRoot, "CHANGELOG.md");
+
+        File.Exists(changelogPath).Should().BeTrue("slice 8 ships the release handover artifact in-repo");
+
+        return File.ReadAllText(changelogPath);
     }
 
     private sealed record PackedArtifact(Version PackageVersion, string Readme);

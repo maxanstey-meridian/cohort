@@ -1,6 +1,7 @@
 using System.Data;
 using System.Data.Common;
 using System.Globalization;
+using System.Reflection;
 
 using Cohort.Application;
 using Cohort.Domain;
@@ -13,9 +14,15 @@ namespace Cohort.Infrastructure.Sweep;
 
 public sealed class AnonymiseSweepStrategy(
     IEnumerable<IAnonymiseValueFactory>? anonymiseValueFactories = null,
-    DbContext? db = null
+    DbContext? db = null,
+    IServiceProvider? services = null
 ) : IRetentionSweepStrategy
 {
+    private static readonly MethodInfo ExecuteHandlerAwareSweepCoreMethod =
+        typeof(AnonymiseSweepStrategy).GetMethod(
+            nameof(ExecuteHandlerAwareSweepCoreAsync),
+            BindingFlags.Instance | BindingFlags.NonPublic
+        )!;
     private readonly IReadOnlyDictionary<Type, IAnonymiseValueFactory> factories =
         (anonymiseValueFactories ?? Array.Empty<IAnonymiseValueFactory>())
         .GroupBy(factory => factory.GetType())
@@ -87,7 +94,8 @@ public sealed class AnonymiseSweepStrategy(
         RetentionResolutionContext ctx,
         DbConnection conn,
         DbTransaction transaction,
-        CancellationToken ct
+        CancellationToken ct,
+        SweepMutationContext? execution = null
     )
     {
         ArgumentNullException.ThrowIfNull(entry);
@@ -129,6 +137,22 @@ public sealed class AnonymiseSweepStrategy(
         if (candidateRecordIds.Count == 0)
         {
             return new SweepExecutionResult([], 0);
+        }
+
+        var handlers = RetentionHandlerSupport.ResolveHandlers(services, entry.EntityType);
+        if (execution is not null && handlers.Count > 0)
+        {
+            return await ExecuteHandlerAwareSweepAsync(
+                entry,
+                rule,
+                ctx,
+                conn,
+                transaction,
+                candidateRecordIds,
+                handlers,
+                execution,
+                ct
+            );
         }
 
         return RequiresPerRowExecution(entry)
@@ -236,7 +260,8 @@ public sealed class AnonymiseSweepStrategy(
         DateTimeOffset now,
         DbConnection conn,
         DbTransaction transaction,
-        CancellationToken ct
+        CancellationToken ct,
+        SweepMutationContext? execution = null
     )
     {
         ArgumentNullException.ThrowIfNull(entry);
@@ -300,6 +325,128 @@ public sealed class AnonymiseSweepStrategy(
                 candidateRecordIds,
                 ct
             );
+    }
+
+    private Task<SweepExecutionResult> ExecuteHandlerAwareSweepAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        RetentionResolutionContext ctx,
+        DbConnection conn,
+        DbTransaction transaction,
+        IReadOnlyList<string> candidateRecordIds,
+        IReadOnlyList<ResolvedRetentionHandler> handlers,
+        SweepMutationContext execution,
+        CancellationToken ct
+    )
+    {
+        return (Task<SweepExecutionResult>)ExecuteHandlerAwareSweepCoreMethod
+            .MakeGenericMethod(entry.EntityType)
+            .Invoke(
+                this,
+                [entry, rule, ctx, conn, transaction, candidateRecordIds, handlers, execution, ct]
+            )!;
+    }
+
+    private async Task<SweepExecutionResult> ExecuteHandlerAwareSweepCoreAsync<TEntity>(
+        RetentionEntry entry,
+        RetentionRule rule,
+        RetentionResolutionContext ctx,
+        DbConnection conn,
+        DbTransaction transaction,
+        IReadOnlyList<string> candidateRecordIds,
+        IReadOnlyList<ResolvedRetentionHandler> handlers,
+        SweepMutationContext execution,
+        CancellationToken ct
+    )
+        where TEntity : class
+    {
+        var runtimeDb = modelDb
+            ?? throw new InvalidOperationException(
+                $"Handler-aware anonymise for {entry.EntityType.FullName} requires a DbContext-backed strategy instance."
+            );
+        var rows = await LoadHandlerRowsAsync<TEntity>(
+            runtimeDb,
+            entry,
+            ctx.Tenant,
+            ctx.Now,
+            conn,
+            candidateRecordIds,
+            ct
+        );
+        var recordIdProperty =
+            typeof(TEntity).GetProperty(entry.RecordId.RecordIdMember)
+            ?? throw new InvalidOperationException(
+                $"Retention entry for {entry.EntityType.FullName} references missing record-id member '{entry.RecordId.RecordIdMember}'."
+            );
+        var heldCount = candidateRecordIds.Count - rows.Count;
+        var staticAssignments = CreateStaticAssignments(entry, ctx.Tenant.Id, ctx.Now);
+        var affectedRecordIds = new List<string>();
+
+        foreach (var row in rows)
+        {
+            var recordId = recordIdProperty.GetValue(row)?.ToString();
+            if (string.IsNullOrWhiteSpace(recordId))
+            {
+                throw new InvalidOperationException(
+                    $"Retention row for {entry.EntityType.FullName} produced an empty record id for member '{entry.RecordId.RecordIdMember}'."
+                );
+            }
+
+            var beforeContext = new RetentionBeforeContext(
+                execution.SweepId,
+                entry.Category,
+                rule.Strategy,
+                ctx.Tenant.Id,
+                execution.At
+            );
+
+            try
+            {
+                await RetentionHandlerSupport.InvokeOnBeforeAsync(handlers, row, beforeContext, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                continue;
+            }
+
+            var originalValues = CreateOriginalValuesFromEntity(entry, row);
+            if (
+                !await ExecuteCapturedRowUpdateAsync(
+                    entry,
+                    ctx.Tenant,
+                    ctx.Now,
+                    conn,
+                    transaction,
+                    recordId,
+                    originalValues,
+                    staticAssignments,
+                    ct
+                )
+            )
+            {
+                continue;
+            }
+
+            await RetentionHandlerSupport.PersistCapturedRowAsync(
+                conn,
+                transaction,
+                execution,
+                entry,
+                rule.Strategy,
+                ctx.Tenant.Id,
+                recordId,
+                new Dictionary<string, object?>(beforeContext.Snapshot, StringComparer.Ordinal),
+                handlers,
+                ct
+            );
+            affectedRecordIds.Add(recordId);
+        }
+
+        return new SweepExecutionResult(affectedRecordIds, heldCount, RowDetailsPersisted: true);
     }
 
     private async Task<SweepExecutionResult> ExecuteSetBasedSweepAsync(
@@ -530,6 +677,72 @@ public sealed class AnonymiseSweepStrategy(
         return affectedRecordIds;
     }
 
+    private async Task<bool> ExecuteCapturedRowUpdateAsync(
+        RetentionEntry entry,
+        TenantContext tenant,
+        DateTimeOffset now,
+        DbConnection conn,
+        DbTransaction transaction,
+        string recordId,
+        IReadOnlyDictionary<string, object?> originalValues,
+        IReadOnlyDictionary<string, object?> staticAssignments,
+        CancellationToken ct
+    )
+    {
+        await using var command = conn.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = BuildPerRowCommandText(
+            entry,
+            entry.Tenant?.TenantColumn,
+            entry.RecordId.RecordIdColumn
+        );
+
+        for (var index = 0; index < entry.AnonymiseFields.Count; index++)
+        {
+            var field = entry.AnonymiseFields[index];
+            var parameterName = $"value{index}";
+            var value = field switch
+            {
+                AnonymiseLiteralField literalField => CreateLiteralAssignmentValue(literalField),
+                AnonymiseFactoryField factoryField when ResolveFactory(factoryField).RequiresPerRowExecution
+                    => ResolveFactory(factoryField)
+                        .Create(
+                            new AnonymiseValueContext(
+                                entry.EntityType,
+                                factoryField.MemberName,
+                                originalValues.TryGetValue(factoryField.MemberName, out var originalValue)
+                                    ? originalValue
+                                    : null,
+                                now,
+                                tenant.Id
+                            )
+                        ),
+                AnonymiseFactoryField factoryField => staticAssignments[factoryField.MemberName],
+                _ => throw new InvalidOperationException(
+                    $"Anonymise field '{field.MemberName}' is not supported."
+                ),
+            };
+            command.Parameters.Add(
+                CreateParameter(
+                    command,
+                    parameterName,
+                    ConvertAssignmentValueToProvider(entry, field, value)
+                )
+            );
+        }
+
+        command.Parameters.Add(CreateParameter(command, "recordId", recordId));
+        if (entry.Tenant is not null)
+        {
+            command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
+        }
+        command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
+        command.Parameters.Add(CreateParameter(command, "holdAsOf", now));
+
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        return await reader.ReadAsync(ct);
+    }
+
     private async Task<IReadOnlyList<AnonymiseRowSnapshot>> LoadUpdatableRowsAsync(
         RetentionEntry entry,
         TenantContext tenant,
@@ -592,6 +805,67 @@ public sealed class AnonymiseSweepStrategy(
         }
 
         return rows;
+    }
+
+    private async Task<List<TEntity>> LoadHandlerRowsAsync<TEntity>(
+        DbContext db,
+        RetentionEntry entry,
+        TenantContext tenant,
+        DateTimeOffset now,
+        DbConnection conn,
+        IReadOnlyList<string> candidateRecordIds,
+        CancellationToken ct
+    )
+        where TEntity : class
+    {
+        var tenantClause = entry.Tenant is not null
+            ? $"AND target.{QuoteIdentifier(entry.Tenant.TenantColumn)} = @tenantId"
+            : "";
+        var sql =
+            $"""
+            SELECT *
+            FROM {QuoteIdentifier(entry.TableName)} AS target
+            WHERE CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) = ANY(@candidateIds)
+              {tenantClause}
+              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn, entry.Tenant?.TenantColumn)}
+            ORDER BY CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text)
+            """;
+        var parameters = new List<object>
+        {
+            CreateProviderParameter(conn, "candidateIds", candidateRecordIds.ToArray()),
+            CreateProviderParameter(conn, "holdTableName", entry.TableName),
+            CreateProviderParameter(conn, "holdAsOf", now),
+        };
+        if (entry.Tenant is not null)
+        {
+            parameters.Add(CreateProviderParameter(conn, "tenantId", tenant.Id));
+        }
+
+        return await db.Set<TEntity>().FromSqlRaw(sql, parameters.ToArray()).AsNoTracking().ToListAsync(ct);
+    }
+
+    private IReadOnlyDictionary<string, object?> CreateOriginalValuesFromEntity<TEntity>(
+        RetentionEntry entry,
+        TEntity row
+    )
+        where TEntity : class
+    {
+        var originalValues = new Dictionary<string, object?>(StringComparer.Ordinal);
+        foreach (
+            var field in entry.AnonymiseFields
+                .OfType<AnonymiseFactoryField>()
+                .Where(candidate => ResolveFactory(candidate).RequiresOriginalValue)
+        )
+        {
+            var property =
+                entry.EntityType.GetProperty(field.MemberName)
+                ?? throw new InvalidOperationException(
+                    $"Property '{field.MemberName}' on {entry.EntityType.FullName} is not mapped by the current EF model."
+                );
+            originalValues[field.MemberName] = property.GetValue(row);
+        }
+
+        return originalValues;
     }
 
     private Dictionary<string, object?> CreateStaticAssignments(
@@ -995,6 +1269,16 @@ public sealed class AnonymiseSweepStrategy(
         parameter.ParameterName = name;
         parameter.Value = value ?? DBNull.Value;
         return parameter;
+    }
+
+    private static DbParameter CreateProviderParameter(
+        DbConnection conn,
+        string name,
+        object? value
+    )
+    {
+        using var command = conn.CreateCommand();
+        return CreateParameter(command, name, value);
     }
 
     private static string QuoteIdentifier(string identifier)

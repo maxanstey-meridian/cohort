@@ -22,7 +22,8 @@ public interface IRetentionSweepStrategy
         RetentionResolutionContext ctx,
         DbConnection conn,
         DbTransaction transaction,
-        CancellationToken ct
+        CancellationToken ct,
+        SweepMutationContext? execution = null
     );
 
     public Task<int> PreviewEraseAsync(
@@ -43,10 +44,17 @@ public interface IRetentionSweepStrategy
         DateTimeOffset now,
         DbConnection conn,
         DbTransaction transaction,
-        CancellationToken ct
+        CancellationToken ct,
+        SweepMutationContext? execution = null
     );
 }
 
-public sealed record SweepExecutionResult(IReadOnlyList<string> AffectedRecordIds, int HeldCount);
+public sealed record SweepExecutionResult(
+    IReadOnlyList<string> AffectedRecordIds,
+    int HeldCount,
+    bool RowDetailsPersisted = false
+);
+
+public sealed record SweepMutationContext(Guid SweepId, DateTimeOffset At);
 
 public sealed record ErasureSubjectMatch(string SubjectMember, string SubjectColumn, object SubjectValue);

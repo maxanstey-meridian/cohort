@@ -98,7 +98,8 @@ public sealed class RetentionSweepEngine(
                         context,
                         connection,
                         dbTransaction,
-                        ct
+                        ct,
+                        new SweepMutationContext(sweepId, eventAt)
                     ),
                 };
 
@@ -128,7 +129,10 @@ public sealed class RetentionSweepEngine(
                 var effectiveAuditDetail = entry.AuditRowDetail == AuditRowDetail.Inherit
                     ? rule.AuditRowDetail
                     : entry.AuditRowDetail;
-                if (effectiveAuditDetail == AuditRowDetail.PerRow)
+                if (
+                    effectiveAuditDetail == AuditRowDetail.PerRow
+                    && !execution.RowDetailsPersisted
+                )
                 {
                     foreach (var recordId in execution.AffectedRecordIds)
                     {

@@ -449,7 +449,8 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             RetentionResolutionContext ctx,
             DbConnection conn,
             DbTransaction transaction,
-            CancellationToken ct
+            CancellationToken ct,
+            SweepMutationContext? execution = null
         )
         {
             ReceivedTransaction = transaction;
@@ -478,7 +479,8 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             DateTimeOffset now,
             DbConnection conn,
             DbTransaction transaction,
-            CancellationToken ct
+            CancellationToken ct,
+            SweepMutationContext? execution = null
         )
         {
             throw new NotSupportedException();

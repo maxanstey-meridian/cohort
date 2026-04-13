@@ -146,7 +146,7 @@ public sealed class AnonymiseWithEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     ExternalId = Guid.NewGuid(),
                     DisplayName = "erasure-alpha",
                     ContactEmail = "erasure-alpha@example.com",
@@ -157,7 +157,7 @@ public sealed class AnonymiseWithEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     ExternalId = Guid.NewGuid(),
                     DisplayName = "erasure-beta",
                     ContactEmail = "erasure-beta@example.com",
@@ -168,7 +168,7 @@ public sealed class AnonymiseWithEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     SubjectId = otherSubjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     ExternalId = Guid.NewGuid(),
                     DisplayName = "other-subject",
                     ContactEmail = "other-subject@example.com",
@@ -179,7 +179,7 @@ public sealed class AnonymiseWithEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = otherTenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     ExternalId = Guid.NewGuid(),
                     DisplayName = "other-tenant",
                     ContactEmail = "other-tenant@example.com",
@@ -237,5 +237,10 @@ public sealed class AnonymiseWithEndToEndTests(PostgresFixture fixture)
                 return Task.CompletedTask;
             }
         );
+    }
+
+    private static DateTimeOffset EligibleErasureCreatedAt(DateTimeOffset asOf)
+    {
+        return asOf.AddDays(-45);
     }
 }

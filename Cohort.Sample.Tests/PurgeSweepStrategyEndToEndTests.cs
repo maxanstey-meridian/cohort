@@ -299,6 +299,7 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
         var heldId = Guid.NewGuid();
         var tenantId = Guid.NewGuid();
         var subjectId = Guid.NewGuid();
+        var now = new DateTimeOffset(2026, 4, 11, 12, 0, 0, TimeSpan.Zero);
         var strategy = new PurgeSweepStrategy();
         var connection = new RecordingDbConnection();
         connection.EnqueueResultSet(selectedId, heldId);
@@ -322,7 +323,7 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
             rule,
             new ErasureSubjectMatch(nameof(PurgeCandidateRecord.Id), "SubjectId", subjectId),
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new DateTimeOffset(2026, 4, 11, 12, 0, 0, TimeSpan.Zero),
+            now,
             connection,
             transaction,
             CancellationToken.None
@@ -332,8 +333,12 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
         affected.HeldCount.Should().Be(1);
         connection.Commands.Should().HaveCount(2);
         connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
+        connection.Commands[0].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
+        connection.Commands[0].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[1].CommandText.Should().Contain("\"SubjectId\" = @subjectValue");
+        connection.Commands[1].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
         connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
+        connection.Commands[1].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
             new[] { selectedId.ToString(), heldId.ToString() }
         );
@@ -378,9 +383,12 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
         connection.Commands[0].AssignedTransaction.Should().BeNull();
         connection.Commands[0].CommandText.Should().NotContain("FOR UPDATE");
         connection.Commands[0].CommandText.Should().Contain("\"SubjectId\" = @subjectValue");
+        connection.Commands[0].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
+        connection.Commands[0].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[1].AssignedTransaction.Should().BeNull();
         connection.Commands[1].CommandText.Should().Contain("SELECT COUNT(*)");
         connection.Commands[1].CommandText.Should().Contain("\"SubjectId\" = @subjectValue");
+        connection.Commands[1].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
         connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
         connection.Commands[1].CommandText.Should().Contain("NOT EXISTS");
         connection.Commands[1].CommandText.Should().NotContain("DELETE FROM");
@@ -388,6 +396,7 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
         connection.Commands[1].CommandText.Should().NotContain("FOR UPDATE");
         connection.Commands[1].Parameters["tenantId"].Value.Should().Be(tenantId);
         connection.Commands[1].Parameters["subjectValue"].Value.Should().Be(subjectId);
+        connection.Commands[1].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
             new[] { selectedId.ToString(), heldId.ToString() }
         );

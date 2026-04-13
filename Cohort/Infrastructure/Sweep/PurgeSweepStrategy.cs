@@ -126,6 +126,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
                 conn,
                 transaction,
                 candidateRecordIds,
+                cutoff,
                 handlers,
                 execution,
                 ct
@@ -176,6 +177,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
         DbConnection conn,
         DbTransaction transaction,
         IReadOnlyList<string> candidateRecordIds,
+        DateTimeOffset cutoff,
         IReadOnlyList<ResolvedRetentionHandler> handlers,
         SweepMutationContext execution,
         CancellationToken ct
@@ -185,7 +187,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
             .MakeGenericMethod(entry.EntityType)
             .Invoke(
                 this,
-                [entry, rule, ctx, conn, transaction, candidateRecordIds, handlers, execution, ct]
+                [entry, rule, ctx, conn, transaction, candidateRecordIds, cutoff, handlers, execution, ct]
             )!;
     }
 
@@ -196,6 +198,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
         DbConnection conn,
         DbTransaction transaction,
         IReadOnlyList<string> candidateRecordIds,
+        DateTimeOffset cutoff,
         IReadOnlyList<ResolvedRetentionHandler> handlers,
         SweepMutationContext execution,
         CancellationToken ct
@@ -267,7 +270,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
                 continue;
             }
 
-            if (!await DeleteCapturedRowAsync(entry, ctx, conn, transaction, recordId, ct))
+            if (!await DeleteCapturedRowAsync(entry, ctx, conn, transaction, recordId, cutoff, ct))
             {
                 heldCount++;
                 continue;
@@ -339,6 +342,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
         DbConnection conn,
         DbTransaction transaction,
         string recordId,
+        DateTimeOffset cutoff,
         CancellationToken ct
     )
     {
@@ -352,11 +356,13 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
             $"""
             DELETE FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) = @recordId
+              AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {tenantClause}
               AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn, entry.Tenant?.TenantColumn)}
             RETURNING target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
             """;
         command.Parameters.Add(CreateParameter(command, "recordId", recordId));
+        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         if (entry.Tenant is not null)
         {
             command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
@@ -396,11 +402,13 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
             await conn.OpenAsync(ct);
         }
 
+        var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
         var candidateRecordIds = await SelectPreviewErasureCandidateRecordIdsAsync(
             entry,
             entry.Tenant?.TenantColumn,
             match,
             tenant,
+            cutoff,
             conn,
             ct
         );
@@ -420,6 +428,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
             SELECT COUNT(*)
             FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+              AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {tenantClause}
               AND CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) = ANY(@candidateIds)
               AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn, entry.Tenant?.TenantColumn)}
@@ -429,6 +438,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
             command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
         }
         command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
+        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
         command.Parameters.Add(CreateParameter(command, "holdAsOf", now));
@@ -467,11 +477,13 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
             await conn.OpenAsync(ct);
         }
 
+        var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
         var candidateRecordIds = await SelectErasureCandidateRecordIdsAsync(
             entry,
             entry.Tenant?.TenantColumn,
             match,
             tenant,
+            cutoff,
             conn,
             transaction,
             ct
@@ -492,6 +504,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
                 conn,
                 transaction,
                 candidateRecordIds,
+                cutoff,
                 handlers,
                 execution,
                 ct
@@ -508,6 +521,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
             $"""
             DELETE FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+              AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {tenantClause}
               AND CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) = ANY(@candidateIds)
               AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn, entry.Tenant?.TenantColumn)}
@@ -518,6 +532,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
             command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
         }
         command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
+        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
         command.Parameters.Add(CreateParameter(command, "holdAsOf", now));
@@ -580,6 +595,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
         string? tenantColumn,
         ErasureSubjectMatch match,
         TenantContext erasureTenant,
+        DateTimeOffset cutoff,
         DbConnection conn,
         DbTransaction transaction,
         CancellationToken ct
@@ -596,6 +612,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
             SELECT target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
             FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+              AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {tenantClause}
             FOR UPDATE
             """;
@@ -604,6 +621,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
             command.Parameters.Add(CreateParameter(command, "tenantId", erasureTenant.Id));
         }
         command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
+        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
 
         var candidateRecordIds = new List<string>();
         await using var reader = await command.ExecuteReaderAsync(ct);
@@ -620,6 +638,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
         string? tenantColumn,
         ErasureSubjectMatch match,
         TenantContext erasureTenant,
+        DateTimeOffset cutoff,
         DbConnection conn,
         CancellationToken ct
     )
@@ -634,6 +653,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
             SELECT target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
             FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+              AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {tenantClause}
             """;
         if (tenantColumn is not null)
@@ -641,6 +661,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
             command.Parameters.Add(CreateParameter(command, "tenantId", erasureTenant.Id));
         }
         command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
+        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
 
         var candidateRecordIds = new List<string>();
         await using var reader = await command.ExecuteReaderAsync(ct);

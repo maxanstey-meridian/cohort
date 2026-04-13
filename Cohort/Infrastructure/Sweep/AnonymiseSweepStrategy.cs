@@ -103,10 +103,14 @@ public sealed class AnonymiseSweepStrategy(
         ArgumentNullException.ThrowIfNull(tenant);
         ArgumentNullException.ThrowIfNull(conn);
 
+        var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
         return await PreviewMutationCountAsync(
             entry,
             rule,
-            CreateSubjectFilter(match.SubjectColumn, match.SubjectValue),
+            CombineFilters(
+                CreateSubjectFilter(match.SubjectColumn, match.SubjectValue),
+                CreateCutoffFilter(entry.AnchorColumn, cutoff)
+            ),
             tenant,
             now,
             conn,
@@ -134,11 +138,15 @@ public sealed class AnonymiseSweepStrategy(
         ArgumentNullException.ThrowIfNull(conn);
         ArgumentNullException.ThrowIfNull(transaction);
 
+        var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
         return await ExecuteMutationAsync(
             entry,
             rule,
             new RetentionResolutionContext(entry.Category, tenant, now, []),
-            CreateSubjectFilter(match.SubjectColumn, match.SubjectValue),
+            CombineFilters(
+                CreateSubjectFilter(match.SubjectColumn, match.SubjectValue),
+                CreateCutoffFilter(entry.AnchorColumn, cutoff)
+            ),
             conn,
             transaction,
             execution,
@@ -215,6 +223,7 @@ public sealed class AnonymiseSweepStrategy(
                 conn,
                 transaction,
                 candidateRecordIds,
+                filter,
                 handlers,
                 execution,
                 ct
@@ -229,6 +238,7 @@ public sealed class AnonymiseSweepStrategy(
                 conn,
                 transaction,
                 candidateRecordIds,
+                filter,
                 ct
             )
             : await ExecuteSetBasedMutationAsync(
@@ -250,6 +260,7 @@ public sealed class AnonymiseSweepStrategy(
         DbConnection conn,
         DbTransaction transaction,
         IReadOnlyList<string> candidateRecordIds,
+        SqlFilter filter,
         IReadOnlyList<ResolvedRetentionHandler> handlers,
         SweepMutationContext execution,
         CancellationToken ct
@@ -259,7 +270,7 @@ public sealed class AnonymiseSweepStrategy(
             .MakeGenericMethod(entry.EntityType)
             .Invoke(
                 this,
-                [entry, rule, ctx, conn, transaction, candidateRecordIds, handlers, execution, ct]
+                [entry, rule, ctx, conn, transaction, candidateRecordIds, filter, handlers, execution, ct]
             )!;
     }
 
@@ -270,6 +281,7 @@ public sealed class AnonymiseSweepStrategy(
         DbConnection conn,
         DbTransaction transaction,
         IReadOnlyList<string> candidateRecordIds,
+        SqlFilter filter,
         IReadOnlyList<ResolvedRetentionHandler> handlers,
         SweepMutationContext execution,
         CancellationToken ct
@@ -349,6 +361,7 @@ public sealed class AnonymiseSweepStrategy(
                     recordId,
                     originalValues,
                     staticAssignments,
+                    filter,
                     ct
                 )
             )
@@ -387,6 +400,7 @@ public sealed class AnonymiseSweepStrategy(
         DbConnection conn,
         DbTransaction transaction,
         IReadOnlyList<string> candidateRecordIds,
+        SqlFilter filter,
         CancellationToken ct
     )
     {
@@ -411,6 +425,7 @@ public sealed class AnonymiseSweepStrategy(
             conn,
             transaction,
             updatableRows,
+            filter,
             ct
         );
         return new SweepExecutionResult(
@@ -426,6 +441,7 @@ public sealed class AnonymiseSweepStrategy(
         DbConnection conn,
         DbTransaction transaction,
         IReadOnlyList<AnonymiseRowSnapshot> rows,
+        SqlFilter filter,
         CancellationToken ct
     )
     {
@@ -439,10 +455,12 @@ public sealed class AnonymiseSweepStrategy(
             command.CommandText = BuildPerRowCommandText(
                 entry,
                 entry.Tenant?.TenantColumn,
+                filter,
                 entry.RecordId.RecordIdColumn
             );
             AddPerRowAssignmentParameters(command, entry, tenant, now, row.OriginalValues, staticAssignments);
             command.Parameters.Add(CreateParameter(command, "recordId", row.RecordId));
+            AddFilterParameters(command, filter);
             AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
             AddHoldParameters(command, entry.TableName, now);
 
@@ -465,6 +483,7 @@ public sealed class AnonymiseSweepStrategy(
         string recordId,
         IReadOnlyDictionary<string, object?> originalValues,
         IReadOnlyDictionary<string, object?> staticAssignments,
+        SqlFilter filter,
         CancellationToken ct
     )
     {
@@ -473,10 +492,12 @@ public sealed class AnonymiseSweepStrategy(
         command.CommandText = BuildPerRowCommandText(
             entry,
             entry.Tenant?.TenantColumn,
+            filter,
             entry.RecordId.RecordIdColumn
         );
         AddPerRowAssignmentParameters(command, entry, tenant, now, originalValues, staticAssignments);
         command.Parameters.Add(CreateParameter(command, "recordId", recordId));
+        AddFilterParameters(command, filter);
         AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
         AddHoldParameters(command, entry.TableName, now);
 
@@ -894,6 +915,7 @@ public sealed class AnonymiseSweepStrategy(
     private static string BuildPerRowCommandText(
         RetentionEntry entry,
         string? tenantColumn,
+        SqlFilter filter,
         string recordIdColumn
     )
     {
@@ -914,6 +936,7 @@ public sealed class AnonymiseSweepStrategy(
             UPDATE {QuoteIdentifier(entry.TableName)} AS target
             SET {string.Join(", ", assignments)}
             WHERE CAST(target.{QuoteIdentifier(recordIdColumn)} AS text) = @recordId
+              AND {filter.PredicateSql}
               {tenantClause}
               AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn, tenantColumn)}
             RETURNING target.{QuoteIdentifier(recordIdColumn)}
@@ -970,6 +993,14 @@ public sealed class AnonymiseSweepStrategy(
         return new SqlFilter(
             $"target.{QuoteIdentifier(subjectColumn)} = @subjectValue",
             [new SqlFilterParameter("subjectValue", subjectValue)]
+        );
+    }
+
+    private static SqlFilter CombineFilters(params SqlFilter[] filters)
+    {
+        return new SqlFilter(
+            string.Join(" AND ", filters.Select(filter => $"({filter.PredicateSql})")),
+            filters.SelectMany(filter => filter.Parameters).ToArray()
         );
     }
 

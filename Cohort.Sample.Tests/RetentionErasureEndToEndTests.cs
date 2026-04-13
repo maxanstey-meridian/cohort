@@ -43,7 +43,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = noteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "erase-note",
                 },
                 new Note
@@ -51,7 +51,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = heldNoteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "held-note",
                 },
                 new Note
@@ -59,7 +59,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     SubjectId = otherSubjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "other-subject-note",
                 },
                 new Note
@@ -67,7 +67,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = otherTenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "other-tenant-note",
                 }
             );
@@ -77,7 +77,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = softDeleteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "erase-soft-delete",
                     IsDeleted = false,
                 },
@@ -86,7 +86,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = heldSoftDeleteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "held-soft-delete",
                     IsDeleted = false,
                 },
@@ -95,7 +95,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     SubjectId = otherSubjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "other-subject-soft-delete",
                     IsDeleted = false,
                 },
@@ -104,7 +104,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = otherTenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "other-tenant-soft-delete",
                     IsDeleted = false,
                 }
@@ -115,7 +115,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = anonymisedContactId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     EmailAddress = "subject@example.com",
                     GivenName = "Target",
                     Surname = "Contact",
@@ -126,7 +126,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = heldAnonymisedContactId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     EmailAddress = "held@example.com",
                     GivenName = "Held",
                     Surname = "Contact",
@@ -137,7 +137,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     SubjectId = otherSubjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     EmailAddress = "other@example.com",
                     GivenName = "Other",
                     Surname = "Subject",
@@ -148,7 +148,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = otherTenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     EmailAddress = "tenant@example.com",
                     GivenName = "Other",
                     Surname = "Tenant",
@@ -161,7 +161,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = exemptErasureSubjectRecordId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "exempt-erasure-subject-record",
                 },
                 new ErasureSubjectRecord
@@ -169,7 +169,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     SubjectId = otherSubjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "other-exempt-erasure-subject-record",
                 }
             );
@@ -339,7 +339,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = noteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "erase-note",
                 },
                 new Note
@@ -347,7 +347,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = heldNoteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "held-note",
                 },
                 new Note
@@ -355,7 +355,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     SubjectId = otherSubjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "other-subject-note",
                 },
                 new Note
@@ -363,7 +363,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = otherTenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "other-tenant-note",
                 }
             );
@@ -373,7 +373,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = softDeleteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "erase-soft-delete",
                     IsDeleted = false,
                 },
@@ -382,7 +382,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = heldSoftDeleteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "held-soft-delete",
                     IsDeleted = false,
                 },
@@ -391,7 +391,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     SubjectId = otherSubjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "other-subject-soft-delete",
                     IsDeleted = false,
                 },
@@ -400,7 +400,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = otherTenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "other-tenant-soft-delete",
                     IsDeleted = false,
                 }
@@ -411,7 +411,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = anonymisedContactId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     EmailAddress = "subject@example.com",
                     GivenName = "Target",
                     Surname = "Contact",
@@ -422,7 +422,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = heldAnonymisedContactId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     EmailAddress = "held@example.com",
                     GivenName = "Held",
                     Surname = "Contact",
@@ -433,7 +433,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     SubjectId = otherSubjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     EmailAddress = "other@example.com",
                     GivenName = "Other",
                     Surname = "Subject",
@@ -444,7 +444,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = otherTenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     EmailAddress = "tenant@example.com",
                     GivenName = "Other",
                     Surname = "Tenant",
@@ -457,7 +457,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = exemptErasureSubjectRecordId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "exempt-erasure-subject-record",
                 },
                 new ErasureSubjectRecord
@@ -465,7 +465,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     SubjectId = otherSubjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "other-exempt-erasure-subject-record",
                 }
             );
@@ -558,7 +558,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "dry-run-audit-note",
                 }
             );
@@ -597,7 +597,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = noteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "lock-check-note",
                 }
             );
@@ -721,7 +721,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     ExternalId = "seed-value",
                     Notes = "converted-set-based-erasure",
                 }
@@ -793,7 +793,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = matchingId,
                     TenantId = tenantId,
                     CustomerReference = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "alias-match",
                 },
                 new AliasSubjectFixtureRecord
@@ -801,7 +801,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     CustomerReference = otherSubjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "alias-other-subject",
                 },
                 new AliasSubjectFixtureRecord
@@ -809,7 +809,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = otherTenantId,
                     CustomerReference = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "alias-other-tenant",
                 }
             );
@@ -874,7 +874,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     ExternalId = Guid.NewGuid(),
                     Notes = "set-based-first",
                 },
@@ -883,7 +883,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     ExternalId = Guid.NewGuid(),
                     Notes = "set-based-second",
                 },
@@ -892,7 +892,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     SubjectId = otherSubjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     ExternalId = Guid.NewGuid(),
                     Notes = "set-based-other-subject",
                 },
@@ -901,7 +901,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = otherTenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     ExternalId = Guid.NewGuid(),
                     Notes = "set-based-other-tenant",
                 }
@@ -913,7 +913,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     ExternalId = "alpha",
                     DisplayName = "first",
                     Notes = "per-row-first",
@@ -923,7 +923,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     ExternalId = "beta",
                     DisplayName = "second",
                     Notes = "per-row-second",
@@ -933,7 +933,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = heldPerRowId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     ExternalId = "held",
                     DisplayName = "held",
                     Notes = "per-row-held",
@@ -943,7 +943,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     SubjectId = otherSubjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleLegalMinErasureCreatedAt(asOf),
                     ExternalId = "other-subject",
                     DisplayName = "other-subject",
                     Notes = "per-row-other-subject",
@@ -1051,7 +1051,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleLegalMinErasureCreatedAt(asOf),
                     Body = "erasure-effective-period-note",
                 }
             );
@@ -1124,6 +1124,16 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                 CancellationToken.None
             );
         });
+    }
+
+    private static DateTimeOffset EligibleErasureCreatedAt(DateTimeOffset asOf)
+    {
+        return asOf.AddDays(-45);
+    }
+
+    private static DateTimeOffset EligibleLegalMinErasureCreatedAt(DateTimeOffset asOf)
+    {
+        return asOf.AddDays(-120);
     }
 
     private static async Task<string> ReadProviderStringAsync(DbContext db, string sql)

@@ -138,6 +138,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
                 conn,
                 transaction,
                 candidateRecordIds,
+                cutoff,
                 handlers,
                 execution,
                 softDelete,
@@ -184,6 +185,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
         DbConnection conn,
         DbTransaction transaction,
         IReadOnlyList<string> candidateRecordIds,
+        DateTimeOffset cutoff,
         IReadOnlyList<ResolvedRetentionHandler> handlers,
         SweepMutationContext execution,
         SoftDeleteConvention softDelete,
@@ -201,6 +203,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
                     conn,
                     transaction,
                     candidateRecordIds,
+                    cutoff,
                     handlers,
                     execution,
                     softDelete,
@@ -216,6 +219,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
         DbConnection conn,
         DbTransaction transaction,
         IReadOnlyList<string> candidateRecordIds,
+        DateTimeOffset cutoff,
         IReadOnlyList<ResolvedRetentionHandler> handlers,
         SweepMutationContext execution,
         SoftDeleteConvention softDelete,
@@ -297,6 +301,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
                     conn,
                     transaction,
                     recordId,
+                    cutoff,
                     ct
                 )
             )
@@ -374,6 +379,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
         DbConnection conn,
         DbTransaction transaction,
         string recordId,
+        DateTimeOffset cutoff,
         CancellationToken ct
     )
     {
@@ -386,6 +392,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             entry.RecordId.RecordIdColumn
         );
         command.Parameters.Add(CreateParameter(command, "recordId", recordId));
+        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         if (entry.Tenant is not null)
         {
             command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
@@ -437,12 +444,14 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             await conn.OpenAsync(ct);
         }
 
+        var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
         var candidateRecordIds = await SelectPreviewErasureCandidateRecordIdsAsync(
             entry,
             entry.Tenant?.TenantColumn,
             softDelete,
             match,
             tenant,
+            cutoff,
             conn,
             ct
         );
@@ -462,6 +471,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             SELECT COUNT(*)
             FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+              AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {tenantClause}
               AND target.{QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
               AND CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) = ANY(@candidateIds)
@@ -472,6 +482,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
         }
         command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
+        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
         command.Parameters.Add(CreateParameter(command, "holdAsOf", now));
@@ -515,12 +526,14 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             await conn.OpenAsync(ct);
         }
 
+        var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
         var candidateRecordIds = await SelectErasureCandidateRecordIdsAsync(
             entry,
             entry.Tenant?.TenantColumn,
             softDelete,
             match,
             tenant,
+            cutoff,
             conn,
             transaction,
             ct
@@ -541,6 +554,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
                 conn,
                 transaction,
                 candidateRecordIds,
+                cutoff,
                 handlers,
                 execution,
                 softDelete,
@@ -562,6 +576,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
         }
         command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
+        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
         command.Parameters.Add(CreateParameter(command, "holdAsOf", now));
@@ -635,6 +650,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             UPDATE {QuoteIdentifier(entry.TableName)} AS target
             SET {QuoteIdentifier(softDelete.IsDeletedColumn)} = TRUE{deletedAtAssignment}
             WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+              AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {tenantClause}
               AND target.{QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
               AND CAST(target.{QuoteIdentifier(recordIdColumn)} AS text) = ANY(@candidateIds)
@@ -663,6 +679,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             UPDATE {QuoteIdentifier(entry.TableName)} AS target
             SET {QuoteIdentifier(softDelete.IsDeletedColumn)} = TRUE{deletedAtAssignment}
             WHERE CAST(target.{QuoteIdentifier(recordIdColumn)} AS text) = @recordId
+              AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {tenantClause}
               AND target.{QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
               AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn, tenantColumn)}
@@ -718,6 +735,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
         SoftDeleteConvention softDelete,
         ErasureSubjectMatch match,
         TenantContext erasureTenant,
+        DateTimeOffset cutoff,
         DbConnection conn,
         DbTransaction transaction,
         CancellationToken ct
@@ -734,6 +752,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             SELECT target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
             FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+              AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {tenantClause}
               AND target.{QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
             FOR UPDATE
@@ -743,6 +762,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             command.Parameters.Add(CreateParameter(command, "tenantId", erasureTenant.Id));
         }
         command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
+        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
 
         var candidateRecordIds = new List<string>();
         await using var reader = await command.ExecuteReaderAsync(ct);
@@ -760,6 +780,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
         SoftDeleteConvention softDelete,
         ErasureSubjectMatch match,
         TenantContext erasureTenant,
+        DateTimeOffset cutoff,
         DbConnection conn,
         CancellationToken ct
     )
@@ -774,6 +795,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             SELECT target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
             FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+              AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {tenantClause}
               AND target.{QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
             """;
@@ -782,6 +804,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             command.Parameters.Add(CreateParameter(command, "tenantId", erasureTenant.Id));
         }
         command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
+        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
 
         var candidateRecordIds = new List<string>();
         await using var reader = await command.ExecuteReaderAsync(ct);

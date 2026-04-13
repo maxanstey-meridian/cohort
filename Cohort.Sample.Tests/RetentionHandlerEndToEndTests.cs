@@ -901,7 +901,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = successfulNoteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "successful-erasure-note",
                 },
                 new Note
@@ -909,7 +909,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = failingNoteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = SelectivelyFailingErasureNoteHandler.FailingBody,
                 }
             );
@@ -919,7 +919,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = successfulSoftDeleteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "successful-erasure-soft-delete",
                     IsDeleted = false,
                 },
@@ -928,7 +928,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = failingSoftDeleteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = SelectivelyFailingErasureSoftDeleteHandler.FailingBody,
                     IsDeleted = false,
                 }
@@ -939,7 +939,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = successfulContactId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     EmailAddress = "successful-erasure@example.com",
                     GivenName = "Successful",
                     Surname = "Contact",
@@ -950,7 +950,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = failingContactId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     EmailAddress = SelectivelyFailingErasureAnonymisedContactHandler.FailingEmailAddress,
                     GivenName = "Failing",
                     Surname = "Contact",
@@ -1089,7 +1089,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = noteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "erase-note",
                 },
                 new Note
@@ -1097,7 +1097,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = heldNoteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "held-note",
                 }
             );
@@ -1107,7 +1107,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = softDeleteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "erase-soft-delete",
                     IsDeleted = false,
                 },
@@ -1116,7 +1116,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = heldSoftDeleteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "held-soft-delete",
                     IsDeleted = false,
                 }
@@ -1127,7 +1127,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = contactId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     EmailAddress = "subject@example.com",
                     GivenName = "Target",
                     Surname = "Contact",
@@ -1138,7 +1138,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = heldContactId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     EmailAddress = "held@example.com",
                     GivenName = "Held",
                     Surname = "Contact",
@@ -1151,7 +1151,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = exemptRecordId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "exempt-erasure-record",
                 }
             );
@@ -1300,7 +1300,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = noteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "dry-run-note",
                 }
             );
@@ -1310,7 +1310,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = softDeleteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "dry-run-soft-delete",
                     IsDeleted = false,
                 }
@@ -1321,7 +1321,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = contactId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     EmailAddress = "dry-run@example.com",
                     GivenName = "Dry",
                     Surname = "Run",
@@ -1334,7 +1334,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = exemptRecordId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "dry-run-exempt",
                 }
             );
@@ -1409,7 +1409,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = noteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "erasure-dispatch-success",
                 }
             );
@@ -1983,7 +1983,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = noteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "erasure-retry-then-succeed",
                 }
             );
@@ -2108,7 +2108,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = noteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "erasure-dead-letter-target",
                 }
             );
@@ -2175,7 +2175,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = noteId,
                     TenantId = tenantId,
                     SubjectId = subjectId,
-                    CreatedAt = asOf.AddDays(-1),
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
                     Body = "erasure-dead-letter-stops-later-handlers",
                 }
             );
@@ -2236,6 +2236,11 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             && status.LastError != null
             && status.LastError.Contains("Skipped because an earlier handler for the same row dead-lettered", StringComparison.Ordinal)
         );
+    }
+
+    private static DateTimeOffset EligibleErasureCreatedAt(DateTimeOffset asOf)
+    {
+        return asOf.AddDays(-45);
     }
 
     private async Task CreateHoldAsync(

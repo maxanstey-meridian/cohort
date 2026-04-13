@@ -858,6 +858,10 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         using var handlerHost = new CohortTestHost(
             GetConnectionString(),
             CreateHandlerErasureCategoryRepository(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxParallelism"] = "1",
+            },
             configureServices: services =>
             {
                 services.AddSingleton(sink);
@@ -934,6 +938,28 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         statuses.Select(status => status.HandlerType).Should().NotContain(
             type => type.Contains(nameof(ExemptErasureTrackingHandler), StringComparison.Ordinal)
         );
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        sink.AfterCalls.Should().BeEquivalentTo(
+            [
+                "after-note:erase-note:1",
+                "after-soft:erase-soft-delete:1",
+                "after-contact:subject@example.com:1",
+            ]
+        );
+        sink.AfterCalls.Should().NotContain(call => call.Contains("exempt", StringComparison.Ordinal));
+
+        var completedStatuses = await LoadHandlerStatusesAsync(result.SweepId);
+        completedStatuses.Should().HaveCount(3);
+        completedStatuses.All(status => status.State == SucceededState).Should().BeTrue();
+        completedStatuses.All(status => status.Attempt == 1).Should().BeTrue();
+        completedStatuses.All(status => status.CompletedAt is not null).Should().BeTrue();
+        completedStatuses.All(status => status.LastError is null).Should().BeTrue();
     }
 
     [Fact]
@@ -1004,7 +1030,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             services =>
             {
                 services.AddSingleton(sink);
-                services.AddRowHandler<Note, NoteErasureTrackingHandler>();
+                services.AddRowHandler<Note, DispatchRecordingErasureNoteHandler>();
                 services.AddRowHandler<SoftDeleteRecord, SoftDeleteErasureTrackingHandler>();
                 services.AddRowHandler<AnonymisedContact, AnonymisedContactErasureTrackingHandler>();
                 services.AddRowHandler<ErasureSubjectRecord, ExemptErasureTrackingHandler>();
@@ -1030,6 +1056,14 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         (await LoadCapturedRowsAsync(result.SweepId)).Should().BeEmpty();
         (await LoadHandlerStatusesAsync(result.SweepId)).Should().BeEmpty();
 
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        sink.AfterCalls.Should().BeEmpty();
+
         await using var verify = Host.CreateDbContext();
         (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
         (await verify.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteId))
@@ -1038,6 +1072,72 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             .EmailAddress.Should().Be("dry-run@example.com");
         (await verify.ErasureSubjectRecords.SingleAsync(record => record.Id == exemptRecordId))
             .Body.Should().Be("dry-run-exempt");
+    }
+
+    [Fact]
+    public async Task FlushAsync_Drains_Erasure_Queued_Work_To_Succeeded()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var sink = new HandlerExecutionSink();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "erasure-dispatch-success",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            CreateHandlerErasureCategoryRepository(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxParallelism"] = "1",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(sink);
+                services.AddRowHandler<Note, DispatchRecordingErasureNoteHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
+            asOf
+        );
+
+        var pendingStatuses = await LoadHandlerStatusesAsync(result.SweepId);
+        pendingStatuses.Should().ContainSingle();
+        pendingStatuses[0].State.Should().Be(PendingState);
+        pendingStatuses[0].Attempt.Should().Be(0);
+        sink.AfterCalls.Should().BeEmpty();
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        sink.AfterCalls.Should().Equal("after-note:erasure-dispatch-success:1");
+
+        var completedStatuses = await LoadHandlerStatusesAsync(result.SweepId);
+        completedStatuses.Should().ContainSingle();
+        completedStatuses[0].State.Should().Be(SucceededState);
+        completedStatuses[0].Attempt.Should().Be(1);
+        completedStatuses[0].CompletedAt.Should().NotBeNull();
+        completedStatuses[0].LastError.Should().BeNull();
     }
 
     [Fact]
@@ -1548,6 +1648,75 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task FlushAsync_Retries_Transient_Erasure_Failures_And_Drains_Them_To_Succeeded()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var sink = new HandlerExecutionSink();
+        var tracker = new DispatchAttemptTracker();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "erasure-retry-then-succeed",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            CreateHandlerErasureCategoryRepository(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:BaseBackoff"] = "00:05:00",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxAttempts"] = "3",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(sink);
+                services.AddSingleton(tracker);
+                services.AddRowHandler<Note, RetryOnceDispatchNoteHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
+            asOf
+        );
+
+        var pendingStatuses = await LoadHandlerStatusesAsync(result.SweepId);
+        pendingStatuses.Should().ContainSingle();
+        pendingStatuses[0].State.Should().Be(PendingState);
+        pendingStatuses[0].Attempt.Should().Be(0);
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        tracker.LoadAttempt(noteId.ToString()).Should().Be(2);
+        sink.AfterCalls.Should().Equal("attempt:1", "attempt:2");
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().ContainSingle();
+        statuses[0].State.Should().Be(SucceededState);
+        statuses[0].Attempt.Should().Be(2);
+        statuses[0].CompletedAt.Should().NotBeNull();
+        statuses[0].LastError.Should().BeNull();
+    }
+
+    [Fact]
     public async Task FlushAsync_DeadLetters_Exhausted_Handler_Failures()
     {
         var tenantId = Guid.NewGuid();
@@ -1587,6 +1756,72 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
             asOf
         );
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        tracker.LoadAttempt(noteId.ToString()).Should().Be(2);
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().ContainSingle();
+        statuses[0].State.Should().Be(DeadLetteredState);
+        statuses[0].Attempt.Should().Be(2);
+        statuses[0].CompletedAt.Should().NotBeNull();
+        statuses[0].LastError.Should().Contain("Simulated permanent after-dispatch failure.");
+    }
+
+    [Fact]
+    public async Task FlushAsync_DeadLetters_Exhausted_Erasure_Handler_Failures()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var tracker = new DispatchAttemptTracker();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "erasure-dead-letter-target",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            CreateHandlerErasureCategoryRepository(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:BaseBackoff"] = "00:05:00",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxAttempts"] = "2",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(tracker);
+                services.AddRowHandler<Note, AlwaysFailingDispatchNoteHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
+            asOf
+        );
+
+        var pendingStatuses = await LoadHandlerStatusesAsync(result.SweepId);
+        pendingStatuses.Should().ContainSingle();
+        pendingStatuses[0].State.Should().Be(PendingState);
+        pendingStatuses[0].Attempt.Should().Be(0);
 
         await handlerHost.RunWithServicesAsync(async serviceProvider =>
         {
@@ -2142,6 +2377,12 @@ file sealed class NoteErasureTrackingHandler(HandlerExecutionSink sink) : IReten
         ctx.Snapshot["body"] = row.Body;
         return Task.CompletedTask;
     }
+
+    public Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
+    {
+        sink.AfterCalls.Add($"after-note:{ctx.Snapshot["body"]}:{ctx.Attempt}");
+        return Task.CompletedTask;
+    }
 }
 
 file sealed class SelectivelyFailingErasureNoteHandler : IRetentionHandler<Note>
@@ -2171,6 +2412,12 @@ file sealed class SoftDeleteErasureTrackingHandler(HandlerExecutionSink sink)
     {
         sink.BeforeCalls.Add($"soft:{row.Body}");
         ctx.Snapshot["body"] = row.Body;
+        return Task.CompletedTask;
+    }
+
+    public Task OnAfterAsync(RetentionAfterContext<SoftDeleteRecord> ctx, CancellationToken ct)
+    {
+        sink.AfterCalls.Add($"after-soft:{ctx.Snapshot["body"]}:{ctx.Attempt}");
         return Task.CompletedTask;
     }
 }
@@ -2208,6 +2455,12 @@ file sealed class AnonymisedContactErasureTrackingHandler(HandlerExecutionSink s
         ctx.Snapshot["email"] = row.EmailAddress;
         return Task.CompletedTask;
     }
+
+    public Task OnAfterAsync(RetentionAfterContext<AnonymisedContact> ctx, CancellationToken ct)
+    {
+        sink.AfterCalls.Add($"after-contact:{ctx.Snapshot["email"]}:{ctx.Attempt}");
+        return Task.CompletedTask;
+    }
 }
 
 file sealed class SelectivelyFailingErasureAnonymisedContactHandler
@@ -2242,6 +2495,28 @@ file sealed class ExemptErasureTrackingHandler(HandlerExecutionSink sink)
     {
         sink.BeforeCalls.Add($"exempt:{row.Body}");
         ctx.Snapshot["body"] = row.Body;
+        return Task.CompletedTask;
+    }
+
+    public Task OnAfterAsync(RetentionAfterContext<ErasureSubjectRecord> ctx, CancellationToken ct)
+    {
+        sink.AfterCalls.Add($"after-exempt:{ctx.Snapshot["body"]}:{ctx.Attempt}");
+        return Task.CompletedTask;
+    }
+}
+
+file sealed class DispatchRecordingErasureNoteHandler(HandlerExecutionSink sink)
+    : IRetentionHandler<Note>
+{
+    public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        ctx.Snapshot["body"] = row.Body;
+        return Task.CompletedTask;
+    }
+
+    public Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
+    {
+        sink.AfterCalls.Add($"after-note:{ctx.Snapshot["body"]}:{ctx.Attempt}");
         return Task.CompletedTask;
     }
 }

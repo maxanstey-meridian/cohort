@@ -1,10 +1,10 @@
 using Cohort.Application;
 using Cohort.Domain;
-using Cohort.Hosting;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Cohort.Sample.Tests;
 
@@ -106,24 +106,31 @@ public sealed class CohortTestHost(
     )
     {
         var services = new ServiceCollection();
+        var effectiveConfiguration = new Dictionary<string, string?>
+        {
+            [$"{SampleOptions.SectionName}:{nameof(SampleOptions.ConnectionString)}"] =
+                connectionString,
+        };
+
+        if (configurationOverrides is not null)
+        {
+            foreach (var pair in configurationOverrides)
+            {
+                effectiveConfiguration[pair.Key] = pair.Value;
+            }
+        }
+
         var configuration = new ConfigurationBuilder()
-            .AddInMemoryCollection(configurationOverrides ?? new Dictionary<string, string?>())
+            .AddInMemoryCollection(effectiveConfiguration)
             .Build();
 
         services.AddSingleton<IConfiguration>(configuration);
         services.AddLogging();
-        services.AddDbContext<SampleDbContext>(options => options.UseNpgsql(connectionString));
+        services.AddSampleRetentionServices();
+        services.RemoveAll<IRetentionCategoryRepository>();
         services.AddSingleton<IRetentionCategoryRepository>(
             categoryRepository ?? new SampleCategoryRepository()
         );
-        services.AddSingleton<GuidTombstoneFactory>();
-        services.AddSingleton<OriginalValueTombstoneFactory>();
-        services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<GuidTombstoneFactory>());
-        services.AddSingleton<IAnonymiseValueFactory>(sp =>
-            sp.GetRequiredService<OriginalValueTombstoneFactory>()
-        );
-        services.AddCohort<SampleDbContext>();
-        services.AddScoped<SampleRetentionStartupService>();
         configureServices?.Invoke(services);
 
         return services.BuildServiceProvider(validateScopes: true);

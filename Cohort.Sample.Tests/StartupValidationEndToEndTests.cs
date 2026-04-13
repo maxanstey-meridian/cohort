@@ -138,6 +138,44 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     [Fact]
+    public async Task Sample_Host_Composition_Registers_Tombstone_Factories_For_Startup_Validation()
+    {
+        var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder();
+        builder.Configuration.AddInMemoryCollection(
+            new Dictionary<string, string?>
+            {
+                [$"{SampleOptions.SectionName}:{nameof(SampleOptions.ConnectionString)}"] =
+                    connectionString,
+            }
+        );
+
+        builder.Services.AddSampleRetentionServices();
+
+        using var host = builder.Build();
+        await host.StartAsync();
+
+        try
+        {
+            await using var scope = host.Services.CreateAsyncScope();
+            var startup = scope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
+
+            var entries = await startup.RunAsync();
+            var factoryTypes = entries[typeof(TombstoneRecord)]
+                .AnonymiseFields.OfType<AnonymiseFactoryField>()
+                .Select(field => field.FactoryType)
+                .ToArray();
+
+            entries.Should().ContainKey(typeof(TombstoneRecord));
+            factoryTypes.Should().Contain(typeof(GuidTombstoneFactory));
+            factoryTypes.Should().Contain(typeof(OriginalValueTombstoneFactory));
+        }
+        finally
+        {
+            await host.StopAsync();
+        }
+    }
+
+    [Fact]
     public async Task Startup_Path_Fails_When_AnonymiseWith_Uses_A_Type_That_Does_Not_Implement_The_Factory_Port()
     {
         var act = async () =>

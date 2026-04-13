@@ -659,6 +659,72 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
+    public async Task ValidateAsync_Rejects_FactoryBacked_Anonymise_Fields_For_Known_Anonymise_Strategies()
+    {
+        var options = new DbContextOptionsBuilder<FactoryBackedAnonymiseDbContext>()
+            .UseInMemoryDatabase($"startup-validator-factory-backed-static-anonymise-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new FactoryBackedAnonymiseDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["factory-backed-anonymise"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                ),
+            }
+        );
+
+        var act = async () =>
+            await new RetentionStartupValidator(
+                db,
+                repository,
+                new RetentionEntryBuilder(new CohortConventions())
+            ).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Anonymise convention on {typeof(FactoryBackedAnonymiseRecord).FullName}: [AnonymiseWith] member ExternalId is not supported until factory-backed anonymisation execution is implemented."
+            );
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Rejects_FactoryBacked_Anonymise_Fields_For_Deferred_Strategies()
+    {
+        var options = new DbContextOptionsBuilder<FactoryBackedAnonymiseDbContext>()
+            .UseInMemoryDatabase($"startup-validator-factory-backed-deferred-anonymise-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new FactoryBackedAnonymiseDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["factory-backed-anonymise"] = new OpaqueDeferredRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                ),
+            }
+        );
+
+        var act = async () =>
+            await new RetentionStartupValidator(
+                db,
+                repository,
+                new RetentionEntryBuilder(new CohortConventions())
+            ).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Anonymise convention on {typeof(FactoryBackedAnonymiseRecord).FullName}: [AnonymiseWith] member ExternalId is not supported until factory-backed anonymisation execution is implemented."
+            );
+    }
+
+    [Fact]
     public async Task ValidateAsync_Rejects_Null_Anonymise_On_NonNullable_Reference_Types()
     {
         var options = new DbContextOptionsBuilder<InvalidNullReferenceAnonymiseDbContext>()
@@ -1216,6 +1282,23 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
+    private sealed class FactoryBackedAnonymiseDbContext(
+        DbContextOptions<FactoryBackedAnonymiseDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<FactoryBackedAnonymiseRecord>(entity =>
+            {
+                entity.ToTable("factory_backed_anonymise_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+                entity.Property(record => record.TenantId).HasColumnName("tenant_id");
+                entity.Property(record => record.ExternalId).HasColumnName("external_id");
+            });
+        }
+    }
+
     private sealed class MissingAnonymiseTenantDbContext(
         DbContextOptions<MissingAnonymiseTenantDbContext> options
     ) : DbContext(options)
@@ -1353,6 +1436,17 @@ public sealed class RetentionStartupValidatorTests
         public DateTimeOffset LastSeenAt { get; init; }
     }
 
+    [Retain("factory-backed-anonymise", nameof(FactoryBackedAnonymiseRecord.CreatedAt))]
+    private sealed class FactoryBackedAnonymiseRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+
+        [AnonymiseWith(typeof(TestAnonymiseValueFactory))]
+        public Guid ExternalId { get; init; }
+    }
+
     [Retain("missing-anonymise-tenant", nameof(MissingAnonymiseTenantRecord.CreatedAt))]
     private sealed class MissingAnonymiseTenantRecord
     {
@@ -1372,5 +1466,10 @@ public sealed class RetentionStartupValidatorTests
 
         [Anonymise(AnonymiseMethod.Null)]
         public string DisplayName { get; init; } = "";
+    }
+
+    private sealed class TestAnonymiseValueFactory : IAnonymiseValueFactory
+    {
+        public object? Create(AnonymiseValueContext context) => Guid.Empty;
     }
 }

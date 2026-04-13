@@ -76,6 +76,15 @@ public sealed class RetentionStartupValidator(
             try
             {
                 var startupRule = resolver.TryResolveAtStartup();
+                if (RequiresFactoryBackedAnonymiseSupport(entry, startupRule))
+                {
+                    ValidateFactoryBackedAnonymiseSupport(
+                        entry,
+                        errors,
+                        $"Anonymise convention on {clrType.FullName}:"
+                    );
+                }
+
                 if (startupRule?.Strategy == Strategy.SoftDelete)
                 {
                     ValidateSoftDeleteConvention(entry, errors, $"Soft-delete convention on {clrType.FullName}:");
@@ -97,6 +106,33 @@ public sealed class RetentionStartupValidator(
         if (errors.Count > 0)
         {
             throw new RetentionConfigurationException(errors);
+        }
+    }
+
+    private static bool RequiresFactoryBackedAnonymiseSupport(
+        RetentionEntry entry,
+        RetentionRule? startupRule
+    )
+    {
+        if (!entry.AnonymiseFields.Any(field => field is AnonymiseFactoryField))
+        {
+            return false;
+        }
+
+        return startupRule is null || startupRule.Strategy == Strategy.Anonymise;
+    }
+
+    private static void ValidateFactoryBackedAnonymiseSupport(
+        RetentionEntry entry,
+        List<string> errors,
+        string messagePrefix
+    )
+    {
+        foreach (var field in entry.AnonymiseFields.OfType<AnonymiseFactoryField>())
+        {
+            errors.Add(
+                $"{messagePrefix} [AnonymiseWith] member {field.MemberName} is not supported until factory-backed anonymisation execution is implemented."
+            );
         }
     }
 

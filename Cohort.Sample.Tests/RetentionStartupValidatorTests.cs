@@ -659,10 +659,43 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
-    public async Task ValidateAsync_Rejects_FactoryBacked_Anonymise_Fields_For_Known_Anonymise_Strategies()
+    public async Task ValidateAsync_Rejects_FactoryBacked_Anonymise_Fields_With_Invalid_Factory_Types()
+    {
+        var options = new DbContextOptionsBuilder<InvalidFactoryTypeAnonymiseDbContext>()
+            .UseInMemoryDatabase($"startup-validator-factory-backed-invalid-type-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new InvalidFactoryTypeAnonymiseDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["invalid-factory-type-anonymise"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                ),
+            }
+        );
+
+        var act = async () =>
+            await new RetentionStartupValidator(
+                db,
+                repository,
+                new RetentionEntryBuilder(new CohortConventions())
+            ).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Anonymise convention on {typeof(InvalidFactoryTypeAnonymiseRecord).FullName}: [AnonymiseWith] member ExternalId specifies factory type {typeof(NotAFactory).FullName} which does not implement {nameof(IAnonymiseValueFactory)}."
+            );
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Rejects_FactoryBacked_Anonymise_Fields_That_Are_Not_Registered()
     {
         var options = new DbContextOptionsBuilder<FactoryBackedAnonymiseDbContext>()
-            .UseInMemoryDatabase($"startup-validator-factory-backed-static-anonymise-{Guid.NewGuid()}")
+            .UseInMemoryDatabase($"startup-validator-factory-backed-unregistered-{Guid.NewGuid()}")
             .Options;
         await using var db = new FactoryBackedAnonymiseDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -687,40 +720,7 @@ public sealed class RetentionStartupValidatorTests
             .Which.Errors[0]
             .Should()
             .Be(
-                $"Anonymise convention on {typeof(FactoryBackedAnonymiseRecord).FullName}: [AnonymiseWith] member ExternalId is not supported until factory-backed anonymisation execution is implemented."
-            );
-    }
-
-    [Fact]
-    public async Task ValidateAsync_Rejects_FactoryBacked_Anonymise_Fields_For_Deferred_Strategies()
-    {
-        var options = new DbContextOptionsBuilder<FactoryBackedAnonymiseDbContext>()
-            .UseInMemoryDatabase($"startup-validator-factory-backed-deferred-anonymise-{Guid.NewGuid()}")
-            .Options;
-        await using var db = new FactoryBackedAnonymiseDbContext(options);
-        var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
-            {
-                ["factory-backed-anonymise"] = new OpaqueDeferredRuleResolver(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
-                ),
-            }
-        );
-
-        var act = async () =>
-            await new RetentionStartupValidator(
-                db,
-                repository,
-                new RetentionEntryBuilder(new CohortConventions())
-            ).ValidateAsync();
-
-        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().ContainSingle();
-        exception
-            .Which.Errors[0]
-            .Should()
-            .Be(
-                $"Anonymise convention on {typeof(FactoryBackedAnonymiseRecord).FullName}: [AnonymiseWith] member ExternalId is not supported until factory-backed anonymisation execution is implemented."
+                $"Anonymise convention on {typeof(FactoryBackedAnonymiseRecord).FullName}: [AnonymiseWith] member ExternalId specifies factory type {typeof(TestAnonymiseValueFactory).FullName} but no matching {nameof(IAnonymiseValueFactory)} is registered in DI."
             );
     }
 
@@ -1299,6 +1299,23 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
+    private sealed class InvalidFactoryTypeAnonymiseDbContext(
+        DbContextOptions<InvalidFactoryTypeAnonymiseDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<InvalidFactoryTypeAnonymiseRecord>(entity =>
+            {
+                entity.ToTable("invalid_factory_type_anonymise_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+                entity.Property(record => record.TenantId).HasColumnName("tenant_id");
+                entity.Property(record => record.ExternalId).HasColumnName("external_id");
+            });
+        }
+    }
+
     private sealed class MissingAnonymiseTenantDbContext(
         DbContextOptions<MissingAnonymiseTenantDbContext> options
     ) : DbContext(options)
@@ -1447,6 +1464,17 @@ public sealed class RetentionStartupValidatorTests
         public Guid ExternalId { get; init; }
     }
 
+    [Retain("invalid-factory-type-anonymise", nameof(InvalidFactoryTypeAnonymiseRecord.CreatedAt))]
+    private sealed class InvalidFactoryTypeAnonymiseRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+
+        [AnonymiseWith(typeof(NotAFactory))]
+        public Guid ExternalId { get; init; }
+    }
+
     [Retain("missing-anonymise-tenant", nameof(MissingAnonymiseTenantRecord.CreatedAt))]
     private sealed class MissingAnonymiseTenantRecord
     {
@@ -1472,4 +1500,6 @@ public sealed class RetentionStartupValidatorTests
     {
         public object? Create(AnonymiseValueContext context) => Guid.Empty;
     }
+
+    private sealed class NotAFactory;
 }

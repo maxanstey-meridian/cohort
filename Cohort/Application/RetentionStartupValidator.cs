@@ -9,7 +9,8 @@ namespace Cohort.Application;
 public sealed class RetentionStartupValidator(
     DbContext db,
     IRetentionCategoryRepository categoryRepository,
-    RetentionEntryBuilder entryBuilder
+    RetentionEntryBuilder entryBuilder,
+    IEnumerable<IAnonymiseValueFactory>? anonymiseValueFactories = null
 )
 {
     private static readonly NullabilityInfoContext NullabilityInfoContext = new();
@@ -20,6 +21,11 @@ public sealed class RetentionStartupValidator(
         typeof(DateTimeOffset),
         typeof(DateTimeOffset?),
     ];
+    private readonly HashSet<Type> registeredAnonymiseFactoryTypes = new(
+        (anonymiseValueFactories ?? Array.Empty<IAnonymiseValueFactory>()).Select(factory =>
+            factory.GetType()
+        )
+    );
 
     public async Task ValidateAsync(CancellationToken ct = default)
     {
@@ -76,7 +82,7 @@ public sealed class RetentionStartupValidator(
             try
             {
                 var startupRule = resolver.TryResolveAtStartup();
-                if (RequiresFactoryBackedAnonymiseSupport(entry, startupRule))
+                if (ShouldValidateFactoryBackedAnonymiseFields(entry, startupRule))
                 {
                     ValidateFactoryBackedAnonymiseSupport(
                         entry,
@@ -109,7 +115,7 @@ public sealed class RetentionStartupValidator(
         }
     }
 
-    private static bool RequiresFactoryBackedAnonymiseSupport(
+    private static bool ShouldValidateFactoryBackedAnonymiseFields(
         RetentionEntry entry,
         RetentionRule? startupRule
     )
@@ -122,7 +128,7 @@ public sealed class RetentionStartupValidator(
         return startupRule is null || startupRule.Strategy == Strategy.Anonymise;
     }
 
-    private static void ValidateFactoryBackedAnonymiseSupport(
+    private void ValidateFactoryBackedAnonymiseSupport(
         RetentionEntry entry,
         List<string> errors,
         string messagePrefix
@@ -130,9 +136,20 @@ public sealed class RetentionStartupValidator(
     {
         foreach (var field in entry.AnonymiseFields.OfType<AnonymiseFactoryField>())
         {
-            errors.Add(
-                $"{messagePrefix} [AnonymiseWith] member {field.MemberName} is not supported until factory-backed anonymisation execution is implemented."
-            );
+            if (!typeof(IAnonymiseValueFactory).IsAssignableFrom(field.FactoryType))
+            {
+                errors.Add(
+                    $"{messagePrefix} [AnonymiseWith] member {field.MemberName} specifies factory type {field.FactoryType.FullName} which does not implement {nameof(IAnonymiseValueFactory)}."
+                );
+                continue;
+            }
+
+            if (!registeredAnonymiseFactoryTypes.Contains(field.FactoryType))
+            {
+                errors.Add(
+                    $"{messagePrefix} [AnonymiseWith] member {field.MemberName} specifies factory type {field.FactoryType.FullName} but no matching {nameof(IAnonymiseValueFactory)} is registered in DI."
+                );
+            }
         }
     }
 

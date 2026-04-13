@@ -13,8 +13,8 @@ using Microsoft.EntityFrameworkCore.Metadata;
 namespace Cohort.Infrastructure.Sweep;
 
 public sealed class AnonymiseSweepStrategy(
+    DbContext db,
     IEnumerable<IAnonymiseValueFactory>? anonymiseValueFactories = null,
-    DbContext? db = null,
     IServiceProvider? services = null
 ) : IRetentionSweepStrategy
 {
@@ -27,7 +27,7 @@ public sealed class AnonymiseSweepStrategy(
         (anonymiseValueFactories ?? Array.Empty<IAnonymiseValueFactory>())
         .GroupBy(factory => factory.GetType())
         .ToDictionary(group => group.Key, group => group.Last());
-    private readonly DbContext? modelDb = db;
+    private readonly DbContext modelDb = db ?? throw new ArgumentNullException(nameof(db));
 
     public Strategy HandlesStrategy => Strategy.Anonymise;
 
@@ -64,26 +64,18 @@ public sealed class AnonymiseSweepStrategy(
         }
 
         var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);
-        var tenantClause = entry.Tenant is not null
-            ? $"AND target.{QuoteIdentifier(entry.Tenant.TenantColumn)} = @tenantId"
-            : "";
+        var targetFilter = CreateCutoffFilter(entry.AnchorColumn, cutoff);
 
         await using var command = conn.CreateCommand();
-        command.CommandText =
-            $"""
-            SELECT COUNT(*)
-            FROM {QuoteIdentifier(entry.TableName)} AS target
-            WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
-              {tenantClause}
-              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn, entry.Tenant?.TenantColumn)}
-            """;
-        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
-        if (entry.Tenant is not null)
-        {
-            command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
-        }
-        command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
-        command.Parameters.Add(CreateParameter(command, "holdAsOf", ctx.Now));
+        command.CommandText = BuildPreviewCountCommandText(
+            entry,
+            entry.Tenant?.TenantColumn,
+            targetFilter,
+            entry.RecordId.RecordIdColumn
+        );
+        AddFilterParameters(command, targetFilter);
+        AddTenantParameter(command, entry.Tenant?.TenantColumn, ctx.Tenant.Id);
+        AddHoldParameters(command, entry.TableName, ctx.Now);
 
         return Convert.ToInt32(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
@@ -127,10 +119,10 @@ public sealed class AnonymiseSweepStrategy(
         var candidateRecordIds = await SelectCandidateRecordIdsAsync(
             entry,
             entry.Tenant?.TenantColumn,
-            ctx,
+            ctx.Tenant.Id,
             conn,
             transaction,
-            cutoff,
+            CreateCutoffFilter(entry.AnchorColumn, cutoff),
             ct
         );
 
@@ -212,42 +204,18 @@ public sealed class AnonymiseSweepStrategy(
             await conn.OpenAsync(ct);
         }
 
-        var candidateRecordIds = await SelectPreviewErasureCandidateRecordIdsAsync(
-            entry,
-            entry.Tenant?.TenantColumn,
-            match,
-            tenant,
-            conn,
-            ct
-        );
-
-        if (candidateRecordIds.Count == 0)
-        {
-            return 0;
-        }
-
-        var tenantClause = entry.Tenant is not null
-            ? $"AND target.{QuoteIdentifier(entry.Tenant.TenantColumn)} = @tenantId"
-            : "";
+        var targetFilter = CreateSubjectFilter(match.SubjectColumn, match.SubjectValue);
 
         await using var command = conn.CreateCommand();
-        command.CommandText =
-            $"""
-            SELECT COUNT(*)
-            FROM {QuoteIdentifier(entry.TableName)} AS target
-            WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
-              {tenantClause}
-              AND CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) = ANY(@candidateIds)
-              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn, entry.Tenant?.TenantColumn)}
-            """;
-        if (entry.Tenant is not null)
-        {
-            command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
-        }
-        command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
-        command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
-        command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
-        command.Parameters.Add(CreateParameter(command, "holdAsOf", now));
+        command.CommandText = BuildPreviewCountCommandText(
+            entry,
+            entry.Tenant?.TenantColumn,
+            targetFilter,
+            entry.RecordId.RecordIdColumn
+        );
+        AddFilterParameters(command, targetFilter);
+        AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
+        AddHoldParameters(command, entry.TableName, now);
 
         return Convert.ToInt32(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
@@ -290,13 +258,13 @@ public sealed class AnonymiseSweepStrategy(
             await conn.OpenAsync(ct);
         }
 
-        var candidateRecordIds = await SelectErasureCandidateRecordIdsAsync(
+        var candidateRecordIds = await SelectCandidateRecordIdsAsync(
             entry,
             entry.Tenant?.TenantColumn,
-            match,
-            tenant,
+            tenant.Id,
             conn,
             transaction,
+            CreateSubjectFilter(match.SubjectColumn, match.SubjectValue),
             ct
         );
 
@@ -360,12 +328,8 @@ public sealed class AnonymiseSweepStrategy(
     )
         where TEntity : class
     {
-        var runtimeDb = modelDb
-            ?? throw new InvalidOperationException(
-                $"Handler-aware anonymise for {entry.EntityType.FullName} requires a DbContext-backed strategy instance."
-            );
         var rows = await LoadHandlerRowsAsync<TEntity>(
-            runtimeDb,
+            modelDb,
             entry,
             ctx.Tenant,
             ctx.Now,
@@ -460,29 +424,15 @@ public sealed class AnonymiseSweepStrategy(
         CancellationToken ct
     )
     {
-        await using var command = conn.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = BuildCommandText(
+        return await ExecuteSetBasedMutationAsync(
             entry,
-            entry.Tenant?.TenantColumn,
-            tenant.Id,
+            tenant,
             now,
-            command,
-            entry.RecordId.RecordIdColumn
-        );
-        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
-        if (entry.Tenant is not null)
-        {
-            command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
-        }
-        command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
-        command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
-        command.Parameters.Add(CreateParameter(command, "holdAsOf", now));
-
-        var affectedRecordIds = await ReadAffectedRecordIdsAsync(command, ct);
-        return new SweepExecutionResult(
-            affectedRecordIds,
-            candidateRecordIds.Count - affectedRecordIds.Count
+            conn,
+            transaction,
+            candidateRecordIds,
+            CreateCutoffFilter(entry.AnchorColumn, cutoff),
+            ct
         );
     }
 
@@ -497,30 +447,15 @@ public sealed class AnonymiseSweepStrategy(
         CancellationToken ct
     )
     {
-        await using var command = conn.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = BuildErasureCommandText(
+        return await ExecuteSetBasedMutationAsync(
             entry,
-            entry.Tenant?.TenantColumn,
-            tenant.Id,
+            tenant,
             now,
-            match,
-            command,
-            entry.RecordId.RecordIdColumn
-        );
-        if (entry.Tenant is not null)
-        {
-            command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
-        }
-        command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
-        command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
-        command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
-        command.Parameters.Add(CreateParameter(command, "holdAsOf", now));
-
-        var affectedRecordIds = await ReadAffectedRecordIdsAsync(command, ct);
-        return new SweepExecutionResult(
-            affectedRecordIds,
-            candidateRecordIds.Count - affectedRecordIds.Count
+            conn,
+            transaction,
+            candidateRecordIds,
+            CreateSubjectFilter(match.SubjectColumn, match.SubjectValue),
+            ct
         );
     }
 
@@ -624,48 +559,10 @@ public sealed class AnonymiseSweepStrategy(
                 entry.Tenant?.TenantColumn,
                 entry.RecordId.RecordIdColumn
             );
-
-            for (var index = 0; index < entry.AnonymiseFields.Count; index++)
-            {
-                var field = entry.AnonymiseFields[index];
-                var parameterName = $"value{index}";
-                var value = field switch
-                {
-                    AnonymiseLiteralField literalField => CreateLiteralAssignmentValue(literalField),
-                    AnonymiseFactoryField factoryField when ResolveFactory(factoryField).RequiresPerRowExecution
-                        => ResolveFactory(factoryField)
-                            .Create(
-                                new AnonymiseValueContext(
-                                    entry.EntityType,
-                                    factoryField.MemberName,
-                                    row.OriginalValues.TryGetValue(factoryField.MemberName, out var originalValue)
-                                        ? originalValue
-                                        : null,
-                                    now,
-                                    tenant.Id
-                                )
-                            ),
-                    AnonymiseFactoryField factoryField => staticAssignments[factoryField.MemberName],
-                    _ => throw new InvalidOperationException(
-                        $"Anonymise field '{field.MemberName}' is not supported."
-                    ),
-                };
-                command.Parameters.Add(
-                    CreateParameter(
-                        command,
-                        parameterName,
-                        ConvertAssignmentValueToProvider(entry, field, value)
-                    )
-                );
-            }
-
+            AddPerRowAssignmentParameters(command, entry, tenant, now, row.OriginalValues, staticAssignments);
             command.Parameters.Add(CreateParameter(command, "recordId", row.RecordId));
-            if (entry.Tenant is not null)
-            {
-                command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
-            }
-            command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
-            command.Parameters.Add(CreateParameter(command, "holdAsOf", now));
+            AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
+            AddHoldParameters(command, entry.TableName, now);
 
             await using var reader = await command.ExecuteReaderAsync(ct);
             if (await reader.ReadAsync(ct))
@@ -696,48 +593,10 @@ public sealed class AnonymiseSweepStrategy(
             entry.Tenant?.TenantColumn,
             entry.RecordId.RecordIdColumn
         );
-
-        for (var index = 0; index < entry.AnonymiseFields.Count; index++)
-        {
-            var field = entry.AnonymiseFields[index];
-            var parameterName = $"value{index}";
-            var value = field switch
-            {
-                AnonymiseLiteralField literalField => CreateLiteralAssignmentValue(literalField),
-                AnonymiseFactoryField factoryField when ResolveFactory(factoryField).RequiresPerRowExecution
-                    => ResolveFactory(factoryField)
-                        .Create(
-                            new AnonymiseValueContext(
-                                entry.EntityType,
-                                factoryField.MemberName,
-                                originalValues.TryGetValue(factoryField.MemberName, out var originalValue)
-                                    ? originalValue
-                                    : null,
-                                now,
-                                tenant.Id
-                            )
-                        ),
-                AnonymiseFactoryField factoryField => staticAssignments[factoryField.MemberName],
-                _ => throw new InvalidOperationException(
-                    $"Anonymise field '{field.MemberName}' is not supported."
-                ),
-            };
-            command.Parameters.Add(
-                CreateParameter(
-                    command,
-                    parameterName,
-                    ConvertAssignmentValueToProvider(entry, field, value)
-                )
-            );
-        }
-
+        AddPerRowAssignmentParameters(command, entry, tenant, now, originalValues, staticAssignments);
         command.Parameters.Add(CreateParameter(command, "recordId", recordId));
-        if (entry.Tenant is not null)
-        {
-            command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
-        }
-        command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
-        command.Parameters.Add(CreateParameter(command, "holdAsOf", now));
+        AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
+        AddHoldParameters(command, entry.TableName, now);
 
         await using var reader = await command.ExecuteReaderAsync(ct);
         return await reader.ReadAsync(ct);
@@ -926,7 +785,7 @@ public sealed class AnonymiseSweepStrategy(
         object? providerValue
     )
     {
-        if (providerValue is null || modelDb is null)
+        if (providerValue is null)
         {
             return providerValue;
         }
@@ -942,7 +801,7 @@ public sealed class AnonymiseSweepStrategy(
         object? value
     )
     {
-        if (value is null or DBNull || modelDb is null)
+        if (value is null or DBNull)
         {
             return value is DBNull ? null : value;
         }
@@ -955,7 +814,7 @@ public sealed class AnonymiseSweepStrategy(
     private IProperty ResolveEfProperty(RetentionEntry entry, string memberName)
     {
         var entityType =
-            modelDb?.Model.FindEntityType(entry.EntityType)
+            modelDb.Model.FindEntityType(entry.EntityType)
             ?? throw new InvalidOperationException(
                 $"Entity {entry.EntityType.FullName} is not mapped by the current EF model."
             );
@@ -980,26 +839,52 @@ public sealed class AnonymiseSweepStrategy(
         return affectedRecordIds;
     }
 
-    private string BuildCommandText(
+    private async Task<SweepExecutionResult> ExecuteSetBasedMutationAsync(
         RetentionEntry entry,
-        string? tenantColumn,
-        Guid tenantId,
+        TenantContext tenant,
         DateTimeOffset now,
-        DbCommand command,
-        string recordIdColumn
+        DbConnection conn,
+        DbTransaction transaction,
+        IReadOnlyList<string> candidateRecordIds,
+        SqlFilter filter,
+        CancellationToken ct
     )
     {
-        var assignments = new List<string>(entry.AnonymiseFields.Count);
+        await using var command = conn.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = BuildSetBasedCommandText(
+            entry,
+            entry.Tenant?.TenantColumn,
+            filter,
+            entry.RecordId.RecordIdColumn
+        );
+        AddSetBasedAssignmentParameters(command, entry, tenant.Id, now);
+        AddFilterParameters(command, filter);
+        AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
+        command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
+        AddHoldParameters(command, entry.TableName, now);
 
+        var affectedRecordIds = await ReadAffectedRecordIdsAsync(command, ct);
+        return new SweepExecutionResult(
+            affectedRecordIds,
+            candidateRecordIds.Count - affectedRecordIds.Count
+        );
+    }
+
+    private void AddSetBasedAssignmentParameters(
+        DbCommand command,
+        RetentionEntry entry,
+        Guid tenantId,
+        DateTimeOffset now
+    )
+    {
         for (var index = 0; index < entry.AnonymiseFields.Count; index++)
         {
             var field = entry.AnonymiseFields[index];
-            var parameterName = $"value{index}";
-            assignments.Add($"{QuoteIdentifier(field.ColumnName)} = @{parameterName}");
             command.Parameters.Add(
                 CreateParameter(
                     command,
-                    parameterName,
+                    $"value{index}",
                     ConvertAssignmentValueToProvider(
                         entry,
                         field,
@@ -1008,52 +893,103 @@ public sealed class AnonymiseSweepStrategy(
                 )
             );
         }
+    }
 
+    private void AddPerRowAssignmentParameters(
+        DbCommand command,
+        RetentionEntry entry,
+        TenantContext tenant,
+        DateTimeOffset now,
+        IReadOnlyDictionary<string, object?> originalValues,
+        IReadOnlyDictionary<string, object?> staticAssignments
+    )
+    {
+        for (var index = 0; index < entry.AnonymiseFields.Count; index++)
+        {
+            var field = entry.AnonymiseFields[index];
+            command.Parameters.Add(
+                CreateParameter(
+                    command,
+                    $"value{index}",
+                    ConvertAssignmentValueToProvider(
+                        entry,
+                        field,
+                        ResolvePerRowAssignmentValue(
+                            entry,
+                            field,
+                            tenant,
+                            now,
+                            originalValues,
+                            staticAssignments
+                        )
+                    )
+                )
+            );
+        }
+    }
+
+    private object? ResolvePerRowAssignmentValue(
+        RetentionEntry entry,
+        AnonymiseField field,
+        TenantContext tenant,
+        DateTimeOffset now,
+        IReadOnlyDictionary<string, object?> originalValues,
+        IReadOnlyDictionary<string, object?> staticAssignments
+    )
+    {
+        return field switch
+        {
+            AnonymiseLiteralField literalField => CreateLiteralAssignmentValue(literalField),
+            AnonymiseFactoryField factoryField when ResolveFactory(factoryField).RequiresPerRowExecution
+                => ResolveFactory(factoryField)
+                    .Create(
+                        new AnonymiseValueContext(
+                            entry.EntityType,
+                            factoryField.MemberName,
+                            originalValues.TryGetValue(factoryField.MemberName, out var originalValue)
+                                ? originalValue
+                                : null,
+                            now,
+                            tenant.Id
+                        )
+                    ),
+            AnonymiseFactoryField factoryField => staticAssignments[factoryField.MemberName],
+            _ => throw new InvalidOperationException(
+                $"Anonymise field '{field.MemberName}' is not supported."
+            ),
+        };
+    }
+
+    private static string BuildPreviewCountCommandText(
+        RetentionEntry entry,
+        string? tenantColumn,
+        SqlFilter filter,
+        string recordIdColumn
+    )
+    {
         var tenantClause = tenantColumn is not null
             ? $"AND target.{QuoteIdentifier(tenantColumn)} = @tenantId"
             : "";
 
         return
             $"""
-            UPDATE {QuoteIdentifier(entry.TableName)} AS target
-            SET {string.Join(", ", assignments)}
-            WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
+            SELECT COUNT(*)
+            FROM {QuoteIdentifier(entry.TableName)} AS target
+            WHERE {filter.PredicateSql}
               {tenantClause}
-              AND CAST(target.{QuoteIdentifier(recordIdColumn)} AS text) = ANY(@candidateIds)
               AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn, tenantColumn)}
-            RETURNING target.{QuoteIdentifier(recordIdColumn)}
             """;
     }
 
-    private string BuildErasureCommandText(
+    private static string BuildSetBasedCommandText(
         RetentionEntry entry,
         string? tenantColumn,
-        Guid tenantId,
-        DateTimeOffset now,
-        ErasureSubjectMatch match,
-        DbCommand command,
+        SqlFilter filter,
         string recordIdColumn
     )
     {
-        var assignments = new List<string>(entry.AnonymiseFields.Count);
-
-        for (var index = 0; index < entry.AnonymiseFields.Count; index++)
-        {
-            var field = entry.AnonymiseFields[index];
-            var parameterName = $"value{index}";
-            assignments.Add($"{QuoteIdentifier(field.ColumnName)} = @{parameterName}");
-            command.Parameters.Add(
-                CreateParameter(
-                    command,
-                    parameterName,
-                    ConvertAssignmentValueToProvider(
-                        entry,
-                        field,
-                        CreateSetBasedAssignmentValue(entry, field, tenantId, now)
-                    )
-                )
-            );
-        }
+        var assignments = entry.AnonymiseFields
+            .Select((field, index) => $"{QuoteIdentifier(field.ColumnName)} = @value{index}");
 
         var tenantClause = tenantColumn is not null
             ? $"AND target.{QuoteIdentifier(tenantColumn)} = @tenantId"
@@ -1063,7 +999,7 @@ public sealed class AnonymiseSweepStrategy(
             $"""
             UPDATE {QuoteIdentifier(entry.TableName)} AS target
             SET {string.Join(", ", assignments)}
-            WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+            WHERE {filter.PredicateSql}
               {tenantClause}
               AND CAST(target.{QuoteIdentifier(recordIdColumn)} AS text) = ANY(@candidateIds)
               AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn, tenantColumn)}
@@ -1103,10 +1039,10 @@ public sealed class AnonymiseSweepStrategy(
     private static async Task<IReadOnlyList<string>> SelectCandidateRecordIdsAsync(
         RetentionEntry entry,
         string? tenantColumn,
-        RetentionResolutionContext ctx,
+        Guid tenantId,
         DbConnection conn,
         DbTransaction transaction,
-        DateTimeOffset cutoff,
+        SqlFilter filter,
         CancellationToken ct
     )
     {
@@ -1120,15 +1056,12 @@ public sealed class AnonymiseSweepStrategy(
             $"""
             SELECT target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
             FROM {QuoteIdentifier(entry.TableName)} AS target
-            WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
+            WHERE {filter.PredicateSql}
               {tenantClause}
             FOR UPDATE
             """;
-        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
-        if (tenantColumn is not null)
-        {
-            command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
-        }
+        AddFilterParameters(command, filter);
+        AddTenantParameter(command, tenantColumn, tenantId);
 
         var candidateRecordIds = new List<string>();
         await using var reader = await command.ExecuteReaderAsync(ct);
@@ -1140,81 +1073,46 @@ public sealed class AnonymiseSweepStrategy(
         return candidateRecordIds;
     }
 
-    private static async Task<IReadOnlyList<string>> SelectErasureCandidateRecordIdsAsync(
-        RetentionEntry entry,
-        string? tenantColumn,
-        ErasureSubjectMatch match,
-        TenantContext erasureTenant,
-        DbConnection conn,
-        DbTransaction transaction,
-        CancellationToken ct
-    )
+    private static SqlFilter CreateCutoffFilter(string anchorColumn, DateTimeOffset cutoff)
     {
-        var tenantClause = tenantColumn is not null
-            ? $"AND target.{QuoteIdentifier(tenantColumn)} = @tenantId"
-            : "";
-
-        await using var command = conn.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText =
-            $"""
-            SELECT target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
-            FROM {QuoteIdentifier(entry.TableName)} AS target
-            WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
-              {tenantClause}
-            FOR UPDATE
-            """;
-        if (tenantColumn is not null)
-        {
-            command.Parameters.Add(CreateParameter(command, "tenantId", erasureTenant.Id));
-        }
-        command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
-
-        var candidateRecordIds = new List<string>();
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
-        {
-            candidateRecordIds.Add(reader.GetValue(0).ToString()!);
-        }
-
-        return candidateRecordIds;
+        return new SqlFilter(
+            $"target.{QuoteIdentifier(anchorColumn)} < @cutoff",
+            [new SqlFilterParameter("cutoff", cutoff)]
+        );
     }
 
-    private static async Task<IReadOnlyList<string>> SelectPreviewErasureCandidateRecordIdsAsync(
-        RetentionEntry entry,
-        string? tenantColumn,
-        ErasureSubjectMatch match,
-        TenantContext erasureTenant,
-        DbConnection conn,
-        CancellationToken ct
-    )
+    private static SqlFilter CreateSubjectFilter(string subjectColumn, object subjectValue)
     {
-        var tenantClause = tenantColumn is not null
-            ? $"AND target.{QuoteIdentifier(tenantColumn)} = @tenantId"
-            : "";
+        return new SqlFilter(
+            $"target.{QuoteIdentifier(subjectColumn)} = @subjectValue",
+            [new SqlFilterParameter("subjectValue", subjectValue)]
+        );
+    }
 
-        await using var command = conn.CreateCommand();
-        command.CommandText =
-            $"""
-            SELECT target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
-            FROM {QuoteIdentifier(entry.TableName)} AS target
-            WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
-              {tenantClause}
-            """;
+    private static void AddFilterParameters(DbCommand command, SqlFilter filter)
+    {
+        foreach (var parameter in filter.Parameters)
+        {
+            command.Parameters.Add(CreateParameter(command, parameter.Name, parameter.Value));
+        }
+    }
+
+    private static void AddTenantParameter(DbCommand command, string? tenantColumn, Guid tenantId)
+    {
         if (tenantColumn is not null)
         {
-            command.Parameters.Add(CreateParameter(command, "tenantId", erasureTenant.Id));
+            command.Parameters.Add(CreateParameter(command, "tenantId", tenantId));
         }
-        command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
+    }
 
-        var candidateRecordIds = new List<string>();
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
-        {
-            candidateRecordIds.Add(reader.GetValue(0).ToString()!);
-        }
-
-        return candidateRecordIds;
+    private static void AddHoldParameters(
+        DbCommand command,
+        string tableName,
+        DateTimeOffset now
+    )
+    {
+        command.Parameters.Add(CreateParameter(command, "holdTableName", tableName));
+        command.Parameters.Add(CreateParameter(command, "holdAsOf", now));
     }
 
     private object? CreateSetBasedAssignmentValue(
@@ -1290,4 +1188,8 @@ public sealed class AnonymiseSweepStrategy(
         string RecordId,
         IReadOnlyDictionary<string, object?> OriginalValues
     );
+
+    private sealed record SqlFilter(string PredicateSql, IReadOnlyList<SqlFilterParameter> Parameters);
+
+    private sealed record SqlFilterParameter(string Name, object? Value);
 }

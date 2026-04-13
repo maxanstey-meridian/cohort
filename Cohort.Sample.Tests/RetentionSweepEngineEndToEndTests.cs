@@ -235,7 +235,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             [
                 new PurgeSweepStrategy(),
                 new SoftDeleteSweepStrategy(),
-                new AnonymiseSweepStrategy(CreateSampleFactories())
+                new AnonymiseSweepStrategy(db, CreateSampleFactories())
             ]
         );
 
@@ -300,7 +300,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             [
                 strategy,
                 new SoftDeleteSweepStrategy(),
-                new AnonymiseSweepStrategy(CreateSampleFactories())
+                new AnonymiseSweepStrategy(db, CreateSampleFactories())
             ]
         );
 

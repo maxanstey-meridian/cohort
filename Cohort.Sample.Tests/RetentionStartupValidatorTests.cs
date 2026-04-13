@@ -818,14 +818,14 @@ public sealed class RetentionStartupValidatorTests
                 repository,
                 validator,
                 new NoOpRetentionAuditWriter(),
-                CreateSweepStrategies()
+                CreateSweepStrategies(db)
             ),
             new RetentionPreviewService(
                 db,
                 registry,
                 repository,
                 validator,
-                CreateSweepStrategies()
+                CreateSweepStrategies(db)
             ),
             new RetentionErasureService(
                 db,
@@ -833,7 +833,7 @@ public sealed class RetentionStartupValidatorTests
                 repository,
                 validator,
                 new NoOpRetentionAuditWriter(),
-                CreateSweepStrategies(),
+                CreateSweepStrategies(db),
                 new StaticOptionsMonitor<CohortOptions>(new CohortOptions())
             )
         );
@@ -853,7 +853,7 @@ public sealed class RetentionStartupValidatorTests
             repository,
             validator,
             new NoOpRetentionAuditWriter(),
-            CreateSweepStrategies()
+            CreateSweepStrategies(db)
         );
     }
 
@@ -870,7 +870,7 @@ public sealed class RetentionStartupValidatorTests
             registry,
             repository,
             validator,
-            CreateSweepStrategies()
+            CreateSweepStrategies(db)
         );
     }
 
@@ -888,14 +888,14 @@ public sealed class RetentionStartupValidatorTests
             repository,
             validator,
             new NoOpRetentionAuditWriter(),
-            CreateSweepStrategies(),
+            CreateSweepStrategies(db),
             new StaticOptionsMonitor<CohortOptions>(new CohortOptions())
         );
     }
 
-    private static IRetentionSweepStrategy[] CreateSweepStrategies()
+    private static IRetentionSweepStrategy[] CreateSweepStrategies(DbContext db)
     {
-        return [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()];
+        return [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy(db)];
     }
 
     private sealed class StaticOptionsMonitor<T>(T currentValue) : IOptionsMonitor<T>

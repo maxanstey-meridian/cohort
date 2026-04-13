@@ -893,9 +893,18 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
 public sealed class AnonymiseSweepStrategyCommandTests
 {
     [Fact]
+    public void Constructor_Requires_A_DbContext()
+    {
+        var act = () => new AnonymiseSweepStrategy(null!);
+
+        act.Should().Throw<ArgumentNullException>().Which.ParamName.Should().Be("db");
+    }
+
+    [Fact]
     public async Task PreviewAsync_Uses_A_Hold_Aware_Count_Query()
     {
-        var strategy = new AnonymiseSweepStrategy();
+        using var db = CreateCommandStrategyDbContext();
+        var strategy = new AnonymiseSweepStrategy(db);
         var connection = new RecordingDbConnection();
         var tenantId = Guid.NewGuid();
         var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
@@ -955,7 +964,8 @@ public sealed class AnonymiseSweepStrategyCommandTests
     [Fact]
     public async Task SweepAsync_Uses_Parameterized_Assignments_For_All_Anonymise_Methods()
     {
-        var strategy = new AnonymiseSweepStrategy();
+        using var db = CreateCommandStrategyDbContext();
+        var strategy = new AnonymiseSweepStrategy(db);
         var connection = new RecordingDbConnection();
         connection.EnqueueResultSet(Guid.NewGuid());
         connection.EnqueueResultSet(Guid.NewGuid());
@@ -1036,7 +1046,8 @@ public sealed class AnonymiseSweepStrategyCommandTests
     {
         var selectedId = Guid.NewGuid();
         var heldId = Guid.NewGuid();
-        var strategy = new AnonymiseSweepStrategy();
+        using var db = CreateCommandStrategyDbContext();
+        var strategy = new AnonymiseSweepStrategy(db);
         var connection = new RecordingDbConnection();
         connection.EnqueueResultSet(selectedId, heldId);
         connection.EnqueueResultSet(selectedId);
@@ -1093,7 +1104,8 @@ public sealed class AnonymiseSweepStrategyCommandTests
     [Fact]
     public async Task SweepAsync_Uses_The_Mapped_Record_Id_Column_In_Hold_Filtering()
     {
-        var strategy = new AnonymiseSweepStrategy();
+        using var db = CreateCommandStrategyDbContext();
+        var strategy = new AnonymiseSweepStrategy(db);
         var connection = new RecordingDbConnection();
         connection.EnqueueResultSet(Guid.NewGuid());
         connection.EnqueueResultSet(Guid.NewGuid());
@@ -1146,14 +1158,12 @@ public sealed class AnonymiseSweepStrategyCommandTests
     [Fact]
     public async Task PreviewEraseAsync_Uses_A_NonMutating_HoldAware_Count_Query_For_The_Selected_Subject()
     {
-        var selectedId = Guid.NewGuid();
-        var heldId = Guid.NewGuid();
         var tenantId = Guid.NewGuid();
         var subjectId = Guid.NewGuid();
         var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
-        var strategy = new AnonymiseSweepStrategy();
+        using var db = CreateCommandStrategyDbContext();
+        var strategy = new AnonymiseSweepStrategy(db);
         var connection = new RecordingDbConnection();
-        connection.EnqueueResultSet(selectedId, heldId);
         var entry = new RetentionEntry(
             typeof(AnonymisedContact),
             "anonymised_contacts",
@@ -1187,25 +1197,20 @@ public sealed class AnonymiseSweepStrategyCommandTests
         );
 
         affected.Should().Be(1);
-        connection.Commands.Should().HaveCount(2);
+        connection.Commands.Should().ContainSingle();
         connection.Commands[0].AssignedTransaction.Should().BeNull();
-        connection.Commands[0].CommandText.Should().NotContain("FOR UPDATE");
+        connection.Commands[0].CommandText.Should().Contain("SELECT COUNT(*)");
         connection.Commands[0].CommandText.Should().Contain("\"SubjectId\" = @subjectValue");
-        connection.Commands[1].AssignedTransaction.Should().BeNull();
-        connection.Commands[1].CommandText.Should().Contain("SELECT COUNT(*)");
-        connection.Commands[1].CommandText.Should().Contain("\"SubjectId\" = @subjectValue");
-        connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
-        connection.Commands[1].CommandText.Should().Contain("NOT EXISTS");
-        connection.Commands[1].CommandText.Should().NotContain("DELETE FROM");
-        connection.Commands[1].CommandText.Should().NotContain("UPDATE ");
-        connection.Commands[1].CommandText.Should().NotContain("FOR UPDATE");
-        connection.Commands[1].Parameters["tenantId"].Value.Should().Be(tenantId);
-        connection.Commands[1].Parameters["subjectValue"].Value.Should().Be(subjectId);
-        connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
-            new[] { selectedId.ToString(), heldId.ToString() }
-        );
-        connection.Commands[1].Parameters["holdTableName"].Value.Should().Be("anonymised_contacts");
-        connection.Commands[1].Parameters["holdAsOf"].Value.Should().Be(now);
+        connection.Commands[0].CommandText.Should().Contain("NOT EXISTS");
+        connection.Commands[0].CommandText.Should().NotContain("ANY(@candidateIds)");
+        connection.Commands[0].CommandText.Should().NotContain("DELETE FROM");
+        connection.Commands[0].CommandText.Should().NotContain("UPDATE ");
+        connection.Commands[0].CommandText.Should().NotContain("FOR UPDATE");
+        connection.Commands[0].Parameters.Count.Should().Be(4);
+        connection.Commands[0].Parameters["tenantId"].Value.Should().Be(tenantId);
+        connection.Commands[0].Parameters["subjectValue"].Value.Should().Be(subjectId);
+        connection.Commands[0].Parameters["holdTableName"].Value.Should().Be("anonymised_contacts");
+        connection.Commands[0].Parameters["holdAsOf"].Value.Should().Be(now);
     }
 
     [Fact]
@@ -1213,7 +1218,8 @@ public sealed class AnonymiseSweepStrategyCommandTests
     {
         var selectedId = Guid.NewGuid();
         var otherSelectedId = Guid.NewGuid();
-        var strategy = new AnonymiseSweepStrategy([new RecordingSetBasedFactory()]);
+        using var db = CreateCommandStrategyDbContext();
+        var strategy = new AnonymiseSweepStrategy(db, [new RecordingSetBasedFactory()]);
         var connection = new RecordingDbConnection();
         connection.EnqueueResultSet(selectedId, otherSelectedId);
         connection.EnqueueResultSet(selectedId, otherSelectedId);
@@ -1261,7 +1267,9 @@ public sealed class AnonymiseSweepStrategyCommandTests
     {
         var firstSelectedId = Guid.NewGuid();
         var secondSelectedId = Guid.NewGuid();
+        using var db = CreateCommandStrategyDbContext();
         var strategy = new AnonymiseSweepStrategy(
+            db,
             [new RecordingOriginalValueFactory(), new RecordingPerRowStringFactory()]
         );
         var connection = new RecordingDbConnection();
@@ -1314,6 +1322,53 @@ public sealed class AnonymiseSweepStrategyCommandTests
         connection.Commands[2].Parameters["value1"].Value.Should().Be("command-per-row-1");
         connection.Commands[3].Parameters["value0"].Value.Should().Be("beta-scrubbed");
         connection.Commands[3].Parameters["value1"].Value.Should().Be("command-per-row-2");
+    }
+
+    private static CommandStrategyDbContext CreateCommandStrategyDbContext()
+    {
+        var options = new DbContextOptionsBuilder<CommandStrategyDbContext>()
+            .UseInMemoryDatabase(Guid.NewGuid().ToString("N"))
+            .Options;
+
+        return new CommandStrategyDbContext(options);
+    }
+
+    private sealed class CommandStrategyDbContext(DbContextOptions<CommandStrategyDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<AnonymisedContact>(entity =>
+            {
+                entity.ToTable("anonymised_contacts");
+                entity.HasKey(contact => contact.Id);
+                entity.Property(contact => contact.TenantId);
+                entity.Property(contact => contact.CreatedAt);
+                entity.Property(contact => contact.EmailAddress);
+                entity.Property(contact => contact.GivenName);
+                entity.Property(contact => contact.Surname);
+                entity.Property(contact => contact.Notes);
+            });
+
+            modelBuilder.Entity<CommandSetBasedFactoryRecord>(entity =>
+            {
+                entity.ToTable("set_based_factory_sweep_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.TenantId);
+                entity.Property(record => record.CreatedAt);
+                entity.Property(record => record.ExternalId);
+            });
+
+            modelBuilder.Entity<CommandPerRowFactoryRecord>(entity =>
+            {
+                entity.ToTable("per_row_factory_sweep_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.TenantId);
+                entity.Property(record => record.CreatedAt);
+                entity.Property(record => record.ExternalId);
+                entity.Property(record => record.DisplayName);
+            });
+        }
     }
 
     private sealed class CommandSetBasedFactoryRecord

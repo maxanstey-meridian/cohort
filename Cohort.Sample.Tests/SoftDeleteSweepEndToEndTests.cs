@@ -268,6 +268,7 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
                 new PurgeSweepStrategy(),
                 new SoftDeleteSweepStrategy(),
                 new AnonymiseSweepStrategy(
+                    db,
                     [new GuidTombstoneFactory(), new OriginalValueTombstoneFactory()]
                 )
             ]

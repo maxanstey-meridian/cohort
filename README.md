@@ -84,12 +84,6 @@ public sealed class GlobalAuditLog
 
 Without `[RetentionTenantless]`, Cohort treats a missing tenant property on a retained entity as a startup configuration error. Tenant-scoped entities get `AND "TenantId" = @tenantId` in sweep and erasure SQL automatically.
 
-## Upgrade from `0.1.1`
-
-`0.2.0` is the first truthful post-`0.1.1` package release. If you are upgrading an existing host, regenerate and apply your Cohort table migration before booting the new package version, then review retained entities for explicit tenant metadata or `[RetentionTenantless]` where the entity is intentionally global.
-
-Release notes and the release verification checklist live in [CHANGELOG.md](CHANGELOG.md). The release gate includes `dotnet pack Cohort/Cohort.csproj` and a clean consumer restore check for `AnonymiseWithAttribute`, `PreviewEraseAsync(...)`, and the row-dispatch surface.
-
 ## Anonymise methods
 
 ```csharp

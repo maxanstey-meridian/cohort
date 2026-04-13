@@ -1030,7 +1030,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             services =>
             {
                 services.AddSingleton(sink);
-                services.AddRowHandler<Note, DispatchRecordingErasureNoteHandler>();
+                services.AddRowHandler<Note, NoteErasureTrackingHandler>();
                 services.AddRowHandler<SoftDeleteRecord, SoftDeleteErasureTrackingHandler>();
                 services.AddRowHandler<AnonymisedContact, AnonymisedContactErasureTrackingHandler>();
                 services.AddRowHandler<ErasureSubjectRecord, ExemptErasureTrackingHandler>();

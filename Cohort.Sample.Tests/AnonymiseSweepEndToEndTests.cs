@@ -480,6 +480,52 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         }
     }
 
+    [Fact]
+    public async Task Sweep_Path_Converts_Provider_Values_Back_To_Clr_Values_Before_Building_OriginalValue_Context()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        await using var services = BuildConvertedOriginalValueServiceProvider(database.ConnectionString);
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<ConvertedOriginalValueDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.ConvertedOriginalValueRecords.Add(
+                new ConvertedOriginalValueRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    ExternalId = "alpha",
+                    Notes = "converted-original",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var engine = scope.ServiceProvider.GetRequiredService<RetentionSweepEngine>();
+            await engine.SweepAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                asOf
+            );
+        }
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<ConvertedOriginalValueDbContext>();
+            var factory = scope.ServiceProvider.GetRequiredService<ConvertedOriginalValueFactory>();
+            var record = await db.ConvertedOriginalValueRecords.SingleAsync();
+
+            record.ExternalId.Should().Be("alpha-scrubbed");
+            factory.Contexts.Should().ContainSingle();
+            factory.Contexts[0].OriginalValue.Should().Be("alpha");
+        }
+    }
+
     private string GetConnectionString()
     {
         using var db = Host.CreateDbContext();
@@ -518,6 +564,33 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         return services.BuildServiceProvider(validateScopes: true);
     }
 
+    private static ServiceProvider BuildConvertedOriginalValueServiceProvider(string connectionString)
+    {
+        var services = new ServiceCollection();
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection().Build();
+
+        services.AddSingleton<IConfiguration>(configuration);
+        services.AddLogging();
+        services.AddDbContext<ConvertedOriginalValueDbContext>(options => options.UseNpgsql(connectionString));
+        services.AddSingleton<IRetentionCategoryRepository>(
+            new StaticCategoryRepository(
+                new Dictionary<string, IRetentionRuleResolver>
+                {
+                    ["converted-original-value"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
+                }
+            )
+        );
+        services.AddSingleton<ConvertedOriginalValueFactory>();
+        services.AddSingleton<IAnonymiseValueFactory>(
+            sp => sp.GetRequiredService<ConvertedOriginalValueFactory>()
+        );
+        services.AddCohort<ConvertedOriginalValueDbContext>();
+
+        return services.BuildServiceProvider(validateScopes: true);
+    }
+
     private sealed class FactoryBackedSweepDbContext(
         DbContextOptions<FactoryBackedSweepDbContext> options
     ) : DbContext(options)
@@ -545,6 +618,35 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
                 entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
                 entity.Property(record => record.ExternalId).HasColumnName("external_id");
                 entity.Property(record => record.DisplayName).HasColumnName("display_name");
+                entity.Property(record => record.Notes).HasColumnName("notes");
+            });
+
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    private sealed class ConvertedOriginalValueDbContext(
+        DbContextOptions<ConvertedOriginalValueDbContext> options
+    ) : DbContext(options)
+    {
+        public DbSet<ConvertedOriginalValueRecord> ConvertedOriginalValueRecords =>
+            Set<ConvertedOriginalValueRecord>();
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<ConvertedOriginalValueRecord>(entity =>
+            {
+                entity.ToTable("converted_original_value_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.TenantId).HasColumnName("tenant_id");
+                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+                entity
+                    .Property(record => record.ExternalId)
+                    .HasColumnName("external_id")
+                    .HasConversion(
+                        value => value.ToUpperInvariant(),
+                        value => value.ToLowerInvariant()
+                    );
                 entity.Property(record => record.Notes).HasColumnName("notes");
             });
 
@@ -581,6 +683,19 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         public string Notes { get; set; } = "";
     }
 
+    [Retain("converted-original-value", nameof(ConvertedOriginalValueRecord.CreatedAt))]
+    private sealed class ConvertedOriginalValueRecord
+    {
+        public Guid Id { get; set; }
+        public Guid TenantId { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
+
+        [AnonymiseWith(typeof(ConvertedOriginalValueFactory))]
+        public string ExternalId { get; set; } = "";
+
+        public string Notes { get; set; } = "";
+    }
+
     private sealed class SetBasedGuidFactory : IAnonymiseValueFactory
     {
         public static readonly Guid ScrubbedValue = Guid.Parse("11111111-1111-1111-1111-111111111111");
@@ -608,6 +723,18 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
     }
 
     private sealed class OriginalValueEchoFactory : IAnonymiseValueFactory
+    {
+        public bool RequiresOriginalValue => true;
+        public List<AnonymiseValueContext> Contexts { get; } = [];
+
+        public object? Create(AnonymiseValueContext context)
+        {
+            Contexts.Add(context);
+            return $"{context.OriginalValue}-scrubbed";
+        }
+    }
+
+    private sealed class ConvertedOriginalValueFactory : IAnonymiseValueFactory
     {
         public bool RequiresOriginalValue => true;
         public List<AnonymiseValueContext> Contexts { get; } = [];

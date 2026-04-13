@@ -6,16 +6,21 @@ using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure.Holds;
 
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata;
+
 namespace Cohort.Infrastructure.Sweep;
 
 public sealed class AnonymiseSweepStrategy(
-    IEnumerable<IAnonymiseValueFactory>? anonymiseValueFactories = null
+    IEnumerable<IAnonymiseValueFactory>? anonymiseValueFactories = null,
+    DbContext? db = null
 ) : IRetentionSweepStrategy
 {
     private readonly IReadOnlyDictionary<Type, IAnonymiseValueFactory> factories =
         (anonymiseValueFactories ?? Array.Empty<IAnonymiseValueFactory>())
         .GroupBy(factory => factory.GetType())
         .ToDictionary(group => group.Key, group => group.Last());
+    private readonly DbContext? modelDb = db;
 
     public Strategy HandlesStrategy => Strategy.Anonymise;
 
@@ -569,9 +574,12 @@ public sealed class AnonymiseSweepStrategy(
             var originalValues = new Dictionary<string, object?>(StringComparer.Ordinal);
             for (var index = 0; index < originalValueFields.Length; index++)
             {
-                originalValues[originalValueFields[index].MemberName] = reader.IsDBNull(index + 1)
-                    ? null
-                    : reader.GetValue(index + 1);
+                var providerValue = reader.IsDBNull(index + 1) ? null : reader.GetValue(index + 1);
+                originalValues[originalValueFields[index].MemberName] = ConvertOriginalValueFromProvider(
+                    entry,
+                    originalValueFields[index],
+                    providerValue
+                );
             }
 
             rows.Add(new AnonymiseRowSnapshot(reader.GetString(0), originalValues));
@@ -630,6 +638,35 @@ public sealed class AnonymiseSweepStrategy(
         }
 
         return factory;
+    }
+
+    private object? ConvertOriginalValueFromProvider(
+        RetentionEntry entry,
+        AnonymiseFactoryField field,
+        object? providerValue
+    )
+    {
+        if (providerValue is null || modelDb is null)
+        {
+            return providerValue;
+        }
+
+        var property = ResolveEfProperty(entry, field.MemberName);
+        var converter = property.GetTypeMapping().Converter;
+        return converter?.ConvertFromProvider(providerValue) ?? providerValue;
+    }
+
+    private IProperty ResolveEfProperty(RetentionEntry entry, string memberName)
+    {
+        var entityType =
+            modelDb?.Model.FindEntityType(entry.EntityType)
+            ?? throw new InvalidOperationException(
+                $"Entity {entry.EntityType.FullName} is not mapped by the current EF model."
+            );
+        return entityType.FindProperty(memberName)
+            ?? throw new InvalidOperationException(
+                $"Property '{memberName}' on {entry.EntityType.FullName} is not mapped by the current EF model."
+            );
     }
 
     private async Task<List<string>> ReadAffectedRecordIdsAsync(

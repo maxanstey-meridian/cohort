@@ -424,6 +424,20 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             return Task.FromResult<SweepExecutionResult>(new([], 0));
         }
 
+        public Task<int> PreviewEraseAsync(
+            RetentionEntry entry,
+            RetentionRule rule,
+            ErasureSubjectMatch match,
+            TenantContext tenant,
+            DateTimeOffset now,
+            DbConnection conn,
+            DbTransaction transaction,
+            CancellationToken ct
+        )
+        {
+            throw new NotSupportedException();
+        }
+
         public Task<SweepExecutionResult> EraseAsync(
             RetentionEntry entry,
             RetentionRule rule,

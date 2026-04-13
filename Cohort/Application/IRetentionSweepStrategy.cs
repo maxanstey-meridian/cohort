@@ -25,6 +25,17 @@ public interface IRetentionSweepStrategy
         CancellationToken ct
     );
 
+    public Task<int> PreviewEraseAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        ErasureSubjectMatch match,
+        TenantContext tenant,
+        DateTimeOffset now,
+        DbConnection conn,
+        DbTransaction transaction,
+        CancellationToken ct
+    );
+
     public Task<SweepExecutionResult> EraseAsync(
         RetentionEntry entry,
         RetentionRule rule,

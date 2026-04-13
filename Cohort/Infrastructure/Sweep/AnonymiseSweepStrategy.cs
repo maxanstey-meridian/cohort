@@ -144,6 +144,85 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         );
     }
 
+    public async Task<int> PreviewEraseAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        ErasureSubjectMatch match,
+        TenantContext tenant,
+        DateTimeOffset now,
+        DbConnection conn,
+        DbTransaction transaction,
+        CancellationToken ct
+    )
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+        ArgumentNullException.ThrowIfNull(rule);
+        ArgumentNullException.ThrowIfNull(match);
+        ArgumentNullException.ThrowIfNull(tenant);
+        ArgumentNullException.ThrowIfNull(conn);
+        ArgumentNullException.ThrowIfNull(transaction);
+
+        if (rule.Strategy != Strategy.Anonymise)
+        {
+            throw new InvalidOperationException(
+                $"AnonymiseSweepStrategy cannot execute {rule.Strategy} rules."
+            );
+        }
+
+        if (entry.AnonymiseFields.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"Retention entry for {entry.EntityType.FullName} must expose anonymise metadata for anonymise erasure previews."
+            );
+        }
+
+        if (conn.State != ConnectionState.Open)
+        {
+            await conn.OpenAsync(ct);
+        }
+
+        var candidateRecordIds = await SelectErasureCandidateRecordIdsAsync(
+            entry,
+            entry.Tenant?.TenantColumn,
+            match,
+            tenant,
+            conn,
+            transaction,
+            ct
+        );
+
+        if (candidateRecordIds.Count == 0)
+        {
+            return 0;
+        }
+
+        var tenantClause = entry.Tenant is not null
+            ? $"AND target.{QuoteIdentifier(entry.Tenant.TenantColumn)} = @tenantId"
+            : "";
+
+        await using var command = conn.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            $"""
+            SELECT COUNT(*)
+            FROM {QuoteIdentifier(entry.TableName)} AS target
+            WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+              {tenantClause}
+              AND CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) = ANY(@candidateIds)
+              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn, entry.Tenant?.TenantColumn)}
+            """;
+        if (entry.Tenant is not null)
+        {
+            command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
+        }
+        command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
+        command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
+        command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
+        command.Parameters.Add(CreateParameter(command, "holdAsOf", now));
+
+        return Convert.ToInt32(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
+    }
+
     public async Task<SweepExecutionResult> EraseAsync(
         RetentionEntry entry,
         RetentionRule rule,

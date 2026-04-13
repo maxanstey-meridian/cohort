@@ -17,6 +17,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     : IntegrationTestBase(fixture)
 {
     private const int PendingState = 0;
+    private const int InFlightState = 1;
     private const int SucceededState = 2;
     private const int DeadLetteredState = 3;
 
@@ -181,6 +182,64 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         var completedStatuses = await LoadHandlerStatusesAsync(result.SweepId);
         completedStatuses.Should().ContainSingle(status =>
             status.HandlerType.Contains(nameof(ContextCapturingNoteHandler), StringComparison.Ordinal)
+            && status.State == SucceededState
+            && status.Attempt == 1
+            && status.CompletedAt != null
+            && status.LastError == null
+        );
+    }
+
+    [Fact]
+    public async Task Scheduled_Sweep_Flush_RoundTrips_Typed_Snapshot_Values_Into_OnAfter()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var recorder = new TypedSnapshotRecorder();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "typed-snapshot-target",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
+            {
+                services.AddSingleton(recorder);
+                services.AddRowHandler<Note, TypedSnapshotNoteHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        var call = recorder.Load().Should().ContainSingle().Subject;
+        call.EntityId.Should().Be(noteId.ToString());
+        call.Payload.NoteId.Should().Be(noteId);
+        call.Payload.RecordedAt.Should().Be(call.At);
+        call.Payload.Body.Should().Be("typed-snapshot-target");
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().ContainSingle(status =>
+            status.HandlerType.Contains(nameof(TypedSnapshotNoteHandler), StringComparison.Ordinal)
             && status.State == SucceededState
             && status.Attempt == 1
             && status.CompletedAt != null
@@ -375,6 +434,99 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             .Should()
             .BeTrue();
         completedStatuses.All(status => status.CompletedAt is not null && status.LastError is null)
+            .Should()
+            .BeTrue();
+    }
+
+    [Fact]
+    public async Task Scheduled_Sweep_Flush_With_MaxParallelism_Greater_Than_One_Processes_One_Handler_At_A_Time_Per_Row()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var sink = new HandlerExecutionSink();
+        var gate = new DispatchBlockGate();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "same-row-serial-dispatch",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxParallelism"] = "4",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(sink);
+                services.AddSingleton(gate);
+                services.AddRowHandler<Note, LowPriorityAfterNoteHandler>();
+                services.AddRowHandler<Note, BlockingHighPriorityAfterNoteHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        var flushTask = handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        await gate.WaitUntilBlockedAsync().WaitAsync(TimeSpan.FromSeconds(5));
+
+        var inFlightHigh = await WaitForHandlerStatusAsync(
+            result.SweepId,
+            row =>
+                row.HandlerType.Contains(
+                    nameof(BlockingHighPriorityAfterNoteHandler),
+                    StringComparison.Ordinal
+                ) && row.State == InFlightState,
+            TimeSpan.FromSeconds(5)
+        );
+        inFlightHigh.Attempt.Should().Be(0);
+
+        var interimStatuses = await LoadHandlerStatusesAsync(result.SweepId);
+        interimStatuses.Should().ContainSingle(status =>
+            status.HandlerType.Contains(
+                nameof(BlockingHighPriorityAfterNoteHandler),
+                StringComparison.Ordinal
+            ) && status.State == InFlightState
+                && status.Attempt == 0
+                && status.ClaimedAt != null
+                && status.CompletedAt == null
+        );
+        interimStatuses.Should().ContainSingle(status =>
+            status.HandlerType.Contains(nameof(LowPriorityAfterNoteHandler), StringComparison.Ordinal)
+            && status.State == PendingState
+            && status.Attempt == 0
+            && status.ClaimedAt == null
+            && status.CompletedAt == null
+        );
+        sink.AfterCalls.Should().BeEmpty();
+
+        gate.Release();
+        await flushTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        sink.AfterCalls.Should().Equal("after-high-blocking", "after-low");
+
+        var completedStatuses = await LoadHandlerStatusesAsync(result.SweepId);
+        completedStatuses.Should().HaveCount(2);
+        completedStatuses.All(status => status.State == SucceededState && status.Attempt == 1)
             .Should()
             .BeTrue();
     }
@@ -2421,6 +2573,28 @@ file sealed class AfterContextRecorder
     }
 }
 
+file sealed class TypedSnapshotRecorder
+{
+    private readonly object gate = new();
+    private readonly List<TypedSnapshotAfterCall> calls = [];
+
+    public void Record(TypedSnapshotAfterCall call)
+    {
+        lock (gate)
+        {
+            calls.Add(call);
+        }
+    }
+
+    public IReadOnlyList<TypedSnapshotAfterCall> Load()
+    {
+        lock (gate)
+        {
+            return calls.ToArray();
+        }
+    }
+}
+
 file sealed record AfterContextCall(
     Guid SweepId,
     string EntityId,
@@ -2431,6 +2605,14 @@ file sealed record AfterContextCall(
     int Attempt,
     string Body,
     Guid ScopeInstanceId
+);
+
+file sealed record TypedSnapshotPayload(Guid NoteId, DateTimeOffset RecordedAt, string Body);
+
+file sealed record TypedSnapshotAfterCall(
+    string EntityId,
+    DateTimeOffset At,
+    TypedSnapshotPayload Payload
 );
 
 file sealed class ScopedDispatchProbe
@@ -2494,6 +2676,25 @@ file sealed class HighPriorityAfterNoteHandler(HandlerExecutionSink sink) : IRet
     {
         sink.AfterCalls.Add("after-high");
         return Task.CompletedTask;
+    }
+}
+
+[RowHandlerPriority(10)]
+file sealed class BlockingHighPriorityAfterNoteHandler(
+    HandlerExecutionSink sink,
+    DispatchBlockGate gate
+) : IRetentionHandler<Note>
+{
+    public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        ctx.Snapshot["body"] = row.Body;
+        return Task.CompletedTask;
+    }
+
+    public async Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
+    {
+        await gate.WaitForReleaseAsync(ct);
+        sink.AfterCalls.Add("after-high-blocking");
     }
 }
 
@@ -2754,6 +2955,28 @@ file sealed class ContextCapturingNoteHandler(
                 ctx.Attempt,
                 (string)ctx.Snapshot["body"]!,
                 probe.InstanceId
+            )
+        );
+
+        return Task.CompletedTask;
+    }
+}
+
+file sealed class TypedSnapshotNoteHandler(TypedSnapshotRecorder recorder) : IRetentionHandler<Note>
+{
+    public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        ctx.Snapshot["payload"] = new TypedSnapshotPayload(row.Id, ctx.At, row.Body);
+        return Task.CompletedTask;
+    }
+
+    public Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
+    {
+        recorder.Record(
+            new TypedSnapshotAfterCall(
+                ctx.EntityId,
+                ctx.At,
+                (TypedSnapshotPayload)ctx.Snapshot["payload"]!
             )
         );
 

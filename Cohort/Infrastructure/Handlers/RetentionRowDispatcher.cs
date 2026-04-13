@@ -1,7 +1,5 @@
 using System.Data;
 using System.Data.Common;
-using System.Text.Json;
-
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
@@ -108,7 +106,7 @@ public sealed class RetentionRowDispatcher(
                     $"Retention row handler '{claimed.HandlerType}' is not registered for entity {claimed.EntityType}."
                 );
 
-            var snapshot = DeserializeSnapshot(claimed.CapturedPayload);
+            var snapshot = RetentionSnapshotSerializer.Deserialize(claimed.CapturedPayload);
             var context = CreateAfterContext(entityType, claimed, currentAttempt, snapshot);
             await InvokeOnAfterAsync(entityType, handler.Instance, context, ct);
             handlerCompleted = true;
@@ -203,6 +201,13 @@ public sealed class RetentionRowDispatcher(
                 FROM {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} AS status
                 WHERE status."State" = @pending
                   AND status."NextAttemptAt" <= @dueCutoff
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} AS blocker
+                      WHERE blocker."SweepRunRowDetailId" = status."SweepRunRowDetailId"
+                        AND blocker."Id" < status."Id"
+                        AND blocker."State" IN (@pending, @inFlight)
+                  )
                 ORDER BY status."NextAttemptAt", status."Id"
                 FOR UPDATE SKIP LOCKED
                 LIMIT @batchSize
@@ -520,51 +525,6 @@ public sealed class RetentionRowDispatcher(
 
         var invocation = onAfterMethod.Invoke(handler, [context, ct]);
         await (Task)invocation!;
-    }
-
-    private static IReadOnlyDictionary<string, object?> DeserializeSnapshot(string? capturedPayload)
-    {
-        if (string.IsNullOrWhiteSpace(capturedPayload))
-        {
-            throw new InvalidOperationException(
-                "Retention row handler dispatch payload is missing from the captured row detail."
-            );
-        }
-
-        using var document = JsonDocument.Parse(capturedPayload);
-        if (document.RootElement.ValueKind != JsonValueKind.Object)
-        {
-            throw new InvalidOperationException(
-                "Retention row handler dispatch payload must be a JSON object."
-            );
-        }
-
-        return document.RootElement.EnumerateObject().ToDictionary(
-            property => property.Name,
-            property => ConvertJsonValue(property.Value),
-            StringComparer.Ordinal
-        );
-    }
-
-    private static object? ConvertJsonValue(JsonElement element)
-    {
-        return element.ValueKind switch
-        {
-            JsonValueKind.Null => null,
-            JsonValueKind.String => element.GetString(),
-            JsonValueKind.True => true,
-            JsonValueKind.False => false,
-            JsonValueKind.Number when element.TryGetInt64(out var int64Value) => int64Value,
-            JsonValueKind.Number when element.TryGetDecimal(out var decimalValue) => decimalValue,
-            JsonValueKind.Number => element.GetDouble(),
-            JsonValueKind.Object => element.EnumerateObject().ToDictionary(
-                property => property.Name,
-                property => ConvertJsonValue(property.Value),
-                StringComparer.Ordinal
-            ),
-            JsonValueKind.Array => element.EnumerateArray().Select(ConvertJsonValue).ToArray(),
-            _ => element.GetRawText(),
-        };
     }
 
     private static TimeSpan CalculateBackoff(TimeSpan baseBackoff, int attempt)

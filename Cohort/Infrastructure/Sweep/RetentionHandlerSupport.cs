@@ -1,7 +1,5 @@
 using System.Collections;
 using System.Data.Common;
-using System.Text.Json;
-
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure.Handlers;
@@ -219,7 +217,7 @@ internal static class RetentionHandlerSupport
         command.Parameters.Add(CreateParameter(command, "strategy", (int)strategy));
         command.Parameters.Add(CreateParameter(command, "tenantId", tenantId));
         command.Parameters.Add(
-            CreateParameter(command, "capturedPayload", JsonSerializer.Serialize(snapshot))
+            CreateParameter(command, "capturedPayload", RetentionSnapshotSerializer.Serialize(snapshot))
         );
 
         var insertedId = await command.ExecuteScalarAsync(ct);

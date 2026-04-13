@@ -215,6 +215,27 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     [Fact]
+    public async Task AddRowHandler_Host_Composed_Dispatcher_Allows_Flush_Through_The_Port()
+    {
+        using var host = new CohortTestHost(
+            connectionString,
+            configureServices: services =>
+            {
+                services.AddRowHandler<Note, FirstNoteHandler>();
+            }
+        );
+
+        await host.RunWithServicesAsync(
+            async serviceProvider =>
+            {
+                var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+
+                await dispatcher.FlushAsync();
+            }
+        );
+    }
+
+    [Fact]
     public async Task Sample_Host_Composition_Registers_Tombstone_Factories_For_Startup_Validation()
     {
         var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder();

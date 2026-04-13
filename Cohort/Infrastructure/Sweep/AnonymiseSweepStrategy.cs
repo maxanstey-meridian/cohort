@@ -44,40 +44,17 @@ public sealed class AnonymiseSweepStrategy(
         ArgumentNullException.ThrowIfNull(ctx);
         ArgumentNullException.ThrowIfNull(conn);
 
-        if (rule.Strategy != Strategy.Anonymise)
-        {
-            throw new InvalidOperationException(
-                $"AnonymiseSweepStrategy cannot execute {rule.Strategy} rules."
-            );
-        }
-
-        if (entry.AnonymiseFields.Count == 0)
-        {
-            throw new InvalidOperationException(
-                $"Retention entry for {entry.EntityType.FullName} must expose anonymise metadata for anonymise previews."
-            );
-        }
-
-        if (conn.State != ConnectionState.Open)
-        {
-            await conn.OpenAsync(ct);
-        }
-
         var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);
-        var targetFilter = CreateCutoffFilter(entry.AnchorColumn, cutoff);
-
-        await using var command = conn.CreateCommand();
-        command.CommandText = BuildPreviewCountCommandText(
+        return await PreviewMutationCountAsync(
             entry,
-            entry.Tenant?.TenantColumn,
-            targetFilter,
-            entry.RecordId.RecordIdColumn
+            rule,
+            CreateCutoffFilter(entry.AnchorColumn, cutoff),
+            ctx.Tenant,
+            ctx.Now,
+            conn,
+            ct,
+            "preview"
         );
-        AddFilterParameters(command, targetFilter);
-        AddTenantParameter(command, entry.Tenant?.TenantColumn, ctx.Tenant.Id);
-        AddHoldParameters(command, entry.TableName, ctx.Now);
-
-        return Convert.ToInt32(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
 
     public async Task<SweepExecutionResult> SweepAsync(
@@ -96,33 +73,130 @@ public sealed class AnonymiseSweepStrategy(
         ArgumentNullException.ThrowIfNull(conn);
         ArgumentNullException.ThrowIfNull(transaction);
 
-        if (rule.Strategy != Strategy.Anonymise)
-        {
-            throw new InvalidOperationException(
-                $"AnonymiseSweepStrategy cannot execute {rule.Strategy} rules."
-            );
-        }
-
-        if (entry.AnonymiseFields.Count == 0)
-        {
-            throw new InvalidOperationException(
-                $"Retention entry for {entry.EntityType.FullName} must expose anonymise metadata for anonymise sweeps."
-            );
-        }
-
-        if (conn.State != ConnectionState.Open)
-        {
-            await conn.OpenAsync(ct);
-        }
-
         var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);
+        return await ExecuteMutationAsync(
+            entry,
+            rule,
+            ctx,
+            CreateCutoffFilter(entry.AnchorColumn, cutoff),
+            conn,
+            transaction,
+            execution,
+            ct,
+            "sweeps"
+        );
+    }
+
+    public async Task<int> PreviewEraseAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        ErasureSubjectMatch match,
+        TenantContext tenant,
+        DateTimeOffset now,
+        DbConnection conn,
+        CancellationToken ct
+    )
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+        ArgumentNullException.ThrowIfNull(rule);
+        ArgumentNullException.ThrowIfNull(match);
+        ArgumentNullException.ThrowIfNull(tenant);
+        ArgumentNullException.ThrowIfNull(conn);
+
+        return await PreviewMutationCountAsync(
+            entry,
+            rule,
+            CreateSubjectFilter(match.SubjectColumn, match.SubjectValue),
+            tenant,
+            now,
+            conn,
+            ct,
+            "erasure previews"
+        );
+    }
+
+    public async Task<SweepExecutionResult> EraseAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        ErasureSubjectMatch match,
+        TenantContext tenant,
+        DateTimeOffset now,
+        DbConnection conn,
+        DbTransaction transaction,
+        CancellationToken ct,
+        SweepMutationContext? execution = null
+    )
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+        ArgumentNullException.ThrowIfNull(rule);
+        ArgumentNullException.ThrowIfNull(match);
+        ArgumentNullException.ThrowIfNull(tenant);
+        ArgumentNullException.ThrowIfNull(conn);
+        ArgumentNullException.ThrowIfNull(transaction);
+
+        return await ExecuteMutationAsync(
+            entry,
+            rule,
+            new RetentionResolutionContext(entry.Category, tenant, now, []),
+            CreateSubjectFilter(match.SubjectColumn, match.SubjectValue),
+            conn,
+            transaction,
+            execution,
+            ct,
+            "erasure"
+        );
+    }
+
+    private async Task<int> PreviewMutationCountAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        SqlFilter filter,
+        TenantContext tenant,
+        DateTimeOffset now,
+        DbConnection conn,
+        CancellationToken ct,
+        string operation
+    )
+    {
+        ValidateEntry(entry, rule, operation);
+        await EnsureConnectionOpenAsync(conn, ct);
+
+        await using var command = conn.CreateCommand();
+        command.CommandText = BuildPreviewCountCommandText(
+            entry,
+            entry.Tenant?.TenantColumn,
+            filter,
+            entry.RecordId.RecordIdColumn
+        );
+        AddFilterParameters(command, filter);
+        AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
+        AddHoldParameters(command, entry.TableName, now);
+
+        return Convert.ToInt32(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
+    }
+
+    private async Task<SweepExecutionResult> ExecuteMutationAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        RetentionResolutionContext ctx,
+        SqlFilter filter,
+        DbConnection conn,
+        DbTransaction transaction,
+        SweepMutationContext? execution,
+        CancellationToken ct,
+        string operation
+    )
+    {
+        ValidateEntry(entry, rule, operation);
+        await EnsureConnectionOpenAsync(conn, ct);
+
         var candidateRecordIds = await SelectCandidateRecordIdsAsync(
             entry,
             entry.Tenant?.TenantColumn,
             ctx.Tenant.Id,
             conn,
             transaction,
-            CreateCutoffFilter(entry.AnchorColumn, cutoff),
+            filter,
             ct
         );
 
@@ -148,7 +222,7 @@ public sealed class AnonymiseSweepStrategy(
         }
 
         return RequiresPerRowExecution(entry)
-            ? await ExecutePerRowSweepAsync(
+            ? await ExecutePerRowMutationAsync(
                 entry,
                 ctx.Tenant,
                 ctx.Now,
@@ -157,156 +231,14 @@ public sealed class AnonymiseSweepStrategy(
                 candidateRecordIds,
                 ct
             )
-            : await ExecuteSetBasedSweepAsync(
+            : await ExecuteSetBasedMutationAsync(
                 entry,
                 ctx.Tenant,
                 ctx.Now,
                 conn,
                 transaction,
                 candidateRecordIds,
-                cutoff,
-                ct
-            );
-    }
-
-    public async Task<int> PreviewEraseAsync(
-        RetentionEntry entry,
-        RetentionRule rule,
-        ErasureSubjectMatch match,
-        TenantContext tenant,
-        DateTimeOffset now,
-        DbConnection conn,
-        CancellationToken ct
-    )
-    {
-        ArgumentNullException.ThrowIfNull(entry);
-        ArgumentNullException.ThrowIfNull(rule);
-        ArgumentNullException.ThrowIfNull(match);
-        ArgumentNullException.ThrowIfNull(tenant);
-        ArgumentNullException.ThrowIfNull(conn);
-
-        if (rule.Strategy != Strategy.Anonymise)
-        {
-            throw new InvalidOperationException(
-                $"AnonymiseSweepStrategy cannot execute {rule.Strategy} rules."
-            );
-        }
-
-        if (entry.AnonymiseFields.Count == 0)
-        {
-            throw new InvalidOperationException(
-                $"Retention entry for {entry.EntityType.FullName} must expose anonymise metadata for anonymise erasure previews."
-            );
-        }
-
-        if (conn.State != ConnectionState.Open)
-        {
-            await conn.OpenAsync(ct);
-        }
-
-        var targetFilter = CreateSubjectFilter(match.SubjectColumn, match.SubjectValue);
-
-        await using var command = conn.CreateCommand();
-        command.CommandText = BuildPreviewCountCommandText(
-            entry,
-            entry.Tenant?.TenantColumn,
-            targetFilter,
-            entry.RecordId.RecordIdColumn
-        );
-        AddFilterParameters(command, targetFilter);
-        AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
-        AddHoldParameters(command, entry.TableName, now);
-
-        return Convert.ToInt32(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
-    }
-
-    public async Task<SweepExecutionResult> EraseAsync(
-        RetentionEntry entry,
-        RetentionRule rule,
-        ErasureSubjectMatch match,
-        TenantContext tenant,
-        DateTimeOffset now,
-        DbConnection conn,
-        DbTransaction transaction,
-        CancellationToken ct,
-        SweepMutationContext? execution = null
-    )
-    {
-        ArgumentNullException.ThrowIfNull(entry);
-        ArgumentNullException.ThrowIfNull(rule);
-        ArgumentNullException.ThrowIfNull(match);
-        ArgumentNullException.ThrowIfNull(tenant);
-        ArgumentNullException.ThrowIfNull(conn);
-        ArgumentNullException.ThrowIfNull(transaction);
-
-        if (rule.Strategy != Strategy.Anonymise)
-        {
-            throw new InvalidOperationException(
-                $"AnonymiseSweepStrategy cannot execute {rule.Strategy} rules."
-            );
-        }
-
-        if (entry.AnonymiseFields.Count == 0)
-        {
-            throw new InvalidOperationException(
-                $"Retention entry for {entry.EntityType.FullName} must expose anonymise metadata for anonymise erasure."
-            );
-        }
-
-        if (conn.State != ConnectionState.Open)
-        {
-            await conn.OpenAsync(ct);
-        }
-
-        var candidateRecordIds = await SelectCandidateRecordIdsAsync(
-            entry,
-            entry.Tenant?.TenantColumn,
-            tenant.Id,
-            conn,
-            transaction,
-            CreateSubjectFilter(match.SubjectColumn, match.SubjectValue),
-            ct
-        );
-
-        if (candidateRecordIds.Count == 0)
-        {
-            return new SweepExecutionResult([], 0);
-        }
-
-        var handlers = RetentionHandlerSupport.ResolveHandlers(services, entry.EntityType);
-        if (execution is not null && handlers.Count > 0)
-        {
-            return await ExecuteHandlerAwareSweepAsync(
-                entry,
-                rule,
-                new RetentionResolutionContext(entry.Category, tenant, now, []),
-                conn,
-                transaction,
-                candidateRecordIds,
-                handlers,
-                execution,
-                ct
-            );
-        }
-
-        return RequiresPerRowExecution(entry)
-            ? await ExecutePerRowErasureAsync(
-                entry,
-                tenant,
-                now,
-                conn,
-                transaction,
-                candidateRecordIds,
-                ct
-            )
-            : await ExecuteSetBasedErasureAsync(
-                entry,
-                match,
-                tenant,
-                now,
-                conn,
-                transaction,
-                candidateRecordIds,
+                filter,
                 ct
             );
     }
@@ -432,92 +364,7 @@ public sealed class AnonymiseSweepStrategy(
         );
     }
 
-    private async Task<SweepExecutionResult> ExecuteSetBasedSweepAsync(
-        RetentionEntry entry,
-        TenantContext tenant,
-        DateTimeOffset now,
-        DbConnection conn,
-        DbTransaction transaction,
-        IReadOnlyList<string> candidateRecordIds,
-        DateTimeOffset cutoff,
-        CancellationToken ct
-    )
-    {
-        return await ExecuteSetBasedMutationAsync(
-            entry,
-            tenant,
-            now,
-            conn,
-            transaction,
-            candidateRecordIds,
-            CreateCutoffFilter(entry.AnchorColumn, cutoff),
-            ct
-        );
-    }
-
-    private async Task<SweepExecutionResult> ExecuteSetBasedErasureAsync(
-        RetentionEntry entry,
-        ErasureSubjectMatch match,
-        TenantContext tenant,
-        DateTimeOffset now,
-        DbConnection conn,
-        DbTransaction transaction,
-        IReadOnlyList<string> candidateRecordIds,
-        CancellationToken ct
-    )
-    {
-        return await ExecuteSetBasedMutationAsync(
-            entry,
-            tenant,
-            now,
-            conn,
-            transaction,
-            candidateRecordIds,
-            CreateSubjectFilter(match.SubjectColumn, match.SubjectValue),
-            ct
-        );
-    }
-
-    private async Task<SweepExecutionResult> ExecutePerRowSweepAsync(
-        RetentionEntry entry,
-        TenantContext tenant,
-        DateTimeOffset now,
-        DbConnection conn,
-        DbTransaction transaction,
-        IReadOnlyList<string> candidateRecordIds,
-        CancellationToken ct
-    )
-    {
-        var updatableRows = await LoadUpdatableRowsAsync(
-            entry,
-            tenant,
-            now,
-            conn,
-            transaction,
-            candidateRecordIds,
-            ct
-        );
-        if (updatableRows.Count == 0)
-        {
-            return new SweepExecutionResult([], candidateRecordIds.Count);
-        }
-
-        var affectedRecordIds = await ExecutePerRowUpdatesAsync(
-            entry,
-            tenant,
-            now,
-            conn,
-            transaction,
-            updatableRows,
-            ct
-        );
-        return new SweepExecutionResult(
-            affectedRecordIds,
-            candidateRecordIds.Count - affectedRecordIds.Count
-        );
-    }
-
-    private async Task<SweepExecutionResult> ExecutePerRowErasureAsync(
+    private async Task<SweepExecutionResult> ExecutePerRowMutationAsync(
         RetentionEntry entry,
         TenantContext tenant,
         DateTimeOffset now,
@@ -897,6 +744,8 @@ public sealed class AnonymiseSweepStrategy(
         DateTimeOffset now
     )
     {
+        var staticAssignments = CreateStaticAssignments(entry, tenantId, now);
+
         for (var index = 0; index < entry.AnonymiseFields.Count; index++)
         {
             var field = entry.AnonymiseFields[index];
@@ -907,7 +756,7 @@ public sealed class AnonymiseSweepStrategy(
                     ConvertAssignmentValueToProvider(
                         entry,
                         field,
-                        CreateSetBasedAssignmentValue(entry, field, tenantId, now)
+                        staticAssignments[field.MemberName]
                     )
                 )
             );
@@ -1134,36 +983,6 @@ public sealed class AnonymiseSweepStrategy(
         command.Parameters.Add(CreateParameter(command, "holdAsOf", now));
     }
 
-    private object? CreateSetBasedAssignmentValue(
-        RetentionEntry entry,
-        AnonymiseField field,
-        Guid tenantId,
-        DateTimeOffset now
-    )
-    {
-        return field switch
-        {
-            AnonymiseLiteralField literalField => CreateLiteralAssignmentValue(literalField),
-            AnonymiseFactoryField factoryField when !ResolveFactory(factoryField).RequiresPerRowExecution
-                => ResolveFactory(factoryField)
-                    .Create(
-                        new AnonymiseValueContext(
-                            entry.EntityType,
-                            factoryField.MemberName,
-                            null,
-                            now,
-                            tenantId
-                        )
-                    ),
-            AnonymiseFactoryField factoryField => throw new InvalidOperationException(
-                $"Anonymise field '{factoryField.MemberName}' requires per-row execution and cannot run on the set-based anonymise path."
-            ),
-            _ => throw new InvalidOperationException(
-                $"Anonymise field '{field.MemberName}' is not supported."
-            ),
-        };
-    }
-
     private static object CreateLiteralAssignmentValue(AnonymiseLiteralField literalField)
     {
         return literalField.Method switch
@@ -1201,6 +1020,35 @@ public sealed class AnonymiseSweepStrategy(
     private static string QuoteIdentifier(string identifier)
     {
         return $"\"{identifier.Replace("\"", "\"\"")}\"";
+    }
+
+    private static void ValidateEntry(
+        RetentionEntry entry,
+        RetentionRule rule,
+        string operation
+    )
+    {
+        if (rule.Strategy != Strategy.Anonymise)
+        {
+            throw new InvalidOperationException(
+                $"AnonymiseSweepStrategy cannot execute {rule.Strategy} rules."
+            );
+        }
+
+        if (entry.AnonymiseFields.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"Retention entry for {entry.EntityType.FullName} must expose anonymise metadata for anonymise {operation}."
+            );
+        }
+    }
+
+    private static async Task EnsureConnectionOpenAsync(DbConnection conn, CancellationToken ct)
+    {
+        if (conn.State != ConnectionState.Open)
+        {
+            await conn.OpenAsync(ct);
+        }
     }
 
     private sealed record AnonymiseRowSnapshot(

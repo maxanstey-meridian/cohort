@@ -1214,6 +1214,71 @@ public sealed class AnonymiseSweepStrategyCommandTests
     }
 
     [Fact]
+    public async Task EraseAsync_Uses_A_SetBased_Update_For_Literal_Fields_And_Subject_Filtered_Candidates()
+    {
+        var selectedId = Guid.NewGuid();
+        var heldId = Guid.NewGuid();
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        using var db = CreateCommandStrategyDbContext();
+        var strategy = new AnonymiseSweepStrategy(db);
+        var connection = new RecordingDbConnection();
+        connection.EnqueueResultSet(selectedId, heldId);
+        connection.EnqueueResultSet(selectedId);
+        var transaction = connection.BeginTransaction();
+        var entry = new RetentionEntry(
+            typeof(AnonymisedContact),
+            "anonymised_contacts",
+            "anonymise",
+            nameof(AnonymisedContact.CreatedAt),
+            "CreatedAt",
+            new RecordIdConvention(nameof(AnonymisedContact.Id), "Id", typeof(Guid)),
+            [
+                new AnonymiseLiteralField(nameof(AnonymisedContact.EmailAddress), "EmailAddress", AnonymiseMethod.Null),
+                new AnonymiseLiteralField(nameof(AnonymisedContact.GivenName), "GivenName", AnonymiseMethod.EmptyString),
+                new AnonymiseLiteralField(
+                    nameof(AnonymisedContact.Surname),
+                    "Surname",
+                    AnonymiseMethod.FixedLiteral,
+                    "[redacted]"
+                ),
+            ],
+            new TenantConvention(nameof(AnonymisedContact.TenantId), "TenantId"),
+            null
+        );
+        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise);
+
+        var affected = await strategy.EraseAsync(
+            entry,
+            rule,
+            new ErasureSubjectMatch(nameof(AnonymisedContact.Id), "SubjectId", subjectId),
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            now,
+            connection,
+            transaction,
+            CancellationToken.None
+        );
+
+        affected.AffectedRecordIds.Should().Equal(selectedId.ToString());
+        affected.HeldCount.Should().Be(1);
+        connection.Commands.Should().HaveCount(2);
+        connection.Commands[0].AssignedTransaction.Should().BeSameAs(transaction);
+        connection.Commands[0].CommandText.Should().Contain("\"SubjectId\" = @subjectValue");
+        connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
+        connection.Commands[0].CommandText.Should().NotContain("@cutoff");
+        connection.Commands[1].AssignedTransaction.Should().BeSameAs(transaction);
+        connection.Commands[1].CommandText.Should().Contain("\"SubjectId\" = @subjectValue");
+        connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
+        connection.Commands[1].CommandText.Should().NotContain("WHERE CAST(target.\"Id\" AS text) = @recordId");
+        connection.Commands[1].Parameters["subjectValue"].Value.Should().Be(subjectId);
+        connection.Commands[1].Parameters["tenantId"].Value.Should().Be(tenantId);
+        connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
+            new[] { selectedId.ToString(), heldId.ToString() }
+        );
+    }
+
+    [Fact]
     public async Task SweepAsync_Uses_A_SetBased_Update_For_FactoryBacked_Fields_That_Do_Not_Require_Original_Values()
     {
         var selectedId = Guid.NewGuid();

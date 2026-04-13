@@ -254,6 +254,132 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Scheduled_Sweep_With_A_BeforeOnly_Handler_Flushes_Default_OnAfter_To_Succeeded()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var logId = Guid.NewGuid();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.PerRowAuditedLogs.Add(
+                new PerRowAuditedLog
+                {
+                    Id = logId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Payload = "before-only-default-onafter",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxParallelism"] = "1",
+            },
+            configureServices: services =>
+            {
+                services.AddRowHandler<PerRowAuditedLog, PerRowAuditHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        var pendingStatuses = await LoadHandlerStatusesAsync(result.SweepId);
+        pendingStatuses.Should().ContainSingle(status =>
+            status.HandlerType.Contains(nameof(PerRowAuditHandler), StringComparison.Ordinal)
+            && status.State == PendingState
+            && status.Attempt == 0
+        );
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        var completedStatuses = await LoadHandlerStatusesAsync(result.SweepId);
+        completedStatuses.Should().ContainSingle(status =>
+            status.HandlerType.Contains(nameof(PerRowAuditHandler), StringComparison.Ordinal)
+            && status.State == SucceededState
+            && status.Attempt == 1
+            && status.CompletedAt != null
+            && status.LastError == null
+        );
+    }
+
+    [Fact]
+    public async Task Scheduled_Sweep_With_Multiple_After_Handlers_Flushes_In_Priority_Order()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var sink = new HandlerExecutionSink();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "post-commit-priority-order",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxParallelism"] = "1",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(sink);
+                services.AddRowHandler<Note, LowPriorityAfterNoteHandler>();
+                services.AddRowHandler<Note, HighPriorityAfterNoteHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        var pendingStatuses = await LoadHandlerStatusesAsync(result.SweepId);
+        pendingStatuses.Should().HaveCount(2);
+        pendingStatuses.All(status => status.State == PendingState && status.Attempt == 0)
+            .Should()
+            .BeTrue();
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        sink.AfterCalls.Should().Equal("after-high", "after-low");
+
+        var completedStatuses = await LoadHandlerStatusesAsync(result.SweepId);
+        completedStatuses.Should().HaveCount(2);
+        completedStatuses.All(status => status.State == SucceededState && status.Attempt == 1)
+            .Should()
+            .BeTrue();
+        completedStatuses.All(status => status.CompletedAt is not null && status.LastError is null)
+            .Should()
+            .BeTrue();
+    }
+
+    [Fact]
     public async Task Scheduled_Sweep_Does_Not_Duplicate_Row_Detail_Audit_For_HandlerManaged_PerRow_Entities()
     {
         var tenantId = Guid.NewGuid();
@@ -2287,6 +2413,22 @@ file sealed class LowPriorityNoteHandler(HandlerExecutionSink sink) : IRetention
     }
 }
 
+[RowHandlerPriority(20)]
+file sealed class LowPriorityAfterNoteHandler(HandlerExecutionSink sink) : IRetentionHandler<Note>
+{
+    public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        ctx.Snapshot["body"] = row.Body;
+        return Task.CompletedTask;
+    }
+
+    public Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
+    {
+        sink.AfterCalls.Add("after-low");
+        return Task.CompletedTask;
+    }
+}
+
 file sealed class BlobBackedFileCleanupHandler(BlobCleanupStoreSpy cleanupStore)
     : IRetentionHandler<BlobBackedFile>
 {
@@ -2300,6 +2442,22 @@ file sealed class BlobBackedFileCleanupHandler(BlobCleanupStoreSpy cleanupStore)
     public Task OnAfterAsync(RetentionAfterContext<BlobBackedFile> ctx, CancellationToken ct)
     {
         return cleanupStore.DeleteAsync((string)ctx.Snapshot["storagePath"]!);
+    }
+}
+
+[RowHandlerPriority(10)]
+file sealed class HighPriorityAfterNoteHandler(HandlerExecutionSink sink) : IRetentionHandler<Note>
+{
+    public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        ctx.Snapshot["body"] = row.Body;
+        return Task.CompletedTask;
+    }
+
+    public Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
+    {
+        sink.AfterCalls.Add("after-high");
+        return Task.CompletedTask;
     }
 }
 

@@ -220,7 +220,6 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
             ?? throw new InvalidOperationException(
                 $"Retention entry for {entry.EntityType.FullName} references missing record-id member '{entry.RecordId.RecordIdMember}'."
             );
-        var heldCount = candidateRecordIds.Count - rows.Count;
         var affectedRecordIds = new List<string>();
 
         foreach (var row in rows)
@@ -274,7 +273,11 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
             affectedRecordIds.Add(recordId);
         }
 
-        return new SweepExecutionResult(affectedRecordIds, heldCount, RowDetailsPersisted: true);
+        return new SweepExecutionResult(
+            affectedRecordIds,
+            candidateRecordIds.Count - affectedRecordIds.Count,
+            RowDetailsPersisted: true
+        );
     }
 
     private static async Task<List<TEntity>> LoadHandlerRowsAsync<TEntity>(

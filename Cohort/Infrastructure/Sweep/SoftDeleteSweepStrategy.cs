@@ -242,7 +242,6 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             ?? throw new InvalidOperationException(
                 $"Retention entry for {entry.EntityType.FullName} references missing record-id member '{entry.RecordId.RecordIdMember}'."
             );
-        var heldCount = candidateRecordIds.Count - rows.Count;
         var affectedRecordIds = new List<string>();
 
         foreach (var row in rows)
@@ -306,7 +305,11 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             affectedRecordIds.Add(recordId);
         }
 
-        return new SweepExecutionResult(affectedRecordIds, heldCount, RowDetailsPersisted: true);
+        return new SweepExecutionResult(
+            affectedRecordIds,
+            candidateRecordIds.Count - affectedRecordIds.Count,
+            RowDetailsPersisted: true
+        );
     }
 
     private static async Task<List<TEntity>> LoadHandlerRowsAsync<TEntity>(

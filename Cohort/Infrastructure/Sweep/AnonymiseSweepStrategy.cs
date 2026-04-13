@@ -358,7 +358,6 @@ public sealed class AnonymiseSweepStrategy(
             ?? throw new InvalidOperationException(
                 $"Retention entry for {entry.EntityType.FullName} references missing record-id member '{entry.RecordId.RecordIdMember}'."
             );
-        var heldCount = candidateRecordIds.Count - rows.Count;
         var staticAssignments = CreateStaticAssignments(entry, ctx.Tenant.Id, ctx.Now);
         var affectedRecordIds = new List<string>();
 
@@ -426,7 +425,11 @@ public sealed class AnonymiseSweepStrategy(
             affectedRecordIds.Add(recordId);
         }
 
-        return new SweepExecutionResult(affectedRecordIds, heldCount, RowDetailsPersisted: true);
+        return new SweepExecutionResult(
+            affectedRecordIds,
+            candidateRecordIds.Count - affectedRecordIds.Count,
+            RowDetailsPersisted: true
+        );
     }
 
     private async Task<SweepExecutionResult> ExecuteSetBasedSweepAsync(

@@ -669,6 +669,420 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Erase_Does_Not_Touch_Row_Within_Period()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var withinPeriodNoteId = Guid.NewGuid();
+        var eligibleNoteId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = withinPeriodNoteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-10),
+                    Body = "within-period-note",
+                },
+                new Note
+                {
+                    Id = eligibleNoteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-45),
+                    Body = "eligible-period-note",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var erasureHost = new CohortTestHost(
+            GetConnectionString(),
+            CreateErasureCategoryRepository()
+        );
+
+        var result = await erasureHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
+            asOf
+        );
+
+        result.Counts.Should().Contain(
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+        );
+
+        var run = await LoadRunAsync(result.SweepId);
+        var summaries = await LoadSummariesAsync(result.SweepId);
+
+        run.TotalAffected.Should().Be(1);
+        summaries.Should().Contain(
+            new SweepRunEntitySummaryRow(
+                result.SweepId,
+                typeof(Note).FullName!,
+                "short-lived",
+                tenantId,
+                Strategy.Purge,
+                TimeSpan.FromDays(30),
+                1,
+                0,
+                0
+            )
+        );
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == eligibleNoteId)).Should().BeFalse();
+
+        var withinPeriodNote = await verify.Notes.SingleAsync(note => note.Id == withinPeriodNoteId);
+        withinPeriodNote.Body.Should().Be("within-period-note");
+        withinPeriodNote.CreatedAt.Should().Be(asOf.AddDays(-10));
+    }
+
+    [Fact]
+    public async Task Erase_Does_Not_Touch_Row_Within_LegalMin()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var withinLegalMinNoteId = Guid.NewGuid();
+        var eligibleNoteId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = withinLegalMinNoteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-45),
+                    Body = "within-legal-min-note",
+                },
+                new Note
+                {
+                    Id = eligibleNoteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "eligible-legal-min-note",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var erasureHost = new CohortTestHost(
+            GetConnectionString(),
+            CreateErasureCategoryRepository(
+                shortLivedRule: new RetentionRule(
+                    TimeSpan.FromDays(30),
+                    Strategy.Purge,
+                    TimeSpan.FromDays(90),
+                    AuditRowDetail: AuditRowDetail.PerRow
+                )
+            )
+        );
+
+        var result = await erasureHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
+            asOf
+        );
+
+        result.Counts.Should().Contain(
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+        );
+
+        var run = await LoadRunAsync(result.SweepId);
+        var summaries = await LoadSummariesAsync(result.SweepId);
+
+        run.TotalAffected.Should().Be(1);
+        summaries.Should().Contain(
+            new SweepRunEntitySummaryRow(
+                result.SweepId,
+                typeof(Note).FullName!,
+                "short-lived",
+                tenantId,
+                Strategy.Purge,
+                TimeSpan.FromDays(90),
+                1,
+                0,
+                0
+            )
+        );
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == eligibleNoteId)).Should().BeFalse();
+
+        var withinLegalMinNote = await verify.Notes.SingleAsync(note => note.Id == withinLegalMinNoteId);
+        withinLegalMinNote.Body.Should().Be("within-legal-min-note");
+        withinLegalMinNote.CreatedAt.Should().Be(asOf.AddDays(-45));
+    }
+
+    [Fact]
+    public async Task PreviewErase_Matches_Mutation_Eligibility()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var noteEligibleId = Guid.NewGuid();
+        var noteWithinPeriodId = Guid.NewGuid();
+        var softDeleteEligibleId = Guid.NewGuid();
+        var softDeleteWithinPeriodId = Guid.NewGuid();
+        var contactEligibleId = Guid.NewGuid();
+        var contactWithinPeriodId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = noteEligibleId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-45),
+                    Body = "preview-live-note-eligible",
+                },
+                new Note
+                {
+                    Id = noteWithinPeriodId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-10),
+                    Body = "preview-live-note-within-period",
+                }
+            );
+            db.SoftDeleteRecords.AddRange(
+                new SoftDeleteRecord
+                {
+                    Id = softDeleteEligibleId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-45),
+                    Body = "preview-live-soft-delete-eligible",
+                    IsDeleted = false,
+                },
+                new SoftDeleteRecord
+                {
+                    Id = softDeleteWithinPeriodId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-10),
+                    Body = "preview-live-soft-delete-within-period",
+                    IsDeleted = false,
+                }
+            );
+            db.AnonymisedContacts.AddRange(
+                new AnonymisedContact
+                {
+                    Id = contactEligibleId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-45),
+                    EmailAddress = "eligible@example.com",
+                    GivenName = "Eligible",
+                    Surname = "Contact",
+                    Notes = "preview-live-contact-eligible",
+                },
+                new AnonymisedContact
+                {
+                    Id = contactWithinPeriodId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-10),
+                    EmailAddress = "within-period@example.com",
+                    GivenName = "Within",
+                    Surname = "Period",
+                    Notes = "preview-live-contact-within-period",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        var previewRepository = CreateErasureCategoryRepository();
+        using var previewHost = new CohortTestHost(
+            GetConnectionString(),
+            previewRepository,
+            CreateCohortSettings(dryRun: true)
+        );
+
+        var previewResult = await previewHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
+            asOf
+        );
+
+        var previewRun = await LoadRunAsync(previewResult.SweepId);
+        var previewSummaries = await LoadSummariesAsync(previewResult.SweepId);
+
+        previewRun.DryRun.Should().BeTrue();
+        previewRun.TotalAffected.Should().Be(3);
+        previewResult.Counts.Should().Contain(
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+        );
+        previewResult.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(SoftDeleteRecord),
+                "soft-delete",
+                tenantId,
+                Strategy.SoftDelete,
+                1
+            )
+        );
+        previewResult.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(AnonymisedContact),
+                "anonymise",
+                tenantId,
+                Strategy.Anonymise,
+                1
+            )
+        );
+
+        await using (var afterPreview = Host.CreateDbContext())
+        {
+            (await afterPreview.Notes.AnyAsync(note => note.Id == noteEligibleId)).Should().BeTrue();
+            (await afterPreview.Notes.AnyAsync(note => note.Id == noteWithinPeriodId)).Should().BeTrue();
+
+            (await afterPreview.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteEligibleId))
+                .IsDeleted.Should()
+                .BeFalse();
+            (await afterPreview.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteWithinPeriodId))
+                .IsDeleted.Should()
+                .BeFalse();
+
+            var previewEligibleContact = await afterPreview.AnonymisedContacts.SingleAsync(contact =>
+                contact.Id == contactEligibleId
+            );
+            previewEligibleContact.EmailAddress.Should().Be("eligible@example.com");
+            previewEligibleContact.GivenName.Should().Be("Eligible");
+            previewEligibleContact.Surname.Should().Be("Contact");
+        }
+
+        using var liveHost = new CohortTestHost(
+            GetConnectionString(),
+            CreateErasureCategoryRepository(),
+            CreateCohortSettings(dryRun: false)
+        );
+
+        var liveResult = await liveHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
+            asOf
+        );
+
+        var liveRun = await LoadRunAsync(liveResult.SweepId);
+        var liveSummaries = await LoadSummariesAsync(liveResult.SweepId);
+
+        liveRun.DryRun.Should().BeFalse();
+        liveRun.TotalAffected.Should().Be(3);
+        previewResult.Counts.Should().BeEquivalentTo(liveResult.Counts);
+        previewSummaries
+            .Select(ProjectSummary)
+            .Should()
+            .BeEquivalentTo(liveSummaries.Select(ProjectSummary));
+
+        await using var afterLive = Host.CreateDbContext();
+        (await afterLive.Notes.AnyAsync(note => note.Id == noteEligibleId)).Should().BeFalse();
+        (await afterLive.Notes.AnyAsync(note => note.Id == noteWithinPeriodId)).Should().BeTrue();
+
+        (await afterLive.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteEligibleId))
+            .IsDeleted.Should()
+            .BeTrue();
+        (await afterLive.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteWithinPeriodId))
+            .IsDeleted.Should()
+            .BeFalse();
+
+        var liveEligibleContact = await afterLive.AnonymisedContacts.SingleAsync(contact =>
+            contact.Id == contactEligibleId
+        );
+        liveEligibleContact.EmailAddress.Should().BeNull();
+        liveEligibleContact.GivenName.Should().BeEmpty();
+        liveEligibleContact.Surname.Should().Be("[redacted]");
+
+        var liveWithinPeriodContact = await afterLive.AnonymisedContacts.SingleAsync(contact =>
+            contact.Id == contactWithinPeriodId
+        );
+        liveWithinPeriodContact.EmailAddress.Should().Be("within-period@example.com");
+        liveWithinPeriodContact.GivenName.Should().Be("Within");
+        liveWithinPeriodContact.Surname.Should().Be("Period");
+    }
+
+    [Fact]
+    public async Task Erase_Still_Respects_Active_Holds_After_Cutoff_Gating()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var eligibleHeldNoteId = Guid.NewGuid();
+        var eligibleUnheldNoteId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = eligibleHeldNoteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-45),
+                    Body = "eligible-held-note",
+                },
+                new Note
+                {
+                    Id = eligibleUnheldNoteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-45),
+                    Body = "eligible-unheld-note",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        await CreateHoldAsync("notes", eligibleHeldNoteId, tenantId, asOf);
+
+        using var erasureHost = new CohortTestHost(
+            GetConnectionString(),
+            CreateErasureCategoryRepository()
+        );
+
+        var result = await erasureHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
+            asOf
+        );
+
+        result.Counts.Should().Contain(
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+        );
+
+        var summaries = await LoadSummariesAsync(result.SweepId);
+        summaries.Should().Contain(
+            new SweepRunEntitySummaryRow(
+                result.SweepId,
+                typeof(Note).FullName!,
+                "short-lived",
+                tenantId,
+                Strategy.Purge,
+                TimeSpan.FromDays(30),
+                1,
+                1,
+                0
+            )
+        );
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == eligibleUnheldNoteId)).Should().BeFalse();
+
+        var heldNote = await verify.Notes.SingleAsync(note => note.Id == eligibleHeldNoteId);
+        heldNote.Body.Should().Be("eligible-held-note");
+        heldNote.CreatedAt.Should().Be(asOf.AddDays(-45));
+    }
+
+    [Fact]
     public async Task Erasure_Path_Fails_When_The_Scope_Subject_Cannot_Be_Expressed_Against_The_Marked_Property()
     {
         var tenantId = Guid.NewGuid();
@@ -1292,6 +1706,20 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             ?? throw new InvalidOperationException($"Could not resolve entity type '{entityType}'.");
     }
 
+    private static SummaryProjection ProjectSummary(SweepRunEntitySummaryRow summary)
+    {
+        return new SummaryProjection(
+            summary.EntityType,
+            summary.Category,
+            summary.TenantId,
+            summary.Strategy,
+            summary.ResolvedPeriod,
+            summary.Affected,
+            summary.HeldCount,
+            summary.SkippedCount
+        );
+    }
+
     private sealed class StaticCategoryRepository(
         IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
     ) : IRetentionCategoryRepository
@@ -1340,29 +1768,45 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         Guid TenantId
     );
 
+    private sealed record SummaryProjection(
+        string EntityType,
+        string Category,
+        Guid TenantId,
+        Strategy Strategy,
+        TimeSpan ResolvedPeriod,
+        int Affected,
+        int HeldCount,
+        int SkippedCount
+    );
+
     private string GetConnectionString()
     {
         using var db = Host.CreateDbContext();
         return db.Database.GetConnectionString()!;
     }
 
-    private static IRetentionCategoryRepository CreateErasureCategoryRepository()
+    private static IRetentionCategoryRepository CreateErasureCategoryRepository(
+        RetentionRule? shortLivedRule = null,
+        RetentionRule? softDeleteRule = null,
+        RetentionRule? anonymiseRule = null
+    )
     {
         return new StaticCategoryRepository(
             new Dictionary<string, IRetentionRuleResolver>
             {
                 ["short-lived"] = new StaticRetentionRuleResolver(
-                    new RetentionRule(
-                        TimeSpan.FromDays(30),
-                        Strategy.Purge,
-                        AuditRowDetail: AuditRowDetail.PerRow
-                    )
+                    shortLivedRule
+                        ?? new RetentionRule(
+                            TimeSpan.FromDays(30),
+                            Strategy.Purge,
+                            AuditRowDetail: AuditRowDetail.PerRow
+                        )
                 ),
                 ["soft-delete"] = new StaticRetentionRuleResolver(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    softDeleteRule ?? new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                 ),
                 ["anonymise"] = new StaticRetentionRuleResolver(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    anonymiseRule ?? new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                 ),
             }
         );

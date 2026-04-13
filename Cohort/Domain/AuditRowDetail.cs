@@ -2,6 +2,7 @@ namespace Cohort.Domain;
 
 public enum AuditRowDetail
 {
-    SummaryOnly,
-    PerRow,
+    SummaryOnly = 0,
+    PerRow = 1,
+    Inherit = 2,
 }

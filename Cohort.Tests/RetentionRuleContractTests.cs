@@ -44,7 +44,11 @@ public sealed class RetentionRuleContractTests
     {
         Enum.GetNames<AuditRowDetail>()
             .Should()
-            .Equal(nameof(AuditRowDetail.SummaryOnly), nameof(AuditRowDetail.PerRow));
+            .Equal(
+                nameof(AuditRowDetail.SummaryOnly),
+                nameof(AuditRowDetail.PerRow),
+                nameof(AuditRowDetail.Inherit)
+            );
     }
 
     [Fact]

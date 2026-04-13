@@ -165,7 +165,9 @@ public sealed class RetentionErasureService(
                     ct
                 );
 
-                var effectiveAuditDetail = entry.AuditRowDetail ?? rule.AuditRowDetail;
+                var effectiveAuditDetail = entry.AuditRowDetail == AuditRowDetail.Inherit
+                    ? rule.AuditRowDetail
+                    : entry.AuditRowDetail;
                 if (effectiveAuditDetail == AuditRowDetail.PerRow)
                 {
                     foreach (var recordId in execution.AffectedRecordIds)

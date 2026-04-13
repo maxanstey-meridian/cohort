@@ -10,7 +10,7 @@ public sealed record RetentionEntry(
     IReadOnlyList<AnonymiseField> AnonymiseFields,
     TenantConvention? Tenant,
     SoftDeleteConvention? SoftDelete,
-    AuditRowDetail? AuditRowDetail = null
+    AuditRowDetail AuditRowDetail = AuditRowDetail.Inherit
 );
 
 public sealed record RecordIdConvention(

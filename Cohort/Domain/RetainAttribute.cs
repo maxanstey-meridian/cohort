@@ -5,5 +5,5 @@ public sealed class RetainAttribute(string category, string anchorMember) : Attr
 {
     public string Category { get; } = category;
     public string AnchorMember { get; } = anchorMember;
-    public AuditRowDetail? AuditRowDetail { get; init; }
+    public AuditRowDetail AuditRowDetail { get; init; } = AuditRowDetail.Inherit;
 }

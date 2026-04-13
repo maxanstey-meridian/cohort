@@ -99,9 +99,7 @@ internal static class RetentionSnapshotSerializer
         return new Dictionary<string, object?>(StringComparer.Ordinal)
         {
             [EncodedTypeProperty] =
-                type.AssemblyQualifiedName ?? throw new InvalidOperationException(
-                    $"Retention snapshot value type '{type.FullName}' cannot be persisted without an assembly-qualified type name."
-                ),
+                RetentionTypeIdentity.GetPersistedName(type),
             [EncodedValueProperty] = serializedValue,
         };
     }
@@ -168,14 +166,7 @@ internal static class RetentionSnapshotSerializer
             );
         }
 
-        var resolvedType = Type.GetType(typeName, throwOnError: false, ignoreCase: false);
-        if (resolvedType is null)
-        {
-            throw new InvalidOperationException(
-                $"Retention snapshot encoded type '{typeName}' could not be resolved."
-            );
-        }
-
+        var resolvedType = RetentionTypeIdentity.Resolve(typeName);
         decoded = JsonSerializer.Deserialize(valueProperty.GetRawText(), resolvedType);
         return true;
     }

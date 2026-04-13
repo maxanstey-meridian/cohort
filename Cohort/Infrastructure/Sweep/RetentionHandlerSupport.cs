@@ -343,10 +343,7 @@ internal sealed class ResolvedRetentionHandler(object instance, Type handlerInte
 
     public Type HandlerType { get; } = instance.GetType();
 
-    public string HandlerTypeName { get; } =
-        instance.GetType().AssemblyQualifiedName
-        ?? instance.GetType().FullName
-        ?? instance.GetType().Name;
+    public string HandlerTypeName { get; } = RetentionTypeIdentity.GetPersistedName(instance.GetType());
 
     public System.Reflection.MethodInfo OnBeforeMethod { get; } =
         handlerInterface.GetMethod(nameof(IRetentionHandler<object>.OnBeforeAsync))

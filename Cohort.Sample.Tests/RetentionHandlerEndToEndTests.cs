@@ -225,6 +225,11 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
+        var capturedRows = await LoadCapturedRowsAsync(result.SweepId);
+        capturedRows.Should().ContainSingle();
+        capturedRows[0].CapturedPayload.Should().Contain("$cohortType");
+        capturedRows[0].CapturedPayload.Should().NotContain("Version=");
+
         await handlerHost.RunWithServicesAsync(async serviceProvider =>
         {
             var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
@@ -245,6 +250,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             && status.CompletedAt != null
             && status.LastError == null
         );
+        statuses[0].HandlerType.Should().NotContain("Version=");
     }
 
     [Fact]
@@ -2151,6 +2157,87 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         statuses[0].LastError.Should().Contain("Simulated permanent after-dispatch failure.");
     }
 
+    [Fact]
+    public async Task FlushAsync_DeadLetters_Later_SameRow_Handlers_When_An_Earlier_Erasure_Handler_Exhausts()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var sink = new HandlerExecutionSink();
+        var tracker = new DispatchAttemptTracker();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "erasure-dead-letter-stops-later-handlers",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            CreateHandlerErasureCategoryRepository(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:BaseBackoff"] = "00:05:00",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxAttempts"] = "2",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxParallelism"] = "4",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(sink);
+                services.AddSingleton(tracker);
+                services.AddRowHandler<Note, AlwaysFailingHighPriorityDispatchNoteHandler>();
+                services.AddRowHandler<Note, LowPriorityAfterNoteHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
+            asOf
+        );
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        tracker.LoadAttempt(noteId.ToString()).Should().Be(2);
+        sink.AfterCalls.Should().BeEmpty();
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().HaveCount(2);
+        statuses.Should().ContainSingle(status =>
+            status.HandlerType.Contains(
+                nameof(AlwaysFailingHighPriorityDispatchNoteHandler),
+                StringComparison.Ordinal
+            )
+            && status.State == DeadLetteredState
+            && status.Attempt == 2
+            && status.CompletedAt != null
+            && status.LastError != null
+            && status.LastError.Contains("Simulated permanent after-dispatch failure.", StringComparison.Ordinal)
+        );
+        statuses.Should().ContainSingle(status =>
+            status.HandlerType.Contains(nameof(LowPriorityAfterNoteHandler), StringComparison.Ordinal)
+            && status.State == DeadLetteredState
+            && status.Attempt == 0
+            && status.CompletedAt != null
+            && status.LastError != null
+            && status.LastError.Contains("Skipped because an earlier handler for the same row dead-lettered", StringComparison.Ordinal)
+        );
+    }
+
     private async Task CreateHoldAsync(
         string tableName,
         Guid recordId,
@@ -3010,6 +3097,25 @@ file sealed class RetryOnceDispatchNoteHandler(
 }
 
 file sealed class AlwaysFailingDispatchNoteHandler(
+    DispatchAttemptTracker tracker
+) : IRetentionHandler<Note>
+{
+    public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        ctx.Snapshot["body"] = row.Body;
+        return Task.CompletedTask;
+    }
+
+    public Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
+    {
+        tracker.Increment(ctx.EntityId);
+        tracker.RecordFailure(ctx.EntityId, DateTimeOffset.UtcNow);
+        throw new InvalidOperationException("Simulated permanent after-dispatch failure.");
+    }
+}
+
+[RowHandlerPriority(10)]
+file sealed class AlwaysFailingHighPriorityDispatchNoteHandler(
     DispatchAttemptTracker tracker
 ) : IRetentionHandler<Note>
 {

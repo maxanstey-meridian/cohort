@@ -90,11 +90,226 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
         legacyNote.TenantId.Should().BeNull();
     }
 
+    [Fact]
+    public async Task Add_Row_Handler_Dispatch_Migration_Updates_The_Live_Postgres_Schema()
+    {
+        var options = CreateOptions();
+
+        await using (var db = new SampleDbContext(options))
+        {
+            var migrator = db.Database.GetService<IMigrator>();
+            await migrator.MigrateAsync("20260413135830_AddAnonymiseWithSampleEntity");
+            await migrator.MigrateAsync();
+        }
+
+        var rowDetailColumns = await GetColumnsAsync("sweep_run_row_detail");
+        rowDetailColumns.Should().ContainKey("Id");
+        rowDetailColumns["Id"].DataType.Should().Be("bigint");
+        rowDetailColumns["Id"].IsNullable.Should().BeFalse();
+        rowDetailColumns["Id"].IdentityGeneration.Should().Be("BY DEFAULT");
+        rowDetailColumns.Should().ContainKey("CapturedPayload");
+        rowDetailColumns["CapturedPayload"].DataType.Should().Be("text");
+        rowDetailColumns["CapturedPayload"].IsNullable.Should().BeTrue();
+        (await GetPrimaryKeyColumnsAsync("sweep_run_row_detail")).Should().Equal("Id");
+
+        var handlerStatusColumns = await GetColumnsAsync("sweep_row_handler_status");
+        handlerStatusColumns.Should().ContainKeys(
+            "Id",
+            "SweepRunRowDetailId",
+            "HandlerType",
+            "State",
+            "Attempt",
+            "QueuedAt",
+            "NextAttemptAt",
+            "ClaimedAt",
+            "CompletedAt",
+            "LastError"
+        );
+        handlerStatusColumns["Id"].DataType.Should().Be("bigint");
+        handlerStatusColumns["Id"].IsNullable.Should().BeFalse();
+        handlerStatusColumns["Id"].IdentityGeneration.Should().Be("BY DEFAULT");
+        handlerStatusColumns["SweepRunRowDetailId"].DataType.Should().Be("bigint");
+        handlerStatusColumns["SweepRunRowDetailId"].IsNullable.Should().BeFalse();
+        handlerStatusColumns["HandlerType"].DataType.Should().Be("text");
+        handlerStatusColumns["HandlerType"].IsNullable.Should().BeFalse();
+        handlerStatusColumns["State"].DataType.Should().Be("integer");
+        handlerStatusColumns["State"].IsNullable.Should().BeFalse();
+        handlerStatusColumns["Attempt"].DataType.Should().Be("integer");
+        handlerStatusColumns["Attempt"].IsNullable.Should().BeFalse();
+        handlerStatusColumns["QueuedAt"].DataType.Should().Be("timestamp with time zone");
+        handlerStatusColumns["QueuedAt"].IsNullable.Should().BeFalse();
+        handlerStatusColumns["NextAttemptAt"].DataType.Should().Be("timestamp with time zone");
+        handlerStatusColumns["NextAttemptAt"].IsNullable.Should().BeFalse();
+        handlerStatusColumns["ClaimedAt"].DataType.Should().Be("timestamp with time zone");
+        handlerStatusColumns["ClaimedAt"].IsNullable.Should().BeTrue();
+        handlerStatusColumns["CompletedAt"].DataType.Should().Be("timestamp with time zone");
+        handlerStatusColumns["CompletedAt"].IsNullable.Should().BeTrue();
+        handlerStatusColumns["LastError"].DataType.Should().Be("text");
+        handlerStatusColumns["LastError"].IsNullable.Should().BeTrue();
+        (await GetPrimaryKeyColumnsAsync("sweep_row_handler_status")).Should().Equal("Id");
+
+        (
+            await HasForeignKeyAsync(
+                "sweep_row_handler_status",
+                "SweepRunRowDetailId",
+                "sweep_run_row_detail",
+                "Id"
+            )
+        ).Should().BeTrue();
+
+        var rowDetailIndexes = await GetIndexDefinitionsAsync("sweep_run_row_detail");
+        rowDetailIndexes.Should().Contain(index =>
+            index.Contains("CREATE UNIQUE INDEX", StringComparison.Ordinal)
+            && index.Contains(
+                "(\"SweepId\", \"EntityType\", \"EntityId\", \"Category\", \"Strategy\", \"TenantId\")",
+                StringComparison.Ordinal
+            )
+        );
+
+        var handlerStatusIndexes = await GetIndexDefinitionsAsync("sweep_row_handler_status");
+        handlerStatusIndexes.Should().Contain(index =>
+            index.Contains("CREATE UNIQUE INDEX", StringComparison.Ordinal)
+            && index.Contains(
+                "(\"SweepRunRowDetailId\", \"HandlerType\")",
+                StringComparison.Ordinal
+            )
+        );
+        handlerStatusIndexes.Should().Contain(index =>
+            index.Contains("CREATE INDEX", StringComparison.Ordinal)
+            && index.Contains(
+                "(\"State\", \"NextAttemptAt\", \"Id\")",
+                StringComparison.Ordinal
+            )
+        );
+    }
+
     private DbContextOptions<SampleDbContext> CreateOptions()
     {
         return new DbContextOptionsBuilder<SampleDbContext>()
             .UseNpgsql(connectionString)
             .Options;
+    }
+
+    private async Task<Dictionary<string, ColumnSchema>> GetColumnsAsync(string tableName)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT column_name, is_nullable, data_type, identity_generation
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = @tableName
+            ORDER BY ordinal_position
+            """;
+        command.Parameters.AddWithValue("tableName", tableName);
+
+        var columns = new Dictionary<string, ColumnSchema>(StringComparer.Ordinal);
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            columns[reader.GetString(0)] = new ColumnSchema(
+                reader.GetString(1) == "YES",
+                reader.GetString(2),
+                reader.IsDBNull(3) ? null : reader.GetString(3)
+            );
+        }
+
+        return columns;
+    }
+
+    private async Task<string[]> GetPrimaryKeyColumnsAsync(string tableName)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT kcu.column_name
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+             AND tc.table_schema = kcu.table_schema
+            WHERE tc.table_schema = 'public'
+              AND tc.table_name = @tableName
+              AND tc.constraint_type = 'PRIMARY KEY'
+            ORDER BY kcu.ordinal_position
+            """;
+        command.Parameters.AddWithValue("tableName", tableName);
+
+        var columns = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            columns.Add(reader.GetString(0));
+        }
+
+        return columns.ToArray();
+    }
+
+    private async Task<bool> HasForeignKeyAsync(
+        string tableName,
+        string columnName,
+        string referencedTable,
+        string referencedColumn
+    )
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT COUNT(*)
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+             AND tc.table_schema = kcu.table_schema
+            JOIN information_schema.constraint_column_usage ccu
+              ON tc.constraint_name = ccu.constraint_name
+             AND tc.table_schema = ccu.table_schema
+            WHERE tc.table_schema = 'public'
+              AND tc.table_name = @tableName
+              AND tc.constraint_type = 'FOREIGN KEY'
+              AND kcu.column_name = @columnName
+              AND ccu.table_name = @referencedTable
+              AND ccu.column_name = @referencedColumn
+            """;
+        command.Parameters.AddWithValue("tableName", tableName);
+        command.Parameters.AddWithValue("columnName", columnName);
+        command.Parameters.AddWithValue("referencedTable", referencedTable);
+        command.Parameters.AddWithValue("referencedColumn", referencedColumn);
+
+        return (long)(await command.ExecuteScalarAsync())! == 1;
+    }
+
+    private async Task<string[]> GetIndexDefinitionsAsync(string tableName)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT indexdef
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND tablename = @tableName
+            ORDER BY indexname
+            """;
+        command.Parameters.AddWithValue("tableName", tableName);
+
+        var indexes = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            indexes.Add(reader.GetString(0));
+        }
+
+        return indexes.ToArray();
     }
 
     private static string CreateAdminConnectionString(string originalConnectionString)
@@ -106,4 +321,6 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
 
         return builder.ConnectionString;
     }
+
+    private sealed record ColumnSchema(bool IsNullable, string DataType, string? IdentityGeneration);
 }

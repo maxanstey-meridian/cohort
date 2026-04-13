@@ -266,6 +266,82 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Scheduled_Sweep_Without_Handlers_Keeps_SoftDelete_And_Anonymise_On_The_Bulk_Path()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var softDeleteId = Guid.NewGuid();
+        var contactId = Guid.NewGuid();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.SoftDeleteRecords.Add(
+                new SoftDeleteRecord
+                {
+                    Id = softDeleteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "bulk-soft-delete-target",
+                    IsDeleted = false,
+                }
+            );
+            db.AnonymisedContacts.Add(
+                new AnonymisedContact
+                {
+                    Id = contactId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    EmailAddress = "bulk-path@example.com",
+                    GivenName = "Bulk",
+                    Surname = "Path",
+                    Notes = "preserve-me",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        var result = await Host.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(SoftDeleteRecord),
+                "soft-delete",
+                tenantId,
+                Strategy.SoftDelete,
+                1
+            )
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(AnonymisedContact),
+                "anonymise",
+                tenantId,
+                Strategy.Anonymise,
+                1
+            )
+        );
+
+        await using (var verify = Host.CreateDbContext())
+        {
+            var softDeleted = await verify.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteId);
+            softDeleted.IsDeleted.Should().BeTrue();
+            softDeleted.DeletedAt.Should().Be(asOf);
+
+            var anonymised = await verify.AnonymisedContacts.SingleAsync(contact => contact.Id == contactId);
+            anonymised.EmailAddress.Should().BeNull();
+            anonymised.GivenName.Should().BeEmpty();
+            anonymised.Surname.Should().Be("[redacted]");
+            anonymised.Notes.Should().Be("preserve-me");
+        }
+
+        (await LoadCapturedRowsAsync(result.SweepId)).Should().BeEmpty();
+        (await LoadHandlerStatusesAsync(result.SweepId)).Should().BeEmpty();
+    }
+
+    [Fact]
     public async Task Scheduled_Sweep_When_OnBefore_Fails_Skips_Only_That_Row_And_Continues_With_Siblings()
     {
         var tenantId = Guid.NewGuid();

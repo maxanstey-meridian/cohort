@@ -935,15 +935,20 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             var perRowRecords = await db.PerRowFactoryErasureRecords.OrderBy(record => record.Notes).ToListAsync();
             var setBasedFactory = scope.ServiceProvider.GetRequiredService<FactorySetBasedGuidFactory>();
             var originalFactory = scope.ServiceProvider.GetRequiredService<FactoryOriginalValueEchoFactory>();
-            var perRowSetBasedFactory = scope.ServiceProvider.GetRequiredService<FactorySetBasedStringFactory>();
+            var perRowFactory = scope.ServiceProvider.GetRequiredService<FactoryPerRowSequenceFactory>();
 
             setBasedRecords.Single(record => record.Notes == "set-based-first").ExternalId.Should().Be(FactorySetBasedGuidFactory.ScrubbedValue);
             setBasedRecords.Single(record => record.Notes == "set-based-second").ExternalId.Should().Be(FactorySetBasedGuidFactory.ScrubbedValue);
             setBasedRecords.Single(record => record.Notes == "set-based-other-subject").ExternalId.Should().NotBe(FactorySetBasedGuidFactory.ScrubbedValue);
             setBasedRecords.Single(record => record.Notes == "set-based-other-tenant").ExternalId.Should().NotBe(FactorySetBasedGuidFactory.ScrubbedValue);
 
-            perRowRecords.Single(record => record.ExternalId == "alpha-scrubbed").DisplayName.Should().Be(FactorySetBasedStringFactory.ScrubbedValue);
-            perRowRecords.Single(record => record.ExternalId == "beta-scrubbed").DisplayName.Should().Be(FactorySetBasedStringFactory.ScrubbedValue);
+            perRowRecords.Where(record =>
+                    record.ExternalId == "alpha-scrubbed"
+                    || record.ExternalId == "beta-scrubbed"
+                )
+                .Select(record => record.DisplayName)
+                .Should()
+                .BeEquivalentTo(["erasure-per-row-1", "erasure-per-row-2"]);
             perRowRecords.Single(record => record.Notes == "per-row-held").ExternalId.Should().Be("held");
             perRowRecords.Single(record => record.Notes == "per-row-held").DisplayName.Should().Be("held");
             perRowRecords.Single(record => record.Notes == "per-row-other-subject").ExternalId.Should().Be("other-subject");
@@ -955,8 +960,8 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             originalFactory.Contexts.Select(context => context.OriginalValue).Should().BeEquivalentTo(new object?[] { "alpha", "beta" });
             originalFactory.Contexts.Should().OnlyContain(context => context.TenantId == tenantId);
 
-            perRowSetBasedFactory.Contexts.Should().ContainSingle();
-            perRowSetBasedFactory.Contexts[0].OriginalValue.Should().BeNull();
+            perRowFactory.Contexts.Should().HaveCount(2);
+            perRowFactory.Contexts.Should().OnlyContain(context => context.OriginalValue == null);
         }
     }
 
@@ -1296,10 +1301,10 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             )
         );
         services.AddSingleton<FactorySetBasedGuidFactory>();
-        services.AddSingleton<FactorySetBasedStringFactory>();
+        services.AddSingleton<FactoryPerRowSequenceFactory>();
         services.AddSingleton<FactoryOriginalValueEchoFactory>();
         services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<FactorySetBasedGuidFactory>());
-        services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<FactorySetBasedStringFactory>());
+        services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<FactoryPerRowSequenceFactory>());
         services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<FactoryOriginalValueEchoFactory>());
         services.AddCohort<FactoryBackedErasureDbContext>();
 
@@ -1397,7 +1402,7 @@ internal sealed class PerRowFactoryErasureRecord
     [AnonymiseWith(typeof(FactoryOriginalValueEchoFactory))]
     public string ExternalId { get; set; } = "";
 
-    [AnonymiseWith(typeof(FactorySetBasedStringFactory))]
+    [AnonymiseWith(typeof(FactoryPerRowSequenceFactory))]
     public string DisplayName { get; set; } = "";
 
     public string Notes { get; set; } = "";
@@ -1415,15 +1420,17 @@ internal sealed class FactorySetBasedGuidFactory : IAnonymiseValueFactory
     }
 }
 
-internal sealed class FactorySetBasedStringFactory : IAnonymiseValueFactory
+internal sealed class FactoryPerRowSequenceFactory : IAnonymiseValueFactory
 {
-    public const string ScrubbedValue = "erasure-factory-scrubbed";
+    public bool RequiresPerRowExecution => true;
     public List<AnonymiseValueContext> Contexts { get; } = [];
+    private int sequence = 0;
 
     public object? Create(AnonymiseValueContext context)
     {
         Contexts.Add(context);
-        return ScrubbedValue;
+        sequence++;
+        return $"erasure-per-row-{sequence}";
     }
 }
 

@@ -480,13 +480,15 @@ public sealed class AnonymiseSweepStrategy(
                 var value = field switch
                 {
                     AnonymiseLiteralField literalField => CreateLiteralAssignmentValue(literalField),
-                    AnonymiseFactoryField factoryField when ResolveFactory(factoryField).RequiresOriginalValue
+                    AnonymiseFactoryField factoryField when ResolveFactory(factoryField).RequiresPerRowExecution
                         => ResolveFactory(factoryField)
                             .Create(
                                 new AnonymiseValueContext(
                                     entry.EntityType,
                                     factoryField.MemberName,
-                                    row.OriginalValues[factoryField.MemberName],
+                                    row.OriginalValues.TryGetValue(factoryField.MemberName, out var originalValue)
+                                        ? originalValue
+                                        : null,
                                     now,
                                     tenant.Id
                                 )
@@ -540,9 +542,12 @@ public sealed class AnonymiseSweepStrategy(
 
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
+        var selectList = selectedColumns.Length == 0
+            ? $"CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text)"
+            : $"CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text), {string.Join(", ", selectedColumns)}";
         command.CommandText =
             $"""
-            SELECT CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text), {string.Join(", ", selectedColumns)}
+            SELECT {selectList}
             FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) = ANY(@candidateIds)
               {tenantClause}
@@ -587,7 +592,7 @@ public sealed class AnonymiseSweepStrategy(
             values[field.MemberName] = field switch
             {
                 AnonymiseLiteralField literalField => CreateLiteralAssignmentValue(literalField),
-                AnonymiseFactoryField factoryField when !ResolveFactory(factoryField).RequiresOriginalValue
+                AnonymiseFactoryField factoryField when !ResolveFactory(factoryField).RequiresPerRowExecution
                     => ResolveFactory(factoryField)
                         .Create(
                             new AnonymiseValueContext(
@@ -612,7 +617,7 @@ public sealed class AnonymiseSweepStrategy(
     {
         return entry.AnonymiseFields
             .OfType<AnonymiseFactoryField>()
-            .Any(field => ResolveFactory(field).RequiresOriginalValue);
+            .Any(field => ResolveFactory(field).RequiresPerRowExecution);
     }
 
     private IAnonymiseValueFactory ResolveFactory(AnonymiseFactoryField field)
@@ -873,7 +878,7 @@ public sealed class AnonymiseSweepStrategy(
         return field switch
         {
             AnonymiseLiteralField literalField => CreateLiteralAssignmentValue(literalField),
-            AnonymiseFactoryField factoryField when !ResolveFactory(factoryField).RequiresOriginalValue
+            AnonymiseFactoryField factoryField when !ResolveFactory(factoryField).RequiresPerRowExecution
                 => ResolveFactory(factoryField)
                     .Create(
                         new AnonymiseValueContext(
@@ -885,7 +890,7 @@ public sealed class AnonymiseSweepStrategy(
                         )
                     ),
             AnonymiseFactoryField factoryField => throw new InvalidOperationException(
-                $"Anonymise field '{factoryField.MemberName}' requires original-value execution and cannot run on the set-based anonymise path."
+                $"Anonymise field '{factoryField.MemberName}' requires per-row execution and cannot run on the set-based anonymise path."
             ),
             _ => throw new InvalidOperationException(
                 $"Anonymise field '{field.MemberName}' is not supported."

@@ -457,12 +457,17 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         await using (var scope = services.CreateAsyncScope())
         {
             var db = scope.ServiceProvider.GetRequiredService<FactoryBackedSweepDbContext>();
-            var records = await db.PerRowFactorySweepRecords.OrderBy(record => record.DisplayName).ToListAsync();
+            var records = await db.PerRowFactorySweepRecords.OrderBy(record => record.Notes).ToListAsync();
             var factory = scope.ServiceProvider.GetRequiredService<OriginalValueEchoFactory>();
-            var setBasedFactory = scope.ServiceProvider.GetRequiredService<SetBasedStringFactory>();
+            var perRowFactory = scope.ServiceProvider.GetRequiredService<PerRowSequenceFactory>();
 
-            records.Single(record => record.ExternalId == "alpha-scrubbed").DisplayName.Should().Be(SetBasedStringFactory.ScrubbedValue);
-            records.Single(record => record.ExternalId == "beta-scrubbed").DisplayName.Should().Be(SetBasedStringFactory.ScrubbedValue);
+            records.Where(record =>
+                    record.ExternalId == "alpha-scrubbed"
+                    || record.ExternalId == "beta-scrubbed"
+                )
+                .Select(record => record.DisplayName)
+                .Should()
+                .BeEquivalentTo(["per-row-1", "per-row-2"]);
             records.Single(record => record.Notes == "keep-held").ExternalId.Should().Be("held");
             records.Single(record => record.Notes == "keep-held").DisplayName.Should().Be("held");
 
@@ -470,8 +475,8 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
             factory.Contexts.Select(context => context.OriginalValue).Should().BeEquivalentTo(new object?[] { "alpha", "beta" });
             factory.Contexts.Should().OnlyContain(context => context.TenantId == tenantId);
 
-            setBasedFactory.Contexts.Should().ContainSingle();
-            setBasedFactory.Contexts[0].OriginalValue.Should().BeNull();
+            perRowFactory.Contexts.Should().HaveCount(2);
+            perRowFactory.Contexts.Should().OnlyContain(context => context.OriginalValue == null);
         }
     }
 
@@ -503,10 +508,10 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
             )
         );
         services.AddSingleton<SetBasedGuidFactory>();
-        services.AddSingleton<SetBasedStringFactory>();
+        services.AddSingleton<PerRowSequenceFactory>();
         services.AddSingleton<OriginalValueEchoFactory>();
         services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<SetBasedGuidFactory>());
-        services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<SetBasedStringFactory>());
+        services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<PerRowSequenceFactory>());
         services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<OriginalValueEchoFactory>());
         services.AddCohort<FactoryBackedSweepDbContext>();
 
@@ -570,7 +575,7 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         [AnonymiseWith(typeof(OriginalValueEchoFactory))]
         public string ExternalId { get; set; } = "";
 
-        [AnonymiseWith(typeof(SetBasedStringFactory))]
+        [AnonymiseWith(typeof(PerRowSequenceFactory))]
         public string DisplayName { get; set; } = "";
 
         public string Notes { get; set; } = "";
@@ -588,15 +593,17 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         }
     }
 
-    private sealed class SetBasedStringFactory : IAnonymiseValueFactory
+    private sealed class PerRowSequenceFactory : IAnonymiseValueFactory
     {
-        public const string ScrubbedValue = "factory-scrubbed";
+        public bool RequiresPerRowExecution => true;
         public List<AnonymiseValueContext> Contexts { get; } = [];
+        private int sequence = 0;
 
         public object? Create(AnonymiseValueContext context)
         {
             Contexts.Add(context);
-            return ScrubbedValue;
+            sequence++;
+            return $"per-row-{sequence}";
         }
     }
 
@@ -999,20 +1006,22 @@ public sealed class AnonymiseSweepStrategyCommandTests
     }
 
     [Fact]
-    public async Task EraseAsync_Uses_PerRow_Updates_For_Factories_That_Require_Original_Values()
+    public async Task EraseAsync_Uses_PerRow_Updates_For_Factories_That_Request_PerRow_Execution_Without_Original_Values()
     {
-        var selectedId = Guid.NewGuid();
-        var heldId = Guid.NewGuid();
+        var firstSelectedId = Guid.NewGuid();
+        var secondSelectedId = Guid.NewGuid();
         var strategy = new AnonymiseSweepStrategy(
-            [new RecordingOriginalValueFactory(), new RecordingSetBasedStringFactory()]
+            [new RecordingOriginalValueFactory(), new RecordingPerRowStringFactory()]
         );
         var connection = new RecordingDbConnection();
-        connection.EnqueueResultSet(selectedId, heldId);
+        connection.EnqueueResultSet(firstSelectedId, secondSelectedId);
         connection.EnqueueRowSet(
             ["Id", "external_id"],
-            [selectedId.ToString(), "alpha"]
+            [firstSelectedId.ToString(), "alpha"],
+            [secondSelectedId.ToString(), "beta"]
         );
-        connection.EnqueueResultSet(selectedId);
+        connection.EnqueueResultSet(firstSelectedId);
+        connection.EnqueueResultSet(secondSelectedId);
         var transaction = connection.BeginTransaction();
         var tenantId = Guid.NewGuid();
         var subjectId = Guid.NewGuid();
@@ -1026,7 +1035,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
             new RecordIdConvention(nameof(CommandPerRowFactoryRecord.Id), "Id", typeof(Guid)),
             [
                 new AnonymiseFactoryField(nameof(CommandPerRowFactoryRecord.ExternalId), "external_id", typeof(RecordingOriginalValueFactory)),
-                new AnonymiseFactoryField(nameof(CommandPerRowFactoryRecord.DisplayName), "display_name", typeof(RecordingSetBasedStringFactory)),
+                new AnonymiseFactoryField(nameof(CommandPerRowFactoryRecord.DisplayName), "display_name", typeof(RecordingPerRowStringFactory)),
             ],
             new TenantConvention(nameof(CommandPerRowFactoryRecord.TenantId), "tenant_id"),
             null
@@ -1044,14 +1053,16 @@ public sealed class AnonymiseSweepStrategyCommandTests
             CancellationToken.None
         );
 
-        affected.AffectedRecordIds.Should().Equal(selectedId.ToString());
-        affected.HeldCount.Should().Be(1);
-        connection.Commands.Should().HaveCount(3);
+        affected.AffectedRecordIds.Should().Equal(firstSelectedId.ToString(), secondSelectedId.ToString());
+        affected.HeldCount.Should().Be(0);
+        connection.Commands.Should().HaveCount(4);
         connection.Commands[1].CommandText.Should().Contain("\"external_id\"");
         connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
         connection.Commands[2].CommandText.Should().Contain("WHERE CAST(target.\"Id\" AS text) = @recordId");
         connection.Commands[2].Parameters["value0"].Value.Should().Be("alpha-scrubbed");
-        connection.Commands[2].Parameters["value1"].Value.Should().Be(RecordingSetBasedStringFactory.ScrubbedValue);
+        connection.Commands[2].Parameters["value1"].Value.Should().Be("command-per-row-1");
+        connection.Commands[3].Parameters["value0"].Value.Should().Be("beta-scrubbed");
+        connection.Commands[3].Parameters["value1"].Value.Should().Be("command-per-row-2");
     }
 
     private sealed class CommandSetBasedFactoryRecord
@@ -1281,11 +1292,16 @@ public sealed class AnonymiseSweepStrategyCommandTests
         public object? Create(AnonymiseValueContext context) => ScrubbedValue;
     }
 
-    private sealed class RecordingSetBasedStringFactory : IAnonymiseValueFactory
+    private sealed class RecordingPerRowStringFactory : IAnonymiseValueFactory
     {
-        public const string ScrubbedValue = "command-scrubbed";
+        public bool RequiresPerRowExecution => true;
+        private int sequence = 0;
 
-        public object? Create(AnonymiseValueContext context) => ScrubbedValue;
+        public object? Create(AnonymiseValueContext context)
+        {
+            sequence++;
+            return $"command-per-row-{sequence}";
+        }
     }
 
     private sealed class RecordingOriginalValueFactory : IAnonymiseValueFactory

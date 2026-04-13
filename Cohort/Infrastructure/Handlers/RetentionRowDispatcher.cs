@@ -66,15 +66,23 @@ public sealed class RetentionRowDispatcher(
             }
 
             var maxParallelism = Math.Max(1, options.CurrentValue.RowHandlerDispatch.MaxParallelism);
-            await Parallel.ForEachAsync(
-                claimed,
-                new ParallelOptions
-                {
-                    CancellationToken = ct,
-                    MaxDegreeOfParallelism = maxParallelism,
-                },
-                ProcessClaimedRowAsync
-            );
+            try
+            {
+                await Parallel.ForEachAsync(
+                    claimed,
+                    new ParallelOptions
+                    {
+                        CancellationToken = ct,
+                        MaxDegreeOfParallelism = maxParallelism,
+                    },
+                    ProcessClaimedRowAsync
+                );
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                await RequeueCancelledClaimsAsync(claimed.Select(row => row.StatusId).ToArray());
+                throw;
+            }
         }
     }
 
@@ -106,7 +114,6 @@ public sealed class RetentionRowDispatcher(
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            await RequeueCancelledClaimAsync(claimed.StatusId, ct);
             throw;
         }
         catch (Exception ex)
@@ -357,20 +364,54 @@ public sealed class RetentionRowDispatcher(
         );
     }
 
-    private Task RequeueCancelledClaimAsync(long statusId, CancellationToken ct)
+    private async Task RequeueCancelledClaimsAsync(IReadOnlyList<long> statusIds)
     {
-        return ExecuteStatusUpdateAsync(
-            statusId,
-            """
-            "State" = @state,
-            "ClaimedAt" = NULL
-            """,
-            parameters =>
+        if (statusIds.Count == 0)
+        {
+            return;
+        }
+
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<DbContext>();
+        var connection = db.Database.GetDbConnection();
+        var shouldCloseConnection = connection.State != ConnectionState.Open;
+
+        if (shouldCloseConnection)
+        {
+            await db.Database.OpenConnectionAsync(CancellationToken.None);
+        }
+
+        try
+        {
+            await using var transaction = await db.Database.BeginTransactionAsync(CancellationToken.None);
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction.GetDbTransaction();
+            command.CommandText =
+                $"""
+                UPDATE {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)}
+                SET "State" = @pending,
+                    "ClaimedAt" = NULL
+                WHERE "Id" = ANY(@statusIds)
+                  AND "State" = @inFlight
+                """;
+            command.Parameters.Add(CreateParameter(command, "pending", (int)SweepRowHandlerDispatchState.Pending));
+            command.Parameters.Add(
+                CreateParameter(command, "statusIds", statusIds.ToArray())
+            );
+            command.Parameters.Add(
+                CreateParameter(command, "inFlight", (int)SweepRowHandlerDispatchState.InFlight)
+            );
+
+            await command.ExecuteNonQueryAsync(CancellationToken.None);
+            await transaction.CommitAsync(CancellationToken.None);
+        }
+        finally
+        {
+            if (shouldCloseConnection)
             {
-                parameters.Add(("state", (int)SweepRowHandlerDispatchState.Pending));
-            },
-            ct
-        );
+                await db.Database.CloseConnectionAsync();
+            }
+        }
     }
 
     private async Task ExecuteStatusUpdateAsync(

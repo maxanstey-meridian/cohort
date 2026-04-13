@@ -850,6 +850,93 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task FlushAsync_Cancellation_Requeues_All_Claimed_Rows_So_A_Later_Flush_Can_Drain_Them()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var firstNoteId = Guid.NewGuid();
+        var secondNoteId = Guid.NewGuid();
+        var sink = new HandlerExecutionSink();
+        var gate = new DispatchBlockGate();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = firstNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "cancelled-batch-first",
+                },
+                new Note
+                {
+                    Id = secondNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "cancelled-batch-second",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:BatchSize"] = "10",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxParallelism"] = "1",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(sink);
+                services.AddSingleton(gate);
+                services.AddRowHandler<Note, BlockingDispatchNoteHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        using var cancellation = new CancellationTokenSource();
+        await handlerHost.RunWithServicesAsync(
+            async serviceProvider =>
+            {
+                var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+                var flushTask = dispatcher.FlushAsync(cancellation.Token);
+
+                await gate.WaitUntilBlockedAsync();
+                cancellation.Cancel();
+
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => flushTask);
+            }
+        );
+
+        gate.Release();
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        sink.AfterCalls.Should().BeEquivalentTo(
+            [
+                "after:cancelled-batch-first:1",
+                "after:cancelled-batch-second:1",
+            ]
+        );
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().HaveCount(2);
+        statuses.All(status => status.State == SucceededState).Should().BeTrue();
+        statuses.All(status => status.Attempt == 1).Should().BeTrue();
+        statuses.All(status => status.CompletedAt is not null).Should().BeTrue();
+    }
+
+    [Fact]
     public async Task Hosted_Dispatcher_Requeues_Retryable_Failures_With_Backoff_And_Last_Error()
     {
         var tenantId = Guid.NewGuid();
@@ -1284,6 +1371,32 @@ file sealed class DispatchAttemptTracker
     }
 }
 
+file sealed class DispatchBlockGate
+{
+    private readonly TaskCompletionSource blocked = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private volatile bool released;
+
+    public Task WaitUntilBlockedAsync()
+    {
+        return blocked.Task;
+    }
+
+    public async Task WaitForReleaseAsync(CancellationToken ct)
+    {
+        blocked.TrySetResult();
+
+        while (!released)
+        {
+            await Task.Delay(10, ct);
+        }
+    }
+
+    public void Release()
+    {
+        released = true;
+    }
+}
+
 [RowHandlerPriority(20)]
 file sealed class LowPriorityNoteHandler(HandlerExecutionSink sink) : IRetentionHandler<Note>
 {
@@ -1527,5 +1640,23 @@ file sealed class AlwaysFailingDispatchNoteHandler(
     {
         tracker.Increment(ctx.EntityId);
         throw new InvalidOperationException("Simulated permanent after-dispatch failure.");
+    }
+}
+
+file sealed class BlockingDispatchNoteHandler(
+    HandlerExecutionSink sink,
+    DispatchBlockGate gate
+) : IRetentionHandler<Note>
+{
+    public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        ctx.Snapshot["body"] = row.Body;
+        return Task.CompletedTask;
+    }
+
+    public async Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
+    {
+        await gate.WaitForReleaseAsync(ct);
+        sink.AfterCalls.Add($"after:{ctx.Snapshot["body"]}:{ctx.Attempt}");
     }
 }

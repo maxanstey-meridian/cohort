@@ -1011,6 +1011,267 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task PreviewErase_Matches_Mutation_Eligibility_When_LegalMin_Exceeds_Period()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var noteWithinLegalMinId = Guid.NewGuid();
+        var noteEligibleId = Guid.NewGuid();
+        var softDeleteWithinLegalMinId = Guid.NewGuid();
+        var softDeleteEligibleId = Guid.NewGuid();
+        var contactWithinLegalMinId = Guid.NewGuid();
+        var contactEligibleId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var legalMinRule = new RetentionRule(
+            TimeSpan.FromDays(30),
+            Strategy.Purge,
+            TimeSpan.FromDays(90),
+            AuditRowDetail: AuditRowDetail.PerRow
+        );
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = noteWithinLegalMinId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-45),
+                    Body = "preview-legal-min-note-within",
+                },
+                new Note
+                {
+                    Id = noteEligibleId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "preview-legal-min-note-eligible",
+                }
+            );
+            db.SoftDeleteRecords.AddRange(
+                new SoftDeleteRecord
+                {
+                    Id = softDeleteWithinLegalMinId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-45),
+                    Body = "preview-legal-min-soft-delete-within",
+                    IsDeleted = false,
+                },
+                new SoftDeleteRecord
+                {
+                    Id = softDeleteEligibleId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "preview-legal-min-soft-delete-eligible",
+                    IsDeleted = false,
+                }
+            );
+            db.AnonymisedContacts.AddRange(
+                new AnonymisedContact
+                {
+                    Id = contactWithinLegalMinId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-45),
+                    EmailAddress = "within-legal-min@example.com",
+                    GivenName = "WithinLegalMin",
+                    Surname = "Contact",
+                    Notes = "preview-legal-min-contact-within",
+                },
+                new AnonymisedContact
+                {
+                    Id = contactEligibleId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-120),
+                    EmailAddress = "eligible-legal-min@example.com",
+                    GivenName = "EligibleLegalMin",
+                    Surname = "Contact",
+                    Notes = "preview-legal-min-contact-eligible",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        var previewRepository = CreateErasureCategoryRepository(
+            shortLivedRule: legalMinRule,
+            softDeleteRule: new RetentionRule(
+                TimeSpan.FromDays(30),
+                Strategy.SoftDelete,
+                TimeSpan.FromDays(90)
+            ),
+            anonymiseRule: new RetentionRule(
+                TimeSpan.FromDays(30),
+                Strategy.Anonymise,
+                TimeSpan.FromDays(90)
+            )
+        );
+        using var previewHost = new CohortTestHost(
+            GetConnectionString(),
+            previewRepository,
+            CreateCohortSettings(dryRun: true)
+        );
+
+        var previewResult = await previewHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
+            asOf
+        );
+
+        var previewRun = await LoadRunAsync(previewResult.SweepId);
+        var previewSummaries = await LoadSummariesAsync(previewResult.SweepId);
+
+        previewRun.DryRun.Should().BeTrue();
+        previewRun.TotalAffected.Should().Be(3);
+        previewResult.Counts.Should().Contain(
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+        );
+        previewResult.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(SoftDeleteRecord),
+                "soft-delete",
+                tenantId,
+                Strategy.SoftDelete,
+                1
+            )
+        );
+        previewResult.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(AnonymisedContact),
+                "anonymise",
+                tenantId,
+                Strategy.Anonymise,
+                1
+            )
+        );
+        previewSummaries.Should().Contain(
+            new SweepRunEntitySummaryRow(
+                previewResult.SweepId,
+                typeof(Note).FullName!,
+                "short-lived",
+                tenantId,
+                Strategy.Purge,
+                TimeSpan.FromDays(90),
+                1,
+                0,
+                0
+            )
+        );
+        previewSummaries.Should().Contain(
+            new SweepRunEntitySummaryRow(
+                previewResult.SweepId,
+                typeof(SoftDeleteRecord).FullName!,
+                "soft-delete",
+                tenantId,
+                Strategy.SoftDelete,
+                TimeSpan.FromDays(90),
+                1,
+                0,
+                0
+            )
+        );
+        previewSummaries.Should().Contain(
+            new SweepRunEntitySummaryRow(
+                previewResult.SweepId,
+                typeof(AnonymisedContact).FullName!,
+                "anonymise",
+                tenantId,
+                Strategy.Anonymise,
+                TimeSpan.FromDays(90),
+                1,
+                0,
+                0
+            )
+        );
+
+        await using (var afterPreview = Host.CreateDbContext())
+        {
+            (await afterPreview.Notes.AnyAsync(note => note.Id == noteWithinLegalMinId)).Should().BeTrue();
+            (await afterPreview.Notes.AnyAsync(note => note.Id == noteEligibleId)).Should().BeTrue();
+
+            (await afterPreview.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteWithinLegalMinId))
+                .IsDeleted.Should()
+                .BeFalse();
+            (await afterPreview.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteEligibleId))
+                .IsDeleted.Should()
+                .BeFalse();
+
+            var previewWithinLegalMinContact = await afterPreview.AnonymisedContacts.SingleAsync(contact =>
+                contact.Id == contactWithinLegalMinId
+            );
+            previewWithinLegalMinContact.EmailAddress.Should().Be("within-legal-min@example.com");
+
+            var previewEligibleContact = await afterPreview.AnonymisedContacts.SingleAsync(contact =>
+                contact.Id == contactEligibleId
+            );
+            previewEligibleContact.EmailAddress.Should().Be("eligible-legal-min@example.com");
+        }
+
+        using var liveHost = new CohortTestHost(
+            GetConnectionString(),
+            CreateErasureCategoryRepository(
+                shortLivedRule: legalMinRule,
+                softDeleteRule: new RetentionRule(
+                    TimeSpan.FromDays(30),
+                    Strategy.SoftDelete,
+                    TimeSpan.FromDays(90)
+                ),
+                anonymiseRule: new RetentionRule(
+                    TimeSpan.FromDays(30),
+                    Strategy.Anonymise,
+                    TimeSpan.FromDays(90)
+                )
+            ),
+            CreateCohortSettings(dryRun: false)
+        );
+
+        var liveResult = await liveHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
+            asOf
+        );
+
+        var liveRun = await LoadRunAsync(liveResult.SweepId);
+        var liveSummaries = await LoadSummariesAsync(liveResult.SweepId);
+
+        liveRun.DryRun.Should().BeFalse();
+        liveRun.TotalAffected.Should().Be(3);
+        previewResult.Counts.Should().BeEquivalentTo(liveResult.Counts);
+        previewSummaries
+            .Select(ProjectSummary)
+            .Should()
+            .BeEquivalentTo(liveSummaries.Select(ProjectSummary));
+
+        await using var afterLive = Host.CreateDbContext();
+        (await afterLive.Notes.AnyAsync(note => note.Id == noteEligibleId)).Should().BeFalse();
+        (await afterLive.Notes.AnyAsync(note => note.Id == noteWithinLegalMinId)).Should().BeTrue();
+
+        (await afterLive.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteEligibleId))
+            .IsDeleted.Should()
+            .BeTrue();
+        (await afterLive.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteWithinLegalMinId))
+            .IsDeleted.Should()
+            .BeFalse();
+
+        var liveEligibleContact = await afterLive.AnonymisedContacts.SingleAsync(contact =>
+            contact.Id == contactEligibleId
+        );
+        liveEligibleContact.EmailAddress.Should().BeNull();
+        liveEligibleContact.GivenName.Should().BeEmpty();
+        liveEligibleContact.Surname.Should().Be("[redacted]");
+
+        var liveWithinLegalMinContact = await afterLive.AnonymisedContacts.SingleAsync(contact =>
+            contact.Id == contactWithinLegalMinId
+        );
+        liveWithinLegalMinContact.EmailAddress.Should().Be("within-legal-min@example.com");
+        liveWithinLegalMinContact.GivenName.Should().Be("WithinLegalMin");
+        liveWithinLegalMinContact.Surname.Should().Be("Contact");
+    }
+
+    [Fact]
     public async Task Erase_Still_Respects_Active_Holds_After_Cutoff_Gating()
     {
         var tenantId = Guid.NewGuid();

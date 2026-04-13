@@ -18,7 +18,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     : IntegrationTestBase(fixture)
 {
     [Fact]
-    public async Task Erasure_Path_Matches_Subject_Across_Entities_Respects_Holds_And_Persists_Auditable_Counts()
+    public async Task Erase_LivePath_StillMutates_AndWritesDryRunFalse()
     {
         var tenantId = Guid.NewGuid();
         var otherTenantId = Guid.NewGuid();
@@ -181,24 +181,8 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
         using var erasureHost = new CohortTestHost(
             GetConnectionString(),
-            new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
-                {
-                    ["short-lived"] = new StaticRetentionRuleResolver(
-                        new RetentionRule(
-                            TimeSpan.FromDays(30),
-                            Strategy.Purge,
-                            AuditRowDetail: AuditRowDetail.PerRow
-                        )
-                    ),
-                    ["soft-delete"] = new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
-                    ),
-                    ["anonymise"] = new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
-                    ),
-                }
-            )
+            CreateErasureCategoryRepository(),
+            CreateCohortSettings(dryRun: false)
         );
 
         var result = await erasureHost.RunErasureAsync(
@@ -328,7 +312,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task Erasure_DryRun_Returns_Counts_Does_Not_Mutate_And_Persists_DryRun_Audit_Flag()
+    public async Task Erase_DryRun_ReturnsCounts_DoesNotMutate()
     {
         var tenantId = Guid.NewGuid();
         var otherTenantId = Guid.NewGuid();
@@ -341,6 +325,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         var heldSoftDeleteId = Guid.NewGuid();
         var anonymisedContactId = Guid.NewGuid();
         var heldAnonymisedContactId = Guid.NewGuid();
+        var exemptErasureSubjectRecordId = Guid.NewGuid();
 
         await using (var db = Host.CreateDbContext())
         {
@@ -462,6 +447,24 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Notes = "tenant-notes",
                 }
             );
+            db.ErasureSubjectRecords.AddRange(
+                new ErasureSubjectRecord
+                {
+                    Id = exemptErasureSubjectRecordId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "exempt-erasure-subject-record",
+                },
+                new ErasureSubjectRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectId = otherSubjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "other-exempt-erasure-subject-record",
+                }
+            );
             await db.SaveChangesAsync();
         }
 
@@ -469,39 +472,17 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         await CreateHoldAsync("soft_delete_records", heldSoftDeleteId, tenantId, asOf);
         await CreateHoldAsync("anonymised_contacts", heldAnonymisedContactId, tenantId, asOf);
 
-        await using var services = BuildErasureServiceProvider(
+        using var erasureHost = new CohortTestHost(
             GetConnectionString(),
-            new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
-                {
-                    ["short-lived"] = new StaticRetentionRuleResolver(
-                        new RetentionRule(
-                            TimeSpan.FromDays(30),
-                            Strategy.Purge,
-                            AuditRowDetail: AuditRowDetail.PerRow
-                        )
-                    ),
-                    ["soft-delete"] = new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
-                    ),
-                    ["anonymise"] = new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
-                    ),
-                }
-            ),
-            dryRun: true
+            CreateErasureCategoryRepository(),
+            CreateCohortSettings(dryRun: true)
         );
 
-        ErasureResult result;
-        await using (var scope = services.CreateAsyncScope())
-        {
-            var erasureService = scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
-            result = await erasureService.EraseAsync(
-                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope(subjectId),
-                asOf
-            );
-        }
+        var result = await erasureHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
+            asOf
+        );
 
         result.Counts.Should().Contain(
             new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
@@ -552,6 +533,48 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         contacts.Single(contact => contact.Id == heldAnonymisedContactId)
             .EmailAddress.Should()
             .Be("held@example.com");
+        verify.ErasureSubjectRecords.Single(record => record.Id == exemptErasureSubjectRecordId)
+            .Body.Should()
+            .Be("exempt-erasure-subject-record");
+        verify.ErasureSubjectRecords.Should().HaveCount(2);
+    }
+
+    [Fact]
+    public async Task Erase_DryRun_AuditEventReflectsFlag()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "dry-run-audit-note",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var erasureHost = new CohortTestHost(
+            GetConnectionString(),
+            CreateErasureCategoryRepository(),
+            CreateCohortSettings(dryRun: true)
+        );
+
+        var result = await erasureHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
+            asOf
+        );
+
+        var run = await LoadRunAsync(result.SweepId);
+        run.DryRun.Should().BeTrue();
     }
 
     [Fact]
@@ -924,6 +947,36 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         return db.Database.GetConnectionString()!;
     }
 
+    private static IRetentionCategoryRepository CreateErasureCategoryRepository()
+    {
+        return new StaticCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["short-lived"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(
+                        TimeSpan.FromDays(30),
+                        Strategy.Purge,
+                        AuditRowDetail: AuditRowDetail.PerRow
+                    )
+                ),
+                ["soft-delete"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                ),
+                ["anonymise"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                ),
+            }
+        );
+    }
+
+    private static IReadOnlyDictionary<string, string?> CreateCohortSettings(bool dryRun)
+    {
+        return new Dictionary<string, string?>
+        {
+            [$"{CohortOptions.SectionName}:DryRun"] = dryRun.ToString(),
+        };
+    }
+
     private static ServiceProvider BuildAliasSubjectServiceProvider(string connectionString)
     {
         var services = new ServiceCollection();
@@ -943,31 +996,6 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             )
         );
         services.AddCohort<AliasSubjectDbContext>();
-
-        return services.BuildServiceProvider(validateScopes: true);
-    }
-
-    private static ServiceProvider BuildErasureServiceProvider(
-        string connectionString,
-        IRetentionCategoryRepository categoryRepository,
-        bool dryRun
-    )
-    {
-        var services = new ServiceCollection();
-        var configuration = new ConfigurationBuilder()
-            .AddInMemoryCollection(
-                new Dictionary<string, string?>
-                {
-                    [CohortOptions.SectionName + ":DryRun"] = dryRun.ToString(),
-                }
-            )
-            .Build();
-
-        services.AddSingleton<IConfiguration>(configuration);
-        services.AddLogging();
-        services.AddDbContext<SampleDbContext>(options => options.UseNpgsql(connectionString));
-        services.AddSingleton<IRetentionCategoryRepository>(categoryRepository);
-        services.AddCohort<SampleDbContext>();
 
         return services.BuildServiceProvider(validateScopes: true);
     }

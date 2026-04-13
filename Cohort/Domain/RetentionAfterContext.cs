@@ -1,3 +1,5 @@
+using System.Collections.ObjectModel;
+
 namespace Cohort.Domain;
 
 public sealed class RetentionAfterContext<TEntity>
@@ -24,7 +26,9 @@ public sealed class RetentionAfterContext<TEntity>
         TenantId = tenantId;
         At = at;
         Attempt = attempt;
-        Snapshot = snapshot;
+        Snapshot = new ReadOnlyDictionary<string, object?>(
+            new Dictionary<string, object?>(snapshot, StringComparer.Ordinal)
+        );
     }
 
     public Guid SweepId { get; }

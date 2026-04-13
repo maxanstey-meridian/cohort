@@ -1,5 +1,7 @@
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Hosting;
+using Cohort.Infrastructure.Migrations;
 using Cohort.Infrastructure.Sweep;
 using Cohort.Sample.Entities;
 
@@ -9,6 +11,8 @@ using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Sample.Tests;
 
@@ -277,6 +281,335 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
                 Notes = "expired-before-cutoff",
             }
         );
+    }
+
+    [Fact]
+    public async Task Sweep_Path_Uses_A_SetBased_Update_For_Factories_That_Do_Not_Require_Original_Values()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        await using var services = BuildFactoryBackedSweepServiceProvider(database.ConnectionString);
+        var tenantId = Guid.NewGuid();
+        var otherTenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<FactoryBackedSweepDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.SetBasedFactorySweepRecords.AddRange(
+                new SetBasedFactorySweepRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    ExternalId = Guid.NewGuid(),
+                    DisplayName = "expired-a",
+                },
+                new SetBasedFactorySweepRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-90),
+                    ExternalId = Guid.NewGuid(),
+                    DisplayName = "expired-b",
+                },
+                new SetBasedFactorySweepRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-5),
+                    ExternalId = Guid.NewGuid(),
+                    DisplayName = "fresh",
+                },
+                new SetBasedFactorySweepRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = otherTenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    ExternalId = Guid.NewGuid(),
+                    DisplayName = "other-tenant",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        RetentionSweepResult result;
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var engine = scope.ServiceProvider.GetRequiredService<RetentionSweepEngine>();
+            result = await engine.SweepAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                asOf
+            );
+        }
+
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(SetBasedFactorySweepRecord),
+                "factory-backed-set-based",
+                tenantId,
+                Strategy.Anonymise,
+                2
+            )
+        );
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<FactoryBackedSweepDbContext>();
+            var records = await db.SetBasedFactorySweepRecords.OrderBy(record => record.DisplayName).ToListAsync();
+            var factory = scope.ServiceProvider.GetRequiredService<SetBasedGuidFactory>();
+
+            records.Single(record => record.DisplayName == "expired-a").ExternalId.Should().Be(SetBasedGuidFactory.ScrubbedValue);
+            records.Single(record => record.DisplayName == "expired-b").ExternalId.Should().Be(SetBasedGuidFactory.ScrubbedValue);
+            records.Single(record => record.DisplayName == "fresh").ExternalId.Should().NotBe(SetBasedGuidFactory.ScrubbedValue);
+            records.Single(record => record.DisplayName == "other-tenant").ExternalId.Should().NotBe(SetBasedGuidFactory.ScrubbedValue);
+
+            factory.Contexts.Should().ContainSingle();
+            factory.Contexts[0].OriginalValue.Should().BeNull();
+            factory.Contexts[0].TenantId.Should().Be(tenantId);
+            factory.Contexts[0].MemberName.Should().Be(nameof(SetBasedFactorySweepRecord.ExternalId));
+        }
+    }
+
+    [Fact]
+    public async Task Sweep_Path_Uses_PerRow_Execution_For_Factories_That_Require_Original_Values_And_Respects_Holds()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        await using var services = BuildFactoryBackedSweepServiceProvider(database.ConnectionString);
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var firstId = Guid.NewGuid();
+        var secondId = Guid.NewGuid();
+        var heldId = Guid.NewGuid();
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<FactoryBackedSweepDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.PerRowFactorySweepRecords.AddRange(
+                new PerRowFactorySweepRecord
+                {
+                    Id = firstId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    ExternalId = "alpha",
+                    DisplayName = "first",
+                    Notes = "keep-first",
+                },
+                new PerRowFactorySweepRecord
+                {
+                    Id = secondId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-90),
+                    ExternalId = "beta",
+                    DisplayName = "second",
+                    Notes = "keep-second",
+                },
+                new PerRowFactorySweepRecord
+                {
+                    Id = heldId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-90),
+                    ExternalId = "held",
+                    DisplayName = "held",
+                    Notes = "keep-held",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var repository = scope.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>();
+            await repository.CreateAsync(
+                new RetentionHoldRequest(
+                    Guid.NewGuid(),
+                    "per_row_factory_sweep_records",
+                    heldId.ToString(),
+                    tenantId,
+                    "per-row-hold",
+                    asOf.AddDays(-1)
+                ),
+                CancellationToken.None
+            );
+        }
+
+        RetentionSweepResult result;
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var engine = scope.ServiceProvider.GetRequiredService<RetentionSweepEngine>();
+            result = await engine.SweepAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                asOf
+            );
+        }
+
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(PerRowFactorySweepRecord),
+                "factory-backed-per-row",
+                tenantId,
+                Strategy.Anonymise,
+                2
+            )
+        );
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<FactoryBackedSweepDbContext>();
+            var records = await db.PerRowFactorySweepRecords.OrderBy(record => record.DisplayName).ToListAsync();
+            var factory = scope.ServiceProvider.GetRequiredService<OriginalValueEchoFactory>();
+            var setBasedFactory = scope.ServiceProvider.GetRequiredService<SetBasedStringFactory>();
+
+            records.Single(record => record.ExternalId == "alpha-scrubbed").DisplayName.Should().Be(SetBasedStringFactory.ScrubbedValue);
+            records.Single(record => record.ExternalId == "beta-scrubbed").DisplayName.Should().Be(SetBasedStringFactory.ScrubbedValue);
+            records.Single(record => record.Notes == "keep-held").ExternalId.Should().Be("held");
+            records.Single(record => record.Notes == "keep-held").DisplayName.Should().Be("held");
+
+            factory.Contexts.Should().HaveCount(2);
+            factory.Contexts.Select(context => context.OriginalValue).Should().BeEquivalentTo(new object?[] { "alpha", "beta" });
+            factory.Contexts.Should().OnlyContain(context => context.TenantId == tenantId);
+
+            setBasedFactory.Contexts.Should().ContainSingle();
+            setBasedFactory.Contexts[0].OriginalValue.Should().BeNull();
+        }
+    }
+
+    private string GetConnectionString()
+    {
+        using var db = Host.CreateDbContext();
+        return db.Database.GetConnectionString()!;
+    }
+
+    private static ServiceProvider BuildFactoryBackedSweepServiceProvider(string connectionString)
+    {
+        var services = new ServiceCollection();
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection().Build();
+
+        services.AddSingleton<IConfiguration>(configuration);
+        services.AddLogging();
+        services.AddDbContext<FactoryBackedSweepDbContext>(options => options.UseNpgsql(connectionString));
+        services.AddSingleton<IRetentionCategoryRepository>(
+            new StaticCategoryRepository(
+                new Dictionary<string, IRetentionRuleResolver>
+                {
+                    ["factory-backed-set-based"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
+                    ["factory-backed-per-row"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
+                }
+            )
+        );
+        services.AddSingleton<SetBasedGuidFactory>();
+        services.AddSingleton<SetBasedStringFactory>();
+        services.AddSingleton<OriginalValueEchoFactory>();
+        services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<SetBasedGuidFactory>());
+        services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<SetBasedStringFactory>());
+        services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<OriginalValueEchoFactory>());
+        services.AddCohort<FactoryBackedSweepDbContext>();
+
+        return services.BuildServiceProvider(validateScopes: true);
+    }
+
+    private sealed class FactoryBackedSweepDbContext(
+        DbContextOptions<FactoryBackedSweepDbContext> options
+    ) : DbContext(options)
+    {
+        public DbSet<SetBasedFactorySweepRecord> SetBasedFactorySweepRecords => Set<SetBasedFactorySweepRecord>();
+        public DbSet<PerRowFactorySweepRecord> PerRowFactorySweepRecords => Set<PerRowFactorySweepRecord>();
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<SetBasedFactorySweepRecord>(entity =>
+            {
+                entity.ToTable("set_based_factory_sweep_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.TenantId).HasColumnName("tenant_id");
+                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+                entity.Property(record => record.ExternalId).HasColumnName("external_id");
+                entity.Property(record => record.DisplayName).HasColumnName("display_name");
+            });
+
+            modelBuilder.Entity<PerRowFactorySweepRecord>(entity =>
+            {
+                entity.ToTable("per_row_factory_sweep_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.TenantId).HasColumnName("tenant_id");
+                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+                entity.Property(record => record.ExternalId).HasColumnName("external_id");
+                entity.Property(record => record.DisplayName).HasColumnName("display_name");
+                entity.Property(record => record.Notes).HasColumnName("notes");
+            });
+
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    [Retain("factory-backed-set-based", nameof(SetBasedFactorySweepRecord.CreatedAt))]
+    private sealed class SetBasedFactorySweepRecord
+    {
+        public Guid Id { get; set; }
+        public Guid TenantId { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
+
+        [AnonymiseWith(typeof(SetBasedGuidFactory))]
+        public Guid ExternalId { get; set; }
+
+        public string DisplayName { get; set; } = "";
+    }
+
+    [Retain("factory-backed-per-row", nameof(PerRowFactorySweepRecord.CreatedAt))]
+    private sealed class PerRowFactorySweepRecord
+    {
+        public Guid Id { get; set; }
+        public Guid TenantId { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
+
+        [AnonymiseWith(typeof(OriginalValueEchoFactory))]
+        public string ExternalId { get; set; } = "";
+
+        [AnonymiseWith(typeof(SetBasedStringFactory))]
+        public string DisplayName { get; set; } = "";
+
+        public string Notes { get; set; } = "";
+    }
+
+    private sealed class SetBasedGuidFactory : IAnonymiseValueFactory
+    {
+        public static readonly Guid ScrubbedValue = Guid.Parse("11111111-1111-1111-1111-111111111111");
+        public List<AnonymiseValueContext> Contexts { get; } = [];
+
+        public object? Create(AnonymiseValueContext context)
+        {
+            Contexts.Add(context);
+            return ScrubbedValue;
+        }
+    }
+
+    private sealed class SetBasedStringFactory : IAnonymiseValueFactory
+    {
+        public const string ScrubbedValue = "factory-scrubbed";
+        public List<AnonymiseValueContext> Contexts { get; } = [];
+
+        public object? Create(AnonymiseValueContext context)
+        {
+            Contexts.Add(context);
+            return ScrubbedValue;
+        }
+    }
+
+    private sealed class OriginalValueEchoFactory : IAnonymiseValueFactory
+    {
+        public bool RequiresOriginalValue => true;
+        public List<AnonymiseValueContext> Contexts { get; } = [];
+
+        public object? Create(AnonymiseValueContext context)
+        {
+            Contexts.Add(context);
+            return $"{context.OriginalValue}-scrubbed";
+        }
     }
 
     private sealed class StaticCategoryRepository(
@@ -617,18 +950,149 @@ public sealed class AnonymiseSweepStrategyCommandTests
         connection.Commands[1].Parameters["holdAsOf"].Value.Should().Be(now);
     }
 
+    [Fact]
+    public async Task SweepAsync_Uses_A_SetBased_Update_For_FactoryBacked_Fields_That_Do_Not_Require_Original_Values()
+    {
+        var selectedId = Guid.NewGuid();
+        var otherSelectedId = Guid.NewGuid();
+        var strategy = new AnonymiseSweepStrategy([new RecordingSetBasedFactory()]);
+        var connection = new RecordingDbConnection();
+        connection.EnqueueResultSet(selectedId, otherSelectedId);
+        connection.EnqueueResultSet(selectedId, otherSelectedId);
+        var transaction = connection.BeginTransaction();
+        var tenantId = Guid.NewGuid();
+        var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var entry = new RetentionEntry(
+            typeof(CommandSetBasedFactoryRecord),
+            "set_based_factory_sweep_records",
+            "factory-backed-set-based",
+            nameof(CommandSetBasedFactoryRecord.CreatedAt),
+            "created_at_utc",
+            new RecordIdConvention(nameof(CommandSetBasedFactoryRecord.Id), "Id", typeof(Guid)),
+            [new AnonymiseFactoryField(nameof(CommandSetBasedFactoryRecord.ExternalId), "external_id", typeof(RecordingSetBasedFactory))],
+            new TenantConvention(nameof(CommandSetBasedFactoryRecord.TenantId), "tenant_id"),
+            null
+        );
+        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise);
+        var context = new RetentionResolutionContext(
+            "factory-backed-set-based",
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            now,
+            []
+        );
+
+        var affected = await strategy.SweepAsync(
+            entry,
+            rule,
+            context,
+            connection,
+            transaction,
+            CancellationToken.None
+        );
+
+        affected.AffectedRecordIds.Should().HaveCount(2);
+        connection.Commands.Should().HaveCount(2);
+        connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
+        connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
+        connection.Commands[1].CommandText.Should().NotContain("WHERE CAST(target.\"Id\" AS text) = @recordId");
+        connection.Commands[1].Parameters["value0"].Value.Should().Be(RecordingSetBasedFactory.ScrubbedValue);
+    }
+
+    [Fact]
+    public async Task EraseAsync_Uses_PerRow_Updates_For_Factories_That_Require_Original_Values()
+    {
+        var selectedId = Guid.NewGuid();
+        var heldId = Guid.NewGuid();
+        var strategy = new AnonymiseSweepStrategy(
+            [new RecordingOriginalValueFactory(), new RecordingSetBasedStringFactory()]
+        );
+        var connection = new RecordingDbConnection();
+        connection.EnqueueResultSet(selectedId, heldId);
+        connection.EnqueueRowSet(
+            ["Id", "external_id"],
+            [selectedId.ToString(), "alpha"]
+        );
+        connection.EnqueueResultSet(selectedId);
+        var transaction = connection.BeginTransaction();
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var entry = new RetentionEntry(
+            typeof(CommandPerRowFactoryRecord),
+            "per_row_factory_sweep_records",
+            "factory-backed-per-row",
+            nameof(CommandPerRowFactoryRecord.CreatedAt),
+            "created_at_utc",
+            new RecordIdConvention(nameof(CommandPerRowFactoryRecord.Id), "Id", typeof(Guid)),
+            [
+                new AnonymiseFactoryField(nameof(CommandPerRowFactoryRecord.ExternalId), "external_id", typeof(RecordingOriginalValueFactory)),
+                new AnonymiseFactoryField(nameof(CommandPerRowFactoryRecord.DisplayName), "display_name", typeof(RecordingSetBasedStringFactory)),
+            ],
+            new TenantConvention(nameof(CommandPerRowFactoryRecord.TenantId), "tenant_id"),
+            null
+        );
+        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise);
+
+        var affected = await strategy.EraseAsync(
+            entry,
+            rule,
+            new ErasureSubjectMatch("SubjectId", "subject_id", subjectId),
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            now,
+            connection,
+            transaction,
+            CancellationToken.None
+        );
+
+        affected.AffectedRecordIds.Should().Equal(selectedId.ToString());
+        affected.HeldCount.Should().Be(1);
+        connection.Commands.Should().HaveCount(3);
+        connection.Commands[1].CommandText.Should().Contain("\"external_id\"");
+        connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
+        connection.Commands[2].CommandText.Should().Contain("WHERE CAST(target.\"Id\" AS text) = @recordId");
+        connection.Commands[2].Parameters["value0"].Value.Should().Be("alpha-scrubbed");
+        connection.Commands[2].Parameters["value1"].Value.Should().Be(RecordingSetBasedStringFactory.ScrubbedValue);
+    }
+
+    private sealed class CommandSetBasedFactoryRecord
+    {
+        public Guid Id { get; set; }
+        public Guid TenantId { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
+        public Guid ExternalId { get; set; }
+    }
+
+    private sealed class CommandPerRowFactoryRecord
+    {
+        public Guid Id { get; set; }
+        public Guid TenantId { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
+        public string ExternalId { get; set; } = "";
+        public string DisplayName { get; set; } = "";
+    }
+
     private sealed class RecordingDbConnection : DbConnection
     {
         private ConnectionState state = ConnectionState.Closed;
         private string connectionString = "Host=recording";
-        private readonly Queue<Guid[]> queuedResultSets = new();
+        private readonly Queue<RecordingResultSet> queuedResultSets = new();
 
         public RecordingDbCommand? LastCommand { get; private set; }
         public List<RecordingDbCommand> Commands { get; } = [];
 
         public void EnqueueResultSet(params Guid[] values)
         {
-            queuedResultSets.Enqueue(values);
+            queuedResultSets.Enqueue(
+                new RecordingResultSet(
+                    ["Id"],
+                    values.Select(value => new object?[] { value }).ToArray()
+                )
+            );
+        }
+
+        public void EnqueueRowSet(string[] columnNames, params object?[][] rows)
+        {
+            queuedResultSets.Enqueue(new RecordingResultSet(columnNames, rows));
         }
 
         [AllowNull]
@@ -671,9 +1135,11 @@ public sealed class AnonymiseSweepStrategyCommandTests
             return LastCommand;
         }
 
-        public Guid[] DequeueResultSet()
+        public RecordingResultSet DequeueResultSet()
         {
-            return queuedResultSets.Count > 0 ? queuedResultSets.Dequeue() : [Guid.NewGuid()];
+            return queuedResultSets.Count > 0
+                ? queuedResultSets.Dequeue()
+                : new RecordingResultSet(["Id"], [new object?[] { Guid.NewGuid() }]);
         }
     }
 
@@ -741,7 +1207,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
 
         protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
         {
-            return new GuidSequenceDbDataReader(connection.DequeueResultSet());
+            return new RecordingDbDataReader(connection.DequeueResultSet());
         }
 
         public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
@@ -750,12 +1216,12 @@ public sealed class AnonymiseSweepStrategyCommandTests
         }
     }
 
-    private sealed class GuidSequenceDbDataReader(IReadOnlyList<Guid> values) : DbDataReader
+    private sealed class RecordingDbDataReader(RecordingResultSet resultSet) : DbDataReader
     {
         private int index = -1;
 
-        public override int FieldCount => 1;
-        public override bool HasRows => values.Count > 0;
+        public override int FieldCount => resultSet.ColumnNames.Length;
+        public override bool HasRows => resultSet.Rows.Length > 0;
         public override bool IsClosed => false;
         public override int RecordsAffected => 1;
         public override int Depth => 0;
@@ -764,7 +1230,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
 
         public override bool Read()
         {
-            if (index + 1 >= values.Count)
+            if (index + 1 >= resultSet.Rows.Length)
             {
                 return false;
             }
@@ -776,27 +1242,27 @@ public sealed class AnonymiseSweepStrategyCommandTests
         public override Task<bool> ReadAsync(CancellationToken cancellationToken) => Task.FromResult(Read());
         public override bool NextResult() => false;
         public override Task<bool> NextResultAsync(CancellationToken cancellationToken) => Task.FromResult(false);
-        public override Guid GetGuid(int ordinal) => values[index];
-        public override object GetValue(int ordinal) => values[index];
+        public override Guid GetGuid(int ordinal) => (Guid)GetValue(ordinal);
+        public override object GetValue(int ordinal) => resultSet.Rows[index][ordinal]!;
         public override int GetValues(object[] items)
         {
-            items[0] = values[index];
-            return 1;
+            Array.Copy(resultSet.Rows[index], items, resultSet.Rows[index].Length);
+            return resultSet.Rows[index].Length;
         }
 
-        public override string GetName(int ordinal) => "Id";
-        public override string GetDataTypeName(int ordinal) => nameof(Guid);
-        public override Type GetFieldType(int ordinal) => typeof(Guid);
-        public override int GetOrdinal(string name) => 0;
-        public override bool IsDBNull(int ordinal) => false;
-        public override IEnumerator GetEnumerator() => values.GetEnumerator();
+        public override string GetName(int ordinal) => resultSet.ColumnNames[ordinal];
+        public override string GetDataTypeName(int ordinal) => GetFieldType(ordinal).Name;
+        public override Type GetFieldType(int ordinal) => resultSet.Rows[index][ordinal]?.GetType() ?? typeof(DBNull);
+        public override int GetOrdinal(string name) => Array.IndexOf(resultSet.ColumnNames, name);
+        public override bool IsDBNull(int ordinal) => resultSet.Rows[index][ordinal] is null or DBNull;
+        public override IEnumerator GetEnumerator() => resultSet.Rows.GetEnumerator();
 
         public override bool GetBoolean(int ordinal) => throw new NotSupportedException();
         public override byte GetByte(int ordinal) => throw new NotSupportedException();
         public override long GetBytes(int ordinal, long dataOffset, byte[]? buffer, int bufferOffset, int length) => throw new NotSupportedException();
         public override char GetChar(int ordinal) => throw new NotSupportedException();
         public override long GetChars(int ordinal, long dataOffset, char[]? buffer, int bufferOffset, int length) => throw new NotSupportedException();
-        public override string GetString(int ordinal) => throw new NotSupportedException();
+        public override string GetString(int ordinal) => (string)GetValue(ordinal);
         public override short GetInt16(int ordinal) => throw new NotSupportedException();
         public override int GetInt32(int ordinal) => throw new NotSupportedException();
         public override long GetInt64(int ordinal) => throw new NotSupportedException();
@@ -804,6 +1270,29 @@ public sealed class AnonymiseSweepStrategyCommandTests
         public override double GetDouble(int ordinal) => throw new NotSupportedException();
         public override decimal GetDecimal(int ordinal) => throw new NotSupportedException();
         public override DateTime GetDateTime(int ordinal) => throw new NotSupportedException();
+    }
+
+    private sealed record RecordingResultSet(string[] ColumnNames, object?[][] Rows);
+
+    private sealed class RecordingSetBasedFactory : IAnonymiseValueFactory
+    {
+        public static readonly Guid ScrubbedValue = Guid.Parse("22222222-2222-2222-2222-222222222222");
+
+        public object? Create(AnonymiseValueContext context) => ScrubbedValue;
+    }
+
+    private sealed class RecordingSetBasedStringFactory : IAnonymiseValueFactory
+    {
+        public const string ScrubbedValue = "command-scrubbed";
+
+        public object? Create(AnonymiseValueContext context) => ScrubbedValue;
+    }
+
+    private sealed class RecordingOriginalValueFactory : IAnonymiseValueFactory
+    {
+        public bool RequiresOriginalValue => true;
+
+        public object? Create(AnonymiseValueContext context) => $"{context.OriginalValue}-scrubbed";
     }
 
     private sealed class RecordingDbParameter : DbParameter

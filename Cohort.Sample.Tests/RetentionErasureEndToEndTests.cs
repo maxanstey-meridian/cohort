@@ -781,6 +781,186 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Erase_Path_Executes_SetBased_And_PerRow_FactoryBacked_Anonymise_Fields()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        await using var services = BuildFactoryBackedErasureServiceProvider(database.ConnectionString);
+        var tenantId = Guid.NewGuid();
+        var otherTenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var otherSubjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var heldPerRowId = Guid.NewGuid();
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<FactoryBackedErasureDbContext>();
+            await db.Database.EnsureCreatedAsync();
+
+            db.SetBasedFactoryErasureRecords.AddRange(
+                new SetBasedFactoryErasureRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    ExternalId = Guid.NewGuid(),
+                    Notes = "set-based-first",
+                },
+                new SetBasedFactoryErasureRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    ExternalId = Guid.NewGuid(),
+                    Notes = "set-based-second",
+                },
+                new SetBasedFactoryErasureRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectId = otherSubjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    ExternalId = Guid.NewGuid(),
+                    Notes = "set-based-other-subject",
+                },
+                new SetBasedFactoryErasureRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = otherTenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    ExternalId = Guid.NewGuid(),
+                    Notes = "set-based-other-tenant",
+                }
+            );
+
+            db.PerRowFactoryErasureRecords.AddRange(
+                new PerRowFactoryErasureRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    ExternalId = "alpha",
+                    DisplayName = "first",
+                    Notes = "per-row-first",
+                },
+                new PerRowFactoryErasureRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    ExternalId = "beta",
+                    DisplayName = "second",
+                    Notes = "per-row-second",
+                },
+                new PerRowFactoryErasureRecord
+                {
+                    Id = heldPerRowId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    ExternalId = "held",
+                    DisplayName = "held",
+                    Notes = "per-row-held",
+                },
+                new PerRowFactoryErasureRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectId = otherSubjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    ExternalId = "other-subject",
+                    DisplayName = "other-subject",
+                    Notes = "per-row-other-subject",
+                }
+            );
+
+            await db.SaveChangesAsync();
+        }
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var repository = scope.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>();
+            await repository.CreateAsync(
+                new RetentionHoldRequest(
+                    Guid.NewGuid(),
+                    "per_row_factory_erasure_records",
+                    heldPerRowId.ToString(),
+                    tenantId,
+                    "factory-erasure-hold",
+                    asOf.AddDays(-1)
+                ),
+                CancellationToken.None
+            );
+        }
+
+        ErasureResult result;
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var erasureService = scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
+            result = await erasureService.EraseAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                new ErasureScope(subjectId),
+                asOf
+            );
+        }
+
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(SetBasedFactoryErasureRecord),
+                "factory-backed-set-based-erasure",
+                tenantId,
+                Strategy.Anonymise,
+                2
+            )
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(PerRowFactoryErasureRecord),
+                "factory-backed-per-row-erasure",
+                tenantId,
+                Strategy.Anonymise,
+                2
+            )
+        );
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<FactoryBackedErasureDbContext>();
+            var setBasedRecords = await db.SetBasedFactoryErasureRecords.OrderBy(record => record.Notes).ToListAsync();
+            var perRowRecords = await db.PerRowFactoryErasureRecords.OrderBy(record => record.Notes).ToListAsync();
+            var setBasedFactory = scope.ServiceProvider.GetRequiredService<FactorySetBasedGuidFactory>();
+            var originalFactory = scope.ServiceProvider.GetRequiredService<FactoryOriginalValueEchoFactory>();
+            var perRowSetBasedFactory = scope.ServiceProvider.GetRequiredService<FactorySetBasedStringFactory>();
+
+            setBasedRecords.Single(record => record.Notes == "set-based-first").ExternalId.Should().Be(FactorySetBasedGuidFactory.ScrubbedValue);
+            setBasedRecords.Single(record => record.Notes == "set-based-second").ExternalId.Should().Be(FactorySetBasedGuidFactory.ScrubbedValue);
+            setBasedRecords.Single(record => record.Notes == "set-based-other-subject").ExternalId.Should().NotBe(FactorySetBasedGuidFactory.ScrubbedValue);
+            setBasedRecords.Single(record => record.Notes == "set-based-other-tenant").ExternalId.Should().NotBe(FactorySetBasedGuidFactory.ScrubbedValue);
+
+            perRowRecords.Single(record => record.ExternalId == "alpha-scrubbed").DisplayName.Should().Be(FactorySetBasedStringFactory.ScrubbedValue);
+            perRowRecords.Single(record => record.ExternalId == "beta-scrubbed").DisplayName.Should().Be(FactorySetBasedStringFactory.ScrubbedValue);
+            perRowRecords.Single(record => record.Notes == "per-row-held").ExternalId.Should().Be("held");
+            perRowRecords.Single(record => record.Notes == "per-row-held").DisplayName.Should().Be("held");
+            perRowRecords.Single(record => record.Notes == "per-row-other-subject").ExternalId.Should().Be("other-subject");
+
+            setBasedFactory.Contexts.Should().ContainSingle();
+            setBasedFactory.Contexts[0].OriginalValue.Should().BeNull();
+
+            originalFactory.Contexts.Should().HaveCount(2);
+            originalFactory.Contexts.Select(context => context.OriginalValue).Should().BeEquivalentTo(new object?[] { "alpha", "beta" });
+            originalFactory.Contexts.Should().OnlyContain(context => context.TenantId == tenantId);
+
+            perRowSetBasedFactory.Contexts.Should().ContainSingle();
+            perRowSetBasedFactory.Contexts[0].OriginalValue.Should().BeNull();
+        }
+    }
+
+    [Fact]
     public async Task Erasure_Audit_Persists_The_Effective_Resolved_Period_When_Legal_Min_Exceeds_The_Base_Period()
     {
         var tenantId = Guid.NewGuid();
@@ -1094,6 +1274,38 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         };
     }
 
+    private static ServiceProvider BuildFactoryBackedErasureServiceProvider(string connectionString)
+    {
+        var services = new ServiceCollection();
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection().Build();
+
+        services.AddSingleton<IConfiguration>(configuration);
+        services.AddLogging();
+        services.AddDbContext<FactoryBackedErasureDbContext>(options => options.UseNpgsql(connectionString));
+        services.AddSingleton<IRetentionCategoryRepository>(
+            new StaticCategoryRepository(
+                new Dictionary<string, IRetentionRuleResolver>
+                {
+                    ["factory-backed-set-based-erasure"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
+                    ["factory-backed-per-row-erasure"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
+                }
+            )
+        );
+        services.AddSingleton<FactorySetBasedGuidFactory>();
+        services.AddSingleton<FactorySetBasedStringFactory>();
+        services.AddSingleton<FactoryOriginalValueEchoFactory>();
+        services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<FactorySetBasedGuidFactory>());
+        services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<FactorySetBasedStringFactory>());
+        services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<FactoryOriginalValueEchoFactory>());
+        services.AddCohort<FactoryBackedErasureDbContext>();
+
+        return services.BuildServiceProvider(validateScopes: true);
+    }
+
     private static ServiceProvider BuildAliasSubjectServiceProvider(string connectionString)
     {
         var services = new ServiceCollection();
@@ -1115,6 +1327,115 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         services.AddCohort<AliasSubjectDbContext>();
 
         return services.BuildServiceProvider(validateScopes: true);
+    }
+}
+
+internal sealed class FactoryBackedErasureDbContext(
+    DbContextOptions<FactoryBackedErasureDbContext> options
+) : DbContext(options)
+{
+    public DbSet<SetBasedFactoryErasureRecord> SetBasedFactoryErasureRecords => Set<SetBasedFactoryErasureRecord>();
+    public DbSet<PerRowFactoryErasureRecord> PerRowFactoryErasureRecords => Set<PerRowFactoryErasureRecord>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<SetBasedFactoryErasureRecord>(entity =>
+        {
+            entity.ToTable("set_based_factory_erasure_records");
+            entity.HasKey(record => record.Id);
+            entity.Property(record => record.TenantId).HasColumnName("tenant_id");
+            entity.Property(record => record.SubjectId).HasColumnName("subject_id");
+            entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+            entity.Property(record => record.ExternalId).HasColumnName("external_id");
+            entity.Property(record => record.Notes).HasColumnName("notes");
+        });
+
+        modelBuilder.Entity<PerRowFactoryErasureRecord>(entity =>
+        {
+            entity.ToTable("per_row_factory_erasure_records");
+            entity.HasKey(record => record.Id);
+            entity.Property(record => record.TenantId).HasColumnName("tenant_id");
+            entity.Property(record => record.SubjectId).HasColumnName("subject_id");
+            entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+            entity.Property(record => record.ExternalId).HasColumnName("external_id");
+            entity.Property(record => record.DisplayName).HasColumnName("display_name");
+            entity.Property(record => record.Notes).HasColumnName("notes");
+        });
+
+        modelBuilder.ConfigureCohortTables();
+    }
+}
+
+[Retain("factory-backed-set-based-erasure", nameof(SetBasedFactoryErasureRecord.CreatedAt))]
+internal sealed class SetBasedFactoryErasureRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+
+    [ErasureSubject]
+    public Guid? SubjectId { get; set; }
+
+    public DateTimeOffset CreatedAt { get; set; }
+
+    [AnonymiseWith(typeof(FactorySetBasedGuidFactory))]
+    public Guid ExternalId { get; set; }
+
+    public string Notes { get; set; } = "";
+}
+
+[Retain("factory-backed-per-row-erasure", nameof(PerRowFactoryErasureRecord.CreatedAt))]
+internal sealed class PerRowFactoryErasureRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+
+    [ErasureSubject]
+    public Guid? SubjectId { get; set; }
+
+    public DateTimeOffset CreatedAt { get; set; }
+
+    [AnonymiseWith(typeof(FactoryOriginalValueEchoFactory))]
+    public string ExternalId { get; set; } = "";
+
+    [AnonymiseWith(typeof(FactorySetBasedStringFactory))]
+    public string DisplayName { get; set; } = "";
+
+    public string Notes { get; set; } = "";
+}
+
+internal sealed class FactorySetBasedGuidFactory : IAnonymiseValueFactory
+{
+    public static readonly Guid ScrubbedValue = Guid.Parse("33333333-3333-3333-3333-333333333333");
+    public List<AnonymiseValueContext> Contexts { get; } = [];
+
+    public object? Create(AnonymiseValueContext context)
+    {
+        Contexts.Add(context);
+        return ScrubbedValue;
+    }
+}
+
+internal sealed class FactorySetBasedStringFactory : IAnonymiseValueFactory
+{
+    public const string ScrubbedValue = "erasure-factory-scrubbed";
+    public List<AnonymiseValueContext> Contexts { get; } = [];
+
+    public object? Create(AnonymiseValueContext context)
+    {
+        Contexts.Add(context);
+        return ScrubbedValue;
+    }
+}
+
+internal sealed class FactoryOriginalValueEchoFactory : IAnonymiseValueFactory
+{
+    public bool RequiresOriginalValue => true;
+    public List<AnonymiseValueContext> Contexts { get; } = [];
+
+    public object? Create(AnonymiseValueContext context)
+    {
+        Contexts.Add(context);
+        return $"{context.OriginalValue}-scrubbed";
     }
 }
 

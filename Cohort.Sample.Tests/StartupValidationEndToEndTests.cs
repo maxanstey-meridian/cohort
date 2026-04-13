@@ -172,27 +172,22 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     [Fact]
-    public async Task Startup_Path_Rejects_Registered_FactoryBacked_Anonymise_Metadata_Until_Execution_Exists()
+    public async Task Startup_Path_Allows_Registered_FactoryBacked_Anonymise_Metadata()
     {
-        var act = async () =>
-            await RunFactoryValidationStartupAsync<RegisteredFactoryStartupDbContext>(
-                new SingleCategoryRepository(
-                    "registered-factory",
-                    new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
-                    )
-                ),
-                services => services.AddSingleton<IAnonymiseValueFactory, RegisteredFactory>()
-            );
+        var entries = await RunFactoryValidationStartupAsync<RegisteredFactoryStartupDbContext>(
+            new SingleCategoryRepository(
+                "registered-factory",
+                new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                )
+            ),
+            services => services.AddSingleton<IAnonymiseValueFactory, RegisteredFactory>()
+        );
 
-        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().ContainSingle();
-        exception
-            .Which.Errors[0]
-            .Should()
-            .Be(
-                $"Anonymise convention on {typeof(RegisteredFactoryStartupRecord).FullName}: [AnonymiseWith] member ExternalId requires factory-backed execution that is not available in this version."
-            );
+        entries.Should().ContainKey(typeof(RegisteredFactoryStartupRecord));
+        entries[typeof(RegisteredFactoryStartupRecord)]
+            .AnonymiseFields.Should()
+            .ContainSingle(field => field is AnonymiseFactoryField);
     }
 
     [Fact]
@@ -215,25 +210,20 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     [Fact]
-    public async Task Startup_Path_Rejects_Registered_FactoryBacked_Metadata_When_Strategy_Is_Deferred()
+    public async Task Startup_Path_Allows_Registered_FactoryBacked_Metadata_When_Strategy_Is_Deferred()
     {
-        var act = async () =>
-            await RunFactoryValidationStartupAsync<RegisteredFactoryStartupDbContext>(
-                new SingleCategoryRepository(
-                    "registered-factory",
-                    new DeferredRuleResolver(new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise))
-                ),
-                services => services.AddSingleton<IAnonymiseValueFactory, RegisteredFactory>()
-            );
+        var entries = await RunFactoryValidationStartupAsync<RegisteredFactoryStartupDbContext>(
+            new SingleCategoryRepository(
+                "registered-factory",
+                new DeferredRuleResolver(new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise))
+            ),
+            services => services.AddSingleton<IAnonymiseValueFactory, RegisteredFactory>()
+        );
 
-        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().ContainSingle();
-        exception
-            .Which.Errors[0]
-            .Should()
-            .Be(
-                $"Anonymise convention on {typeof(RegisteredFactoryStartupRecord).FullName}: [AnonymiseWith] member ExternalId requires factory-backed execution that is not available in this version."
-            );
+        entries.Should().ContainKey(typeof(RegisteredFactoryStartupRecord));
+        entries[typeof(RegisteredFactoryStartupRecord)]
+            .AnonymiseFields.Should()
+            .ContainSingle(field => field is AnonymiseFactoryField);
     }
 
     private async Task<IReadOnlyDictionary<Type, RetentionEntry>> RunFactoryValidationStartupAsync<TContext>(

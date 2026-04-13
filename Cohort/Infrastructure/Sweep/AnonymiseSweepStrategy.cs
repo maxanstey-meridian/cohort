@@ -8,8 +8,15 @@ using Cohort.Infrastructure.Holds;
 
 namespace Cohort.Infrastructure.Sweep;
 
-public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
+public sealed class AnonymiseSweepStrategy(
+    IEnumerable<IAnonymiseValueFactory>? anonymiseValueFactories = null
+) : IRetentionSweepStrategy
 {
+    private readonly IReadOnlyDictionary<Type, IAnonymiseValueFactory> factories =
+        (anonymiseValueFactories ?? Array.Empty<IAnonymiseValueFactory>())
+        .GroupBy(factory => factory.GetType())
+        .ToDictionary(group => group.Key, group => group.Last());
+
     public Strategy HandlesStrategy => Strategy.Anonymise;
 
     public async Task<int> PreviewAsync(
@@ -119,29 +126,26 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             return new SweepExecutionResult([], 0);
         }
 
-        await using var command = conn.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = BuildCommandText(entry, entry.Tenant?.TenantColumn, command, entry.RecordId.RecordIdColumn);
-        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
-        if (entry.Tenant is not null)
-        {
-            command.Parameters.Add(CreateParameter(command, "tenantId", ctx.Tenant.Id));
-        }
-        command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
-        command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
-        command.Parameters.Add(CreateParameter(command, "holdAsOf", ctx.Now));
-
-        var affectedRecordIds = new List<string>();
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
-        {
-            affectedRecordIds.Add(reader.GetValue(0).ToString()!);
-        }
-
-        return new SweepExecutionResult(
-            affectedRecordIds,
-            candidateRecordIds.Count - affectedRecordIds.Count
-        );
+        return RequiresPerRowExecution(entry)
+            ? await ExecutePerRowSweepAsync(
+                entry,
+                ctx.Tenant,
+                ctx.Now,
+                conn,
+                transaction,
+                candidateRecordIds,
+                ct
+            )
+            : await ExecuteSetBasedSweepAsync(
+                entry,
+                ctx.Tenant,
+                ctx.Now,
+                conn,
+                transaction,
+                candidateRecordIds,
+                cutoff,
+                ct
+            );
     }
 
     public async Task<int> PreviewEraseAsync(
@@ -271,11 +275,83 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             return new SweepExecutionResult([], 0);
         }
 
+        return RequiresPerRowExecution(entry)
+            ? await ExecutePerRowErasureAsync(
+                entry,
+                tenant,
+                now,
+                conn,
+                transaction,
+                candidateRecordIds,
+                ct
+            )
+            : await ExecuteSetBasedErasureAsync(
+                entry,
+                match,
+                tenant,
+                now,
+                conn,
+                transaction,
+                candidateRecordIds,
+                ct
+            );
+    }
+
+    private async Task<SweepExecutionResult> ExecuteSetBasedSweepAsync(
+        RetentionEntry entry,
+        TenantContext tenant,
+        DateTimeOffset now,
+        DbConnection conn,
+        DbTransaction transaction,
+        IReadOnlyList<string> candidateRecordIds,
+        DateTimeOffset cutoff,
+        CancellationToken ct
+    )
+    {
+        await using var command = conn.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = BuildCommandText(
+            entry,
+            entry.Tenant?.TenantColumn,
+            tenant.Id,
+            now,
+            command,
+            entry.RecordId.RecordIdColumn
+        );
+        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
+        if (entry.Tenant is not null)
+        {
+            command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
+        }
+        command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
+        command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
+        command.Parameters.Add(CreateParameter(command, "holdAsOf", now));
+
+        var affectedRecordIds = await ReadAffectedRecordIdsAsync(command, ct);
+        return new SweepExecutionResult(
+            affectedRecordIds,
+            candidateRecordIds.Count - affectedRecordIds.Count
+        );
+    }
+
+    private async Task<SweepExecutionResult> ExecuteSetBasedErasureAsync(
+        RetentionEntry entry,
+        ErasureSubjectMatch match,
+        TenantContext tenant,
+        DateTimeOffset now,
+        DbConnection conn,
+        DbTransaction transaction,
+        IReadOnlyList<string> candidateRecordIds,
+        CancellationToken ct
+    )
+    {
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = BuildErasureCommandText(
             entry,
             entry.Tenant?.TenantColumn,
+            tenant.Id,
+            now,
             match,
             command,
             entry.RecordId.RecordIdColumn
@@ -289,6 +365,273 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
         command.Parameters.Add(CreateParameter(command, "holdAsOf", now));
 
+        var affectedRecordIds = await ReadAffectedRecordIdsAsync(command, ct);
+        return new SweepExecutionResult(
+            affectedRecordIds,
+            candidateRecordIds.Count - affectedRecordIds.Count
+        );
+    }
+
+    private async Task<SweepExecutionResult> ExecutePerRowSweepAsync(
+        RetentionEntry entry,
+        TenantContext tenant,
+        DateTimeOffset now,
+        DbConnection conn,
+        DbTransaction transaction,
+        IReadOnlyList<string> candidateRecordIds,
+        CancellationToken ct
+    )
+    {
+        var updatableRows = await LoadUpdatableRowsAsync(
+            entry,
+            tenant,
+            now,
+            conn,
+            transaction,
+            candidateRecordIds,
+            ct
+        );
+        if (updatableRows.Count == 0)
+        {
+            return new SweepExecutionResult([], candidateRecordIds.Count);
+        }
+
+        var affectedRecordIds = await ExecutePerRowUpdatesAsync(
+            entry,
+            tenant,
+            now,
+            conn,
+            transaction,
+            updatableRows,
+            ct
+        );
+        return new SweepExecutionResult(
+            affectedRecordIds,
+            candidateRecordIds.Count - affectedRecordIds.Count
+        );
+    }
+
+    private async Task<SweepExecutionResult> ExecutePerRowErasureAsync(
+        RetentionEntry entry,
+        TenantContext tenant,
+        DateTimeOffset now,
+        DbConnection conn,
+        DbTransaction transaction,
+        IReadOnlyList<string> candidateRecordIds,
+        CancellationToken ct
+    )
+    {
+        var updatableRows = await LoadUpdatableRowsAsync(
+            entry,
+            tenant,
+            now,
+            conn,
+            transaction,
+            candidateRecordIds,
+            ct
+        );
+        if (updatableRows.Count == 0)
+        {
+            return new SweepExecutionResult([], candidateRecordIds.Count);
+        }
+
+        var affectedRecordIds = await ExecutePerRowUpdatesAsync(
+            entry,
+            tenant,
+            now,
+            conn,
+            transaction,
+            updatableRows,
+            ct
+        );
+        return new SweepExecutionResult(
+            affectedRecordIds,
+            candidateRecordIds.Count - affectedRecordIds.Count
+        );
+    }
+
+    private async Task<IReadOnlyList<string>> ExecutePerRowUpdatesAsync(
+        RetentionEntry entry,
+        TenantContext tenant,
+        DateTimeOffset now,
+        DbConnection conn,
+        DbTransaction transaction,
+        IReadOnlyList<AnonymiseRowSnapshot> rows,
+        CancellationToken ct
+    )
+    {
+        var staticAssignments = CreateStaticAssignments(entry, tenant.Id, now);
+        var affectedRecordIds = new List<string>(rows.Count);
+
+        foreach (var row in rows)
+        {
+            await using var command = conn.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = BuildPerRowCommandText(
+                entry,
+                entry.Tenant?.TenantColumn,
+                entry.RecordId.RecordIdColumn
+            );
+
+            for (var index = 0; index < entry.AnonymiseFields.Count; index++)
+            {
+                var field = entry.AnonymiseFields[index];
+                var parameterName = $"value{index}";
+                var value = field switch
+                {
+                    AnonymiseLiteralField literalField => CreateLiteralAssignmentValue(literalField),
+                    AnonymiseFactoryField factoryField when ResolveFactory(factoryField).RequiresOriginalValue
+                        => ResolveFactory(factoryField)
+                            .Create(
+                                new AnonymiseValueContext(
+                                    entry.EntityType,
+                                    factoryField.MemberName,
+                                    row.OriginalValues[factoryField.MemberName],
+                                    now,
+                                    tenant.Id
+                                )
+                            ),
+                    AnonymiseFactoryField factoryField => staticAssignments[factoryField.MemberName],
+                    _ => throw new InvalidOperationException(
+                        $"Anonymise field '{field.MemberName}' is not supported."
+                    ),
+                };
+                command.Parameters.Add(CreateParameter(command, parameterName, value));
+            }
+
+            command.Parameters.Add(CreateParameter(command, "recordId", row.RecordId));
+            if (entry.Tenant is not null)
+            {
+                command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
+            }
+            command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
+            command.Parameters.Add(CreateParameter(command, "holdAsOf", now));
+
+            await using var reader = await command.ExecuteReaderAsync(ct);
+            if (await reader.ReadAsync(ct))
+            {
+                affectedRecordIds.Add(reader.GetValue(0).ToString()!);
+            }
+        }
+
+        return affectedRecordIds;
+    }
+
+    private async Task<IReadOnlyList<AnonymiseRowSnapshot>> LoadUpdatableRowsAsync(
+        RetentionEntry entry,
+        TenantContext tenant,
+        DateTimeOffset now,
+        DbConnection conn,
+        DbTransaction transaction,
+        IReadOnlyList<string> candidateRecordIds,
+        CancellationToken ct
+    )
+    {
+        var originalValueFields = entry.AnonymiseFields
+            .OfType<AnonymiseFactoryField>()
+            .Where(field => ResolveFactory(field).RequiresOriginalValue)
+            .ToArray();
+        var tenantClause = entry.Tenant is not null
+            ? $"AND target.{QuoteIdentifier(entry.Tenant.TenantColumn)} = @tenantId"
+            : "";
+        var selectedColumns = originalValueFields
+            .Select(field => $"target.{QuoteIdentifier(field.ColumnName)}")
+            .ToArray();
+
+        await using var command = conn.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            $"""
+            SELECT CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text), {string.Join(", ", selectedColumns)}
+            FROM {QuoteIdentifier(entry.TableName)} AS target
+            WHERE CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) = ANY(@candidateIds)
+              {tenantClause}
+              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn, entry.Tenant?.TenantColumn)}
+            ORDER BY CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text)
+            """;
+        command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
+        if (entry.Tenant is not null)
+        {
+            command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
+        }
+        command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
+        command.Parameters.Add(CreateParameter(command, "holdAsOf", now));
+
+        var rows = new List<AnonymiseRowSnapshot>();
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            var originalValues = new Dictionary<string, object?>(StringComparer.Ordinal);
+            for (var index = 0; index < originalValueFields.Length; index++)
+            {
+                originalValues[originalValueFields[index].MemberName] = reader.IsDBNull(index + 1)
+                    ? null
+                    : reader.GetValue(index + 1);
+            }
+
+            rows.Add(new AnonymiseRowSnapshot(reader.GetString(0), originalValues));
+        }
+
+        return rows;
+    }
+
+    private Dictionary<string, object?> CreateStaticAssignments(
+        RetentionEntry entry,
+        Guid tenantId,
+        DateTimeOffset now
+    )
+    {
+        var values = new Dictionary<string, object?>(StringComparer.Ordinal);
+        foreach (var field in entry.AnonymiseFields)
+        {
+            values[field.MemberName] = field switch
+            {
+                AnonymiseLiteralField literalField => CreateLiteralAssignmentValue(literalField),
+                AnonymiseFactoryField factoryField when !ResolveFactory(factoryField).RequiresOriginalValue
+                    => ResolveFactory(factoryField)
+                        .Create(
+                            new AnonymiseValueContext(
+                                entry.EntityType,
+                                factoryField.MemberName,
+                                null,
+                                now,
+                                tenantId
+                            )
+                        ),
+                AnonymiseFactoryField => null,
+                _ => throw new InvalidOperationException(
+                    $"Anonymise field '{field.MemberName}' is not supported."
+                ),
+            };
+        }
+
+        return values;
+    }
+
+    private bool RequiresPerRowExecution(RetentionEntry entry)
+    {
+        return entry.AnonymiseFields
+            .OfType<AnonymiseFactoryField>()
+            .Any(field => ResolveFactory(field).RequiresOriginalValue);
+    }
+
+    private IAnonymiseValueFactory ResolveFactory(AnonymiseFactoryField field)
+    {
+        if (!factories.TryGetValue(field.FactoryType, out var factory))
+        {
+            throw new InvalidOperationException(
+                $"Anonymise field '{field.MemberName}' requires factory type {field.FactoryType.FullName}, but no matching {nameof(IAnonymiseValueFactory)} is registered."
+            );
+        }
+
+        return factory;
+    }
+
+    private async Task<List<string>> ReadAffectedRecordIdsAsync(
+        DbCommand command,
+        CancellationToken ct
+    )
+    {
         var affectedRecordIds = new List<string>();
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
@@ -296,15 +639,14 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             affectedRecordIds.Add(reader.GetValue(0).ToString()!);
         }
 
-        return new SweepExecutionResult(
-            affectedRecordIds,
-            candidateRecordIds.Count - affectedRecordIds.Count
-        );
+        return affectedRecordIds;
     }
 
-    private static string BuildCommandText(
+    private string BuildCommandText(
         RetentionEntry entry,
         string? tenantColumn,
+        Guid tenantId,
+        DateTimeOffset now,
         DbCommand command,
         string recordIdColumn
     )
@@ -317,7 +659,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             var parameterName = $"value{index}";
             assignments.Add($"{QuoteIdentifier(field.ColumnName)} = @{parameterName}");
             command.Parameters.Add(
-                CreateParameter(command, parameterName, CreateAssignmentValue(field))
+                CreateParameter(command, parameterName, CreateSetBasedAssignmentValue(entry, field, tenantId, now))
             );
         }
 
@@ -337,9 +679,11 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             """;
     }
 
-    private static string BuildErasureCommandText(
+    private string BuildErasureCommandText(
         RetentionEntry entry,
         string? tenantColumn,
+        Guid tenantId,
+        DateTimeOffset now,
         ErasureSubjectMatch match,
         DbCommand command,
         string recordIdColumn
@@ -353,7 +697,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             var parameterName = $"value{index}";
             assignments.Add($"{QuoteIdentifier(field.ColumnName)} = @{parameterName}");
             command.Parameters.Add(
-                CreateParameter(command, parameterName, CreateAssignmentValue(field))
+                CreateParameter(command, parameterName, CreateSetBasedAssignmentValue(entry, field, tenantId, now))
             );
         }
 
@@ -368,6 +712,35 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
               {tenantClause}
               AND CAST(target.{QuoteIdentifier(recordIdColumn)} AS text) = ANY(@candidateIds)
+              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn, tenantColumn)}
+            RETURNING target.{QuoteIdentifier(recordIdColumn)}
+            """;
+    }
+
+    private static string BuildPerRowCommandText(
+        RetentionEntry entry,
+        string? tenantColumn,
+        string recordIdColumn
+    )
+    {
+        var assignments = new List<string>(entry.AnonymiseFields.Count);
+
+        for (var index = 0; index < entry.AnonymiseFields.Count; index++)
+        {
+            var field = entry.AnonymiseFields[index];
+            assignments.Add($"{QuoteIdentifier(field.ColumnName)} = @value{index}");
+        }
+
+        var tenantClause = tenantColumn is not null
+            ? $"AND target.{QuoteIdentifier(tenantColumn)} = @tenantId"
+            : "";
+
+        return
+            $"""
+            UPDATE {QuoteIdentifier(entry.TableName)} AS target
+            SET {string.Join(", ", assignments)}
+            WHERE CAST(target.{QuoteIdentifier(recordIdColumn)} AS text) = @recordId
+              {tenantClause}
               AND {RetentionHoldSql.BuildActiveHoldExclusion("target", recordIdColumn, tenantColumn)}
             RETURNING target.{QuoteIdentifier(recordIdColumn)}
             """;
@@ -490,15 +863,38 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         return candidateRecordIds;
     }
 
-    private static object CreateAssignmentValue(AnonymiseField field)
+    private object? CreateSetBasedAssignmentValue(
+        RetentionEntry entry,
+        AnonymiseField field,
+        Guid tenantId,
+        DateTimeOffset now
+    )
     {
-        if (field is not AnonymiseLiteralField literalField)
+        return field switch
         {
-            throw new InvalidOperationException(
-                $"Anonymise field '{field.MemberName}' requires factory-backed execution that is not available in this version."
-            );
-        }
+            AnonymiseLiteralField literalField => CreateLiteralAssignmentValue(literalField),
+            AnonymiseFactoryField factoryField when !ResolveFactory(factoryField).RequiresOriginalValue
+                => ResolveFactory(factoryField)
+                    .Create(
+                        new AnonymiseValueContext(
+                            entry.EntityType,
+                            factoryField.MemberName,
+                            null,
+                            now,
+                            tenantId
+                        )
+                    ),
+            AnonymiseFactoryField factoryField => throw new InvalidOperationException(
+                $"Anonymise field '{factoryField.MemberName}' requires original-value execution and cannot run on the set-based anonymise path."
+            ),
+            _ => throw new InvalidOperationException(
+                $"Anonymise field '{field.MemberName}' is not supported."
+            ),
+        };
+    }
 
+    private static object CreateLiteralAssignmentValue(AnonymiseLiteralField literalField)
+    {
         return literalField.Method switch
         {
             AnonymiseMethod.Null => DBNull.Value,
@@ -513,11 +909,11 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         };
     }
 
-    private static DbParameter CreateParameter(DbCommand command, string name, object value)
+    private static DbParameter CreateParameter(DbCommand command, string name, object? value)
     {
         var parameter = command.CreateParameter();
         parameter.ParameterName = name;
-        parameter.Value = value;
+        parameter.Value = value ?? DBNull.Value;
         return parameter;
     }
 
@@ -525,4 +921,9 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
     {
         return $"\"{identifier.Replace("\"", "\"\"")}\"";
     }
+
+    private sealed record AnonymiseRowSnapshot(
+        string RecordId,
+        IReadOnlyDictionary<string, object?> OriginalValues
+    );
 }

@@ -89,12 +89,6 @@ public sealed class RetentionStartupValidator(
                         errors,
                         $"Anonymise convention on {clrType.FullName}:"
                     );
-                    ValidateFactoryBackedAnonymiseExecutionSupport(
-                        entry,
-                        startupRule,
-                        errors,
-                        $"Anonymise convention on {clrType.FullName}:"
-                    );
                 }
 
                 if (startupRule?.Strategy == Strategy.SoftDelete)
@@ -118,36 +112,6 @@ public sealed class RetentionStartupValidator(
         if (errors.Count > 0)
         {
             throw new RetentionConfigurationException(errors);
-        }
-    }
-
-    private void ValidateFactoryBackedAnonymiseExecutionSupport(
-        RetentionEntry entry,
-        RetentionRule? startupRule,
-        List<string> errors,
-        string messagePrefix
-    )
-    {
-        if (startupRule is not null && startupRule.Strategy != Strategy.Anonymise)
-        {
-            return;
-        }
-
-        foreach (var field in entry.AnonymiseFields.OfType<AnonymiseFactoryField>())
-        {
-            if (!typeof(IAnonymiseValueFactory).IsAssignableFrom(field.FactoryType))
-            {
-                continue;
-            }
-
-            if (!registeredAnonymiseFactoryTypes.Contains(field.FactoryType))
-            {
-                continue;
-            }
-
-            errors.Add(
-                $"{messagePrefix} [AnonymiseWith] member {field.MemberName} requires factory-backed execution that is not available in this version."
-            );
         }
     }
 

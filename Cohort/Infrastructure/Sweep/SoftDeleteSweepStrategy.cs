@@ -512,6 +512,23 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             return new SweepExecutionResult([], 0);
         }
 
+        var handlers = RetentionHandlerSupport.ResolveHandlers(services, entry.EntityType);
+        if (execution is not null && handlers.Count > 0)
+        {
+            return await ExecuteHandlerAwareSweepAsync(
+                entry,
+                rule,
+                new RetentionResolutionContext(entry.Category, tenant, now, []),
+                conn,
+                transaction,
+                candidateRecordIds,
+                handlers,
+                execution,
+                softDelete,
+                ct
+            );
+        }
+
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = BuildErasureCommandText(

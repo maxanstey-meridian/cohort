@@ -130,7 +130,8 @@ public sealed class RetentionErasureService(
                             now,
                             connection,
                             dbTransaction,
-                            ct
+                            ct,
+                            new SweepMutationContext(sweepId, eventAt)
                         ),
                         -1
                     ),
@@ -167,7 +168,10 @@ public sealed class RetentionErasureService(
                 var effectiveAuditDetail = entry.AuditRowDetail == AuditRowDetail.Inherit
                     ? rule.AuditRowDetail
                     : entry.AuditRowDetail;
-                if (effectiveAuditDetail == AuditRowDetail.PerRow)
+                if (
+                    effectiveAuditDetail == AuditRowDetail.PerRow
+                    && !execution.RowDetailsPersisted
+                )
                 {
                     foreach (var recordId in execution.AffectedRecordIds)
                     {

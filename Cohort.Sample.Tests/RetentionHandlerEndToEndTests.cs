@@ -324,6 +324,311 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         );
     }
 
+    [Fact]
+    public async Task Live_Erasure_With_Handlers_Captures_Target_Rows_And_Skips_Held_And_Exempt_Work()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var heldNoteId = Guid.NewGuid();
+        var softDeleteId = Guid.NewGuid();
+        var heldSoftDeleteId = Guid.NewGuid();
+        var contactId = Guid.NewGuid();
+        var heldContactId = Guid.NewGuid();
+        var exemptRecordId = Guid.NewGuid();
+        var sink = new HandlerExecutionSink();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "erase-note",
+                },
+                new Note
+                {
+                    Id = heldNoteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "held-note",
+                }
+            );
+            db.SoftDeleteRecords.AddRange(
+                new SoftDeleteRecord
+                {
+                    Id = softDeleteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "erase-soft-delete",
+                    IsDeleted = false,
+                },
+                new SoftDeleteRecord
+                {
+                    Id = heldSoftDeleteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "held-soft-delete",
+                    IsDeleted = false,
+                }
+            );
+            db.AnonymisedContacts.AddRange(
+                new AnonymisedContact
+                {
+                    Id = contactId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    EmailAddress = "subject@example.com",
+                    GivenName = "Target",
+                    Surname = "Contact",
+                    Notes = "keep-notes",
+                },
+                new AnonymisedContact
+                {
+                    Id = heldContactId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    EmailAddress = "held@example.com",
+                    GivenName = "Held",
+                    Surname = "Contact",
+                    Notes = "held-notes",
+                }
+            );
+            db.ErasureSubjectRecords.Add(
+                new ErasureSubjectRecord
+                {
+                    Id = exemptRecordId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "exempt-erasure-record",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        await CreateHoldAsync("notes", heldNoteId, tenantId, asOf);
+        await CreateHoldAsync("soft_delete_records", heldSoftDeleteId, tenantId, asOf);
+        await CreateHoldAsync("anonymised_contacts", heldContactId, tenantId, asOf);
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            CreateHandlerErasureCategoryRepository(),
+            configureServices: services =>
+            {
+                services.AddSingleton(sink);
+                services.AddRowHandler<Note, NoteErasureTrackingHandler>();
+                services.AddRowHandler<SoftDeleteRecord, SoftDeleteErasureTrackingHandler>();
+                services.AddRowHandler<AnonymisedContact, AnonymisedContactErasureTrackingHandler>();
+                services.AddRowHandler<ErasureSubjectRecord, ExemptErasureTrackingHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
+            asOf
+        );
+
+        result.Counts.Should().Contain(
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(typeof(SoftDeleteRecord), "soft-delete", tenantId, Strategy.SoftDelete, 1)
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(typeof(AnonymisedContact), "anonymise", tenantId, Strategy.Anonymise, 1)
+        );
+        sink.BeforeCalls.Should().BeEquivalentTo(
+            [
+                "note:erase-note",
+                "soft:erase-soft-delete",
+                "contact:subject@example.com",
+            ]
+        );
+
+        await using (var verify = Host.CreateDbContext())
+        {
+            (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeFalse();
+            (await verify.Notes.AnyAsync(note => note.Id == heldNoteId)).Should().BeTrue();
+
+            var softDelete = await verify.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteId);
+            softDelete.IsDeleted.Should().BeTrue();
+            softDelete.DeletedAt.Should().Be(asOf);
+            (await verify.SoftDeleteRecords.SingleAsync(record => record.Id == heldSoftDeleteId))
+                .IsDeleted.Should().BeFalse();
+
+            var contact = await verify.AnonymisedContacts.SingleAsync(candidate => candidate.Id == contactId);
+            contact.EmailAddress.Should().BeNull();
+            contact.GivenName.Should().BeEmpty();
+            contact.Surname.Should().Be("[redacted]");
+            (await verify.AnonymisedContacts.SingleAsync(candidate => candidate.Id == heldContactId))
+                .EmailAddress.Should().Be("held@example.com");
+
+            (await verify.ErasureSubjectRecords.SingleAsync(record => record.Id == exemptRecordId))
+                .Body.Should().Be("exempt-erasure-record");
+        }
+
+        var rowDetails = await LoadCapturedRowsAsync(result.SweepId);
+        rowDetails.Should().HaveCount(3);
+        rowDetails.Select(row => row.EntityId).Should().BeEquivalentTo(
+            [noteId.ToString(), softDeleteId.ToString(), contactId.ToString()]
+        );
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().HaveCount(3);
+        statuses.All(status => status.State == 0 && status.Attempt == 0).Should().BeTrue();
+        statuses.Select(status => status.HandlerType).Should().Contain(
+            type => type.Contains(nameof(NoteErasureTrackingHandler), StringComparison.Ordinal)
+        );
+        statuses.Select(status => status.HandlerType).Should().Contain(
+            type => type.Contains(nameof(SoftDeleteErasureTrackingHandler), StringComparison.Ordinal)
+        );
+        statuses.Select(status => status.HandlerType).Should().Contain(
+            type => type.Contains(nameof(AnonymisedContactErasureTrackingHandler), StringComparison.Ordinal)
+        );
+        statuses.Select(status => status.HandlerType).Should().NotContain(
+            type => type.Contains(nameof(ExemptErasureTrackingHandler), StringComparison.Ordinal)
+        );
+    }
+
+    [Fact]
+    public async Task DryRun_Erasure_With_Handlers_Does_Not_Invoke_Handlers_Or_Persist_Handler_Work()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var softDeleteId = Guid.NewGuid();
+        var contactId = Guid.NewGuid();
+        var exemptRecordId = Guid.NewGuid();
+        var sink = new HandlerExecutionSink();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "dry-run-note",
+                }
+            );
+            db.SoftDeleteRecords.Add(
+                new SoftDeleteRecord
+                {
+                    Id = softDeleteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "dry-run-soft-delete",
+                    IsDeleted = false,
+                }
+            );
+            db.AnonymisedContacts.Add(
+                new AnonymisedContact
+                {
+                    Id = contactId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    EmailAddress = "dry-run@example.com",
+                    GivenName = "Dry",
+                    Surname = "Run",
+                    Notes = "keep-me",
+                }
+            );
+            db.ErasureSubjectRecords.Add(
+                new ErasureSubjectRecord
+                {
+                    Id = exemptRecordId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "dry-run-exempt",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            CreateHandlerErasureCategoryRepository(),
+            CreateCohortSettings(dryRun: true),
+            services =>
+            {
+                services.AddSingleton(sink);
+                services.AddRowHandler<Note, NoteErasureTrackingHandler>();
+                services.AddRowHandler<SoftDeleteRecord, SoftDeleteErasureTrackingHandler>();
+                services.AddRowHandler<AnonymisedContact, AnonymisedContactErasureTrackingHandler>();
+                services.AddRowHandler<ErasureSubjectRecord, ExemptErasureTrackingHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
+            asOf
+        );
+
+        result.Counts.Should().Contain(
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(typeof(SoftDeleteRecord), "soft-delete", tenantId, Strategy.SoftDelete, 1)
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(typeof(AnonymisedContact), "anonymise", tenantId, Strategy.Anonymise, 1)
+        );
+        sink.BeforeCalls.Should().BeEmpty();
+        (await LoadCapturedRowsAsync(result.SweepId)).Should().BeEmpty();
+        (await LoadHandlerStatusesAsync(result.SweepId)).Should().BeEmpty();
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
+        (await verify.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteId))
+            .IsDeleted.Should().BeFalse();
+        (await verify.AnonymisedContacts.SingleAsync(candidate => candidate.Id == contactId))
+            .EmailAddress.Should().Be("dry-run@example.com");
+        (await verify.ErasureSubjectRecords.SingleAsync(record => record.Id == exemptRecordId))
+            .Body.Should().Be("dry-run-exempt");
+    }
+
+    private async Task CreateHoldAsync(
+        string tableName,
+        Guid recordId,
+        Guid tenantId,
+        DateTimeOffset asOf
+    )
+    {
+        await Host.RunWithServicesAsync(async services =>
+        {
+            var repository = services.GetRequiredService<IRetentionHoldsRepository>();
+            await repository.CreateAsync(
+                new RetentionHoldRequest(
+                    Guid.NewGuid(),
+                    tableName,
+                    recordId.ToString(),
+                    tenantId,
+                    "handler-erasure-hold",
+                    asOf.AddDays(-1)
+                ),
+                CancellationToken.None
+            );
+        });
+    }
+
     private async Task<IReadOnlyList<CapturedRow>> LoadCapturedRowsAsync(Guid sweepId)
     {
         await using var connection = new NpgsqlConnection(GetConnectionString());
@@ -379,9 +684,55 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         return db.Database.GetConnectionString()!;
     }
 
+    private static IRetentionCategoryRepository CreateHandlerErasureCategoryRepository()
+    {
+        return new StaticCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["short-lived"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(
+                        TimeSpan.FromDays(30),
+                        Strategy.Purge,
+                        AuditRowDetail: AuditRowDetail.PerRow
+                    )
+                ),
+                ["soft-delete"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                ),
+                ["anonymise"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                ),
+            }
+        );
+    }
+
+    private static IReadOnlyDictionary<string, string?> CreateCohortSettings(bool dryRun)
+    {
+        return new Dictionary<string, string?>
+        {
+            [$"{CohortOptions.SectionName}:DryRun"] = dryRun.ToString(),
+        };
+    }
+
     private sealed record CapturedRow(string EntityType, string EntityId, string CapturedPayload);
 
     private sealed record HandlerStatusRow(string HandlerType, int State, int Attempt);
+
+    private sealed class StaticCategoryRepository(
+        IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
+    ) : IRetentionCategoryRepository
+    {
+        private static readonly IRetentionRuleResolver ExemptFallback = new StaticRetentionRuleResolver(
+            new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+        );
+
+        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        {
+            return resolvers.TryGetValue(category, out var resolver)
+                ? Task.FromResult<IRetentionRuleResolver?>(resolver)
+                : Task.FromResult<IRetentionRuleResolver?>(ExemptFallback);
+        }
+    }
 }
 
 file sealed class HandlerExecutionSink
@@ -461,6 +812,61 @@ file sealed class SelectivelyFailingNoteHandler : IRetentionHandler<Note>
             throw new InvalidOperationException("Simulated handler failure.");
         }
 
+        ctx.Snapshot["body"] = row.Body;
+        return Task.CompletedTask;
+    }
+}
+
+file sealed class NoteErasureTrackingHandler(HandlerExecutionSink sink) : IRetentionHandler<Note>
+{
+    public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        sink.BeforeCalls.Add($"note:{row.Body}");
+        ctx.Snapshot["body"] = row.Body;
+        return Task.CompletedTask;
+    }
+}
+
+file sealed class SoftDeleteErasureTrackingHandler(HandlerExecutionSink sink)
+    : IRetentionHandler<SoftDeleteRecord>
+{
+    public Task OnBeforeAsync(
+        SoftDeleteRecord row,
+        RetentionBeforeContext ctx,
+        CancellationToken ct
+    )
+    {
+        sink.BeforeCalls.Add($"soft:{row.Body}");
+        ctx.Snapshot["body"] = row.Body;
+        return Task.CompletedTask;
+    }
+}
+
+file sealed class AnonymisedContactErasureTrackingHandler(HandlerExecutionSink sink)
+    : IRetentionHandler<AnonymisedContact>
+{
+    public Task OnBeforeAsync(
+        AnonymisedContact row,
+        RetentionBeforeContext ctx,
+        CancellationToken ct
+    )
+    {
+        sink.BeforeCalls.Add($"contact:{row.EmailAddress}");
+        ctx.Snapshot["email"] = row.EmailAddress;
+        return Task.CompletedTask;
+    }
+}
+
+file sealed class ExemptErasureTrackingHandler(HandlerExecutionSink sink)
+    : IRetentionHandler<ErasureSubjectRecord>
+{
+    public Task OnBeforeAsync(
+        ErasureSubjectRecord row,
+        RetentionBeforeContext ctx,
+        CancellationToken ct
+    )
+    {
+        sink.BeforeCalls.Add($"exempt:{row.Body}");
         ctx.Snapshot["body"] = row.Body;
         return Task.CompletedTask;
     }

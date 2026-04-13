@@ -463,6 +463,22 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
             return new SweepExecutionResult([], 0);
         }
 
+        var handlers = RetentionHandlerSupport.ResolveHandlers(services, entry.EntityType);
+        if (execution is not null && handlers.Count > 0)
+        {
+            return await ExecuteHandlerAwareSweepAsync(
+                entry,
+                rule,
+                new RetentionResolutionContext(entry.Category, tenant, now, []),
+                conn,
+                transaction,
+                candidateRecordIds,
+                handlers,
+                execution,
+                ct
+            );
+        }
+
         var tenantClause = entry.Tenant is not null
             ? $"AND target.{QuoteIdentifier(entry.Tenant.TenantColumn)} = @tenantId"
             : "";

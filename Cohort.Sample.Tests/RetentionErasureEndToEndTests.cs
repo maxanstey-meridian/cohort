@@ -578,6 +578,93 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Erase_DryRun_DoesNotLockMatchingRows()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "lock-check-note",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        await using var summaryLockConnection = new NpgsqlConnection(GetConnectionString());
+        await summaryLockConnection.OpenAsync();
+        await using var summaryLockTransaction = await summaryLockConnection.BeginTransactionAsync();
+        await using (var lockCommand = summaryLockConnection.CreateCommand())
+        {
+            lockCommand.Transaction = summaryLockTransaction;
+            lockCommand.CommandText = """LOCK TABLE "sweep_run_entity_summary" IN ACCESS EXCLUSIVE MODE""";
+            await lockCommand.ExecuteNonQueryAsync();
+        }
+
+        using var erasureHost = new CohortTestHost(
+            GetConnectionString(),
+            CreateErasureCategoryRepository(),
+            CreateCohortSettings(dryRun: true)
+        );
+
+        var erasureTask = erasureHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
+            asOf
+        );
+
+        await WaitForSummaryInsertLockAsync(GetConnectionString());
+
+        await using (var updateConnection = new NpgsqlConnection(GetConnectionString()))
+        {
+            await updateConnection.OpenAsync();
+            await using var updateTransaction = await updateConnection.BeginTransactionAsync();
+            await using var timeoutCommand = updateConnection.CreateCommand();
+            timeoutCommand.Transaction = updateTransaction;
+            timeoutCommand.CommandText = """SET LOCAL lock_timeout = '250ms'""";
+            await timeoutCommand.ExecuteNonQueryAsync();
+
+            await using var updateCommand = updateConnection.CreateCommand();
+            updateCommand.Transaction = updateTransaction;
+            updateCommand.CommandText =
+                """
+                UPDATE "notes"
+                SET "Body" = @body
+                WHERE "Id" = @id
+                """;
+            updateCommand.Parameters.Add(new NpgsqlParameter("body", "lock-check-note-updated"));
+            updateCommand.Parameters.Add(new NpgsqlParameter("id", noteId));
+
+            var affected = await updateCommand.ExecuteNonQueryAsync();
+            affected.Should().Be(1);
+            await updateTransaction.CommitAsync();
+        }
+
+        await summaryLockTransaction.CommitAsync();
+
+        var result = await erasureTask;
+        var run = await LoadRunAsync(result.SweepId);
+
+        run.DryRun.Should().BeTrue();
+        result.Counts.Should().Contain(
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+        );
+
+        await using var verify = Host.CreateDbContext();
+        var note = await verify.Notes.SingleAsync(record => record.Id == noteId);
+        note.Body.Should().Be("lock-check-note-updated");
+    }
+
+    [Fact]
     public async Task Erasure_Path_Fails_When_The_Scope_Subject_Cannot_Be_Expressed_Against_The_Marked_Property()
     {
         var tenantId = Guid.NewGuid();
@@ -780,6 +867,36 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                 CancellationToken.None
             );
         });
+    }
+
+    private static async Task WaitForSummaryInsertLockAsync(string connectionString)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+
+        while (DateTime.UtcNow < deadline)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText =
+                """
+                SELECT COUNT(*)
+                FROM pg_stat_activity
+                WHERE wait_event_type = 'Lock'
+                  AND query ILIKE '%sweep_run_entity_summary%'
+                """;
+
+            var blockedCount = Convert.ToInt32(await command.ExecuteScalarAsync());
+            if (blockedCount > 0)
+            {
+                return;
+            }
+
+            await Task.Delay(50);
+        }
+
+        throw new TimeoutException("Timed out waiting for the dry-run erasure session to block on sweep_run_entity_summary.");
     }
 
     private async Task<SweepRunRow> LoadRunAsync(Guid sweepId)

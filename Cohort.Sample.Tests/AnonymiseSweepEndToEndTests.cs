@@ -563,7 +563,6 @@ public sealed class AnonymiseSweepStrategyCommandTests
         var strategy = new AnonymiseSweepStrategy();
         var connection = new RecordingDbConnection();
         connection.EnqueueResultSet(selectedId, heldId);
-        var transaction = connection.BeginTransaction();
         var entry = new RetentionEntry(
             typeof(AnonymisedContact),
             "anonymised_contacts",
@@ -593,22 +592,22 @@ public sealed class AnonymiseSweepStrategyCommandTests
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
             now,
             connection,
-            transaction,
             CancellationToken.None
         );
 
         affected.Should().Be(1);
         connection.Commands.Should().HaveCount(2);
-        connection.Commands[0].AssignedTransaction.Should().BeSameAs(transaction);
-        connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
+        connection.Commands[0].AssignedTransaction.Should().BeNull();
+        connection.Commands[0].CommandText.Should().NotContain("FOR UPDATE");
         connection.Commands[0].CommandText.Should().Contain("\"SubjectId\" = @subjectValue");
-        connection.Commands[1].AssignedTransaction.Should().BeSameAs(transaction);
+        connection.Commands[1].AssignedTransaction.Should().BeNull();
         connection.Commands[1].CommandText.Should().Contain("SELECT COUNT(*)");
         connection.Commands[1].CommandText.Should().Contain("\"SubjectId\" = @subjectValue");
         connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
         connection.Commands[1].CommandText.Should().Contain("NOT EXISTS");
         connection.Commands[1].CommandText.Should().NotContain("DELETE FROM");
         connection.Commands[1].CommandText.Should().NotContain("UPDATE ");
+        connection.Commands[1].CommandText.Should().NotContain("FOR UPDATE");
         connection.Commands[1].Parameters["tenantId"].Value.Should().Be(tenantId);
         connection.Commands[1].Parameters["subjectValue"].Value.Should().Be(subjectId);
         connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(

@@ -118,7 +118,6 @@ public sealed class RetentionErasureService(
                             tenant,
                             now,
                             connection,
-                            dbTransaction,
                             ct
                         )
                     ),

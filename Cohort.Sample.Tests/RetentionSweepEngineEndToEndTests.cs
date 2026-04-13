@@ -436,7 +436,6 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             TenantContext tenant,
             DateTimeOffset now,
             DbConnection conn,
-            DbTransaction transaction,
             CancellationToken ct
         )
         {

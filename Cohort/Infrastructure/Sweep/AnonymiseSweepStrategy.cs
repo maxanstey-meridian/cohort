@@ -151,7 +151,6 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         TenantContext tenant,
         DateTimeOffset now,
         DbConnection conn,
-        DbTransaction transaction,
         CancellationToken ct
     )
     {
@@ -160,7 +159,6 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         ArgumentNullException.ThrowIfNull(match);
         ArgumentNullException.ThrowIfNull(tenant);
         ArgumentNullException.ThrowIfNull(conn);
-        ArgumentNullException.ThrowIfNull(transaction);
 
         if (rule.Strategy != Strategy.Anonymise)
         {
@@ -181,13 +179,12 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             await conn.OpenAsync(ct);
         }
 
-        var candidateRecordIds = await SelectErasureCandidateRecordIdsAsync(
+        var candidateRecordIds = await SelectPreviewErasureCandidateRecordIdsAsync(
             entry,
             entry.Tenant?.TenantColumn,
             match,
             tenant,
             conn,
-            transaction,
             ct
         );
 
@@ -201,7 +198,6 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             : "";
 
         await using var command = conn.CreateCommand();
-        command.Transaction = transaction;
         command.CommandText =
             $"""
             SELECT COUNT(*)
@@ -440,6 +436,43 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
               {tenantClause}
             FOR UPDATE
+            """;
+        if (tenantColumn is not null)
+        {
+            command.Parameters.Add(CreateParameter(command, "tenantId", erasureTenant.Id));
+        }
+        command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
+
+        var candidateRecordIds = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            candidateRecordIds.Add(reader.GetValue(0).ToString()!);
+        }
+
+        return candidateRecordIds;
+    }
+
+    private static async Task<IReadOnlyList<string>> SelectPreviewErasureCandidateRecordIdsAsync(
+        RetentionEntry entry,
+        string? tenantColumn,
+        ErasureSubjectMatch match,
+        TenantContext erasureTenant,
+        DbConnection conn,
+        CancellationToken ct
+    )
+    {
+        var tenantClause = tenantColumn is not null
+            ? $"AND target.{QuoteIdentifier(tenantColumn)} = @tenantId"
+            : "";
+
+        await using var command = conn.CreateCommand();
+        command.CommandText =
+            $"""
+            SELECT target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
+            FROM {QuoteIdentifier(entry.TableName)} AS target
+            WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+              {tenantClause}
             """;
         if (tenantColumn is not null)
         {

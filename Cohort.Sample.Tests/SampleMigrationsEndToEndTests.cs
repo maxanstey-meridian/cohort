@@ -183,6 +183,42 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
         );
     }
 
+    [Fact]
+    public async Task Add_Handler_Fixtures_Migration_Adds_The_Blob_Backed_File_Table()
+    {
+        var options = CreateOptions();
+
+        await using (var db = new SampleDbContext(options))
+        {
+            var migrator = db.Database.GetService<IMigrator>();
+            await migrator.MigrateAsync("20260413150144_AddRowHandlerDispatch");
+            await migrator.MigrateAsync();
+        }
+
+        var columns = await GetColumnsAsync("blob_backed_files");
+        columns.Should().ContainKeys(
+            "Id",
+            "TenantId",
+            "CreatedAt",
+            "StoragePath",
+            "OriginalFileName",
+            "ContentType"
+        );
+        columns["Id"].DataType.Should().Be("uuid");
+        columns["Id"].IsNullable.Should().BeFalse();
+        columns["TenantId"].DataType.Should().Be("uuid");
+        columns["TenantId"].IsNullable.Should().BeFalse();
+        columns["CreatedAt"].DataType.Should().Be("timestamp with time zone");
+        columns["CreatedAt"].IsNullable.Should().BeFalse();
+        columns["StoragePath"].DataType.Should().Be("text");
+        columns["StoragePath"].IsNullable.Should().BeFalse();
+        columns["OriginalFileName"].DataType.Should().Be("text");
+        columns["OriginalFileName"].IsNullable.Should().BeFalse();
+        columns["ContentType"].DataType.Should().Be("text");
+        columns["ContentType"].IsNullable.Should().BeFalse();
+        (await GetPrimaryKeyColumnsAsync("blob_backed_files")).Should().Equal("Id");
+    }
+
     private DbContextOptions<SampleDbContext> CreateOptions()
     {
         return new DbContextOptionsBuilder<SampleDbContext>()

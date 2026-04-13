@@ -83,12 +83,22 @@ public sealed class RegistryScanTests
             field.MemberName == nameof(TombstoneRecord.DisplayName)
             && field.FactoryType == typeof(OriginalValueTombstoneFactory)
         );
+        entries
+            .Should()
+            .Contain(kvp =>
+                kvp.Key == typeof(BlobBackedFile)
+                && kvp.Value.Category == "blob-cleanup"
+                && kvp.Value.TableName == "blob_backed_files"
+                && kvp.Value.AnchorMember == nameof(BlobBackedFile.CreatedAt)
+                && kvp.Value.EntityType == typeof(BlobBackedFile)
+            );
 
         // Negative — nothing else sneaks in
         entries.Values.Should().NotContain(e => e.Category == "long-lived");
-        // SampleDbContext has 7 retained entities: the original sample categories plus
-        // TenantlessLog/TenantlessSoftDelete/PerRowAuditedLog and the factory-backed tombstone entity.
-        entries.Should().HaveCount(7);
+        // SampleDbContext has 8 retained entities: the original sample categories plus
+        // TenantlessLog/TenantlessSoftDelete/PerRowAuditedLog, the factory-backed tombstone entity,
+        // and the blob-backed handler fixture.
+        entries.Should().HaveCount(8);
     }
 
     [Fact]

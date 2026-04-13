@@ -21,6 +21,85 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     private const int DeadLetteredState = 3;
 
     [Fact]
+    public async Task Scheduled_Sweep_With_A_BlobBacked_Fixture_Captures_StoragePath_And_Uses_TestHost_Service_Registrations()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var fileId = Guid.NewGuid();
+        var cleanupStore = new BlobCleanupStoreSpy();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.BlobBackedFiles.Add(
+                new BlobBackedFile
+                {
+                    Id = fileId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    StoragePath = "blob://tenant-a/archive/invoice.pdf",
+                    OriginalFileName = "invoice.pdf",
+                    ContentType = "application/pdf",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
+            {
+                services.AddSingleton(cleanupStore);
+                services.AddRowHandler<BlobBackedFile, BlobBackedFileCleanupHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        result.Counts.Should().Contain(
+            new EntitySweepCount(typeof(BlobBackedFile), "blob-cleanup", tenantId, Strategy.Purge, 1)
+        );
+
+        var rowDetails = await LoadCapturedRowsAsync(result.SweepId);
+        rowDetails.Should().ContainSingle(row => row.EntityType == typeof(BlobBackedFile).FullName);
+        using (var payload = JsonDocument.Parse(rowDetails[0].CapturedPayload))
+        {
+            payload.RootElement.GetProperty("storagePath").GetString().Should().Be("blob://tenant-a/archive/invoice.pdf");
+            payload.RootElement.GetProperty("originalFileName").GetString().Should().Be("invoice.pdf");
+        }
+
+        var queuedStatuses = await LoadHandlerStatusesAsync(result.SweepId);
+        queuedStatuses.Should().ContainSingle(status =>
+            status.HandlerType.Contains(nameof(BlobBackedFileCleanupHandler), StringComparison.Ordinal)
+            && status.State == PendingState
+            && status.Attempt == 0
+        );
+        cleanupStore.DeletedPaths.Should().BeEmpty();
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        cleanupStore.DeletedPaths.Should().Equal("blob://tenant-a/archive/invoice.pdf");
+
+        await using (var verify = Host.CreateDbContext())
+        {
+            (await verify.BlobBackedFiles.AnyAsync(file => file.Id == fileId)).Should().BeFalse();
+        }
+
+        var completedStatuses = await LoadHandlerStatusesAsync(result.SweepId);
+        completedStatuses.Should().ContainSingle();
+        completedStatuses[0].State.Should().Be(SucceededState);
+        completedStatuses[0].Attempt.Should().Be(1);
+        completedStatuses[0].CompletedAt.Should().NotBeNull();
+        completedStatuses[0].LastError.Should().BeNull();
+    }
+
+    [Fact]
     public async Task Scheduled_Sweep_With_Handlers_Runs_OnBefore_In_Priority_Order_And_Queues_PostCommit_Work()
     {
         var tenantId = Guid.NewGuid();
@@ -1710,6 +1789,17 @@ file sealed class HandlerExecutionSink
     public List<string> AfterCalls { get; } = [];
 }
 
+file sealed class BlobCleanupStoreSpy
+{
+    public List<string> DeletedPaths { get; } = [];
+
+    public Task DeleteAsync(string storagePath)
+    {
+        DeletedPaths.Add(storagePath);
+        return Task.CompletedTask;
+    }
+}
+
 file sealed class DispatchAttemptTracker
 {
     private readonly object gate = new();
@@ -1870,6 +1960,22 @@ file sealed class LowPriorityNoteHandler(HandlerExecutionSink sink) : IRetention
         sink.BeforeCalls.Add("low");
         ctx.Snapshot["body"] = row.Body;
         return Task.CompletedTask;
+    }
+}
+
+file sealed class BlobBackedFileCleanupHandler(BlobCleanupStoreSpy cleanupStore)
+    : IRetentionHandler<BlobBackedFile>
+{
+    public Task OnBeforeAsync(BlobBackedFile row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        ctx.Snapshot["storagePath"] = row.StoragePath;
+        ctx.Snapshot["originalFileName"] = row.OriginalFileName;
+        return Task.CompletedTask;
+    }
+
+    public Task OnAfterAsync(RetentionAfterContext<BlobBackedFile> ctx, CancellationToken ct)
+    {
+        return cleanupStore.DeleteAsync((string)ctx.Snapshot["storagePath"]!);
     }
 }
 

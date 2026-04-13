@@ -164,11 +164,16 @@ public sealed class RetentionStartupValidatorTests
             await new RetentionStartupValidator(db, InMemoryCategoryRepository.Empty, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().HaveCount(7);
+        exception.Which.Errors.Should().HaveCount(8);
         exception
             .Which.Errors.Should()
             .Contain(
                 $"Retention category 'short-lived' for entity {typeof(Note).FullName} could not be resolved."
+            );
+        exception
+            .Which.Errors.Should()
+            .Contain(
+                $"Retention category 'blob-cleanup' for entity {typeof(BlobBackedFile).FullName} could not be resolved."
             );
         exception
             .Which.Errors.Should()
@@ -599,6 +604,7 @@ public sealed class RetentionStartupValidatorTests
                 ),
                 // Other sample entities in SampleDbContext aren't the subject of this test;
                 // resolve them as Exempt so only the Anonymise-on-Note mismatch surfaces.
+                ["blob-cleanup"] = ExemptResolver,
                 ["tenantless-purge"] = ExemptResolver,
                 ["tenantless-softdelete"] = ExemptResolver,
                 ["per-row-audit-override"] = ExemptResolver,
@@ -958,7 +964,11 @@ public sealed class RetentionStartupValidatorTests
     {
         public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
         {
-            if (category == "short-lived" || category == "tenantless-purge")
+            if (
+                category == "short-lived"
+                || category == "blob-cleanup"
+                || category == "tenantless-purge"
+            )
             {
                 return Task.FromResult<IRetentionRuleResolver?>(
                     new StaticRetentionRuleResolver(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge))
@@ -1006,7 +1016,12 @@ public sealed class RetentionStartupValidatorTests
     {
         public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
         {
-            if (category == "short-lived" || category == "tenantless-purge" || category == "per-row-audit-override")
+            if (
+                category == "short-lived"
+                || category == "blob-cleanup"
+                || category == "tenantless-purge"
+                || category == "per-row-audit-override"
+            )
             {
                 return Task.FromResult<IRetentionRuleResolver?>(
                     new DeferredRuleResolver(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge))
@@ -1051,7 +1066,7 @@ public sealed class RetentionStartupValidatorTests
         {
             return category switch
             {
-                "short-lived" or "tenantless-purge" or "per-row-audit-override" =>
+                "short-lived" or "blob-cleanup" or "tenantless-purge" or "per-row-audit-override" =>
                     Task.FromResult<IRetentionRuleResolver?>(
                         new OpaqueDeferredRuleResolver(
                             new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
@@ -1081,7 +1096,7 @@ public sealed class RetentionStartupValidatorTests
         {
             return category switch
             {
-                "short-lived" or "tenantless-purge" or "per-row-audit-override" =>
+                "short-lived" or "blob-cleanup" or "tenantless-purge" or "per-row-audit-override" =>
                     Task.FromResult<IRetentionRuleResolver?>(
                         new StaticRetentionRuleResolver(
                             new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)

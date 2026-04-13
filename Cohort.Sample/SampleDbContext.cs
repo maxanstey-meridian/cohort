@@ -17,6 +17,7 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
     public DbSet<TenantlessSoftDelete> TenantlessSoftDeletes => Set<TenantlessSoftDelete>();
     public DbSet<PerRowAuditedLog> PerRowAuditedLogs => Set<PerRowAuditedLog>();
     public DbSet<TombstoneRecord> TombstoneRecords => Set<TombstoneRecord>();
+    public DbSet<BlobBackedFile> BlobBackedFiles => Set<BlobBackedFile>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -111,6 +112,17 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
             b.Property(record => record.DisplayName).IsRequired();
             b.Property(record => record.ContactEmail);
             b.Property(record => record.Notes).IsRequired();
+        });
+
+        modelBuilder.Entity<BlobBackedFile>(b =>
+        {
+            b.ToTable("blob_backed_files");
+            b.HasKey(file => file.Id);
+            b.Property(file => file.TenantId).IsRequired();
+            b.Property(file => file.CreatedAt).IsRequired();
+            b.Property(file => file.StoragePath).IsRequired();
+            b.Property(file => file.OriginalFileName).IsRequired();
+            b.Property(file => file.ContentType).IsRequired();
         });
 
         modelBuilder.Entity<HeldRecord>(b =>

@@ -69,6 +69,13 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         entries
             .Should()
             .Contain(kvp =>
+                kvp.Key == typeof(BlobBackedFile)
+                && kvp.Value.Category == "blob-cleanup"
+                && kvp.Value.AnchorMember == nameof(BlobBackedFile.CreatedAt)
+            );
+        entries
+            .Should()
+            .Contain(kvp =>
                 kvp.Key == typeof(TombstoneRecord)
                 && kvp.Value.Category == "tombstone-anonymise"
                 && kvp.Value.AnchorMember == nameof(TombstoneRecord.CreatedAt)
@@ -85,11 +92,16 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         var act = async () => await host.RunStartupAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().HaveCount(7);
+        exception.Which.Errors.Should().HaveCount(8);
         exception
             .Which.Errors.Should()
             .Contain(
                 $"Retention category 'short-lived' for entity {typeof(Note).FullName} could not be resolved."
+            );
+        exception
+            .Which.Errors.Should()
+            .Contain(
+                $"Retention category 'blob-cleanup' for entity {typeof(BlobBackedFile).FullName} could not be resolved."
             );
         exception
             .Which.Errors.Should()

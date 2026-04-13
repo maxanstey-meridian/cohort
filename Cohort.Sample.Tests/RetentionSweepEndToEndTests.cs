@@ -79,8 +79,8 @@ public sealed class RetentionSweepEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        // SampleDbContext now has 6 retained entities (adds TenantlessLog/TenantlessSoftDelete/PerRowAuditedLog).
-        result.Counts.Should().HaveCount(7);
+        // SampleDbContext now has 8 retained entities including the blob-backed handler fixture.
+        result.Counts.Should().HaveCount(8);
         result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
@@ -159,8 +159,8 @@ public sealed class RetentionSweepEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        // SampleDbContext now has 6 retained entities (adds TenantlessLog/TenantlessSoftDelete/PerRowAuditedLog).
-        result.Counts.Should().HaveCount(7);
+        // SampleDbContext now has 8 retained entities including the blob-backed handler fixture.
+        result.Counts.Should().HaveCount(8);
         result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),

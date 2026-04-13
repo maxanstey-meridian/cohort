@@ -70,7 +70,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
             );
         }
 
-        // Expected shape: Started + one EntitySummary per retained sample entity (6) + one RowDetail
+        // Expected shape: Started + one EntitySummary per retained sample entity (8) + one RowDetail
         // for the purged note + Completed. Entity iteration order is model-dependent so we assert
         // containment rather than positional ordering, except for Started/Completed bookends.
         auditWriter.Events[0].Should().BeOfType<SweepEvent.Started>();
@@ -82,7 +82,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         started.TenantId.Should().Be(tenantId);
 
         var summaries = auditWriter.Events.OfType<SweepEvent.EntitySummary>().ToList();
-        summaries.Should().HaveCount(7);
+        summaries.Should().HaveCount(8);
         summaries.Should().Contain(
             s => s.SweepId == started.SweepId
                 && s.EntityType == typeof(AnonymisedContact)
@@ -287,8 +287,9 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         run.Duration.Should().NotBeNull();
         run.Duration.Should().BePositive();
 
-        // 3 original retained entities + 3 tenantless/per-row sample additions (all Exempt under this test's restricted dict).
-        summaries.Should().HaveCount(7);
+        // 3 original retained entities + blob-backed fixture + 3 tenantless/per-row sample additions
+        // + tombstone entity (all later additions are Exempt under this test's restricted dict).
+        summaries.Should().HaveCount(8);
         summaries.Should().Contain(
             new SweepRunEntitySummaryRow(
                 result.SweepId,

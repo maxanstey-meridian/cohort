@@ -11,6 +11,9 @@ public sealed class SampleCategoryRepository : IRetentionCategoryRepository
             ["short-lived"] = new StaticRetentionRuleResolver(
                 new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
             ),
+            ["blob-cleanup"] = new StaticRetentionRuleResolver(
+                new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+            ),
             ["soft-delete"] = new StaticRetentionRuleResolver(
                 new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
             ),

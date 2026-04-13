@@ -76,7 +76,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(7);
+        result.Counts.Should().HaveCount(8);
         result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
@@ -153,7 +153,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(7);
+        result.Counts.Should().HaveCount(8);
         result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),

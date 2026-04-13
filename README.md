@@ -39,6 +39,8 @@ public sealed class MyCategoryRepository : IRetentionCategoryRepository
 
 Unannotated entities are implicitly exempt — no annotation needed to opt out. Use `[ExemptFromRetention("reason")]` if you want to document the exemption explicitly.
 
+Retained entities are tenant-scoped by default. They must expose a `TenantId` property (or mark an alternative property with `[RetentionTenant]`) unless the entity is intentionally global and explicitly marked with `[RetentionTenantless]`.
+
 ### 2. Wire it up
 
 ```csharp
@@ -67,7 +69,20 @@ protected override void OnModelCreating(ModelBuilder modelBuilder)
 | `Anonymise` | Scrub `[Anonymise]`-marked fields | Above + at least one `[Anonymise]` field |
 | `Exempt` | Skip entirely | `[ExemptFromRetention]` or no annotation |
 
-`TenantId` is optional. Single-tenant apps work without it — the sweep SQL simply omits the tenant filter. Multi-tenant apps get `AND "TenantId" = @tenantId` in every query automatically when the property exists.
+If a retained entity is intentionally tenantless, mark it explicitly:
+
+```csharp
+[Retain("global-audit", nameof(CreatedAt))]
+[RetentionTenantless]
+public sealed class GlobalAuditLog
+{
+    public Guid Id { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+    public string Payload { get; set; } = "";
+}
+```
+
+Without `[RetentionTenantless]`, Cohort treats a missing tenant property on a retained entity as a startup configuration error. Tenant-scoped entities get `AND "TenantId" = @tenantId` in sweep and erasure SQL automatically.
 
 ## Anonymise methods
 
@@ -152,7 +167,12 @@ Then trigger erasure:
 var result = await erasureService.EraseAsync(tenant, new ErasureScope(userId), DateTimeOffset.UtcNow);
 ```
 
-Cohort walks every entity with a matching `[ErasureSubject]` and applies the category's strategy. Held records are respected. The full sweep is audited.
+Cohort only erases rows that satisfy both conditions:
+
+1. The row matches the requested `[ErasureSubject]`.
+2. The row is already past the effective retention cutoff for its category (`max(Period, LegalMin)`).
+
+Active holds still block erasure, and tenant-scoped entities still keep the tenant predicate in the SQL. Cohort does not use right-to-erasure to bypass the retention window.
 
 ## Configuration
 

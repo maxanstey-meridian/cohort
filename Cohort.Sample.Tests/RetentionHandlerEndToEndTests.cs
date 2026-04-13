@@ -703,7 +703,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             summary =>
                 summary.EntityType == typeof(Note).FullName
                 && summary.Affected == 1
-                && summary.HeldCount == 1
+                && summary.HeldCount == 0
         );
     }
 
@@ -875,13 +875,13 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         var summaries = await LoadEntitySummariesAsync(result.SweepId);
         summaries.Should().Contain(
-            new EntitySummaryRow(typeof(Note).FullName!, Strategy.Purge, 1, 1)
+            new EntitySummaryRow(typeof(Note).FullName!, Strategy.Purge, 1, 0)
         );
         summaries.Should().Contain(
-            new EntitySummaryRow(typeof(SoftDeleteRecord).FullName!, Strategy.SoftDelete, 1, 1)
+            new EntitySummaryRow(typeof(SoftDeleteRecord).FullName!, Strategy.SoftDelete, 1, 0)
         );
         summaries.Should().Contain(
-            new EntitySummaryRow(typeof(AnonymisedContact).FullName!, Strategy.Anonymise, 1, 1)
+            new EntitySummaryRow(typeof(AnonymisedContact).FullName!, Strategy.Anonymise, 1, 0)
         );
     }
 
@@ -1086,6 +1086,17 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         completedStatuses.All(status => status.Attempt == 1).Should().BeTrue();
         completedStatuses.All(status => status.CompletedAt is not null).Should().BeTrue();
         completedStatuses.All(status => status.LastError is null).Should().BeTrue();
+
+        var summaries = await LoadEntitySummariesAsync(result.SweepId);
+        summaries.Should().Contain(
+            new EntitySummaryRow(typeof(Note).FullName!, Strategy.Purge, 1, 1)
+        );
+        summaries.Should().Contain(
+            new EntitySummaryRow(typeof(SoftDeleteRecord).FullName!, Strategy.SoftDelete, 1, 1)
+        );
+        summaries.Should().Contain(
+            new EntitySummaryRow(typeof(AnonymisedContact).FullName!, Strategy.Anonymise, 1, 1)
+        );
     }
 
     [Fact]

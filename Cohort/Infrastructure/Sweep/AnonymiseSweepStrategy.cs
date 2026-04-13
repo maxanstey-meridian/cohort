@@ -292,6 +292,7 @@ public sealed class AnonymiseSweepStrategy(
             );
         var staticAssignments = CreateStaticAssignments(entry, ctx.Tenant.Id, ctx.Now);
         var affectedRecordIds = new List<string>();
+        var heldCount = candidateRecordIds.Count - rows.Count;
 
         foreach (var row in rows)
         {
@@ -339,6 +340,7 @@ public sealed class AnonymiseSweepStrategy(
                 )
             )
             {
+                heldCount++;
                 continue;
             }
 
@@ -359,7 +361,7 @@ public sealed class AnonymiseSweepStrategy(
 
         return new SweepExecutionResult(
             affectedRecordIds,
-            candidateRecordIds.Count - affectedRecordIds.Count,
+            heldCount,
             RowDetailsPersisted: true
         );
     }

@@ -283,10 +283,17 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
     ) : IRetentionCategoryRepository
     {
+        // Falls through to Exempt for categories the test does not care about
+        // (e.g. categories owned by other sample entities sharing SampleDbContext).
+        private static readonly IRetentionRuleResolver ExemptFallback = new StaticRetentionRuleResolver(
+            new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+        );
+
         public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
         {
-            resolvers.TryGetValue(category, out var resolver);
-            return Task.FromResult(resolver);
+            return resolvers.TryGetValue(category, out var resolver)
+                ? Task.FromResult<IRetentionRuleResolver?>(resolver)
+                : Task.FromResult<IRetentionRuleResolver?>(ExemptFallback);
         }
     }
 }

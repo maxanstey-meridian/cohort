@@ -43,7 +43,7 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(3);
+        result.Counts.Should().HaveCount(6);
         result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
@@ -95,6 +95,10 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
 
     private sealed class TenantAwareCategoryRepository : IRetentionCategoryRepository
     {
+        private static readonly IRetentionRuleResolver ExemptFallback = new StaticRetentionRuleResolver(
+            new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+        );
+
         private readonly IRetentionRuleResolver resolver = new TenantAwareResolver();
 
         public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
@@ -109,7 +113,7 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
                     "anonymise" => new StaticRetentionRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
-                    _ => null,
+                    _ => ExemptFallback,
                 }
             );
         }
@@ -134,6 +138,10 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
 
     private sealed class AliasCategoryRepository : IRetentionCategoryRepository
     {
+        private static readonly IRetentionRuleResolver ExemptFallback = new StaticRetentionRuleResolver(
+            new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+        );
+
         private readonly IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers;
 
         public AliasCategoryRepository()
@@ -154,8 +162,9 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
 
         public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
         {
-            resolvers.TryGetValue(category, out var resolver);
-            return Task.FromResult(resolver);
+            return resolvers.TryGetValue(category, out var resolver)
+                ? Task.FromResult<IRetentionRuleResolver?>(resolver)
+                : Task.FromResult<IRetentionRuleResolver?>(ExemptFallback);
         }
     }
 

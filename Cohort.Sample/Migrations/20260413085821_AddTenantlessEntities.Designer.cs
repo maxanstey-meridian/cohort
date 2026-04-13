@@ -3,6 +3,7 @@ using System;
 using Cohort.Sample;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace Cohort.Sample.Migrations
 {
     [DbContext(typeof(SampleDbContext))]
-    partial class SampleDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260413085821_AddTenantlessEntities")]
+    partial class AddTenantlessEntities
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -157,27 +160,6 @@ namespace Cohort.Sample.Migrations
                     b.HasKey("Id");
 
                     b.ToTable("notes", (string)null);
-                });
-
-            modelBuilder.Entity("Cohort.Sample.Entities.PerRowAuditedLog", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("uuid");
-
-                    b.Property<DateTimeOffset>("CreatedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<string>("Payload")
-                        .IsRequired()
-                        .HasColumnType("text");
-
-                    b.Property<Guid>("TenantId")
-                        .HasColumnType("uuid");
-
-                    b.HasKey("Id");
-
-                    b.ToTable("per_row_audited_logs", (string)null);
                 });
 
             modelBuilder.Entity("Cohort.Sample.Entities.SoftDeleteRecord", b =>

@@ -79,7 +79,8 @@ public sealed class RetentionSweepEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(3);
+        // SampleDbContext now has 6 retained entities (adds TenantlessLog/TenantlessSoftDelete/PerRowAuditedLog).
+        result.Counts.Should().HaveCount(6);
         result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
@@ -158,7 +159,8 @@ public sealed class RetentionSweepEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(3);
+        // SampleDbContext now has 6 retained entities (adds TenantlessLog/TenantlessSoftDelete/PerRowAuditedLog).
+        result.Counts.Should().HaveCount(6);
         result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
@@ -196,10 +198,15 @@ public sealed class RetentionSweepEndToEndTests(PostgresFixture fixture)
         IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
     ) : IRetentionCategoryRepository
     {
+        private static readonly IRetentionRuleResolver ExemptFallback = new StaticRetentionRuleResolver(
+            new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+        );
+
         public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
         {
-            resolvers.TryGetValue(category, out var resolver);
-            return Task.FromResult(resolver);
+            return resolvers.TryGetValue(category, out var resolver)
+                ? Task.FromResult<IRetentionRuleResolver?>(resolver)
+                : Task.FromResult<IRetentionRuleResolver?>(ExemptFallback);
         }
     }
 

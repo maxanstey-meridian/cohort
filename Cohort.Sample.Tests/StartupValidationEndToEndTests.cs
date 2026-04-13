@@ -67,7 +67,7 @@ public sealed class StartupValidationEndToEndTests(PostgresFixture fixture) : In
         var act = async () => await host.RunStartupAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().HaveCount(3);
+        exception.Which.Errors.Should().HaveCount(6);
         exception
             .Which.Errors.Should()
             .Contain(
@@ -82,6 +82,21 @@ public sealed class StartupValidationEndToEndTests(PostgresFixture fixture) : In
             .Which.Errors.Should()
             .Contain(
                 $"Retention category 'anonymise' for entity {typeof(AnonymisedContact).FullName} could not be resolved."
+            );
+        exception
+            .Which.Errors.Should()
+            .Contain(
+                $"Retention category 'tenantless-purge' for entity {typeof(TenantlessLog).FullName} could not be resolved."
+            );
+        exception
+            .Which.Errors.Should()
+            .Contain(
+                $"Retention category 'tenantless-softdelete' for entity {typeof(TenantlessSoftDelete).FullName} could not be resolved."
+            );
+        exception
+            .Which.Errors.Should()
+            .Contain(
+                $"Retention category 'per-row-audit-override' for entity {typeof(PerRowAuditedLog).FullName} could not be resolved."
             );
     }
 

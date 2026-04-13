@@ -13,6 +13,9 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
     public DbSet<AnonymisedContact> AnonymisedContacts => Set<AnonymisedContact>();
     public DbSet<ErasureSubjectRecord> ErasureSubjectRecords => Set<ErasureSubjectRecord>();
     public DbSet<HeldRecord> HeldRecords => Set<HeldRecord>();
+    public DbSet<TenantlessLog> TenantlessLogs => Set<TenantlessLog>();
+    public DbSet<TenantlessSoftDelete> TenantlessSoftDeletes => Set<TenantlessSoftDelete>();
+    public DbSet<PerRowAuditedLog> PerRowAuditedLogs => Set<PerRowAuditedLog>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -67,6 +70,33 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
             b.Property(record => record.SubjectId);
             b.Property(record => record.CreatedAt).IsRequired();
             b.Property(record => record.Body).IsRequired();
+        });
+
+        modelBuilder.Entity<TenantlessLog>(b =>
+        {
+            b.ToTable("tenantless_logs");
+            b.HasKey(log => log.Id);
+            b.Property(log => log.CreatedAt).IsRequired();
+            b.Property(log => log.Payload).IsRequired();
+        });
+
+        modelBuilder.Entity<TenantlessSoftDelete>(b =>
+        {
+            b.ToTable("tenantless_soft_deletes");
+            b.HasKey(record => record.Id);
+            b.Property(record => record.CreatedAt).IsRequired();
+            b.Property(record => record.Payload).IsRequired();
+            b.Property(record => record.IsDeleted).IsRequired();
+            b.Property(record => record.DeletedAt);
+        });
+
+        modelBuilder.Entity<PerRowAuditedLog>(b =>
+        {
+            b.ToTable("per_row_audited_logs");
+            b.HasKey(log => log.Id);
+            b.Property(log => log.TenantId).IsRequired();
+            b.Property(log => log.CreatedAt).IsRequired();
+            b.Property(log => log.Payload).IsRequired();
         });
 
         modelBuilder.Entity<HeldRecord>(b =>

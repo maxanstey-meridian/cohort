@@ -76,7 +76,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(3);
+        result.Counts.Should().HaveCount(6);
         result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
@@ -153,7 +153,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(3);
+        result.Counts.Should().HaveCount(6);
         result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
@@ -361,10 +361,15 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
     ) : IRetentionCategoryRepository
     {
+        private static readonly IRetentionRuleResolver ExemptFallback = new StaticRetentionRuleResolver(
+            new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+        );
+
         public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
         {
-            resolvers.TryGetValue(category, out var resolver);
-            return Task.FromResult(resolver);
+            return resolvers.TryGetValue(category, out var resolver)
+                ? Task.FromResult<IRetentionRuleResolver?>(resolver)
+                : Task.FromResult<IRetentionRuleResolver?>(ExemptFallback);
         }
     }
 

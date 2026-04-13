@@ -11,6 +11,10 @@ namespace Cohort.Sample.Tests;
 
 public sealed class RetentionStartupValidatorTests
 {
+    private static readonly IRetentionRuleResolver ExemptResolver = new StaticRetentionRuleResolver(
+        new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+    );
+
     [Fact]
     public async Task ValidateAsync_Succeeds_For_Retained_Entities_With_Static_Resolvers()
     {
@@ -163,7 +167,7 @@ public sealed class RetentionStartupValidatorTests
             await new RetentionStartupValidator(db, InMemoryCategoryRepository.Empty, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().HaveCount(3);
+        exception.Which.Errors.Should().HaveCount(6);
         exception
             .Which.Errors.Should()
             .Contain(
@@ -178,6 +182,21 @@ public sealed class RetentionStartupValidatorTests
             .Which.Errors.Should()
             .Contain(
                 $"Retention category 'anonymise' for entity {typeof(AnonymisedContact).FullName} could not be resolved."
+            );
+        exception
+            .Which.Errors.Should()
+            .Contain(
+                $"Retention category 'tenantless-purge' for entity {typeof(TenantlessLog).FullName} could not be resolved."
+            );
+        exception
+            .Which.Errors.Should()
+            .Contain(
+                $"Retention category 'tenantless-softdelete' for entity {typeof(TenantlessSoftDelete).FullName} could not be resolved."
+            );
+        exception
+            .Which.Errors.Should()
+            .Contain(
+                $"Retention category 'per-row-audit-override' for entity {typeof(PerRowAuditedLog).FullName} could not be resolved."
             );
         exception.Which.Message.Should().Contain("short-lived");
         exception.Which.Message.Should().Contain("soft-delete");
@@ -576,6 +595,11 @@ public sealed class RetentionStartupValidatorTests
                 ["anonymise"] = new StaticRetentionRuleResolver(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                 ),
+                // Other sample entities in SampleDbContext aren't the subject of this test;
+                // resolve them as Exempt so only the Anonymise-on-Note mismatch surfaces.
+                ["tenantless-purge"] = ExemptResolver,
+                ["tenantless-softdelete"] = ExemptResolver,
+                ["per-row-audit-override"] = ExemptResolver,
             }
         );
 
@@ -860,14 +884,14 @@ public sealed class RetentionStartupValidatorTests
     {
         public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
         {
-            if (category == "short-lived")
+            if (category == "short-lived" || category == "tenantless-purge")
             {
                 return Task.FromResult<IRetentionRuleResolver?>(
                     new StaticRetentionRuleResolver(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge))
                 );
             }
 
-            if (category == "soft-delete")
+            if (category == "soft-delete" || category == "tenantless-softdelete")
             {
                 return Task.FromResult<IRetentionRuleResolver?>(
                     new StaticRetentionRuleResolver(
@@ -885,6 +909,19 @@ public sealed class RetentionStartupValidatorTests
                 );
             }
 
+            if (category == "per-row-audit-override")
+            {
+                return Task.FromResult<IRetentionRuleResolver?>(
+                    new StaticRetentionRuleResolver(
+                        new RetentionRule(
+                            TimeSpan.FromDays(30),
+                            Strategy.Purge,
+                            AuditRowDetail: AuditRowDetail.SummaryOnly
+                        )
+                    )
+                );
+            }
+
             throw new InvalidOperationException(
                 $"Unexpected category lookup for '{category}'. Exempt sample entities must not resolve categories."
             );
@@ -895,14 +932,14 @@ public sealed class RetentionStartupValidatorTests
     {
         public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
         {
-            if (category == "short-lived")
+            if (category == "short-lived" || category == "tenantless-purge" || category == "per-row-audit-override")
             {
                 return Task.FromResult<IRetentionRuleResolver?>(
                     new DeferredRuleResolver(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge))
                 );
             }
 
-            if (category == "soft-delete")
+            if (category == "soft-delete" || category == "tenantless-softdelete")
             {
                 return Task.FromResult<IRetentionRuleResolver?>(
                     new DeferredRuleResolver(
@@ -940,12 +977,13 @@ public sealed class RetentionStartupValidatorTests
         {
             return category switch
             {
-                "short-lived" => Task.FromResult<IRetentionRuleResolver?>(
-                    new OpaqueDeferredRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
-                    )
-                ),
-                "soft-delete" => Task.FromResult<IRetentionRuleResolver?>(
+                "short-lived" or "tenantless-purge" or "per-row-audit-override" =>
+                    Task.FromResult<IRetentionRuleResolver?>(
+                        new OpaqueDeferredRuleResolver(
+                            new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                        )
+                    ),
+                "soft-delete" or "tenantless-softdelete" => Task.FromResult<IRetentionRuleResolver?>(
                     new OpaqueDeferredRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     )
@@ -969,12 +1007,13 @@ public sealed class RetentionStartupValidatorTests
         {
             return category switch
             {
-                "short-lived" => Task.FromResult<IRetentionRuleResolver?>(
-                    new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
-                    )
-                ),
-                "soft-delete" => Task.FromResult<IRetentionRuleResolver?>(
+                "short-lived" or "tenantless-purge" or "per-row-audit-override" =>
+                    Task.FromResult<IRetentionRuleResolver?>(
+                        new StaticRetentionRuleResolver(
+                            new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                        )
+                    ),
+                "soft-delete" or "tenantless-softdelete" => Task.FromResult<IRetentionRuleResolver?>(
                     new StaticRetentionRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     )

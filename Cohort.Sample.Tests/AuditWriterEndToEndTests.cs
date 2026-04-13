@@ -70,44 +70,53 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
             );
         }
 
-        auditWriter.Events.Should().HaveCount(6);
-
+        // Expected shape: Started + one EntitySummary per retained sample entity (6) + one RowDetail
+        // for the purged note + Completed. Entity iteration order is model-dependent so we assert
+        // containment rather than positional ordering, except for Started/Completed bookends.
         auditWriter.Events[0].Should().BeOfType<SweepEvent.Started>();
+        auditWriter.Events[^1].Should().BeOfType<SweepEvent.Completed>();
+
         var started = (SweepEvent.Started)auditWriter.Events[0];
         started.Trigger.Should().Be(SweepTriggerKind.Scheduled);
         started.DryRun.Should().BeFalse();
         started.TenantId.Should().Be(tenantId);
 
-        auditWriter.Events[1].Should().Be(
-            new SweepEvent.EntitySummary(
-                started.SweepId,
-                ((SweepEvent.EntitySummary)auditWriter.Events[1]).At,
-                typeof(AnonymisedContact),
-                "anonymise",
-                tenantId,
-                Strategy.Anonymise,
-                TimeSpan.FromDays(30),
-                0,
-                0
-            )
+        var summaries = auditWriter.Events.OfType<SweepEvent.EntitySummary>().ToList();
+        summaries.Should().HaveCount(6);
+        summaries.Should().Contain(
+            s => s.SweepId == started.SweepId
+                && s.EntityType == typeof(AnonymisedContact)
+                && s.Category == "anonymise"
+                && s.TenantId == tenantId
+                && s.Strategy == Strategy.Anonymise
+                && s.Affected == 0
+                && s.HeldCount == 0
         );
-        auditWriter.Events[2].Should().Be(
-            new SweepEvent.EntitySummary(
-                started.SweepId,
-                ((SweepEvent.EntitySummary)auditWriter.Events[2]).At,
-                typeof(Note),
-                "short-lived",
-                tenantId,
-                Strategy.Purge,
-                TimeSpan.FromDays(30),
-                1,
-                0
-            )
+        summaries.Should().Contain(
+            s => s.SweepId == started.SweepId
+                && s.EntityType == typeof(Note)
+                && s.Category == "short-lived"
+                && s.TenantId == tenantId
+                && s.Strategy == Strategy.Purge
+                && s.Affected == 1
+                && s.HeldCount == 0
         );
-        auditWriter.Events[3].Should().Be(
+        summaries.Should().Contain(
+            s => s.SweepId == started.SweepId
+                && s.EntityType == typeof(SoftDeleteRecord)
+                && s.Category == "soft-delete"
+                && s.TenantId == tenantId
+                && s.Strategy == Strategy.SoftDelete
+                && s.Affected == 0
+                && s.HeldCount == 0
+        );
+
+        var rowDetails = auditWriter.Events.OfType<SweepEvent.RowDetail>().ToList();
+        rowDetails.Should().ContainSingle();
+        rowDetails[0].Should().Be(
             new SweepEvent.RowDetail(
                 started.SweepId,
-                ((SweepEvent.RowDetail)auditWriter.Events[3]).At,
+                rowDetails[0].At,
                 typeof(Note),
                 deletedNoteId.ToString(),
                 "short-lived",
@@ -115,22 +124,8 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                 tenantId
             )
         );
-        auditWriter.Events[4].Should().Be(
-            new SweepEvent.EntitySummary(
-                started.SweepId,
-                ((SweepEvent.EntitySummary)auditWriter.Events[4]).At,
-                typeof(SoftDeleteRecord),
-                "soft-delete",
-                tenantId,
-                Strategy.SoftDelete,
-                TimeSpan.FromDays(30),
-                0,
-                0
-            )
-        );
 
-        auditWriter.Events[5].Should().BeOfType<SweepEvent.Completed>();
-        var completed = (SweepEvent.Completed)auditWriter.Events[5];
+        var completed = (SweepEvent.Completed)auditWriter.Events[^1];
         completed.SweepId.Should().Be(started.SweepId);
         completed.TotalAffected.Should().Be(1);
 
@@ -292,7 +287,8 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         run.Duration.Should().NotBeNull();
         run.Duration.Should().BePositive();
 
-        summaries.Should().HaveCount(3);
+        // 3 original retained entities + 3 tenantless/per-row sample additions (all Exempt under this test's restricted dict).
+        summaries.Should().HaveCount(6);
         summaries.Should().Contain(
             new SweepRunEntitySummaryRow(
                 result.SweepId,
@@ -432,6 +428,71 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                 1,
                 0
             )
+        );
+    }
+
+    [Fact]
+    public async Task Entity_Level_AuditRowDetail_PerRow_Overrides_Category_Level_SummaryOnly()
+    {
+        // [Retain] on PerRowAuditedLog sets AuditRowDetail = PerRow. The sample category
+        // repository resolves "per-row-audit-override" to a rule with AuditRowDetail.SummaryOnly.
+        // The effective setting must come from the entity attribute, so per-row events should
+        // fire even though the rule says summary-only. Also prove that entities in OTHER
+        // categories (short-lived, whose rule is the default SummaryOnly) do NOT get per-row
+        // events from this same sweep.
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var perRowId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        var auditWriter = new RecordingAuditWriter();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.PerRowAuditedLogs.Add(
+                new PerRowAuditedLog
+                {
+                    Id = perRowId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Payload = "per-row-audited",
+                }
+            );
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "not-per-row-audited",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        await using var services = BuildRecordingAuditProvider(
+            GetConnectionString(),
+            new SampleCategoryRepository(),
+            auditWriter
+        );
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var startup = scope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
+            await startup.RunSweepAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                asOf
+            );
+        }
+
+        var rowDetails = auditWriter.Events.OfType<SweepEvent.RowDetail>().ToList();
+
+        rowDetails.Should().ContainSingle(
+            detail => detail.EntityType == typeof(PerRowAuditedLog) && detail.EntityId == perRowId.ToString(),
+            because: "entity-level AuditRowDetail.PerRow overrides the category rule's SummaryOnly"
+        );
+        rowDetails.Should().NotContain(
+            detail => detail.EntityType == typeof(Note),
+            because: "Note's category rule is SummaryOnly and its [Retain] does not override to PerRow"
         );
     }
 
@@ -596,10 +657,15 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
     ) : IRetentionCategoryRepository
     {
+        private static readonly IRetentionRuleResolver ExemptFallback = new StaticRetentionRuleResolver(
+            new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+        );
+
         public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
         {
-            resolvers.TryGetValue(category, out var resolver);
-            return Task.FromResult(resolver);
+            return resolvers.TryGetValue(category, out var resolver)
+                ? Task.FromResult<IRetentionRuleResolver?>(resolver)
+                : Task.FromResult<IRetentionRuleResolver?>(ExemptFallback);
         }
     }
 

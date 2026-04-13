@@ -17,6 +17,17 @@ public sealed class SampleCategoryRepository : IRetentionCategoryRepository
             ["anonymise"] = new StaticRetentionRuleResolver(
                 new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
             ),
+            ["tenantless-purge"] = new StaticRetentionRuleResolver(
+                new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+            ),
+            ["tenantless-softdelete"] = new StaticRetentionRuleResolver(
+                new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+            ),
+            // Category default is SummaryOnly — the entity [Retain] attribute overrides to PerRow,
+            // which is exactly what CohortConventionsEndToEndTests / PerRowAuditOverride tests assert.
+            ["per-row-audit-override"] = new StaticRetentionRuleResolver(
+                new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge, AuditRowDetail: AuditRowDetail.SummaryOnly)
+            ),
         };
 
     public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)

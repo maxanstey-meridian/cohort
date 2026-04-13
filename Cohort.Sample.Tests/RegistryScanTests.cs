@@ -68,7 +68,9 @@ public sealed class RegistryScanTests
 
         // Negative — nothing else sneaks in
         entries.Values.Should().NotContain(e => e.Category == "long-lived");
-        entries.Should().HaveCount(3);
+        // SampleDbContext has 6 retained entities: the three original categories plus
+        // TenantlessLog/TenantlessSoftDelete/PerRowAuditedLog added for negative-coverage tests.
+        entries.Should().HaveCount(6);
     }
 
     [Fact]

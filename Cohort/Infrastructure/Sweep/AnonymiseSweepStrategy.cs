@@ -293,6 +293,7 @@ public sealed class AnonymiseSweepStrategy(
         var staticAssignments = CreateStaticAssignments(entry, ctx.Tenant.Id, ctx.Now);
         var affectedRecordIds = new List<string>();
         var heldCount = candidateRecordIds.Count - rows.Count;
+        var skippedCount = 0;
 
         foreach (var row in rows)
         {
@@ -312,16 +313,28 @@ public sealed class AnonymiseSweepStrategy(
                 execution.At
             );
 
-            try
+            var beforeResult = await RetentionHandlerSupport.InvokeOnBeforeAsync(
+                handlers,
+                row,
+                beforeContext,
+                ct
+            );
+            if (!beforeResult.Succeeded)
             {
-                await RetentionHandlerSupport.InvokeOnBeforeAsync(handlers, row, beforeContext, ct);
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch
-            {
+                skippedCount++;
+                await RetentionHandlerSupport.PersistBeforeFailureAsync(
+                    conn,
+                    transaction,
+                    execution,
+                    entry,
+                    rule.Strategy,
+                    ctx.Tenant.Id,
+                    recordId,
+                    new Dictionary<string, object?>(beforeContext.Snapshot, StringComparer.Ordinal),
+                    beforeResult.FailedHandler!,
+                    beforeResult.Failure!,
+                    ct
+                );
                 continue;
             }
 
@@ -362,7 +375,8 @@ public sealed class AnonymiseSweepStrategy(
         return new SweepExecutionResult(
             affectedRecordIds,
             heldCount,
-            RowDetailsPersisted: true
+            RowDetailsPersisted: true,
+            SkippedCount: skippedCount
         );
     }
 

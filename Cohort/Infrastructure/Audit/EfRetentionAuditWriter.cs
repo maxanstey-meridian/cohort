@@ -79,7 +79,8 @@ public sealed class EfRetentionAuditWriter(DbContext db) : IRetentionAuditWriter
                 "Strategy",
                 "ResolvedPeriod",
                 "Affected",
-                "HeldCount"
+                "HeldCount",
+                "SkippedCount"
             )
             VALUES (
                 @sweepId,
@@ -90,7 +91,8 @@ public sealed class EfRetentionAuditWriter(DbContext db) : IRetentionAuditWriter
                 @strategy,
                 @resolvedPeriod,
                 @affected,
-                @heldCount
+                @heldCount,
+                @skippedCount
             )
             """,
             command =>
@@ -108,6 +110,9 @@ public sealed class EfRetentionAuditWriter(DbContext db) : IRetentionAuditWriter
                 );
                 command.Parameters.Add(CreateParameter(command, "affected", summary.Affected));
                 command.Parameters.Add(CreateParameter(command, "heldCount", summary.HeldCount));
+                command.Parameters.Add(
+                    CreateParameter(command, "skippedCount", summary.SkippedCount)
+                );
             },
             ct
         );

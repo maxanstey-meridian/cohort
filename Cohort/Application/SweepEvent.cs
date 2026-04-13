@@ -21,7 +21,8 @@ public abstract record SweepEvent
         Strategy Strategy,
         TimeSpan ResolvedPeriod,
         int Affected,
-        int HeldCount
+        int HeldCount,
+        int SkippedCount = 0
     ) : SweepEvent;
 
     public sealed record RowDetail(

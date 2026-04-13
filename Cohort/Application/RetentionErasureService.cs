@@ -149,6 +149,13 @@ public sealed class RetentionErasureService(
                     );
                 }
 
+                if (execution.SkippedCount < 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Retention strategy '{rule.Strategy}' produced an invalid skipped-count for entity {entry.EntityType.FullName}."
+                    );
+                }
+
                 await WriteAuditEventAsync(
                     new SweepEvent.EntitySummary(
                         sweepId,
@@ -159,7 +166,8 @@ public sealed class RetentionErasureService(
                         rule.Strategy,
                         resolvedPeriod,
                         affectedCount,
-                        execution.HeldCount
+                        execution.HeldCount,
+                        execution.SkippedCount
                     ),
                     auditEvents,
                     ct

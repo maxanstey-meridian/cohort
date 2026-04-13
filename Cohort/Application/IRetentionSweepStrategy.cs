@@ -52,7 +52,8 @@ public interface IRetentionSweepStrategy
 public sealed record SweepExecutionResult(
     IReadOnlyList<string> AffectedRecordIds,
     int HeldCount,
-    bool RowDetailsPersisted = false
+    bool RowDetailsPersisted = false,
+    int SkippedCount = 0
 );
 
 public sealed record SweepMutationContext(Guid SweepId, DateTimeOffset At);

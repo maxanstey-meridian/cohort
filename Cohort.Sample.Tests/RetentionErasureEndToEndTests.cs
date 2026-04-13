@@ -235,7 +235,8 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                 Strategy.Purge,
                 TimeSpan.FromDays(30),
                 1,
-                1
+                1,
+                0
             )
         );
         summaries.Should().Contain(
@@ -247,7 +248,8 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                 Strategy.SoftDelete,
                 TimeSpan.FromDays(30),
                 1,
-                1
+                1,
+                0
             )
         );
         summaries.Should().Contain(
@@ -259,7 +261,8 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                 Strategy.Anonymise,
                 TimeSpan.FromDays(30),
                 1,
-                1
+                1,
+                0
             )
         );
         rowDetails.Should().ContainSingle();
@@ -1093,6 +1096,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                 Strategy.Purge,
                 TimeSpan.FromDays(90),
                 1,
+                0,
                 0
             )
         );
@@ -1197,7 +1201,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         await using var command = await CreateCommandAsync(db, sweepId);
         command.CommandText =
             """
-            SELECT "SweepId", "EntityType", "Category", "TenantId", "Strategy", "ResolvedPeriod", "Affected", "HeldCount"
+            SELECT "SweepId", "EntityType", "Category", "TenantId", "Strategy", "ResolvedPeriod", "Affected", "HeldCount", "SkippedCount"
             FROM "sweep_run_entity_summary"
             WHERE "SweepId" = @sweepId
             ORDER BY "EntityType"
@@ -1216,7 +1220,8 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     (Strategy)reader.GetInt32(4),
                     reader.GetFieldValue<TimeSpan>(5),
                     reader.GetInt32(6),
-                    reader.GetInt32(7)
+                    reader.GetInt32(7),
+                    reader.GetInt32(8)
                 )
             );
         }
@@ -1312,7 +1317,8 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         Strategy Strategy,
         TimeSpan ResolvedPeriod,
         int Affected,
-        int HeldCount
+        int HeldCount,
+        int SkippedCount = 0
     );
 
     private sealed record SweepRunRowDetailRow(

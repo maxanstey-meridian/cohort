@@ -685,17 +685,31 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         }
 
         var rowDetails = await LoadCapturedRowsAsync(result.SweepId);
-        rowDetails.Should().ContainSingle(row => row.EntityId == successfulNoteId.ToString());
-        rowDetails.Should().NotContain(row => row.EntityId == failingNoteId.ToString());
+        rowDetails.Should().HaveCount(2);
+        rowDetails.Should().Contain(row => row.EntityId == successfulNoteId.ToString());
+        rowDetails.Should().Contain(row => row.EntityId == failingNoteId.ToString());
 
-        using (var payload = JsonDocument.Parse(rowDetails[0].CapturedPayload))
+        using (var payload = JsonDocument.Parse(rowDetails.Single(row => row.EntityId == successfulNoteId.ToString()).CapturedPayload))
         {
             payload.RootElement.GetProperty("body").GetString().Should().Be("surviving-sibling");
         }
+        using (var payload = JsonDocument.Parse(rowDetails.Single(row => row.EntityId == failingNoteId.ToString()).CapturedPayload))
+        {
+            payload.RootElement.EnumerateObject().Should().BeEmpty();
+        }
 
         var statuses = await LoadHandlerStatusesAsync(result.SweepId);
-        statuses.Should().ContainSingle(
+        statuses.Should().HaveCount(2);
+        statuses.Should().Contain(
             status => status.HandlerType.Contains(nameof(SelectivelyFailingNoteHandler), StringComparison.Ordinal)
+                && status.State == PendingState
+        );
+        statuses.Should().Contain(
+            status => status.HandlerType.Contains(nameof(SelectivelyFailingNoteHandler), StringComparison.Ordinal)
+                && status.State == DeadLetteredState
+                && status.Attempt == 1
+                && status.CompletedAt != null
+                && status.LastError != null
         );
 
         var summaries = await LoadEntitySummariesAsync(result.SweepId);
@@ -704,6 +718,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                 summary.EntityType == typeof(Note).FullName
                 && summary.Affected == 1
                 && summary.HeldCount == 0
+                && summary.SkippedCount == 1
         );
     }
 
@@ -851,13 +866,16 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         rowDetails.Select(row => row.EntityId).Should().BeEquivalentTo(
             [
                 successfulNoteId.ToString(),
+                failingNoteId.ToString(),
                 successfulSoftDeleteId.ToString(),
+                failingSoftDeleteId.ToString(),
                 successfulContactId.ToString(),
+                failingContactId.ToString(),
             ]
         );
 
         var statuses = await LoadHandlerStatusesAsync(result.SweepId);
-        statuses.Should().HaveCount(3);
+        statuses.Should().HaveCount(6);
         statuses.Select(status => status.HandlerType).Should().Contain(
             type => type.Contains(nameof(SelectivelyFailingErasureNoteHandler), StringComparison.Ordinal)
         );
@@ -872,16 +890,21 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     StringComparison.Ordinal
                 )
         );
+        statuses.Count(status => status.State == PendingState).Should().Be(3);
+        statuses.Count(status => status.State == DeadLetteredState).Should().Be(3);
+        statuses.Where(status => status.State == DeadLetteredState)
+            .Should()
+            .OnlyContain(status => status.Attempt == 1 && status.CompletedAt != null && status.LastError != null);
 
         var summaries = await LoadEntitySummariesAsync(result.SweepId);
         summaries.Should().Contain(
-            new EntitySummaryRow(typeof(Note).FullName!, Strategy.Purge, 1, 0)
+            new EntitySummaryRow(typeof(Note).FullName!, Strategy.Purge, 1, 0, 1)
         );
         summaries.Should().Contain(
-            new EntitySummaryRow(typeof(SoftDeleteRecord).FullName!, Strategy.SoftDelete, 1, 0)
+            new EntitySummaryRow(typeof(SoftDeleteRecord).FullName!, Strategy.SoftDelete, 1, 0, 1)
         );
         summaries.Should().Contain(
-            new EntitySummaryRow(typeof(AnonymisedContact).FullName!, Strategy.Anonymise, 1, 0)
+            new EntitySummaryRow(typeof(AnonymisedContact).FullName!, Strategy.Anonymise, 1, 0, 1)
         );
     }
 
@@ -1089,13 +1112,13 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         var summaries = await LoadEntitySummariesAsync(result.SweepId);
         summaries.Should().Contain(
-            new EntitySummaryRow(typeof(Note).FullName!, Strategy.Purge, 1, 1)
+            new EntitySummaryRow(typeof(Note).FullName!, Strategy.Purge, 1, 1, 0)
         );
         summaries.Should().Contain(
-            new EntitySummaryRow(typeof(SoftDeleteRecord).FullName!, Strategy.SoftDelete, 1, 1)
+            new EntitySummaryRow(typeof(SoftDeleteRecord).FullName!, Strategy.SoftDelete, 1, 1, 0)
         );
         summaries.Should().Contain(
-            new EntitySummaryRow(typeof(AnonymisedContact).FullName!, Strategy.Anonymise, 1, 1)
+            new EntitySummaryRow(typeof(AnonymisedContact).FullName!, Strategy.Anonymise, 1, 1, 0)
         );
     }
 
@@ -2138,7 +2161,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         await using var command = connection.CreateCommand();
         command.CommandText =
             """
-            SELECT "EntityType", "Strategy", "Affected", "HeldCount"
+            SELECT "EntityType", "Strategy", "Affected", "HeldCount", "SkippedCount"
             FROM "sweep_run_entity_summary"
             WHERE "SweepId" = @sweepId
             ORDER BY "EntityType"
@@ -2154,7 +2177,8 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     reader.GetString(0),
                     (Strategy)reader.GetInt32(1),
                     reader.GetInt32(2),
-                    reader.GetInt32(3)
+                    reader.GetInt32(3),
+                    reader.GetInt32(4)
                 )
             );
         }
@@ -2223,7 +2247,8 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         string EntityType,
         Strategy Strategy,
         int Affected,
-        int HeldCount
+        int HeldCount,
+        int SkippedCount = 0
     );
 
     private sealed class StaticCategoryRepository(

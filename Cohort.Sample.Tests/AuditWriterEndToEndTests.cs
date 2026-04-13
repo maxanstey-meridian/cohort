@@ -91,6 +91,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                 && s.Strategy == Strategy.Anonymise
                 && s.Affected == 0
                 && s.HeldCount == 0
+                && s.SkippedCount == 0
         );
         summaries.Should().Contain(
             s => s.SweepId == started.SweepId
@@ -100,6 +101,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                 && s.Strategy == Strategy.Purge
                 && s.Affected == 1
                 && s.HeldCount == 0
+                && s.SkippedCount == 0
         );
         summaries.Should().Contain(
             s => s.SweepId == started.SweepId
@@ -109,6 +111,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                 && s.Strategy == Strategy.SoftDelete
                 && s.Affected == 0
                 && s.HeldCount == 0
+                && s.SkippedCount == 0
         );
 
         var rowDetails = auditWriter.Events.OfType<SweepEvent.RowDetail>().ToList();
@@ -299,7 +302,8 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                 Strategy.Purge,
                 TimeSpan.FromDays(30),
                 1,
-                1
+                1,
+                0
             )
         );
         summaries.Should().Contain(
@@ -311,7 +315,8 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                 Strategy.SoftDelete,
                 TimeSpan.FromDays(30),
                 1,
-                1
+                1,
+                0
             )
         );
         summaries.Should().Contain(
@@ -323,7 +328,8 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                 Strategy.Anonymise,
                 TimeSpan.FromDays(30),
                 1,
-                1
+                1,
+                0
             )
         );
 
@@ -553,7 +559,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         await using var command = await CreateCommandAsync(db, sweepId);
         command.CommandText =
             """
-            SELECT "SweepId", "EntityType", "Category", "TenantId", "Strategy", "ResolvedPeriod", "Affected", "HeldCount"
+            SELECT "SweepId", "EntityType", "Category", "TenantId", "Strategy", "ResolvedPeriod", "Affected", "HeldCount", "SkippedCount"
             FROM "sweep_run_entity_summary"
             WHERE "SweepId" = @sweepId
             ORDER BY "EntityType"
@@ -572,7 +578,8 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                     (Strategy)reader.GetInt32(4),
                     reader.GetFieldValue<TimeSpan>(5),
                     reader.GetInt32(6),
-                    reader.GetInt32(7)
+                    reader.GetInt32(7),
+                    reader.GetInt32(8)
                 )
             );
         }
@@ -708,7 +715,8 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         Strategy Strategy,
         TimeSpan ResolvedPeriod,
         int Affected,
-        int HeldCount
+        int HeldCount,
+        int SkippedCount = 0
     );
 
     private sealed record SweepRunRowDetailRow(

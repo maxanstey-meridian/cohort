@@ -39,7 +39,7 @@ internal static class RetentionHandlerSupport
             .ToArray();
     }
 
-    public static async Task InvokeOnBeforeAsync(
+    public static async Task<OnBeforeInvocationResult> InvokeOnBeforeAsync(
         IReadOnlyList<ResolvedRetentionHandler> handlers,
         object row,
         RetentionBeforeContext ctx,
@@ -52,9 +52,31 @@ internal static class RetentionHandlerSupport
 
         foreach (var handler in handlers)
         {
-            var invocation = handler.OnBeforeMethod.Invoke(handler.Instance, [row, ctx, ct]);
-            await (Task)invocation!;
+            try
+            {
+                var invocation = handler.OnBeforeMethod.Invoke(handler.Instance, [row, ctx, ct]);
+                await (Task)invocation!;
+            }
+            catch (System.Reflection.TargetInvocationException ex)
+                when (ex.InnerException is OperationCanceledException cancellation)
+            {
+                throw cancellation;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (System.Reflection.TargetInvocationException ex) when (ex.InnerException is not null)
+            {
+                return new OnBeforeInvocationResult(handler, ex.InnerException);
+            }
+            catch (Exception ex)
+            {
+                return new OnBeforeInvocationResult(handler, ex);
+            }
         }
+
+        return OnBeforeInvocationResult.Success;
     }
 
     public static async Task PersistCapturedRowAsync(
@@ -101,6 +123,52 @@ internal static class RetentionHandlerSupport
                 ct
             );
         }
+    }
+
+    public static async Task PersistBeforeFailureAsync(
+        DbConnection conn,
+        DbTransaction transaction,
+        SweepMutationContext execution,
+        RetentionEntry entry,
+        Strategy strategy,
+        Guid tenantId,
+        string entityId,
+        IReadOnlyDictionary<string, object?> snapshot,
+        ResolvedRetentionHandler failedHandler,
+        Exception failure,
+        CancellationToken ct
+    )
+    {
+        ArgumentNullException.ThrowIfNull(conn);
+        ArgumentNullException.ThrowIfNull(transaction);
+        ArgumentNullException.ThrowIfNull(execution);
+        ArgumentNullException.ThrowIfNull(entry);
+        ArgumentException.ThrowIfNullOrWhiteSpace(entityId);
+        ArgumentNullException.ThrowIfNull(snapshot);
+        ArgumentNullException.ThrowIfNull(failedHandler);
+        ArgumentNullException.ThrowIfNull(failure);
+
+        var rowDetailId = await InsertRowDetailAsync(
+            conn,
+            transaction,
+            execution,
+            entry,
+            strategy,
+            tenantId,
+            entityId,
+            snapshot,
+            ct
+        );
+
+        await InsertDeadLetteredHandlerStatusAsync(
+            conn,
+            transaction,
+            rowDetailId,
+            failedHandler,
+            execution.At,
+            failure,
+            ct
+        );
     }
 
     private static async Task<long> InsertRowDetailAsync(
@@ -206,6 +274,57 @@ internal static class RetentionHandlerSupport
         await command.ExecuteNonQueryAsync(ct);
     }
 
+    private static async Task InsertDeadLetteredHandlerStatusAsync(
+        DbConnection conn,
+        DbTransaction transaction,
+        long rowDetailId,
+        ResolvedRetentionHandler handler,
+        DateTimeOffset failedAt,
+        Exception failure,
+        CancellationToken ct
+    )
+    {
+        await using var command = conn.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            $"""
+            INSERT INTO {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} (
+                "SweepRunRowDetailId",
+                "HandlerType",
+                "State",
+                "Attempt",
+                "QueuedAt",
+                "NextAttemptAt",
+                "ClaimedAt",
+                "CompletedAt",
+                "LastError"
+            )
+            VALUES (
+                @rowDetailId,
+                @handlerType,
+                @state,
+                @attempt,
+                @queuedAt,
+                @nextAttemptAt,
+                NULL,
+                @completedAt,
+                @lastError
+            )
+            """;
+        command.Parameters.Add(CreateParameter(command, "rowDetailId", rowDetailId));
+        command.Parameters.Add(CreateParameter(command, "handlerType", handler.HandlerTypeName));
+        command.Parameters.Add(
+            CreateParameter(command, "state", (int)SweepRowHandlerDispatchState.DeadLettered)
+        );
+        command.Parameters.Add(CreateParameter(command, "attempt", 1));
+        command.Parameters.Add(CreateParameter(command, "queuedAt", failedAt));
+        command.Parameters.Add(CreateParameter(command, "nextAttemptAt", failedAt));
+        command.Parameters.Add(CreateParameter(command, "completedAt", failedAt));
+        command.Parameters.Add(CreateParameter(command, "lastError", failure.ToString()));
+
+        await command.ExecuteNonQueryAsync(ct);
+    }
+
     private static DbParameter CreateParameter(DbCommand command, string name, object? value)
     {
         var parameter = command.CreateParameter();
@@ -236,4 +355,14 @@ internal sealed class ResolvedRetentionHandler(object instance, Type handlerInte
         ?? throw new InvalidOperationException(
             $"Could not resolve {nameof(IRetentionHandler<object>.OnBeforeAsync)} for handler interface {handlerInterface.FullName}."
         );
+}
+
+internal sealed record OnBeforeInvocationResult(
+    ResolvedRetentionHandler? FailedHandler,
+    Exception? Failure
+)
+{
+    public static OnBeforeInvocationResult Success { get; } = new(null, null);
+
+    public bool Succeeded => FailedHandler is null;
 }

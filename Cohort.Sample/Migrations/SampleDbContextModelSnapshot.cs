@@ -418,6 +418,9 @@ namespace Cohort.Sample.Migrations
                     b.Property<int>("HeldCount")
                         .HasColumnType("integer");
 
+                    b.Property<int>("SkippedCount")
+                        .HasColumnType("integer");
+
                     b.Property<TimeSpan>("ResolvedPeriod")
                         .HasColumnType("interval");
 

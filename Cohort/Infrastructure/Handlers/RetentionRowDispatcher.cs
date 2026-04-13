@@ -89,6 +89,7 @@ public sealed class RetentionRowDispatcher(
     private async ValueTask ProcessClaimedRowAsync(ClaimedHandlerRow claimed, CancellationToken ct)
     {
         var currentAttempt = claimed.Attempt + 1;
+        var handlerCompleted = false;
 
         try
         {
@@ -110,9 +111,15 @@ public sealed class RetentionRowDispatcher(
             var snapshot = DeserializeSnapshot(claimed.CapturedPayload);
             var context = CreateAfterContext(entityType, claimed, currentAttempt, snapshot);
             await InvokeOnAfterAsync(entityType, handler.Instance, context, ct);
-            await MarkSucceededAsync(claimed.StatusId, currentAttempt, DateTimeOffset.UtcNow, ct);
+            handlerCompleted = true;
+            await MarkSucceededAsync(
+                claimed.StatusId,
+                currentAttempt,
+                DateTimeOffset.UtcNow,
+                CancellationToken.None
+            );
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested && !handlerCompleted)
         {
             throw;
         }

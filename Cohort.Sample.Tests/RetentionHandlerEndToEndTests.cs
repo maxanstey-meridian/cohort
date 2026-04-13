@@ -937,6 +937,86 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task FlushAsync_Cancellation_After_Handler_Completes_Does_Not_Requeue_The_Same_Row()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var sink = new HandlerExecutionSink();
+        var blocker = new StatusUpdateBlocker(GetConnectionString());
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "post-handler-cancellation",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:BatchSize"] = "10",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxParallelism"] = "1",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(sink);
+                services.AddSingleton(blocker);
+                services.AddRowHandler<Note, LocksStatusThenReturnsNoteHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        using var cancellation = new CancellationTokenSource();
+        await handlerHost.RunWithServicesAsync(
+            async serviceProvider =>
+            {
+                var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+                var flushTask = dispatcher.FlushAsync(cancellation.Token);
+
+                await blocker.WaitUntilLockedAsync();
+                cancellation.Cancel();
+                await blocker.ReleaseAsync();
+
+                try
+                {
+                    await flushTask;
+                }
+                catch (OperationCanceledException)
+                {
+                }
+            }
+        );
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        sink.AfterCalls.Should().Equal("after:post-handler-cancellation:1");
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().ContainSingle();
+        statuses[0].State.Should().Be(SucceededState);
+        statuses[0].Attempt.Should().Be(1);
+        statuses[0].CompletedAt.Should().NotBeNull();
+        statuses[0].LastError.Should().BeNull();
+    }
+
+    [Fact]
     public async Task Hosted_Dispatcher_Requeues_Retryable_Failures_With_Backoff_And_Last_Error()
     {
         var tenantId = Guid.NewGuid();
@@ -1397,6 +1477,52 @@ file sealed class DispatchBlockGate
     }
 }
 
+file sealed class StatusUpdateBlocker(string connectionString) : IAsyncDisposable
+{
+    private readonly TaskCompletionSource locked = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private NpgsqlConnection? connection;
+    private NpgsqlTransaction? transaction;
+
+    public Task WaitUntilLockedAsync()
+    {
+        return locked.Task;
+    }
+
+    public async Task AcquireAsync(CancellationToken ct)
+    {
+        connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(ct);
+        transaction = await connection.BeginTransactionAsync(ct);
+
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """LOCK TABLE "sweep_row_handler_status" IN ACCESS EXCLUSIVE MODE""";
+        await command.ExecuteNonQueryAsync(ct);
+        locked.TrySetResult();
+    }
+
+    public async Task ReleaseAsync()
+    {
+        if (transaction is not null)
+        {
+            await transaction.CommitAsync();
+            await transaction.DisposeAsync();
+            transaction = null;
+        }
+
+        if (connection is not null)
+        {
+            await connection.DisposeAsync();
+            connection = null;
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await ReleaseAsync();
+    }
+}
+
 [RowHandlerPriority(20)]
 file sealed class LowPriorityNoteHandler(HandlerExecutionSink sink) : IRetentionHandler<Note>
 {
@@ -1658,5 +1784,23 @@ file sealed class BlockingDispatchNoteHandler(
     {
         await gate.WaitForReleaseAsync(ct);
         sink.AfterCalls.Add($"after:{ctx.Snapshot["body"]}:{ctx.Attempt}");
+    }
+}
+
+file sealed class LocksStatusThenReturnsNoteHandler(
+    HandlerExecutionSink sink,
+    StatusUpdateBlocker blocker
+) : IRetentionHandler<Note>
+{
+    public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        ctx.Snapshot["body"] = row.Body;
+        return Task.CompletedTask;
+    }
+
+    public async Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
+    {
+        sink.AfterCalls.Add($"after:{ctx.Snapshot["body"]}:{ctx.Attempt}");
+        await blocker.AcquireAsync(ct);
     }
 }

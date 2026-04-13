@@ -82,7 +82,7 @@ public sealed class RetentionStartupValidator(
             try
             {
                 var startupRule = resolver.TryResolveAtStartup();
-                if (ShouldValidateFactoryBackedAnonymiseFields(entry, startupRule))
+                if (entry.AnonymiseFields.Any(field => field is AnonymiseFactoryField))
                 {
                     ValidateFactoryBackedAnonymiseSupport(
                         entry,
@@ -113,19 +113,6 @@ public sealed class RetentionStartupValidator(
         {
             throw new RetentionConfigurationException(errors);
         }
-    }
-
-    private static bool ShouldValidateFactoryBackedAnonymiseFields(
-        RetentionEntry entry,
-        RetentionRule? startupRule
-    )
-    {
-        if (!entry.AnonymiseFields.Any(field => field is AnonymiseFactoryField))
-        {
-            return false;
-        }
-
-        return startupRule is null || startupRule.Strategy == Strategy.Anonymise;
     }
 
     private void ValidateFactoryBackedAnonymiseSupport(

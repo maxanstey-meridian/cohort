@@ -133,7 +133,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
                 new SingleCategoryRepository(
                     "invalid-factory-type",
                     new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                     )
                 )
             );
@@ -156,7 +156,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
                 new SingleCategoryRepository(
                     "unregistered-factory",
                     new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                     )
                 )
             );
@@ -179,6 +179,25 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
                 "registered-factory",
                 new StaticRetentionRuleResolver(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                )
+            ),
+            services => services.AddSingleton<IAnonymiseValueFactory, RegisteredFactory>()
+        );
+
+        entries.Should().ContainKey(typeof(RegisteredFactoryStartupRecord));
+        entries[typeof(RegisteredFactoryStartupRecord)]
+            .AnonymiseFields.Should()
+            .ContainSingle(field => field is AnonymiseFactoryField);
+    }
+
+    [Fact]
+    public async Task Startup_Path_Allows_Registered_FactoryBacked_Metadata_Even_When_Category_Is_Not_Anonymise()
+    {
+        var entries = await RunFactoryValidationStartupAsync<RegisteredFactoryStartupDbContext>(
+            new SingleCategoryRepository(
+                "registered-factory",
+                new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                 )
             ),
             services => services.AddSingleton<IAnonymiseValueFactory, RegisteredFactory>()

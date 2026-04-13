@@ -316,9 +316,9 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "CreatedAt",
             new RecordIdConvention(nameof(AnonymisedContact.Id), "Id", typeof(Guid)),
             [
-                new AnonymiseField(nameof(AnonymisedContact.EmailAddress), "EmailAddress", AnonymiseMethod.Null),
-                new AnonymiseField(nameof(AnonymisedContact.GivenName), "GivenName", AnonymiseMethod.EmptyString),
-                new AnonymiseField(
+                new AnonymiseLiteralField(nameof(AnonymisedContact.EmailAddress), "EmailAddress", AnonymiseMethod.Null),
+                new AnonymiseLiteralField(nameof(AnonymisedContact.GivenName), "GivenName", AnonymiseMethod.EmptyString),
+                new AnonymiseLiteralField(
                     nameof(AnonymisedContact.Surname),
                     "Surname",
                     AnonymiseMethod.FixedLiteral,
@@ -379,9 +379,9 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "CreatedAt",
             new RecordIdConvention(nameof(AnonymisedContact.Id), "Id", typeof(Guid)),
             [
-                new AnonymiseField(nameof(AnonymisedContact.EmailAddress), "EmailAddress", AnonymiseMethod.Null),
-                new AnonymiseField(nameof(AnonymisedContact.GivenName), "GivenName", AnonymiseMethod.EmptyString),
-                new AnonymiseField(
+                new AnonymiseLiteralField(nameof(AnonymisedContact.EmailAddress), "EmailAddress", AnonymiseMethod.Null),
+                new AnonymiseLiteralField(nameof(AnonymisedContact.GivenName), "GivenName", AnonymiseMethod.EmptyString),
+                new AnonymiseLiteralField(
                     nameof(AnonymisedContact.Surname),
                     "Surname",
                     AnonymiseMethod.FixedLiteral,
@@ -460,9 +460,9 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "CreatedAt",
             new RecordIdConvention(nameof(AnonymisedContact.Id), "Id", typeof(Guid)),
             [
-                new AnonymiseField(nameof(AnonymisedContact.EmailAddress), "EmailAddress", AnonymiseMethod.Null),
-                new AnonymiseField(nameof(AnonymisedContact.GivenName), "GivenName", AnonymiseMethod.EmptyString),
-                new AnonymiseField(
+                new AnonymiseLiteralField(nameof(AnonymisedContact.EmailAddress), "EmailAddress", AnonymiseMethod.Null),
+                new AnonymiseLiteralField(nameof(AnonymisedContact.GivenName), "GivenName", AnonymiseMethod.EmptyString),
+                new AnonymiseLiteralField(
                     nameof(AnonymisedContact.Surname),
                     "Surname",
                     AnonymiseMethod.FixedLiteral,
@@ -517,9 +517,9 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "CreatedAt",
             new RecordIdConvention(nameof(AnonymisedContact.Id), "record_id", typeof(Guid)),
             [
-                new AnonymiseField(nameof(AnonymisedContact.EmailAddress), "EmailAddress", AnonymiseMethod.Null),
-                new AnonymiseField(nameof(AnonymisedContact.GivenName), "GivenName", AnonymiseMethod.EmptyString),
-                new AnonymiseField(
+                new AnonymiseLiteralField(nameof(AnonymisedContact.EmailAddress), "EmailAddress", AnonymiseMethod.Null),
+                new AnonymiseLiteralField(nameof(AnonymisedContact.GivenName), "GivenName", AnonymiseMethod.EmptyString),
+                new AnonymiseLiteralField(
                     nameof(AnonymisedContact.Surname),
                     "Surname",
                     AnonymiseMethod.FixedLiteral,
@@ -571,9 +571,9 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "CreatedAt",
             new RecordIdConvention(nameof(AnonymisedContact.Id), "Id", typeof(Guid)),
             [
-                new AnonymiseField(nameof(AnonymisedContact.EmailAddress), "EmailAddress", AnonymiseMethod.Null),
-                new AnonymiseField(nameof(AnonymisedContact.GivenName), "GivenName", AnonymiseMethod.EmptyString),
-                new AnonymiseField(
+                new AnonymiseLiteralField(nameof(AnonymisedContact.EmailAddress), "EmailAddress", AnonymiseMethod.Null),
+                new AnonymiseLiteralField(nameof(AnonymisedContact.GivenName), "GivenName", AnonymiseMethod.EmptyString),
+                new AnonymiseLiteralField(
                     nameof(AnonymisedContact.Surname),
                     "Surname",
                     AnonymiseMethod.FixedLiteral,

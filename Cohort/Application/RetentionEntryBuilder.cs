@@ -124,7 +124,16 @@ public sealed class RetentionEntryBuilder(CohortConventions conventions)
         foreach (var property in clrType.GetProperties(BindingFlags.Public | BindingFlags.Instance))
         {
             var anonymise = property.GetCustomAttribute<AnonymiseAttribute>(inherit: false);
-            if (anonymise is null)
+            var anonymiseWith = property.GetCustomAttribute<AnonymiseWithAttribute>(inherit: false);
+
+            if (anonymise is not null && anonymiseWith is not null)
+            {
+                throw new InvalidOperationException(
+                    $"[Anonymise] and [AnonymiseWith] on {clrType.FullName}.{property.Name}: exactly one is allowed per property."
+                );
+            }
+
+            if (anonymise is null && anonymiseWith is null)
             {
                 continue;
             }
@@ -141,7 +150,26 @@ public sealed class RetentionEntryBuilder(CohortConventions conventions)
                     $"[Anonymise] on {clrType.FullName}.{property.Name}: property has no mapped table column."
                 );
 
-            fields.Add(new AnonymiseField(property.Name, columnName, anonymise.Method, anonymise.Literal));
+            if (anonymise is not null)
+            {
+                fields.Add(
+                    new AnonymiseLiteralField(
+                        property.Name,
+                        columnName,
+                        anonymise.Method,
+                        anonymise.Literal
+                    )
+                );
+                continue;
+            }
+
+            fields.Add(
+                new AnonymiseFactoryField(
+                    property.Name,
+                    columnName,
+                    anonymiseWith!.FactoryType
+                )
+            );
         }
 
         return fields.ToArray();

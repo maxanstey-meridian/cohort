@@ -191,7 +191,12 @@ public sealed class RetentionStartupValidator(
                 continue;
             }
 
-            switch (field.Method)
+            if (field is not AnonymiseLiteralField literalField)
+            {
+                continue;
+            }
+
+            switch (literalField.Method)
             {
                 case AnonymiseMethod.Null when !CanAssignNull(property):
                     errors.Add(

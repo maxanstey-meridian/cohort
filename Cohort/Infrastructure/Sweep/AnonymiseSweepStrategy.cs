@@ -492,16 +492,23 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
 
     private static object CreateAssignmentValue(AnonymiseField field)
     {
-        return field.Method switch
+        if (field is not AnonymiseLiteralField literalField)
+        {
+            throw new InvalidOperationException(
+                $"Anonymise field '{field.MemberName}' requires factory-backed execution that is not available in this version."
+            );
+        }
+
+        return literalField.Method switch
         {
             AnonymiseMethod.Null => DBNull.Value,
             AnonymiseMethod.EmptyString => string.Empty,
-            AnonymiseMethod.FixedLiteral => field.Literal
+            AnonymiseMethod.FixedLiteral => literalField.Literal
                 ?? throw new InvalidOperationException(
-                    $"Anonymise field '{field.MemberName}' requires a literal value."
+                    $"Anonymise field '{literalField.MemberName}' requires a literal value."
                 ),
             _ => throw new InvalidOperationException(
-                $"Anonymise method '{field.Method}' is not supported."
+                $"Anonymise method '{literalField.Method}' is not supported."
             ),
         };
     }

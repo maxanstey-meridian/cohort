@@ -94,13 +94,51 @@ public sealed class RegistryScanTests
         );
         entry.AnonymiseFields.Should().ContainSingle();
         entry.AnonymiseFields[0].Should().Be(
-            new AnonymiseField(
+            new AnonymiseLiteralField(
                 nameof(RetentionReadyRecord.EmailAddress),
                 "email_address",
                 AnonymiseMethod.FixedLiteral,
                 "[redacted]"
             )
         );
+    }
+
+    [Fact]
+    public void Scan_Discovers_Factory_Backed_Anonymise_Metadata_And_Column_Mapping()
+    {
+        var options = new DbContextOptionsBuilder<FactoryBackedRegistryMetadataDbContext>()
+            .UseInMemoryDatabase($"registry-factory-anonymise-{Guid.NewGuid()}")
+            .Options;
+        using var db = new FactoryBackedRegistryMetadataDbContext(options);
+
+        var entry = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())).Scan()[typeof(FactoryBackedRetentionReadyRecord)];
+
+        entry.AnonymiseFields.Should().ContainSingle();
+        entry.AnonymiseFields[0].Should().Be(
+            new AnonymiseFactoryField(
+                nameof(FactoryBackedRetentionReadyRecord.ExternalId),
+                "external_identifier",
+                typeof(TestAnonymiseValueFactory)
+            )
+        );
+    }
+
+    [Fact]
+    public void Scan_Rejects_Properties_With_Both_Literal_And_Factory_Anonymise_Metadata()
+    {
+        var options = new DbContextOptionsBuilder<ConflictingAnonymiseMetadataDbContext>()
+            .UseInMemoryDatabase($"registry-conflicting-anonymise-{Guid.NewGuid()}")
+            .Options;
+        using var db = new ConflictingAnonymiseMetadataDbContext(options);
+        var registry = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions()));
+
+        var act = () => registry.Scan();
+
+        act.Should()
+            .Throw<InvalidOperationException>()
+            .WithMessage(
+                $"[Anonymise] and [AnonymiseWith] on *{nameof(ConflictingAnonymiseMetadataRecord)}.{nameof(ConflictingAnonymiseMetadataRecord.ExternalId)}: exactly one is allowed per property."
+            );
     }
 
     [Fact]
@@ -218,6 +256,27 @@ public sealed class RegistryScanTests
         public DateTimeOffset? DeletedAt { get; init; }
     }
 
+    [Retain("long-lived", nameof(FactoryBackedRetentionReadyRecord.RetainedAt))]
+    private sealed class FactoryBackedRetentionReadyRecord
+    {
+        public Guid Id { get; init; }
+        public DateTimeOffset RetainedAt { get; init; }
+
+        [AnonymiseWith(typeof(TestAnonymiseValueFactory))]
+        public Guid ExternalId { get; init; }
+    }
+
+    [Retain("long-lived", nameof(ConflictingAnonymiseMetadataRecord.RetainedAt))]
+    private sealed class ConflictingAnonymiseMetadataRecord
+    {
+        public Guid Id { get; init; }
+        public DateTimeOffset RetainedAt { get; init; }
+
+        [Anonymise(AnonymiseMethod.FixedLiteral, "[redacted]")]
+        [AnonymiseWith(typeof(TestAnonymiseValueFactory))]
+        public string ExternalId { get; init; } = "";
+    }
+
     [Retain("long-lived", nameof(SoftDeleteEntityWithUnmappedDeletedAt.RetainedAt))]
     private sealed class SoftDeleteEntityWithUnmappedDeletedAt
     {
@@ -246,6 +305,38 @@ public sealed class RegistryScanTests
         }
     }
 
+    private sealed class FactoryBackedRegistryMetadataDbContext(
+        DbContextOptions<FactoryBackedRegistryMetadataDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<FactoryBackedRetentionReadyRecord>(entity =>
+            {
+                entity.ToTable("factory_backed_retention_ready_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.RetainedAt).HasColumnName("retained_at_utc");
+                entity.Property(record => record.ExternalId).HasColumnName("external_identifier");
+            });
+        }
+    }
+
+    private sealed class ConflictingAnonymiseMetadataDbContext(
+        DbContextOptions<ConflictingAnonymiseMetadataDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<ConflictingAnonymiseMetadataRecord>(entity =>
+            {
+                entity.ToTable("conflicting_anonymise_metadata_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.RetainedAt).HasColumnName("retained_at_utc");
+                entity.Property(record => record.ExternalId).HasColumnName("external_identifier");
+            });
+        }
+    }
+
     private sealed class UnmappedDeletedAtDbContext(DbContextOptions<UnmappedDeletedAtDbContext> options)
         : DbContext(options)
     {
@@ -260,5 +351,10 @@ public sealed class RegistryScanTests
                 entity.Ignore(record => record.DeletedAt);
             });
         }
+    }
+
+    private sealed class TestAnonymiseValueFactory : IAnonymiseValueFactory
+    {
+        public object? Create(AnonymiseValueContext context) => Guid.Empty;
     }
 }

@@ -1166,6 +1166,84 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task FlushAsync_Drains_All_Due_Work_Across_Multiple_Claim_Batches_In_One_Call()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var firstNoteId = Guid.NewGuid();
+        var secondNoteId = Guid.NewGuid();
+        var thirdNoteId = Guid.NewGuid();
+        var sink = new HandlerExecutionSink();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = firstNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "batch-one",
+                },
+                new Note
+                {
+                    Id = secondNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "batch-two",
+                },
+                new Note
+                {
+                    Id = thirdNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "batch-three",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:BatchSize"] = "1",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxParallelism"] = "1",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(sink);
+                services.AddRowHandler<Note, DispatchRecordingNoteHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        sink.AfterCalls.Should().BeEquivalentTo(
+            [
+                "after:batch-one:1",
+                "after:batch-two:1",
+                "after:batch-three:1",
+            ]
+        );
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().HaveCount(3);
+        statuses.All(status => status.State == SucceededState).Should().BeTrue();
+        statuses.All(status => status.Attempt == 1).Should().BeTrue();
+        statuses.All(status => status.CompletedAt is not null).Should().BeTrue();
+    }
+
+    [Fact]
     public async Task FlushAsync_Retries_Transient_Failures_And_Drains_Them_To_Succeeded()
     {
         var tenantId = Guid.NewGuid();

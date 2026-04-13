@@ -1393,6 +1393,332 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Preview_And_Live_Erasure_With_Handlers_Apply_Cutoff_Gating_Before_Queueing_Handler_Work()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var noteEligibleId = Guid.NewGuid();
+        var noteWithinPeriodId = Guid.NewGuid();
+        var noteWithinLegalMinId = Guid.NewGuid();
+        var softDeleteEligibleId = Guid.NewGuid();
+        var softDeleteWithinPeriodId = Guid.NewGuid();
+        var softDeleteWithinLegalMinId = Guid.NewGuid();
+        var contactEligibleId = Guid.NewGuid();
+        var contactWithinPeriodId = Guid.NewGuid();
+        var contactWithinLegalMinId = Guid.NewGuid();
+        var sink = new HandlerExecutionSink();
+        var purgeRule = new RetentionRule(
+            TimeSpan.FromDays(30),
+            Strategy.Purge,
+            TimeSpan.FromDays(90),
+            AuditRowDetail: AuditRowDetail.PerRow
+        );
+        var softDeleteRule = new RetentionRule(
+            TimeSpan.FromDays(30),
+            Strategy.SoftDelete,
+            TimeSpan.FromDays(90)
+        );
+        var anonymiseRule = new RetentionRule(
+            TimeSpan.FromDays(30),
+            Strategy.Anonymise,
+            TimeSpan.FromDays(90)
+        );
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = noteEligibleId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "handler-cutoff-note-eligible",
+                },
+                new Note
+                {
+                    Id = noteWithinPeriodId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-10),
+                    Body = "handler-cutoff-note-within-period",
+                },
+                new Note
+                {
+                    Id = noteWithinLegalMinId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-45),
+                    Body = "handler-cutoff-note-within-legal-min",
+                }
+            );
+            db.SoftDeleteRecords.AddRange(
+                new SoftDeleteRecord
+                {
+                    Id = softDeleteEligibleId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "handler-cutoff-soft-eligible",
+                    IsDeleted = false,
+                },
+                new SoftDeleteRecord
+                {
+                    Id = softDeleteWithinPeriodId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-10),
+                    Body = "handler-cutoff-soft-within-period",
+                    IsDeleted = false,
+                },
+                new SoftDeleteRecord
+                {
+                    Id = softDeleteWithinLegalMinId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-45),
+                    Body = "handler-cutoff-soft-within-legal-min",
+                    IsDeleted = false,
+                }
+            );
+            db.AnonymisedContacts.AddRange(
+                new AnonymisedContact
+                {
+                    Id = contactEligibleId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-120),
+                    EmailAddress = "handler-cutoff-eligible@example.com",
+                    GivenName = "Eligible",
+                    Surname = "Contact",
+                    Notes = "handler-cutoff-contact-eligible",
+                },
+                new AnonymisedContact
+                {
+                    Id = contactWithinPeriodId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-10),
+                    EmailAddress = "handler-cutoff-within-period@example.com",
+                    GivenName = "Within",
+                    Surname = "Period",
+                    Notes = "handler-cutoff-contact-within-period",
+                },
+                new AnonymisedContact
+                {
+                    Id = contactWithinLegalMinId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-45),
+                    EmailAddress = "handler-cutoff-within-legal-min@example.com",
+                    GivenName = "Within",
+                    Surname = "LegalMin",
+                    Notes = "handler-cutoff-contact-within-legal-min",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        var categoryRepository = CreateHandlerErasureCategoryRepository(
+            shortLivedRule: purgeRule,
+            softDeleteRule: softDeleteRule,
+            anonymiseRule: anonymiseRule
+        );
+
+        using var previewHost = new CohortTestHost(
+            GetConnectionString(),
+            categoryRepository,
+            CreateCohortSettings(dryRun: true),
+            services =>
+            {
+                services.AddSingleton(sink);
+                services.AddRowHandler<Note, NoteErasureTrackingHandler>();
+                services.AddRowHandler<SoftDeleteRecord, SoftDeleteErasureTrackingHandler>();
+                services.AddRowHandler<AnonymisedContact, AnonymisedContactErasureTrackingHandler>();
+            }
+        );
+
+        var previewResult = await previewHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
+            asOf
+        );
+
+        previewResult.Counts.Should().Contain(
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+        );
+        previewResult.Counts.Should().Contain(
+            new EntitySweepCount(typeof(SoftDeleteRecord), "soft-delete", tenantId, Strategy.SoftDelete, 1)
+        );
+        previewResult.Counts.Should().Contain(
+            new EntitySweepCount(typeof(AnonymisedContact), "anonymise", tenantId, Strategy.Anonymise, 1)
+        );
+        sink.BeforeCalls.Should().BeEmpty();
+        sink.AfterCalls.Should().BeEmpty();
+        (await LoadCapturedRowsAsync(previewResult.SweepId)).Should().BeEmpty();
+        (await LoadHandlerStatusesAsync(previewResult.SweepId)).Should().BeEmpty();
+        var previewSummaries = await LoadEntitySummariesAsync(previewResult.SweepId);
+        previewSummaries.Should().Contain(
+            new EntitySummaryRow(typeof(Note).FullName!, Strategy.Purge, 1, 0, 0)
+        );
+        previewSummaries.Should().Contain(
+            new EntitySummaryRow(typeof(SoftDeleteRecord).FullName!, Strategy.SoftDelete, 1, 0, 0)
+        );
+        previewSummaries.Should().Contain(
+            new EntitySummaryRow(typeof(AnonymisedContact).FullName!, Strategy.Anonymise, 1, 0, 0)
+        );
+
+        await using (var afterPreview = Host.CreateDbContext())
+        {
+            (await afterPreview.Notes.AnyAsync(note => note.Id == noteEligibleId)).Should().BeTrue();
+            (await afterPreview.Notes.AnyAsync(note => note.Id == noteWithinPeriodId)).Should().BeTrue();
+            (await afterPreview.Notes.AnyAsync(note => note.Id == noteWithinLegalMinId)).Should().BeTrue();
+
+            (await afterPreview.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteEligibleId))
+                .IsDeleted.Should()
+                .BeFalse();
+            (await afterPreview.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteWithinPeriodId))
+                .IsDeleted.Should()
+                .BeFalse();
+            (
+                await afterPreview.SoftDeleteRecords.SingleAsync(
+                    record => record.Id == softDeleteWithinLegalMinId
+                )
+            ).IsDeleted.Should().BeFalse();
+
+            (await afterPreview.AnonymisedContacts.SingleAsync(contact => contact.Id == contactEligibleId))
+                .EmailAddress.Should()
+                .Be("handler-cutoff-eligible@example.com");
+            (
+                await afterPreview.AnonymisedContacts.SingleAsync(
+                    contact => contact.Id == contactWithinPeriodId
+                )
+            ).EmailAddress.Should().Be("handler-cutoff-within-period@example.com");
+            (
+                await afterPreview.AnonymisedContacts.SingleAsync(
+                    contact => contact.Id == contactWithinLegalMinId
+                )
+            ).EmailAddress.Should().Be("handler-cutoff-within-legal-min@example.com");
+        }
+
+        using var liveHost = new CohortTestHost(
+            GetConnectionString(),
+            CreateHandlerErasureCategoryRepository(
+                shortLivedRule: purgeRule,
+                softDeleteRule: softDeleteRule,
+                anonymiseRule: anonymiseRule
+            ),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxParallelism"] = "1",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(sink);
+                services.AddRowHandler<Note, NoteErasureTrackingHandler>();
+                services.AddRowHandler<SoftDeleteRecord, SoftDeleteErasureTrackingHandler>();
+                services.AddRowHandler<AnonymisedContact, AnonymisedContactErasureTrackingHandler>();
+            }
+        );
+
+        var liveResult = await liveHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
+            asOf
+        );
+
+        liveResult.Counts.Should().BeEquivalentTo(previewResult.Counts);
+        sink.BeforeCalls.Should().BeEquivalentTo(
+            [
+                "note:handler-cutoff-note-eligible",
+                "soft:handler-cutoff-soft-eligible",
+                "contact:handler-cutoff-eligible@example.com",
+            ]
+        );
+
+        var pendingRows = await LoadCapturedRowsAsync(liveResult.SweepId);
+        pendingRows.Should().HaveCount(3);
+        pendingRows.Select(row => row.EntityId).Should().BeEquivalentTo(
+            [noteEligibleId.ToString(), softDeleteEligibleId.ToString(), contactEligibleId.ToString()]
+        );
+
+        var pendingStatuses = await LoadHandlerStatusesAsync(liveResult.SweepId);
+        pendingStatuses.Should().HaveCount(3);
+        pendingStatuses.All(status => status.State == PendingState && status.Attempt == 0).Should().BeTrue();
+        var liveSummaries = await LoadEntitySummariesAsync(liveResult.SweepId);
+        liveSummaries.Should().Contain(
+            new EntitySummaryRow(typeof(Note).FullName!, Strategy.Purge, 1, 0, 0)
+        );
+        liveSummaries.Should().Contain(
+            new EntitySummaryRow(typeof(SoftDeleteRecord).FullName!, Strategy.SoftDelete, 1, 0, 0)
+        );
+        liveSummaries.Should().Contain(
+            new EntitySummaryRow(typeof(AnonymisedContact).FullName!, Strategy.Anonymise, 1, 0, 0)
+        );
+
+        await using (var afterLive = Host.CreateDbContext())
+        {
+            (await afterLive.Notes.AnyAsync(note => note.Id == noteEligibleId)).Should().BeFalse();
+            (await afterLive.Notes.AnyAsync(note => note.Id == noteWithinPeriodId)).Should().BeTrue();
+            (await afterLive.Notes.AnyAsync(note => note.Id == noteWithinLegalMinId)).Should().BeTrue();
+
+            (await afterLive.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteEligibleId))
+                .IsDeleted.Should()
+                .BeTrue();
+            (await afterLive.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteWithinPeriodId))
+                .IsDeleted.Should()
+                .BeFalse();
+            (
+                await afterLive.SoftDeleteRecords.SingleAsync(
+                    record => record.Id == softDeleteWithinLegalMinId
+                )
+            ).IsDeleted.Should().BeFalse();
+
+            var eligibleContact = await afterLive.AnonymisedContacts.SingleAsync(contact =>
+                contact.Id == contactEligibleId
+            );
+            eligibleContact.EmailAddress.Should().BeNull();
+            eligibleContact.GivenName.Should().BeEmpty();
+            eligibleContact.Surname.Should().Be("[redacted]");
+
+            var withinPeriodContact = await afterLive.AnonymisedContacts.SingleAsync(contact =>
+                contact.Id == contactWithinPeriodId
+            );
+            withinPeriodContact.EmailAddress.Should().Be("handler-cutoff-within-period@example.com");
+            withinPeriodContact.GivenName.Should().Be("Within");
+            withinPeriodContact.Surname.Should().Be("Period");
+
+            var withinLegalMinContact = await afterLive.AnonymisedContacts.SingleAsync(contact =>
+                contact.Id == contactWithinLegalMinId
+            );
+            withinLegalMinContact.EmailAddress.Should().Be("handler-cutoff-within-legal-min@example.com");
+            withinLegalMinContact.GivenName.Should().Be("Within");
+            withinLegalMinContact.Surname.Should().Be("LegalMin");
+        }
+
+        await liveHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        sink.AfterCalls.Should().BeEquivalentTo(
+            [
+                "after-note:handler-cutoff-note-eligible:1",
+                "after-soft:handler-cutoff-soft-eligible:1",
+                "after-contact:handler-cutoff-eligible@example.com:1",
+            ]
+        );
+
+        var completedStatuses = await LoadHandlerStatusesAsync(liveResult.SweepId);
+        completedStatuses.Should().HaveCount(3);
+        completedStatuses.All(status => status.State == SucceededState && status.Attempt == 1)
+            .Should()
+            .BeTrue();
+    }
+
+    [Fact]
     public async Task FlushAsync_Drains_Erasure_Queued_Work_To_Succeeded()
     {
         var tenantId = Guid.NewGuid();
@@ -2436,23 +2762,28 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         return db.Database.GetConnectionString()!;
     }
 
-    private static IRetentionCategoryRepository CreateHandlerErasureCategoryRepository()
+    private static IRetentionCategoryRepository CreateHandlerErasureCategoryRepository(
+        RetentionRule? shortLivedRule = null,
+        RetentionRule? softDeleteRule = null,
+        RetentionRule? anonymiseRule = null
+    )
     {
         return new StaticCategoryRepository(
             new Dictionary<string, IRetentionRuleResolver>
             {
                 ["short-lived"] = new StaticRetentionRuleResolver(
-                    new RetentionRule(
-                        TimeSpan.FromDays(30),
-                        Strategy.Purge,
-                        AuditRowDetail: AuditRowDetail.PerRow
-                    )
+                    shortLivedRule
+                        ?? new RetentionRule(
+                            TimeSpan.FromDays(30),
+                            Strategy.Purge,
+                            AuditRowDetail: AuditRowDetail.PerRow
+                        )
                 ),
                 ["soft-delete"] = new StaticRetentionRuleResolver(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    softDeleteRule ?? new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                 ),
                 ["anonymise"] = new StaticRetentionRuleResolver(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    anonymiseRule ?? new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                 ),
             }
         );

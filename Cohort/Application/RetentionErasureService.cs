@@ -2,10 +2,12 @@ using System.Data;
 using System.Reflection;
 
 using Cohort.Domain;
+using Cohort.Hosting;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Storage;
+using Microsoft.Extensions.Options;
 
 namespace Cohort.Application;
 
@@ -15,7 +17,8 @@ public sealed class RetentionErasureService(
     IRetentionCategoryRepository categoryRepository,
     RetentionStartupValidator validator,
     IRetentionAuditWriter auditWriter,
-    IEnumerable<IRetentionSweepStrategy> sweepStrategies
+    IEnumerable<IRetentionSweepStrategy> sweepStrategies,
+    IOptionsMonitor<CohortOptions> options
 ) : IRetentionErasureService
 {
     private readonly IReadOnlyDictionary<Strategy, IRetentionSweepStrategy> strategies = sweepStrategies
@@ -31,6 +34,7 @@ public sealed class RetentionErasureService(
         ArgumentNullException.ThrowIfNull(tenant);
         ArgumentNullException.ThrowIfNull(scope);
         await validator.ValidateAsync(ct);
+        var dryRun = options.CurrentValue.DryRun;
 
         var sweepId = Guid.NewGuid();
         var startedAt = DateTimeOffset.UtcNow;
@@ -91,7 +95,7 @@ public sealed class RetentionErasureService(
                     sweepId,
                     startedAt,
                     SweepTriggerKind.Erasure,
-                    DryRun: false,
+                    DryRun: dryRun,
                     tenant.Id
                 ),
                 auditEvents,
@@ -102,20 +106,41 @@ public sealed class RetentionErasureService(
             {
                 var eventAt = DateTimeOffset.UtcNow;
                 var resolvedPeriod = CutoffCalculator.ResolveEffectivePeriod(rule.Period, rule.LegalMin);
-                var execution = rule.Strategy switch
+                var (execution, affectedCount) = rule.Strategy switch
                 {
-                    Strategy.Exempt => new SweepExecutionResult([], 0),
-                    _ => await strategies[rule.Strategy].EraseAsync(
-                        entry,
-                        rule,
-                        match,
-                        tenant,
-                        now,
-                        connection,
-                        dbTransaction,
-                        ct
+                    Strategy.Exempt => (new SweepExecutionResult([], 0), 0),
+                    _ when dryRun => (
+                        new SweepExecutionResult([], 0),
+                        await strategies[rule.Strategy].PreviewEraseAsync(
+                            entry,
+                            rule,
+                            match,
+                            tenant,
+                            now,
+                            connection,
+                            dbTransaction,
+                            ct
+                        )
+                    ),
+                    _ => (
+                        await strategies[rule.Strategy].EraseAsync(
+                            entry,
+                            rule,
+                            match,
+                            tenant,
+                            now,
+                            connection,
+                            dbTransaction,
+                            ct
+                        ),
+                        -1
                     ),
                 };
+
+                if (affectedCount < 0)
+                {
+                    affectedCount = execution.AffectedRecordIds.Count;
+                }
 
                 if (execution.HeldCount < 0)
                 {
@@ -133,7 +158,7 @@ public sealed class RetentionErasureService(
                         tenant.Id,
                         rule.Strategy,
                         resolvedPeriod,
-                        execution.AffectedRecordIds.Count,
+                        affectedCount,
                         execution.HeldCount
                     ),
                     auditEvents,

@@ -5,6 +5,7 @@ using Cohort.Infrastructure.Sweep;
 using Cohort.Sample.Entities;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 
 namespace Cohort.Sample.Tests;
 
@@ -747,7 +748,8 @@ public sealed class RetentionStartupValidatorTests
                 repository,
                 validator,
                 new NoOpRetentionAuditWriter(),
-                CreateSweepStrategies()
+                CreateSweepStrategies(),
+                new StaticOptionsMonitor<CohortOptions>(new CohortOptions())
             )
         );
     }
@@ -801,13 +803,29 @@ public sealed class RetentionStartupValidatorTests
             repository,
             validator,
             new NoOpRetentionAuditWriter(),
-            CreateSweepStrategies()
+            CreateSweepStrategies(),
+            new StaticOptionsMonitor<CohortOptions>(new CohortOptions())
         );
     }
 
     private static IRetentionSweepStrategy[] CreateSweepStrategies()
     {
         return [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()];
+    }
+
+    private sealed class StaticOptionsMonitor<T>(T currentValue) : IOptionsMonitor<T>
+    {
+        public T CurrentValue => currentValue;
+
+        public T Get(string? name)
+        {
+            return currentValue;
+        }
+
+        public IDisposable? OnChange(Action<T, string?> listener)
+        {
+            return null;
+        }
     }
 
     private sealed class InMemoryCategoryRepository(

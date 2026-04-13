@@ -234,6 +234,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         var rowDetails = await LoadRowDetailsAsync(result.SweepId);
 
         run.Trigger.Should().Be(SweepTriggerKind.Erasure);
+        run.DryRun.Should().BeFalse();
         run.TotalAffected.Should().Be(3);
         run.TenantId.Should().Be(tenantId);
         result.Scope.Should().Be(inputScope);
@@ -324,6 +325,233 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             .Body.Should()
             .Be("exempt-erasure-subject-record");
         verify.ErasureSubjectRecords.Should().HaveCount(2);
+    }
+
+    [Fact]
+    public async Task Erasure_DryRun_Returns_Counts_Does_Not_Mutate_And_Persists_DryRun_Audit_Flag()
+    {
+        var tenantId = Guid.NewGuid();
+        var otherTenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var otherSubjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var heldNoteId = Guid.NewGuid();
+        var softDeleteId = Guid.NewGuid();
+        var heldSoftDeleteId = Guid.NewGuid();
+        var anonymisedContactId = Guid.NewGuid();
+        var heldAnonymisedContactId = Guid.NewGuid();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "erase-note",
+                },
+                new Note
+                {
+                    Id = heldNoteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "held-note",
+                },
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectId = otherSubjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "other-subject-note",
+                },
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = otherTenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "other-tenant-note",
+                }
+            );
+            db.SoftDeleteRecords.AddRange(
+                new SoftDeleteRecord
+                {
+                    Id = softDeleteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "erase-soft-delete",
+                    IsDeleted = false,
+                },
+                new SoftDeleteRecord
+                {
+                    Id = heldSoftDeleteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "held-soft-delete",
+                    IsDeleted = false,
+                },
+                new SoftDeleteRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectId = otherSubjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "other-subject-soft-delete",
+                    IsDeleted = false,
+                },
+                new SoftDeleteRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = otherTenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "other-tenant-soft-delete",
+                    IsDeleted = false,
+                }
+            );
+            db.AnonymisedContacts.AddRange(
+                new AnonymisedContact
+                {
+                    Id = anonymisedContactId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    EmailAddress = "subject@example.com",
+                    GivenName = "Target",
+                    Surname = "Contact",
+                    Notes = "keep-notes",
+                },
+                new AnonymisedContact
+                {
+                    Id = heldAnonymisedContactId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    EmailAddress = "held@example.com",
+                    GivenName = "Held",
+                    Surname = "Contact",
+                    Notes = "held-notes",
+                },
+                new AnonymisedContact
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectId = otherSubjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    EmailAddress = "other@example.com",
+                    GivenName = "Other",
+                    Surname = "Subject",
+                    Notes = "other-notes",
+                },
+                new AnonymisedContact
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = otherTenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    EmailAddress = "tenant@example.com",
+                    GivenName = "Other",
+                    Surname = "Tenant",
+                    Notes = "tenant-notes",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        await CreateHoldAsync("notes", heldNoteId, tenantId, asOf);
+        await CreateHoldAsync("soft_delete_records", heldSoftDeleteId, tenantId, asOf);
+        await CreateHoldAsync("anonymised_contacts", heldAnonymisedContactId, tenantId, asOf);
+
+        await using var services = BuildErasureServiceProvider(
+            GetConnectionString(),
+            new StaticCategoryRepository(
+                new Dictionary<string, IRetentionRuleResolver>
+                {
+                    ["short-lived"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(
+                            TimeSpan.FromDays(30),
+                            Strategy.Purge,
+                            AuditRowDetail: AuditRowDetail.PerRow
+                        )
+                    ),
+                    ["soft-delete"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    ),
+                    ["anonymise"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
+                }
+            ),
+            dryRun: true
+        );
+
+        ErasureResult result;
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var erasureService = scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
+            result = await erasureService.EraseAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                new ErasureScope(subjectId),
+                asOf
+            );
+        }
+
+        result.Counts.Should().Contain(
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(SoftDeleteRecord),
+                "soft-delete",
+                tenantId,
+                Strategy.SoftDelete,
+                1
+            )
+        );
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(AnonymisedContact),
+                "anonymise",
+                tenantId,
+                Strategy.Anonymise,
+                1
+            )
+        );
+
+        var run = await LoadRunAsync(result.SweepId);
+        var rowDetails = await LoadRowDetailsAsync(result.SweepId);
+
+        run.Trigger.Should().Be(SweepTriggerKind.Erasure);
+        run.DryRun.Should().BeTrue();
+        run.TotalAffected.Should().Be(3);
+        rowDetails.Should().BeEmpty();
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.OrderBy(note => note.Body).Select(note => note.Body).ToListAsync())
+            .Should()
+            .Equal("erase-note", "held-note", "other-subject-note", "other-tenant-note");
+
+        var softDeleteRecords = await verify.SoftDeleteRecords.OrderBy(record => record.Body).ToListAsync();
+        softDeleteRecords.Single(record => record.Id == softDeleteId).IsDeleted.Should().BeFalse();
+        softDeleteRecords.Single(record => record.Id == heldSoftDeleteId).IsDeleted.Should().BeFalse();
+        softDeleteRecords.Single(record => record.Body == "other-subject-soft-delete").IsDeleted.Should().BeFalse();
+        softDeleteRecords.Single(record => record.Body == "other-tenant-soft-delete").IsDeleted.Should().BeFalse();
+
+        var contacts = await verify.AnonymisedContacts.OrderBy(contact => contact.EmailAddress).ToListAsync();
+        contacts.Single(contact => contact.Id == anonymisedContactId).EmailAddress.Should().Be("subject@example.com");
+        contacts.Single(contact => contact.Id == anonymisedContactId).GivenName.Should().Be("Target");
+        contacts.Single(contact => contact.Id == anonymisedContactId).Surname.Should().Be("Contact");
+        contacts.Single(contact => contact.Id == anonymisedContactId).Notes.Should().Be("keep-notes");
+        contacts.Single(contact => contact.Id == heldAnonymisedContactId)
+            .EmailAddress.Should()
+            .Be("held@example.com");
     }
 
     [Fact]
@@ -710,6 +938,31 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             )
         );
         services.AddCohort<AliasSubjectDbContext>();
+
+        return services.BuildServiceProvider(validateScopes: true);
+    }
+
+    private static ServiceProvider BuildErasureServiceProvider(
+        string connectionString,
+        IRetentionCategoryRepository categoryRepository,
+        bool dryRun
+    )
+    {
+        var services = new ServiceCollection();
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(
+                new Dictionary<string, string?>
+                {
+                    [CohortOptions.SectionName + ":DryRun"] = dryRun.ToString(),
+                }
+            )
+            .Build();
+
+        services.AddSingleton<IConfiguration>(configuration);
+        services.AddLogging();
+        services.AddDbContext<SampleDbContext>(options => options.UseNpgsql(connectionString));
+        services.AddSingleton<IRetentionCategoryRepository>(categoryRepository);
+        services.AddCohort<SampleDbContext>();
 
         return services.BuildServiceProvider(validateScopes: true);
     }

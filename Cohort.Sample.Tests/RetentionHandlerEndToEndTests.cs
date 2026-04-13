@@ -100,6 +100,95 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Scheduled_Sweep_Flows_OnBefore_Snapshot_Into_OnAfter_With_The_Persisted_Metadata()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var recorder = new AfterContextRecorder();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "scheduled-after-context-target",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxParallelism"] = "1",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(recorder);
+                services.AddScoped<ScopedDispatchProbe>();
+                services.AddRowHandler<Note, ContextCapturingNoteHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        result.Counts.Should().Contain(
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+        );
+
+        await using (var verify = Host.CreateDbContext())
+        {
+            (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeFalse();
+        }
+
+        var persistedRows = await LoadCapturedRowDetailsAsync(result.SweepId);
+        persistedRows.Should().ContainSingle(row => row.EntityId == noteId.ToString());
+
+        var queuedStatuses = await LoadHandlerStatusesAsync(result.SweepId);
+        queuedStatuses.Should().ContainSingle(status =>
+            status.HandlerType.Contains(nameof(ContextCapturingNoteHandler), StringComparison.Ordinal)
+            && status.State == PendingState
+            && status.Attempt == 0
+        );
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        var call = recorder.Load().Should().ContainSingle().Subject;
+        var persisted = persistedRows.Single();
+
+        call.SweepId.Should().Be(result.SweepId);
+        call.EntityId.Should().Be(noteId.ToString());
+        call.Category.Should().Be(persisted.Category);
+        call.Strategy.Should().Be(persisted.Strategy);
+        call.TenantId.Should().Be(persisted.TenantId);
+        call.At.Should().Be(persisted.At);
+        call.Attempt.Should().Be(1);
+        call.Body.Should().Be("scheduled-after-context-target");
+        call.Body.Should().Be(persisted.Body);
+
+        var completedStatuses = await LoadHandlerStatusesAsync(result.SweepId);
+        completedStatuses.Should().ContainSingle(status =>
+            status.HandlerType.Contains(nameof(ContextCapturingNoteHandler), StringComparison.Ordinal)
+            && status.State == SucceededState
+            && status.Attempt == 1
+            && status.CompletedAt != null
+            && status.LastError == null
+        );
+    }
+
+    [Fact]
     public async Task Scheduled_Sweep_With_Handlers_Runs_OnBefore_In_Priority_Order_And_Queues_PostCommit_Work()
     {
         var tenantId = Guid.NewGuid();

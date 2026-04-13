@@ -35,9 +35,13 @@ public sealed class PackageReleaseContractTests
     [Fact]
     public void Packed_Readme_Points_To_Release_Notes_With_A_Package_Safe_Link()
     {
+        var expectedReleaseNotesUrl = BuildVersionPinnedChangelogUrl(Artifact.Value.PackageVersion);
+
         Artifact.Value.Readme.Should().Contain("## Upgrade from `0.1.1`");
         Artifact.Value.Readme.Should().Contain("regenerate and apply your Cohort migration before booting `0.2.0`");
-        Artifact.Value.Readme.Should().Contain("https://github.com/maxanstey-meridian/cohort/blob/main/CHANGELOG.md");
+        Artifact.Value.Readme.Should().Contain("version-pinned changelog entry");
+        Artifact.Value.Readme.Should().Contain(expectedReleaseNotesUrl);
+        Artifact.Value.Readme.Should().NotContain("/blob/main/CHANGELOG.md");
         Artifact.Value.Readme.Should().Contain("AnonymiseWithAttribute");
         Artifact.Value.Readme.Should().Contain("PreviewEraseAsync(...)");
         Artifact.Value.Readme.Should().Contain("row-dispatch surface");
@@ -166,6 +170,11 @@ public sealed class PackageReleaseContractTests
         File.Exists(changelogPath).Should().BeTrue("slice 8 ships the release handover artifact in-repo");
 
         return File.ReadAllText(changelogPath);
+    }
+
+    private static string BuildVersionPinnedChangelogUrl(Version packageVersion)
+    {
+        return $"https://github.com/maxanstey-meridian/cohort/blob/v{packageVersion}/CHANGELOG.md#020";
     }
 
     private sealed record PackedArtifact(Version PackageVersion, string Readme);

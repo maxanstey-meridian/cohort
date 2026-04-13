@@ -260,6 +260,70 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         (await LoadHandlerStatusesAsync(result.SweepId)).Should().BeEmpty();
     }
 
+    [Fact]
+    public async Task Scheduled_Sweep_When_OnBefore_Fails_Skips_Only_That_Row_And_Continues_With_Siblings()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var successfulNoteId = Guid.NewGuid();
+        var failingNoteId = Guid.NewGuid();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = successfulNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "surviving-sibling",
+                },
+                new Note
+                {
+                    Id = failingNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = SelectivelyFailingNoteHandler.FailingBody,
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services => services.AddRowHandler<Note, SelectivelyFailingNoteHandler>()
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        result.Counts.Should().Contain(
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+        );
+
+        await using (var verify = Host.CreateDbContext())
+        {
+            (await verify.Notes.AnyAsync(note => note.Id == successfulNoteId)).Should().BeFalse();
+            (await verify.Notes.AnyAsync(note => note.Id == failingNoteId)).Should().BeTrue();
+        }
+
+        var rowDetails = await LoadCapturedRowsAsync(result.SweepId);
+        rowDetails.Should().ContainSingle(row => row.EntityId == successfulNoteId.ToString());
+        rowDetails.Should().NotContain(row => row.EntityId == failingNoteId.ToString());
+
+        using (var payload = JsonDocument.Parse(rowDetails[0].CapturedPayload))
+        {
+            payload.RootElement.GetProperty("body").GetString().Should().Be("surviving-sibling");
+        }
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().ContainSingle(
+            status => status.HandlerType.Contains(nameof(SelectivelyFailingNoteHandler), StringComparison.Ordinal)
+        );
+    }
+
     private async Task<IReadOnlyList<CapturedRow>> LoadCapturedRowsAsync(Guid sweepId)
     {
         await using var connection = new NpgsqlConnection(GetConnectionString());
@@ -382,6 +446,22 @@ file sealed class AnonymisedContactHandler : IRetentionHandler<AnonymisedContact
     )
     {
         ctx.Snapshot["email"] = row.EmailAddress;
+        return Task.CompletedTask;
+    }
+}
+
+file sealed class SelectivelyFailingNoteHandler : IRetentionHandler<Note>
+{
+    public const string FailingBody = "fail-before-delete";
+
+    public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        if (string.Equals(row.Body, FailingBody, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("Simulated handler failure.");
+        }
+
+        ctx.Snapshot["body"] = row.Body;
         return Task.CompletedTask;
     }
 }

@@ -1,5 +1,6 @@
 using Cohort.Application;
 using Cohort.Infrastructure.Audit;
+using Cohort.Infrastructure.Handlers;
 using Cohort.Infrastructure.Holds;
 using Cohort.Infrastructure.Sweep;
 
@@ -44,14 +45,11 @@ public static class ServiceCollectionExtensions
         services.TryAddScoped<RetentionRegistry>();
         services.TryAddScoped<RetentionStartupValidator>();
         services.TryAddScoped<RetentionSweepEngine>();
+        services.TryAddSingleton<RetentionRowDispatcher>();
         services.TryAddSingleton<IRetentionRowDispatcher>(sp =>
-            (IRetentionRowDispatcher)sp.GetServices<IHostedService>().Single(service =>
-                service is NoOpRetentionRowDispatcher
-            )
+            sp.GetRequiredService<RetentionRowDispatcher>()
         );
-        services.TryAddEnumerable(
-            ServiceDescriptor.Singleton<IHostedService, NoOpRetentionRowDispatcher>()
-        );
+        services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<RetentionRowDispatcher>());
         services.TryAddEnumerable(ServiceDescriptor.Singleton<IHostedService, RetentionWorker>());
 
         return services;
@@ -77,19 +75,6 @@ public static class ServiceCollectionExtensions
                 + $"services.AddSingleton<IRetentionCategoryRepository, YourRepository>(). "
                 + $"(Attempted to resolve category '{category}'.)"
             );
-        }
-    }
-
-    private sealed class NoOpRetentionRowDispatcher : BackgroundService, IRetentionRowDispatcher
-    {
-        public Task FlushAsync(CancellationToken ct = default)
-        {
-            return Task.CompletedTask;
-        }
-
-        protected override Task ExecuteAsync(CancellationToken stoppingToken)
-        {
-            return Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken);
         }
     }
 }

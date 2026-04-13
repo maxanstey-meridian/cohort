@@ -7,6 +7,7 @@ using Cohort.Sample.Entities;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 
 using Npgsql;
 
@@ -15,6 +16,10 @@ namespace Cohort.Sample.Tests;
 public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     : IntegrationTestBase(fixture)
 {
+    private const int PendingState = 0;
+    private const int SucceededState = 2;
+    private const int DeadLetteredState = 3;
+
     [Fact]
     public async Task Scheduled_Sweep_With_Handlers_Runs_OnBefore_In_Priority_Order_And_Queues_PostCommit_Work()
     {
@@ -791,6 +796,246 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             .Body.Should().Be("dry-run-exempt");
     }
 
+    [Fact]
+    public async Task FlushAsync_Claims_Each_Queued_Status_At_Most_Once_When_Called_Concurrently()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var sink = new HandlerExecutionSink();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "concurrent-dispatch",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
+            {
+                services.AddSingleton(sink);
+                services.AddRowHandler<Note, DispatchRecordingNoteHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await Task.WhenAll(dispatcher.FlushAsync(), dispatcher.FlushAsync());
+        });
+
+        sink.AfterCalls.Should().Equal("after:concurrent-dispatch:1");
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().ContainSingle();
+        statuses[0].State.Should().Be(SucceededState);
+        statuses[0].Attempt.Should().Be(1);
+        statuses[0].ClaimedAt.Should().NotBeNull();
+        statuses[0].CompletedAt.Should().NotBeNull();
+        statuses[0].LastError.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task Hosted_Dispatcher_Requeues_Retryable_Failures_With_Backoff_And_Last_Error()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var tracker = new DispatchAttemptTracker();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "retry-pending",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:PollInterval"] = "00:10:00",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:BaseBackoff"] = "00:05:00",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxAttempts"] = "3",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(tracker);
+                services.AddRowHandler<Note, AlwaysFailingDispatchNoteHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var hostedDispatcher = serviceProvider.GetServices<IHostedService>().Single(service =>
+                service is IRetentionRowDispatcher
+            );
+            await hostedDispatcher.StartAsync(CancellationToken.None);
+
+            try
+            {
+                var status = await WaitForHandlerStatusAsync(
+                    result.SweepId,
+                    row => row.State == PendingState && row.Attempt == 1 && row.LastError is not null
+                );
+
+                status.ClaimedAt.Should().BeNull();
+                status.CompletedAt.Should().BeNull();
+                status.NextAttemptAt.Should().BeAfter(asOf.AddMinutes(4));
+                status.LastError.Should().Contain("Simulated permanent after-dispatch failure.");
+            }
+            finally
+            {
+                await hostedDispatcher.StopAsync(CancellationToken.None);
+            }
+        });
+
+        tracker.LoadAttempt(noteId.ToString()).Should().Be(1);
+    }
+
+    [Fact]
+    public async Task FlushAsync_Retries_Transient_Failures_And_Drains_Them_To_Succeeded()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var sink = new HandlerExecutionSink();
+        var tracker = new DispatchAttemptTracker();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "retry-then-succeed",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:BaseBackoff"] = "00:05:00",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxAttempts"] = "3",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(sink);
+                services.AddSingleton(tracker);
+                services.AddRowHandler<Note, RetryOnceDispatchNoteHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        tracker.LoadAttempt(noteId.ToString()).Should().Be(2);
+        sink.AfterCalls.Should().Equal("attempt:1", "attempt:2");
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().ContainSingle();
+        statuses[0].State.Should().Be(SucceededState);
+        statuses[0].Attempt.Should().Be(2);
+        statuses[0].CompletedAt.Should().NotBeNull();
+        statuses[0].LastError.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task FlushAsync_DeadLetters_Exhausted_Handler_Failures()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var tracker = new DispatchAttemptTracker();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "dead-letter-target",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:BaseBackoff"] = "00:05:00",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxAttempts"] = "2",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(tracker);
+                services.AddRowHandler<Note, AlwaysFailingDispatchNoteHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        tracker.LoadAttempt(noteId.ToString()).Should().Be(2);
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().ContainSingle();
+        statuses[0].State.Should().Be(DeadLetteredState);
+        statuses[0].Attempt.Should().Be(2);
+        statuses[0].CompletedAt.Should().NotBeNull();
+        statuses[0].LastError.Should().Contain("Simulated permanent after-dispatch failure.");
+    }
+
     private async Task CreateHoldAsync(
         string tableName,
         Guid recordId,
@@ -846,7 +1091,14 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         await using var command = connection.CreateCommand();
         command.CommandText =
             """
-            SELECT status."HandlerType", status."State", status."Attempt"
+            SELECT
+                status."HandlerType",
+                status."State",
+                status."Attempt",
+                status."NextAttemptAt",
+                status."ClaimedAt",
+                status."CompletedAt",
+                status."LastError"
             FROM "sweep_row_handler_status" AS status
             INNER JOIN "sweep_run_row_detail" AS detail ON detail."Id" = status."SweepRunRowDetailId"
             WHERE detail."SweepId" = @sweepId
@@ -858,10 +1110,44 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         await using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
         {
-            rows.Add(new HandlerStatusRow(reader.GetString(0), reader.GetInt32(1), reader.GetInt32(2)));
+            rows.Add(
+                new HandlerStatusRow(
+                    reader.GetString(0),
+                    reader.GetInt32(1),
+                    reader.GetInt32(2),
+                    reader.GetFieldValue<DateTimeOffset>(3),
+                    reader.IsDBNull(4) ? null : reader.GetFieldValue<DateTimeOffset>(4),
+                    reader.IsDBNull(5) ? null : reader.GetFieldValue<DateTimeOffset>(5),
+                    reader.IsDBNull(6) ? null : reader.GetString(6)
+                )
+            );
         }
 
         return rows;
+    }
+
+    private async Task<HandlerStatusRow> WaitForHandlerStatusAsync(
+        Guid sweepId,
+        Func<HandlerStatusRow, bool> predicate,
+        TimeSpan? timeout = null
+    )
+    {
+        var deadline = DateTimeOffset.UtcNow + (timeout ?? TimeSpan.FromSeconds(5));
+
+        while (DateTimeOffset.UtcNow <= deadline)
+        {
+            var match = (await LoadHandlerStatusesAsync(sweepId)).SingleOrDefault(predicate);
+            if (match is not null)
+            {
+                return match;
+            }
+
+            await Task.Delay(50);
+        }
+
+        throw new TimeoutException(
+            $"Timed out waiting for a handler status row that matched the requested predicate for sweep {sweepId}."
+        );
     }
 
     private async Task<IReadOnlyList<EntitySummaryRow>> LoadEntitySummariesAsync(Guid sweepId)
@@ -933,7 +1219,15 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
     private sealed record CapturedRow(string EntityType, string EntityId, string CapturedPayload);
 
-    private sealed record HandlerStatusRow(string HandlerType, int State, int Attempt);
+    private sealed record HandlerStatusRow(
+        string HandlerType,
+        int State,
+        int Attempt,
+        DateTimeOffset NextAttemptAt,
+        DateTimeOffset? ClaimedAt,
+        DateTimeOffset? CompletedAt,
+        string? LastError
+    );
 
     private sealed record EntitySummaryRow(
         string EntityType,
@@ -962,6 +1256,32 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 file sealed class HandlerExecutionSink
 {
     public List<string> BeforeCalls { get; } = [];
+
+    public List<string> AfterCalls { get; } = [];
+}
+
+file sealed class DispatchAttemptTracker
+{
+    private readonly object gate = new();
+    private readonly Dictionary<string, int> attempts = new(StringComparer.Ordinal);
+
+    public int Increment(string entityId)
+    {
+        lock (gate)
+        {
+            var next = attempts.TryGetValue(entityId, out var current) ? current + 1 : 1;
+            attempts[entityId] = next;
+            return next;
+        }
+    }
+
+    public int LoadAttempt(string entityId)
+    {
+        lock (gate)
+        {
+            return attempts.TryGetValue(entityId, out var attempt) ? attempt : 0;
+        }
+    }
 }
 
 [RowHandlerPriority(20)]
@@ -1150,5 +1470,62 @@ file sealed class ExemptErasureTrackingHandler(HandlerExecutionSink sink)
         sink.BeforeCalls.Add($"exempt:{row.Body}");
         ctx.Snapshot["body"] = row.Body;
         return Task.CompletedTask;
+    }
+}
+
+file sealed class DispatchRecordingNoteHandler(HandlerExecutionSink sink) : IRetentionHandler<Note>
+{
+    public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        ctx.Snapshot["body"] = row.Body;
+        return Task.CompletedTask;
+    }
+
+    public async Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
+    {
+        await Task.Delay(100, ct);
+        sink.AfterCalls.Add($"after:{ctx.Snapshot["body"]}:{ctx.Attempt}");
+    }
+}
+
+file sealed class RetryOnceDispatchNoteHandler(
+    HandlerExecutionSink sink,
+    DispatchAttemptTracker tracker
+) : IRetentionHandler<Note>
+{
+    public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        ctx.Snapshot["body"] = row.Body;
+        return Task.CompletedTask;
+    }
+
+    public Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
+    {
+        var attempt = tracker.Increment(ctx.EntityId);
+        sink.AfterCalls.Add($"attempt:{attempt}");
+
+        if (attempt == 1)
+        {
+            throw new InvalidOperationException("Simulated transient after-dispatch failure.");
+        }
+
+        return Task.CompletedTask;
+    }
+}
+
+file sealed class AlwaysFailingDispatchNoteHandler(
+    DispatchAttemptTracker tracker
+) : IRetentionHandler<Note>
+{
+    public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        ctx.Snapshot["body"] = row.Body;
+        return Task.CompletedTask;
+    }
+
+    public Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
+    {
+        tracker.Increment(ctx.EntityId);
+        throw new InvalidOperationException("Simulated permanent after-dispatch failure.");
     }
 }

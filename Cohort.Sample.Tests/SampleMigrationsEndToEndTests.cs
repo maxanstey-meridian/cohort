@@ -91,16 +91,27 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
     }
 
     [Fact]
-    public async Task Add_Row_Handler_Dispatch_Migration_Updates_The_Live_Postgres_Schema()
+    public async Task Legacy_Cohort_Schema_Upgrades_To_Current_ConfigureCohortTables_Shape()
     {
         var options = CreateOptions();
 
         await using (var db = new SampleDbContext(options))
         {
+            await LegacyCohortSchema.BootstrapPreRowDispatchAsync(connectionString);
+
             var migrator = db.Database.GetService<IMigrator>();
-            await migrator.MigrateAsync("20260413135830_AddAnonymiseWithSampleEntity");
             await migrator.MigrateAsync();
         }
+
+        var sweepRunColumns = await GetColumnsAsync("sweep_run");
+        sweepRunColumns.Should().ContainKey("TriggerKind");
+        sweepRunColumns["TriggerKind"].DataType.Should().Be("integer");
+        sweepRunColumns["TriggerKind"].IsNullable.Should().BeFalse();
+
+        var entitySummaryColumns = await GetColumnsAsync("sweep_run_entity_summary");
+        entitySummaryColumns.Should().ContainKey("SkippedCount");
+        entitySummaryColumns["SkippedCount"].DataType.Should().Be("integer");
+        entitySummaryColumns["SkippedCount"].IsNullable.Should().BeFalse();
 
         var rowDetailColumns = await GetColumnsAsync("sweep_run_row_detail");
         rowDetailColumns.Should().ContainKey("Id");

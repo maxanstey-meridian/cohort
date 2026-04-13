@@ -38,7 +38,12 @@ public sealed class MigrationModelEndToEndTests(PostgresFixture fixture)
         );
         rowDetailEntity.FindPrimaryKey()!.Properties.Select(property => property.Name).Should().Equal("Id");
         rowDetailEntity.FindProperty("Id")!.ValueGenerated.Should().Be(ValueGenerated.OnAdd);
+        rowDetailEntity.FindProperty("SweepId")!.IsNullable.Should().BeFalse();
+        rowDetailEntity.FindProperty("TenantId")!.IsNullable.Should().BeFalse();
         rowDetailEntity.FindProperty("CapturedPayload")!.IsNullable.Should().BeTrue();
+        rowDetailEntity.GetIndexes().Any(index =>
+            !index.IsUnique && index.Properties.Select(property => property.Name).SequenceEqual(["SweepId"])
+        ).Should().BeTrue();
         rowDetailEntity.GetIndexes().Any(index =>
             index.IsUnique
             && index.Properties.Select(property => property.Name).SequenceEqual(
@@ -50,6 +55,7 @@ public sealed class MigrationModelEndToEndTests(PostgresFixture fixture)
             string.Equals(entityType.GetTableName(), "sweep_row_handler_status", StringComparison.Ordinal)
         );
         handlerStatusEntity.FindPrimaryKey()!.Properties.Select(property => property.Name).Should().Equal("Id");
+        handlerStatusEntity.FindProperty("Id")!.ValueGenerated.Should().Be(ValueGenerated.OnAdd);
         handlerStatusEntity.FindProperty("SweepRunRowDetailId")!.IsNullable.Should().BeFalse();
         handlerStatusEntity.FindProperty("HandlerType")!.IsNullable.Should().BeFalse();
         handlerStatusEntity.FindProperty("State")!.IsNullable.Should().BeFalse();
@@ -64,6 +70,8 @@ public sealed class MigrationModelEndToEndTests(PostgresFixture fixture)
         rowDetailForeignKey.PrincipalEntityType.GetTableName().Should().Be("sweep_run_row_detail");
         rowDetailForeignKey.PrincipalKey.Properties.Select(property => property.Name).Should().Equal("Id");
         rowDetailForeignKey.Properties.Select(property => property.Name).Should().Equal("SweepRunRowDetailId");
+        rowDetailForeignKey.IsRequired.Should().BeTrue();
+        rowDetailForeignKey.DeleteBehavior.Should().Be(DeleteBehavior.Cascade);
 
         handlerStatusEntity.GetIndexes().Any(index =>
             index.IsUnique

@@ -25,6 +25,8 @@ public sealed class PackageReleaseContractTests
         Artifact.Value.Readme.Should().Contain("tenant-scoped by default");
         Artifact.Value.Readme.Should().Contain("[RetentionTenantless]");
         Artifact.Value.Readme.Should().Contain("startup configuration error");
+        Artifact.Value.Readme.Should().NotContain("TenantId is optional");
+        Artifact.Value.Readme.Should().NotContain("retained entities without a TenantId");
         Artifact.Value.Readme.Should().NotContain("[CHANGELOG.md](CHANGELOG.md)");
     }
 
@@ -34,6 +36,10 @@ public sealed class PackageReleaseContractTests
         Artifact.Value.Readme.Should().Contain("matches the requested `[ErasureSubject]`");
         Artifact.Value.Readme.Should().Contain("effective retention cutoff");
         Artifact.Value.Readme.Should().Contain("max(Period, LegalMin)");
+        Artifact.Value.Readme.Should().NotContain(
+            "Cohort walks every entity with a matching [ErasureSubject] and applies the category's strategy."
+        );
+        Artifact.Value.Readme.Should().NotContain("subject match alone");
     }
 
     [Fact]

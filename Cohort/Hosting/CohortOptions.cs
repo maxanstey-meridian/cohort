@@ -12,5 +12,7 @@ public sealed class CohortOptions
 
     public bool ApplyMigrations { get; init; }
 
+    public RowHandlerDispatchOptions RowHandlerDispatch { get; init; } = new();
+
     public CohortConventions Conventions { get; init; } = new();
 }

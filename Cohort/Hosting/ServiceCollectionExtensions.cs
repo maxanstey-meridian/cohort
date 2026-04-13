@@ -44,7 +44,25 @@ public static class ServiceCollectionExtensions
         services.TryAddScoped<RetentionRegistry>();
         services.TryAddScoped<RetentionStartupValidator>();
         services.TryAddScoped<RetentionSweepEngine>();
+        services.TryAddSingleton<IRetentionRowDispatcher>(sp =>
+            (IRetentionRowDispatcher)sp.GetServices<IHostedService>().Single(service =>
+                service is NoOpRetentionRowDispatcher
+            )
+        );
+        services.TryAddEnumerable(
+            ServiceDescriptor.Singleton<IHostedService, NoOpRetentionRowDispatcher>()
+        );
         services.TryAddEnumerable(ServiceDescriptor.Singleton<IHostedService, RetentionWorker>());
+
+        return services;
+    }
+
+    public static IServiceCollection AddRowHandler<TEntity, THandler>(this IServiceCollection services)
+        where THandler : class, IRetentionHandler<TEntity>
+    {
+        ArgumentNullException.ThrowIfNull(services);
+
+        services.TryAddEnumerable(ServiceDescriptor.Scoped<IRetentionHandler<TEntity>, THandler>());
 
         return services;
     }
@@ -59,6 +77,19 @@ public static class ServiceCollectionExtensions
                 + $"services.AddSingleton<IRetentionCategoryRepository, YourRepository>(). "
                 + $"(Attempted to resolve category '{category}'.)"
             );
+        }
+    }
+
+    private sealed class NoOpRetentionRowDispatcher : BackgroundService, IRetentionRowDispatcher
+    {
+        public Task FlushAsync(CancellationToken ct = default)
+        {
+            return Task.CompletedTask;
+        }
+
+        protected override Task ExecuteAsync(CancellationToken stoppingToken)
+        {
+            return Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken);
         }
     }
 }

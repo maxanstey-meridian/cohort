@@ -7,6 +7,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
 
 namespace Cohort.Sample.Tests;
 
@@ -131,6 +132,82 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
                 serviceProvider.GetServices<IHostedService>()
                     .Should()
                     .ContainSingle(service => service.GetType() == typeof(RetentionWorker));
+
+                return Task.CompletedTask;
+            }
+        );
+    }
+
+    [Fact]
+    public async Task Shared_Test_Host_Registers_Row_Handler_Dispatcher_As_Both_Port_And_Hosted_Service()
+    {
+        await Host.RunWithServicesAsync(
+            serviceProvider =>
+            {
+                var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+                var hostedDispatcher = serviceProvider.GetServices<IHostedService>().Single(service =>
+                    service is IRetentionRowDispatcher
+                );
+
+                hostedDispatcher.Should().BeSameAs(dispatcher);
+
+                return Task.CompletedTask;
+            }
+        );
+    }
+
+    [Fact]
+    public async Task Shared_Test_Host_Binds_Row_Handler_Dispatch_Options_From_Cohort_Configuration()
+    {
+        using var host = new CohortTestHost(
+            connectionString,
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:PollInterval"] = "00:00:03",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:BatchSize"] = "25",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxAttempts"] = "7",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxParallelism"] = "6",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:BaseBackoff"] = "00:00:02",
+            }
+        );
+
+        await host.RunWithServicesAsync(
+            serviceProvider =>
+            {
+                var options = serviceProvider.GetRequiredService<IOptions<CohortOptions>>().Value;
+
+                options.RowHandlerDispatch.PollInterval.Should().Be(TimeSpan.FromSeconds(3));
+                options.RowHandlerDispatch.BatchSize.Should().Be(25);
+                options.RowHandlerDispatch.MaxAttempts.Should().Be(7);
+                options.RowHandlerDispatch.MaxParallelism.Should().Be(6);
+                options.RowHandlerDispatch.BaseBackoff.Should().Be(TimeSpan.FromSeconds(2));
+
+                return Task.CompletedTask;
+            }
+        );
+    }
+
+    [Fact]
+    public async Task AddRowHandler_Registers_Typed_Handlers_Without_Duplicates()
+    {
+        using var host = new CohortTestHost(
+            connectionString,
+            configureServices: services =>
+            {
+                services.AddRowHandler<Note, FirstNoteHandler>();
+                services.AddRowHandler<Note, FirstNoteHandler>();
+                services.AddRowHandler<Note, SecondNoteHandler>();
+            }
+        );
+
+        await host.RunWithServicesAsync(
+            serviceProvider =>
+            {
+                var handlers = serviceProvider.GetServices<IRetentionHandler<Note>>().ToArray();
+
+                handlers.Should().HaveCount(2);
+                handlers[0].Should().BeOfType<FirstNoteHandler>();
+                handlers[1].Should().BeOfType<SecondNoteHandler>();
 
                 return Task.CompletedTask;
             }
@@ -410,6 +487,10 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     {
         public object? Create(AnonymiseValueContext context) => Guid.Empty;
     }
+
+    private sealed class FirstNoteHandler : IRetentionHandler<Note>;
+
+    private sealed class SecondNoteHandler : IRetentionHandler<Note>;
 
     private sealed class NotAFactory;
 }

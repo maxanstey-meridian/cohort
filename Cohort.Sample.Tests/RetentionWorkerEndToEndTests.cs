@@ -363,6 +363,12 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
 
         builder.Services.AddDbContext<SampleDbContext>(options => options.UseNpgsql(connectionString));
         builder.Services.AddSingleton(tenant);
+        builder.Services.AddSingleton<GuidTombstoneFactory>();
+        builder.Services.AddSingleton<OriginalValueTombstoneFactory>();
+        builder.Services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<GuidTombstoneFactory>());
+        builder.Services.AddSingleton<IAnonymiseValueFactory>(sp =>
+            sp.GetRequiredService<OriginalValueTombstoneFactory>()
+        );
         builder.Services.AddCohort<SampleDbContext>();
         configureServices(builder.Services);
 

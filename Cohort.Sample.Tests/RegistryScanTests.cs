@@ -65,12 +65,30 @@ public sealed class RegistryScanTests
                 && kvp.Value.AnchorMember == nameof(AnonymisedContact.CreatedAt)
                 && kvp.Value.EntityType == typeof(AnonymisedContact)
             );
+        entries.Should().ContainKey(typeof(TombstoneRecord));
+        var tombstoneEntry = entries[typeof(TombstoneRecord)];
+        tombstoneEntry.Category.Should().Be("tombstone-anonymise");
+        tombstoneEntry.TableName.Should().Be("tombstone_records");
+        tombstoneEntry.AnchorMember.Should().Be(nameof(TombstoneRecord.CreatedAt));
+        tombstoneEntry.EntityType.Should().Be(typeof(TombstoneRecord));
+        tombstoneEntry.AnonymiseFields.Should().HaveCount(3);
+        var tombstoneFactoryFields = tombstoneEntry.AnonymiseFields
+            .OfType<AnonymiseFactoryField>()
+            .ToArray();
+        tombstoneFactoryFields.Should().ContainSingle(field =>
+            field.MemberName == nameof(TombstoneRecord.ExternalId)
+            && field.FactoryType == typeof(GuidTombstoneFactory)
+        );
+        tombstoneFactoryFields.Should().ContainSingle(field =>
+            field.MemberName == nameof(TombstoneRecord.DisplayName)
+            && field.FactoryType == typeof(OriginalValueTombstoneFactory)
+        );
 
         // Negative — nothing else sneaks in
         entries.Values.Should().NotContain(e => e.Category == "long-lived");
-        // SampleDbContext has 6 retained entities: the three original categories plus
-        // TenantlessLog/TenantlessSoftDelete/PerRowAuditedLog added for negative-coverage tests.
-        entries.Should().HaveCount(6);
+        // SampleDbContext has 7 retained entities: the original sample categories plus
+        // TenantlessLog/TenantlessSoftDelete/PerRowAuditedLog and the factory-backed tombstone entity.
+        entries.Should().HaveCount(7);
     }
 
     [Fact]

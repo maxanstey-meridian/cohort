@@ -16,6 +16,7 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
     public DbSet<TenantlessLog> TenantlessLogs => Set<TenantlessLog>();
     public DbSet<TenantlessSoftDelete> TenantlessSoftDeletes => Set<TenantlessSoftDelete>();
     public DbSet<PerRowAuditedLog> PerRowAuditedLogs => Set<PerRowAuditedLog>();
+    public DbSet<TombstoneRecord> TombstoneRecords => Set<TombstoneRecord>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -97,6 +98,19 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
             b.Property(log => log.TenantId).IsRequired();
             b.Property(log => log.CreatedAt).IsRequired();
             b.Property(log => log.Payload).IsRequired();
+        });
+
+        modelBuilder.Entity<TombstoneRecord>(b =>
+        {
+            b.ToTable("tombstone_records");
+            b.HasKey(record => record.Id);
+            b.Property(record => record.TenantId).IsRequired();
+            b.Property(record => record.SubjectId);
+            b.Property(record => record.CreatedAt).IsRequired();
+            b.Property(record => record.ExternalId).IsRequired();
+            b.Property(record => record.DisplayName).IsRequired();
+            b.Property(record => record.ContactEmail);
+            b.Property(record => record.Notes).IsRequired();
         });
 
         modelBuilder.Entity<HeldRecord>(b =>

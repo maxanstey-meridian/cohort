@@ -17,6 +17,9 @@ public sealed class SampleCategoryRepository : IRetentionCategoryRepository
             ["anonymise"] = new StaticRetentionRuleResolver(
                 new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
             ),
+            ["tombstone-anonymise"] = new StaticRetentionRuleResolver(
+                new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+            ),
             ["tenantless-purge"] = new StaticRetentionRuleResolver(
                 new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
             ),

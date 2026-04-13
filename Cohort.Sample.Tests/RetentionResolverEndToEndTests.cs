@@ -43,7 +43,7 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(6);
+        result.Counts.Should().HaveCount(7);
         result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),

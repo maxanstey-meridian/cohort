@@ -96,6 +96,16 @@ public sealed class RegistryEndToEndTests(PostgresFixture fixture) : Integration
                 && kvp.Value.AnonymiseFields.Count == 3
                 && kvp.Value.EntityType == typeof(AnonymisedContact)
             );
+        entries
+            .Should()
+            .Contain(kvp =>
+                kvp.Key == typeof(TombstoneRecord)
+                && kvp.Value.Category == "tombstone-anonymise"
+                && kvp.Value.AnchorMember == nameof(TombstoneRecord.CreatedAt)
+                && kvp.Value.Tenant != null
+                && kvp.Value.AnonymiseFields.Count == 3
+                && kvp.Value.EntityType == typeof(TombstoneRecord)
+            );
         entries.Values.Should().NotContain(e => e.Category == "long-lived");
         entries.Should().NotContainKey(typeof(ExemptDocument));
 

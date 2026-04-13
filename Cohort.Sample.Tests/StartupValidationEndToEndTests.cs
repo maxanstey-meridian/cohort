@@ -65,6 +65,13 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
                 && kvp.Value.Category == "anonymise"
                 && kvp.Value.AnchorMember == nameof(AnonymisedContact.CreatedAt)
             );
+        entries
+            .Should()
+            .Contain(kvp =>
+                kvp.Key == typeof(TombstoneRecord)
+                && kvp.Value.Category == "tombstone-anonymise"
+                && kvp.Value.AnchorMember == nameof(TombstoneRecord.CreatedAt)
+            );
     }
 
     [Fact]
@@ -77,7 +84,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         var act = async () => await host.RunStartupAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().HaveCount(6);
+        exception.Which.Errors.Should().HaveCount(7);
         exception
             .Which.Errors.Should()
             .Contain(
@@ -107,6 +114,11 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
             .Which.Errors.Should()
             .Contain(
                 $"Retention category 'per-row-audit-override' for entity {typeof(PerRowAuditedLog).FullName} could not be resolved."
+            );
+        exception
+            .Which.Errors.Should()
+            .Contain(
+                $"Retention category 'tombstone-anonymise' for entity {typeof(TombstoneRecord).FullName} could not be resolved."
             );
     }
 

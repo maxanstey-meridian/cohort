@@ -82,7 +82,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         started.TenantId.Should().Be(tenantId);
 
         var summaries = auditWriter.Events.OfType<SweepEvent.EntitySummary>().ToList();
-        summaries.Should().HaveCount(6);
+        summaries.Should().HaveCount(7);
         summaries.Should().Contain(
             s => s.SweepId == started.SweepId
                 && s.EntityType == typeof(AnonymisedContact)
@@ -288,7 +288,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         run.Duration.Should().BePositive();
 
         // 3 original retained entities + 3 tenantless/per-row sample additions (all Exempt under this test's restricted dict).
-        summaries.Should().HaveCount(6);
+        summaries.Should().HaveCount(7);
         summaries.Should().Contain(
             new SweepRunEntitySummaryRow(
                 result.SweepId,
@@ -647,6 +647,12 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         services.AddSingleton(categoryRepository);
         services.AddSingleton(auditWriter);
         services.AddScoped<IRetentionAuditWriter>(sp => sp.GetRequiredService<RecordingAuditWriter>());
+        services.AddSingleton<GuidTombstoneFactory>();
+        services.AddSingleton<OriginalValueTombstoneFactory>();
+        services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<GuidTombstoneFactory>());
+        services.AddSingleton<IAnonymiseValueFactory>(sp =>
+            sp.GetRequiredService<OriginalValueTombstoneFactory>()
+        );
         services.AddCohort<SampleDbContext>();
         services.AddScoped<SampleRetentionStartupService>();
 

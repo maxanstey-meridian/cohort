@@ -32,6 +32,12 @@ builder.Services.AddDbContext<SampleDbContext>(
 
 builder.Services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
 builder.Services.AddSingleton(previewTenant);
+builder.Services.AddSingleton<GuidTombstoneFactory>();
+builder.Services.AddSingleton<OriginalValueTombstoneFactory>();
+builder.Services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<GuidTombstoneFactory>());
+builder.Services.AddSingleton<IAnonymiseValueFactory>(sp =>
+    sp.GetRequiredService<OriginalValueTombstoneFactory>()
+);
 builder.Services.AddCohort<SampleDbContext>();
 builder.Services.AddScoped<SampleRetentionStartupService>();
 

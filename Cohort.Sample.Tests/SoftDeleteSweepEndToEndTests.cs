@@ -258,8 +258,19 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
             db,
             new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())),
             repository,
-            new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())),
-            [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
+            new RetentionStartupValidator(
+                db,
+                repository,
+                new RetentionEntryBuilder(new CohortConventions()),
+                [new GuidTombstoneFactory(), new OriginalValueTombstoneFactory()]
+            ),
+            [
+                new PurgeSweepStrategy(),
+                new SoftDeleteSweepStrategy(),
+                new AnonymiseSweepStrategy(
+                    [new GuidTombstoneFactory(), new OriginalValueTombstoneFactory()]
+                )
+            ]
         );
 
         var act = () =>

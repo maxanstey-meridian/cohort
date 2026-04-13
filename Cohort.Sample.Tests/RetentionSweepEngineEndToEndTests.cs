@@ -76,7 +76,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(6);
+        result.Counts.Should().HaveCount(7);
         result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
@@ -153,7 +153,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(6);
+        result.Counts.Should().HaveCount(7);
         result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
@@ -225,9 +225,18 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             db,
             new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())),
             repository,
-            new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())),
+            new RetentionStartupValidator(
+                db,
+                repository,
+                new RetentionEntryBuilder(new CohortConventions()),
+                CreateSampleFactories()
+            ),
             new NoOpRetentionAuditWriter(),
-            [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
+            [
+                new PurgeSweepStrategy(),
+                new SoftDeleteSweepStrategy(),
+                new AnonymiseSweepStrategy(CreateSampleFactories())
+            ]
         );
 
         var result = await engine.SweepAsync(
@@ -281,9 +290,18 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             db,
             new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())),
             repository,
-            new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())),
+            new RetentionStartupValidator(
+                db,
+                repository,
+                new RetentionEntryBuilder(new CohortConventions()),
+                CreateSampleFactories()
+            ),
             new NoOpRetentionAuditWriter(),
-            [strategy, new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy()]
+            [
+                strategy,
+                new SoftDeleteSweepStrategy(),
+                new AnonymiseSweepStrategy(CreateSampleFactories())
+            ]
         );
 
         var result = await engine.SweepAsync(
@@ -337,7 +355,12 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             db,
             new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())),
             repository,
-            new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())),
+            new RetentionStartupValidator(
+                db,
+                repository,
+                new RetentionEntryBuilder(new CohortConventions()),
+                CreateSampleFactories()
+            ),
             new NoOpRetentionAuditWriter(),
             [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy()]
         );
@@ -371,6 +394,11 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
                 ? Task.FromResult<IRetentionRuleResolver?>(resolver)
                 : Task.FromResult<IRetentionRuleResolver?>(ExemptFallback);
         }
+    }
+
+    private static IAnonymiseValueFactory[] CreateSampleFactories()
+    {
+        return [new GuidTombstoneFactory(), new OriginalValueTombstoneFactory()];
     }
 
     private sealed class TransactionAssertingResolver(

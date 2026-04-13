@@ -20,7 +20,8 @@ namespace Cohort.Sample.Tests;
 public sealed class CohortTestHost(
     string connectionString,
     IRetentionCategoryRepository? categoryRepository = null,
-    IReadOnlyDictionary<string, string?>? configurationOverrides = null
+    IReadOnlyDictionary<string, string?>? configurationOverrides = null,
+    Action<IServiceCollection>? configureServices = null
 ) : IDisposable
 {
     private readonly DbContextOptions<SampleDbContext> _options = new DbContextOptionsBuilder<SampleDbContext>()
@@ -29,7 +30,8 @@ public sealed class CohortTestHost(
     private readonly ServiceProvider _services = BuildServices(
         connectionString,
         categoryRepository,
-        configurationOverrides
+        configurationOverrides,
+        configureServices
     );
 
     public SampleDbContext CreateDbContext() => new(_options);
@@ -99,7 +101,8 @@ public sealed class CohortTestHost(
     private static ServiceProvider BuildServices(
         string connectionString,
         IRetentionCategoryRepository? categoryRepository,
-        IReadOnlyDictionary<string, string?>? configurationOverrides
+        IReadOnlyDictionary<string, string?>? configurationOverrides,
+        Action<IServiceCollection>? configureServices
     )
     {
         var services = new ServiceCollection();
@@ -113,8 +116,15 @@ public sealed class CohortTestHost(
         services.AddSingleton<IRetentionCategoryRepository>(
             categoryRepository ?? new SampleCategoryRepository()
         );
+        services.AddSingleton<GuidTombstoneFactory>();
+        services.AddSingleton<OriginalValueTombstoneFactory>();
+        services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<GuidTombstoneFactory>());
+        services.AddSingleton<IAnonymiseValueFactory>(sp =>
+            sp.GetRequiredService<OriginalValueTombstoneFactory>()
+        );
         services.AddCohort<SampleDbContext>();
         services.AddScoped<SampleRetentionStartupService>();
+        configureServices?.Invoke(services);
 
         return services.BuildServiceProvider(validateScopes: true);
     }

@@ -24,7 +24,7 @@ public sealed class RetentionStartupValidatorTests
         await using var db = new SampleDbContext(options);
         var repository = new GuardedSampleCategoryRepository();
 
-        var act = async () => await new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
 
         await act.Should().NotThrowAsync();
     }
@@ -38,7 +38,7 @@ public sealed class RetentionStartupValidatorTests
         await using var db = new SampleDbContext(options);
         var repository = new DeferredSampleCategoryRepository();
 
-        var act = async () => await new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
 
         await act.Should().NotThrowAsync();
     }
@@ -52,7 +52,7 @@ public sealed class RetentionStartupValidatorTests
         await using var db = new SampleDbContext(options);
 
         var act = async () =>
-            await new RetentionStartupValidator(db, new OpaqueDeferredSampleCategoryRepository(), new RetentionEntryBuilder(new CohortConventions()))
+            await CreateValidator(db, new OpaqueDeferredSampleCategoryRepository())
                 .ValidateAsync();
 
         await act.Should().NotThrowAsync();
@@ -67,11 +67,8 @@ public sealed class RetentionStartupValidatorTests
         await using var db = new SampleDbContext(options);
 
         var act = async () =>
-            await new RetentionStartupValidator(
-                db,
-                new OpaqueDeferredAnonymiseSampleCategoryRepository(),
-                new RetentionEntryBuilder(new CohortConventions())
-            ).ValidateAsync();
+            await CreateValidator(db, new OpaqueDeferredAnonymiseSampleCategoryRepository())
+                .ValidateAsync();
 
         await act.Should().NotThrowAsync();
     }
@@ -85,7 +82,7 @@ public sealed class RetentionStartupValidatorTests
         await using var db = new SampleDbContext(options);
 
         var act = async () =>
-            await new RetentionStartupValidator(db, new GuardedSampleCategoryRepository(), new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
+            await CreateValidator(db, new GuardedSampleCategoryRepository()).ValidateAsync();
 
         await act.Should().NotThrowAsync();
     }
@@ -167,7 +164,7 @@ public sealed class RetentionStartupValidatorTests
             await new RetentionStartupValidator(db, InMemoryCategoryRepository.Empty, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().HaveCount(6);
+        exception.Which.Errors.Should().HaveCount(7);
         exception
             .Which.Errors.Should()
             .Contain(
@@ -198,6 +195,11 @@ public sealed class RetentionStartupValidatorTests
             .Contain(
                 $"Retention category 'per-row-audit-override' for entity {typeof(PerRowAuditedLog).FullName} could not be resolved."
             );
+        exception
+            .Which.Errors.Should()
+            .Contain(
+                $"Retention category 'tombstone-anonymise' for entity {typeof(TombstoneRecord).FullName} could not be resolved."
+            );
         exception.Which.Message.Should().Contain("short-lived");
         exception.Which.Message.Should().Contain("soft-delete");
         exception.Which.Message.Should().Contain("anonymise");
@@ -219,7 +221,7 @@ public sealed class RetentionStartupValidatorTests
             }
         );
 
-        var act = async () => await new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().HaveCount(2);
@@ -251,7 +253,7 @@ public sealed class RetentionStartupValidatorTests
             }
         );
 
-        var act = async () => await new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle();
@@ -487,7 +489,7 @@ public sealed class RetentionStartupValidatorTests
             }
         );
 
-        var act = async () => await new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle();
@@ -515,7 +517,7 @@ public sealed class RetentionStartupValidatorTests
             }
         );
 
-        var act = async () => await new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle();
@@ -543,7 +545,7 @@ public sealed class RetentionStartupValidatorTests
             }
         );
 
-        var act = async () => await new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle();
@@ -571,7 +573,7 @@ public sealed class RetentionStartupValidatorTests
             }
         );
 
-        var act = async () => await new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
 
         await act.Should().NotThrowAsync();
     }
@@ -600,10 +602,11 @@ public sealed class RetentionStartupValidatorTests
                 ["tenantless-purge"] = ExemptResolver,
                 ["tenantless-softdelete"] = ExemptResolver,
                 ["per-row-audit-override"] = ExemptResolver,
+                ["tombstone-anonymise"] = ExemptResolver,
             }
         );
 
-        var act = async () => await new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle();
@@ -675,11 +678,7 @@ public sealed class RetentionStartupValidatorTests
         );
 
         var act = async () =>
-            await new RetentionStartupValidator(
-                db,
-                repository,
-                new RetentionEntryBuilder(new CohortConventions())
-            ).ValidateAsync();
+            await CreateValidator(db, repository).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle();
@@ -708,11 +707,7 @@ public sealed class RetentionStartupValidatorTests
         );
 
         var act = async () =>
-            await new RetentionStartupValidator(
-                db,
-                repository,
-                new RetentionEntryBuilder(new CohortConventions())
-            ).ValidateAsync();
+            await CreateValidator(db, repository).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle();
@@ -812,7 +807,7 @@ public sealed class RetentionStartupValidatorTests
     )
     {
         var registry = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions()));
-        var validator = new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions()));
+        var validator = CreateValidator(db, repository);
 
         return new SampleRetentionStartupService(
             registry,
@@ -850,7 +845,7 @@ public sealed class RetentionStartupValidatorTests
     )
     {
         var registry = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions()));
-        var validator = new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions()));
+        var validator = CreateValidator(db, repository);
 
         return new RetentionSweepEngine(
             db,
@@ -868,7 +863,7 @@ public sealed class RetentionStartupValidatorTests
     )
     {
         var registry = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions()));
-        var validator = new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions()));
+        var validator = CreateValidator(db, repository);
 
         return new RetentionPreviewService(
             db,
@@ -885,7 +880,7 @@ public sealed class RetentionStartupValidatorTests
     )
     {
         var registry = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions()));
-        var validator = new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions()));
+        var validator = CreateValidator(db, repository);
 
         return new RetentionErasureService(
             db,
@@ -946,6 +941,19 @@ public sealed class RetentionStartupValidatorTests
             Task.FromResult(rule);
     }
 
+    private static RetentionStartupValidator CreateValidator(
+        DbContext db,
+        IRetentionCategoryRepository repository
+    )
+    {
+        return new RetentionStartupValidator(
+            db,
+            repository,
+            new RetentionEntryBuilder(new CohortConventions()),
+            [new GuidTombstoneFactory(), new OriginalValueTombstoneFactory()]
+        );
+    }
+
     private sealed class GuardedSampleCategoryRepository : IRetentionCategoryRepository
     {
         public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
@@ -966,7 +974,7 @@ public sealed class RetentionStartupValidatorTests
                 );
             }
 
-            if (category == "anonymise")
+            if (category == "anonymise" || category == "tombstone-anonymise")
             {
                 return Task.FromResult<IRetentionRuleResolver?>(
                     new StaticRetentionRuleResolver(
@@ -1014,7 +1022,7 @@ public sealed class RetentionStartupValidatorTests
                 );
             }
 
-            if (category == "anonymise")
+            if (category == "anonymise" || category == "tombstone-anonymise")
             {
                 return Task.FromResult<IRetentionRuleResolver?>(
                     new DeferredRuleResolver(
@@ -1054,7 +1062,7 @@ public sealed class RetentionStartupValidatorTests
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     )
                 ),
-                "anonymise" => Task.FromResult<IRetentionRuleResolver?>(
+                "anonymise" or "tombstone-anonymise" => Task.FromResult<IRetentionRuleResolver?>(
                     new StaticRetentionRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     )
@@ -1084,7 +1092,7 @@ public sealed class RetentionStartupValidatorTests
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     )
                 ),
-                "anonymise" => Task.FromResult<IRetentionRuleResolver?>(
+                "anonymise" or "tombstone-anonymise" => Task.FromResult<IRetentionRuleResolver?>(
                     new OpaqueDeferredRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     )

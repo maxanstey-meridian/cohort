@@ -1,5 +1,7 @@
 #nullable enable
 
+using Cohort.Infrastructure.Handlers;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata.Builders;
 
@@ -15,6 +17,7 @@ public static class CohortModelBuilder
         ConfigureSweepRunTable(modelBuilder);
         ConfigureSweepRunEntitySummaryTable(modelBuilder);
         ConfigureSweepRunRowDetailTable(modelBuilder);
+        ConfigureSweepRowHandlerStatusTable(modelBuilder);
 
         return modelBuilder;
     }
@@ -95,6 +98,15 @@ public static class CohortModelBuilder
         );
     }
 
+    private static void ConfigureSweepRowHandlerStatusTable(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<SweepRowHandlerStatusEntity>(builder =>
+        {
+            builder.ToTable(CohortTableNames.SweepRowHandlerStatus);
+            ConfigureSweepRowHandlerStatusColumns(builder);
+        });
+    }
+
     private static void ConfigureRetentionHoldColumns(EntityTypeBuilder builder)
     {
         builder.Property<Guid>("HoldId").ValueGeneratedNever();
@@ -139,6 +151,7 @@ public static class CohortModelBuilder
 
     private static void ConfigureSweepRunRowDetailColumns(EntityTypeBuilder builder)
     {
+        builder.Property<long>("Id").ValueGeneratedOnAdd();
         builder.Property<Guid>("SweepId").ValueGeneratedNever();
         builder.Property<DateTimeOffset>("At").IsRequired();
         builder.Property<string>("EntityType").IsRequired();
@@ -146,8 +159,37 @@ public static class CohortModelBuilder
         builder.Property<string>("Category").IsRequired();
         builder.Property<int>("Strategy").IsRequired();
         builder.Property<Guid>("TenantId").IsRequired();
-        builder.HasKey("SweepId", "EntityType", "EntityId", "Category", "Strategy", "TenantId");
+        builder.Property<string>("CapturedPayload");
+        builder.HasKey("Id");
         builder.HasIndex("SweepId");
+        builder
+            .HasIndex("SweepId", "EntityType", "EntityId", "Category", "Strategy", "TenantId")
+            .IsUnique();
+    }
+
+    private static void ConfigureSweepRowHandlerStatusColumns(
+        EntityTypeBuilder<SweepRowHandlerStatusEntity> builder
+    )
+    {
+        builder.Property(status => status.Id).ValueGeneratedOnAdd();
+        builder.Property(status => status.SweepRunRowDetailId).IsRequired();
+        builder.Property(status => status.HandlerType).IsRequired();
+        builder.Property(status => status.State).IsRequired();
+        builder.Property(status => status.Attempt).IsRequired();
+        builder.Property(status => status.QueuedAt).IsRequired();
+        builder.Property(status => status.NextAttemptAt).IsRequired();
+        builder.Property(status => status.ClaimedAt);
+        builder.Property(status => status.CompletedAt);
+        builder.Property(status => status.LastError);
+        builder.HasKey(status => status.Id);
+        builder.HasIndex(status => new { status.SweepRunRowDetailId, status.HandlerType }).IsUnique();
+        builder.HasIndex(status => new { status.State, status.NextAttemptAt, status.Id });
+        builder
+            .HasOne(CohortSharedTypeNames.SweepRunRowDetail, navigationName: null)
+            .WithMany()
+            .HasForeignKey(nameof(SweepRowHandlerStatusEntity.SweepRunRowDetailId))
+            .HasPrincipalKey("Id")
+            .OnDelete(DeleteBehavior.Cascade);
     }
 
     private static Microsoft.EntityFrameworkCore.Metadata.IMutableEntityType? TryFindEntityMappedToTable(
@@ -167,6 +209,7 @@ internal static class CohortTableNames
     internal const string SweepRun = "sweep_run";
     internal const string SweepRunEntitySummary = "sweep_run_entity_summary";
     internal const string SweepRunRowDetail = "sweep_run_row_detail";
+    internal const string SweepRowHandlerStatus = "sweep_row_handler_status";
 }
 
 internal static class CohortSharedTypeNames

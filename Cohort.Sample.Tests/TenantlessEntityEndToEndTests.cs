@@ -11,11 +11,16 @@ public sealed class TenantlessEntityEndToEndTests(PostgresFixture fixture)
     : IntegrationTestBase(fixture)
 {
     [Fact]
-    public async Task Sweep_Path_Purges_Only_Expired_Rows_On_Entity_Without_TenantId_Property()
+    public async Task Sweep_Path_Purges_Only_Expired_Rows_On_Explicitly_Tenantless_Entity()
     {
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
         var oldId = Guid.NewGuid();
         var youngId = Guid.NewGuid();
+        var entries = await Host.RunStartupAsync();
+        var tenantlessEntry = entries[typeof(TenantlessLog)];
+
+        tenantlessEntry.Tenant.Should().BeNull();
+        tenantlessEntry.IsExplicitlyTenantless.Should().BeTrue();
 
         await using (var db = Host.CreateDbContext())
         {
@@ -57,9 +62,14 @@ public sealed class TenantlessEntityEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task Sweep_Path_Soft_Deletes_Only_Expired_Rows_On_Entity_Without_TenantId_Property()
+    public async Task Sweep_Path_Soft_Deletes_Only_Expired_Rows_On_Explicitly_Tenantless_Entity()
     {
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var entries = await Host.RunStartupAsync();
+        var tenantlessEntry = entries[typeof(TenantlessSoftDelete)];
+
+        tenantlessEntry.Tenant.Should().BeNull();
+        tenantlessEntry.IsExplicitlyTenantless.Should().BeTrue();
 
         await using (var db = Host.CreateDbContext())
         {
@@ -104,7 +114,7 @@ public sealed class TenantlessEntityEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task Sweep_Path_Respects_Active_Holds_On_Tenantless_Entity_Matched_By_Table_And_RecordId_Only()
+    public async Task Sweep_Path_Respects_Active_Holds_On_Explicitly_Tenantless_Entity_Matched_By_Table_And_RecordId_Only()
     {
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
         var heldId = Guid.NewGuid();

@@ -1,6 +1,7 @@
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
+using Cohort.Infrastructure.Migrations;
 using Cohort.Sample.Entities;
 
 using Microsoft.EntityFrameworkCore;
@@ -76,10 +77,119 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         entries
             .Should()
             .Contain(kvp =>
+                kvp.Key == typeof(TenantlessLog)
+                && kvp.Value.Category == "tenantless-purge"
+                && kvp.Value.AnchorMember == nameof(TenantlessLog.CreatedAt)
+                && kvp.Value.Tenant == null
+                && kvp.Value.IsExplicitlyTenantless
+            );
+        entries
+            .Should()
+            .Contain(kvp =>
+                kvp.Key == typeof(TenantlessSoftDelete)
+                && kvp.Value.Category == "tenantless-softdelete"
+                && kvp.Value.AnchorMember == nameof(TenantlessSoftDelete.CreatedAt)
+                && kvp.Value.Tenant == null
+                && kvp.Value.IsExplicitlyTenantless
+            );
+        entries
+            .Should()
+            .Contain(kvp =>
                 kvp.Key == typeof(TombstoneRecord)
                 && kvp.Value.Category == "tombstone-anonymise"
                 && kvp.Value.AnchorMember == nameof(TombstoneRecord.CreatedAt)
             );
+    }
+
+    [Fact]
+    public async Task Startup_Fails_When_Retained_Entity_Cannot_Resolve_Tenant_In_TenantScoped_Config()
+    {
+        var act = async () =>
+            await RunTenantScopeStartupAsync<MisconfiguredTenantScopedDbContext>(
+                new SingleCategoryRepository(
+                    "misconfigured-tenant-scope",
+                    new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    )
+                )
+            );
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Tenant convention on {typeof(MisconfiguredTenantScopedRecord).FullName}: retained entities must expose a public Guid or nullable Guid tenant property named 'TenantId' by convention, or mark the tenant property with [RetentionTenant], unless the entity is explicitly marked with [RetentionTenantless]."
+            );
+    }
+
+    [Fact]
+    public async Task Sweep_Path_Does_Not_Start_When_TenantScoped_Retained_Entity_Is_Misconfigured()
+    {
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var recordId = Guid.NewGuid();
+
+        await RunTenantScopeHostAsync<MisconfiguredTenantScopedDbContext>(
+            new SingleCategoryRepository(
+                "misconfigured-tenant-scope",
+                new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                )
+            ),
+            async serviceProvider =>
+            {
+                await using (var seedScope = serviceProvider.CreateAsyncScope())
+                {
+                    var db = seedScope.ServiceProvider.GetRequiredService<MisconfiguredTenantScopedDbContext>();
+                    await db.Database.ExecuteSqlRawAsync(
+                        """
+                        CREATE TABLE IF NOT EXISTS "misconfigured_tenant_scoped_records" (
+                            "Id" uuid PRIMARY KEY,
+                            "created_at_utc" timestamp with time zone NOT NULL,
+                            "payload" text NOT NULL
+                        )
+                        """
+                    );
+                    db.MisconfiguredTenantScopedRecords.Add(
+                        new MisconfiguredTenantScopedRecord
+                        {
+                            Id = recordId,
+                            CreatedAt = asOf.AddDays(-120),
+                            Payload = "still-here-because-validation-failed",
+                        }
+                    );
+                    await db.SaveChangesAsync();
+                }
+
+                var act = async () =>
+                {
+                    await using var startupScope = serviceProvider.CreateAsyncScope();
+                    var startup = startupScope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
+                    await startup.RunSweepAsync(
+                        new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
+                        asOf
+                    );
+                };
+
+                var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+                exception.Which.Errors.Should().ContainSingle();
+                exception
+                    .Which.Errors[0]
+                    .Should()
+                    .Be(
+                        $"Tenant convention on {typeof(MisconfiguredTenantScopedRecord).FullName}: retained entities must expose a public Guid or nullable Guid tenant property named 'TenantId' by convention, or mark the tenant property with [RetentionTenant], unless the entity is explicitly marked with [RetentionTenantless]."
+                    );
+
+                await using var verifyScope = serviceProvider.CreateAsyncScope();
+                var verifyDb = verifyScope.ServiceProvider.GetRequiredService<MisconfiguredTenantScopedDbContext>();
+                var remaining = await verifyDb.MisconfiguredTenantScopedRecords.SingleAsync(record =>
+                    record.Id == recordId
+                );
+
+                remaining.Payload.Should().Be("still-here-because-validation-failed");
+            }
+        );
     }
 
     [Fact]
@@ -411,6 +521,48 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         return await startup.RunAsync();
     }
 
+    private async Task<IReadOnlyDictionary<Type, RetentionEntry>> RunTenantScopeStartupAsync<TContext>(
+        IRetentionCategoryRepository categoryRepository
+    )
+        where TContext : DbContext
+    {
+        IReadOnlyDictionary<Type, RetentionEntry>? entries = null;
+
+        await RunTenantScopeHostAsync<TContext>(
+            categoryRepository,
+            async serviceProvider =>
+            {
+                await using var scope = serviceProvider.CreateAsyncScope();
+                var startup = scope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
+                entries = await startup.RunAsync();
+            }
+        );
+
+        return entries!;
+    }
+
+    private async Task RunTenantScopeHostAsync<TContext>(
+        IRetentionCategoryRepository categoryRepository,
+        Func<ServiceProvider, Task> action
+    )
+        where TContext : DbContext
+    {
+        var services = new ServiceCollection();
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>())
+            .Build();
+
+        services.AddSingleton<IConfiguration>(configuration);
+        services.AddLogging();
+        services.AddDbContext<TContext>(options => options.UseNpgsql(connectionString));
+        services.AddSingleton(categoryRepository);
+        services.AddCohort<TContext>();
+        services.AddScoped<SampleRetentionStartupService>();
+
+        await using var serviceProvider = services.BuildServiceProvider(validateScopes: true);
+        await action(serviceProvider);
+    }
+
     private sealed class EmptyCategoryRepository : IRetentionCategoryRepository
     {
         public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct) =>
@@ -489,6 +641,26 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         }
     }
 
+    private sealed class MisconfiguredTenantScopedDbContext(
+        DbContextOptions<MisconfiguredTenantScopedDbContext> options
+    ) : DbContext(options)
+    {
+        public DbSet<MisconfiguredTenantScopedRecord> MisconfiguredTenantScopedRecords => Set<MisconfiguredTenantScopedRecord>();
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<MisconfiguredTenantScopedRecord>(entity =>
+            {
+                entity.ToTable("misconfigured_tenant_scoped_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+                entity.Property(record => record.Payload).HasColumnName("payload");
+            });
+
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
     [Retain("invalid-factory-type", nameof(InvalidFactoryTypeStartupRecord.CreatedAt))]
     private sealed class InvalidFactoryTypeStartupRecord
     {
@@ -520,6 +692,14 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
 
         [AnonymiseWith(typeof(RegisteredFactory))]
         public Guid ExternalId { get; init; }
+    }
+
+    [Retain("misconfigured-tenant-scope", nameof(MisconfiguredTenantScopedRecord.CreatedAt))]
+    private sealed class MisconfiguredTenantScopedRecord
+    {
+        public Guid Id { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+        public string Payload { get; init; } = "";
     }
 
     private sealed class RegisteredFactory : IAnonymiseValueFactory

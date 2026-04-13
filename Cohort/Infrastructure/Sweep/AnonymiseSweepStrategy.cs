@@ -503,7 +503,13 @@ public sealed class AnonymiseSweepStrategy(
                         $"Anonymise field '{field.MemberName}' is not supported."
                     ),
                 };
-                command.Parameters.Add(CreateParameter(command, parameterName, value));
+                command.Parameters.Add(
+                    CreateParameter(
+                        command,
+                        parameterName,
+                        ConvertAssignmentValueToProvider(entry, field, value)
+                    )
+                );
             }
 
             command.Parameters.Add(CreateParameter(command, "recordId", row.RecordId));
@@ -656,6 +662,22 @@ public sealed class AnonymiseSweepStrategy(
         return converter?.ConvertFromProvider(providerValue) ?? providerValue;
     }
 
+    private object? ConvertAssignmentValueToProvider(
+        RetentionEntry entry,
+        AnonymiseField field,
+        object? value
+    )
+    {
+        if (value is null or DBNull || modelDb is null)
+        {
+            return value is DBNull ? null : value;
+        }
+
+        var property = ResolveEfProperty(entry, field.MemberName);
+        var converter = property.GetTypeMapping().Converter;
+        return converter?.ConvertToProvider(value) ?? value;
+    }
+
     private IProperty ResolveEfProperty(RetentionEntry entry, string memberName)
     {
         var entityType =
@@ -701,7 +723,15 @@ public sealed class AnonymiseSweepStrategy(
             var parameterName = $"value{index}";
             assignments.Add($"{QuoteIdentifier(field.ColumnName)} = @{parameterName}");
             command.Parameters.Add(
-                CreateParameter(command, parameterName, CreateSetBasedAssignmentValue(entry, field, tenantId, now))
+                CreateParameter(
+                    command,
+                    parameterName,
+                    ConvertAssignmentValueToProvider(
+                        entry,
+                        field,
+                        CreateSetBasedAssignmentValue(entry, field, tenantId, now)
+                    )
+                )
             );
         }
 
@@ -739,7 +769,15 @@ public sealed class AnonymiseSweepStrategy(
             var parameterName = $"value{index}";
             assignments.Add($"{QuoteIdentifier(field.ColumnName)} = @{parameterName}");
             command.Parameters.Add(
-                CreateParameter(command, parameterName, CreateSetBasedAssignmentValue(entry, field, tenantId, now))
+                CreateParameter(
+                    command,
+                    parameterName,
+                    ConvertAssignmentValueToProvider(
+                        entry,
+                        field,
+                        CreateSetBasedAssignmentValue(entry, field, tenantId, now)
+                    )
+                )
             );
         }
 

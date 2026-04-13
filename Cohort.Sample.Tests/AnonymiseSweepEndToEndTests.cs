@@ -519,10 +519,72 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
             var db = scope.ServiceProvider.GetRequiredService<ConvertedOriginalValueDbContext>();
             var factory = scope.ServiceProvider.GetRequiredService<ConvertedOriginalValueFactory>();
             var record = await db.ConvertedOriginalValueRecords.SingleAsync();
+            var providerValue = await ReadProviderStringAsync(
+                db,
+                """
+                SELECT external_id
+                FROM converted_original_value_records
+                """
+            );
 
             record.ExternalId.Should().Be("alpha-scrubbed");
+            providerValue.Should().Be("ALPHA-SCRUBBED");
             factory.Contexts.Should().ContainSingle();
             factory.Contexts[0].OriginalValue.Should().Be("alpha");
+        }
+    }
+
+    [Fact]
+    public async Task Sweep_Path_Converts_SetBased_Factory_Output_To_Provider_Values_Before_Writing()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        await using var services = BuildConvertedOriginalValueServiceProvider(database.ConnectionString);
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<ConvertedOriginalValueDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.ConvertedSetBasedValueRecords.Add(
+                new ConvertedSetBasedValueRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    ExternalId = "seed-value",
+                    Notes = "converted-set-based",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var engine = scope.ServiceProvider.GetRequiredService<RetentionSweepEngine>();
+            await engine.SweepAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                asOf
+            );
+        }
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<ConvertedOriginalValueDbContext>();
+            var factory = scope.ServiceProvider.GetRequiredService<ConvertedSetBasedValueFactory>();
+            var record = await db.ConvertedSetBasedValueRecords.SingleAsync();
+            var providerValue = await ReadProviderStringAsync(
+                db,
+                """
+                SELECT external_id
+                FROM converted_set_based_value_records
+                """
+            );
+
+            record.ExternalId.Should().Be("set-based-scrubbed");
+            providerValue.Should().Be("SET-BASED-SCRUBBED");
+            factory.Contexts.Should().ContainSingle();
+            factory.Contexts[0].OriginalValue.Should().BeNull();
         }
     }
 
@@ -579,10 +641,17 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
                     ["converted-original-value"] = new StaticRetentionRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
+                    ["converted-set-based-value"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
                 }
             )
         );
+        services.AddSingleton<ConvertedSetBasedValueFactory>();
         services.AddSingleton<ConvertedOriginalValueFactory>();
+        services.AddSingleton<IAnonymiseValueFactory>(
+            sp => sp.GetRequiredService<ConvertedSetBasedValueFactory>()
+        );
         services.AddSingleton<IAnonymiseValueFactory>(
             sp => sp.GetRequiredService<ConvertedOriginalValueFactory>()
         );
@@ -631,12 +700,30 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
     {
         public DbSet<ConvertedOriginalValueRecord> ConvertedOriginalValueRecords =>
             Set<ConvertedOriginalValueRecord>();
+        public DbSet<ConvertedSetBasedValueRecord> ConvertedSetBasedValueRecords =>
+            Set<ConvertedSetBasedValueRecord>();
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
             modelBuilder.Entity<ConvertedOriginalValueRecord>(entity =>
             {
                 entity.ToTable("converted_original_value_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.TenantId).HasColumnName("tenant_id");
+                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+                entity
+                    .Property(record => record.ExternalId)
+                    .HasColumnName("external_id")
+                    .HasConversion(
+                        value => value.ToUpperInvariant(),
+                        value => value.ToLowerInvariant()
+                    );
+                entity.Property(record => record.Notes).HasColumnName("notes");
+            });
+
+            modelBuilder.Entity<ConvertedSetBasedValueRecord>(entity =>
+            {
+                entity.ToTable("converted_set_based_value_records");
                 entity.HasKey(record => record.Id);
                 entity.Property(record => record.TenantId).HasColumnName("tenant_id");
                 entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
@@ -696,6 +783,19 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         public string Notes { get; set; } = "";
     }
 
+    [Retain("converted-set-based-value", nameof(ConvertedSetBasedValueRecord.CreatedAt))]
+    private sealed class ConvertedSetBasedValueRecord
+    {
+        public Guid Id { get; set; }
+        public Guid TenantId { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
+
+        [AnonymiseWith(typeof(ConvertedSetBasedValueFactory))]
+        public string ExternalId { get; set; } = "";
+
+        public string Notes { get; set; } = "";
+    }
+
     private sealed class SetBasedGuidFactory : IAnonymiseValueFactory
     {
         public static readonly Guid ScrubbedValue = Guid.Parse("11111111-1111-1111-1111-111111111111");
@@ -744,6 +844,30 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
             Contexts.Add(context);
             return $"{context.OriginalValue}-scrubbed";
         }
+    }
+
+    private sealed class ConvertedSetBasedValueFactory : IAnonymiseValueFactory
+    {
+        public List<AnonymiseValueContext> Contexts { get; } = [];
+
+        public object? Create(AnonymiseValueContext context)
+        {
+            Contexts.Add(context);
+            return "set-based-scrubbed";
+        }
+    }
+
+    private static async Task<string> ReadProviderStringAsync(DbContext db, string sql)
+    {
+        var connection = db.Database.GetDbConnection();
+        if (connection.State != ConnectionState.Open)
+        {
+            await connection.OpenAsync();
+        }
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        return (string)(await command.ExecuteScalarAsync())!;
     }
 
     private sealed class StaticCategoryRepository(

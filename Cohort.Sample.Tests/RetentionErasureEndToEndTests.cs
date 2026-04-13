@@ -1,3 +1,4 @@
+using System.Data;
 using System.Data.Common;
 
 using Cohort.Application;
@@ -699,6 +700,73 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Erase_Path_Converts_SetBased_Factory_Output_To_Provider_Values_Before_Writing()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        await using var services = BuildFactoryBackedErasureServiceProvider(database.ConnectionString);
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<FactoryBackedErasureDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.ConvertedSetBasedErasureRecords.Add(
+                new ConvertedSetBasedErasureRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    ExternalId = "seed-value",
+                    Notes = "converted-set-based-erasure",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var erasureService = scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
+            var result = await erasureService.EraseAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                new ErasureScope(subjectId),
+                asOf
+            );
+
+            result.Counts.Should().Contain(
+                new EntitySweepCount(
+                    typeof(ConvertedSetBasedErasureRecord),
+                    "converted-set-based-erasure",
+                    tenantId,
+                    Strategy.Anonymise,
+                    1
+                )
+            );
+        }
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<FactoryBackedErasureDbContext>();
+            var factory = scope.ServiceProvider.GetRequiredService<ConvertedSetBasedErasureFactory>();
+            var record = await db.ConvertedSetBasedErasureRecords.SingleAsync();
+            var providerValue = await ReadProviderStringAsync(
+                db,
+                """
+                SELECT external_id
+                FROM converted_set_based_erasure_records
+                """
+            );
+
+            record.ExternalId.Should().Be("set-based-erasure-scrubbed");
+            providerValue.Should().Be("SET-BASED-ERASURE-SCRUBBED");
+            factory.Contexts.Should().ContainSingle();
+            factory.Contexts[0].OriginalValue.Should().BeNull();
+        }
+    }
+
+    [Fact]
     public async Task Erasure_Path_Matches_Using_The_Marked_Clr_Property_Instead_Of_A_Hardcoded_SubjectId_Name()
     {
         await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
@@ -1054,6 +1122,19 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         });
     }
 
+    private static async Task<string> ReadProviderStringAsync(DbContext db, string sql)
+    {
+        var connection = db.Database.GetDbConnection();
+        if (connection.State != ConnectionState.Open)
+        {
+            await connection.OpenAsync();
+        }
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        return (string)(await command.ExecuteScalarAsync())!;
+    }
+
     private static async Task WaitForSummaryInsertLockAsync(string connectionString)
     {
         var deadline = DateTime.UtcNow.AddSeconds(5);
@@ -1297,15 +1378,22 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     ["factory-backed-per-row-erasure"] = new StaticRetentionRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
+                    ["converted-set-based-erasure"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
                 }
             )
         );
         services.AddSingleton<FactorySetBasedGuidFactory>();
         services.AddSingleton<FactoryPerRowSequenceFactory>();
         services.AddSingleton<FactoryOriginalValueEchoFactory>();
+        services.AddSingleton<ConvertedSetBasedErasureFactory>();
         services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<FactorySetBasedGuidFactory>());
         services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<FactoryPerRowSequenceFactory>());
         services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<FactoryOriginalValueEchoFactory>());
+        services.AddSingleton<IAnonymiseValueFactory>(
+            sp => sp.GetRequiredService<ConvertedSetBasedErasureFactory>()
+        );
         services.AddCohort<FactoryBackedErasureDbContext>();
 
         return services.BuildServiceProvider(validateScopes: true);
@@ -1341,6 +1429,8 @@ internal sealed class FactoryBackedErasureDbContext(
 {
     public DbSet<SetBasedFactoryErasureRecord> SetBasedFactoryErasureRecords => Set<SetBasedFactoryErasureRecord>();
     public DbSet<PerRowFactoryErasureRecord> PerRowFactoryErasureRecords => Set<PerRowFactoryErasureRecord>();
+    public DbSet<ConvertedSetBasedErasureRecord> ConvertedSetBasedErasureRecords =>
+        Set<ConvertedSetBasedErasureRecord>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -1364,6 +1454,23 @@ internal sealed class FactoryBackedErasureDbContext(
             entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
             entity.Property(record => record.ExternalId).HasColumnName("external_id");
             entity.Property(record => record.DisplayName).HasColumnName("display_name");
+            entity.Property(record => record.Notes).HasColumnName("notes");
+        });
+
+        modelBuilder.Entity<ConvertedSetBasedErasureRecord>(entity =>
+        {
+            entity.ToTable("converted_set_based_erasure_records");
+            entity.HasKey(record => record.Id);
+            entity.Property(record => record.TenantId).HasColumnName("tenant_id");
+            entity.Property(record => record.SubjectId).HasColumnName("subject_id");
+            entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+            entity
+                .Property(record => record.ExternalId)
+                .HasColumnName("external_id")
+                .HasConversion(
+                    value => value.ToUpperInvariant(),
+                    value => value.ToLowerInvariant()
+                );
             entity.Property(record => record.Notes).HasColumnName("notes");
         });
 
@@ -1408,6 +1515,23 @@ internal sealed class PerRowFactoryErasureRecord
     public string Notes { get; set; } = "";
 }
 
+[Retain("converted-set-based-erasure", nameof(ConvertedSetBasedErasureRecord.CreatedAt))]
+internal sealed class ConvertedSetBasedErasureRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+
+    [ErasureSubject]
+    public Guid? SubjectId { get; set; }
+
+    public DateTimeOffset CreatedAt { get; set; }
+
+    [AnonymiseWith(typeof(ConvertedSetBasedErasureFactory))]
+    public string ExternalId { get; set; } = "";
+
+    public string Notes { get; set; } = "";
+}
+
 internal sealed class FactorySetBasedGuidFactory : IAnonymiseValueFactory
 {
     public static readonly Guid ScrubbedValue = Guid.Parse("33333333-3333-3333-3333-333333333333");
@@ -1443,6 +1567,17 @@ internal sealed class FactoryOriginalValueEchoFactory : IAnonymiseValueFactory
     {
         Contexts.Add(context);
         return $"{context.OriginalValue}-scrubbed";
+    }
+}
+
+internal sealed class ConvertedSetBasedErasureFactory : IAnonymiseValueFactory
+{
+    public List<AnonymiseValueContext> Contexts { get; } = [];
+
+    public object? Create(AnonymiseValueContext context)
+    {
+        Contexts.Add(context);
+        return "set-based-erasure-scrubbed";
     }
 }
 

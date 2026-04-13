@@ -507,6 +507,34 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
+    public void Scan_Leaves_Tenant_Metadata_Null_But_Only_Records_Explicit_Tenantless_Intent_When_Marked()
+    {
+        var explicitOptions = new DbContextOptionsBuilder<ExplicitTenantlessSoftDeleteDbContext>()
+            .UseInMemoryDatabase($"registry-explicit-tenantless-{Guid.NewGuid()}")
+            .Options;
+        using var explicitDb = new ExplicitTenantlessSoftDeleteDbContext(explicitOptions);
+        var explicitEntry = new RetentionRegistry(
+            explicitDb,
+            new RetentionEntryBuilder(new CohortConventions())
+        ).Scan()[typeof(ExplicitTenantlessSoftDeleteRecord)];
+
+        explicitEntry.Tenant.Should().BeNull();
+        explicitEntry.IsExplicitlyTenantless.Should().BeTrue();
+
+        var missingOptions = new DbContextOptionsBuilder<MissingSoftDeleteTenantDbContext>()
+            .UseInMemoryDatabase($"registry-missing-tenant-{Guid.NewGuid()}")
+            .Options;
+        using var missingDb = new MissingSoftDeleteTenantDbContext(missingOptions);
+        var missingEntry = new RetentionRegistry(
+            missingDb,
+            new RetentionEntryBuilder(new CohortConventions())
+        ).Scan()[typeof(MissingSoftDeleteTenantRecord)];
+
+        missingEntry.Tenant.Should().BeNull();
+        missingEntry.IsExplicitlyTenantless.Should().BeFalse();
+    }
+
+    [Fact]
     public async Task ValidateAsync_Rejects_SoftDelete_Categories_Without_A_Public_Bool_IsDeleted_Property()
     {
         var options = new DbContextOptionsBuilder<InvalidSoftDeleteIsDeletedDbContext>()
@@ -563,7 +591,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
-    public async Task ValidateAsync_Allows_SoftDelete_Categories_Without_Tenant_Metadata()
+    public async Task ValidateAsync_Rejects_Retained_Entities_Without_Tenant_Metadata_Unless_Explicitly_Tenantless()
     {
         var options = new DbContextOptionsBuilder<MissingSoftDeleteTenantDbContext>()
             .UseInMemoryDatabase($"startup-validator-missing-soft-delete-tenant-{Guid.NewGuid()}")
@@ -573,6 +601,34 @@ public sealed class RetentionStartupValidatorTests
             new Dictionary<string, IRetentionRuleResolver>
             {
                 ["missing-soft-delete-tenant"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                ),
+            }
+        );
+
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Tenant convention on {typeof(MissingSoftDeleteTenantRecord).FullName}: retained entities must expose a public Guid or nullable Guid tenant property named 'TenantId' by convention, or mark the tenant property with [RetentionTenant], unless the entity is explicitly marked with [RetentionTenantless]."
+            );
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Allows_Explicitly_Tenantless_SoftDelete_Categories()
+    {
+        var options = new DbContextOptionsBuilder<ExplicitTenantlessSoftDeleteDbContext>()
+            .UseInMemoryDatabase($"startup-validator-explicit-tenantless-soft-delete-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new ExplicitTenantlessSoftDeleteDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["explicit-tenantless-soft-delete"] = new StaticRetentionRuleResolver(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                 ),
             }
@@ -754,16 +810,16 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
-    public async Task ValidateAsync_Allows_Anonymise_Categories_Without_Tenant_Metadata()
+    public async Task ValidateAsync_Allows_Explicitly_Tenantless_Anonymise_Categories()
     {
-        var options = new DbContextOptionsBuilder<MissingAnonymiseTenantDbContext>()
-            .UseInMemoryDatabase($"startup-validator-missing-anonymise-tenant-{Guid.NewGuid()}")
+        var options = new DbContextOptionsBuilder<ExplicitTenantlessAnonymiseDbContext>()
+            .UseInMemoryDatabase($"startup-validator-explicit-tenantless-anonymise-{Guid.NewGuid()}")
             .Options;
-        await using var db = new MissingAnonymiseTenantDbContext(options);
+        await using var db = new ExplicitTenantlessAnonymiseDbContext(options);
         var repository = new InMemoryCategoryRepository(
             new Dictionary<string, IRetentionRuleResolver>
             {
-                ["missing-anonymise-tenant"] = new StaticRetentionRuleResolver(
+                ["explicit-tenantless-anonymise"] = new StaticRetentionRuleResolver(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                 ),
             }
@@ -775,16 +831,18 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
-    public async Task ValidateAsync_Allows_Opaque_Deferred_SoftDelete_Categories_Without_Tenant_Metadata()
+    public async Task ValidateAsync_Allows_Opaque_Deferred_Explicitly_Tenantless_SoftDelete_Categories()
     {
-        var options = new DbContextOptionsBuilder<MissingSoftDeleteTenantDbContext>()
-            .UseInMemoryDatabase($"startup-validator-opaque-soft-delete-missing-tenant-{Guid.NewGuid()}")
+        var options = new DbContextOptionsBuilder<ExplicitTenantlessSoftDeleteDbContext>()
+            .UseInMemoryDatabase(
+                $"startup-validator-opaque-explicit-tenantless-soft-delete-{Guid.NewGuid()}"
+            )
             .Options;
-        await using var db = new MissingSoftDeleteTenantDbContext(options);
+        await using var db = new ExplicitTenantlessSoftDeleteDbContext(options);
         var repository = new InMemoryCategoryRepository(
             new Dictionary<string, IRetentionRuleResolver>
             {
-                ["missing-soft-delete-tenant"] = new OpaqueDeferredRuleResolver(
+                ["explicit-tenantless-soft-delete"] = new OpaqueDeferredRuleResolver(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                 ),
             }
@@ -1179,12 +1237,14 @@ public sealed class RetentionStartupValidatorTests
             {
                 entity.ToTable("aggregate_missing_category_records");
                 entity.HasKey(record => record.Id);
+                entity.Property(record => record.TenantId).HasColumnName("tenant_id");
                 entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
             });
             modelBuilder.Entity<ValidRetainedRecord>(entity =>
             {
                 entity.ToTable("aggregate_valid_records");
                 entity.HasKey(record => record.Id);
+                entity.Property(record => record.TenantId).HasColumnName("tenant_id");
                 entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
             });
         }
@@ -1200,6 +1260,7 @@ public sealed class RetentionStartupValidatorTests
             {
                 entity.ToTable("throwing_resolver_records");
                 entity.HasKey(record => record.Id);
+                entity.Property(record => record.TenantId).HasColumnName("tenant_id");
                 entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
             });
         }
@@ -1264,6 +1325,23 @@ public sealed class RetentionStartupValidatorTests
             modelBuilder.Entity<MissingSoftDeleteTenantRecord>(entity =>
             {
                 entity.ToTable("missing_soft_delete_tenant_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+                entity.Property(record => record.IsDeleted).HasColumnName("is_deleted");
+                entity.Property(record => record.DeletedAt).HasColumnName("deleted_at_utc");
+            });
+        }
+    }
+
+    private sealed class ExplicitTenantlessSoftDeleteDbContext(
+        DbContextOptions<ExplicitTenantlessSoftDeleteDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<ExplicitTenantlessSoftDeleteRecord>(entity =>
+            {
+                entity.ToTable("explicit_tenantless_soft_delete_records");
                 entity.HasKey(record => record.Id);
                 entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
                 entity.Property(record => record.IsDeleted).HasColumnName("is_deleted");
@@ -1355,6 +1433,22 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
+    private sealed class ExplicitTenantlessAnonymiseDbContext(
+        DbContextOptions<ExplicitTenantlessAnonymiseDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<ExplicitTenantlessAnonymiseRecord>(entity =>
+            {
+                entity.ToTable("explicit_tenantless_anonymise_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+                entity.Property(record => record.EmailAddress).HasColumnName("email_address");
+            });
+        }
+    }
+
     private sealed class InvalidNullReferenceAnonymiseDbContext(
         DbContextOptions<InvalidNullReferenceAnonymiseDbContext> options
     ) : DbContext(options)
@@ -1390,6 +1484,7 @@ public sealed class RetentionStartupValidatorTests
     private sealed class MissingCategoryRecord
     {
         public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
         public DateTimeOffset CreatedAt { get; init; }
     }
 
@@ -1397,6 +1492,7 @@ public sealed class RetentionStartupValidatorTests
     private sealed class ValidRetainedRecord
     {
         public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
         public DateTimeOffset CreatedAt { get; init; }
     }
 
@@ -1404,6 +1500,7 @@ public sealed class RetentionStartupValidatorTests
     private sealed class ThrowingResolverRecord
     {
         public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
         public DateTimeOffset CreatedAt { get; init; }
     }
 
@@ -1436,6 +1533,16 @@ public sealed class RetentionStartupValidatorTests
 
     [Retain("missing-soft-delete-tenant", nameof(MissingSoftDeleteTenantRecord.CreatedAt))]
     private sealed class MissingSoftDeleteTenantRecord
+    {
+        public Guid Id { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+        public bool IsDeleted { get; init; }
+        public DateTimeOffset? DeletedAt { get; init; }
+    }
+
+    [Retain("explicit-tenantless-soft-delete", nameof(ExplicitTenantlessSoftDeleteRecord.CreatedAt))]
+    [RetentionTenantless]
+    private sealed class ExplicitTenantlessSoftDeleteRecord
     {
         public Guid Id { get; init; }
         public DateTimeOffset CreatedAt { get; init; }
@@ -1500,6 +1607,17 @@ public sealed class RetentionStartupValidatorTests
 
     [Retain("missing-anonymise-tenant", nameof(MissingAnonymiseTenantRecord.CreatedAt))]
     private sealed class MissingAnonymiseTenantRecord
+    {
+        public Guid Id { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+
+        [Anonymise(AnonymiseMethod.Null)]
+        public string? EmailAddress { get; init; }
+    }
+
+    [Retain("explicit-tenantless-anonymise", nameof(ExplicitTenantlessAnonymiseRecord.CreatedAt))]
+    [RetentionTenantless]
+    private sealed class ExplicitTenantlessAnonymiseRecord
     {
         public Guid Id { get; init; }
         public DateTimeOffset CreatedAt { get; init; }

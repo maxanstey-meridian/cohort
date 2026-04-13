@@ -3,6 +3,7 @@ using Cohort.Domain;
 namespace Cohort.Sample.Entities;
 
 [Retain("tenantless-softdelete", nameof(CreatedAt))]
+[RetentionTenantless]
 public sealed class TenantlessSoftDelete
 {
     public Guid Id { get; set; }

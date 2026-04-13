@@ -449,6 +449,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
                 entity.ToTable("invalid_factory_type_startup_records");
                 entity.HasKey(record => record.Id);
                 entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+                entity.Property(record => record.TenantId).HasColumnName("tenant_id");
                 entity.Property(record => record.ExternalId).HasColumnName("external_id");
             });
         }
@@ -465,6 +466,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
                 entity.ToTable("unregistered_factory_startup_records");
                 entity.HasKey(record => record.Id);
                 entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+                entity.Property(record => record.TenantId).HasColumnName("tenant_id");
                 entity.Property(record => record.ExternalId).HasColumnName("external_id");
             });
         }
@@ -481,6 +483,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
                 entity.ToTable("registered_factory_startup_records");
                 entity.HasKey(record => record.Id);
                 entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+                entity.Property(record => record.TenantId).HasColumnName("tenant_id");
                 entity.Property(record => record.ExternalId).HasColumnName("external_id");
             });
         }
@@ -490,6 +493,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     private sealed class InvalidFactoryTypeStartupRecord
     {
         public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
         public DateTimeOffset CreatedAt { get; init; }
 
         [AnonymiseWith(typeof(NotAFactory))]
@@ -500,6 +504,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     private sealed class UnregisteredFactoryStartupRecord
     {
         public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
         public DateTimeOffset CreatedAt { get; init; }
 
         [AnonymiseWith(typeof(RegisteredFactory))]
@@ -510,6 +515,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     private sealed class RegisteredFactoryStartupRecord
     {
         public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
         public DateTimeOffset CreatedAt { get; init; }
 
         [AnonymiseWith(typeof(RegisteredFactory))]

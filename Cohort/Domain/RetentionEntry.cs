@@ -10,6 +10,7 @@ public sealed record RetentionEntry(
     IReadOnlyList<AnonymiseField> AnonymiseFields,
     TenantConvention? Tenant,
     SoftDeleteConvention? SoftDelete,
+    bool IsExplicitlyTenantless = false,
     AuditRowDetail AuditRowDetail = AuditRowDetail.Inherit
 );
 

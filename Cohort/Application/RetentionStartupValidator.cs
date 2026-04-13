@@ -70,6 +70,8 @@ public sealed class RetentionStartupValidator(
                 continue;
             }
 
+            ValidateTenantConvention(entry, errors);
+
             var resolver = await categoryRepository.GetAsync(entry.Category, ct);
             if (resolver is null)
             {
@@ -113,6 +115,18 @@ public sealed class RetentionStartupValidator(
         {
             throw new RetentionConfigurationException(errors);
         }
+    }
+
+    private void ValidateTenantConvention(RetentionEntry entry, List<string> errors)
+    {
+        if (entry.Tenant is not null || entry.IsExplicitlyTenantless)
+        {
+            return;
+        }
+
+        errors.Add(
+            $"Tenant convention on {entry.EntityType.FullName}: retained entities must expose a public Guid or nullable Guid tenant property named '{entryBuilder.ExpectedTenantPropertyName}' by convention, or mark the tenant property with [RetentionTenant], unless the entity is explicitly marked with [RetentionTenantless]."
+        );
     }
 
     private void ValidateFactoryBackedAnonymiseSupport(

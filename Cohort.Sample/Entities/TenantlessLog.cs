@@ -3,6 +3,7 @@ using Cohort.Domain;
 namespace Cohort.Sample.Entities;
 
 [Retain("tenantless-purge", nameof(CreatedAt))]
+[RetentionTenantless]
 public sealed class TenantlessLog
 {
     public Guid Id { get; set; }

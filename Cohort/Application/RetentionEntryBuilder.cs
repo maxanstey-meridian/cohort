@@ -19,6 +19,8 @@ public sealed class RetentionEntryBuilder(CohortConventions conventions)
     ];
     private static readonly Type[] AllowedTenantTypes = [typeof(Guid), typeof(Guid?)];
 
+    public string ExpectedTenantPropertyName => conventions.TenantPropertyName;
+
     public RetentionEntry? TryBuild(IEntityType entityType)
     {
         var clrType = entityType.ClrType;
@@ -77,6 +79,7 @@ public sealed class RetentionEntryBuilder(CohortConventions conventions)
             BuildAnonymiseFields(clrType, entityType, storeObject),
             BuildTenantConvention(entityType, storeObject),
             BuildSoftDeleteConvention(entityType, storeObject),
+            clrType.GetCustomAttribute<RetentionTenantlessAttribute>(inherit: false) is not null,
             retain.AuditRowDetail
         );
     }

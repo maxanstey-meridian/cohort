@@ -1071,10 +1071,15 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     result.SweepId,
                     row => row.State == PendingState && row.Attempt == 1 && row.LastError is not null
                 );
+                var failureAt = tracker.LoadLastFailure(noteId.ToString());
 
                 status.ClaimedAt.Should().BeNull();
                 status.CompletedAt.Should().BeNull();
-                status.NextAttemptAt.Should().BeAfter(asOf.AddMinutes(4));
+                failureAt.Should().NotBeNull();
+                status.NextAttemptAt.Should().BeCloseTo(
+                    failureAt!.Value.AddMinutes(5),
+                    TimeSpan.FromSeconds(15)
+                );
                 status.LastError.Should().Contain("Simulated permanent after-dispatch failure.");
             }
             finally
@@ -1084,6 +1089,80 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         });
 
         tracker.LoadAttempt(noteId.ToString()).Should().Be(1);
+    }
+
+    [Fact]
+    public async Task FlushAsync_Rebuilds_Full_AfterContext_From_Persisted_Row_Detail_Using_A_Fresh_Scope_Per_Dispatch()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var firstNoteId = Guid.NewGuid();
+        var secondNoteId = Guid.NewGuid();
+        var recorder = new AfterContextRecorder();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = firstNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "after-context-first",
+                },
+                new Note
+                {
+                    Id = secondNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "after-context-second",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxParallelism"] = "1",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(recorder);
+                services.AddScoped<ScopedDispatchProbe>();
+                services.AddRowHandler<Note, ContextCapturingNoteHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        var persistedRows = await LoadCapturedRowDetailsAsync(result.SweepId);
+        var observed = recorder.Load().OrderBy(call => call.EntityId, StringComparer.Ordinal).ToArray();
+
+        observed.Should().HaveCount(2);
+        observed.Select(call => call.ScopeInstanceId).Should().OnlyHaveUniqueItems();
+
+        foreach (var call in observed)
+        {
+            var persisted = persistedRows.Single(row => row.EntityId == call.EntityId);
+            call.SweepId.Should().Be(result.SweepId);
+            call.Category.Should().Be(persisted.Category);
+            call.Strategy.Should().Be(persisted.Strategy);
+            call.TenantId.Should().Be(persisted.TenantId);
+            call.At.Should().Be(persisted.At);
+            call.Attempt.Should().Be(1);
+            call.Body.Should().Be(persisted.Body);
+        }
     }
 
     [Fact]
@@ -1251,6 +1330,47 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         return rows;
     }
 
+    private async Task<IReadOnlyList<CapturedRowDetail>> LoadCapturedRowDetailsAsync(Guid sweepId)
+    {
+        await using var connection = new NpgsqlConnection(GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT
+                "EntityId",
+                "Category",
+                "Strategy",
+                "TenantId",
+                "At",
+                COALESCE("CapturedPayload", '')
+            FROM "sweep_run_row_detail"
+            WHERE "SweepId" = @sweepId
+            ORDER BY "Id"
+            """;
+        command.Parameters.AddWithValue("sweepId", sweepId);
+
+        var rows = new List<CapturedRowDetail>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            var payload = reader.GetString(5);
+            using var snapshot = JsonDocument.Parse(payload);
+            rows.Add(
+                new CapturedRowDetail(
+                    reader.GetString(0),
+                    reader.GetString(1),
+                    (Strategy)reader.GetInt32(2),
+                    reader.GetGuid(3),
+                    reader.GetFieldValue<DateTimeOffset>(4),
+                    snapshot.RootElement.GetProperty("body").GetString()!
+                )
+            );
+        }
+
+        return rows;
+    }
+
     private async Task<IReadOnlyList<HandlerStatusRow>> LoadHandlerStatusesAsync(Guid sweepId)
     {
         await using var connection = new NpgsqlConnection(GetConnectionString());
@@ -1386,6 +1506,15 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
     private sealed record CapturedRow(string EntityType, string EntityId, string CapturedPayload);
 
+    private sealed record CapturedRowDetail(
+        string EntityId,
+        string Category,
+        Strategy Strategy,
+        Guid TenantId,
+        DateTimeOffset At,
+        string Body
+    );
+
     private sealed record HandlerStatusRow(
         string HandlerType,
         int State,
@@ -1431,6 +1560,7 @@ file sealed class DispatchAttemptTracker
 {
     private readonly object gate = new();
     private readonly Dictionary<string, int> attempts = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DateTimeOffset> lastFailures = new(StringComparer.Ordinal);
 
     public int Increment(string entityId)
     {
@@ -1447,6 +1577,22 @@ file sealed class DispatchAttemptTracker
         lock (gate)
         {
             return attempts.TryGetValue(entityId, out var attempt) ? attempt : 0;
+        }
+    }
+
+    public void RecordFailure(string entityId, DateTimeOffset at)
+    {
+        lock (gate)
+        {
+            lastFailures[entityId] = at;
+        }
+    }
+
+    public DateTimeOffset? LoadLastFailure(string entityId)
+    {
+        lock (gate)
+        {
+            return lastFailures.TryGetValue(entityId, out var failureAt) ? failureAt : null;
         }
     }
 }
@@ -1521,6 +1667,45 @@ file sealed class StatusUpdateBlocker(string connectionString) : IAsyncDisposabl
     {
         await ReleaseAsync();
     }
+}
+
+file sealed class AfterContextRecorder
+{
+    private readonly object gate = new();
+    private readonly List<AfterContextCall> calls = [];
+
+    public void Record(AfterContextCall call)
+    {
+        lock (gate)
+        {
+            calls.Add(call);
+        }
+    }
+
+    public IReadOnlyList<AfterContextCall> Load()
+    {
+        lock (gate)
+        {
+            return calls.ToArray();
+        }
+    }
+}
+
+file sealed record AfterContextCall(
+    Guid SweepId,
+    string EntityId,
+    string Category,
+    Strategy Strategy,
+    Guid TenantId,
+    DateTimeOffset At,
+    int Attempt,
+    string Body,
+    Guid ScopeInstanceId
+);
+
+file sealed class ScopedDispatchProbe
+{
+    public Guid InstanceId { get; } = Guid.NewGuid();
 }
 
 [RowHandlerPriority(20)]
@@ -1727,6 +1912,37 @@ file sealed class DispatchRecordingNoteHandler(HandlerExecutionSink sink) : IRet
     }
 }
 
+file sealed class ContextCapturingNoteHandler(
+    AfterContextRecorder recorder,
+    ScopedDispatchProbe probe
+) : IRetentionHandler<Note>
+{
+    public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        ctx.Snapshot["body"] = row.Body;
+        return Task.CompletedTask;
+    }
+
+    public Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
+    {
+        recorder.Record(
+            new AfterContextCall(
+                ctx.SweepId,
+                ctx.EntityId,
+                ctx.Category,
+                ctx.Strategy,
+                ctx.TenantId,
+                ctx.At,
+                ctx.Attempt,
+                (string)ctx.Snapshot["body"]!,
+                probe.InstanceId
+            )
+        );
+
+        return Task.CompletedTask;
+    }
+}
+
 file sealed class RetryOnceDispatchNoteHandler(
     HandlerExecutionSink sink,
     DispatchAttemptTracker tracker
@@ -1765,6 +1981,7 @@ file sealed class AlwaysFailingDispatchNoteHandler(
     public Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
     {
         tracker.Increment(ctx.EntityId);
+        tracker.RecordFailure(ctx.EntityId, DateTimeOffset.UtcNow);
         throw new InvalidOperationException("Simulated permanent after-dispatch failure.");
     }
 }

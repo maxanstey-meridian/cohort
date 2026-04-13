@@ -261,7 +261,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     [Fact]
-    public async Task Shared_Test_Host_Registers_Row_Handler_Dispatcher_As_Both_Port_And_Hosted_Service()
+    public async Task Shared_Test_Host_Registers_Row_Handler_Dispatcher_As_Both_Port_And_Hosted_Service_Without_Row_Handlers()
     {
         await Host.RunWithServicesAsync(
             serviceProvider =>
@@ -270,8 +270,10 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
                 var hostedDispatcher = serviceProvider.GetServices<IHostedService>().Single(service =>
                     service is IRetentionRowDispatcher
                 );
+                var noteHandlers = serviceProvider.GetServices<IRetentionHandler<Note>>();
 
                 hostedDispatcher.Should().BeSameAs(dispatcher);
+                noteHandlers.Should().BeEmpty();
 
                 return Task.CompletedTask;
             }

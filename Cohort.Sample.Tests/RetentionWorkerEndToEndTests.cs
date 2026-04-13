@@ -351,6 +351,85 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         (await TableExistsAsync(database.ConnectionString, "notes")).Should().BeTrue();
     }
 
+    [Fact]
+    public async Task Migrated_Host_With_Zero_Row_Handlers_Starts_Cleanly_And_Keeps_The_Dispatcher_Registered()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await LegacyCohortSchema.BootstrapPreRowDispatchAsync(database.ConnectionString);
+
+        var tenant = CreateTenant();
+        var settings = CreateSettings(
+            database.ConnectionString,
+            schedule: null,
+            dryRun: false,
+            killSwitch: false,
+            applyMigrations: true
+        );
+        using var host = BuildHost(
+            settings,
+            tenant,
+            services =>
+            {
+                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+            }
+        );
+
+        await host.Host.StartAsync();
+        await WaitUntilAsync(
+            () => TableExistsAsync(database.ConnectionString, "sweep_row_handler_status"),
+            TimeSpan.FromSeconds(8)
+        );
+
+        using var scope = host.Host.Services.CreateScope();
+        var dispatcher = scope.ServiceProvider.GetRequiredService<IRetentionRowDispatcher>();
+        var hostedDispatcher = scope.ServiceProvider.GetServices<IHostedService>().Single(service =>
+            service is IRetentionRowDispatcher
+        );
+
+        hostedDispatcher.Should().BeSameAs(dispatcher);
+
+        await host.Host.StopAsync();
+    }
+
+    [Fact]
+    public async Task FlushAsync_Completes_Against_An_Empty_Migrated_Handler_Queue_And_Creates_No_Status_Rows()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await LegacyCohortSchema.BootstrapPreRowDispatchAsync(database.ConnectionString);
+
+        var tenant = CreateTenant();
+        var settings = CreateSettings(
+            database.ConnectionString,
+            schedule: null,
+            dryRun: false,
+            killSwitch: false,
+            applyMigrations: true
+        );
+        using var host = BuildHost(
+            settings,
+            tenant,
+            services =>
+            {
+                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+            }
+        );
+
+        await host.Host.StartAsync();
+        await WaitUntilAsync(
+            () => TableExistsAsync(database.ConnectionString, "sweep_row_handler_status"),
+            TimeSpan.FromSeconds(8)
+        );
+
+        using var scope = host.Host.Services.CreateScope();
+        var dispatcher = scope.ServiceProvider.GetRequiredService<IRetentionRowDispatcher>();
+
+        await dispatcher.FlushAsync();
+
+        (await CountRowsAsync(database.ConnectionString, "sweep_row_handler_status")).Should().Be(0);
+
+        await host.Host.StopAsync();
+    }
+
     private WorkerTestHost BuildHost(
         IReadOnlyDictionary<string, string?> settings,
         TenantContext tenant,
@@ -445,6 +524,17 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         command.Parameters.AddWithValue("tableName", tableName);
 
         return (bool)(await command.ExecuteScalarAsync())!;
+    }
+
+    private static async Task<long> CountRowsAsync(string connectionString, string tableName)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""SELECT COUNT(*) FROM "{tableName}" """;
+
+        return (long)(await command.ExecuteScalarAsync())!;
     }
 
     private static async Task WaitUntilAsync(Func<Task<bool>> predicate, TimeSpan timeout)

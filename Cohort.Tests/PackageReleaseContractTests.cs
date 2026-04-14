@@ -10,7 +10,6 @@ namespace Cohort.Tests;
 public sealed class PackageReleaseContractTests
 {
     private static readonly Lazy<PackedArtifact> Artifact = new(BuildPackedArtifact);
-    private static readonly Lazy<string> Changelog = new(BuildChangelog);
     private static readonly string GlobalPackagesFolder = GetGlobalPackagesFolder();
 
     [Fact]
@@ -20,35 +19,35 @@ public sealed class PackageReleaseContractTests
     }
 
     [Fact]
-    public void Changelog_Release_Notes_Cover_The_Current_Runtime_Surface()
+    public void Readme_Release_Notes_Cover_The_Current_Runtime_Surface()
     {
-        Changelog.Value.Should().Contain("Startup tenant enforcement is now fail-closed");
-        Changelog.Value.Should().Contain("effective retention cutoff");
-        Changelog.Value.Should().Contain("multiple `[ErasureSubject]` properties");
-        Changelog.Value.Should().Contain("RetentionRowDispatcher");
-        Changelog.Value.Should().Contain("sweep_run_entity_summary");
-        Changelog.Value.Should().Contain("RuleSource");
-        Changelog.Value.Should().Contain("RuleReason");
-        Changelog.Value.Should().Contain("Upgrade notes");
-        Changelog.Value.Should().Contain("refresh or regenerate and apply the Cohort migration");
-        Changelog.Value.Should().Contain("ApplyMigrations");
+        Artifact.Value.Readme.Should().Contain("Startup tenant enforcement is now fail-closed");
+        Artifact.Value.Readme.Should().Contain("effective retention cutoff");
+        Artifact.Value.Readme.Should().Contain("multiple `[ErasureSubject]` properties");
+        Artifact.Value.Readme.Should().Contain("RetentionRowDispatcher");
+        Artifact.Value.Readme.Should().Contain("sweep_run_entity_summary");
+        Artifact.Value.Readme.Should().Contain("RuleSource");
+        Artifact.Value.Readme.Should().Contain("RuleReason");
+        Artifact.Value.Readme.Should().Contain("Upgrade notes");
+        Artifact.Value.Readme.Should().Contain("regenerate and apply the Cohort migration");
+        Artifact.Value.Readme.Should().Contain("ApplyMigrations");
     }
 
     [Fact]
-    public void Changelog_Release_Checklist_Covers_Pack_And_Clean_Consumer_Restore()
+    public void Readme_Release_Checklist_Covers_Pack_And_Clean_Consumer_Restore()
     {
-        Changelog.Value.Should().Contain("dotnet pack Cohort/Cohort.csproj");
-        Changelog.Value.Should().Contain("Restore the packed version into a clean consumer.");
-        Changelog.Value.Should().Contain("AnonymiseWithAttribute");
-        Changelog.Value.Should().Contain("IRetentionSweepStrategy.PreviewEraseAsync(...)");
-        Changelog.Value.Should().Contain("ErasureSubjectPredicate");
-        Changelog.Value.Should().Contain("IRetentionRowDispatcher");
-        Changelog.Value.Should().Contain(
+        Artifact.Value.Readme.Should().Contain("dotnet pack Cohort/Cohort.csproj");
+        Artifact.Value.Readme.Should().Contain("Restore the packed version into a clean consumer.");
+        Artifact.Value.Readme.Should().Contain("AnonymiseWithAttribute");
+        Artifact.Value.Readme.Should().Contain("IRetentionSweepStrategy.PreviewEraseAsync(...)");
+        Artifact.Value.Readme.Should().Contain("ErasureSubjectPredicate");
+        Artifact.Value.Readme.Should().Contain("IRetentionRowDispatcher");
+        Artifact.Value.Readme.Should().Contain(
             "Refresh or regenerate your host migration against the `0.3.0` package"
         );
-        Changelog.Value.Should().Contain("confirm it adds `RuleSource` and `RuleReason`");
-        Changelog.Value.Should().Contain("`sweep_run_entity_summary`");
-        Changelog.Value.Should().Contain(
+        Artifact.Value.Readme.Should().Contain("confirm it adds `RuleSource` and `RuleReason`");
+        Artifact.Value.Readme.Should().Contain("`sweep_run_entity_summary`");
+        Artifact.Value.Readme.Should().Contain(
             "apply that migration before booting the new package version"
         );
     }
@@ -326,16 +325,6 @@ public sealed class PackageReleaseContractTests
                 Directory.Delete(outputDirectory, recursive: true);
             }
         }
-    }
-
-    private static string BuildChangelog()
-    {
-        var repoRoot = FindRepoRoot();
-        var changelogPath = Path.Combine(repoRoot, "CHANGELOG.md");
-
-        File.Exists(changelogPath).Should().BeTrue("slice 8 ships the release handover artifact in-repo");
-
-        return File.ReadAllText(changelogPath);
     }
 
     private static string RunDotnet(

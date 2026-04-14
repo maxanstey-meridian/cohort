@@ -26,8 +26,9 @@ public sealed class PackageReleaseContractTests
         Changelog.Value.Should().Contain("effective retention cutoff");
         Changelog.Value.Should().Contain("multiple `[ErasureSubject]` properties");
         Changelog.Value.Should().Contain("RetentionRowDispatcher");
-        Changelog.Value.Should().NotContain("Upgrade notes");
-        Changelog.Value.Should().NotContain("upgrading from `0.1.1`");
+        Changelog.Value.Should().Contain("Upgrade notes");
+        Changelog.Value.Should().Contain("regenerate and apply the Cohort migration");
+        Changelog.Value.Should().Contain("ApplyMigrations");
     }
 
     [Fact]
@@ -39,8 +40,12 @@ public sealed class PackageReleaseContractTests
         Changelog.Value.Should().Contain("IRetentionSweepStrategy.PreviewEraseAsync(...)");
         Changelog.Value.Should().Contain("ErasureSubjectPredicate");
         Changelog.Value.Should().Contain("IRetentionRowDispatcher");
-        Changelog.Value.Should().NotContain("Regenerate your host migration against the `0.2.0` package");
-        Changelog.Value.Should().NotContain("Apply that migration before booting the new package version");
+        Changelog.Value.Should().Contain(
+            "Regenerate your host migration against the `0.3.0` package"
+        );
+        Changelog.Value.Should().Contain(
+            "apply that migration before booting the new package version"
+        );
     }
 
     [Fact]
@@ -289,6 +294,8 @@ public sealed class PackageReleaseContractTests
             }
             readme.Should().Contain("multiple `[ErasureSubject]` properties");
             readme.Should().Contain("Any marked subject column equals the requested subject");
+            readme.Should().Contain("Existing hosts must regenerate and apply the Cohort migration");
+            readme.Should().Contain("ApplyMigrations");
 
             string nuspec;
             using (var reader = new StreamReader(nuspecEntry.Open()))

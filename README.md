@@ -199,6 +199,10 @@ Active holds still block erasure, and tenant-scoped entities still keep the tena
 | `KillSwitch` | `false` | Finish current iteration, skip all subsequent ticks. Hot-reloadable. |
 | `ApplyMigrations` | `false` | Run `MigrateAsync()` on startup. Cannot combine with `DryRun` or `KillSwitch`. |
 
+## Upgrade notes
+
+Existing hosts must regenerate and apply the Cohort migration before booting this package version unless they intentionally enable `Cohort:ApplyMigrations=true` during startup. The package ships the current model and migration helpers, but it does not apply schema changes by default.
+
 ## Legal holds
 
 ```csharp

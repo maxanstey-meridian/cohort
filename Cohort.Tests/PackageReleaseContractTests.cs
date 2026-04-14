@@ -19,37 +19,33 @@ public sealed class PackageReleaseContractTests
     }
 
     [Fact]
-    public void Readme_Release_Notes_Cover_The_Current_Runtime_Surface()
+    public void Readme_Explains_The_Product_Surface()
     {
-        Artifact.Value.Readme.Should().Contain("Startup tenant enforcement is now fail-closed");
-        Artifact.Value.Readme.Should().Contain("effective retention cutoff");
+        Artifact.Value.Readme.Should().Contain("Annotation-driven data retention");
+        Artifact.Value.Readme.Should().Contain("Postgres-only.");
+        Artifact.Value.Readme.Should().Contain("Annotations declare membership. Category rules declare policy.");
+        Artifact.Value.Readme.Should().Contain("ConfigureCohortTables()");
+        Artifact.Value.Readme.Should().Contain("AddCohort<MyDbContext>()");
+        Artifact.Value.Readme.Should().Contain("IRetentionPreview");
+        Artifact.Value.Readme.Should().Contain("RetentionSweepEngine");
+        Artifact.Value.Readme.Should().Contain("IRetentionErasureService");
         Artifact.Value.Readme.Should().Contain("multiple `[ErasureSubject]` properties");
-        Artifact.Value.Readme.Should().Contain("RetentionRowDispatcher");
         Artifact.Value.Readme.Should().Contain("sweep_run_entity_summary");
         Artifact.Value.Readme.Should().Contain("RuleSource");
         Artifact.Value.Readme.Should().Contain("RuleReason");
-        Artifact.Value.Readme.Should().Contain("Upgrade notes");
-        Artifact.Value.Readme.Should().Contain("regenerate and apply the Cohort migration");
-        Artifact.Value.Readme.Should().Contain("ApplyMigrations");
+        Artifact.Value.Readme.Should().Contain("RetentionRowDispatcher");
     }
 
     [Fact]
-    public void Readme_Release_Checklist_Covers_Pack_And_Clean_Consumer_Restore()
+    public void Readme_Covers_The_Useful_Greenfield_Paths()
     {
-        Artifact.Value.Readme.Should().Contain("dotnet pack Cohort/Cohort.csproj");
-        Artifact.Value.Readme.Should().Contain("Restore the packed version into a clean consumer.");
+        Artifact.Value.Readme.Should().Contain("old `SessionNote` rows are deleted");
+        Artifact.Value.Readme.Should().Contain("marked fields are scrubbed");
         Artifact.Value.Readme.Should().Contain("AnonymiseWithAttribute");
-        Artifact.Value.Readme.Should().Contain("IRetentionSweepStrategy.PreviewEraseAsync(...)");
         Artifact.Value.Readme.Should().Contain("ErasureSubjectPredicate");
         Artifact.Value.Readme.Should().Contain("IRetentionRowDispatcher");
-        Artifact.Value.Readme.Should().Contain(
-            "Refresh or regenerate your host migration against the `0.3.0` package"
-        );
-        Artifact.Value.Readme.Should().Contain("confirm it adds `RuleSource` and `RuleReason`");
-        Artifact.Value.Readme.Should().Contain("`sweep_run_entity_summary`");
-        Artifact.Value.Readme.Should().Contain(
-            "apply that migration before booting the new package version"
-        );
+        Artifact.Value.Readme.Should().Contain("RetentionHoldRequest");
+        Artifact.Value.Readme.Should().Contain("ApplyMigrations");
     }
 
     [Fact]
@@ -296,10 +292,11 @@ public sealed class PackageReleaseContractTests
             {
                 readme = reader.ReadToEnd();
             }
+            readme.Should().Contain("Annotation-driven data retention");
             readme.Should().Contain("multiple `[ErasureSubject]` properties");
             readme.Should().Contain("Any marked subject column equals the requested subject");
-            readme.Should().Contain("Existing hosts must regenerate and apply the Cohort migration");
             readme.Should().Contain("ApplyMigrations");
+            readme.Should().Contain("RetentionRowDispatcher");
 
             string nuspec;
             using (var reader = new StreamReader(nuspecEntry.Open()))

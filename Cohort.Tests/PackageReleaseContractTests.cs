@@ -26,8 +26,11 @@ public sealed class PackageReleaseContractTests
         Changelog.Value.Should().Contain("effective retention cutoff");
         Changelog.Value.Should().Contain("multiple `[ErasureSubject]` properties");
         Changelog.Value.Should().Contain("RetentionRowDispatcher");
+        Changelog.Value.Should().Contain("sweep_run_entity_summary");
+        Changelog.Value.Should().Contain("RuleSource");
+        Changelog.Value.Should().Contain("RuleReason");
         Changelog.Value.Should().Contain("Upgrade notes");
-        Changelog.Value.Should().Contain("regenerate and apply the Cohort migration");
+        Changelog.Value.Should().Contain("refresh or regenerate and apply the Cohort migration");
         Changelog.Value.Should().Contain("ApplyMigrations");
     }
 
@@ -41,8 +44,10 @@ public sealed class PackageReleaseContractTests
         Changelog.Value.Should().Contain("ErasureSubjectPredicate");
         Changelog.Value.Should().Contain("IRetentionRowDispatcher");
         Changelog.Value.Should().Contain(
-            "Regenerate your host migration against the `0.3.0` package"
+            "Refresh or regenerate your host migration against the `0.3.0` package"
         );
+        Changelog.Value.Should().Contain("confirm it adds `RuleSource` and `RuleReason`");
+        Changelog.Value.Should().Contain("`sweep_run_entity_summary`");
         Changelog.Value.Should().Contain(
             "apply that migration before booting the new package version"
         );

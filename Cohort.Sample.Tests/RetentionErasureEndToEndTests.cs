@@ -1594,6 +1594,8 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             providerValue.Should().Be("SET-BASED-ERASURE-SCRUBBED");
             factory.Contexts.Should().ContainSingle();
             factory.Contexts[0].OriginalValue.Should().BeNull();
+            factory.Contexts[0].TenantId.Should().Be(tenantId);
+            factory.Contexts[0].MemberName.Should().Be(nameof(ConvertedSetBasedErasureRecord.ExternalId));
         }
     }
 
@@ -2264,13 +2266,17 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
             setBasedFactory.Contexts.Should().ContainSingle();
             setBasedFactory.Contexts[0].OriginalValue.Should().BeNull();
+            setBasedFactory.Contexts[0].TenantId.Should().Be(tenantId);
+            setBasedFactory.Contexts[0].MemberName.Should().Be(nameof(SetBasedFactoryErasureRecord.ExternalId));
 
             originalFactory.Contexts.Should().HaveCount(2);
             originalFactory.Contexts.Select(context => context.OriginalValue).Should().BeEquivalentTo(new object?[] { "alpha", "beta" });
             originalFactory.Contexts.Should().OnlyContain(context => context.TenantId == tenantId);
+            originalFactory.Contexts.Should().OnlyContain(context => context.MemberName == nameof(PerRowFactoryErasureRecord.ExternalId));
 
             perRowFactory.Contexts.Should().HaveCount(2);
             perRowFactory.Contexts.Should().OnlyContain(context => context.OriginalValue == null);
+            perRowFactory.Contexts.Should().OnlyContain(context => context.MemberName == nameof(PerRowFactoryErasureRecord.DisplayName));
         }
     }
 

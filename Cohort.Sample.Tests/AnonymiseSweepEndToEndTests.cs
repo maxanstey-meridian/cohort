@@ -474,9 +474,11 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
             factory.Contexts.Should().HaveCount(2);
             factory.Contexts.Select(context => context.OriginalValue).Should().BeEquivalentTo(new object?[] { "alpha", "beta" });
             factory.Contexts.Should().OnlyContain(context => context.TenantId == tenantId);
+            factory.Contexts.Should().OnlyContain(context => context.MemberName == nameof(PerRowFactorySweepRecord.ExternalId));
 
             perRowFactory.Contexts.Should().HaveCount(2);
             perRowFactory.Contexts.Should().OnlyContain(context => context.OriginalValue == null);
+            perRowFactory.Contexts.Should().OnlyContain(context => context.MemberName == nameof(PerRowFactorySweepRecord.DisplayName));
         }
     }
 
@@ -531,6 +533,8 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
             providerValue.Should().Be("ALPHA-SCRUBBED");
             factory.Contexts.Should().ContainSingle();
             factory.Contexts[0].OriginalValue.Should().Be("alpha");
+            factory.Contexts[0].TenantId.Should().Be(tenantId);
+            factory.Contexts[0].MemberName.Should().Be(nameof(ConvertedOriginalValueRecord.ExternalId));
         }
     }
 
@@ -585,6 +589,8 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
             providerValue.Should().Be("SET-BASED-SCRUBBED");
             factory.Contexts.Should().ContainSingle();
             factory.Contexts[0].OriginalValue.Should().BeNull();
+            factory.Contexts[0].TenantId.Should().Be(tenantId);
+            factory.Contexts[0].MemberName.Should().Be(nameof(ConvertedSetBasedValueRecord.ExternalId));
         }
     }
 

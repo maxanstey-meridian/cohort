@@ -7,26 +7,32 @@ using Cohort.Application;
 using Cohort.Domain;
 
 using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Metadata;
 
 namespace Cohort.Infrastructure.Sweep;
 
-public sealed class AnonymiseSweepStrategy(
-    DbContext db,
-    IEnumerable<IAnonymiseValueFactory>? anonymiseValueFactories = null,
-    IServiceProvider? services = null
-) : IRetentionSweepStrategy
+public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
 {
     private static readonly MethodInfo ExecuteHandlerAwareSweepCoreMethod =
         typeof(AnonymiseSweepStrategy).GetMethod(
             nameof(ExecuteHandlerAwareSweepCoreAsync),
             BindingFlags.Instance | BindingFlags.NonPublic
         )!;
-    private readonly IReadOnlyDictionary<Type, IAnonymiseValueFactory> factories =
-        (anonymiseValueFactories ?? Array.Empty<IAnonymiseValueFactory>())
-        .GroupBy(factory => factory.GetType())
-        .ToDictionary(group => group.Key, group => group.Last());
-    private readonly DbContext modelDb = db ?? throw new ArgumentNullException(nameof(db));
+    private readonly AnonymiseAssignmentResolver assignmentResolver;
+    private readonly AnonymiseRowLoader rowLoader;
+    private readonly IServiceProvider? services;
+
+    public AnonymiseSweepStrategy(
+        DbContext db,
+        IEnumerable<IAnonymiseValueFactory>? anonymiseValueFactories = null,
+        IServiceProvider? services = null
+    )
+    {
+        ArgumentNullException.ThrowIfNull(db);
+
+        assignmentResolver = new AnonymiseAssignmentResolver(db, anonymiseValueFactories);
+        rowLoader = new AnonymiseRowLoader(db, assignmentResolver);
+        this.services = services;
+    }
 
     public Strategy HandlesStrategy => Strategy.Anonymise;
 
@@ -192,9 +198,8 @@ public sealed class AnonymiseSweepStrategy(
         ValidateEntry(entry, rule, operation);
         await EnsureConnectionOpenAsync(conn, ct);
 
-        var candidateRecordIds = await SelectCandidateRecordIdsAsync(
+        var candidateRecordIds = await rowLoader.SelectCandidateRecordIdsAsync(
             entry,
-            entry.Tenant?.TenantColumn,
             ctx.Tenant.Id,
             conn,
             transaction,
@@ -224,7 +229,7 @@ public sealed class AnonymiseSweepStrategy(
             );
         }
 
-        return RequiresPerRowExecution(entry)
+        return assignmentResolver.RequiresPerRowExecution(entry)
             ? await ExecutePerRowMutationAsync(
                 entry,
                 ctx.Tenant,
@@ -282,8 +287,7 @@ public sealed class AnonymiseSweepStrategy(
     )
         where TEntity : class
     {
-        var rows = await LoadHandlerRowsAsync<TEntity>(
-            modelDb,
+        var rows = await rowLoader.LoadHandlerRowsAsync<TEntity>(
             entry,
             ctx.Tenant,
             ctx.Now,
@@ -296,7 +300,7 @@ public sealed class AnonymiseSweepStrategy(
             ?? throw new InvalidOperationException(
                 $"Retention entry for {entry.EntityType.FullName} references missing record-id member '{entry.RecordId.RecordIdMember}'."
             );
-        var staticAssignments = CreateStaticAssignments(entry, ctx.Tenant.Id, ctx.Now);
+        var staticAssignments = assignmentResolver.CreateStaticAssignments(entry, ctx.Tenant.Id, ctx.Now);
         var affectedRecordIds = new List<string>();
         var heldCount = candidateRecordIds.Count - rows.Count;
         var skippedCount = 0;
@@ -344,7 +348,7 @@ public sealed class AnonymiseSweepStrategy(
                 continue;
             }
 
-            var originalValues = CreateOriginalValuesFromEntity(entry, row);
+            var originalValues = assignmentResolver.CreateOriginalValuesFromEntity(entry, row);
             if (
                 !await ExecuteCapturedRowUpdateAsync(
                     entry,
@@ -398,7 +402,7 @@ public sealed class AnonymiseSweepStrategy(
         CancellationToken ct
     )
     {
-        var updatableRows = await LoadUpdatableRowsAsync(
+        var updatableRows = await rowLoader.LoadUpdatableRowsAsync(
             entry,
             tenant,
             now,
@@ -439,7 +443,7 @@ public sealed class AnonymiseSweepStrategy(
         CancellationToken ct
     )
     {
-        var staticAssignments = CreateStaticAssignments(entry, tenant.Id, now);
+        var staticAssignments = assignmentResolver.CreateStaticAssignments(entry, tenant.Id, now);
         var affectedRecordIds = new List<string>(rows.Count);
 
         foreach (var row in rows)
@@ -447,7 +451,16 @@ public sealed class AnonymiseSweepStrategy(
             await using var command = conn.CreateCommand();
             command.Transaction = transaction;
             command.CommandText = AnonymiseSqlBuilder.BuildPerRowCommandText(entry, filter);
-            AddPerRowAssignmentParameters(command, entry, tenant, now, row.OriginalValues, staticAssignments);
+            AddPerRowAssignmentParameters(
+                command,
+                assignmentResolver.CreatePerRowAssignmentValues(
+                    entry,
+                    tenant,
+                    now,
+                    row.OriginalValues,
+                    staticAssignments
+                )
+            );
             command.Parameters.Add(AnonymiseDbParameterFactory.Create(command, "recordId", row.RecordId));
             AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
             AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
@@ -479,7 +492,16 @@ public sealed class AnonymiseSweepStrategy(
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = AnonymiseSqlBuilder.BuildPerRowCommandText(entry, filter);
-        AddPerRowAssignmentParameters(command, entry, tenant, now, originalValues, staticAssignments);
+        AddPerRowAssignmentParameters(
+            command,
+            assignmentResolver.CreatePerRowAssignmentValues(
+                entry,
+                tenant,
+                now,
+                originalValues,
+                staticAssignments
+            )
+        );
         command.Parameters.Add(AnonymiseDbParameterFactory.Create(command, "recordId", recordId));
         AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
         AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
@@ -487,196 +509,6 @@ public sealed class AnonymiseSweepStrategy(
 
         await using var reader = await command.ExecuteReaderAsync(ct);
         return await reader.ReadAsync(ct);
-    }
-
-    private async Task<IReadOnlyList<AnonymiseRowSnapshot>> LoadUpdatableRowsAsync(
-        RetentionEntry entry,
-        TenantContext tenant,
-        DateTimeOffset now,
-        DbConnection conn,
-        DbTransaction transaction,
-        IReadOnlyList<string> candidateRecordIds,
-        CancellationToken ct
-    )
-    {
-        var originalValueFields = entry.AnonymiseFields
-            .OfType<AnonymiseFactoryField>()
-            .Where(field => ResolveFactory(field).RequiresOriginalValue)
-            .ToArray();
-
-        await using var command = conn.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = AnonymiseSqlBuilder.BuildLoadUpdatableRowsCommandText(entry, originalValueFields);
-        AnonymiseDbParameterFactory.AddCandidateIdsParameter(command, candidateRecordIds);
-        AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
-        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName, now);
-
-        var rows = new List<AnonymiseRowSnapshot>();
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
-        {
-            var originalValues = new Dictionary<string, object?>(StringComparer.Ordinal);
-            for (var index = 0; index < originalValueFields.Length; index++)
-            {
-                var providerValue = reader.IsDBNull(index + 1) ? null : reader.GetValue(index + 1);
-                originalValues[originalValueFields[index].MemberName] = ConvertOriginalValueFromProvider(
-                    entry,
-                    originalValueFields[index],
-                    providerValue
-                );
-            }
-
-            rows.Add(new AnonymiseRowSnapshot(reader.GetString(0), originalValues));
-        }
-
-        return rows;
-    }
-
-    private async Task<List<TEntity>> LoadHandlerRowsAsync<TEntity>(
-        DbContext db,
-        RetentionEntry entry,
-        TenantContext tenant,
-        DateTimeOffset now,
-        DbConnection conn,
-        IReadOnlyList<string> candidateRecordIds,
-        CancellationToken ct
-    )
-        where TEntity : class
-    {
-        var sql = AnonymiseSqlBuilder.BuildLoadHandlerRowsCommandText(entry);
-        var parameters = new List<object>
-        {
-            AnonymiseDbParameterFactory.CreateProviderParameter(conn, "candidateIds", candidateRecordIds.ToArray()),
-            AnonymiseDbParameterFactory.CreateProviderParameter(conn, "holdTableName", entry.TableName),
-            AnonymiseDbParameterFactory.CreateProviderParameter(conn, "holdAsOf", now),
-        };
-        if (entry.Tenant is not null)
-        {
-            parameters.Add(AnonymiseDbParameterFactory.CreateProviderParameter(conn, "tenantId", tenant.Id));
-        }
-
-        return await db.Set<TEntity>().FromSqlRaw(sql, parameters.ToArray()).AsNoTracking().ToListAsync(ct);
-    }
-
-    private IReadOnlyDictionary<string, object?> CreateOriginalValuesFromEntity<TEntity>(
-        RetentionEntry entry,
-        TEntity row
-    )
-        where TEntity : class
-    {
-        var originalValues = new Dictionary<string, object?>(StringComparer.Ordinal);
-        foreach (
-            var field in entry.AnonymiseFields
-                .OfType<AnonymiseFactoryField>()
-                .Where(candidate => ResolveFactory(candidate).RequiresOriginalValue)
-        )
-        {
-            var property =
-                entry.EntityType.GetProperty(field.MemberName)
-                ?? throw new InvalidOperationException(
-                    $"Property '{field.MemberName}' on {entry.EntityType.FullName} is not mapped by the current EF model."
-                );
-            originalValues[field.MemberName] = property.GetValue(row);
-        }
-
-        return originalValues;
-    }
-
-    private Dictionary<string, object?> CreateStaticAssignments(
-        RetentionEntry entry,
-        Guid tenantId,
-        DateTimeOffset now
-    )
-    {
-        var values = new Dictionary<string, object?>(StringComparer.Ordinal);
-        foreach (var field in entry.AnonymiseFields)
-        {
-            values[field.MemberName] = field switch
-            {
-                AnonymiseLiteralField literalField => CreateLiteralAssignmentValue(literalField),
-                AnonymiseFactoryField factoryField when !ResolveFactory(factoryField).RequiresPerRowExecution
-                    => ResolveFactory(factoryField)
-                        .Create(
-                            new AnonymiseValueContext(
-                                entry.EntityType,
-                                factoryField.MemberName,
-                                null,
-                                now,
-                                tenantId
-                            )
-                        ),
-                AnonymiseFactoryField => null,
-                _ => throw new InvalidOperationException(
-                    $"Anonymise field '{field.MemberName}' is not supported."
-                ),
-            };
-        }
-
-        return values;
-    }
-
-    private bool RequiresPerRowExecution(RetentionEntry entry)
-    {
-        return entry.AnonymiseFields
-            .OfType<AnonymiseFactoryField>()
-            .Any(field => ResolveFactory(field).RequiresPerRowExecution);
-    }
-
-    private IAnonymiseValueFactory ResolveFactory(AnonymiseFactoryField field)
-    {
-        if (!factories.TryGetValue(field.FactoryType, out var factory))
-        {
-            throw new InvalidOperationException(
-                $"Anonymise field '{field.MemberName}' requires factory type {field.FactoryType.FullName}, but no matching {nameof(IAnonymiseValueFactory)} is registered."
-            );
-        }
-
-        return factory;
-    }
-
-    private object? ConvertOriginalValueFromProvider(
-        RetentionEntry entry,
-        AnonymiseFactoryField field,
-        object? providerValue
-    )
-    {
-        if (providerValue is null)
-        {
-            return providerValue;
-        }
-
-        var property = ResolveEfProperty(entry, field.MemberName);
-        var converter = property.GetTypeMapping().Converter;
-        return converter?.ConvertFromProvider(providerValue) ?? providerValue;
-    }
-
-    private object? ConvertAssignmentValueToProvider(
-        RetentionEntry entry,
-        AnonymiseField field,
-        object? value
-    )
-    {
-        if (value is null or DBNull)
-        {
-            return value is DBNull ? null : value;
-        }
-
-        var property = ResolveEfProperty(entry, field.MemberName);
-        var converter = property.GetTypeMapping().Converter;
-        return converter?.ConvertToProvider(value) ?? value;
-    }
-
-    private IProperty ResolveEfProperty(RetentionEntry entry, string memberName)
-    {
-        var entityType =
-            modelDb.Model.FindEntityType(entry.EntityType)
-            ?? throw new InvalidOperationException(
-                $"Entity {entry.EntityType.FullName} is not mapped by the current EF model."
-            );
-        return entityType.FindProperty(memberName)
-            ?? throw new InvalidOperationException(
-                $"Property '{memberName}' on {entry.EntityType.FullName} is not mapped by the current EF model."
-            );
     }
 
     private async Task<List<string>> ReadAffectedRecordIdsAsync(
@@ -708,7 +540,10 @@ public sealed class AnonymiseSweepStrategy(
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = AnonymiseSqlBuilder.BuildSetBasedCommandText(entry, filter);
-        AddSetBasedAssignmentParameters(command, entry, tenant.Id, now);
+        AddSetBasedAssignmentParameters(
+            command,
+            assignmentResolver.CreateSetBasedAssignmentValues(entry, tenant.Id, now)
+        );
         AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
         AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
         AnonymiseDbParameterFactory.AddCandidateIdsParameter(command, candidateRecordIds);
@@ -721,137 +556,30 @@ public sealed class AnonymiseSweepStrategy(
         );
     }
 
-    private void AddSetBasedAssignmentParameters(
+    private static void AddSetBasedAssignmentParameters(
         DbCommand command,
-        RetentionEntry entry,
-        Guid tenantId,
-        DateTimeOffset now
+        IReadOnlyList<object?> assignmentValues
     )
     {
-        var staticAssignments = CreateStaticAssignments(entry, tenantId, now);
-
-        for (var index = 0; index < entry.AnonymiseFields.Count; index++)
+        for (var index = 0; index < assignmentValues.Count; index++)
         {
-            var field = entry.AnonymiseFields[index];
             command.Parameters.Add(
-                AnonymiseDbParameterFactory.Create(
-                    command,
-                    $"value{index}",
-                    ConvertAssignmentValueToProvider(
-                        entry,
-                        field,
-                        staticAssignments[field.MemberName]
-                    )
-                )
+                AnonymiseDbParameterFactory.Create(command, $"value{index}", assignmentValues[index])
             );
         }
     }
 
-    private void AddPerRowAssignmentParameters(
+    private static void AddPerRowAssignmentParameters(
         DbCommand command,
-        RetentionEntry entry,
-        TenantContext tenant,
-        DateTimeOffset now,
-        IReadOnlyDictionary<string, object?> originalValues,
-        IReadOnlyDictionary<string, object?> staticAssignments
+        IReadOnlyList<object?> assignmentValues
     )
     {
-        for (var index = 0; index < entry.AnonymiseFields.Count; index++)
+        for (var index = 0; index < assignmentValues.Count; index++)
         {
-            var field = entry.AnonymiseFields[index];
             command.Parameters.Add(
-                AnonymiseDbParameterFactory.Create(
-                    command,
-                    $"value{index}",
-                    ConvertAssignmentValueToProvider(
-                        entry,
-                        field,
-                        ResolvePerRowAssignmentValue(
-                            entry,
-                            field,
-                            tenant,
-                            now,
-                            originalValues,
-                            staticAssignments
-                        )
-                    )
-                )
+                AnonymiseDbParameterFactory.Create(command, $"value{index}", assignmentValues[index])
             );
         }
-    }
-
-    private object? ResolvePerRowAssignmentValue(
-        RetentionEntry entry,
-        AnonymiseField field,
-        TenantContext tenant,
-        DateTimeOffset now,
-        IReadOnlyDictionary<string, object?> originalValues,
-        IReadOnlyDictionary<string, object?> staticAssignments
-    )
-    {
-        return field switch
-        {
-            AnonymiseLiteralField literalField => CreateLiteralAssignmentValue(literalField),
-            AnonymiseFactoryField factoryField when ResolveFactory(factoryField).RequiresPerRowExecution
-                => ResolveFactory(factoryField)
-                    .Create(
-                        new AnonymiseValueContext(
-                            entry.EntityType,
-                            factoryField.MemberName,
-                            originalValues.TryGetValue(factoryField.MemberName, out var originalValue)
-                                ? originalValue
-                                : null,
-                            now,
-                            tenant.Id
-                        )
-                    ),
-            AnonymiseFactoryField factoryField => staticAssignments[factoryField.MemberName],
-            _ => throw new InvalidOperationException(
-                $"Anonymise field '{field.MemberName}' is not supported."
-            ),
-        };
-    }
-
-    private static async Task<IReadOnlyList<string>> SelectCandidateRecordIdsAsync(
-        RetentionEntry entry,
-        string? tenantColumn,
-        Guid tenantId,
-        DbConnection conn,
-        DbTransaction transaction,
-        SqlFilter filter,
-        CancellationToken ct
-    )
-    {
-        await using var command = conn.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = AnonymiseSqlBuilder.BuildCandidateSelectionCommandText(entry, filter);
-        AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
-        AnonymiseDbParameterFactory.AddTenantParameter(command, tenantColumn, tenantId);
-
-        var candidateRecordIds = new List<string>();
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
-        {
-            candidateRecordIds.Add(reader.GetValue(0).ToString()!);
-        }
-
-        return candidateRecordIds;
-    }
-
-    private static object CreateLiteralAssignmentValue(AnonymiseLiteralField literalField)
-    {
-        return literalField.Method switch
-        {
-            AnonymiseMethod.Null => DBNull.Value,
-            AnonymiseMethod.EmptyString => string.Empty,
-            AnonymiseMethod.FixedLiteral => literalField.Literal
-                ?? throw new InvalidOperationException(
-                    $"Anonymise field '{literalField.MemberName}' requires a literal value."
-                ),
-            _ => throw new InvalidOperationException(
-                $"Anonymise method '{literalField.Method}' is not supported."
-            ),
-        };
     }
 
     private static void ValidateEntry(
@@ -882,9 +610,4 @@ public sealed class AnonymiseSweepStrategy(
             await conn.OpenAsync(ct);
         }
     }
-
-    private sealed record AnonymiseRowSnapshot(
-        string RecordId,
-        IReadOnlyDictionary<string, object?> OriginalValues
-    );
 }

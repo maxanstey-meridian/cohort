@@ -1117,6 +1117,9 @@ public sealed class AnonymiseSweepStrategyCommandTests
         affected.HeldCount.Should().Be(1);
         connection.Commands.Should().HaveCount(2);
         connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
+        connection.Commands[0].CommandText.Should().Contain(
+            "ORDER BY target.\"CreatedAt\" ASC, CAST(target.\"Id\" AS text) ASC"
+        );
         GetParameterNames(connection.Commands[0]).Should().Equal("cutoff", "tenantId");
         connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
         GetParameterNames(connection.Commands[1]).Should().Equal(
@@ -1313,6 +1316,9 @@ public sealed class AnonymiseSweepStrategyCommandTests
         connection.Commands[0].CommandText.Should().Contain("\"SubjectId\" = @subjectValue0");
         connection.Commands[0].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
         connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
+        connection.Commands[0].CommandText.Should().Contain(
+            "ORDER BY target.\"CreatedAt\" ASC, CAST(target.\"Id\" AS text) ASC"
+        );
         GetParameterNames(connection.Commands[0]).Should().Equal(
             "subjectValue0",
             "cutoff",
@@ -1642,6 +1648,9 @@ public sealed class AnonymiseSweepStrategyCommandTests
         );
         connection.Commands[0].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
         connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
+        connection.Commands[0].CommandText.Should().Contain(
+            "ORDER BY target.\"CreatedAt\" ASC, CAST(target.\"Id\" AS text) ASC"
+        );
         GetParameterNames(connection.Commands[0]).Should().Equal(
             "subjectValue0",
             "subjectValue1",

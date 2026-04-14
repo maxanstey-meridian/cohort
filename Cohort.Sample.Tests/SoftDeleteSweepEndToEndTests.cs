@@ -415,6 +415,9 @@ public sealed class SoftDeleteSweepStrategyCommandTests
         affected.HeldCount.Should().Be(1);
         connection.Commands.Should().HaveCount(2);
         connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
+        connection.Commands[0].CommandText.Should().Contain(
+            "ORDER BY target.\"CreatedAt\" ASC, CAST(target.\"Id\" AS text) ASC"
+        );
         connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
         connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
             new[] { selectedId.ToString(), heldId.ToString() }
@@ -520,6 +523,9 @@ public sealed class SoftDeleteSweepStrategyCommandTests
         connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
         connection.Commands[0].CommandText.Should().Contain("\"SubjectId\" = @subjectValue0");
         connection.Commands[0].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
+        connection.Commands[0].CommandText.Should().Contain(
+            "ORDER BY target.\"CreatedAt\" ASC, CAST(target.\"Id\" AS text) ASC"
+        );
         connection.Commands[0].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[1].CommandText.Should().Contain("\"SubjectId\" = @subjectValue0");
         connection.Commands[1].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
@@ -654,6 +660,9 @@ public sealed class SoftDeleteSweepStrategyCommandTests
         );
         connection.Commands[0].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
         connection.Commands[0].CommandText.Should().Contain("\"IsDeleted\" = FALSE");
+        connection.Commands[0].CommandText.Should().Contain(
+            "ORDER BY target.\"CreatedAt\" ASC, CAST(target.\"Id\" AS text) ASC"
+        );
         connection.Commands[0].Parameters["tenantId"].Value.Should().Be(tenantId);
         connection.Commands[0].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[1].CommandText.Should().Contain(

@@ -356,7 +356,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
               {tenantClause}
               AND target.{QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
               AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn, entry.Tenant?.TenantColumn)}
-            ORDER BY CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text)
+            ORDER BY target.{QuoteIdentifier(entry.AnchorColumn)} ASC, CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) ASC
             """;
         var parameters = new List<object>
         {
@@ -713,6 +713,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {tenantClause}
               AND target.{QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
+            ORDER BY target.{QuoteIdentifier(entry.AnchorColumn)} ASC, CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) ASC
             FOR UPDATE
             """;
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
@@ -758,6 +759,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
               AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {tenantClause}
               AND target.{QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
+            ORDER BY target.{QuoteIdentifier(entry.AnchorColumn)} ASC, CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) ASC
             FOR UPDATE
             """;
         if (tenantColumn is not null)

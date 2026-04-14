@@ -33,11 +33,7 @@ public sealed class RetentionSweepEngine(
         var executionPlan = new List<(RetentionEntry Entry, RetentionResolutionContext Context, RetentionRule Rule)>();
         var auditEvents = new List<SweepEvent>();
 
-        foreach (
-            var entry in registry
-                .Scan()
-                .Values.OrderBy(entry => entry.EntityType.FullName, StringComparer.Ordinal)
-        )
+        foreach (var entry in registry.Scan().Values)
         {
             var resolver = await categoryRepository.GetAsync(entry.Category, ct);
             if (resolver is null)
@@ -85,7 +81,13 @@ public sealed class RetentionSweepEngine(
                 ct
             );
 
-            foreach (var (entry, context, rule) in executionPlan)
+            foreach (
+                var (entry, context, rule) in RetentionExecutionPlanOrderer.Order(
+                    db,
+                    executionPlan,
+                    item => item.Entry
+                )
+            )
             {
                 var eventAt = DateTimeOffset.UtcNow;
                 var resolvedPeriod = CutoffCalculator.ResolveEffectivePeriod(rule.Period, rule.LegalMin);

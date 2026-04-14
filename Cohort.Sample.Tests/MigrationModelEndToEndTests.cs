@@ -65,6 +65,7 @@ public sealed class MigrationModelEndToEndTests(PostgresFixture fixture)
         handlerStatusEntity.FindProperty("Id")!.ValueGenerated.Should().Be(ValueGenerated.OnAdd);
         handlerStatusEntity.FindProperty("SweepRunRowDetailId")!.IsNullable.Should().BeFalse();
         handlerStatusEntity.FindProperty("HandlerType")!.IsNullable.Should().BeFalse();
+        handlerStatusEntity.FindProperty("DispatchPhase")!.IsNullable.Should().BeFalse();
         handlerStatusEntity.FindProperty("State")!.IsNullable.Should().BeFalse();
         handlerStatusEntity.FindProperty("Attempt")!.IsNullable.Should().BeFalse();
         handlerStatusEntity.FindProperty("QueuedAt")!.IsNullable.Should().BeFalse();

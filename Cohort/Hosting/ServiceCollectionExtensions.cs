@@ -55,12 +55,21 @@ public static class ServiceCollectionExtensions
         return services;
     }
 
-    public static IServiceCollection AddRowHandler<TEntity, THandler>(this IServiceCollection services)
+    public static IServiceCollection AddRowHandler<TEntity, THandler>(
+        this IServiceCollection services,
+        RowHandlerDispatchPhase dispatchPhase = RowHandlerDispatchPhase.Immediate
+    )
         where THandler : class, IRetentionHandler<TEntity>
     {
         ArgumentNullException.ThrowIfNull(services);
 
         services.TryAddEnumerable(ServiceDescriptor.Scoped<IRetentionHandler<TEntity>, THandler>());
+        services.TryAddEnumerable(
+            ServiceDescriptor.Singleton(
+                typeof(IRetentionHandlerRegistration),
+                new RetentionHandlerRegistration(typeof(TEntity), typeof(THandler), dispatchPhase)
+            )
+        );
 
         return services;
     }

@@ -177,6 +177,7 @@ public static class CohortModelBuilder
         builder.Property(status => status.Id).ValueGeneratedOnAdd();
         builder.Property(status => status.SweepRunRowDetailId).IsRequired();
         builder.Property(status => status.HandlerType).IsRequired();
+        builder.Property(status => status.DispatchPhase).IsRequired();
         builder.Property(status => status.State).IsRequired();
         builder.Property(status => status.Attempt).IsRequired();
         builder.Property(status => status.QueuedAt).IsRequired();

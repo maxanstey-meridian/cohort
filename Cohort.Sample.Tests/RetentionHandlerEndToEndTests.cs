@@ -101,6 +101,170 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Scheduled_Sweep_Default_Row_Handler_Persists_Immediate_Dispatch_Phase()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var sink = new HandlerExecutionSink();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "immediate-phase",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
+            {
+                services.AddSingleton(sink);
+                services.AddRowHandler<Note, DispatchRecordingNoteHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().ContainSingle();
+        statuses[0].DispatchPhase.Should().Be((int)RowHandlerDispatchPhase.Immediate);
+    }
+
+    [Fact]
+    public async Task FlushAsync_Deferred_Row_Handler_Waits_For_Sweep_Completion_But_Immediate_Does_Not()
+    {
+        var immediateTenantId = Guid.NewGuid();
+        var deferredTenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var immediateNoteId = Guid.NewGuid();
+        var deferredNoteId = Guid.NewGuid();
+        var recorder = new HandlerExecutionSink();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = immediateNoteId,
+                    TenantId = immediateTenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "immediate-gate",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var immediateHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:PollInterval"] = "1.00:00:00",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(recorder);
+                services.AddRowHandler<Note, DispatchRecordingNoteHandler>();
+            }
+        );
+
+        var immediateResult = await immediateHost.RunSweepAsync(
+            new TenantContext(immediateTenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        await SetSweepCompletedAtAsync(immediateResult.SweepId, null);
+        await immediateHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        recorder.AfterCalls.Should().ContainSingle(call => call == "after:immediate-gate:1");
+
+        var immediateStatuses = await LoadHandlerStatusesAsync(immediateResult.SweepId);
+        immediateStatuses.Should().ContainSingle();
+        immediateStatuses[0].DispatchPhase.Should().Be((int)RowHandlerDispatchPhase.Immediate);
+        immediateStatuses[0].CompletedAt.Should().NotBeNull();
+
+        recorder.AfterCalls.Clear();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = deferredNoteId,
+                    TenantId = deferredTenantId,
+                    CreatedAt = asOf.AddDays(-121),
+                    Body = "deferred-gate",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var deferredHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:PollInterval"] = "1.00:00:00",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(recorder);
+                services.AddRowHandler<Note, DispatchRecordingNoteHandler>(
+                    RowHandlerDispatchPhase.AfterSweepSettled
+                );
+            }
+        );
+
+        var deferredResult = await deferredHost.RunSweepAsync(
+            new TenantContext(deferredTenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        await SetSweepCompletedAtAsync(deferredResult.SweepId, null);
+        await deferredHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        recorder.AfterCalls.Should().BeEmpty();
+
+        var pendingStatuses = await LoadHandlerStatusesAsync(deferredResult.SweepId);
+        pendingStatuses.Should().ContainSingle();
+        pendingStatuses[0].DispatchPhase.Should().Be((int)RowHandlerDispatchPhase.AfterSweepSettled);
+        pendingStatuses[0].Attempt.Should().Be(0);
+        pendingStatuses[0].ClaimedAt.Should().BeNull();
+        pendingStatuses[0].CompletedAt.Should().BeNull();
+
+        await SetSweepCompletedAtAsync(deferredResult.SweepId, deferredResult.CompletedAt);
+        await deferredHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        recorder.AfterCalls.Should().ContainSingle(call => call == "after:deferred-gate:1");
+
+        var completedStatuses = await LoadHandlerStatusesAsync(deferredResult.SweepId);
+        completedStatuses.Should().ContainSingle();
+        completedStatuses[0].CompletedAt.Should().NotBeNull();
+        completedStatuses[0].Attempt.Should().Be(1);
+    }
+
+    [Fact]
     public async Task Scheduled_Sweep_Flows_OnBefore_Snapshot_Into_OnAfter_With_The_Persisted_Metadata()
     {
         var tenantId = Guid.NewGuid();
@@ -2667,6 +2831,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             """
             SELECT
                 status."HandlerType",
+                status."DispatchPhase",
                 status."State",
                 status."Attempt",
                 status."NextAttemptAt",
@@ -2689,10 +2854,11 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     reader.GetString(0),
                     reader.GetInt32(1),
                     reader.GetInt32(2),
-                    reader.GetFieldValue<DateTimeOffset>(3),
-                    reader.IsDBNull(4) ? null : reader.GetFieldValue<DateTimeOffset>(4),
+                    reader.GetInt32(3),
+                    reader.GetFieldValue<DateTimeOffset>(4),
                     reader.IsDBNull(5) ? null : reader.GetFieldValue<DateTimeOffset>(5),
-                    reader.IsDBNull(6) ? null : reader.GetString(6)
+                    reader.IsDBNull(6) ? null : reader.GetFieldValue<DateTimeOffset>(6),
+                    reader.IsDBNull(7) ? null : reader.GetString(7)
                 )
             );
         }
@@ -2762,6 +2928,22 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         return db.Database.GetConnectionString()!;
     }
 
+    private async Task SetSweepCompletedAtAsync(Guid sweepId, DateTimeOffset? completedAt)
+    {
+        await using var connection = new NpgsqlConnection(GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            UPDATE "sweep_run"
+            SET "CompletedAt" = @completedAt
+            WHERE "SweepId" = @sweepId
+            """;
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        command.Parameters.AddWithValue("completedAt", (object?)completedAt ?? DBNull.Value);
+        await command.ExecuteNonQueryAsync();
+    }
+
     private static IRetentionCategoryRepository CreateHandlerErasureCategoryRepository(
         RetentionRule? shortLivedRule = null,
         RetentionRule? softDeleteRule = null,
@@ -2810,6 +2992,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
     private sealed record HandlerStatusRow(
         string HandlerType,
+        int DispatchPhase,
         int State,
         int Attempt,
         DateTimeOffset NextAttemptAt,

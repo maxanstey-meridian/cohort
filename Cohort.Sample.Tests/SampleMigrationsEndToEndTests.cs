@@ -139,6 +139,7 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
             "Id",
             "SweepRunRowDetailId",
             "HandlerType",
+            "DispatchPhase",
             "State",
             "Attempt",
             "QueuedAt",
@@ -154,6 +155,8 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
         handlerStatusColumns["SweepRunRowDetailId"].IsNullable.Should().BeFalse();
         handlerStatusColumns["HandlerType"].DataType.Should().Be("text");
         handlerStatusColumns["HandlerType"].IsNullable.Should().BeFalse();
+        handlerStatusColumns["DispatchPhase"].DataType.Should().Be("integer");
+        handlerStatusColumns["DispatchPhase"].IsNullable.Should().BeFalse();
         handlerStatusColumns["State"].DataType.Should().Be("integer");
         handlerStatusColumns["State"].IsNullable.Should().BeFalse();
         handlerStatusColumns["Attempt"].DataType.Should().Be("integer");

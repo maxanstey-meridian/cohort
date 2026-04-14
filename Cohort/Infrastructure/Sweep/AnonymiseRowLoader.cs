@@ -115,6 +115,7 @@ internal sealed class AnonymiseRowLoader(
         return modelDb
             .Set<TEntity>()
             .FromSqlRaw(sql, parameters.ToArray())
+            .IgnoreQueryFilters()
             .AsNoTracking()
             .ToListAsync(ct);
     }

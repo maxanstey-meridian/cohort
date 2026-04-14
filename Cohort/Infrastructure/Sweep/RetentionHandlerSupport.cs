@@ -5,6 +5,8 @@ using Cohort.Domain;
 using Cohort.Infrastructure.Handlers;
 using Cohort.Infrastructure.Migrations;
 
+using Microsoft.Extensions.DependencyInjection;
+
 namespace Cohort.Infrastructure.Sweep;
 
 internal static class RetentionHandlerSupport
@@ -29,9 +31,25 @@ internal static class RetentionHandlerSupport
             return [];
         }
 
+        var metadata = services.GetService<IEnumerable<IRetentionHandlerRegistration>>()?
+            .Where(registration => registration.EntityType == entityType)
+            .ToDictionary(
+                registration => registration.HandlerType,
+                registration => registration.DispatchPhase
+            );
+
         return registeredHandlers
             .Cast<object>()
-            .Select(handler => new ResolvedRetentionHandler(handler, handlerInterface))
+            .Select(handler =>
+                new ResolvedRetentionHandler(
+                    handler,
+                    handlerInterface,
+                    metadata is not null
+                    && metadata.TryGetValue(handler.GetType(), out var dispatchPhase)
+                        ? dispatchPhase
+                        : RowHandlerDispatchPhase.Immediate
+                )
+            )
             .OrderBy(handler => RowHandlerPriorityAttribute.GetPriority(handler.HandlerType))
             .ThenBy(handler => handler.HandlerType.FullName, StringComparer.Ordinal)
             .ToArray();
@@ -240,6 +258,7 @@ internal static class RetentionHandlerSupport
             INSERT INTO {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} (
                 "SweepRunRowDetailId",
                 "HandlerType",
+                "DispatchPhase",
                 "State",
                 "Attempt",
                 "QueuedAt",
@@ -251,6 +270,7 @@ internal static class RetentionHandlerSupport
             VALUES (
                 @rowDetailId,
                 @handlerType,
+                @dispatchPhase,
                 @state,
                 @attempt,
                 @queuedAt,
@@ -262,6 +282,9 @@ internal static class RetentionHandlerSupport
             """;
         command.Parameters.Add(CreateParameter(command, "rowDetailId", rowDetailId));
         command.Parameters.Add(CreateParameter(command, "handlerType", handler.HandlerTypeName));
+        command.Parameters.Add(
+            CreateParameter(command, "dispatchPhase", (int)handler.DispatchPhase)
+        );
         command.Parameters.Add(
             CreateParameter(command, "state", (int)SweepRowHandlerDispatchState.Pending)
         );
@@ -337,13 +360,19 @@ internal static class RetentionHandlerSupport
     }
 }
 
-internal sealed class ResolvedRetentionHandler(object instance, Type handlerInterface)
+internal sealed class ResolvedRetentionHandler(
+    object instance,
+    Type handlerInterface,
+    RowHandlerDispatchPhase dispatchPhase
+)
 {
     public object Instance { get; } = instance;
 
     public Type HandlerType { get; } = instance.GetType();
 
     public string HandlerTypeName { get; } = RetentionTypeIdentity.GetPersistedName(instance.GetType());
+
+    public RowHandlerDispatchPhase DispatchPhase { get; } = dispatchPhase;
 
     public System.Reflection.MethodInfo OnBeforeMethod { get; } =
         handlerInterface.GetMethod(nameof(IRetentionHandler<object>.OnBeforeAsync))

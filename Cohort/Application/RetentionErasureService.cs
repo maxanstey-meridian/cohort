@@ -46,11 +46,7 @@ public sealed class RetentionErasureService(
         )>();
         var auditEvents = new List<SweepEvent>();
 
-        foreach (
-            var entry in registry
-                .Scan()
-                .Values.OrderBy(entry => entry.EntityType.FullName, StringComparer.Ordinal)
-        )
+        foreach (var entry in registry.Scan().Values)
         {
             var predicate = ResolveMatch(entry, scope);
             if (predicate is null)
@@ -102,7 +98,13 @@ public sealed class RetentionErasureService(
                 ct
             );
 
-            foreach (var (entry, context, rule, predicate) in executionPlan)
+            foreach (
+                var (entry, context, rule, predicate) in RetentionExecutionPlanOrderer.Order(
+                    db,
+                    executionPlan,
+                    item => item.Entry
+                )
+            )
             {
                 var eventAt = DateTimeOffset.UtcNow;
                 var resolvedPeriod = CutoffCalculator.ResolveEffectivePeriod(rule.Period, rule.LegalMin);

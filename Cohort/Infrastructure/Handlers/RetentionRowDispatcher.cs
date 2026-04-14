@@ -200,8 +200,19 @@ public sealed class RetentionRowDispatcher(
             WITH due AS (
                 SELECT status."Id"
                 FROM {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} AS status
+                INNER JOIN {QuoteIdentifier(CohortTableNames.SweepRunRowDetail)} AS detail
+                    ON detail."Id" = status."SweepRunRowDetailId"
+                INNER JOIN {QuoteIdentifier(CohortTableNames.SweepRun)} AS run
+                    ON run."SweepId" = detail."SweepId"
                 WHERE status."State" = @pending
                   AND status."NextAttemptAt" <= @dueCutoff
+                  AND (
+                      status."DispatchPhase" = @immediatePhase
+                      OR (
+                          status."DispatchPhase" = @afterSweepSettledPhase
+                          AND run."CompletedAt" IS NOT NULL
+                      )
+                  )
                   AND NOT EXISTS (
                       SELECT 1
                       FROM {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} AS blocker
@@ -223,6 +234,16 @@ public sealed class RetentionRowDispatcher(
         command.Parameters.Add(CreateParameter(command, "pending", (int)SweepRowHandlerDispatchState.Pending));
         command.Parameters.Add(
             CreateParameter(command, "dueCutoff", ClampDateTimeOffset(dueCutoff))
+        );
+        command.Parameters.Add(
+            CreateParameter(command, "immediatePhase", (int)RowHandlerDispatchPhase.Immediate)
+        );
+        command.Parameters.Add(
+            CreateParameter(
+                command,
+                "afterSweepSettledPhase",
+                (int)RowHandlerDispatchPhase.AfterSweepSettled
+            )
         );
         command.Parameters.Add(
             CreateParameter(command, "batchSize", Math.Max(1, options.CurrentValue.RowHandlerDispatch.BatchSize))

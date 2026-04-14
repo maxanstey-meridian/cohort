@@ -1,5 +1,7 @@
 #nullable enable
 
+using Cohort.Application;
+
 namespace Cohort.Infrastructure.Handlers;
 
 internal sealed class SweepRowHandlerStatusEntity
@@ -9,6 +11,8 @@ internal sealed class SweepRowHandlerStatusEntity
     public long SweepRunRowDetailId { get; set; }
 
     public string HandlerType { get; set; } = "";
+
+    public RowHandlerDispatchPhase DispatchPhase { get; set; }
 
     public SweepRowHandlerDispatchState State { get; set; }
 

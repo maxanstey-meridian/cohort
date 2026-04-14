@@ -333,7 +333,11 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
             parameters.Add(CreateProviderParameter(conn, "tenantId", tenant.Id));
         }
 
-        return await db.Set<TEntity>().FromSqlRaw(sql, parameters.ToArray()).AsNoTracking().ToListAsync(ct);
+        return await db.Set<TEntity>()
+            .FromSqlRaw(sql, parameters.ToArray())
+            .IgnoreQueryFilters()
+            .AsNoTracking()
+            .ToListAsync(ct);
     }
 
     private static async Task<bool> DeleteCapturedRowAsync(

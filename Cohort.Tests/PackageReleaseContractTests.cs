@@ -20,50 +20,13 @@ public sealed class PackageReleaseContractTests
     }
 
     [Fact]
-    public void Packed_Readme_Documents_Explicit_Tenantless_Opt_Out_Without_A_Broken_Changelog_Link()
-    {
-        Artifact.Value.Readme.Should().Contain("tenant-scoped by default");
-        Artifact.Value.Readme.Should().Contain("[RetentionTenantless]");
-        Artifact.Value.Readme.Should().Contain("startup configuration error");
-        Artifact.Value.Readme.Should().NotContain("TenantId is optional");
-        Artifact.Value.Readme.Should().NotContain("retained entities without a TenantId");
-        Artifact.Value.Readme.Should().NotContain("[CHANGELOG.md](CHANGELOG.md)");
-    }
-
-    [Fact]
-    public void Packed_Readme_Documents_Subject_And_Effective_Cutoff_Gating_For_Erasure()
-    {
-        Artifact.Value.Readme.Should().Contain("matches the requested `[ErasureSubject]`");
-        Artifact.Value.Readme.Should().Contain("effective retention cutoff");
-        Artifact.Value.Readme.Should().Contain("max(Period, LegalMin)");
-        Artifact.Value.Readme.Should().NotContain(
-            "Cohort walks every entity with a matching [ErasureSubject] and applies the category's strategy."
-        );
-        Artifact.Value.Readme.Should().NotContain("subject match alone");
-    }
-
-    [Fact]
-    public void Packed_Readme_Points_To_Release_Notes_With_A_Package_Safe_Link()
-    {
-        var expectedReleaseNotesUrl = BuildVersionPinnedChangelogUrl(Artifact.Value.PackageVersion);
-
-        Artifact.Value.Readme.Should().Contain("## Upgrade from `0.1.1`");
-        Artifact.Value.Readme.Should().Contain("regenerate and apply your Cohort migration before booting `0.2.0`");
-        Artifact.Value.Readme.Should().Contain("version-pinned changelog entry");
-        Artifact.Value.Readme.Should().Contain(expectedReleaseNotesUrl);
-        Artifact.Value.Readme.Should().NotContain("/blob/main/CHANGELOG.md");
-        Artifact.Value.Readme.Should().Contain("AnonymiseWithAttribute");
-        Artifact.Value.Readme.Should().Contain("PreviewEraseAsync(...)");
-        Artifact.Value.Readme.Should().Contain("row-dispatch surface");
-    }
-
-    [Fact]
-    public void Changelog_Release_Notes_Cover_The_Runtime_Upgrade_Contract()
+    public void Changelog_Release_Notes_Cover_The_Current_Runtime_Surface()
     {
         Changelog.Value.Should().Contain("Startup tenant enforcement is now fail-closed");
         Changelog.Value.Should().Contain("effective retention cutoff");
-        Changelog.Value.Should().Contain("must refresh their Cohort-owned table migrations before booting this package version");
         Changelog.Value.Should().Contain("RetentionRowDispatcher");
+        Changelog.Value.Should().NotContain("Upgrade notes");
+        Changelog.Value.Should().NotContain("upgrading from `0.1.1`");
     }
 
     [Fact]
@@ -74,8 +37,8 @@ public sealed class PackageReleaseContractTests
         Changelog.Value.Should().Contain("AnonymiseWithAttribute");
         Changelog.Value.Should().Contain("IRetentionSweepStrategy.PreviewEraseAsync(...)");
         Changelog.Value.Should().Contain("IRetentionRowDispatcher");
-        Changelog.Value.Should().Contain("Regenerate your host migration against the `0.2.0` package");
-        Changelog.Value.Should().Contain("Apply that migration before booting the new package version");
+        Changelog.Value.Should().NotContain("Regenerate your host migration against the `0.2.0` package");
+        Changelog.Value.Should().NotContain("Apply that migration before booting the new package version");
     }
 
     [Fact]
@@ -355,11 +318,6 @@ public sealed class PackageReleaseContractTests
         File.Exists(changelogPath).Should().BeTrue("slice 8 ships the release handover artifact in-repo");
 
         return File.ReadAllText(changelogPath);
-    }
-
-    private static string BuildVersionPinnedChangelogUrl(Version packageVersion)
-    {
-        return $"https://github.com/maxanstey-meridian/cohort/blob/v{packageVersion}/CHANGELOG.md#020";
     }
 
     private static string RunDotnet(

@@ -397,18 +397,17 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
             );
         }
 
-        var match = RequireSingleSubjectMatch(predicate);
-
         if (conn.State != ConnectionState.Open)
         {
             await conn.OpenAsync(ct);
         }
 
         var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
+        var subjectPredicateSql = BuildSubjectPredicateSql(predicate);
         var candidateRecordIds = await SelectPreviewErasureCandidateRecordIdsAsync(
             entry,
             entry.Tenant?.TenantColumn,
-            match,
+            predicate,
             tenant,
             cutoff,
             conn,
@@ -429,7 +428,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
             $"""
             SELECT COUNT(*)
             FROM {QuoteIdentifier(entry.TableName)} AS target
-            WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+            WHERE {subjectPredicateSql}
               AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {tenantClause}
               AND CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) = ANY(@candidateIds)
@@ -439,7 +438,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
         {
             command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
         }
-        command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
+        AddSubjectParameters(command, predicate);
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
@@ -474,18 +473,17 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
             );
         }
 
-        var match = RequireSingleSubjectMatch(predicate);
-
         if (conn.State != ConnectionState.Open)
         {
             await conn.OpenAsync(ct);
         }
 
         var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
+        var subjectPredicateSql = BuildSubjectPredicateSql(predicate);
         var candidateRecordIds = await SelectErasureCandidateRecordIdsAsync(
             entry,
             entry.Tenant?.TenantColumn,
-            match,
+            predicate,
             tenant,
             cutoff,
             conn,
@@ -524,7 +522,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
         command.CommandText =
             $"""
             DELETE FROM {QuoteIdentifier(entry.TableName)} AS target
-            WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+            WHERE {subjectPredicateSql}
               AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {tenantClause}
               AND CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) = ANY(@candidateIds)
@@ -535,7 +533,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
         {
             command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
         }
-        command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
+        AddSubjectParameters(command, predicate);
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
@@ -597,7 +595,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
     private static async Task<IReadOnlyList<string>> SelectErasureCandidateRecordIdsAsync(
         RetentionEntry entry,
         string? tenantColumn,
-        ErasureSubjectMatch match,
+        ErasureSubjectPredicate predicate,
         TenantContext erasureTenant,
         DateTimeOffset cutoff,
         DbConnection conn,
@@ -605,6 +603,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
         CancellationToken ct
     )
     {
+        var subjectPredicateSql = BuildSubjectPredicateSql(predicate);
         var tenantClause = tenantColumn is not null
             ? $"AND target.{QuoteIdentifier(tenantColumn)} = @tenantId"
             : "";
@@ -615,7 +614,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
             $"""
             SELECT target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
             FROM {QuoteIdentifier(entry.TableName)} AS target
-            WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+            WHERE {subjectPredicateSql}
               AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {tenantClause}
             FOR UPDATE
@@ -624,7 +623,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
         {
             command.Parameters.Add(CreateParameter(command, "tenantId", erasureTenant.Id));
         }
-        command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
+        AddSubjectParameters(command, predicate);
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
 
         var candidateRecordIds = new List<string>();
@@ -640,13 +639,14 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
     private static async Task<IReadOnlyList<string>> SelectPreviewErasureCandidateRecordIdsAsync(
         RetentionEntry entry,
         string? tenantColumn,
-        ErasureSubjectMatch match,
+        ErasureSubjectPredicate predicate,
         TenantContext erasureTenant,
         DateTimeOffset cutoff,
         DbConnection conn,
         CancellationToken ct
     )
     {
+        var subjectPredicateSql = BuildSubjectPredicateSql(predicate);
         var tenantClause = tenantColumn is not null
             ? $"AND target.{QuoteIdentifier(tenantColumn)} = @tenantId"
             : "";
@@ -656,7 +656,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
             $"""
             SELECT target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
             FROM {QuoteIdentifier(entry.TableName)} AS target
-            WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+            WHERE {subjectPredicateSql}
               AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {tenantClause}
             """;
@@ -664,7 +664,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
         {
             command.Parameters.Add(CreateParameter(command, "tenantId", erasureTenant.Id));
         }
-        command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
+        AddSubjectParameters(command, predicate);
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
 
         var candidateRecordIds = new List<string>();
@@ -700,17 +700,27 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
         return $"\"{identifier.Replace("\"", "\"\"")}\"";
     }
 
-    private static ErasureSubjectMatch RequireSingleSubjectMatch(
+    private static string BuildSubjectPredicateSql(
         ErasureSubjectPredicate predicate
     )
     {
-        if (predicate.Matches.Count != 1)
+        return "("
+            + string.Join(
+                " OR ",
+                predicate.Matches.Select((match, index) =>
+                    $"target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue{index}"
+                )
+            )
+            + ")";
+    }
+
+    private static void AddSubjectParameters(DbCommand command, ErasureSubjectPredicate predicate)
+    {
+        for (var index = 0; index < predicate.Matches.Count; index++)
         {
-            throw new InvalidOperationException(
-                $"PurgeSweepStrategy requires exactly one erasure subject match in this release. Received {predicate.Matches.Count}."
+            command.Parameters.Add(
+                CreateParameter(command, $"subjectValue{index}", predicate.Matches[index].SubjectValue)
             );
         }
-
-        return predicate.Matches[0];
     }
 }

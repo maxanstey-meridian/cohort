@@ -1664,6 +1664,252 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Erasure_Path_Matches_When_The_First_Marked_Subject_Property_Equals_The_Requested_Subject()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        await using var services = BuildMultiSubjectServiceProvider(database.ConnectionString);
+
+        var tenantId = Guid.NewGuid();
+        var otherTenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var otherSubjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var matchingId = Guid.NewGuid();
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<MultiSubjectDbContext>();
+            await db.Database.EnsureCreatedAsync();
+
+            db.MultiSubjectFixtureRecords.AddRange(
+                new MultiSubjectFixtureRecord
+                {
+                    Id = matchingId,
+                    TenantId = tenantId,
+                    PrimarySubjectId = subjectId,
+                    DelegateSubjectId = otherSubjectId,
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
+                    Body = "primary-match",
+                },
+                new MultiSubjectFixtureRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    PrimarySubjectId = otherSubjectId,
+                    DelegateSubjectId = otherSubjectId,
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
+                    Body = "other-subject",
+                },
+                new MultiSubjectFixtureRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = otherTenantId,
+                    PrimarySubjectId = subjectId,
+                    DelegateSubjectId = otherSubjectId,
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
+                    Body = "other-tenant",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        ErasureResult result;
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var erasureService = scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
+            result = await erasureService.EraseAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                new ErasureScope(subjectId),
+                asOf
+            );
+        }
+
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(MultiSubjectFixtureRecord),
+                "short-lived",
+                tenantId,
+                Strategy.Purge,
+                1
+            )
+        );
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var verify = scope.ServiceProvider.GetRequiredService<MultiSubjectDbContext>();
+            (await verify.MultiSubjectFixtureRecords.Select(record => record.Body).OrderBy(body => body).ToListAsync())
+                .Should()
+                .Equal("other-subject", "other-tenant");
+            (await verify.MultiSubjectFixtureRecords.AnyAsync(record => record.Id == matchingId))
+                .Should()
+                .BeFalse();
+        }
+    }
+
+    [Fact]
+    public async Task Erasure_Path_Matches_When_Only_The_Second_Marked_Subject_Property_Equals_The_Requested_Subject()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        await using var services = BuildMultiSubjectServiceProvider(database.ConnectionString);
+
+        var tenantId = Guid.NewGuid();
+        var otherTenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var otherSubjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var matchingId = Guid.NewGuid();
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<MultiSubjectDbContext>();
+            await db.Database.EnsureCreatedAsync();
+
+            db.MultiSubjectFixtureRecords.AddRange(
+                new MultiSubjectFixtureRecord
+                {
+                    Id = matchingId,
+                    TenantId = tenantId,
+                    PrimarySubjectId = otherSubjectId,
+                    DelegateSubjectId = subjectId,
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
+                    Body = "delegate-match",
+                },
+                new MultiSubjectFixtureRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    PrimarySubjectId = otherSubjectId,
+                    DelegateSubjectId = otherSubjectId,
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
+                    Body = "other-subject",
+                },
+                new MultiSubjectFixtureRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = otherTenantId,
+                    PrimarySubjectId = otherSubjectId,
+                    DelegateSubjectId = subjectId,
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
+                    Body = "other-tenant",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        ErasureResult result;
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var erasureService = scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
+            result = await erasureService.EraseAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                new ErasureScope(subjectId),
+                asOf
+            );
+        }
+
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(MultiSubjectFixtureRecord),
+                "short-lived",
+                tenantId,
+                Strategy.Purge,
+                1
+            )
+        );
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var verify = scope.ServiceProvider.GetRequiredService<MultiSubjectDbContext>();
+            (await verify.MultiSubjectFixtureRecords.Select(record => record.Body).OrderBy(body => body).ToListAsync())
+                .Should()
+                .Equal("other-subject", "other-tenant");
+            (await verify.MultiSubjectFixtureRecords.AnyAsync(record => record.Id == matchingId))
+                .Should()
+                .BeFalse();
+        }
+    }
+
+    [Fact]
+    public async Task Erasure_Path_Converts_Erasure_Subject_Values_To_The_Provider_Type_Before_SQL_Comparison()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        await using var services = BuildConvertedErasureSubjectServiceProvider(database.ConnectionString);
+
+        var tenantId = Guid.NewGuid();
+        var otherTenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var otherSubjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var matchingId = Guid.NewGuid();
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<ConvertedErasureSubjectDbContext>();
+            await db.Database.EnsureCreatedAsync();
+
+            db.ConvertedErasureSubjectFixtureRecords.AddRange(
+                new ConvertedErasureSubjectFixtureRecord
+                {
+                    Id = matchingId,
+                    TenantId = tenantId,
+                    SubjectKey = subjectId,
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
+                    Body = "converted-subject-match",
+                },
+                new ConvertedErasureSubjectFixtureRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectKey = otherSubjectId,
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
+                    Body = "other-subject",
+                },
+                new ConvertedErasureSubjectFixtureRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = otherTenantId,
+                    SubjectKey = subjectId,
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
+                    Body = "other-tenant",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        ErasureResult result;
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var erasureService = scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
+            result = await erasureService.EraseAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                new ErasureScope(subjectId),
+                asOf
+            );
+        }
+
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(ConvertedErasureSubjectFixtureRecord),
+                "short-lived",
+                tenantId,
+                Strategy.Purge,
+                1
+            )
+        );
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var verify = scope.ServiceProvider.GetRequiredService<ConvertedErasureSubjectDbContext>();
+            (await verify.ConvertedErasureSubjectFixtureRecords.Select(record => record.Body).OrderBy(body => body).ToListAsync())
+                .Should()
+                .Equal("other-subject", "other-tenant");
+            (await verify.ConvertedErasureSubjectFixtureRecords.AnyAsync(record => record.Id == matchingId))
+                .Should()
+                .BeFalse();
+        }
+    }
+
+    [Fact]
     public async Task Erase_Path_Executes_SetBased_And_PerRow_FactoryBacked_Anonymise_Fields()
     {
         await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
@@ -2386,6 +2632,54 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
         return services.BuildServiceProvider(validateScopes: true);
     }
+
+    private static ServiceProvider BuildMultiSubjectServiceProvider(string connectionString)
+    {
+        var services = new ServiceCollection();
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection().Build();
+
+        services.AddSingleton<IConfiguration>(configuration);
+        services.AddLogging();
+        services.AddDbContext<MultiSubjectDbContext>(options => options.UseNpgsql(connectionString));
+        services.AddSingleton<IRetentionCategoryRepository>(
+            new StaticCategoryRepository(
+                new Dictionary<string, IRetentionRuleResolver>
+                {
+                    ["short-lived"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    ),
+                }
+            )
+        );
+        services.AddCohort<MultiSubjectDbContext>();
+
+        return services.BuildServiceProvider(validateScopes: true);
+    }
+
+    private static ServiceProvider BuildConvertedErasureSubjectServiceProvider(string connectionString)
+    {
+        var services = new ServiceCollection();
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection().Build();
+
+        services.AddSingleton<IConfiguration>(configuration);
+        services.AddLogging();
+        services.AddDbContext<ConvertedErasureSubjectDbContext>(
+            options => options.UseNpgsql(connectionString)
+        );
+        services.AddSingleton<IRetentionCategoryRepository>(
+            new StaticCategoryRepository(
+                new Dictionary<string, IRetentionRuleResolver>
+                {
+                    ["short-lived"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    ),
+                }
+            )
+        );
+        services.AddCohort<ConvertedErasureSubjectDbContext>();
+
+        return services.BuildServiceProvider(validateScopes: true);
+    }
 }
 
 internal sealed class FactoryBackedErasureDbContext(
@@ -2575,6 +2869,87 @@ internal sealed class AliasSubjectFixtureRecord
 
     [ErasureSubject]
     public Guid? CustomerReference { get; set; }
+
+    public DateTimeOffset CreatedAt { get; set; }
+    public string Body { get; set; } = "";
+}
+
+internal sealed class MultiSubjectDbContext(DbContextOptions<MultiSubjectDbContext> options)
+    : DbContext(options)
+{
+    public DbSet<MultiSubjectFixtureRecord> MultiSubjectFixtureRecords => Set<MultiSubjectFixtureRecord>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<MultiSubjectFixtureRecord>(builder =>
+        {
+            builder.ToTable("multi_subject_fixture_records");
+            builder.HasKey(record => record.Id);
+            builder.Property(record => record.TenantId).IsRequired();
+            builder.Property(record => record.PrimarySubjectId).HasColumnName("primary_subject_id");
+            builder.Property(record => record.DelegateSubjectId).HasColumnName("delegate_subject_id");
+            builder.Property(record => record.CreatedAt).IsRequired();
+            builder.Property(record => record.Body).IsRequired();
+        });
+
+        modelBuilder.ConfigureCohortTables();
+    }
+}
+
+[Retain("short-lived", nameof(CreatedAt))]
+internal sealed class MultiSubjectFixtureRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+
+    [ErasureSubject]
+    public Guid? PrimarySubjectId { get; set; }
+
+    [ErasureSubject]
+    public Guid? DelegateSubjectId { get; set; }
+
+    public DateTimeOffset CreatedAt { get; set; }
+    public string Body { get; set; } = "";
+}
+
+internal sealed class ConvertedErasureSubjectDbContext(
+    DbContextOptions<ConvertedErasureSubjectDbContext> options
+) : DbContext(options)
+{
+    public DbSet<ConvertedErasureSubjectFixtureRecord> ConvertedErasureSubjectFixtureRecords =>
+        Set<ConvertedErasureSubjectFixtureRecord>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<ConvertedErasureSubjectFixtureRecord>(builder =>
+        {
+            builder.ToTable("converted_erasure_subject_fixture_records");
+            builder.HasKey(record => record.Id);
+            builder.Property(record => record.TenantId).IsRequired();
+            builder
+                .Property(record => record.SubjectKey)
+                .HasColumnName("external_subject_key")
+                .HasColumnType("text")
+                .HasConversion(
+                    value => value.ToString("N").ToUpperInvariant(),
+                    value => Guid.ParseExact(value, "N")
+                );
+            builder.Property(record => record.CreatedAt).IsRequired();
+            builder.Property(record => record.Body).IsRequired();
+        });
+
+        modelBuilder.ConfigureCohortTables();
+    }
+}
+
+[Retain("short-lived", nameof(CreatedAt))]
+internal sealed class ConvertedErasureSubjectFixtureRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+
+    [ErasureSubject]
+    public Guid SubjectKey { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; }
     public string Body { get; set; } = "";

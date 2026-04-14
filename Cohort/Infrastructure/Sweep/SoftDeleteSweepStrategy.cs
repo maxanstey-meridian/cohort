@@ -434,8 +434,6 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             );
         }
 
-        var match = RequireSingleSubjectMatch(predicate);
-
         var softDelete = entry.SoftDelete
             ?? throw new InvalidOperationException(
                 $"Retention entry for {entry.EntityType.FullName} must expose soft-delete metadata for soft-delete erasure previews."
@@ -447,11 +445,12 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
         }
 
         var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
+        var subjectPredicateSql = BuildSubjectPredicateSql(predicate);
         var candidateRecordIds = await SelectPreviewErasureCandidateRecordIdsAsync(
             entry,
             entry.Tenant?.TenantColumn,
             softDelete,
-            match,
+            predicate,
             tenant,
             cutoff,
             conn,
@@ -472,7 +471,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             $"""
             SELECT COUNT(*)
             FROM {QuoteIdentifier(entry.TableName)} AS target
-            WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+            WHERE {subjectPredicateSql}
               AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {tenantClause}
               AND target.{QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
@@ -483,7 +482,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
         {
             command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
         }
-        command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
+        AddSubjectParameters(command, predicate);
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
@@ -518,8 +517,6 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             );
         }
 
-        var match = RequireSingleSubjectMatch(predicate);
-
         var softDelete = entry.SoftDelete
             ?? throw new InvalidOperationException(
                 $"Retention entry for {entry.EntityType.FullName} must expose soft-delete metadata for soft-delete erasure."
@@ -531,11 +528,12 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
         }
 
         var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
+        var subjectPredicateSql = BuildSubjectPredicateSql(predicate);
         var candidateRecordIds = await SelectErasureCandidateRecordIdsAsync(
             entry,
             entry.Tenant?.TenantColumn,
             softDelete,
-            match,
+            predicate,
             tenant,
             cutoff,
             conn,
@@ -572,14 +570,14 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             entry,
             entry.Tenant?.TenantColumn,
             softDelete,
-            match,
+            subjectPredicateSql,
             entry.RecordId.RecordIdColumn
         );
         if (entry.Tenant is not null)
         {
             command.Parameters.Add(CreateParameter(command, "tenantId", tenant.Id));
         }
-        command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
+        AddSubjectParameters(command, predicate);
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
@@ -637,7 +635,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
         RetentionEntry entry,
         string? tenantColumn,
         SoftDeleteConvention softDelete,
-        ErasureSubjectMatch match,
+        string subjectPredicateSql,
         string recordIdColumn
     )
     {
@@ -653,7 +651,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             $"""
             UPDATE {QuoteIdentifier(entry.TableName)} AS target
             SET {QuoteIdentifier(softDelete.IsDeletedColumn)} = TRUE{deletedAtAssignment}
-            WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+            WHERE {subjectPredicateSql}
               AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {tenantClause}
               AND target.{QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
@@ -737,7 +735,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
         RetentionEntry entry,
         string? tenantColumn,
         SoftDeleteConvention softDelete,
-        ErasureSubjectMatch match,
+        ErasureSubjectPredicate predicate,
         TenantContext erasureTenant,
         DateTimeOffset cutoff,
         DbConnection conn,
@@ -745,6 +743,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
         CancellationToken ct
     )
     {
+        var subjectPredicateSql = BuildSubjectPredicateSql(predicate);
         var tenantClause = tenantColumn is not null
             ? $"AND target.{QuoteIdentifier(tenantColumn)} = @tenantId"
             : "";
@@ -755,7 +754,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             $"""
             SELECT target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
             FROM {QuoteIdentifier(entry.TableName)} AS target
-            WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+            WHERE {subjectPredicateSql}
               AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {tenantClause}
               AND target.{QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
@@ -765,7 +764,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
         {
             command.Parameters.Add(CreateParameter(command, "tenantId", erasureTenant.Id));
         }
-        command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
+        AddSubjectParameters(command, predicate);
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
 
         var candidateRecordIds = new List<string>();
@@ -782,13 +781,14 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
         RetentionEntry entry,
         string? tenantColumn,
         SoftDeleteConvention softDelete,
-        ErasureSubjectMatch match,
+        ErasureSubjectPredicate predicate,
         TenantContext erasureTenant,
         DateTimeOffset cutoff,
         DbConnection conn,
         CancellationToken ct
     )
     {
+        var subjectPredicateSql = BuildSubjectPredicateSql(predicate);
         var tenantClause = tenantColumn is not null
             ? $"AND target.{QuoteIdentifier(tenantColumn)} = @tenantId"
             : "";
@@ -798,7 +798,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
             $"""
             SELECT target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
             FROM {QuoteIdentifier(entry.TableName)} AS target
-            WHERE target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue
+            WHERE {subjectPredicateSql}
               AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {tenantClause}
               AND target.{QuoteIdentifier(softDelete.IsDeletedColumn)} = FALSE
@@ -807,7 +807,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
         {
             command.Parameters.Add(CreateParameter(command, "tenantId", erasureTenant.Id));
         }
-        command.Parameters.Add(CreateParameter(command, "subjectValue", match.SubjectValue));
+        AddSubjectParameters(command, predicate);
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
 
         var candidateRecordIds = new List<string>();
@@ -877,17 +877,27 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
         return $"\"{identifier.Replace("\"", "\"\"")}\"";
     }
 
-    private static ErasureSubjectMatch RequireSingleSubjectMatch(
+    private static string BuildSubjectPredicateSql(
         ErasureSubjectPredicate predicate
     )
     {
-        if (predicate.Matches.Count != 1)
+        return "("
+            + string.Join(
+                " OR ",
+                predicate.Matches.Select((match, index) =>
+                    $"target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue{index}"
+                )
+            )
+            + ")";
+    }
+
+    private static void AddSubjectParameters(DbCommand command, ErasureSubjectPredicate predicate)
+    {
+        for (var index = 0; index < predicate.Matches.Count; index++)
         {
-            throw new InvalidOperationException(
-                $"SoftDeleteSweepStrategy requires exactly one erasure subject match in this release. Received {predicate.Matches.Count}."
+            command.Parameters.Add(
+                CreateParameter(command, $"subjectValue{index}", predicate.Matches[index].SubjectValue)
             );
         }
-
-        return predicate.Matches[0];
     }
 }

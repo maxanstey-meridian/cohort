@@ -103,13 +103,12 @@ public sealed class AnonymiseSweepStrategy(
         ArgumentNullException.ThrowIfNull(tenant);
         ArgumentNullException.ThrowIfNull(conn);
 
-        var match = RequireSingleSubjectMatch(predicate);
         var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
         return await PreviewMutationCountAsync(
             entry,
             rule,
             CombineFilters(
-                CreateSubjectFilter(match.SubjectColumn, match.SubjectValue),
+                CreateSubjectFilter(predicate),
                 CreateCutoffFilter(entry.AnchorColumn, cutoff)
             ),
             tenant,
@@ -139,14 +138,13 @@ public sealed class AnonymiseSweepStrategy(
         ArgumentNullException.ThrowIfNull(conn);
         ArgumentNullException.ThrowIfNull(transaction);
 
-        var match = RequireSingleSubjectMatch(predicate);
         var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
         return await ExecuteMutationAsync(
             entry,
             rule,
             new RetentionResolutionContext(entry.Category, tenant, now, []),
             CombineFilters(
-                CreateSubjectFilter(match.SubjectColumn, match.SubjectValue),
+                CreateSubjectFilter(predicate),
                 CreateCutoffFilter(entry.AnchorColumn, cutoff)
             ),
             conn,
@@ -990,11 +988,20 @@ public sealed class AnonymiseSweepStrategy(
         );
     }
 
-    private static SqlFilter CreateSubjectFilter(string subjectColumn, object subjectValue)
+    private static SqlFilter CreateSubjectFilter(ErasureSubjectPredicate predicate)
     {
         return new SqlFilter(
-            $"target.{QuoteIdentifier(subjectColumn)} = @subjectValue",
-            [new SqlFilterParameter("subjectValue", subjectValue)]
+            "("
+                + string.Join(
+                    " OR ",
+                    predicate.Matches.Select((match, index) =>
+                        $"target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue{index}"
+                    )
+                )
+                + ")",
+            predicate.Matches
+                .Select((match, index) => new SqlFilterParameter($"subjectValue{index}", match.SubjectValue))
+                .ToArray()
         );
     }
 
@@ -1069,20 +1076,6 @@ public sealed class AnonymiseSweepStrategy(
     private static string QuoteIdentifier(string identifier)
     {
         return $"\"{identifier.Replace("\"", "\"\"")}\"";
-    }
-
-    private static ErasureSubjectMatch RequireSingleSubjectMatch(
-        ErasureSubjectPredicate predicate
-    )
-    {
-        if (predicate.Matches.Count != 1)
-        {
-            throw new InvalidOperationException(
-                $"AnonymiseSweepStrategy requires exactly one erasure subject match in this release. Received {predicate.Matches.Count}."
-            );
-        }
-
-        return predicate.Matches[0];
     }
 
     private static void ValidateEntry(

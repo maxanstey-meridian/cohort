@@ -518,10 +518,10 @@ public sealed class SoftDeleteSweepStrategyCommandTests
         affected.HeldCount.Should().Be(1);
         connection.Commands.Should().HaveCount(2);
         connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
-        connection.Commands[0].CommandText.Should().Contain("\"SubjectId\" = @subjectValue");
+        connection.Commands[0].CommandText.Should().Contain("\"SubjectId\" = @subjectValue0");
         connection.Commands[0].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
         connection.Commands[0].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
-        connection.Commands[1].CommandText.Should().Contain("\"SubjectId\" = @subjectValue");
+        connection.Commands[1].CommandText.Should().Contain("\"SubjectId\" = @subjectValue0");
         connection.Commands[1].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
         connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
         connection.Commands[1].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
@@ -575,12 +575,12 @@ public sealed class SoftDeleteSweepStrategyCommandTests
         connection.Commands.Should().HaveCount(2);
         connection.Commands[0].AssignedTransaction.Should().BeNull();
         connection.Commands[0].CommandText.Should().NotContain("FOR UPDATE");
-        connection.Commands[0].CommandText.Should().Contain("\"SubjectId\" = @subjectValue");
+        connection.Commands[0].CommandText.Should().Contain("\"SubjectId\" = @subjectValue0");
         connection.Commands[0].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
         connection.Commands[0].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[1].AssignedTransaction.Should().BeNull();
         connection.Commands[1].CommandText.Should().Contain("SELECT COUNT(*)");
-        connection.Commands[1].CommandText.Should().Contain("\"SubjectId\" = @subjectValue");
+        connection.Commands[1].CommandText.Should().Contain("\"SubjectId\" = @subjectValue0");
         connection.Commands[1].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
         connection.Commands[1].CommandText.Should().Contain("\"IsDeleted\" = FALSE");
         connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
@@ -589,13 +589,130 @@ public sealed class SoftDeleteSweepStrategyCommandTests
         connection.Commands[1].CommandText.Should().NotContain("UPDATE ");
         connection.Commands[1].CommandText.Should().NotContain("FOR UPDATE");
         connection.Commands[1].Parameters["tenantId"].Value.Should().Be(tenantId);
-        connection.Commands[1].Parameters["subjectValue"].Value.Should().Be(subjectId);
+        connection.Commands[1].Parameters["subjectValue0"].Value.Should().Be(subjectId);
         connection.Commands[1].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
             new[] { selectedId.ToString(), heldId.ToString() }
         );
         connection.Commands[1].Parameters["holdTableName"].Value.Should().Be("soft_delete_records");
         connection.Commands[1].Parameters["holdAsOf"].Value.Should().Be(now);
+    }
+
+    [Fact]
+    public async Task EraseAsync_Uses_An_Or_Subject_Predicate_When_Multiple_Subject_Matches_Are_Provided()
+    {
+        var selectedId = Guid.NewGuid();
+        var heldId = Guid.NewGuid();
+        var tenantId = Guid.NewGuid();
+        var firstSubjectId = Guid.NewGuid();
+        var secondSubjectId = Guid.NewGuid();
+        var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var strategy = new SoftDeleteSweepStrategy();
+        var connection = new RecordingDbConnection();
+        connection.EnqueueResultSet(selectedId, heldId);
+        connection.EnqueueResultSet(selectedId);
+        var transaction = connection.BeginTransaction();
+        var entry = new RetentionEntry(
+            typeof(SoftDeleteRecord),
+            "soft_delete_records",
+            "soft-delete",
+            nameof(SoftDeleteRecord.CreatedAt),
+            "CreatedAt",
+            new RecordIdConvention(nameof(SoftDeleteRecord.Id), "Id", typeof(Guid)),
+            [],
+            new TenantConvention(nameof(SoftDeleteRecord.TenantId), "TenantId"),
+            new SoftDeleteConvention(
+                nameof(SoftDeleteRecord.IsDeleted),
+                "IsDeleted",
+                nameof(SoftDeleteRecord.DeletedAt),
+                "DeletedAt"
+            )
+        );
+        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete);
+
+        var affected = await strategy.EraseAsync(
+            entry,
+            rule,
+            new ErasureSubjectPredicate(
+                [
+                    new ErasureSubjectMatch(nameof(SoftDeleteRecord.Id), "SubjectId", firstSubjectId),
+                    new ErasureSubjectMatch(nameof(SoftDeleteRecord.Id), "DelegateSubjectId", secondSubjectId),
+                ]
+            ),
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            now,
+            connection,
+            transaction,
+            CancellationToken.None
+        );
+
+        affected.AffectedRecordIds.Should().Equal(selectedId.ToString());
+        connection.Commands[0].CommandText.Should().Contain(
+            "(target.\"SubjectId\" = @subjectValue0 OR target.\"DelegateSubjectId\" = @subjectValue1)"
+        );
+        connection.Commands[1].CommandText.Should().Contain(
+            "(target.\"SubjectId\" = @subjectValue0 OR target.\"DelegateSubjectId\" = @subjectValue1)"
+        );
+        connection.Commands[0].Parameters["subjectValue0"].Value.Should().Be(firstSubjectId);
+        connection.Commands[0].Parameters["subjectValue1"].Value.Should().Be(secondSubjectId);
+        connection.Commands[1].Parameters["subjectValue0"].Value.Should().Be(firstSubjectId);
+        connection.Commands[1].Parameters["subjectValue1"].Value.Should().Be(secondSubjectId);
+    }
+
+    [Fact]
+    public async Task PreviewEraseAsync_Uses_An_Or_Subject_Predicate_When_Multiple_Subject_Matches_Are_Provided()
+    {
+        var selectedId = Guid.NewGuid();
+        var heldId = Guid.NewGuid();
+        var tenantId = Guid.NewGuid();
+        var firstSubjectId = Guid.NewGuid();
+        var secondSubjectId = Guid.NewGuid();
+        var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var strategy = new SoftDeleteSweepStrategy();
+        var connection = new RecordingDbConnection();
+        connection.EnqueueResultSet(selectedId, heldId);
+        var entry = new RetentionEntry(
+            typeof(SoftDeleteRecord),
+            "soft_delete_records",
+            "soft-delete",
+            nameof(SoftDeleteRecord.CreatedAt),
+            "CreatedAt",
+            new RecordIdConvention(nameof(SoftDeleteRecord.Id), "Id", typeof(Guid)),
+            [],
+            new TenantConvention(nameof(SoftDeleteRecord.TenantId), "TenantId"),
+            new SoftDeleteConvention(
+                nameof(SoftDeleteRecord.IsDeleted),
+                "IsDeleted",
+                nameof(SoftDeleteRecord.DeletedAt),
+                "DeletedAt"
+            )
+        );
+        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete);
+
+        var affected = await strategy.PreviewEraseAsync(
+            entry,
+            rule,
+            new ErasureSubjectPredicate(
+                [
+                    new ErasureSubjectMatch(nameof(SoftDeleteRecord.Id), "SubjectId", firstSubjectId),
+                    new ErasureSubjectMatch(nameof(SoftDeleteRecord.Id), "DelegateSubjectId", secondSubjectId),
+                ]
+            ),
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            now,
+            connection,
+            CancellationToken.None
+        );
+
+        affected.Should().Be(1);
+        connection.Commands[0].CommandText.Should().Contain(
+            "(target.\"SubjectId\" = @subjectValue0 OR target.\"DelegateSubjectId\" = @subjectValue1)"
+        );
+        connection.Commands[1].CommandText.Should().Contain(
+            "(target.\"SubjectId\" = @subjectValue0 OR target.\"DelegateSubjectId\" = @subjectValue1)"
+        );
+        connection.Commands[1].Parameters["subjectValue0"].Value.Should().Be(firstSubjectId);
+        connection.Commands[1].Parameters["subjectValue1"].Value.Should().Be(secondSubjectId);
     }
 
     private sealed class RecordingDbConnection : DbConnection

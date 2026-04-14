@@ -1202,7 +1202,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
         connection.Commands.Should().ContainSingle();
         connection.Commands[0].AssignedTransaction.Should().BeNull();
         connection.Commands[0].CommandText.Should().Contain("SELECT COUNT(*)");
-        connection.Commands[0].CommandText.Should().Contain("\"SubjectId\" = @subjectValue");
+        connection.Commands[0].CommandText.Should().Contain("\"SubjectId\" = @subjectValue0");
         connection.Commands[0].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
         connection.Commands[0].CommandText.Should().Contain("NOT EXISTS");
         connection.Commands[0].CommandText.Should().NotContain("ANY(@candidateIds)");
@@ -1211,7 +1211,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
         connection.Commands[0].CommandText.Should().NotContain("FOR UPDATE");
         connection.Commands[0].Parameters.Count.Should().Be(5);
         connection.Commands[0].Parameters["tenantId"].Value.Should().Be(tenantId);
-        connection.Commands[0].Parameters["subjectValue"].Value.Should().Be(subjectId);
+        connection.Commands[0].Parameters["subjectValue0"].Value.Should().Be(subjectId);
         connection.Commands[0].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[0].Parameters["holdTableName"].Value.Should().Be("anonymised_contacts");
         connection.Commands[0].Parameters["holdAsOf"].Value.Should().Be(now);
@@ -1270,16 +1270,16 @@ public sealed class AnonymiseSweepStrategyCommandTests
         affected.HeldCount.Should().Be(1);
         connection.Commands.Should().HaveCount(2);
         connection.Commands[0].AssignedTransaction.Should().BeSameAs(transaction);
-        connection.Commands[0].CommandText.Should().Contain("\"SubjectId\" = @subjectValue");
+        connection.Commands[0].CommandText.Should().Contain("\"SubjectId\" = @subjectValue0");
         connection.Commands[0].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
         connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
         connection.Commands[0].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[1].AssignedTransaction.Should().BeSameAs(transaction);
-        connection.Commands[1].CommandText.Should().Contain("\"SubjectId\" = @subjectValue");
+        connection.Commands[1].CommandText.Should().Contain("\"SubjectId\" = @subjectValue0");
         connection.Commands[1].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
         connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
         connection.Commands[1].CommandText.Should().NotContain("WHERE CAST(target.\"Id\" AS text) = @recordId");
-        connection.Commands[1].Parameters["subjectValue"].Value.Should().Be(subjectId);
+        connection.Commands[1].Parameters["subjectValue0"].Value.Should().Be(subjectId);
         connection.Commands[1].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[1].Parameters["tenantId"].Value.Should().Be(tenantId);
         connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
@@ -1391,22 +1391,144 @@ public sealed class AnonymiseSweepStrategyCommandTests
         affected.AffectedRecordIds.Should().Equal(firstSelectedId.ToString(), secondSelectedId.ToString());
         affected.HeldCount.Should().Be(0);
         connection.Commands.Should().HaveCount(4);
-        connection.Commands[0].CommandText.Should().Contain("\"subject_id\" = @subjectValue");
+        connection.Commands[0].CommandText.Should().Contain("\"subject_id\" = @subjectValue0");
         connection.Commands[0].CommandText.Should().Contain("\"created_at_utc\" < @cutoff");
         connection.Commands[0].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[1].CommandText.Should().Contain("\"external_id\"");
         connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
         connection.Commands[2].CommandText.Should().Contain("WHERE CAST(target.\"Id\" AS text) = @recordId");
-        connection.Commands[2].CommandText.Should().Contain("\"subject_id\" = @subjectValue");
+        connection.Commands[2].CommandText.Should().Contain("\"subject_id\" = @subjectValue0");
         connection.Commands[2].CommandText.Should().Contain("\"created_at_utc\" < @cutoff");
         connection.Commands[2].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[2].Parameters["value0"].Value.Should().Be("alpha-scrubbed");
         connection.Commands[2].Parameters["value1"].Value.Should().Be("command-per-row-1");
-        connection.Commands[3].CommandText.Should().Contain("\"subject_id\" = @subjectValue");
+        connection.Commands[3].CommandText.Should().Contain("\"subject_id\" = @subjectValue0");
         connection.Commands[3].CommandText.Should().Contain("\"created_at_utc\" < @cutoff");
         connection.Commands[3].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[3].Parameters["value0"].Value.Should().Be("beta-scrubbed");
         connection.Commands[3].Parameters["value1"].Value.Should().Be("command-per-row-2");
+    }
+
+    [Fact]
+    public async Task PreviewEraseAsync_Uses_An_Or_Subject_Predicate_When_Multiple_Subject_Matches_Are_Provided()
+    {
+        var tenantId = Guid.NewGuid();
+        var firstSubjectId = Guid.NewGuid();
+        var secondSubjectId = Guid.NewGuid();
+        var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        using var db = CreateCommandStrategyDbContext();
+        var strategy = new AnonymiseSweepStrategy(db);
+        var connection = new RecordingDbConnection();
+        var entry = new RetentionEntry(
+            typeof(AnonymisedContact),
+            "anonymised_contacts",
+            "anonymise",
+            nameof(AnonymisedContact.CreatedAt),
+            "CreatedAt",
+            new RecordIdConvention(nameof(AnonymisedContact.Id), "Id", typeof(Guid)),
+            [
+                new AnonymiseLiteralField(nameof(AnonymisedContact.EmailAddress), "EmailAddress", AnonymiseMethod.Null),
+                new AnonymiseLiteralField(nameof(AnonymisedContact.GivenName), "GivenName", AnonymiseMethod.EmptyString),
+                new AnonymiseLiteralField(
+                    nameof(AnonymisedContact.Surname),
+                    "Surname",
+                    AnonymiseMethod.FixedLiteral,
+                    "[redacted]"
+                ),
+            ],
+            new TenantConvention(nameof(AnonymisedContact.TenantId), "TenantId"),
+            null
+        );
+        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise);
+
+        var affected = await strategy.PreviewEraseAsync(
+            entry,
+            rule,
+            new ErasureSubjectPredicate(
+                [
+                    new ErasureSubjectMatch(nameof(AnonymisedContact.Id), "SubjectId", firstSubjectId),
+                    new ErasureSubjectMatch(nameof(AnonymisedContact.Id), "DelegateSubjectId", secondSubjectId),
+                ]
+            ),
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            now,
+            connection,
+            CancellationToken.None
+        );
+
+        affected.Should().Be(1);
+        connection.Commands.Should().ContainSingle();
+        connection.Commands[0].CommandText.Should().Contain(
+            "((target.\"SubjectId\" = @subjectValue0 OR target.\"DelegateSubjectId\" = @subjectValue1))"
+        );
+        connection.Commands[0].Parameters["subjectValue0"].Value.Should().Be(firstSubjectId);
+        connection.Commands[0].Parameters["subjectValue1"].Value.Should().Be(secondSubjectId);
+    }
+
+    [Fact]
+    public async Task EraseAsync_Uses_An_Or_Subject_Predicate_When_Multiple_Subject_Matches_Are_Provided()
+    {
+        var selectedId = Guid.NewGuid();
+        var heldId = Guid.NewGuid();
+        var tenantId = Guid.NewGuid();
+        var firstSubjectId = Guid.NewGuid();
+        var secondSubjectId = Guid.NewGuid();
+        var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        using var db = CreateCommandStrategyDbContext();
+        var strategy = new AnonymiseSweepStrategy(db);
+        var connection = new RecordingDbConnection();
+        connection.EnqueueResultSet(selectedId, heldId);
+        connection.EnqueueResultSet(selectedId);
+        var transaction = connection.BeginTransaction();
+        var entry = new RetentionEntry(
+            typeof(AnonymisedContact),
+            "anonymised_contacts",
+            "anonymise",
+            nameof(AnonymisedContact.CreatedAt),
+            "CreatedAt",
+            new RecordIdConvention(nameof(AnonymisedContact.Id), "Id", typeof(Guid)),
+            [
+                new AnonymiseLiteralField(nameof(AnonymisedContact.EmailAddress), "EmailAddress", AnonymiseMethod.Null),
+                new AnonymiseLiteralField(nameof(AnonymisedContact.GivenName), "GivenName", AnonymiseMethod.EmptyString),
+                new AnonymiseLiteralField(
+                    nameof(AnonymisedContact.Surname),
+                    "Surname",
+                    AnonymiseMethod.FixedLiteral,
+                    "[redacted]"
+                ),
+            ],
+            new TenantConvention(nameof(AnonymisedContact.TenantId), "TenantId"),
+            null
+        );
+        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise);
+
+        var affected = await strategy.EraseAsync(
+            entry,
+            rule,
+            new ErasureSubjectPredicate(
+                [
+                    new ErasureSubjectMatch(nameof(AnonymisedContact.Id), "SubjectId", firstSubjectId),
+                    new ErasureSubjectMatch(nameof(AnonymisedContact.Id), "DelegateSubjectId", secondSubjectId),
+                ]
+            ),
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            now,
+            connection,
+            transaction,
+            CancellationToken.None
+        );
+
+        affected.AffectedRecordIds.Should().Equal(selectedId.ToString());
+        connection.Commands[0].CommandText.Should().Contain(
+            "((target.\"SubjectId\" = @subjectValue0 OR target.\"DelegateSubjectId\" = @subjectValue1))"
+        );
+        connection.Commands[1].CommandText.Should().Contain(
+            "((target.\"SubjectId\" = @subjectValue0 OR target.\"DelegateSubjectId\" = @subjectValue1))"
+        );
+        connection.Commands[0].Parameters["subjectValue0"].Value.Should().Be(firstSubjectId);
+        connection.Commands[0].Parameters["subjectValue1"].Value.Should().Be(secondSubjectId);
+        connection.Commands[1].Parameters["subjectValue0"].Value.Should().Be(firstSubjectId);
+        connection.Commands[1].Parameters["subjectValue1"].Value.Should().Be(secondSubjectId);
     }
 
     private static CommandStrategyDbContext CreateCommandStrategyDbContext()

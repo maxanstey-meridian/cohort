@@ -273,7 +273,7 @@ public sealed class RetentionErasureService(
                 return new ErasureSubjectMatch(
                     subjectProperty.Name,
                     subjectColumn,
-                    ConvertSubjectValue(entry.EntityType, subjectProperty, scope.Subject)
+                    ConvertSubjectValue(entry.EntityType, subjectProperty, efProperty, scope.Subject)
                 );
             })
             .ToArray();
@@ -281,12 +281,18 @@ public sealed class RetentionErasureService(
         return new ErasureSubjectPredicate(matches);
     }
 
-    private static object ConvertSubjectValue(Type entityType, PropertyInfo property, object subject)
+    private static object ConvertSubjectValue(
+        Type entityType,
+        PropertyInfo property,
+        IProperty efProperty,
+        object subject
+    )
     {
         var targetType = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
         if (targetType.IsInstanceOfType(subject))
         {
-            return subject;
+            var converter = efProperty.GetTypeMapping().Converter;
+            return converter?.ConvertToProvider(subject) ?? subject;
         }
 
         throw new InvalidOperationException(

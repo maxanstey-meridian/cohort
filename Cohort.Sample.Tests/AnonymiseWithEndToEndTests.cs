@@ -1,4 +1,6 @@
+using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Hosting;
 using Cohort.Sample.Entities;
 
 using Microsoft.EntityFrameworkCore;
@@ -322,8 +324,129 @@ public sealed class AnonymiseWithEndToEndTests(PostgresFixture fixture)
         );
     }
 
+    [Fact]
+    public async Task Sweep_Path_With_Handlers_Preserves_FactoryBacked_Anonymisation_And_Loads_Original_Clr_Values()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.TombstoneRecords.AddRange(
+                new TombstoneRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectId = Guid.NewGuid(),
+                    CreatedAt = asOf.AddDays(-120),
+                    ExternalId = Guid.NewGuid(),
+                    DisplayName = "alpha",
+                    ContactEmail = "alpha@example.com",
+                    Notes = "handler-first",
+                },
+                new TombstoneRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectId = Guid.NewGuid(),
+                    CreatedAt = asOf.AddDays(-90),
+                    ExternalId = Guid.NewGuid(),
+                    DisplayName = "beta",
+                    ContactEmail = "beta@example.com",
+                    Notes = "handler-second",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        await using var dbContext = Host.CreateDbContext();
+        var connectionString = dbContext.Database.GetConnectionString()
+            ?? throw new InvalidOperationException("Expected sample db context to expose a connection string.");
+
+        using var handlerHost = new CohortTestHost(
+            connectionString,
+            configureServices: services =>
+            {
+                services.AddSingleton<FactoryBackedTombstoneHandlerSink>();
+                services.AddRowHandler<TombstoneRecord, FactoryBackedTombstoneHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(TombstoneRecord),
+                "tombstone-anonymise",
+                tenantId,
+                Strategy.Anonymise,
+                2
+            )
+        );
+
+        await using (var verify = Host.CreateDbContext())
+        {
+            var records = await verify.TombstoneRecords.OrderBy(record => record.Notes).ToListAsync();
+
+            records.Single(record => record.Notes == "handler-first").ExternalId.Should().Be(GuidTombstoneFactory.TombstoneValue);
+            records.Single(record => record.Notes == "handler-first").DisplayName.Should().Be("alpha-tombstone");
+            records.Single(record => record.Notes == "handler-first").ContactEmail.Should().BeNull();
+
+            records.Single(record => record.Notes == "handler-second").ExternalId.Should().Be(GuidTombstoneFactory.TombstoneValue);
+            records.Single(record => record.Notes == "handler-second").DisplayName.Should().Be("beta-tombstone");
+            records.Single(record => record.Notes == "handler-second").ContactEmail.Should().BeNull();
+        }
+
+        await handlerHost.RunWithServicesAsync(
+            serviceProvider =>
+            {
+                var sink = serviceProvider.GetRequiredService<FactoryBackedTombstoneHandlerSink>();
+                var guidFactory = serviceProvider.GetRequiredService<GuidTombstoneFactory>();
+                var originalValueFactory = serviceProvider.GetRequiredService<OriginalValueTombstoneFactory>();
+
+                sink.BeforeDisplayNames.Should().Equal("alpha", "beta");
+
+                guidFactory.Contexts.Should().ContainSingle();
+                guidFactory.Contexts[0].OriginalValue.Should().BeNull();
+                guidFactory.Contexts[0].MemberName.Should().Be(nameof(TombstoneRecord.ExternalId));
+                guidFactory.Contexts[0].TenantId.Should().Be(tenantId);
+
+                originalValueFactory.Contexts.Should().HaveCount(2);
+                originalValueFactory.Contexts.Select(context => context.OriginalValue)
+                    .Should()
+                    .BeEquivalentTo(new object?[] { "alpha", "beta" });
+                originalValueFactory.Contexts.Select(context => context.MemberName)
+                    .Should()
+                    .OnlyContain(memberName => memberName == nameof(TombstoneRecord.DisplayName));
+                originalValueFactory.Contexts.Select(context => context.TenantId)
+                    .Should()
+                    .OnlyContain(currentTenantId => currentTenantId == tenantId);
+
+                return Task.CompletedTask;
+            }
+        );
+    }
+
     private static DateTimeOffset EligibleErasureCreatedAt(DateTimeOffset asOf)
     {
         return asOf.AddDays(-45);
+    }
+}
+
+file sealed class FactoryBackedTombstoneHandlerSink
+{
+    public List<string> BeforeDisplayNames { get; } = [];
+}
+
+file sealed class FactoryBackedTombstoneHandler(FactoryBackedTombstoneHandlerSink sink)
+    : IRetentionHandler<TombstoneRecord>
+{
+    public Task OnBeforeAsync(TombstoneRecord row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        sink.BeforeDisplayNames.Add(row.DisplayName);
+        return Task.CompletedTask;
     }
 }

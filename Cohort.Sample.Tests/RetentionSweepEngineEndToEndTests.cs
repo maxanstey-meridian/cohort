@@ -461,7 +461,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         public Task<int> PreviewEraseAsync(
             RetentionEntry entry,
             RetentionRule rule,
-            ErasureSubjectMatch match,
+            ErasureSubjectPredicate predicate,
             TenantContext tenant,
             DateTimeOffset now,
             DbConnection conn,
@@ -474,7 +474,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         public Task<SweepExecutionResult> EraseAsync(
             RetentionEntry entry,
             RetentionRule rule,
-            ErasureSubjectMatch match,
+            ErasureSubjectPredicate predicate,
             TenantContext tenant,
             DateTimeOffset now,
             DbConnection conn,

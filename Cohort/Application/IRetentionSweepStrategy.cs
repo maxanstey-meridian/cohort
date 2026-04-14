@@ -29,7 +29,7 @@ public interface IRetentionSweepStrategy
     public Task<int> PreviewEraseAsync(
         RetentionEntry entry,
         RetentionRule rule,
-        ErasureSubjectMatch match,
+        ErasureSubjectPredicate predicate,
         TenantContext tenant,
         DateTimeOffset now,
         DbConnection conn,
@@ -39,7 +39,7 @@ public interface IRetentionSweepStrategy
     public Task<SweepExecutionResult> EraseAsync(
         RetentionEntry entry,
         RetentionRule rule,
-        ErasureSubjectMatch match,
+        ErasureSubjectPredicate predicate,
         TenantContext tenant,
         DateTimeOffset now,
         DbConnection conn,
@@ -57,5 +57,24 @@ public sealed record SweepExecutionResult(
 );
 
 public sealed record SweepMutationContext(Guid SweepId, DateTimeOffset At);
+
+public sealed record ErasureSubjectPredicate
+{
+    public ErasureSubjectPredicate(IReadOnlyList<ErasureSubjectMatch> matches)
+    {
+        ArgumentNullException.ThrowIfNull(matches);
+        if (matches.Count == 0)
+        {
+            throw new ArgumentException(
+                "Erasure subject predicates must contain at least one subject match.",
+                nameof(matches)
+            );
+        }
+
+        Matches = matches;
+    }
+
+    public IReadOnlyList<ErasureSubjectMatch> Matches { get; }
+}
 
 public sealed record ErasureSubjectMatch(string SubjectMember, string SubjectColumn, object SubjectValue);

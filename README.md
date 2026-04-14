@@ -146,7 +146,7 @@ Priority: attribute > global config > built-in default.
 
 ## Right-to-erasure (Art. 17)
 
-Mark the subject identifier with `[ErasureSubject]`:
+Mark one or more subject identifiers with `[ErasureSubject]`:
 
 ```csharp
 [Retain("user-data", nameof(CreatedAt))]
@@ -158,6 +158,9 @@ public sealed class UserRecord
 
     [ErasureSubject]
     public Guid UserId { get; set; }
+
+    [ErasureSubject]
+    public Guid? DelegateUserId { get; set; }
 }
 ```
 
@@ -167,9 +170,11 @@ Then trigger erasure:
 var result = await erasureService.EraseAsync(tenant, new ErasureScope(userId), DateTimeOffset.UtcNow);
 ```
 
+You can mark multiple `[ErasureSubject]` properties on the same entity. Any marked subject column equals the requested subject is treated as an erasure match.
+
 Cohort only erases rows that satisfy both conditions:
 
-1. The row matches the requested `[ErasureSubject]`.
+1. Any marked subject column equals the requested subject.
 2. The row is already past the effective retention cutoff for its category (`max(Period, LegalMin)`).
 
 Active holds still block erasure, and tenant-scoped entities still keep the tenant predicate in the SQL. Cohort does not use right-to-erasure to bypass the retention window.

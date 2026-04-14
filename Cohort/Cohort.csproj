@@ -3,7 +3,7 @@
   <PropertyGroup>
     <RootNamespace>Cohort</RootNamespace>
     <PackageId>Cohort</PackageId>
-    <Version>0.2.0</Version>
+    <Version>0.3.0</Version>
     <Authors>Max Anstey</Authors>
     <Description>Annotation-driven GDPR retention for EF Core. Purge, soft-delete, or anonymise rows past their retention period.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

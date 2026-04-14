@@ -10,6 +10,7 @@ using Cohort.Sample.Entities;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 
 using Npgsql;
 
@@ -1378,6 +1379,142 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Erasure_Service_Skips_Subjectless_Entities_And_Produces_A_Single_Match_Predicate()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        await using var db = CreatePredicateResolutionDbContext<SinglePredicateResolutionDbContext>(
+            database.ConnectionString
+        );
+        await db.Database.EnsureCreatedAsync();
+
+        var strategy = new PredicateCapturingSweepStrategy();
+        var service = CreatePredicateResolutionService(
+            db,
+            strategy,
+            new StaticCategoryRepository(
+                new Dictionary<string, IRetentionRuleResolver>
+                {
+                    ["single-subject-erasure"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    ),
+                    ["subjectless-erasure"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    ),
+                }
+            )
+        );
+
+        var result = await service.EraseAsync(
+            new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
+            new ErasureScope(Guid.Parse("11111111-1111-1111-1111-111111111111")),
+            new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero)
+        );
+
+        strategy.CapturedPredicates.Should().HaveCount(1);
+        strategy.CapturedPredicates[0].Matches.Should().ContainSingle();
+        strategy
+            .CapturedPredicates[0]
+            .Matches[0]
+            .Should()
+            .Be(
+                new ErasureSubjectMatch(
+                    nameof(SingleSubjectPredicateRecord.CustomerReference),
+                    "external_subject_key",
+                    Guid.Parse("11111111-1111-1111-1111-111111111111")
+                )
+            );
+        result.Counts.Should().ContainSingle(count => count.Category == "single-subject-erasure");
+        result.Counts.Should().NotContain(count => count.Category == "subjectless-erasure");
+    }
+
+    [Fact]
+    public async Task Erasure_Service_Produces_A_Multi_Match_Predicate_For_Compatible_Subject_Metadata()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        await using var db = CreatePredicateResolutionDbContext<MultiPredicateResolutionDbContext>(
+            database.ConnectionString
+        );
+        await db.Database.EnsureCreatedAsync();
+
+        var strategy = new PredicateCapturingSweepStrategy();
+        var service = CreatePredicateResolutionService(
+            db,
+            strategy,
+            new StaticCategoryRepository(
+                new Dictionary<string, IRetentionRuleResolver>
+                {
+                    ["multi-subject-erasure"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    ),
+                }
+            )
+        );
+        var subjectId = Guid.Parse("22222222-2222-2222-2222-222222222222");
+
+        await service.EraseAsync(
+            new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
+            new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero)
+        );
+
+        strategy.CapturedPredicates.Should().HaveCount(1);
+        strategy
+            .CapturedPredicates[0]
+            .Matches.Should()
+            .Equal(
+                new ErasureSubjectMatch(
+                    nameof(MultiSubjectPredicateRecord.DelegateSubjectId),
+                    "delegate_subject_id",
+                    subjectId
+                ),
+                new ErasureSubjectMatch(
+                    nameof(MultiSubjectPredicateRecord.PrimarySubjectId),
+                    "primary_subject_id",
+                    subjectId
+                )
+            );
+    }
+
+    [Fact]
+    public async Task Erasure_Service_Fails_When_Multi_Subject_Metadata_Uses_Incompatible_Effective_Types()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        await using var db = CreatePredicateResolutionDbContext<IncompatiblePredicateResolutionDbContext>(
+            database.ConnectionString
+        );
+        await db.Database.EnsureCreatedAsync();
+
+        var strategy = new PredicateCapturingSweepStrategy();
+        var service = CreatePredicateResolutionService(
+            db,
+            strategy,
+            new StaticCategoryRepository(
+                new Dictionary<string, IRetentionRuleResolver>
+                {
+                    ["incompatible-multi-subject-erasure"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    ),
+                }
+            )
+        );
+
+        var act = () =>
+            service.EraseAsync(
+                new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
+                new ErasureScope(Guid.Parse("33333333-3333-3333-3333-333333333333")),
+                new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero)
+            );
+
+        await act
+            .Should()
+            .ThrowAsync<InvalidOperationException>()
+            .WithMessage(
+                "*incompatible [ErasureSubject] properties*AlternateSubjectId:String*PrimarySubjectId:Guid*"
+            );
+        strategy.CapturedPredicates.Should().BeEmpty();
+    }
+
+    [Fact]
     public async Task Erase_Path_Converts_SetBased_Factory_Output_To_Provider_Values_Before_Writing()
     {
         await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
@@ -1967,6 +2104,38 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             ?? throw new InvalidOperationException($"Could not resolve entity type '{entityType}'.");
     }
 
+    private static TContext CreatePredicateResolutionDbContext<TContext>(string connectionString)
+        where TContext : DbContext
+    {
+        var options = new DbContextOptionsBuilder<TContext>().UseNpgsql(connectionString).Options;
+        return (TContext)Activator.CreateInstance(typeof(TContext), options)!;
+    }
+
+    private static RetentionErasureService CreatePredicateResolutionService(
+        DbContext db,
+        IRetentionSweepStrategy strategy,
+        IRetentionCategoryRepository repository
+    )
+    {
+        var registry = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions()));
+        var validator = new RetentionStartupValidator(
+            db,
+            repository,
+            new RetentionEntryBuilder(new CohortConventions()),
+            []
+        );
+
+        return new RetentionErasureService(
+            db,
+            registry,
+            repository,
+            validator,
+            new NoOpRetentionAuditWriter(),
+            [strategy],
+            new StaticOptionsMonitor<CohortOptions>(new CohortOptions())
+        );
+    }
+
     private static SummaryProjection ProjectSummary(SweepRunEntitySummaryRow summary)
     {
         return new SummaryProjection(
@@ -2039,6 +2208,81 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         int HeldCount,
         int SkippedCount
     );
+
+    private sealed class StaticOptionsMonitor<T>(T currentValue) : IOptionsMonitor<T>
+    {
+        public T CurrentValue => currentValue;
+
+        public T Get(string? name)
+        {
+            return currentValue;
+        }
+
+        public IDisposable? OnChange(Action<T, string?> listener)
+        {
+            return null;
+        }
+    }
+
+    private sealed class PredicateCapturingSweepStrategy : IRetentionSweepStrategy
+    {
+        public Strategy HandlesStrategy => Strategy.Purge;
+        public List<ErasureSubjectPredicate> CapturedPredicates { get; } = [];
+
+        public Task<int> PreviewAsync(
+            RetentionEntry entry,
+            RetentionRule rule,
+            RetentionResolutionContext ctx,
+            DbConnection conn,
+            CancellationToken ct
+        )
+        {
+            throw new NotSupportedException();
+        }
+
+        public Task<SweepExecutionResult> SweepAsync(
+            RetentionEntry entry,
+            RetentionRule rule,
+            RetentionResolutionContext ctx,
+            DbConnection conn,
+            DbTransaction transaction,
+            CancellationToken ct,
+            SweepMutationContext? execution = null
+        )
+        {
+            throw new NotSupportedException();
+        }
+
+        public Task<int> PreviewEraseAsync(
+            RetentionEntry entry,
+            RetentionRule rule,
+            ErasureSubjectPredicate predicate,
+            TenantContext tenant,
+            DateTimeOffset now,
+            DbConnection conn,
+            CancellationToken ct
+        )
+        {
+            CapturedPredicates.Add(predicate);
+            return Task.FromResult(0);
+        }
+
+        public Task<SweepExecutionResult> EraseAsync(
+            RetentionEntry entry,
+            RetentionRule rule,
+            ErasureSubjectPredicate predicate,
+            TenantContext tenant,
+            DateTimeOffset now,
+            DbConnection conn,
+            DbTransaction transaction,
+            CancellationToken ct,
+            SweepMutationContext? execution = null
+        )
+        {
+            CapturedPredicates.Add(predicate);
+            return Task.FromResult(new SweepExecutionResult([], 0));
+        }
+    }
 
     private string GetConnectionString()
     {
@@ -2334,6 +2578,123 @@ internal sealed class AliasSubjectFixtureRecord
 
     public DateTimeOffset CreatedAt { get; set; }
     public string Body { get; set; } = "";
+}
+
+internal sealed class SinglePredicateResolutionDbContext(
+    DbContextOptions<SinglePredicateResolutionDbContext> options
+) : DbContext(options)
+{
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<SingleSubjectPredicateRecord>(builder =>
+        {
+            builder.ToTable("single_subject_predicate_records");
+            builder.HasKey(record => record.Id);
+            builder.Property(record => record.TenantId).HasColumnName("tenant_id");
+            builder.Property(record => record.CustomerReference).HasColumnName("external_subject_key");
+            builder.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+        });
+
+        modelBuilder.Entity<SubjectlessPredicateRecord>(builder =>
+        {
+            builder.ToTable("subjectless_predicate_records");
+            builder.HasKey(record => record.Id);
+            builder.Property(record => record.TenantId).HasColumnName("tenant_id");
+            builder.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+        });
+
+        modelBuilder.ConfigureCohortTables();
+    }
+}
+
+[Retain("single-subject-erasure", nameof(CreatedAt))]
+internal sealed class SingleSubjectPredicateRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+
+    [ErasureSubject]
+    public Guid? CustomerReference { get; set; }
+
+    public DateTimeOffset CreatedAt { get; set; }
+}
+
+[Retain("subjectless-erasure", nameof(CreatedAt))]
+internal sealed class SubjectlessPredicateRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+}
+
+internal sealed class MultiPredicateResolutionDbContext(
+    DbContextOptions<MultiPredicateResolutionDbContext> options
+) : DbContext(options)
+{
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<MultiSubjectPredicateRecord>(builder =>
+        {
+            builder.ToTable("multi_subject_predicate_records");
+            builder.HasKey(record => record.Id);
+            builder.Property(record => record.TenantId).HasColumnName("tenant_id");
+            builder.Property(record => record.PrimarySubjectId).HasColumnName("primary_subject_id");
+            builder.Property(record => record.DelegateSubjectId).HasColumnName("delegate_subject_id");
+            builder.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+        });
+
+        modelBuilder.ConfigureCohortTables();
+    }
+}
+
+[Retain("multi-subject-erasure", nameof(CreatedAt))]
+internal sealed class MultiSubjectPredicateRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+
+    [ErasureSubject]
+    public Guid? PrimarySubjectId { get; set; }
+
+    [ErasureSubject]
+    public Guid? DelegateSubjectId { get; set; }
+
+    public DateTimeOffset CreatedAt { get; set; }
+}
+
+internal sealed class IncompatiblePredicateResolutionDbContext(
+    DbContextOptions<IncompatiblePredicateResolutionDbContext> options
+) : DbContext(options)
+{
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<IncompatibleMultiSubjectPredicateRecord>(builder =>
+        {
+            builder.ToTable("incompatible_multi_subject_predicate_records");
+            builder.HasKey(record => record.Id);
+            builder.Property(record => record.TenantId).HasColumnName("tenant_id");
+            builder.Property(record => record.PrimarySubjectId).HasColumnName("primary_subject_id");
+            builder.Property(record => record.AlternateSubjectId).HasColumnName("alternate_subject_id");
+            builder.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
+        });
+
+        modelBuilder.ConfigureCohortTables();
+    }
+}
+
+[Retain("incompatible-multi-subject-erasure", nameof(CreatedAt))]
+internal sealed class IncompatibleMultiSubjectPredicateRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+
+    [ErasureSubject]
+    public Guid? PrimarySubjectId { get; set; }
+
+    [ErasureSubject]
+    public string AlternateSubjectId { get; set; } = "";
+
+    public DateTimeOffset CreatedAt { get; set; }
 }
 
 internal sealed class TemporaryDatabase(string connectionString, string databaseName) : IAsyncDisposable

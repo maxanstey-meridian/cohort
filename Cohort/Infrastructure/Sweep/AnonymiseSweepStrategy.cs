@@ -90,7 +90,7 @@ public sealed class AnonymiseSweepStrategy(
     public async Task<int> PreviewEraseAsync(
         RetentionEntry entry,
         RetentionRule rule,
-        ErasureSubjectMatch match,
+        ErasureSubjectPredicate predicate,
         TenantContext tenant,
         DateTimeOffset now,
         DbConnection conn,
@@ -99,10 +99,11 @@ public sealed class AnonymiseSweepStrategy(
     {
         ArgumentNullException.ThrowIfNull(entry);
         ArgumentNullException.ThrowIfNull(rule);
-        ArgumentNullException.ThrowIfNull(match);
+        ArgumentNullException.ThrowIfNull(predicate);
         ArgumentNullException.ThrowIfNull(tenant);
         ArgumentNullException.ThrowIfNull(conn);
 
+        var match = RequireSingleSubjectMatch(predicate);
         var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
         return await PreviewMutationCountAsync(
             entry,
@@ -122,7 +123,7 @@ public sealed class AnonymiseSweepStrategy(
     public async Task<SweepExecutionResult> EraseAsync(
         RetentionEntry entry,
         RetentionRule rule,
-        ErasureSubjectMatch match,
+        ErasureSubjectPredicate predicate,
         TenantContext tenant,
         DateTimeOffset now,
         DbConnection conn,
@@ -133,11 +134,12 @@ public sealed class AnonymiseSweepStrategy(
     {
         ArgumentNullException.ThrowIfNull(entry);
         ArgumentNullException.ThrowIfNull(rule);
-        ArgumentNullException.ThrowIfNull(match);
+        ArgumentNullException.ThrowIfNull(predicate);
         ArgumentNullException.ThrowIfNull(tenant);
         ArgumentNullException.ThrowIfNull(conn);
         ArgumentNullException.ThrowIfNull(transaction);
 
+        var match = RequireSingleSubjectMatch(predicate);
         var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
         return await ExecuteMutationAsync(
             entry,
@@ -1067,6 +1069,20 @@ public sealed class AnonymiseSweepStrategy(
     private static string QuoteIdentifier(string identifier)
     {
         return $"\"{identifier.Replace("\"", "\"\"")}\"";
+    }
+
+    private static ErasureSubjectMatch RequireSingleSubjectMatch(
+        ErasureSubjectPredicate predicate
+    )
+    {
+        if (predicate.Matches.Count != 1)
+        {
+            throw new InvalidOperationException(
+                $"AnonymiseSweepStrategy requires exactly one erasure subject match in this release. Received {predicate.Matches.Count}."
+            );
+        }
+
+        return predicate.Matches[0];
     }
 
     private static void ValidateEntry(

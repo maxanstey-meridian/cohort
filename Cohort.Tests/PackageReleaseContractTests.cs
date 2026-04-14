@@ -24,6 +24,7 @@ public sealed class PackageReleaseContractTests
     {
         Changelog.Value.Should().Contain("Startup tenant enforcement is now fail-closed");
         Changelog.Value.Should().Contain("effective retention cutoff");
+        Changelog.Value.Should().Contain("multiple `[ErasureSubject]` properties");
         Changelog.Value.Should().Contain("RetentionRowDispatcher");
         Changelog.Value.Should().NotContain("Upgrade notes");
         Changelog.Value.Should().NotContain("upgrading from `0.1.1`");
@@ -36,6 +37,7 @@ public sealed class PackageReleaseContractTests
         Changelog.Value.Should().Contain("Restore the packed version into a clean consumer.");
         Changelog.Value.Should().Contain("AnonymiseWithAttribute");
         Changelog.Value.Should().Contain("IRetentionSweepStrategy.PreviewEraseAsync(...)");
+        Changelog.Value.Should().Contain("ErasureSubjectPredicate");
         Changelog.Value.Should().Contain("IRetentionRowDispatcher");
         Changelog.Value.Should().NotContain("Regenerate your host migration against the `0.2.0` package");
         Changelog.Value.Should().NotContain("Apply that migration before booting the new package version");
@@ -117,11 +119,12 @@ public sealed class PackageReleaseContractTests
                 var dispatcher = provider.GetRequiredService<IRetentionRowDispatcher>();
 
                 _ = PreviewEraseSignature(
-                    (strategy, entry, rule, match, tenant, now, conn, ct) =>
-                        strategy.PreviewEraseAsync(entry, rule, match, tenant, now, conn, ct)
+                    (strategy, entry, rule, predicate, tenant, now, conn, ct) =>
+                        strategy.PreviewEraseAsync(entry, rule, predicate, tenant, now, conn, ct)
                 );
 
                 Console.WriteLine(typeof(AnonymiseWithAttribute).FullName);
+                Console.WriteLine(typeof(ErasureSubjectPredicate).FullName);
                 Console.WriteLine(typeof(IRetentionSweepStrategy).FullName);
                 Console.WriteLine(dispatcher.GetType().FullName);
 
@@ -132,7 +135,7 @@ public sealed class PackageReleaseContractTests
                         IRetentionSweepStrategy,
                         RetentionEntry,
                         RetentionRule,
-                        ErasureSubjectMatch,
+                        ErasureSubjectPredicate,
                         TenantContext,
                         DateTimeOffset,
                         DbConnection,
@@ -203,6 +206,7 @@ public sealed class PackageReleaseContractTests
             );
 
             run.Should().Contain(typeof(AnonymiseWithAttribute).FullName);
+            run.Should().Contain(typeof(ErasureSubjectPredicate).FullName);
             run.Should().Contain(typeof(IRetentionSweepStrategy).FullName);
             run.Should().Contain("RetentionRowDispatcher");
         }
@@ -283,6 +287,8 @@ public sealed class PackageReleaseContractTests
             {
                 readme = reader.ReadToEnd();
             }
+            readme.Should().Contain("multiple `[ErasureSubject]` properties");
+            readme.Should().Contain("Any marked subject column equals the requested subject");
 
             string nuspec;
             using (var reader = new StreamReader(nuspecEntry.Open()))

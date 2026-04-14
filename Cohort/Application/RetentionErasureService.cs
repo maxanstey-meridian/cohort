@@ -42,7 +42,7 @@ public sealed class RetentionErasureService(
             RetentionEntry Entry,
             RetentionResolutionContext Context,
             RetentionRule Rule,
-            ErasureSubjectMatch Match
+            ErasureSubjectPredicate Predicate
         )>();
         var auditEvents = new List<SweepEvent>();
 
@@ -52,8 +52,8 @@ public sealed class RetentionErasureService(
                 .Values.OrderBy(entry => entry.EntityType.FullName, StringComparer.Ordinal)
         )
         {
-            var match = ResolveMatch(entry, scope);
-            if (match is null)
+            var predicate = ResolveMatch(entry, scope);
+            if (predicate is null)
             {
                 continue;
             }
@@ -75,7 +75,7 @@ public sealed class RetentionErasureService(
                 );
             }
 
-            executionPlan.Add((entry, context, rule, match));
+            executionPlan.Add((entry, context, rule, predicate));
         }
 
         var connection = db.Database.GetDbConnection();
@@ -102,7 +102,7 @@ public sealed class RetentionErasureService(
                 ct
             );
 
-            foreach (var (entry, context, rule, match) in executionPlan)
+            foreach (var (entry, context, rule, predicate) in executionPlan)
             {
                 var eventAt = DateTimeOffset.UtcNow;
                 var resolvedPeriod = CutoffCalculator.ResolveEffectivePeriod(rule.Period, rule.LegalMin);
@@ -114,7 +114,7 @@ public sealed class RetentionErasureService(
                         await strategies[rule.Strategy].PreviewEraseAsync(
                             entry,
                             rule,
-                            match,
+                            predicate,
                             tenant,
                             now,
                             connection,
@@ -125,7 +125,7 @@ public sealed class RetentionErasureService(
                         await strategies[rule.Strategy].EraseAsync(
                             entry,
                             rule,
-                            match,
+                            predicate,
                             tenant,
                             now,
                             connection,
@@ -221,11 +221,12 @@ public sealed class RetentionErasureService(
         return CreateResult(auditEvents, scope);
     }
 
-    private ErasureSubjectMatch? ResolveMatch(RetentionEntry entry, ErasureScope scope)
+    private ErasureSubjectPredicate? ResolveMatch(RetentionEntry entry, ErasureScope scope)
     {
         var subjectProperties = entry.EntityType
             .GetProperties(BindingFlags.Public | BindingFlags.Instance)
             .Where(property => property.IsDefined(typeof(ErasureSubjectAttribute), inherit: false))
+            .OrderBy(property => property.Name, StringComparer.Ordinal)
             .ToArray();
 
         if (subjectProperties.Length == 0)
@@ -233,14 +234,6 @@ public sealed class RetentionErasureService(
             return null;
         }
 
-        if (subjectProperties.Length > 1)
-        {
-            throw new InvalidOperationException(
-                $"Entity {entry.EntityType.FullName} defines multiple [ErasureSubject] properties. Exactly one is required."
-            );
-        }
-
-        var subjectProperty = subjectProperties[0];
         var entityType =
             db.Model.FindEntityType(entry.EntityType)
             ?? throw new InvalidOperationException(
@@ -251,22 +244,41 @@ public sealed class RetentionErasureService(
             ?? throw new InvalidOperationException(
                 $"Entity {entry.EntityType.FullName} does not have a mapped table for erasure."
             );
-        var efProperty =
-            entityType.FindProperty(subjectProperty.Name)
-            ?? throw new InvalidOperationException(
-                $"[ErasureSubject] on {entry.EntityType.FullName}.{subjectProperty.Name}: property is not mapped by EF."
-            );
-        var subjectColumn =
-            efProperty.GetColumnName(storeObject)
-            ?? throw new InvalidOperationException(
-                $"[ErasureSubject] on {entry.EntityType.FullName}.{subjectProperty.Name}: property has no mapped table column."
-            );
 
-        return new ErasureSubjectMatch(
-            subjectProperty.Name,
-            subjectColumn,
-            ConvertSubjectValue(entry.EntityType, subjectProperty, scope.Subject)
-        );
+        var effectiveTypes = subjectProperties
+            .Select(property => Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType)
+            .Distinct()
+            .ToArray();
+        if (effectiveTypes.Length > 1)
+        {
+            throw new InvalidOperationException(
+                $"Entity {entry.EntityType.FullName} defines incompatible [ErasureSubject] properties. All marked properties must share the same effective CLR type after nullable unwrapping. Found: {string.Join(", ", subjectProperties.Select(property => $"{property.Name}:{(Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType).Name}"))}."
+            );
+        }
+
+        var matches = subjectProperties
+            .Select(subjectProperty =>
+            {
+                var efProperty =
+                    entityType.FindProperty(subjectProperty.Name)
+                    ?? throw new InvalidOperationException(
+                        $"[ErasureSubject] on {entry.EntityType.FullName}.{subjectProperty.Name}: property is not mapped by EF."
+                    );
+                var subjectColumn =
+                    efProperty.GetColumnName(storeObject)
+                    ?? throw new InvalidOperationException(
+                        $"[ErasureSubject] on {entry.EntityType.FullName}.{subjectProperty.Name}: property has no mapped table column."
+                    );
+
+                return new ErasureSubjectMatch(
+                    subjectProperty.Name,
+                    subjectColumn,
+                    ConvertSubjectValue(entry.EntityType, subjectProperty, scope.Subject)
+                );
+            })
+            .ToArray();
+
+        return new ErasureSubjectPredicate(matches);
     }
 
     private static object ConvertSubjectValue(Type entityType, PropertyInfo property, object subject)

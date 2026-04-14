@@ -377,7 +377,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
     public async Task<int> PreviewEraseAsync(
         RetentionEntry entry,
         RetentionRule rule,
-        ErasureSubjectMatch match,
+        ErasureSubjectPredicate predicate,
         TenantContext tenant,
         DateTimeOffset now,
         DbConnection conn,
@@ -386,7 +386,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
     {
         ArgumentNullException.ThrowIfNull(entry);
         ArgumentNullException.ThrowIfNull(rule);
-        ArgumentNullException.ThrowIfNull(match);
+        ArgumentNullException.ThrowIfNull(predicate);
         ArgumentNullException.ThrowIfNull(tenant);
         ArgumentNullException.ThrowIfNull(conn);
 
@@ -396,6 +396,8 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
                 $"PurgeSweepStrategy cannot execute {rule.Strategy} rules."
             );
         }
+
+        var match = RequireSingleSubjectMatch(predicate);
 
         if (conn.State != ConnectionState.Open)
         {
@@ -449,7 +451,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
     public async Task<SweepExecutionResult> EraseAsync(
         RetentionEntry entry,
         RetentionRule rule,
-        ErasureSubjectMatch match,
+        ErasureSubjectPredicate predicate,
         TenantContext tenant,
         DateTimeOffset now,
         DbConnection conn,
@@ -460,7 +462,7 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
     {
         ArgumentNullException.ThrowIfNull(entry);
         ArgumentNullException.ThrowIfNull(rule);
-        ArgumentNullException.ThrowIfNull(match);
+        ArgumentNullException.ThrowIfNull(predicate);
         ArgumentNullException.ThrowIfNull(tenant);
         ArgumentNullException.ThrowIfNull(conn);
         ArgumentNullException.ThrowIfNull(transaction);
@@ -471,6 +473,8 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
                 $"PurgeSweepStrategy cannot execute {rule.Strategy} rules."
             );
         }
+
+        var match = RequireSingleSubjectMatch(predicate);
 
         if (conn.State != ConnectionState.Open)
         {
@@ -694,5 +698,19 @@ public sealed class PurgeSweepStrategy(DbContext? db = null, IServiceProvider? s
     private static string QuoteIdentifier(string identifier)
     {
         return $"\"{identifier.Replace("\"", "\"\"")}\"";
+    }
+
+    private static ErasureSubjectMatch RequireSingleSubjectMatch(
+        ErasureSubjectPredicate predicate
+    )
+    {
+        if (predicate.Matches.Count != 1)
+        {
+            throw new InvalidOperationException(
+                $"PurgeSweepStrategy requires exactly one erasure subject match in this release. Received {predicate.Matches.Count}."
+            );
+        }
+
+        return predicate.Matches[0];
     }
 }

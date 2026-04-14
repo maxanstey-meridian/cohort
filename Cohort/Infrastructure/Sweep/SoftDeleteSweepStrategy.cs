@@ -414,7 +414,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
     public async Task<int> PreviewEraseAsync(
         RetentionEntry entry,
         RetentionRule rule,
-        ErasureSubjectMatch match,
+        ErasureSubjectPredicate predicate,
         TenantContext tenant,
         DateTimeOffset now,
         DbConnection conn,
@@ -423,7 +423,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
     {
         ArgumentNullException.ThrowIfNull(entry);
         ArgumentNullException.ThrowIfNull(rule);
-        ArgumentNullException.ThrowIfNull(match);
+        ArgumentNullException.ThrowIfNull(predicate);
         ArgumentNullException.ThrowIfNull(tenant);
         ArgumentNullException.ThrowIfNull(conn);
 
@@ -433,6 +433,8 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
                 $"SoftDeleteSweepStrategy cannot execute {rule.Strategy} rules."
             );
         }
+
+        var match = RequireSingleSubjectMatch(predicate);
 
         var softDelete = entry.SoftDelete
             ?? throw new InvalidOperationException(
@@ -493,7 +495,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
     public async Task<SweepExecutionResult> EraseAsync(
         RetentionEntry entry,
         RetentionRule rule,
-        ErasureSubjectMatch match,
+        ErasureSubjectPredicate predicate,
         TenantContext tenant,
         DateTimeOffset now,
         DbConnection conn,
@@ -504,7 +506,7 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
     {
         ArgumentNullException.ThrowIfNull(entry);
         ArgumentNullException.ThrowIfNull(rule);
-        ArgumentNullException.ThrowIfNull(match);
+        ArgumentNullException.ThrowIfNull(predicate);
         ArgumentNullException.ThrowIfNull(tenant);
         ArgumentNullException.ThrowIfNull(conn);
         ArgumentNullException.ThrowIfNull(transaction);
@@ -515,6 +517,8 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
                 $"SoftDeleteSweepStrategy cannot execute {rule.Strategy} rules."
             );
         }
+
+        var match = RequireSingleSubjectMatch(predicate);
 
         var softDelete = entry.SoftDelete
             ?? throw new InvalidOperationException(
@@ -871,5 +875,19 @@ public sealed class SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvid
     private static string QuoteIdentifier(string identifier)
     {
         return $"\"{identifier.Replace("\"", "\"\"")}\"";
+    }
+
+    private static ErasureSubjectMatch RequireSingleSubjectMatch(
+        ErasureSubjectPredicate predicate
+    )
+    {
+        if (predicate.Matches.Count != 1)
+        {
+            throw new InvalidOperationException(
+                $"SoftDeleteSweepStrategy requires exactly one erasure subject match in this release. Received {predicate.Matches.Count}."
+            );
+        }
+
+        return predicate.Matches[0];
     }
 }

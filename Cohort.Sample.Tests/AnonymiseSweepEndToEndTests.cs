@@ -1189,7 +1189,9 @@ public sealed class AnonymiseSweepStrategyCommandTests
         var affected = await strategy.PreviewEraseAsync(
             entry,
             rule,
-            new ErasureSubjectMatch(nameof(AnonymisedContact.Id), "SubjectId", subjectId),
+            new ErasureSubjectPredicate(
+                [new ErasureSubjectMatch(nameof(AnonymisedContact.Id), "SubjectId", subjectId)]
+            ),
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
             now,
             connection,
@@ -1254,7 +1256,9 @@ public sealed class AnonymiseSweepStrategyCommandTests
         var affected = await strategy.EraseAsync(
             entry,
             rule,
-            new ErasureSubjectMatch(nameof(AnonymisedContact.Id), "SubjectId", subjectId),
+            new ErasureSubjectPredicate(
+                [new ErasureSubjectMatch(nameof(AnonymisedContact.Id), "SubjectId", subjectId)]
+            ),
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
             now,
             connection,
@@ -1374,7 +1378,9 @@ public sealed class AnonymiseSweepStrategyCommandTests
         var affected = await strategy.EraseAsync(
             entry,
             rule,
-            new ErasureSubjectMatch("SubjectId", "subject_id", subjectId),
+            new ErasureSubjectPredicate(
+                [new ErasureSubjectMatch("SubjectId", "subject_id", subjectId)]
+            ),
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
             now,
             connection,

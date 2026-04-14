@@ -239,6 +239,89 @@ public sealed class AnonymiseWithEndToEndTests(PostgresFixture fixture)
         );
     }
 
+    [Fact]
+    public async Task Erasure_DryRun_Does_Not_Mutate_FactoryBacked_Anonymisation_On_TombstoneRecord()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+
+        Guid recordId;
+        Guid externalId;
+
+        await using (var db = Host.CreateDbContext())
+        {
+            recordId = Guid.NewGuid();
+            externalId = Guid.NewGuid();
+
+            db.TombstoneRecords.Add(
+                new TombstoneRecord
+                {
+                    Id = recordId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
+                    ExternalId = externalId,
+                    DisplayName = "dry-run-target",
+                    ContactEmail = "dry-run-target@example.com",
+                    Notes = "dry-run-target",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        await using var dbContext = Host.CreateDbContext();
+        var connectionString = dbContext.Database.GetConnectionString()
+            ?? throw new InvalidOperationException("Expected sample db context to expose a connection string.");
+
+        using var dryRunHost = new CohortTestHost(
+            connectionString,
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{Cohort.Hosting.CohortOptions.SectionName}:DryRun"] = "true",
+            }
+        );
+
+        var result = await dryRunHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId),
+            asOf
+        );
+
+        result.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(TombstoneRecord),
+                "tombstone-anonymise",
+                tenantId,
+                Strategy.Anonymise,
+                1
+            )
+        );
+
+        await using (var verify = Host.CreateDbContext())
+        {
+            var record = await verify.TombstoneRecords.SingleAsync(current => current.Id == recordId);
+
+            record.ExternalId.Should().Be(externalId, "dry-run erasure must not mutate factory-backed fields");
+            record.DisplayName.Should().Be("dry-run-target", "dry-run erasure must not invoke string tombstoning");
+            record.ContactEmail.Should().Be("dry-run-target@example.com", "dry-run erasure must not null regular anonymise fields");
+        }
+
+        await dryRunHost.RunWithServicesAsync(
+            serviceProvider =>
+            {
+                serviceProvider.GetRequiredService<GuidTombstoneFactory>().Contexts.Should().BeEmpty(
+                    "dry-run erasure must not invoke set-based factories"
+                );
+                serviceProvider.GetRequiredService<OriginalValueTombstoneFactory>().Contexts.Should().BeEmpty(
+                    "dry-run erasure must not invoke per-row/original-value factories"
+                );
+
+                return Task.CompletedTask;
+            }
+        );
+    }
+
     private static DateTimeOffset EligibleErasureCreatedAt(DateTimeOffset asOf)
     {
         return asOf.AddDays(-45);

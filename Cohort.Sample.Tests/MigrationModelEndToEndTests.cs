@@ -32,6 +32,8 @@ public sealed class MigrationModelEndToEndTests(PostgresFixture fixture)
             string.Equals(entityType.GetTableName(), "sweep_run_entity_summary", StringComparison.Ordinal)
         );
         entitySummaryEntity.FindProperty("SkippedCount")!.IsNullable.Should().BeFalse();
+        entitySummaryEntity.FindProperty("RuleSource")!.IsNullable.Should().BeTrue();
+        entitySummaryEntity.FindProperty("RuleReason")!.IsNullable.Should().BeTrue();
 
         var rowDetailEntity = db.Model.GetEntityTypes().Single(entityType =>
             string.Equals(entityType.GetTableName(), "sweep_run_row_detail", StringComparison.Ordinal)

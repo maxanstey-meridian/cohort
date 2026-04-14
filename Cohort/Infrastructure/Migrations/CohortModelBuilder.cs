@@ -146,6 +146,8 @@ public static class CohortModelBuilder
         builder.Property<int>("Affected").IsRequired();
         builder.Property<int>("HeldCount").IsRequired();
         builder.Property<int>("SkippedCount").IsRequired();
+        builder.Property<string>("RuleSource");
+        builder.Property<string>("RuleReason");
         builder.HasKey("SweepId", "EntityType", "Category", "TenantId", "Strategy");
         builder.HasIndex("SweepId");
     }

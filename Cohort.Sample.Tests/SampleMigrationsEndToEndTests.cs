@@ -112,6 +112,12 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
         entitySummaryColumns.Should().ContainKey("SkippedCount");
         entitySummaryColumns["SkippedCount"].DataType.Should().Be("integer");
         entitySummaryColumns["SkippedCount"].IsNullable.Should().BeFalse();
+        entitySummaryColumns.Should().ContainKey("RuleSource");
+        entitySummaryColumns["RuleSource"].DataType.Should().Be("text");
+        entitySummaryColumns["RuleSource"].IsNullable.Should().BeTrue();
+        entitySummaryColumns.Should().ContainKey("RuleReason");
+        entitySummaryColumns["RuleReason"].DataType.Should().Be("text");
+        entitySummaryColumns["RuleReason"].IsNullable.Should().BeTrue();
 
         var rowDetailColumns = await GetColumnsAsync("sweep_run_row_detail");
         rowDetailColumns.Should().ContainKey("Id");

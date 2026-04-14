@@ -39,6 +39,19 @@ public sealed class RetentionAttributeTests
     }
 
     [Fact]
+    public void ErasureSubject_Attribute_Is_Property_Targeted_Multi_Instance_And_Not_Inherited()
+    {
+        var usage = typeof(ErasureSubjectAttribute)
+            .GetCustomAttributes(typeof(AttributeUsageAttribute), inherit: false)
+            .Cast<AttributeUsageAttribute>()
+            .Single();
+
+        usage.ValidOn.Should().Be(AttributeTargets.Property);
+        usage.AllowMultiple.Should().BeTrue();
+        usage.Inherited.Should().BeFalse();
+    }
+
+    [Fact]
     public void Anonymise_Attribute_Preserves_Method_And_Literal()
     {
         var attribute = new AnonymiseAttribute(AnonymiseMethod.FixedLiteral, "[redacted]");

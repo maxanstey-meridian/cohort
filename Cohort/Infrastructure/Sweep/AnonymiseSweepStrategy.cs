@@ -302,12 +302,26 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             ?? throw new InvalidOperationException(
                 $"Retention entry for {entry.EntityType.FullName} references missing record-id member '{entry.RecordId.RecordIdMember}'."
             );
+        var candidateOrder = candidateRecordIds
+            .Select((recordId, index) => new KeyValuePair<string, int>(recordId, index))
+            .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
+        var orderedRows = rows
+            .OrderBy(
+                row =>
+                {
+                    var recordId = recordIdProperty.GetValue(row)?.ToString();
+                    return recordId is not null && candidateOrder.TryGetValue(recordId, out var index)
+                        ? index
+                        : int.MaxValue;
+                }
+            )
+            .ToArray();
         var staticAssignments = assignmentResolver.CreateStaticAssignments(entry, ctx.Tenant.Id, ctx.Now);
         var affectedRecordIds = new List<string>();
         var heldCount = candidateRecordIds.Count - rows.Count;
         var skippedCount = 0;
 
-        foreach (var row in rows)
+        foreach (var row in orderedRows)
         {
             var recordId = recordIdProperty.GetValue(row)?.ToString();
             if (string.IsNullOrWhiteSpace(recordId))

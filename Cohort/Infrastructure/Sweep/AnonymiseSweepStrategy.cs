@@ -12,13 +12,10 @@ namespace Cohort.Infrastructure.Sweep;
 
 public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
 {
-    private static readonly MethodInfo ExecuteHandlerAwareSweepCoreMethod =
-        typeof(AnonymiseSweepStrategy).GetMethod(
-            nameof(ExecuteHandlerAwareSweepCoreAsync),
-            BindingFlags.Instance | BindingFlags.NonPublic
-        )!;
     private readonly AnonymiseAssignmentResolver assignmentResolver;
+    private readonly AnonymiseHandlerAwareMutationExecutor handlerAwareMutationExecutor;
     private readonly AnonymiseMutationExecutor mutationExecutor;
+    private readonly AnonymisePreviewExecutor previewExecutor;
     private readonly AnonymiseRowLoader rowLoader;
     private readonly IServiceProvider? services;
 
@@ -33,6 +30,12 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         assignmentResolver = new AnonymiseAssignmentResolver(db, anonymiseValueFactories);
         rowLoader = new AnonymiseRowLoader(db, assignmentResolver);
         mutationExecutor = new AnonymiseMutationExecutor(assignmentResolver, rowLoader);
+        previewExecutor = new AnonymisePreviewExecutor();
+        handlerAwareMutationExecutor = new AnonymiseHandlerAwareMutationExecutor(
+            assignmentResolver,
+            rowLoader,
+            mutationExecutor
+        );
         this.services = services;
     }
 
@@ -52,15 +55,16 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         ArgumentNullException.ThrowIfNull(conn);
 
         var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);
-        return await PreviewMutationCountAsync(
+        ValidateEntry(entry, rule, "preview");
+        await EnsureConnectionOpenAsync(conn, ct);
+
+        return await previewExecutor.ExecuteAsync(
             entry,
-            rule,
             AnonymiseFilterBuilder.CreateCutoffFilter(entry.AnchorColumn, cutoff),
             ctx.Tenant,
             ctx.Now,
             conn,
-            ct,
-            "preview"
+            ct
         );
     }
 
@@ -111,9 +115,11 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         ArgumentNullException.ThrowIfNull(conn);
 
         var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
-        return await PreviewMutationCountAsync(
+        ValidateEntry(entry, rule, "erasure previews");
+        await EnsureConnectionOpenAsync(conn, ct);
+
+        return await previewExecutor.ExecuteAsync(
             entry,
-            rule,
             AnonymiseFilterBuilder.Combine(
                 AnonymiseFilterBuilder.CreateSubjectFilter(predicate),
                 AnonymiseFilterBuilder.CreateCutoffFilter(entry.AnchorColumn, cutoff)
@@ -121,8 +127,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             tenant,
             now,
             conn,
-            ct,
-            "erasure previews"
+            ct
         );
     }
 
@@ -162,29 +167,6 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         );
     }
 
-    private async Task<int> PreviewMutationCountAsync(
-        RetentionEntry entry,
-        RetentionRule rule,
-        SqlFilter filter,
-        TenantContext tenant,
-        DateTimeOffset now,
-        DbConnection conn,
-        CancellationToken ct,
-        string operation
-    )
-    {
-        ValidateEntry(entry, rule, operation);
-        await EnsureConnectionOpenAsync(conn, ct);
-
-        await using var command = conn.CreateCommand();
-        command.CommandText = AnonymiseSqlBuilder.BuildPreviewCountCommandText(entry, filter);
-        AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
-        AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
-        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName, now);
-
-        return Convert.ToInt32(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
-    }
-
     private async Task<SweepExecutionResult> ExecuteMutationAsync(
         RetentionEntry entry,
         RetentionRule rule,
@@ -217,7 +199,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         var handlers = RetentionHandlerSupport.ResolveHandlers(services, entry.EntityType);
         if (execution is not null && handlers.Count > 0)
         {
-            return await ExecuteHandlerAwareSweepAsync(
+            return await handlerAwareMutationExecutor.ExecuteAsync(
                 entry,
                 rule,
                 ctx,
@@ -254,7 +236,76 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             );
     }
 
-    private Task<SweepExecutionResult> ExecuteHandlerAwareSweepAsync(
+    private static void ValidateEntry(
+        RetentionEntry entry,
+        RetentionRule rule,
+        string operation
+    )
+    {
+        if (rule.Strategy != Strategy.Anonymise)
+        {
+            throw new InvalidOperationException(
+                $"AnonymiseSweepStrategy cannot execute {rule.Strategy} rules."
+            );
+        }
+
+        if (entry.AnonymiseFields.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"Retention entry for {entry.EntityType.FullName} must expose anonymise metadata for anonymise {operation}."
+            );
+        }
+    }
+
+    private static async Task EnsureConnectionOpenAsync(DbConnection conn, CancellationToken ct)
+    {
+        if (conn.State != ConnectionState.Open)
+        {
+            await conn.OpenAsync(ct);
+        }
+    }
+}
+
+internal sealed class AnonymisePreviewExecutor
+{
+    internal async Task<int> ExecuteAsync(
+        RetentionEntry entry,
+        SqlFilter filter,
+        TenantContext tenant,
+        DateTimeOffset now,
+        DbConnection conn,
+        CancellationToken ct
+    )
+    {
+        await using var command = conn.CreateCommand();
+        command.CommandText = AnonymiseSqlBuilder.BuildPreviewCountCommandText(entry, filter);
+        AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
+        AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
+        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName, now);
+
+        return Convert.ToInt32(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
+    }
+}
+
+internal sealed class AnonymiseHandlerAwareMutationExecutor(
+    AnonymiseAssignmentResolver assignmentResolver,
+    AnonymiseRowLoader rowLoader,
+    AnonymiseMutationExecutor mutationExecutor
+)
+{
+    private static readonly MethodInfo ExecuteCoreMethod =
+        typeof(AnonymiseHandlerAwareMutationExecutor).GetMethod(
+            nameof(ExecuteCoreAsync),
+            BindingFlags.Instance | BindingFlags.NonPublic
+        )!;
+    private readonly AnonymiseAssignmentResolver assignmentResolver =
+        assignmentResolver ?? throw new ArgumentNullException(nameof(assignmentResolver));
+    private readonly AnonymiseRowLoader rowLoader =
+        rowLoader ?? throw new ArgumentNullException(nameof(rowLoader));
+    private readonly AnonymiseMutationExecutor mutationExecutor =
+        mutationExecutor ?? throw new ArgumentNullException(nameof(mutationExecutor));
+
+    internal Task<SweepExecutionResult> ExecuteAsync(
         RetentionEntry entry,
         RetentionRule rule,
         RetentionResolutionContext ctx,
@@ -267,7 +318,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         CancellationToken ct
     )
     {
-        return (Task<SweepExecutionResult>)ExecuteHandlerAwareSweepCoreMethod
+        return (Task<SweepExecutionResult>)ExecuteCoreMethod
             .MakeGenericMethod(entry.EntityType)
             .Invoke(
                 this,
@@ -275,7 +326,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             )!;
     }
 
-    private async Task<SweepExecutionResult> ExecuteHandlerAwareSweepCoreAsync<TEntity>(
+    private async Task<SweepExecutionResult> ExecuteCoreAsync<TEntity>(
         RetentionEntry entry,
         RetentionRule rule,
         RetentionResolutionContext ctx,
@@ -405,35 +456,6 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             RowDetailsPersisted: true,
             SkippedCount: skippedCount
         );
-    }
-
-    private static void ValidateEntry(
-        RetentionEntry entry,
-        RetentionRule rule,
-        string operation
-    )
-    {
-        if (rule.Strategy != Strategy.Anonymise)
-        {
-            throw new InvalidOperationException(
-                $"AnonymiseSweepStrategy cannot execute {rule.Strategy} rules."
-            );
-        }
-
-        if (entry.AnonymiseFields.Count == 0)
-        {
-            throw new InvalidOperationException(
-                $"Retention entry for {entry.EntityType.FullName} must expose anonymise metadata for anonymise {operation}."
-            );
-        }
-    }
-
-    private static async Task EnsureConnectionOpenAsync(DbConnection conn, CancellationToken ct)
-    {
-        if (conn.State != ConnectionState.Open)
-        {
-            await conn.OpenAsync(ct);
-        }
     }
 }
 

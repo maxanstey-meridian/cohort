@@ -1830,6 +1830,170 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Erasure_Path_DryRun_And_Live_MultiSubject_Matches_Report_The_Same_Eligible_Count_While_Cutoff_And_Holds_Block_Mutation()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        await using var previewServices = BuildMultiSubjectServiceProvider(
+            database.ConnectionString,
+            dryRun: true
+        );
+        await using var liveServices = BuildMultiSubjectServiceProvider(
+            database.ConnectionString,
+            dryRun: false
+        );
+
+        var tenantId = Guid.NewGuid();
+        var otherTenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var otherSubjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var eligibleId = Guid.NewGuid();
+        var cutoffBlockedId = Guid.NewGuid();
+        var heldId = Guid.NewGuid();
+
+        await using (var scope = previewServices.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<MultiSubjectDbContext>();
+            await db.Database.EnsureCreatedAsync();
+
+            db.MultiSubjectFixtureRecords.AddRange(
+                new MultiSubjectFixtureRecord
+                {
+                    Id = eligibleId,
+                    TenantId = tenantId,
+                    PrimarySubjectId = subjectId,
+                    DelegateSubjectId = otherSubjectId,
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
+                    Body = "eligible-primary-match",
+                },
+                new MultiSubjectFixtureRecord
+                {
+                    Id = cutoffBlockedId,
+                    TenantId = tenantId,
+                    PrimarySubjectId = otherSubjectId,
+                    DelegateSubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-5),
+                    Body = "cutoff-blocked-delegate-match",
+                },
+                new MultiSubjectFixtureRecord
+                {
+                    Id = heldId,
+                    TenantId = tenantId,
+                    PrimarySubjectId = otherSubjectId,
+                    DelegateSubjectId = subjectId,
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
+                    Body = "held-delegate-match",
+                },
+                new MultiSubjectFixtureRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    PrimarySubjectId = otherSubjectId,
+                    DelegateSubjectId = otherSubjectId,
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
+                    Body = "other-subject",
+                },
+                new MultiSubjectFixtureRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = otherTenantId,
+                    PrimarySubjectId = subjectId,
+                    DelegateSubjectId = otherSubjectId,
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
+                    Body = "other-tenant",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        await using (var scope = previewServices.CreateAsyncScope())
+        {
+            var repository = scope.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>();
+            await repository.CreateAsync(
+                new RetentionHoldRequest(
+                    Guid.NewGuid(),
+                    "multi_subject_fixture_records",
+                    heldId.ToString(),
+                    tenantId,
+                    "multi-subject-erasure-hold",
+                    asOf.AddDays(-1)
+                ),
+                CancellationToken.None
+            );
+        }
+
+        ErasureResult previewResult;
+        await using (var scope = previewServices.CreateAsyncScope())
+        {
+            var erasureService = scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
+            previewResult = await erasureService.EraseAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                new ErasureScope(subjectId),
+                asOf
+            );
+        }
+
+        previewResult.Counts.Should().Contain(
+            new EntitySweepCount(
+                typeof(MultiSubjectFixtureRecord),
+                "short-lived",
+                tenantId,
+                Strategy.Purge,
+                1
+            )
+        );
+
+        await using (var scope = previewServices.CreateAsyncScope())
+        {
+            var verify = scope.ServiceProvider.GetRequiredService<MultiSubjectDbContext>();
+            (await verify.MultiSubjectFixtureRecords.Select(record => record.Body).OrderBy(body => body).ToListAsync())
+                .Should()
+                .Equal(
+                    "cutoff-blocked-delegate-match",
+                    "eligible-primary-match",
+                    "held-delegate-match",
+                    "other-subject",
+                    "other-tenant"
+                );
+        }
+
+        ErasureResult liveResult;
+        await using (var scope = liveServices.CreateAsyncScope())
+        {
+            var erasureService = scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
+            liveResult = await erasureService.EraseAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                new ErasureScope(subjectId),
+                asOf
+            );
+        }
+
+        liveResult.Counts.Should().BeEquivalentTo(previewResult.Counts);
+
+        await using (var scope = liveServices.CreateAsyncScope())
+        {
+            var verify = scope.ServiceProvider.GetRequiredService<MultiSubjectDbContext>();
+            (await verify.MultiSubjectFixtureRecords.Select(record => record.Body).OrderBy(body => body).ToListAsync())
+                .Should()
+                .Equal(
+                    "cutoff-blocked-delegate-match",
+                    "held-delegate-match",
+                    "other-subject",
+                    "other-tenant"
+                );
+            (await verify.MultiSubjectFixtureRecords.AnyAsync(record => record.Id == eligibleId))
+                .Should()
+                .BeFalse();
+            (await verify.MultiSubjectFixtureRecords.AnyAsync(record => record.Id == cutoffBlockedId))
+                .Should()
+                .BeTrue();
+            (await verify.MultiSubjectFixtureRecords.AnyAsync(record => record.Id == heldId))
+                .Should()
+                .BeTrue();
+        }
+    }
+
+    [Fact]
     public async Task Erasure_Path_Converts_Erasure_Subject_Values_To_The_Provider_Type_Before_SQL_Comparison()
     {
         await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
@@ -2633,10 +2797,15 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         return services.BuildServiceProvider(validateScopes: true);
     }
 
-    private static ServiceProvider BuildMultiSubjectServiceProvider(string connectionString)
+    private static ServiceProvider BuildMultiSubjectServiceProvider(
+        string connectionString,
+        bool dryRun = false
+    )
     {
         var services = new ServiceCollection();
-        var configuration = new ConfigurationBuilder().AddInMemoryCollection().Build();
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(CreateCohortSettings(dryRun))
+            .Build();
 
         services.AddSingleton<IConfiguration>(configuration);
         services.AddLogging();

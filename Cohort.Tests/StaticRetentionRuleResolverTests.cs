@@ -18,6 +18,22 @@ public sealed class StaticRetentionRuleResolverTests
     }
 
     [Fact]
+    public async Task Resolve_Async_Preserves_Configured_Provenance()
+    {
+        var provenance = new RetentionRuleProvenance("policy-alias", "county override");
+        var rule = new RetentionRule(
+            TimeSpan.FromDays(30),
+            Strategy.Purge,
+            Provenance: provenance
+        );
+        var resolver = new StaticRetentionRuleResolver(rule);
+
+        var resolved = await resolver.ResolveAsync(CreateContext(), CancellationToken.None);
+
+        resolved.Provenance.Should().Be(provenance);
+    }
+
+    [Fact]
     public void Try_Resolve_At_Startup_Returns_Configured_Rule()
     {
         var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge);
@@ -26,6 +42,35 @@ public sealed class StaticRetentionRuleResolverTests
         var resolved = resolver.TryResolveAtStartup();
 
         resolved.Should().Be(rule);
+    }
+
+    [Fact]
+    public void Try_Resolve_At_Startup_Preserves_Configured_Provenance()
+    {
+        var provenance = new RetentionRuleProvenance("policy-alias", "county override");
+        var rule = new RetentionRule(
+            TimeSpan.FromDays(30),
+            Strategy.Purge,
+            Provenance: provenance
+        );
+        var resolver = new StaticRetentionRuleResolver(rule);
+
+        var resolved = resolver.TryResolveAtStartup();
+
+        resolved.Should().NotBeNull();
+        resolved!.Provenance.Should().Be(provenance);
+    }
+
+    [Fact]
+    public async Task Resolve_Async_Leaves_Default_Provenance_Null()
+    {
+        var resolver = new StaticRetentionRuleResolver(
+            new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+        );
+
+        var resolved = await resolver.ResolveAsync(CreateContext(), CancellationToken.None);
+
+        resolved.Provenance.Should().BeNull();
     }
 
     [Fact]

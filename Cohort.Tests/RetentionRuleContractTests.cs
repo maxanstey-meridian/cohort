@@ -13,6 +13,7 @@ public sealed class RetentionRuleContractTests
         rule.Strategy.Should().Be(Strategy.Purge);
         rule.LegalMin.Should().BeNull();
         rule.AuditRowDetail.Should().Be(AuditRowDetail.SummaryOnly);
+        rule.Provenance.Should().BeNull();
     }
 
     [Fact]
@@ -29,6 +30,20 @@ public sealed class RetentionRuleContractTests
         rule.Strategy.Should().Be(Strategy.Anonymise);
         rule.LegalMin.Should().Be(TimeSpan.FromDays(90));
         rule.AuditRowDetail.Should().Be(AuditRowDetail.PerRow);
+    }
+
+    [Fact]
+    public void RetentionRule_Preserves_Explicit_Provenance()
+    {
+        var provenance = new RetentionRuleProvenance("policy-alias", "county override");
+        var rule = new RetentionRule(
+            TimeSpan.FromDays(30),
+            Strategy.Purge,
+            AuditRowDetail: AuditRowDetail.PerRow,
+            Provenance: provenance
+        );
+
+        rule.Provenance.Should().Be(provenance);
     }
 
     [Fact]

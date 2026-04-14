@@ -22,7 +22,8 @@ public abstract record SweepEvent
         TimeSpan ResolvedPeriod,
         int Affected,
         int HeldCount,
-        int SkippedCount = 0
+        int SkippedCount = 0,
+        RetentionRuleProvenance? Provenance = null
     ) : SweepEvent;
 
     public sealed record RowDetail(

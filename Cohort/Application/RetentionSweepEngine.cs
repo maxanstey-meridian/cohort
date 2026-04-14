@@ -128,7 +128,8 @@ public sealed class RetentionSweepEngine(
                         resolvedPeriod,
                         execution.AffectedRecordIds.Count,
                         execution.HeldCount,
-                        execution.SkippedCount
+                        execution.SkippedCount,
+                        rule.Provenance
                     ),
                     auditEvents,
                     ct

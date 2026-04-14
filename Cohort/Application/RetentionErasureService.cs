@@ -167,7 +167,8 @@ public sealed class RetentionErasureService(
                         resolvedPeriod,
                         affectedCount,
                         execution.HeldCount,
-                        execution.SkippedCount
+                        execution.SkippedCount,
+                        rule.Provenance
                     ),
                     auditEvents,
                     ct

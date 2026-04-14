@@ -4,5 +4,6 @@ public sealed record RetentionRule(
     TimeSpan Period,
     Strategy Strategy,
     TimeSpan? LegalMin = null,
-    AuditRowDetail AuditRowDetail = AuditRowDetail.SummaryOnly
+    AuditRowDetail AuditRowDetail = AuditRowDetail.SummaryOnly,
+    RetentionRuleProvenance? Provenance = null
 );

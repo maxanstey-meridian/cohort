@@ -1458,11 +1458,23 @@ public sealed class AnonymiseSweepStrategyCommandTests
 
         affected.Should().Be(1);
         connection.Commands.Should().ContainSingle();
+        connection.Commands[0].AssignedTransaction.Should().BeNull();
+        connection.Commands[0].CommandText.Should().Contain("SELECT COUNT(*)");
         connection.Commands[0].CommandText.Should().Contain(
             "((target.\"SubjectId\" = @subjectValue0 OR target.\"DelegateSubjectId\" = @subjectValue1))"
         );
+        connection.Commands[0].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
+        connection.Commands[0].CommandText.Should().Contain("NOT EXISTS");
+        connection.Commands[0].CommandText.Should().NotContain("ANY(@candidateIds)");
+        connection.Commands[0].CommandText.Should().NotContain("DELETE FROM");
+        connection.Commands[0].CommandText.Should().NotContain("UPDATE ");
+        connection.Commands[0].CommandText.Should().NotContain("FOR UPDATE");
+        connection.Commands[0].Parameters["tenantId"].Value.Should().Be(tenantId);
         connection.Commands[0].Parameters["subjectValue0"].Value.Should().Be(firstSubjectId);
         connection.Commands[0].Parameters["subjectValue1"].Value.Should().Be(secondSubjectId);
+        connection.Commands[0].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
+        connection.Commands[0].Parameters["holdTableName"].Value.Should().Be("anonymised_contacts");
+        connection.Commands[0].Parameters["holdAsOf"].Value.Should().Be(now);
     }
 
     [Fact]
@@ -1519,16 +1531,33 @@ public sealed class AnonymiseSweepStrategyCommandTests
         );
 
         affected.AffectedRecordIds.Should().Equal(selectedId.ToString());
+        connection.Commands.Should().HaveCount(2);
+        connection.Commands[0].AssignedTransaction.Should().BeSameAs(transaction);
         connection.Commands[0].CommandText.Should().Contain(
             "((target.\"SubjectId\" = @subjectValue0 OR target.\"DelegateSubjectId\" = @subjectValue1))"
         );
+        connection.Commands[0].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
+        connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
+        connection.Commands[0].Parameters["tenantId"].Value.Should().Be(tenantId);
+        connection.Commands[0].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[1].CommandText.Should().Contain(
             "((target.\"SubjectId\" = @subjectValue0 OR target.\"DelegateSubjectId\" = @subjectValue1))"
         );
+        connection.Commands[1].AssignedTransaction.Should().BeSameAs(transaction);
+        connection.Commands[1].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
+        connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
+        connection.Commands[1].CommandText.Should().Contain("NOT EXISTS");
+        connection.Commands[1].Parameters["tenantId"].Value.Should().Be(tenantId);
         connection.Commands[0].Parameters["subjectValue0"].Value.Should().Be(firstSubjectId);
         connection.Commands[0].Parameters["subjectValue1"].Value.Should().Be(secondSubjectId);
         connection.Commands[1].Parameters["subjectValue0"].Value.Should().Be(firstSubjectId);
         connection.Commands[1].Parameters["subjectValue1"].Value.Should().Be(secondSubjectId);
+        connection.Commands[1].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
+        connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
+            new[] { selectedId.ToString(), heldId.ToString() }
+        );
+        connection.Commands[1].Parameters["holdTableName"].Value.Should().Be("anonymised_contacts");
+        connection.Commands[1].Parameters["holdAsOf"].Value.Should().Be(now);
     }
 
     private static CommandStrategyDbContext CreateCommandStrategyDbContext()

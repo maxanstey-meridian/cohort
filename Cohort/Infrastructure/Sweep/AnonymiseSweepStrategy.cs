@@ -18,6 +18,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             BindingFlags.Instance | BindingFlags.NonPublic
         )!;
     private readonly AnonymiseAssignmentResolver assignmentResolver;
+    private readonly AnonymiseMutationExecutor mutationExecutor;
     private readonly AnonymiseRowLoader rowLoader;
     private readonly IServiceProvider? services;
 
@@ -31,6 +32,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
 
         assignmentResolver = new AnonymiseAssignmentResolver(db, anonymiseValueFactories);
         rowLoader = new AnonymiseRowLoader(db, assignmentResolver);
+        mutationExecutor = new AnonymiseMutationExecutor(assignmentResolver, rowLoader);
         this.services = services;
     }
 
@@ -230,7 +232,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         }
 
         return assignmentResolver.RequiresPerRowExecution(entry)
-            ? await ExecutePerRowMutationAsync(
+            ? await mutationExecutor.ExecutePerRowMutationAsync(
                 entry,
                 ctx.Tenant,
                 ctx.Now,
@@ -240,7 +242,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
                 filter,
                 ct
             )
-            : await ExecuteSetBasedMutationAsync(
+            : await mutationExecutor.ExecuteSetBasedMutationAsync(
                 entry,
                 ctx.Tenant,
                 ctx.Now,
@@ -350,7 +352,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
 
             var originalValues = assignmentResolver.CreateOriginalValuesFromEntity(entry, row);
             if (
-                !await ExecuteCapturedRowUpdateAsync(
+                await mutationExecutor.TryUpdateRowAsync(
                     entry,
                     ctx.Tenant,
                     ctx.Now,
@@ -361,7 +363,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
                     staticAssignments,
                     filter,
                     ct
-                )
+                ) is null
             )
             {
                 heldCount++;
@@ -391,197 +393,6 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         );
     }
 
-    private async Task<SweepExecutionResult> ExecutePerRowMutationAsync(
-        RetentionEntry entry,
-        TenantContext tenant,
-        DateTimeOffset now,
-        DbConnection conn,
-        DbTransaction transaction,
-        IReadOnlyList<string> candidateRecordIds,
-        SqlFilter filter,
-        CancellationToken ct
-    )
-    {
-        var updatableRows = await rowLoader.LoadUpdatableRowsAsync(
-            entry,
-            tenant,
-            now,
-            conn,
-            transaction,
-            candidateRecordIds,
-            ct
-        );
-        if (updatableRows.Count == 0)
-        {
-            return new SweepExecutionResult([], candidateRecordIds.Count);
-        }
-
-        var affectedRecordIds = await ExecutePerRowUpdatesAsync(
-            entry,
-            tenant,
-            now,
-            conn,
-            transaction,
-            updatableRows,
-            filter,
-            ct
-        );
-        return new SweepExecutionResult(
-            affectedRecordIds,
-            candidateRecordIds.Count - affectedRecordIds.Count
-        );
-    }
-
-    private async Task<IReadOnlyList<string>> ExecutePerRowUpdatesAsync(
-        RetentionEntry entry,
-        TenantContext tenant,
-        DateTimeOffset now,
-        DbConnection conn,
-        DbTransaction transaction,
-        IReadOnlyList<AnonymiseRowSnapshot> rows,
-        SqlFilter filter,
-        CancellationToken ct
-    )
-    {
-        var staticAssignments = assignmentResolver.CreateStaticAssignments(entry, tenant.Id, now);
-        var affectedRecordIds = new List<string>(rows.Count);
-
-        foreach (var row in rows)
-        {
-            await using var command = conn.CreateCommand();
-            command.Transaction = transaction;
-            command.CommandText = AnonymiseSqlBuilder.BuildPerRowCommandText(entry, filter);
-            AddPerRowAssignmentParameters(
-                command,
-                assignmentResolver.CreatePerRowAssignmentValues(
-                    entry,
-                    tenant,
-                    now,
-                    row.OriginalValues,
-                    staticAssignments
-                )
-            );
-            command.Parameters.Add(AnonymiseDbParameterFactory.Create(command, "recordId", row.RecordId));
-            AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
-            AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
-            AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName, now);
-
-            await using var reader = await command.ExecuteReaderAsync(ct);
-            if (await reader.ReadAsync(ct))
-            {
-                affectedRecordIds.Add(reader.GetValue(0).ToString()!);
-            }
-        }
-
-        return affectedRecordIds;
-    }
-
-    private async Task<bool> ExecuteCapturedRowUpdateAsync(
-        RetentionEntry entry,
-        TenantContext tenant,
-        DateTimeOffset now,
-        DbConnection conn,
-        DbTransaction transaction,
-        string recordId,
-        IReadOnlyDictionary<string, object?> originalValues,
-        IReadOnlyDictionary<string, object?> staticAssignments,
-        SqlFilter filter,
-        CancellationToken ct
-    )
-    {
-        await using var command = conn.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = AnonymiseSqlBuilder.BuildPerRowCommandText(entry, filter);
-        AddPerRowAssignmentParameters(
-            command,
-            assignmentResolver.CreatePerRowAssignmentValues(
-                entry,
-                tenant,
-                now,
-                originalValues,
-                staticAssignments
-            )
-        );
-        command.Parameters.Add(AnonymiseDbParameterFactory.Create(command, "recordId", recordId));
-        AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
-        AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
-        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName, now);
-
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        return await reader.ReadAsync(ct);
-    }
-
-    private async Task<List<string>> ReadAffectedRecordIdsAsync(
-        DbCommand command,
-        CancellationToken ct
-    )
-    {
-        var affectedRecordIds = new List<string>();
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
-        {
-            affectedRecordIds.Add(reader.GetValue(0).ToString()!);
-        }
-
-        return affectedRecordIds;
-    }
-
-    private async Task<SweepExecutionResult> ExecuteSetBasedMutationAsync(
-        RetentionEntry entry,
-        TenantContext tenant,
-        DateTimeOffset now,
-        DbConnection conn,
-        DbTransaction transaction,
-        IReadOnlyList<string> candidateRecordIds,
-        SqlFilter filter,
-        CancellationToken ct
-    )
-    {
-        await using var command = conn.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = AnonymiseSqlBuilder.BuildSetBasedCommandText(entry, filter);
-        AddSetBasedAssignmentParameters(
-            command,
-            assignmentResolver.CreateSetBasedAssignmentValues(entry, tenant.Id, now)
-        );
-        AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
-        AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
-        AnonymiseDbParameterFactory.AddCandidateIdsParameter(command, candidateRecordIds);
-        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName, now);
-
-        var affectedRecordIds = await ReadAffectedRecordIdsAsync(command, ct);
-        return new SweepExecutionResult(
-            affectedRecordIds,
-            candidateRecordIds.Count - affectedRecordIds.Count
-        );
-    }
-
-    private static void AddSetBasedAssignmentParameters(
-        DbCommand command,
-        IReadOnlyList<object?> assignmentValues
-    )
-    {
-        for (var index = 0; index < assignmentValues.Count; index++)
-        {
-            command.Parameters.Add(
-                AnonymiseDbParameterFactory.Create(command, $"value{index}", assignmentValues[index])
-            );
-        }
-    }
-
-    private static void AddPerRowAssignmentParameters(
-        DbCommand command,
-        IReadOnlyList<object?> assignmentValues
-    )
-    {
-        for (var index = 0; index < assignmentValues.Count; index++)
-        {
-            command.Parameters.Add(
-                AnonymiseDbParameterFactory.Create(command, $"value{index}", assignmentValues[index])
-            );
-        }
-    }
-
     private static void ValidateEntry(
         RetentionEntry entry,
         RetentionRule rule,
@@ -608,6 +419,164 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         if (conn.State != ConnectionState.Open)
         {
             await conn.OpenAsync(ct);
+        }
+    }
+}
+
+internal sealed class AnonymiseMutationExecutor(
+    AnonymiseAssignmentResolver assignmentResolver,
+    AnonymiseRowLoader rowLoader
+)
+{
+    private readonly AnonymiseAssignmentResolver assignmentResolver =
+        assignmentResolver ?? throw new ArgumentNullException(nameof(assignmentResolver));
+    private readonly AnonymiseRowLoader rowLoader =
+        rowLoader ?? throw new ArgumentNullException(nameof(rowLoader));
+
+    internal async Task<SweepExecutionResult> ExecutePerRowMutationAsync(
+        RetentionEntry entry,
+        TenantContext tenant,
+        DateTimeOffset now,
+        DbConnection conn,
+        DbTransaction transaction,
+        IReadOnlyList<string> candidateRecordIds,
+        SqlFilter filter,
+        CancellationToken ct
+    )
+    {
+        var updatableRows = await rowLoader.LoadUpdatableRowsAsync(
+            entry,
+            tenant,
+            now,
+            conn,
+            transaction,
+            candidateRecordIds,
+            ct
+        );
+        if (updatableRows.Count == 0)
+        {
+            return new SweepExecutionResult([], candidateRecordIds.Count);
+        }
+
+        var staticAssignments = assignmentResolver.CreateStaticAssignments(entry, tenant.Id, now);
+        var affectedRecordIds = new List<string>(updatableRows.Count);
+
+        foreach (var row in updatableRows)
+        {
+            var affectedRecordId = await TryUpdateRowAsync(
+                entry,
+                tenant,
+                now,
+                conn,
+                transaction,
+                row.RecordId,
+                row.OriginalValues,
+                staticAssignments,
+                filter,
+                ct
+            );
+            if (affectedRecordId is not null)
+            {
+                affectedRecordIds.Add(affectedRecordId);
+            }
+        }
+
+        return new SweepExecutionResult(
+            affectedRecordIds,
+            candidateRecordIds.Count - affectedRecordIds.Count
+        );
+    }
+
+    internal async Task<SweepExecutionResult> ExecuteSetBasedMutationAsync(
+        RetentionEntry entry,
+        TenantContext tenant,
+        DateTimeOffset now,
+        DbConnection conn,
+        DbTransaction transaction,
+        IReadOnlyList<string> candidateRecordIds,
+        SqlFilter filter,
+        CancellationToken ct
+    )
+    {
+        await using var command = conn.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = AnonymiseSqlBuilder.BuildSetBasedCommandText(entry, filter);
+        AddAssignmentParameters(
+            command,
+            assignmentResolver.CreateSetBasedAssignmentValues(entry, tenant.Id, now)
+        );
+        AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
+        AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
+        AnonymiseDbParameterFactory.AddCandidateIdsParameter(command, candidateRecordIds);
+        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName, now);
+
+        var affectedRecordIds = await ReadAffectedRecordIdsAsync(command, ct);
+        return new SweepExecutionResult(
+            affectedRecordIds,
+            candidateRecordIds.Count - affectedRecordIds.Count
+        );
+    }
+
+    internal async Task<string?> TryUpdateRowAsync(
+        RetentionEntry entry,
+        TenantContext tenant,
+        DateTimeOffset now,
+        DbConnection conn,
+        DbTransaction transaction,
+        string recordId,
+        IReadOnlyDictionary<string, object?> originalValues,
+        IReadOnlyDictionary<string, object?> staticAssignments,
+        SqlFilter filter,
+        CancellationToken ct
+    )
+    {
+        await using var command = conn.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = AnonymiseSqlBuilder.BuildPerRowCommandText(entry, filter);
+        AddAssignmentParameters(
+            command,
+            assignmentResolver.CreatePerRowAssignmentValues(
+                entry,
+                tenant,
+                now,
+                originalValues,
+                staticAssignments
+            )
+        );
+        command.Parameters.Add(AnonymiseDbParameterFactory.Create(command, "recordId", recordId));
+        AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
+        AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
+        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName, now);
+
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        return await reader.ReadAsync(ct) ? reader.GetValue(0).ToString() : null;
+    }
+
+    private static async Task<List<string>> ReadAffectedRecordIdsAsync(
+        DbCommand command,
+        CancellationToken ct
+    )
+    {
+        var affectedRecordIds = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            affectedRecordIds.Add(reader.GetValue(0).ToString()!);
+        }
+
+        return affectedRecordIds;
+    }
+
+    private static void AddAssignmentParameters(
+        DbCommand command,
+        IReadOnlyList<object?> assignmentValues
+    )
+    {
+        for (var index = 0; index < assignmentValues.Count; index++)
+        {
+            command.Parameters.Add(
+                AnonymiseDbParameterFactory.Create(command, $"value{index}", assignmentValues[index])
+            );
         }
     }
 }

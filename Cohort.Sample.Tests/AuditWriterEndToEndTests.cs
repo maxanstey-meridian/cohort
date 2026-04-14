@@ -46,7 +46,11 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                         new RetentionRule(
                             TimeSpan.FromDays(30),
                             Strategy.Purge,
-                            AuditRowDetail: AuditRowDetail.PerRow
+                            AuditRowDetail: AuditRowDetail.PerRow,
+                            Provenance: new RetentionRuleProvenance(
+                                "retention-policy",
+                                "county override"
+                            )
                         )
                     ),
                     ["soft-delete"] = new StaticRetentionRuleResolver(
@@ -236,7 +240,11 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                         new RetentionRule(
                             TimeSpan.FromDays(30),
                             Strategy.Purge,
-                            AuditRowDetail: AuditRowDetail.PerRow
+                            AuditRowDetail: AuditRowDetail.PerRow,
+                            Provenance: new RetentionRuleProvenance(
+                                "retention-policy",
+                                "county override"
+                            )
                         )
                     ),
                     ["soft-delete"] = new StaticRetentionRuleResolver(
@@ -303,7 +311,9 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                 TimeSpan.FromDays(30),
                 1,
                 1,
-                0
+                0,
+                "retention-policy",
+                "county override"
             )
         );
         summaries.Should().Contain(
@@ -316,7 +326,9 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                 TimeSpan.FromDays(30),
                 1,
                 1,
-                0
+                0,
+                null,
+                null
             )
         );
         summaries.Should().Contain(
@@ -329,7 +341,9 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                 TimeSpan.FromDays(30),
                 1,
                 1,
-                0
+                0,
+                null,
+                null
             )
         );
 
@@ -559,7 +573,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         await using var command = await CreateCommandAsync(db, sweepId);
         command.CommandText =
             """
-            SELECT "SweepId", "EntityType", "Category", "TenantId", "Strategy", "ResolvedPeriod", "Affected", "HeldCount", "SkippedCount"
+            SELECT "SweepId", "EntityType", "Category", "TenantId", "Strategy", "ResolvedPeriod", "Affected", "HeldCount", "SkippedCount", "RuleSource", "RuleReason"
             FROM "sweep_run_entity_summary"
             WHERE "SweepId" = @sweepId
             ORDER BY "EntityType"
@@ -579,7 +593,9 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                     reader.GetFieldValue<TimeSpan>(5),
                     reader.GetInt32(6),
                     reader.GetInt32(7),
-                    reader.GetInt32(8)
+                    reader.GetInt32(8),
+                    reader.IsDBNull(9) ? null : reader.GetString(9),
+                    reader.IsDBNull(10) ? null : reader.GetString(10)
                 )
             );
         }
@@ -716,7 +732,9 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         TimeSpan ResolvedPeriod,
         int Affected,
         int HeldCount,
-        int SkippedCount = 0
+        int SkippedCount = 0,
+        string? RuleSource = null,
+        string? RuleReason = null
     );
 
     private sealed record SweepRunRowDetailRow(

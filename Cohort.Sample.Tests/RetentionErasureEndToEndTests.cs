@@ -183,7 +183,17 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
         using var erasureHost = new CohortTestHost(
             GetConnectionString(),
-            CreateErasureCategoryRepository(),
+            CreateErasureCategoryRepository(
+                shortLivedRule: new RetentionRule(
+                    TimeSpan.FromDays(30),
+                    Strategy.Purge,
+                    AuditRowDetail: AuditRowDetail.PerRow,
+                    Provenance: new RetentionRuleProvenance(
+                        "retention-policy",
+                        "subject erasure override"
+                    )
+                )
+            ),
             CreateCohortSettings(dryRun: false)
         );
 
@@ -237,7 +247,9 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                 TimeSpan.FromDays(30),
                 1,
                 1,
-                0
+                0,
+                "retention-policy",
+                "subject erasure override"
             )
         );
         summaries.Should().Contain(
@@ -250,7 +262,9 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                 TimeSpan.FromDays(30),
                 1,
                 1,
-                0
+                0,
+                null,
+                null
             )
         );
         summaries.Should().Contain(
@@ -263,7 +277,9 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                 TimeSpan.FromDays(30),
                 1,
                 1,
-                0
+                0,
+                null,
+                null
             )
         );
         rowDetails.Should().ContainSingle();
@@ -2433,7 +2449,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         await using var command = await CreateCommandAsync(db, sweepId);
         command.CommandText =
             """
-            SELECT "SweepId", "EntityType", "Category", "TenantId", "Strategy", "ResolvedPeriod", "Affected", "HeldCount", "SkippedCount"
+            SELECT "SweepId", "EntityType", "Category", "TenantId", "Strategy", "ResolvedPeriod", "Affected", "HeldCount", "SkippedCount", "RuleSource", "RuleReason"
             FROM "sweep_run_entity_summary"
             WHERE "SweepId" = @sweepId
             ORDER BY "EntityType"
@@ -2453,7 +2469,9 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     reader.GetFieldValue<TimeSpan>(5),
                     reader.GetInt32(6),
                     reader.GetInt32(7),
-                    reader.GetInt32(8)
+                    reader.GetInt32(8),
+                    reader.IsDBNull(9) ? null : reader.GetString(9),
+                    reader.IsDBNull(10) ? null : reader.GetString(10)
                 )
             );
         }
@@ -2596,7 +2614,9 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         TimeSpan ResolvedPeriod,
         int Affected,
         int HeldCount,
-        int SkippedCount = 0
+        int SkippedCount = 0,
+        string? RuleSource = null,
+        string? RuleReason = null
     );
 
     private sealed record SweepRunRowDetailRow(

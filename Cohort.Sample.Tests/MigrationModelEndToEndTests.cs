@@ -34,6 +34,9 @@ public sealed class MigrationModelEndToEndTests(PostgresFixture fixture)
         entitySummaryEntity.FindProperty("SkippedCount")!.IsNullable.Should().BeFalse();
         entitySummaryEntity.FindProperty("RuleSource")!.IsNullable.Should().BeTrue();
         entitySummaryEntity.FindProperty("RuleReason")!.IsNullable.Should().BeTrue();
+        entitySummaryEntity.FindPrimaryKey()!.Properties.Select(property => property.Name)
+            .Should()
+            .Equal("SweepId", "EntityType", "Category", "TenantId", "Strategy");
 
         var rowDetailEntity = db.Model.GetEntityTypes().Single(entityType =>
             string.Equals(entityType.GetTableName(), "sweep_run_row_detail", StringComparison.Ordinal)
@@ -43,6 +46,8 @@ public sealed class MigrationModelEndToEndTests(PostgresFixture fixture)
         rowDetailEntity.FindProperty("SweepId")!.IsNullable.Should().BeFalse();
         rowDetailEntity.FindProperty("TenantId")!.IsNullable.Should().BeFalse();
         rowDetailEntity.FindProperty("CapturedPayload")!.IsNullable.Should().BeTrue();
+        rowDetailEntity.FindProperty("RuleSource").Should().BeNull();
+        rowDetailEntity.FindProperty("RuleReason").Should().BeNull();
         rowDetailEntity.GetIndexes().Any(index =>
             !index.IsUnique && index.Properties.Select(property => property.Name).SequenceEqual(["SweepId"])
         ).Should().BeTrue();

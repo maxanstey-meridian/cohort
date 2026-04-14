@@ -118,6 +118,9 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
         entitySummaryColumns.Should().ContainKey("RuleReason");
         entitySummaryColumns["RuleReason"].DataType.Should().Be("text");
         entitySummaryColumns["RuleReason"].IsNullable.Should().BeTrue();
+        (await GetPrimaryKeyColumnsAsync("sweep_run_entity_summary"))
+            .Should()
+            .Equal("SweepId", "EntityType", "Category", "TenantId", "Strategy");
 
         var rowDetailColumns = await GetColumnsAsync("sweep_run_row_detail");
         rowDetailColumns.Should().ContainKey("Id");
@@ -127,6 +130,8 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
         rowDetailColumns.Should().ContainKey("CapturedPayload");
         rowDetailColumns["CapturedPayload"].DataType.Should().Be("text");
         rowDetailColumns["CapturedPayload"].IsNullable.Should().BeTrue();
+        rowDetailColumns.Should().NotContainKey("RuleSource");
+        rowDetailColumns.Should().NotContainKey("RuleReason");
         (await GetPrimaryKeyColumnsAsync("sweep_run_row_detail")).Should().Equal("Id");
 
         var handlerStatusColumns = await GetColumnsAsync("sweep_row_handler_status");

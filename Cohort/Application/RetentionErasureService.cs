@@ -115,7 +115,8 @@ public sealed class RetentionErasureService(
                 var (entry, context, rule, predicate) in RetentionExecutionPlanOrderer.Order(
                     db,
                     executionPlan,
-                    item => item.Entry
+                    item => item.Entry,
+                    logger
                 )
             )
             {

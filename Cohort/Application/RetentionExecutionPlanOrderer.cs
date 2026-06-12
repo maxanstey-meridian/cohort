@@ -1,6 +1,7 @@
 using Cohort.Domain;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 using Microsoft.EntityFrameworkCore.Metadata;
 
 namespace Cohort.Application;
@@ -10,7 +11,8 @@ internal static class RetentionExecutionPlanOrderer
     internal static IReadOnlyList<TPlan> Order<TPlan>(
         DbContext db,
         IReadOnlyList<TPlan> plan,
-        Func<TPlan, RetentionEntry> entrySelector
+        Func<TPlan, RetentionEntry> entrySelector,
+        ILogger? logger = null
     )
     {
         ArgumentNullException.ThrowIfNull(db);
@@ -98,12 +100,21 @@ internal static class RetentionExecutionPlanOrderer
 
         if (orderedEntityTypes.Count != orderedItems.Length)
         {
-            foreach (var entityType in orderedItems
-                         .Select(item => entrySelector(item).EntityType)
-                         .Where(entityType => !orderedEntityTypes.Contains(entityType)))
-            {
-                orderedEntityTypes.Add(entityType);
-            }
+            var resolved = new HashSet<Type>(orderedEntityTypes);
+            var cycleMembers = orderedItems
+                .Select(item => entrySelector(item).EntityType)
+                .Where(entityType => !resolved.Contains(entityType))
+                .ToArray();
+
+            // A dependency-respecting order does not exist for these entities; they are
+            // appended alphabetically and the operator is told, because a Purge sweep
+            // inside an FK cycle can fail on constraint violations depending on order.
+            logger?.LogWarning(
+                "Retention entities {CycleMembers} form a foreign-key cycle; no dependency-respecting sweep order exists, so they are processed alphabetically.",
+                string.Join(", ", cycleMembers.Select(entityType => entityType.FullName))
+            );
+
+            orderedEntityTypes.AddRange(cycleMembers);
         }
 
         return orderedEntityTypes

@@ -98,7 +98,8 @@ public sealed class RetentionSweepEngine(
                 var (entry, context, rule) in RetentionExecutionPlanOrderer.Order(
                     db,
                     executionPlan,
-                    item => item.Entry
+                    item => item.Entry,
+                    logger
                 )
             )
             {
@@ -209,7 +210,8 @@ public sealed class RetentionSweepEngine(
                 var (entry, context, rule) in RetentionExecutionPlanOrderer.Order(
                     db,
                     executionPlan,
-                    item => item.Entry
+                    item => item.Entry,
+                    logger
                 )
             )
             {

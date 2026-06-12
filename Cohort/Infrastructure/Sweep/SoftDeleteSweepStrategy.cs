@@ -75,6 +75,17 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
         return core.CountHeldAsync(entry, rule, ctx, conn, ct);
     }
 
+    public Task<long> CountNullAnchorsAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        RetentionResolutionContext ctx,
+        DbConnection conn,
+        CancellationToken ct
+    )
+    {
+        return core.CountNullAnchorsAsync(entry, rule, ctx, conn, ct);
+    }
+
     public Task<SweepExecutionResult> SweepAsync(
         RetentionEntry entry,
         RetentionRule rule,

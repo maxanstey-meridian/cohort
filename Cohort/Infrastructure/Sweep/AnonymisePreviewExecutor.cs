@@ -24,6 +24,22 @@ internal sealed class AnonymisePreviewExecutor
         return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
 
+    internal async Task<long> ExecuteNullAnchorCountAsync(
+        RetentionEntry entry,
+        SqlFilter filter,
+        TenantContext tenant,
+        DbConnection conn,
+        CancellationToken ct
+    )
+    {
+        await using var command = conn.CreateCommand();
+        command.CommandText = AnonymiseSqlBuilder.BuildNullAnchorCountCommandText(entry, filter);
+        AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
+        AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
+
+        return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
+    }
+
     internal async Task<long> ExecuteHeldCountAsync(
         RetentionEntry entry,
         SqlFilter filter,

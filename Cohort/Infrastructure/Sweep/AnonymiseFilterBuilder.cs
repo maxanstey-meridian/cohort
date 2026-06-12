@@ -19,6 +19,20 @@ internal static class AnonymiseFilterBuilder
         );
     }
 
+    internal static SqlFilter CreateNullAnchorFilter(RetentionEntry entry)
+    {
+        // Rows already scrubbed (AnonymisedAt set) are excluded: a NULL-anchor count
+        // reports rows anonymisation could otherwise still act on.
+        var anonymisedAtClause = entry.AnonymisedAt is { } anonymisedAt
+            ? $" AND target.{AnonymiseSqlBuilder.QuoteIdentifier(anonymisedAt.AnonymisedAtColumn)} IS NULL"
+            : "";
+
+        return new SqlFilter(
+            $"target.{AnonymiseSqlBuilder.QuoteIdentifier(entry.AnchorColumn)} IS NULL{anonymisedAtClause}",
+            []
+        );
+    }
+
     internal static SqlFilter CreateSubjectFilter(ErasureSubjectPredicate predicate)
     {
         return new SqlFilter(

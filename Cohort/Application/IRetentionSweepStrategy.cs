@@ -39,6 +39,19 @@ public interface IRetentionSweepStrategy
         CancellationToken ct
     );
 
+    /// <summary>
+    /// Counts rows this strategy could otherwise act on whose anchor column is NULL.
+    /// Such rows never match a cutoff comparison and are retained indefinitely; the
+    /// count is surfaced on every sweep summary so they cannot accumulate invisibly.
+    /// </summary>
+    public Task<long> CountNullAnchorsAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        RetentionResolutionContext ctx,
+        DbConnection conn,
+        CancellationToken ct
+    );
+
     public Task<long> PreviewEraseAsync(
         RetentionEntry entry,
         RetentionRule rule,

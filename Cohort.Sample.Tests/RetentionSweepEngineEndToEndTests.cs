@@ -76,7 +76,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(8);
+        result.Counts.Should().HaveCount(9);
         result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
@@ -153,7 +153,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(8);
+        result.Counts.Should().HaveCount(9);
         result.Counts.Should().Contain(
             new EntitySweepCount(
                 typeof(Note),
@@ -692,6 +692,17 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         }
 
         public Task<long> CountHeldAsync(
+            RetentionEntry entry,
+            RetentionRule rule,
+            RetentionResolutionContext ctx,
+            DbConnection conn,
+            CancellationToken ct
+        )
+        {
+            return Task.FromResult(0L);
+        }
+
+        public Task<long> CountNullAnchorsAsync(
             RetentionEntry entry,
             RetentionRule rule,
             RetentionResolutionContext ctx,

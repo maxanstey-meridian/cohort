@@ -202,7 +202,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         var act = async () => await host.RunStartupAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().HaveCount(8);
+        exception.Which.Errors.Should().HaveCount(9);
         exception
             .Which.Errors.Should()
             .Contain(

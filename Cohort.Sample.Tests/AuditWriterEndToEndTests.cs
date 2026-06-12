@@ -86,7 +86,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         started.TenantId.Should().Be(tenantId);
 
         var summaries = auditWriter.Events.OfType<SweepEvent.EntitySummary>().ToList();
-        summaries.Should().HaveCount(8);
+        summaries.Should().HaveCount(9);
         summaries.Should().Contain(
             s => s.SweepId == started.SweepId
                 && s.EntityType == typeof(AnonymisedContact)
@@ -304,7 +304,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
 
         // 3 original retained entities + blob-backed fixture + 3 tenantless/per-row sample additions
         // + tombstone entity (all later additions are Exempt under this test's restricted dict).
-        summaries.Should().HaveCount(8);
+        summaries.Should().HaveCount(9);
         summaries.Should().Contain(
             new SweepRunEntitySummaryRow(
                 result.SweepId,

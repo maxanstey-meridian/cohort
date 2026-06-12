@@ -101,6 +101,37 @@ internal sealed class RelationalSweepStrategyCore(
         return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
 
+    public async Task<long> CountNullAnchorsAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        RetentionResolutionContext ctx,
+        DbConnection conn,
+        CancellationToken ct
+    )
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+        ArgumentNullException.ThrowIfNull(rule);
+        ArgumentNullException.ThrowIfNull(ctx);
+        ArgumentNullException.ThrowIfNull(conn);
+        EnsureStrategy(rule);
+        await EnsureConnectionOpenAsync(conn, ct);
+
+        // No cutoff and no hold exclusion: a NULL anchor never matches any cutoff, and
+        // a held NULL-anchor row is just as invisible to retention either way.
+        await using var command = conn.CreateCommand();
+        command.CommandText =
+            $"""
+            SELECT COUNT(*)
+            FROM {QuoteIdentifier(entry.TableName)} AS target
+            WHERE target.{QuoteIdentifier(entry.AnchorColumn)} IS NULL
+              {TenantClause(entry)}
+              {eligibilityClause(entry)}
+            """;
+        AddTenantParameter(command, entry, ctx.Tenant.Id);
+
+        return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
+    }
+
     public async Task<SweepExecutionResult> SweepAsync(
         RetentionEntry entry,
         RetentionRule rule,

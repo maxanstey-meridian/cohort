@@ -307,7 +307,7 @@ public sealed class RetentionErasureService(
                 affectedCount,
                 heldCount,
                 skippedCount,
-                rule.Provenance
+                Provenance: rule.Provenance
             ),
             auditEvents,
             ct

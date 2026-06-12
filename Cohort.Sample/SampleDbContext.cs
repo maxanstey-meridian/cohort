@@ -18,6 +18,7 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
     public DbSet<PerRowAuditedLog> PerRowAuditedLogs => Set<PerRowAuditedLog>();
     public DbSet<TombstoneRecord> TombstoneRecords => Set<TombstoneRecord>();
     public DbSet<BlobBackedFile> BlobBackedFiles => Set<BlobBackedFile>();
+    public DbSet<NullableAnchorEvent> NullableAnchorEvents => Set<NullableAnchorEvent>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -73,6 +74,15 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
             b.Property(record => record.SubjectId);
             b.Property(record => record.CreatedAt).IsRequired();
             b.Property(record => record.Body).IsRequired();
+        });
+
+        modelBuilder.Entity<NullableAnchorEvent>(b =>
+        {
+            b.ToTable("nullable_anchor_events");
+            b.HasKey(record => record.Id);
+            b.Property(record => record.TenantId);
+            b.Property(record => record.OccurredAt);
+            b.Property(record => record.Payload).IsRequired();
         });
 
         modelBuilder.Entity<TenantlessLog>(b =>

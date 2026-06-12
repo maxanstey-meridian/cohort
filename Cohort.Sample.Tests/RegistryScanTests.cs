@@ -95,10 +95,10 @@ public sealed class RegistryScanTests
 
         // Negative — nothing else sneaks in
         entries.Values.Should().NotContain(e => e.Category == "long-lived");
-        // SampleDbContext has 8 retained entities: the original sample categories plus
+        // SampleDbContext has 9 retained entities: the original sample categories plus
         // TenantlessLog/TenantlessSoftDelete/PerRowAuditedLog, the factory-backed tombstone entity,
-        // and the blob-backed handler fixture.
-        entries.Should().HaveCount(8);
+        // the blob-backed handler fixture, and the nullable-anchor reporting fixture.
+        entries.Should().HaveCount(9);
     }
 
     [Fact]

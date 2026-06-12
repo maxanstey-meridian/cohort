@@ -164,7 +164,7 @@ public sealed class RetentionStartupValidatorTests
             await new RetentionStartupValidator(db, InMemoryCategoryRepository.Empty, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().HaveCount(8);
+        exception.Which.Errors.Should().HaveCount(9);
         exception
             .Which.Errors.Should()
             .Contain(
@@ -662,6 +662,7 @@ public sealed class RetentionStartupValidatorTests
                 // resolve them as Exempt so only the Anonymise-on-Note mismatch surfaces.
                 ["blob-cleanup"] = ExemptResolver,
                 ["tenantless-purge"] = ExemptResolver,
+                ["nullable-anchor-purge"] = ExemptResolver,
                 ["tenantless-softdelete"] = ExemptResolver,
                 ["per-row-audit-override"] = ExemptResolver,
                 ["tombstone-anonymise"] = ExemptResolver,
@@ -1216,6 +1217,7 @@ public sealed class RetentionStartupValidatorTests
                 category == "short-lived"
                 || category == "blob-cleanup"
                 || category == "tenantless-purge"
+                || category == "nullable-anchor-purge"
             )
             {
                 return Task.FromResult<IRetentionRuleResolver?>(
@@ -1268,6 +1270,7 @@ public sealed class RetentionStartupValidatorTests
                 category == "short-lived"
                 || category == "blob-cleanup"
                 || category == "tenantless-purge"
+                || category == "nullable-anchor-purge"
                 || category == "per-row-audit-override"
             )
             {
@@ -1314,7 +1317,7 @@ public sealed class RetentionStartupValidatorTests
         {
             return category switch
             {
-                "short-lived" or "blob-cleanup" or "tenantless-purge" or "per-row-audit-override" =>
+                "short-lived" or "blob-cleanup" or "tenantless-purge" or "nullable-anchor-purge" or "per-row-audit-override" =>
                     Task.FromResult<IRetentionRuleResolver?>(
                         new OpaqueDeferredRuleResolver(
                             new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
@@ -1344,7 +1347,7 @@ public sealed class RetentionStartupValidatorTests
         {
             return category switch
             {
-                "short-lived" or "blob-cleanup" or "tenantless-purge" or "per-row-audit-override" =>
+                "short-lived" or "blob-cleanup" or "tenantless-purge" or "nullable-anchor-purge" or "per-row-audit-override" =>
                     Task.FromResult<IRetentionRuleResolver?>(
                         new StaticRetentionRuleResolver(
                             new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)

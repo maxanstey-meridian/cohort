@@ -23,6 +23,7 @@ public abstract record SweepEvent
         long Affected,
         long HeldCount,
         long SkippedCount = 0,
+        long NullAnchorCount = 0,
         RetentionRuleProvenance? Provenance = null
     ) : SweepEvent;
 

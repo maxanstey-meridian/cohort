@@ -18,5 +18,6 @@ public sealed record EntitySweepCount(
     Strategy Strategy,
     long Affected,
     long HeldCount = 0,
-    long SkippedCount = 0
+    long SkippedCount = 0,
+    long NullAnchorCount = 0
 );

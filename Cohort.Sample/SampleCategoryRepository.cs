@@ -26,6 +26,9 @@ public sealed class SampleCategoryRepository : IRetentionCategoryRepository
             ["tenantless-purge"] = new StaticRetentionRuleResolver(
                 new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
             ),
+            ["nullable-anchor-purge"] = new StaticRetentionRuleResolver(
+                new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+            ),
             ["tenantless-softdelete"] = new StaticRetentionRuleResolver(
                 new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
             ),

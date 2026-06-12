@@ -82,6 +82,7 @@ public sealed class EfRetentionAuditWriter(DbContext db) : IRetentionAuditWriter
                 "Affected",
                 "HeldCount",
                 "SkippedCount",
+                "NullAnchorCount",
                 "RuleSource",
                 "RuleReason"
             )
@@ -96,6 +97,7 @@ public sealed class EfRetentionAuditWriter(DbContext db) : IRetentionAuditWriter
                 @affected,
                 @heldCount,
                 @skippedCount,
+                @nullAnchorCount,
                 @ruleSource,
                 @ruleReason
             )
@@ -117,6 +119,9 @@ public sealed class EfRetentionAuditWriter(DbContext db) : IRetentionAuditWriter
                 command.Parameters.Add(CreateParameter(command, "heldCount", summary.HeldCount));
                 command.Parameters.Add(
                     CreateParameter(command, "skippedCount", summary.SkippedCount)
+                );
+                command.Parameters.Add(
+                    CreateParameter(command, "nullAnchorCount", summary.NullAnchorCount)
                 );
                 command.Parameters.Add(
                     CreateParameter(command, "ruleSource", summary.Provenance?.Source)

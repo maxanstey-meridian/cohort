@@ -219,12 +219,14 @@ public sealed class RetentionSweepEngine(
                     var resolvedPeriod = CutoffCalculator.ResolveEffectivePeriod(rule.Period, rule.LegalMin);
                     var affected = 0L;
                     var heldCount = 0L;
+                    var nullAnchorCount = 0L;
 
                     if (rule.Strategy != Strategy.Exempt)
                     {
                         var strategy = strategies[rule.Strategy];
                         affected = await strategy.PreviewAsync(entry, rule, context, connection, ct);
                         heldCount = await strategy.CountHeldAsync(entry, rule, context, connection, ct);
+                        nullAnchorCount = await strategy.CountNullAnchorsAsync(entry, rule, context, connection, ct);
                     }
 
                     await WriteAuditEventAsync(
@@ -239,6 +241,7 @@ public sealed class RetentionSweepEngine(
                             affected,
                             heldCount,
                             0,
+                            nullAnchorCount,
                             rule.Provenance
                         ),
                         auditEvents,
@@ -354,6 +357,7 @@ public sealed class RetentionSweepEngine(
         var affectedRecordIds = new List<string>();
         var skippedCount = 0L;
         var heldCount = 0L;
+        var nullAnchorCount = 0L;
         var rowDetailsPersisted = false;
 
         if (rule.Strategy != Strategy.Exempt)
@@ -414,6 +418,7 @@ public sealed class RetentionSweepEngine(
             // Held rows are measured directly (eligible AND actively held) instead of
             // being inferred from candidate arithmetic.
             heldCount = await strategy.CountHeldAsync(entry, rule, context, connection, ct);
+            nullAnchorCount = await strategy.CountNullAnchorsAsync(entry, rule, context, connection, ct);
         }
 
         await using (var summaryTransaction = await db.Database.BeginTransactionAsync(ct))
@@ -430,6 +435,7 @@ public sealed class RetentionSweepEngine(
                     affectedRecordIds.Count,
                     heldCount,
                     skippedCount,
+                    nullAnchorCount,
                     rule.Provenance
                 ),
                 auditEvents,
@@ -495,7 +501,8 @@ public sealed class RetentionSweepEngine(
                     summary.Strategy,
                     summary.Affected,
                     summary.HeldCount,
-                    summary.SkippedCount
+                    summary.SkippedCount,
+                    summary.NullAnchorCount
                 )
             )
             .ToArray();

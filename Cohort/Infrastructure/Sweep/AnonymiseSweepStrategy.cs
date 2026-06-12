@@ -91,6 +91,31 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         );
     }
 
+    public async Task<long> CountNullAnchorsAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        RetentionResolutionContext ctx,
+        DbConnection conn,
+        CancellationToken ct
+    )
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+        ArgumentNullException.ThrowIfNull(rule);
+        ArgumentNullException.ThrowIfNull(ctx);
+        ArgumentNullException.ThrowIfNull(conn);
+
+        ValidateEntry(entry, rule, "null-anchor counts");
+        await EnsureConnectionOpenAsync(conn, ct);
+
+        return await previewExecutor.ExecuteNullAnchorCountAsync(
+            entry,
+            AnonymiseFilterBuilder.CreateNullAnchorFilter(entry),
+            ctx.Tenant,
+            conn,
+            ct
+        );
+    }
+
     public async Task<SweepExecutionResult> SweepAsync(
         RetentionEntry entry,
         RetentionRule rule,

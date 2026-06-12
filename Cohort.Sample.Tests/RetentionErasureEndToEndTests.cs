@@ -2990,6 +2990,17 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             throw new NotSupportedException();
         }
 
+        public Task<long> CountNullAnchorsAsync(
+            RetentionEntry entry,
+            RetentionRule rule,
+            RetentionResolutionContext ctx,
+            DbConnection conn,
+            CancellationToken ct
+        )
+        {
+            return Task.FromResult(0L);
+        }
+
 
 
         public Task<long> CountHeldForEraseAsync(

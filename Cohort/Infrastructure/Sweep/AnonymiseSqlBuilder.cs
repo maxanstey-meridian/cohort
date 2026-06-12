@@ -33,6 +33,20 @@ internal static class AnonymiseSqlBuilder
             """;
     }
 
+    internal static string BuildNullAnchorCountCommandText(RetentionEntry entry, SqlFilter filter)
+    {
+        // No hold exclusion: a held NULL-anchor row is just as invisible to retention.
+        var tenantClause = BuildTenantClause(entry.Tenant?.TenantColumn);
+
+        return
+            $"""
+            SELECT COUNT(*)
+            FROM {QuoteIdentifier(entry.TableName)} AS target
+            WHERE {filter.PredicateSql}
+              {tenantClause}
+            """;
+    }
+
     private static string BuildAnonymisedAtAssignment(RetentionEntry entry)
     {
         return entry.AnonymisedAt is { } anonymisedAt

@@ -241,13 +241,18 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         await SetHandlerStatusInFlightAsync(result.SweepId, DateTimeOffset.UtcNow);
 
+        RowDispatcherFlushResult? flushResult = null;
         await handlerHost.RunWithServicesAsync(async serviceProvider =>
         {
             var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
-            await dispatcher.FlushAsync();
+            flushResult = await dispatcher.FlushAsync();
         });
 
         cleanupStore.DeletedPaths.Should().BeEmpty();
+        flushResult.Should().NotBeNull();
+        flushResult!.Settled.Should().BeFalse();
+        flushResult.InFlightRemaining.Should().Be(1);
+        flushResult.PendingRemaining.Should().Be(0);
 
         var statuses = await LoadHandlerStatusesAsync(result.SweepId);
         statuses.Should().ContainSingle();
@@ -347,13 +352,18 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         );
 
         await SetSweepCompletedAtAsync(deferredResult.SweepId, null);
+        RowDispatcherFlushResult? midSweepFlushResult = null;
         await deferredHost.RunWithServicesAsync(async serviceProvider =>
         {
             var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
-            await dispatcher.FlushAsync();
+            midSweepFlushResult = await dispatcher.FlushAsync();
         });
 
         recorder.AfterCalls.Should().BeEmpty();
+        midSweepFlushResult.Should().NotBeNull();
+        midSweepFlushResult!.Settled.Should().BeFalse();
+        midSweepFlushResult.InFlightRemaining.Should().Be(0);
+        midSweepFlushResult.PendingRemaining.Should().Be(1);
 
         var pendingStatuses = await LoadHandlerStatusesAsync(deferredResult.SweepId);
         pendingStatuses.Should().ContainSingle();
@@ -363,13 +373,16 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         pendingStatuses[0].CompletedAt.Should().BeNull();
 
         await SetSweepCompletedAtAsync(deferredResult.SweepId, deferredResult.CompletedAt);
+        RowDispatcherFlushResult? settledFlushResult = null;
         await deferredHost.RunWithServicesAsync(async serviceProvider =>
         {
             var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
-            await dispatcher.FlushAsync();
+            settledFlushResult = await dispatcher.FlushAsync();
         });
 
         recorder.AfterCalls.Should().ContainSingle(call => call == "after:deferred-gate:1");
+        settledFlushResult.Should().NotBeNull();
+        settledFlushResult!.Settled.Should().BeTrue();
 
         var completedStatuses = await LoadHandlerStatusesAsync(deferredResult.SweepId);
         completedStatuses.Should().ContainSingle();

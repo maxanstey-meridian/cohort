@@ -21,10 +21,63 @@ public sealed class RetentionRowDispatcher(
     ILogger<RetentionRowDispatcher> logger
 ) : BackgroundService, IRetentionRowDispatcher
 {
-    public async Task FlushAsync(CancellationToken ct = default)
+    public async Task<RowDispatcherFlushResult> FlushAsync(CancellationToken ct = default)
     {
         await ScrubExpiredPayloadsAsync(ct);
         await DrainQueueAsync(DateTimeOffset.MaxValue, ct);
+        return await CountRemainingWorkAsync(ct);
+    }
+
+    /// <summary>
+    /// Counts non-terminal handler rows left after a drain. Any pending row remaining
+    /// here was not dispatchable by the flush (deferred phase with an unsettled sweep,
+    /// or queued behind an in-flight sibling); any in-flight row is held by another
+    /// claimer under a live lease.
+    /// </summary>
+    private async Task<RowDispatcherFlushResult> CountRemainingWorkAsync(CancellationToken ct)
+    {
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<DbContext>();
+        var connection = db.Database.GetDbConnection();
+        var shouldCloseConnection = connection.State != ConnectionState.Open;
+
+        if (shouldCloseConnection)
+        {
+            await db.Database.OpenConnectionAsync(ct);
+        }
+
+        try
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText =
+                $"""
+                SELECT
+                    COUNT(*) FILTER (WHERE "State" = @inFlight),
+                    COUNT(*) FILTER (WHERE "State" = @pending)
+                FROM {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)}
+                """;
+            command.Parameters.Add(
+                CreateParameter(command, "inFlight", (int)SweepRowHandlerDispatchState.InFlight)
+            );
+            command.Parameters.Add(
+                CreateParameter(command, "pending", (int)SweepRowHandlerDispatchState.Pending)
+            );
+
+            await using var reader = await command.ExecuteReaderAsync(ct);
+            await reader.ReadAsync(ct);
+
+            return new RowDispatcherFlushResult(
+                (int)reader.GetInt64(0),
+                (int)reader.GetInt64(1)
+            );
+        }
+        finally
+        {
+            if (shouldCloseConnection)
+            {
+                await db.Database.CloseConnectionAsync();
+            }
+        }
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)

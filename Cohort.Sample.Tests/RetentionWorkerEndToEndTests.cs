@@ -546,8 +546,9 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         using var scope = host.Host.Services.CreateScope();
         var dispatcher = scope.ServiceProvider.GetRequiredService<IRetentionRowDispatcher>();
 
-        await dispatcher.FlushAsync();
+        var flushResult = await dispatcher.FlushAsync();
 
+        flushResult.Settled.Should().BeTrue();
         (await CountRowsAsync(database.ConnectionString, "sweep_row_handler_status")).Should().Be(0);
 
         await host.Host.StopAsync();

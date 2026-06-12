@@ -33,6 +33,11 @@ internal sealed class RelationalSweepStrategyCore(
             BindingFlags.Instance | BindingFlags.NonPublic
         )!;
 
+    // MakeGenericMethod is allocation-heavy and the entity set is small and fixed;
+    // closed methods are cached per entity type for the process lifetime.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, MethodInfo> HandlerAwareSweepMethods =
+        new();
+
     public async Task<long> PreviewAsync(
         RetentionEntry entry,
         RetentionRule rule,
@@ -404,12 +409,15 @@ internal sealed class RelationalSweepStrategyCore(
         CancellationToken ct
     )
     {
-        return (Task<SweepExecutionResult>)ExecuteHandlerAwareSweepCoreMethod
-            .MakeGenericMethod(entry.EntityType)
-            .Invoke(
-                this,
-                [entry, rule, ctx, conn, transaction, candidateRecordIds, cutoff, handlers, execution, ct]
-            )!;
+        var closedMethod = HandlerAwareSweepMethods.GetOrAdd(
+            entry.EntityType,
+            static entityType => ExecuteHandlerAwareSweepCoreMethod.MakeGenericMethod(entityType)
+        );
+
+        return (Task<SweepExecutionResult>)closedMethod.Invoke(
+            this,
+            [entry, rule, ctx, conn, transaction, candidateRecordIds, cutoff, handlers, execution, ct]
+        )!;
     }
 
     private async Task<SweepExecutionResult> ExecuteHandlerAwareSweepCoreAsync<TEntity>(

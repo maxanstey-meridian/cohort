@@ -34,50 +34,36 @@ public sealed class RetentionRowDispatcher(
     /// or queued behind an in-flight sibling); any in-flight row is held by another
     /// claimer under a live lease.
     /// </summary>
-    private async Task<RowDispatcherFlushResult> CountRemainingWorkAsync(CancellationToken ct)
+    private Task<RowDispatcherFlushResult> CountRemainingWorkAsync(CancellationToken ct)
     {
-        await using var scope = scopeFactory.CreateAsyncScope();
-        var db = scope.ServiceProvider.GetRequiredService<DbContext>();
-        var connection = db.Database.GetDbConnection();
-        var shouldCloseConnection = connection.State != ConnectionState.Open;
-
-        if (shouldCloseConnection)
-        {
-            await db.Database.OpenConnectionAsync(ct);
-        }
-
-        try
-        {
-            await using var command = connection.CreateCommand();
-            command.CommandText =
-                $"""
-                SELECT
-                    COUNT(*) FILTER (WHERE "State" = @inFlight),
-                    COUNT(*) FILTER (WHERE "State" = @pending)
-                FROM {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)}
-                """;
-            command.Parameters.Add(
-                CreateParameter(command, "inFlight", (int)SweepRowHandlerDispatchState.InFlight)
-            );
-            command.Parameters.Add(
-                CreateParameter(command, "pending", (int)SweepRowHandlerDispatchState.Pending)
-            );
-
-            await using var reader = await command.ExecuteReaderAsync(ct);
-            await reader.ReadAsync(ct);
-
-            return new RowDispatcherFlushResult(
-                (int)reader.GetInt64(0),
-                (int)reader.GetInt64(1)
-            );
-        }
-        finally
-        {
-            if (shouldCloseConnection)
+        return WithScopedConnectionAsync(
+            async (_, connection) =>
             {
-                await db.Database.CloseConnectionAsync();
-            }
-        }
+                await using var command = connection.CreateCommand();
+                command.CommandText =
+                    $"""
+                    SELECT
+                        COUNT(*) FILTER (WHERE "State" = @inFlight),
+                        COUNT(*) FILTER (WHERE "State" = @pending)
+                    FROM {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)}
+                    """;
+                command.Parameters.Add(
+                    CreateParameter(command, "inFlight", (int)SweepRowHandlerDispatchState.InFlight)
+                );
+                command.Parameters.Add(
+                    CreateParameter(command, "pending", (int)SweepRowHandlerDispatchState.Pending)
+                );
+
+                await using var reader = await command.ExecuteReaderAsync(ct);
+                await reader.ReadAsync(ct);
+
+                return new RowDispatcherFlushResult(
+                    (int)reader.GetInt64(0),
+                    (int)reader.GetInt64(1)
+                );
+            },
+            ct
+        );
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -122,54 +108,40 @@ public sealed class RetentionRowDispatcher(
     /// reached a terminal state. Snapshots exist solely to feed OnAfterAsync; keeping
     /// them longer retains exactly the personal data the sweep was meant to remove.
     /// </summary>
-    private async Task ClearSettledPayloadAsync(long rowDetailId)
+    private Task ClearSettledPayloadAsync(long rowDetailId)
     {
-        await using var scope = scopeFactory.CreateAsyncScope();
-        var db = scope.ServiceProvider.GetRequiredService<DbContext>();
-        var connection = db.Database.GetDbConnection();
-        var shouldCloseConnection = connection.State != ConnectionState.Open;
-
-        if (shouldCloseConnection)
-        {
-            await db.Database.OpenConnectionAsync(CancellationToken.None);
-        }
-
-        try
-        {
-            await using var command = connection.CreateCommand();
-            command.CommandText =
-                $"""
-                UPDATE {QuoteIdentifier(CohortTableNames.SweepRunRowDetail)} AS detail
-                SET "CapturedPayload" = NULL
-                WHERE detail."Id" = @rowDetailId
-                  AND detail."CapturedPayload" IS NOT NULL
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} AS status
-                      WHERE status."SweepRunRowDetailId" = detail."Id"
-                        AND status."State" IN (@pending, @inFlight)
-                  )
-                """;
-            command.Parameters.Add(CreateParameter(command, "rowDetailId", rowDetailId));
-            command.Parameters.Add(
-                CreateParameter(command, "pending", (int)SweepRowHandlerDispatchState.Pending)
-            );
-            command.Parameters.Add(
-                CreateParameter(command, "inFlight", (int)SweepRowHandlerDispatchState.InFlight)
-            );
-
-            await command.ExecuteNonQueryAsync(CancellationToken.None);
-        }
-        finally
-        {
-            if (shouldCloseConnection)
+        return WithScopedConnectionAsync(
+            async (_, connection) =>
             {
-                await db.Database.CloseConnectionAsync();
-            }
-        }
+                await using var command = connection.CreateCommand();
+                command.CommandText =
+                    $"""
+                    UPDATE {QuoteIdentifier(CohortTableNames.SweepRunRowDetail)} AS detail
+                    SET "CapturedPayload" = NULL
+                    WHERE detail."Id" = @rowDetailId
+                      AND detail."CapturedPayload" IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} AS status
+                          WHERE status."SweepRunRowDetailId" = detail."Id"
+                            AND status."State" IN (@pending, @inFlight)
+                      )
+                    """;
+                command.Parameters.Add(CreateParameter(command, "rowDetailId", rowDetailId));
+                command.Parameters.Add(
+                    CreateParameter(command, "pending", (int)SweepRowHandlerDispatchState.Pending)
+                );
+                command.Parameters.Add(
+                    CreateParameter(command, "inFlight", (int)SweepRowHandlerDispatchState.InFlight)
+                );
+
+                await command.ExecuteNonQueryAsync(CancellationToken.None);
+            },
+            CancellationToken.None
+        );
     }
 
-    private async Task ScrubExpiredPayloadsAsync(CancellationToken ct)
+    private Task ScrubExpiredPayloadsAsync(CancellationToken ct)
     {
         var retention = options.CurrentValue.RowHandlerDispatch.PayloadRetention;
         if (retention < TimeSpan.FromHours(1))
@@ -177,39 +149,25 @@ public sealed class RetentionRowDispatcher(
             retention = TimeSpan.FromHours(1);
         }
 
-        await using var scope = scopeFactory.CreateAsyncScope();
-        var db = scope.ServiceProvider.GetRequiredService<DbContext>();
-        var connection = db.Database.GetDbConnection();
-        var shouldCloseConnection = connection.State != ConnectionState.Open;
-
-        if (shouldCloseConnection)
-        {
-            await db.Database.OpenConnectionAsync(ct);
-        }
-
-        try
-        {
-            await using var command = connection.CreateCommand();
-            command.CommandText =
-                $"""
-                UPDATE {QuoteIdentifier(CohortTableNames.SweepRunRowDetail)}
-                SET "CapturedPayload" = NULL
-                WHERE "CapturedPayload" IS NOT NULL
-                  AND "At" < @payloadCutoff
-                """;
-            command.Parameters.Add(
-                CreateParameter(command, "payloadCutoff", DateTimeOffset.UtcNow - retention)
-            );
-
-            await command.ExecuteNonQueryAsync(ct);
-        }
-        finally
-        {
-            if (shouldCloseConnection)
+        return WithScopedConnectionAsync(
+            async (_, connection) =>
             {
-                await db.Database.CloseConnectionAsync();
-            }
-        }
+                await using var command = connection.CreateCommand();
+                command.CommandText =
+                    $"""
+                    UPDATE {QuoteIdentifier(CohortTableNames.SweepRunRowDetail)}
+                    SET "CapturedPayload" = NULL
+                    WHERE "CapturedPayload" IS NOT NULL
+                      AND "At" < @payloadCutoff
+                    """;
+                command.Parameters.Add(
+                    CreateParameter(command, "payloadCutoff", DateTimeOffset.UtcNow - retention)
+                );
+
+                await command.ExecuteNonQueryAsync(ct);
+            },
+            ct
+        );
     }
 
     private async Task DrainQueueAsync(DateTimeOffset dueCutoff, CancellationToken ct)
@@ -318,61 +276,47 @@ public sealed class RetentionRowDispatcher(
         }
     }
 
-    private async Task<IReadOnlyList<ClaimedHandlerRow>> ClaimBatchAsync(
+    private Task<IReadOnlyList<ClaimedHandlerRow>> ClaimBatchAsync(
         DateTimeOffset dueCutoff,
         CancellationToken ct
     )
     {
-        await using var scope = scopeFactory.CreateAsyncScope();
-        var db = scope.ServiceProvider.GetRequiredService<DbContext>();
-        var connection = db.Database.GetDbConnection();
-        var shouldCloseConnection = connection.State != ConnectionState.Open;
-
-        if (shouldCloseConnection)
-        {
-            await db.Database.OpenConnectionAsync(ct);
-        }
-
-        try
-        {
-            await using var transaction = await db.Database.BeginTransactionAsync(ct);
-            var claimedAt = DateTimeOffset.UtcNow;
-            var claimedIds = await ClaimBatchIdsAsync(
-                connection,
-                transaction.GetDbTransaction(),
-                claimedAt,
-                dueCutoff,
-                ct
-            );
-            if (claimedIds.Count == 0)
+        return WithScopedConnectionAsync<IReadOnlyList<ClaimedHandlerRow>>(
+            async (db, connection) =>
             {
-                await transaction.CommitAsync(ct);
-                return [];
-            }
-
-            var claimedRows = await LoadClaimedRowsAsync(
-                connection,
-                transaction.GetDbTransaction(),
-                claimedIds,
-                ct
-            );
-            if (claimedRows.Count != claimedIds.Count)
-            {
-                throw new InvalidOperationException(
-                    "Retention row dispatcher claimed status rows that could not be reloaded."
+                await using var transaction = await db.Database.BeginTransactionAsync(ct);
+                var claimedAt = DateTimeOffset.UtcNow;
+                var claimedIds = await ClaimBatchIdsAsync(
+                    connection,
+                    transaction.GetDbTransaction(),
+                    claimedAt,
+                    dueCutoff,
+                    ct
                 );
-            }
+                if (claimedIds.Count == 0)
+                {
+                    await transaction.CommitAsync(ct);
+                    return [];
+                }
 
-            await transaction.CommitAsync(ct);
-            return claimedRows;
-        }
-        finally
-        {
-            if (shouldCloseConnection)
-            {
-                await db.Database.CloseConnectionAsync();
-            }
-        }
+                var claimedRows = await LoadClaimedRowsAsync(
+                    connection,
+                    transaction.GetDbTransaction(),
+                    claimedIds,
+                    ct
+                );
+                if (claimedRows.Count != claimedIds.Count)
+                {
+                    throw new InvalidOperationException(
+                        "Retention row dispatcher claimed status rows that could not be reloaded."
+                    );
+                }
+
+                await transaction.CommitAsync(ct);
+                return claimedRows;
+            },
+            ct
+        );
     }
 
     private async Task<IReadOnlyList<long>> ClaimBatchIdsAsync(
@@ -607,7 +551,7 @@ public sealed class RetentionRowDispatcher(
         );
     }
 
-    private async Task MarkDeadLetteredAsync(
+    private Task MarkDeadLetteredAsync(
         ClaimedHandlerRow claimed,
         int attempt,
         string lastError,
@@ -615,153 +559,173 @@ public sealed class RetentionRowDispatcher(
         CancellationToken ct
     )
     {
-        await using var scope = scopeFactory.CreateAsyncScope();
-        var db = scope.ServiceProvider.GetRequiredService<DbContext>();
-        var connection = db.Database.GetDbConnection();
-        var shouldCloseConnection = connection.State != ConnectionState.Open;
-
-        if (shouldCloseConnection)
-        {
-            await db.Database.OpenConnectionAsync(ct);
-        }
-
-        try
-        {
-            await using var transaction = await db.Database.BeginTransactionAsync(ct);
-
-            await using (var currentCommand = connection.CreateCommand())
+        return WithScopedConnectionAsync(
+            async (db, connection) =>
             {
-                currentCommand.Transaction = transaction.GetDbTransaction();
-                currentCommand.CommandText =
-                    $"""
-                    UPDATE {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)}
-                    SET "State" = @state,
-                        "Attempt" = @attempt,
-                        "CompletedAt" = @completedAt,
-                        "LastError" = @lastError
-                    WHERE "Id" = @statusId
-                      AND "State" = @expectedState
-                    """;
-                currentCommand.Parameters.Add(CreateParameter(currentCommand, "state", (int)SweepRowHandlerDispatchState.DeadLettered));
-                currentCommand.Parameters.Add(CreateParameter(currentCommand, "attempt", attempt));
-                currentCommand.Parameters.Add(CreateParameter(currentCommand, "completedAt", now));
-                currentCommand.Parameters.Add(CreateParameter(currentCommand, "lastError", lastError));
-                currentCommand.Parameters.Add(CreateParameter(currentCommand, "statusId", claimed.StatusId));
-                currentCommand.Parameters.Add(
-                    CreateParameter(currentCommand, "expectedState", (int)SweepRowHandlerDispatchState.InFlight)
-                );
+                await using var transaction = await db.Database.BeginTransactionAsync(ct);
 
-                var affected = await currentCommand.ExecuteNonQueryAsync(ct);
-                if (affected != 1)
+                await using (var currentCommand = connection.CreateCommand())
                 {
-                    throw new InvalidOperationException(
-                        $"Retention row dispatcher could not update status row {claimed.StatusId} from InFlight state."
+                    currentCommand.Transaction = transaction.GetDbTransaction();
+                    currentCommand.CommandText =
+                        $"""
+                        UPDATE {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)}
+                        SET "State" = @state,
+                            "Attempt" = @attempt,
+                            "CompletedAt" = @completedAt,
+                            "LastError" = @lastError
+                        WHERE "Id" = @statusId
+                          AND "State" = @expectedState
+                        """;
+                    currentCommand.Parameters.Add(CreateParameter(currentCommand, "state", (int)SweepRowHandlerDispatchState.DeadLettered));
+                    currentCommand.Parameters.Add(CreateParameter(currentCommand, "attempt", attempt));
+                    currentCommand.Parameters.Add(CreateParameter(currentCommand, "completedAt", now));
+                    currentCommand.Parameters.Add(CreateParameter(currentCommand, "lastError", lastError));
+                    currentCommand.Parameters.Add(CreateParameter(currentCommand, "statusId", claimed.StatusId));
+                    currentCommand.Parameters.Add(
+                        CreateParameter(currentCommand, "expectedState", (int)SweepRowHandlerDispatchState.InFlight)
                     );
+
+                    var affected = await currentCommand.ExecuteNonQueryAsync(ct);
+                    if (affected != 1)
+                    {
+                        throw new InvalidOperationException(
+                            $"Retention row dispatcher could not update status row {claimed.StatusId} from InFlight state."
+                        );
+                    }
                 }
-            }
 
-            await using (var dependentCommand = connection.CreateCommand())
-            {
-                dependentCommand.Transaction = transaction.GetDbTransaction();
-                dependentCommand.CommandText =
-                    $"""
-                    UPDATE {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)}
-                    SET "State" = @state,
-                        "ClaimedAt" = NULL,
-                        "CompletedAt" = @completedAt,
-                        "LastError" = @lastError
-                    WHERE "SweepRunRowDetailId" = @rowDetailId
-                      AND "Id" > @statusId
-                      AND "State" IN (@pending, @inFlight)
-                    """;
-                dependentCommand.Parameters.Add(
-                    CreateParameter(dependentCommand, "state", (int)SweepRowHandlerDispatchState.DeadLettered)
-                );
-                dependentCommand.Parameters.Add(CreateParameter(dependentCommand, "completedAt", now));
-                dependentCommand.Parameters.Add(
-                    CreateParameter(
-                        dependentCommand,
-                        "lastError",
-                        $"Skipped because an earlier handler for the same row dead-lettered: {claimed.HandlerType}"
-                    )
-                );
-                dependentCommand.Parameters.Add(CreateParameter(dependentCommand, "rowDetailId", claimed.RowDetailId));
-                dependentCommand.Parameters.Add(CreateParameter(dependentCommand, "statusId", claimed.StatusId));
-                dependentCommand.Parameters.Add(
-                    CreateParameter(dependentCommand, "pending", (int)SweepRowHandlerDispatchState.Pending)
-                );
-                dependentCommand.Parameters.Add(
-                    CreateParameter(dependentCommand, "inFlight", (int)SweepRowHandlerDispatchState.InFlight)
-                );
+                await using (var dependentCommand = connection.CreateCommand())
+                {
+                    dependentCommand.Transaction = transaction.GetDbTransaction();
+                    dependentCommand.CommandText =
+                        $"""
+                        UPDATE {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)}
+                        SET "State" = @state,
+                            "ClaimedAt" = NULL,
+                            "CompletedAt" = @completedAt,
+                            "LastError" = @lastError
+                        WHERE "SweepRunRowDetailId" = @rowDetailId
+                          AND "Id" > @statusId
+                          AND "State" IN (@pending, @inFlight)
+                        """;
+                    dependentCommand.Parameters.Add(
+                        CreateParameter(dependentCommand, "state", (int)SweepRowHandlerDispatchState.DeadLettered)
+                    );
+                    dependentCommand.Parameters.Add(CreateParameter(dependentCommand, "completedAt", now));
+                    dependentCommand.Parameters.Add(
+                        CreateParameter(
+                            dependentCommand,
+                            "lastError",
+                            $"Skipped because an earlier handler for the same row dead-lettered: {claimed.HandlerType}"
+                        )
+                    );
+                    dependentCommand.Parameters.Add(CreateParameter(dependentCommand, "rowDetailId", claimed.RowDetailId));
+                    dependentCommand.Parameters.Add(CreateParameter(dependentCommand, "statusId", claimed.StatusId));
+                    dependentCommand.Parameters.Add(
+                        CreateParameter(dependentCommand, "pending", (int)SweepRowHandlerDispatchState.Pending)
+                    );
+                    dependentCommand.Parameters.Add(
+                        CreateParameter(dependentCommand, "inFlight", (int)SweepRowHandlerDispatchState.InFlight)
+                    );
 
-                await dependentCommand.ExecuteNonQueryAsync(ct);
-            }
+                    await dependentCommand.ExecuteNonQueryAsync(ct);
+                }
 
-            await transaction.CommitAsync(ct);
-        }
-        finally
-        {
-            if (shouldCloseConnection)
-            {
-                await db.Database.CloseConnectionAsync();
-            }
-        }
+                await transaction.CommitAsync(ct);
+            },
+            ct
+        );
     }
 
-    private async Task RequeueCancelledClaimsAsync(IReadOnlyList<long> statusIds)
+    private Task RequeueCancelledClaimsAsync(IReadOnlyList<long> statusIds)
     {
         if (statusIds.Count == 0)
         {
-            return;
+            return Task.CompletedTask;
         }
 
-        await using var scope = scopeFactory.CreateAsyncScope();
-        var db = scope.ServiceProvider.GetRequiredService<DbContext>();
-        var connection = db.Database.GetDbConnection();
-        var shouldCloseConnection = connection.State != ConnectionState.Open;
-
-        if (shouldCloseConnection)
-        {
-            await db.Database.OpenConnectionAsync(CancellationToken.None);
-        }
-
-        try
-        {
-            await using var transaction = await db.Database.BeginTransactionAsync(CancellationToken.None);
-            await using var command = connection.CreateCommand();
-            command.Transaction = transaction.GetDbTransaction();
-            command.CommandText =
-                $"""
-                UPDATE {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)}
-                SET "State" = @pending,
-                    "ClaimedAt" = NULL
-                WHERE "Id" = ANY(@statusIds)
-                  AND "State" = @inFlight
-                """;
-            command.Parameters.Add(CreateParameter(command, "pending", (int)SweepRowHandlerDispatchState.Pending));
-            command.Parameters.Add(
-                CreateParameter(command, "statusIds", statusIds.ToArray())
-            );
-            command.Parameters.Add(
-                CreateParameter(command, "inFlight", (int)SweepRowHandlerDispatchState.InFlight)
-            );
-
-            await command.ExecuteNonQueryAsync(CancellationToken.None);
-            await transaction.CommitAsync(CancellationToken.None);
-        }
-        finally
-        {
-            if (shouldCloseConnection)
+        return WithScopedConnectionAsync(
+            async (db, connection) =>
             {
-                await db.Database.CloseConnectionAsync();
-            }
-        }
+                await using var transaction = await db.Database.BeginTransactionAsync(CancellationToken.None);
+                await using var command = connection.CreateCommand();
+                command.Transaction = transaction.GetDbTransaction();
+                command.CommandText =
+                    $"""
+                    UPDATE {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)}
+                    SET "State" = @pending,
+                        "ClaimedAt" = NULL
+                    WHERE "Id" = ANY(@statusIds)
+                      AND "State" = @inFlight
+                    """;
+                command.Parameters.Add(CreateParameter(command, "pending", (int)SweepRowHandlerDispatchState.Pending));
+                command.Parameters.Add(
+                    CreateParameter(command, "statusIds", statusIds.ToArray())
+                );
+                command.Parameters.Add(
+                    CreateParameter(command, "inFlight", (int)SweepRowHandlerDispatchState.InFlight)
+                );
+
+                await command.ExecuteNonQueryAsync(CancellationToken.None);
+                await transaction.CommitAsync(CancellationToken.None);
+            },
+            CancellationToken.None
+        );
     }
 
-    private async Task ExecuteStatusUpdateAsync(
+    private Task ExecuteStatusUpdateAsync(
         long statusId,
         string setClause,
         Action<List<(string Name, object? Value)>> configureParameters,
+        CancellationToken ct
+    )
+    {
+        return WithScopedConnectionAsync(
+            async (db, connection) =>
+            {
+                await using var transaction = await db.Database.BeginTransactionAsync(ct);
+                await using var command = connection.CreateCommand();
+                command.Transaction = transaction.GetDbTransaction();
+                command.CommandText =
+                    $"""
+                    UPDATE {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)}
+                    SET {setClause}
+                    WHERE "Id" = @statusId
+                      AND "State" = @expectedState
+                    """;
+                command.Parameters.Add(CreateParameter(command, "statusId", statusId));
+                command.Parameters.Add(
+                    CreateParameter(command, "expectedState", (int)SweepRowHandlerDispatchState.InFlight)
+                );
+
+                var parameters = new List<(string Name, object? Value)>();
+                configureParameters(parameters);
+                foreach (var (name, value) in parameters)
+                {
+                    command.Parameters.Add(CreateParameter(command, name, value));
+                }
+
+                var affected = await command.ExecuteNonQueryAsync(ct);
+                if (affected != 1)
+                {
+                    throw new InvalidOperationException(
+                        $"Retention row dispatcher could not update status row {statusId} from InFlight state."
+                    );
+                }
+
+                await transaction.CommitAsync(ct);
+            },
+            ct
+        );
+    }
+
+    /// <summary>
+    /// Runs <paramref name="action"/> against a fresh scope's DbContext connection,
+    /// opening it when closed and restoring its state afterwards.
+    /// </summary>
+    private async Task<TResult> WithScopedConnectionAsync<TResult>(
+        Func<DbContext, DbConnection, Task<TResult>> action,
         CancellationToken ct
     )
     {
@@ -777,37 +741,7 @@ public sealed class RetentionRowDispatcher(
 
         try
         {
-            await using var transaction = await db.Database.BeginTransactionAsync(ct);
-            await using var command = connection.CreateCommand();
-            command.Transaction = transaction.GetDbTransaction();
-            command.CommandText =
-                $"""
-                UPDATE {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)}
-                SET {setClause}
-                WHERE "Id" = @statusId
-                  AND "State" = @expectedState
-                """;
-            command.Parameters.Add(CreateParameter(command, "statusId", statusId));
-            command.Parameters.Add(
-                CreateParameter(command, "expectedState", (int)SweepRowHandlerDispatchState.InFlight)
-            );
-
-            var parameters = new List<(string Name, object? Value)>();
-            configureParameters(parameters);
-            foreach (var (name, value) in parameters)
-            {
-                command.Parameters.Add(CreateParameter(command, name, value));
-            }
-
-            var affected = await command.ExecuteNonQueryAsync(ct);
-            if (affected != 1)
-            {
-                throw new InvalidOperationException(
-                    $"Retention row dispatcher could not update status row {statusId} from InFlight state."
-                );
-            }
-
-            await transaction.CommitAsync(ct);
+            return await action(db, connection);
         }
         finally
         {
@@ -816,6 +750,21 @@ public sealed class RetentionRowDispatcher(
                 await db.Database.CloseConnectionAsync();
             }
         }
+    }
+
+    private async Task WithScopedConnectionAsync(
+        Func<DbContext, DbConnection, Task> action,
+        CancellationToken ct
+    )
+    {
+        await WithScopedConnectionAsync<bool>(
+            async (db, connection) =>
+            {
+                await action(db, connection);
+                return true;
+            },
+            ct
+        );
     }
 
     private static object CreateAfterContext(
@@ -825,7 +774,7 @@ public sealed class RetentionRowDispatcher(
         IReadOnlyDictionary<string, object?> snapshot
     )
     {
-        var contextType = typeof(RetentionAfterContext<>).MakeGenericType(entityType);
+        var contextType = GetDispatchReflection(entityType).ContextType;
         return Activator.CreateInstance(
             contextType,
             claimed.SweepId,
@@ -841,6 +790,33 @@ public sealed class RetentionRowDispatcher(
         );
     }
 
+    // MakeGenericType/GetMethod run on every dispatched row otherwise; the entity set
+    // is small and fixed, so the closed types are cached for the process lifetime.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<
+        Type,
+        (Type ContextType, System.Reflection.MethodInfo OnAfterMethod)
+    > DispatchReflectionCache = new();
+
+    private static (Type ContextType, System.Reflection.MethodInfo OnAfterMethod) GetDispatchReflection(
+        Type entityType
+    )
+    {
+        return DispatchReflectionCache.GetOrAdd(
+            entityType,
+            static entityType =>
+            {
+                var handlerInterface = typeof(IRetentionHandler<>).MakeGenericType(entityType);
+                var onAfterMethod =
+                    handlerInterface.GetMethod(nameof(IRetentionHandler<object>.OnAfterAsync))
+                    ?? throw new InvalidOperationException(
+                        $"Could not resolve {nameof(IRetentionHandler<object>.OnAfterAsync)} for {handlerInterface.FullName}."
+                    );
+
+                return (typeof(RetentionAfterContext<>).MakeGenericType(entityType), onAfterMethod);
+            }
+        );
+    }
+
     private static async Task InvokeOnAfterAsync(
         Type entityType,
         object handler,
@@ -848,14 +824,7 @@ public sealed class RetentionRowDispatcher(
         CancellationToken ct
     )
     {
-        var handlerInterface = typeof(IRetentionHandler<>).MakeGenericType(entityType);
-        var onAfterMethod =
-            handlerInterface.GetMethod(nameof(IRetentionHandler<object>.OnAfterAsync))
-            ?? throw new InvalidOperationException(
-                $"Could not resolve {nameof(IRetentionHandler<object>.OnAfterAsync)} for {handlerInterface.FullName}."
-            );
-
-        var invocation = onAfterMethod.Invoke(handler, [context, ct]);
+        var invocation = GetDispatchReflection(entityType).OnAfterMethod.Invoke(handler, [context, ct]);
         await (Task)invocation!;
     }
 

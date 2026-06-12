@@ -129,6 +129,134 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Hold_Created_After_A_Backdated_Sweeps_Logical_Now_Still_Protects_The_Row()
+    {
+        // Hold activity is evaluated against the database wall clock, not the sweep's
+        // logical 'now' — a litigation hold protects from the moment it exists, even
+        // when an operator runs a backdated sweep.
+        var tenantId = Guid.NewGuid();
+        var backdatedAsOf = DateTimeOffset.UtcNow.AddDays(-7);
+        Guid heldId;
+
+        await using (var db = Host.CreateDbContext())
+        {
+            var held = new Note
+            {
+                Id = Guid.NewGuid(),
+                TenantId = tenantId,
+                CreatedAt = backdatedAsOf.AddDays(-120),
+                Body = "backdated-sweep-hold",
+            };
+            heldId = held.Id;
+            db.Notes.Add(held);
+            await db.SaveChangesAsync();
+        }
+
+        await CreateHoldAsync(
+            new RetentionHoldRequest(
+                Guid.NewGuid(),
+                "notes",
+                heldId.ToString(),
+                tenantId,
+                "hold created after the backdated as-of",
+                DateTimeOffset.UtcNow
+            )
+        );
+
+        await Host.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            backdatedAsOf
+        );
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == heldId)).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task CreateAsync_Rejects_Table_Names_That_Do_Not_Match_The_Ef_Model()
+    {
+        var act = async () =>
+            await CreateHoldAsync(
+                new RetentionHoldRequest(
+                    Guid.NewGuid(),
+                    "Notes",
+                    Guid.NewGuid().ToString(),
+                    Guid.NewGuid(),
+                    "typo'd table name",
+                    new DateTimeOffset(2026, 4, 10, 12, 0, 0, TimeSpan.Zero)
+                )
+            );
+
+        await act
+            .Should()
+            .ThrowAsync<InvalidOperationException>()
+            .WithMessage("*'Notes' does not match any table mapped by the EF model*");
+    }
+
+    [Fact]
+    public async Task CreateAsync_Rejects_NonGuid_Record_Ids_For_Guid_Keyed_Tables()
+    {
+        var act = async () =>
+            await CreateHoldAsync(
+                new RetentionHoldRequest(
+                    Guid.NewGuid(),
+                    "notes",
+                    "not-a-guid",
+                    Guid.NewGuid(),
+                    "malformed record id",
+                    new DateTimeOffset(2026, 4, 10, 12, 0, 0, TimeSpan.Zero)
+                )
+            );
+
+        await act
+            .Should()
+            .ThrowAsync<InvalidOperationException>()
+            .WithMessage("*not a valid Guid*");
+    }
+
+    [Fact]
+    public async Task CreateAsync_Normalises_Guid_Record_Id_Formats_So_The_Hold_Still_Protects_The_Row()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        Guid heldId;
+
+        await using (var db = Host.CreateDbContext())
+        {
+            var held = new Note
+            {
+                Id = Guid.NewGuid(),
+                TenantId = tenantId,
+                CreatedAt = asOf.AddDays(-120),
+                Body = "purge-uppercase-hold",
+            };
+            heldId = held.Id;
+            db.Notes.Add(held);
+            await db.SaveChangesAsync();
+        }
+
+        // "N"-format uppercase would never match CAST(uuid AS text) without normalisation.
+        await CreateHoldAsync(
+            new RetentionHoldRequest(
+                Guid.NewGuid(),
+                "notes",
+                heldId.ToString("N").ToUpperInvariant(),
+                tenantId,
+                "legal hold with non-canonical record id",
+                asOf.AddDays(-10)
+            )
+        );
+
+        await Host.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == heldId)).Should().BeTrue();
+    }
+
+    [Fact]
     public async Task Purge_Path_Excludes_Rows_With_Active_Holds_And_Allows_Expired_Or_Removed_Holds()
     {
         var tenantA = Guid.NewGuid();
@@ -222,7 +350,8 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
                 "short-lived",
                 tenantA,
                 Strategy.Purge,
-                2
+                2,
+                HeldCount: 1
             )
         );
 
@@ -329,7 +458,8 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
                 "soft-delete",
                 tenantA,
                 Strategy.SoftDelete,
-                2
+                2,
+                HeldCount: 1
             )
         );
 
@@ -478,7 +608,8 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
                 "anonymise",
                 tenantA,
                 Strategy.Anonymise,
-                2
+                2,
+                HeldCount: 1
             )
         );
 

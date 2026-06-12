@@ -38,6 +38,11 @@ public sealed class CohortOptionsValidator : IValidateOptions<CohortOptions>
             errors.Add("Cohort cannot apply migrations while KillSwitch is enabled.");
         }
 
+        if (options.SweepBatchSize < 1)
+        {
+            errors.Add("Cohort SweepBatchSize must be at least 1.");
+        }
+
         return errors.Count == 0 ? ValidateOptionsResult.Success : ValidateOptionsResult.Fail(errors);
     }
 }

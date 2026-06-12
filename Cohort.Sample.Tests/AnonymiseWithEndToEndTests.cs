@@ -193,7 +193,7 @@ public sealed class AnonymiseWithEndToEndTests(PostgresFixture fixture)
 
         var result = await Host.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId),
+            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
             asOf
         );
 
@@ -286,7 +286,7 @@ public sealed class AnonymiseWithEndToEndTests(PostgresFixture fixture)
 
         var result = await dryRunHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId),
+            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
             asOf
         );
 

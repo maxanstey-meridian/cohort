@@ -42,10 +42,17 @@ public abstract record SweepEvent
         TimeSpan Duration,
         int TotalAffected
     ) : SweepEvent;
+
+    public sealed record Failed(
+        Guid SweepId,
+        DateTimeOffset At,
+        string Error
+    ) : SweepEvent;
 }
 
 public enum SweepTriggerKind
 {
     Scheduled,
     Erasure,
+    Manual,
 }

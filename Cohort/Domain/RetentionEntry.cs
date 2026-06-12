@@ -11,13 +11,20 @@ public sealed record RetentionEntry(
     TenantConvention? Tenant,
     SoftDeleteConvention? SoftDelete,
     bool IsExplicitlyTenantless = false,
-    AuditRowDetail AuditRowDetail = AuditRowDetail.Inherit
+    AuditRowDetail AuditRowDetail = AuditRowDetail.Inherit,
+    AnonymisedAtConvention? AnonymisedAt = null
 );
 
 public sealed record RecordIdConvention(
     string RecordIdMember,
     string RecordIdColumn,
-    Type RecordIdType
+    Type RecordIdType,
+    string? RecordIdStoreType = null
+);
+
+public sealed record AnonymisedAtConvention(
+    string AnonymisedAtMember,
+    string AnonymisedAtColumn
 );
 
 public sealed record TenantConvention(

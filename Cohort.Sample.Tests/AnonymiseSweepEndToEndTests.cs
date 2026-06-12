@@ -142,12 +142,16 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         var act = () => host.RunStartupAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().ContainSingle();
+        exception.Which.Errors.Should().HaveCount(2);
         exception
-            .Which.Errors[0]
-            .Should()
-            .Be(
+            .Which.Errors.Should()
+            .Contain(
                 $"Anonymise convention on {typeof(Note).FullName}: retained Anonymise categories require at least one [Anonymise]-annotated property mapped by EF."
+            );
+        exception
+            .Which.Errors.Should()
+            .Contain(
+                $"Anonymise convention on {typeof(Note).FullName}: retained Anonymise categories require a nullable DateTimeOffset marker property (named AnonymisedAt by convention, or marked with [RetentionAnonymisedAt]). NULL marks rows not yet anonymised; without it anonymisation re-scrubs every expired row on every sweep."
             );
     }
 
@@ -188,12 +192,15 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
                 1
             )
         );
+        // AnonymisedAt makes anonymisation idempotent: rows scrubbed by the first
+        // sweep are stamped and fall out of the second sweep's candidate filter.
         second.Counts.Should().Contain(
             count =>
                 count.EntityType == typeof(AnonymisedContact)
                 && count.Category == "anonymise"
                 && count.TenantId == tenantId
                 && count.Strategy == Strategy.Anonymise
+                && count.Affected == 0
         );
 
         await using var verify = Host.CreateDbContext();
@@ -203,6 +210,7 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         contact.GivenName.Should().BeEmpty();
         contact.Surname.Should().Be("[redacted]");
         contact.Notes.Should().Be("repeat-notes");
+        contact.AnonymisedAt.Should().Be(asOf);
     }
 
     [Fact]
@@ -450,7 +458,8 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
                 "factory-backed-per-row",
                 tenantId,
                 Strategy.Anonymise,
-                2
+                2,
+                HeldCount: 1
             )
         );
 
@@ -758,6 +767,8 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         public Guid ExternalId { get; set; }
 
         public string DisplayName { get; set; } = "";
+
+        public DateTimeOffset? AnonymisedAt { get; set; }
     }
 
     [Retain("factory-backed-per-row", nameof(PerRowFactorySweepRecord.CreatedAt))]
@@ -774,6 +785,8 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         public string DisplayName { get; set; } = "";
 
         public string Notes { get; set; } = "";
+
+        public DateTimeOffset? AnonymisedAt { get; set; }
     }
 
     [Retain("converted-original-value", nameof(ConvertedOriginalValueRecord.CreatedAt))]
@@ -787,6 +800,8 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         public string ExternalId { get; set; } = "";
 
         public string Notes { get; set; } = "";
+
+        public DateTimeOffset? AnonymisedAt { get; set; }
     }
 
     [Retain("converted-set-based-value", nameof(ConvertedSetBasedValueRecord.CreatedAt))]
@@ -800,6 +815,8 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         public string ExternalId { get; set; } = "";
 
         public string Notes { get; set; } = "";
+
+        public DateTimeOffset? AnonymisedAt { get; set; }
     }
 
     private sealed class SetBasedGuidFactory : IAnonymiseValueFactory
@@ -958,19 +975,17 @@ public sealed class AnonymiseSweepStrategyCommandTests
         connection.LastCommand.CommandText.Should().Contain("@cutoff");
         connection.LastCommand.CommandText.Should().Contain("@tenantId");
         connection.LastCommand.CommandText.Should().Contain("@holdTableName");
-        connection.LastCommand.CommandText.Should().Contain("@holdAsOf");
+        connection.LastCommand.CommandText.Should().Contain("now()");
         connection.LastCommand.CommandText.Should().Contain("NOT EXISTS");
-        connection.LastCommand.Parameters.Count.Should().Be(4);
+        connection.LastCommand.Parameters.Count.Should().Be(3);
         GetParameterNames(connection.LastCommand).Should().Equal(
             "cutoff",
             "tenantId",
-            "holdTableName",
-            "holdAsOf"
+            "holdTableName"
         );
         connection.LastCommand.Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.LastCommand.Parameters["tenantId"].Value.Should().Be(tenantId);
         connection.LastCommand.Parameters["holdTableName"].Value.Should().Be("anonymised_contacts");
-        connection.LastCommand.Parameters["holdAsOf"].Value.Should().Be(now);
     }
 
     [Fact]
@@ -1032,9 +1047,9 @@ public sealed class AnonymiseSweepStrategyCommandTests
         connection.LastCommand.CommandText.Should().Contain("@tenantId");
         connection.LastCommand.CommandText.Should().Contain("@candidateIds");
         connection.LastCommand.CommandText.Should().Contain("@holdTableName");
-        connection.LastCommand.CommandText.Should().Contain("@holdAsOf");
+        connection.LastCommand.CommandText.Should().Contain("now()");
         connection.LastCommand.CommandText.Should().Contain("NOT EXISTS");
-        connection.LastCommand.Parameters.Count.Should().Be(8);
+        connection.LastCommand.Parameters.Count.Should().Be(7);
         GetParameterNames(connection.LastCommand).Should().Equal(
             "value0",
             "value1",
@@ -1042,8 +1057,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "cutoff",
             "tenantId",
             "candidateIds",
-            "holdTableName",
-            "holdAsOf"
+            "holdTableName"
         );
         connection.LastCommand.Parameters.Contains("value0").Should().BeTrue();
         connection.LastCommand.Parameters.Contains("value1").Should().BeTrue();
@@ -1052,7 +1066,6 @@ public sealed class AnonymiseSweepStrategyCommandTests
         connection.LastCommand.Parameters.Contains("tenantId").Should().BeTrue();
         connection.LastCommand.Parameters.Contains("candidateIds").Should().BeTrue();
         connection.LastCommand.Parameters.Contains("holdTableName").Should().BeTrue();
-        connection.LastCommand.Parameters.Contains("holdAsOf").Should().BeTrue();
         connection.LastCommand.Parameters["value0"].Value.Should().Be(DBNull.Value);
         connection.LastCommand.Parameters["value1"].Value.Should().Be(string.Empty);
         connection.LastCommand.Parameters["value2"].Value.Should().Be("[redacted]");
@@ -1060,18 +1073,18 @@ public sealed class AnonymiseSweepStrategyCommandTests
         connection.LastCommand.Parameters["tenantId"].Value.Should().Be(tenantId);
         connection.LastCommand.Parameters["candidateIds"].Value.Should().BeOfType<string[]>();
         connection.LastCommand.Parameters["holdTableName"].Value.Should().Be("anonymised_contacts");
-        connection.LastCommand.Parameters["holdAsOf"].Value.Should().Be(now);
     }
 
     [Fact]
-    public async Task SweepAsync_Computes_HeldCount_From_Selected_Candidates_And_Targets_Only_Those_Ids()
+    public async Task SweepAsync_Excludes_Held_Rows_From_Candidate_Selection_And_Targets_Only_Selected_Ids()
     {
         var selectedId = Guid.NewGuid();
-        var heldId = Guid.NewGuid();
         using var db = CreateCommandStrategyDbContext();
         var strategy = new AnonymiseSweepStrategy(db);
         var connection = new RecordingDbConnection();
-        connection.EnqueueResultSet(selectedId, heldId);
+        // Held rows are excluded by the candidate selection SQL itself, so the select
+        // only ever returns unheld ids and the strategy result reports no held rows.
+        connection.EnqueueResultSet(selectedId);
         connection.EnqueueResultSet(selectedId);
         var transaction = connection.BeginTransaction();
         var tenantId = Guid.NewGuid();
@@ -1114,13 +1127,17 @@ public sealed class AnonymiseSweepStrategyCommandTests
         );
 
         affected.AffectedRecordIds.Should().Equal(selectedId.ToString());
-        affected.HeldCount.Should().Be(1);
+        affected.HeldCount.Should().Be(0);
         connection.Commands.Should().HaveCount(2);
-        connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
+        connection.Commands[0].CommandText.Should().Contain("FOR UPDATE SKIP LOCKED");
+        connection.Commands[0].CommandText.Should().NotContain("LIMIT");
+        connection.Commands[0].CommandText.Should().Contain("NOT EXISTS");
+        connection.Commands[0].CommandText.Should().Contain("@holdTableName");
         connection.Commands[0].CommandText.Should().Contain(
             "ORDER BY target.\"CreatedAt\" ASC, CAST(target.\"Id\" AS text) ASC"
         );
-        GetParameterNames(connection.Commands[0]).Should().Equal("cutoff", "tenantId");
+        GetParameterNames(connection.Commands[0]).Should().Equal("cutoff", "tenantId", "holdTableName");
+        connection.Commands[0].Parameters["holdTableName"].Value.Should().Be("anonymised_contacts");
         connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
         GetParameterNames(connection.Commands[1]).Should().Equal(
             "value0",
@@ -1129,11 +1146,10 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "cutoff",
             "tenantId",
             "candidateIds",
-            "holdTableName",
-            "holdAsOf"
+            "holdTableName"
         );
         connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
-            new[] { selectedId.ToString(), heldId.ToString() }
+            new[] { selectedId.ToString() }
         );
     }
 
@@ -1245,19 +1261,17 @@ public sealed class AnonymiseSweepStrategyCommandTests
         connection.Commands[0].CommandText.Should().NotContain("DELETE FROM");
         connection.Commands[0].CommandText.Should().NotContain("UPDATE ");
         connection.Commands[0].CommandText.Should().NotContain("FOR UPDATE");
-        connection.Commands[0].Parameters.Count.Should().Be(5);
+        connection.Commands[0].Parameters.Count.Should().Be(4);
         GetParameterNames(connection.Commands[0]).Should().Equal(
             "subjectValue0",
             "cutoff",
             "tenantId",
-            "holdTableName",
-            "holdAsOf"
+            "holdTableName"
         );
         connection.Commands[0].Parameters["tenantId"].Value.Should().Be(tenantId);
         connection.Commands[0].Parameters["subjectValue0"].Value.Should().Be(subjectId);
         connection.Commands[0].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[0].Parameters["holdTableName"].Value.Should().Be("anonymised_contacts");
-        connection.Commands[0].Parameters["holdAsOf"].Value.Should().Be(now);
     }
 
     [Fact]
@@ -1322,7 +1336,8 @@ public sealed class AnonymiseSweepStrategyCommandTests
         GetParameterNames(connection.Commands[0]).Should().Equal(
             "subjectValue0",
             "cutoff",
-            "tenantId"
+            "tenantId",
+            "holdTableName"
         );
         connection.Commands[0].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[1].AssignedTransaction.Should().BeSameAs(transaction);
@@ -1338,8 +1353,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "cutoff",
             "tenantId",
             "candidateIds",
-            "holdTableName",
-            "holdAsOf"
+            "holdTableName"
         );
         connection.Commands[1].Parameters["subjectValue0"].Value.Should().Be(subjectId);
         connection.Commands[1].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
@@ -1393,7 +1407,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
         affected.AffectedRecordIds.Should().HaveCount(2);
         connection.Commands.Should().HaveCount(2);
         connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
-        GetParameterNames(connection.Commands[0]).Should().Equal("cutoff", "tenantId");
+        GetParameterNames(connection.Commands[0]).Should().Equal("cutoff", "tenantId", "holdTableName");
         connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
         connection.Commands[1].CommandText.Should().NotContain("WHERE CAST(target.\"Id\" AS text) = @recordId");
         GetParameterNames(connection.Commands[1]).Should().Equal(
@@ -1401,8 +1415,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "cutoff",
             "tenantId",
             "candidateIds",
-            "holdTableName",
-            "holdAsOf"
+            "holdTableName"
         );
         connection.Commands[1].Parameters["value0"].Value.Should().Be(RecordingSetBasedFactory.ScrubbedValue);
     }
@@ -1467,7 +1480,8 @@ public sealed class AnonymiseSweepStrategyCommandTests
         GetParameterNames(connection.Commands[0]).Should().Equal(
             "subjectValue0",
             "cutoff",
-            "tenantId"
+            "tenantId",
+            "holdTableName"
         );
         connection.Commands[0].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[1].CommandText.Should().Contain("\"external_id\"");
@@ -1475,8 +1489,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
         GetParameterNames(connection.Commands[1]).Should().Equal(
             "candidateIds",
             "tenantId",
-            "holdTableName",
-            "holdAsOf"
+            "holdTableName"
         );
         connection.Commands[2].CommandText.Should().Contain("WHERE CAST(target.\"Id\" AS text) = @recordId");
         connection.Commands[2].CommandText.Should().Contain("\"subject_id\" = @subjectValue0");
@@ -1488,8 +1501,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "subjectValue0",
             "cutoff",
             "tenantId",
-            "holdTableName",
-            "holdAsOf"
+            "holdTableName"
         );
         connection.Commands[2].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[2].Parameters["value0"].Value.Should().Be("alpha-scrubbed");
@@ -1503,8 +1515,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "subjectValue0",
             "cutoff",
             "tenantId",
-            "holdTableName",
-            "holdAsOf"
+            "holdTableName"
         );
         connection.Commands[3].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[3].Parameters["value0"].Value.Should().Be("beta-scrubbed");
@@ -1576,15 +1587,13 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "subjectValue1",
             "cutoff",
             "tenantId",
-            "holdTableName",
-            "holdAsOf"
+            "holdTableName"
         );
         connection.Commands[0].Parameters["tenantId"].Value.Should().Be(tenantId);
         connection.Commands[0].Parameters["subjectValue0"].Value.Should().Be(firstSubjectId);
         connection.Commands[0].Parameters["subjectValue1"].Value.Should().Be(secondSubjectId);
         connection.Commands[0].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[0].Parameters["holdTableName"].Value.Should().Be("anonymised_contacts");
-        connection.Commands[0].Parameters["holdAsOf"].Value.Should().Be(now);
     }
 
     [Fact]
@@ -1655,7 +1664,8 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "subjectValue0",
             "subjectValue1",
             "cutoff",
-            "tenantId"
+            "tenantId",
+            "holdTableName"
         );
         connection.Commands[0].Parameters["tenantId"].Value.Should().Be(tenantId);
         connection.Commands[0].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
@@ -1675,8 +1685,7 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "cutoff",
             "tenantId",
             "candidateIds",
-            "holdTableName",
-            "holdAsOf"
+            "holdTableName"
         );
         connection.Commands[1].Parameters["tenantId"].Value.Should().Be(tenantId);
         connection.Commands[0].Parameters["subjectValue0"].Value.Should().Be(firstSubjectId);
@@ -1688,7 +1697,6 @@ public sealed class AnonymiseSweepStrategyCommandTests
             new[] { selectedId.ToString(), heldId.ToString() }
         );
         connection.Commands[1].Parameters["holdTableName"].Value.Should().Be("anonymised_contacts");
-        connection.Commands[1].Parameters["holdAsOf"].Value.Should().Be(now);
     }
 
     private static CommandStrategyDbContext CreateCommandStrategyDbContext()

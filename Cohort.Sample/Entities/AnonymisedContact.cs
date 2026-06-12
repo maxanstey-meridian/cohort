@@ -21,4 +21,6 @@ public sealed class AnonymisedContact
     public string Surname { get; set; } = "";
 
     public string Notes { get; set; } = "";
+
+    public DateTimeOffset? AnonymisedAt { get; set; }
 }

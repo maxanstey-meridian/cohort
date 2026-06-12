@@ -312,6 +312,7 @@ internal static class RetentionHandlerSupport
             INSERT INTO {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} (
                 "SweepRunRowDetailId",
                 "HandlerType",
+                "DispatchPhase",
                 "State",
                 "Attempt",
                 "QueuedAt",
@@ -323,6 +324,7 @@ internal static class RetentionHandlerSupport
             VALUES (
                 @rowDetailId,
                 @handlerType,
+                @dispatchPhase,
                 @state,
                 @attempt,
                 @queuedAt,
@@ -335,13 +337,26 @@ internal static class RetentionHandlerSupport
         command.Parameters.Add(CreateParameter(command, "rowDetailId", rowDetailId));
         command.Parameters.Add(CreateParameter(command, "handlerType", handler.HandlerTypeName));
         command.Parameters.Add(
+            CreateParameter(command, "dispatchPhase", (int)handler.DispatchPhase)
+        );
+        command.Parameters.Add(
             CreateParameter(command, "state", (int)SweepRowHandlerDispatchState.DeadLettered)
         );
         command.Parameters.Add(CreateParameter(command, "attempt", 1));
         command.Parameters.Add(CreateParameter(command, "queuedAt", failedAt));
         command.Parameters.Add(CreateParameter(command, "nextAttemptAt", failedAt));
         command.Parameters.Add(CreateParameter(command, "completedAt", failedAt));
-        command.Parameters.Add(CreateParameter(command, "lastError", failure.ToString()));
+        // Type + message only: full ToString() includes stack frames and inner-exception
+        // dumps that can echo row data into a long-lived audit table.
+        var rootFailure = failure.GetBaseException();
+        var sanitizedError = $"{rootFailure.GetType().FullName}: {rootFailure.Message}";
+        command.Parameters.Add(
+            CreateParameter(
+                command,
+                "lastError",
+                sanitizedError.Length <= 2000 ? sanitizedError : sanitizedError[..2000]
+            )
+        );
 
         await command.ExecuteNonQueryAsync(ct);
     }

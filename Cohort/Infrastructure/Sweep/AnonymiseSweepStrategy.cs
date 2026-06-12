@@ -58,9 +58,34 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
 
         return await previewExecutor.ExecuteAsync(
             entry,
-            AnonymiseFilterBuilder.CreateCutoffFilter(entry.AnchorColumn, cutoff),
+            AnonymiseFilterBuilder.CreateCutoffFilter(entry, cutoff),
             ctx.Tenant,
-            ctx.Now,
+            conn,
+            ct
+        );
+    }
+
+    public async Task<int> CountHeldAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        RetentionResolutionContext ctx,
+        DbConnection conn,
+        CancellationToken ct
+    )
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+        ArgumentNullException.ThrowIfNull(rule);
+        ArgumentNullException.ThrowIfNull(ctx);
+        ArgumentNullException.ThrowIfNull(conn);
+
+        var cutoff = CutoffCalculator.Compute(ctx.Now, rule.Period, rule.LegalMin);
+        ValidateEntry(entry, rule, "held counts");
+        await EnsureConnectionOpenAsync(conn, ct);
+
+        return await previewExecutor.ExecuteHeldCountAsync(
+            entry,
+            AnonymiseFilterBuilder.CreateCutoffFilter(entry, cutoff),
+            ctx.Tenant,
             conn,
             ct
         );
@@ -87,7 +112,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             entry,
             rule,
             ctx,
-            AnonymiseFilterBuilder.CreateCutoffFilter(entry.AnchorColumn, cutoff),
+            AnonymiseFilterBuilder.CreateCutoffFilter(entry, cutoff),
             conn,
             transaction,
             execution,
@@ -120,10 +145,41 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             entry,
             AnonymiseFilterBuilder.Combine(
                 AnonymiseFilterBuilder.CreateSubjectFilter(predicate),
-                AnonymiseFilterBuilder.CreateCutoffFilter(entry.AnchorColumn, cutoff)
+                AnonymiseFilterBuilder.CreateCutoffFilter(entry, cutoff)
             ),
             tenant,
-            now,
+            conn,
+            ct
+        );
+    }
+
+    public async Task<int> CountHeldForEraseAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        ErasureSubjectPredicate predicate,
+        TenantContext tenant,
+        DateTimeOffset now,
+        DbConnection conn,
+        CancellationToken ct
+    )
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+        ArgumentNullException.ThrowIfNull(rule);
+        ArgumentNullException.ThrowIfNull(predicate);
+        ArgumentNullException.ThrowIfNull(tenant);
+        ArgumentNullException.ThrowIfNull(conn);
+
+        var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
+        ValidateEntry(entry, rule, "erasure held counts");
+        await EnsureConnectionOpenAsync(conn, ct);
+
+        return await previewExecutor.ExecuteHeldCountAsync(
+            entry,
+            AnonymiseFilterBuilder.Combine(
+                AnonymiseFilterBuilder.CreateSubjectFilter(predicate),
+                AnonymiseFilterBuilder.CreateCutoffFilter(entry, cutoff)
+            ),
+            tenant,
             conn,
             ct
         );
@@ -155,7 +211,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             new RetentionResolutionContext(entry.Category, tenant, now, []),
             AnonymiseFilterBuilder.Combine(
                 AnonymiseFilterBuilder.CreateSubjectFilter(predicate),
-                AnonymiseFilterBuilder.CreateCutoffFilter(entry.AnchorColumn, cutoff)
+                AnonymiseFilterBuilder.CreateCutoffFilter(entry, cutoff)
             ),
             conn,
             transaction,
@@ -186,6 +242,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             conn,
             transaction,
             filter,
+            execution?.BatchSize,
             ct
         );
 

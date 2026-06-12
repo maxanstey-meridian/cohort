@@ -4,7 +4,7 @@ Project-specific agent instructions. Read this before writing tests or adding fe
 
 ## What Cohort is
 
-Standalone .NET 9 class library. Annotation-driven retention for EF Core consumers (Postgres-only SQL). Hosts annotate entities with `[Retain(category, anchor)]`, register an `IRetentionCategoryRepository`, and Cohort sweeps rows past their cutoff via configurable strategies (Purge, SoftDelete, Anonymise, Exempt). All three milestones (A/B/C) are implemented — see [`.plans/COHORT1.md`](.plans/COHORT1.md) for the milestone sequence.
+Standalone .NET 9 class library. Annotation-driven retention for EF Core consumers (Postgres-only SQL). Hosts annotate entities with `[Retain(category, anchor)]`, register an `IRetentionCategoryRepository`, and Cohort sweeps rows past their cutoff via configurable strategies (Purge, SoftDelete, Anonymise, Exempt). All three milestones (A/B/C) are implemented.
 
 ## Test-writing rules — READ BEFORE WRITING ANY TEST
 
@@ -39,7 +39,7 @@ Cohort/                 — the library. No tests of its own.
 ├── Domain/             — pure types. Depends on NOTHING (not even EF Core).
 ├── Application/        — ports + orchestration. Depends on Domain only.
 ├── Infrastructure/     — EF defaults, raw SQL adapters. Depends on Application + Domain.
-│   ├── Sweep/          — PurgeSweepStrategy, SoftDeleteSweepStrategy, AnonymiseSweepStrategy
+│   ├── Sweep/          — RelationalSweepStrategyCore (shared purge/soft-delete SQL), Purge/SoftDelete/AnonymiseSweepStrategy
 │   ├── Holds/          — EfRetentionHoldsRepository, RetentionHoldSql
 │   ├── Audit/          — EfRetentionAuditWriter
 │   └── Migrations/     — CohortModelBuilder (ConfigureCohortTables extension)
@@ -81,12 +81,13 @@ Property names for record ID, tenant, soft-delete flag, and deletion timestamp a
 - `[RetentionTenant]` — marks the tenant property (replaces `TenantId` convention)
 - `[RetentionSoftDelete]` — marks the soft-delete flag (replaces `IsDeleted` convention)
 - `[RetentionDeletedAt]` — marks the deletion timestamp (replaces `DeletedAt` convention)
+- `[RetentionAnonymisedAt]` — marks the anonymised-at marker (replaces `AnonymisedAt` convention; mandatory for Anonymise categories)
 
 These follow the same pattern as `[Anonymise]` — property-level, discovered by reflection, attribute wins over convention.
 
 ## Record ID types
 
-Cohort is PK-type-agnostic. Entity record IDs can be `Guid`, `int`, `long`, `string`, or any other type. Cohort stores record IDs as `text` in its own infrastructure tables (`retention_holds.RecordId`, `sweep_run_row_detail.EntityId`) and returns them as `string` in `SweepExecutionResult.AffectedRecordIds`. SQL comparisons use `CAST(target."pk_col" AS text)` for type-safe joins against the holds table.
+Cohort is PK-type-agnostic. Entity record IDs can be `Guid`, `int`, `long`, `string`, or any other type. Cohort stores record IDs as `text` in its own infrastructure tables (`retention_holds.RecordId`, `sweep_run_row_detail.EntityId`) and returns them as `string` in `SweepExecutionResult.AffectedRecordIds`. Hold-table joins cast the column to text (`hold."RecordId" = CAST(target."pk_col" AS text)`); candidate-id matching casts the **parameter** to the column's store type when EF metadata exposes one (`RecordIdSql`, index-friendly), falling back to the column-to-text cast otherwise.
 
 ## Entity annotation
 
@@ -100,10 +101,8 @@ Cohort is PK-type-agnostic. Entity record IDs can be `Guid`, `int`, `long`, `str
 All three milestones (A/B/C) are implemented. The following are explicitly out of scope for v1:
 
 - No `ConditionalRetentionRuleResolver`, `AliasRetentionRuleResolver`, `CachingRetentionRuleResolver` — hosts build these when needed
-- No hash/format-preserving anonymisation — v1 is `Null`/`EmptyString`/`FixedLiteral` only (see `.plans/COHORT1.md` anti-scope)
+- No hash/format-preserving anonymisation — v1 is `Null`/`EmptyString`/`FixedLiteral` only
 - No SQL Server or SQLite support — Postgres-only SQL (`RETURNING`, `= ANY()`, `FOR UPDATE`)
 - No source generator — reflection is fine for a daily sweep
 - No OneTrust/Purview adapters
-- No GitHub Actions CI workflow
-
-Pointer: `.plans/COHORT1.md` for the milestone sequence and anti-scope. `.plans/COHORT0.md` for the original scaffolding plan.
+- CI: `.github/workflows/publish.yml` packs and publishes; there is no separate test workflow

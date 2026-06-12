@@ -1,13 +1,20 @@
 using Cohort.Application;
+using Cohort.Domain;
 
 namespace Cohort.Infrastructure.Sweep;
 
 internal static class AnonymiseFilterBuilder
 {
-    internal static SqlFilter CreateCutoffFilter(string anchorColumn, DateTimeOffset cutoff)
+    internal static SqlFilter CreateCutoffFilter(RetentionEntry entry, DateTimeOffset cutoff)
     {
+        // The AnonymisedAt marker keeps anonymisation idempotent: rows scrubbed by an
+        // earlier sweep fall out of the filter instead of being re-anonymised forever.
+        var anonymisedAtClause = entry.AnonymisedAt is { } anonymisedAt
+            ? $" AND target.{AnonymiseSqlBuilder.QuoteIdentifier(anonymisedAt.AnonymisedAtColumn)} IS NULL"
+            : "";
+
         return new SqlFilter(
-            $"target.{AnonymiseSqlBuilder.QuoteIdentifier(anchorColumn)} < @cutoff",
+            $"target.{AnonymiseSqlBuilder.QuoteIdentifier(entry.AnchorColumn)} < @cutoff{anonymisedAtClause}",
             [new SqlFilterParameter("cutoff", cutoff)]
         );
     }

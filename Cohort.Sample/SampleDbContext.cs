@@ -62,6 +62,7 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
             b.Property(contact => contact.GivenName).IsRequired();
             b.Property(contact => contact.Surname).IsRequired();
             b.Property(contact => contact.Notes).IsRequired();
+            b.Property(contact => contact.AnonymisedAt);
         });
 
         modelBuilder.Entity<ErasureSubjectRecord>(b =>
@@ -112,6 +113,7 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
             b.Property(record => record.DisplayName).IsRequired();
             b.Property(record => record.ContactEmail);
             b.Property(record => record.Notes).IsRequired();
+            b.Property(record => record.AnonymisedAt);
         });
 
         modelBuilder.Entity<BlobBackedFile>(b =>

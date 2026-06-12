@@ -171,6 +171,129 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
     }
 
     [Fact]
+    public async Task Worker_Sweeps_Every_Tenant_Returned_By_The_Tenant_Source()
+    {
+        var tenantA = CreateTenant();
+        var tenantB = CreateTenant();
+        var settings = CreateSettings(
+            fixture.ConnectionString,
+            schedule: "*/1 * * * * *",
+            dryRun: false,
+            killSwitch: false
+        );
+        using var host = BuildHost(
+            settings,
+            tenantA,
+            services =>
+            {
+                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+                services.AddSingleton<IRetentionTenantSource>(
+                    new StaticTenantSource(tenantA, tenantB)
+                );
+            }
+        );
+        await SeedOldNoteAsync(tenantA.Id, "multi-tenant-a");
+        await SeedOldNoteAsync(tenantB.Id, "multi-tenant-b");
+
+        await host.Host.StartAsync();
+        await WaitUntilAsync(
+            async () =>
+                !await NoteExistsAsync("multi-tenant-a") && !await NoteExistsAsync("multi-tenant-b"),
+            TimeSpan.FromSeconds(8)
+        );
+
+        await host.Host.StopAsync();
+
+        (await NoteExistsAsync("multi-tenant-a")).Should().BeFalse();
+        (await NoteExistsAsync("multi-tenant-b")).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task Worker_Skips_Occurrences_While_Another_Instance_Holds_The_Sweep_Lock()
+    {
+        const long sweepAdvisoryLockKey = 0x636F_686F_7274_3031;
+        var tenant = CreateTenant();
+        var settings = CreateSettings(
+            fixture.ConnectionString,
+            schedule: "*/1 * * * * *",
+            dryRun: false,
+            killSwitch: false
+        );
+        using var host = BuildHost(
+            settings,
+            tenant,
+            services =>
+            {
+                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+            }
+        );
+        await SeedOldNoteAsync(tenant.Id, "lock-guarded-note");
+
+        await using var lockConnection = new NpgsqlConnection(fixture.ConnectionString);
+        await lockConnection.OpenAsync();
+        await using (var acquire = lockConnection.CreateCommand())
+        {
+            acquire.CommandText = "SELECT pg_advisory_lock(@key)";
+            acquire.Parameters.AddWithValue("key", sweepAdvisoryLockKey);
+            await acquire.ExecuteScalarAsync();
+        }
+
+        await host.Host.StartAsync();
+        // Two cron ticks pass while the lock is held elsewhere: nothing may be swept.
+        await Task.Delay(TimeSpan.FromSeconds(2.5));
+        (await NoteExistsAsync("lock-guarded-note")).Should().BeTrue();
+
+        await using (var release = lockConnection.CreateCommand())
+        {
+            release.CommandText = "SELECT pg_advisory_unlock(@key)";
+            release.Parameters.AddWithValue("key", sweepAdvisoryLockKey);
+            await release.ExecuteScalarAsync();
+        }
+
+        await WaitUntilAsync(
+            async () => !await NoteExistsAsync("lock-guarded-note"),
+            TimeSpan.FromSeconds(8)
+        );
+
+        await host.Host.StopAsync();
+
+        (await NoteExistsAsync("lock-guarded-note")).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task Worker_Survives_A_Failing_Iteration_And_Sweeps_On_A_Later_Tick()
+    {
+        var tenant = CreateTenant();
+        var settings = CreateSettings(
+            fixture.ConnectionString,
+            schedule: "*/1 * * * * *",
+            dryRun: false,
+            killSwitch: false
+        );
+        var categoryRepository = new FailingOnceCategoryRepository(new SampleCategoryRepository());
+        using var host = BuildHost(
+            settings,
+            tenant,
+            services =>
+            {
+                services.AddSingleton<IRetentionCategoryRepository>(categoryRepository);
+            }
+        );
+        await SeedOldNoteAsync(tenant.Id, "resilient-delete");
+
+        await host.Host.StartAsync();
+        await WaitUntilAsync(
+            async () => !await NoteExistsAsync("resilient-delete"),
+            TimeSpan.FromSeconds(8)
+        );
+
+        await host.Host.StopAsync();
+
+        categoryRepository.FailureCount.Should().BeGreaterThan(0);
+        (await NoteExistsAsync("resilient-delete")).Should().BeFalse();
+    }
+
+    [Fact]
     public async Task Worker_Uses_Preview_When_DryRun_Is_Enabled_And_Leaves_Rows_Untouched()
     {
         var tenant = CreateTenant();
@@ -565,6 +688,35 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         {
             Interlocked.Increment(ref getAsyncCount);
             return await inner.GetAsync(category, ct);
+        }
+    }
+
+    private sealed class StaticTenantSource(params TenantContext[] tenants)
+        : IRetentionTenantSource
+    {
+        public Task<IReadOnlyList<TenantContext>> GetTenantsAsync(CancellationToken ct)
+        {
+            return Task.FromResult<IReadOnlyList<TenantContext>>(tenants);
+        }
+    }
+
+    private sealed class FailingOnceCategoryRepository(IRetentionCategoryRepository inner)
+        : IRetentionCategoryRepository
+    {
+        public int FailureCount => failureCount;
+
+        private int failureCount;
+
+        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        {
+            if (Interlocked.CompareExchange(ref failureCount, 1, 0) == 0)
+            {
+                throw new InvalidOperationException(
+                    "Simulated transient category repository failure."
+                );
+            }
+
+            return inner.GetAsync(category, ct);
         }
     }
 

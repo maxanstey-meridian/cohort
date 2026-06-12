@@ -142,6 +142,119 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task FlushAsync_Reclaims_Stale_InFlight_Work_And_Counts_The_Reclaim_As_An_Attempt()
+    {
+        // Simulates a process crash between claiming and completing: the row is stuck
+        // InFlight with an old ClaimedAt. The lease must reclaim and execute it.
+        var tenantId = Guid.NewGuid();
+        var fileId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var cleanupStore = new BlobCleanupStoreSpy();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.BlobBackedFiles.Add(
+                new BlobBackedFile
+                {
+                    Id = fileId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    StoragePath = "blob://tenant-a/stale/claimed.pdf",
+                    OriginalFileName = "claimed.pdf",
+                    ContentType = "application/pdf",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
+            {
+                services.AddSingleton(cleanupStore);
+                services.AddRowHandler<BlobBackedFile, BlobBackedFileCleanupHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        await SetHandlerStatusInFlightAsync(
+            result.SweepId,
+            DateTimeOffset.UtcNow - TimeSpan.FromMinutes(10)
+        );
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        cleanupStore.DeletedPaths.Should().Equal("blob://tenant-a/stale/claimed.pdf");
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().ContainSingle();
+        statuses[0].State.Should().Be(SucceededState);
+        // One attempt charged for the reclaimed (crashed) claim, one for the successful run.
+        statuses[0].Attempt.Should().Be(2);
+    }
+
+    [Fact]
+    public async Task FlushAsync_Leaves_Recently_Claimed_InFlight_Work_Alone()
+    {
+        var tenantId = Guid.NewGuid();
+        var fileId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var cleanupStore = new BlobCleanupStoreSpy();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.BlobBackedFiles.Add(
+                new BlobBackedFile
+                {
+                    Id = fileId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    StoragePath = "blob://tenant-a/fresh/claimed.pdf",
+                    OriginalFileName = "claimed.pdf",
+                    ContentType = "application/pdf",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
+            {
+                services.AddSingleton(cleanupStore);
+                services.AddRowHandler<BlobBackedFile, BlobBackedFileCleanupHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        await SetHandlerStatusInFlightAsync(result.SweepId, DateTimeOffset.UtcNow);
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        cleanupStore.DeletedPaths.Should().BeEmpty();
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().ContainSingle();
+        statuses[0].State.Should().Be(InFlightState);
+    }
+
+    [Fact]
     public async Task FlushAsync_Deferred_Row_Handler_Waits_For_Sweep_Completion_But_Immediate_Does_Not()
     {
         var immediateTenantId = Guid.NewGuid();
@@ -997,7 +1110,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         );
 
         result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1, SkippedCount: 1)
         );
 
         await using (var verify = Host.CreateDbContext())
@@ -1137,18 +1250,18 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         var result = await handlerHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId),
+            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
             asOf
         );
 
         result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1, SkippedCount: 1)
         );
         result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(SoftDeleteRecord), "soft-delete", tenantId, Strategy.SoftDelete, 1)
+            new EntitySweepCount(typeof(SoftDeleteRecord), "soft-delete", tenantId, Strategy.SoftDelete, 1, SkippedCount: 1)
         );
         result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(AnonymisedContact), "anonymise", tenantId, Strategy.Anonymise, 1)
+            new EntitySweepCount(typeof(AnonymisedContact), "anonymise", tenantId, Strategy.Anonymise, 1, SkippedCount: 1)
         );
 
         await using (var verify = Host.CreateDbContext())
@@ -1345,18 +1458,20 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         var result = await handlerHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId),
+            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
             asOf
         );
 
         result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1, HeldCount: 1)
         );
         result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(SoftDeleteRecord), "soft-delete", tenantId, Strategy.SoftDelete, 1)
+            new EntitySweepCount(typeof(SoftDeleteRecord), "soft-delete", tenantId, Strategy.SoftDelete, 1, HeldCount: 1)
         );
         result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(AnonymisedContact), "anonymise", tenantId, Strategy.Anonymise, 1)
+            // Held counts are measured directly (subject-matching, past cutoff, actively
+            // held), so the anonymise erase path reports the held contact too.
+            new EntitySweepCount(typeof(AnonymisedContact), "anonymise", tenantId, Strategy.Anonymise, 1, HeldCount: 1)
         );
         sink.BeforeCalls.Should().BeEquivalentTo(
             [
@@ -1521,7 +1636,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         var result = await handlerHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId),
+            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
             asOf
         );
 
@@ -1705,7 +1820,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         var previewResult = await previewHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId),
+            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
             asOf
         );
 
@@ -1788,7 +1903,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         var liveResult = await liveHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId),
+            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
             asOf
         );
 
@@ -1922,7 +2037,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         var result = await handlerHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId),
+            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
             asOf
         );
 
@@ -2292,13 +2407,18 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
+        // Captured payloads are cleared once a row's handler work settles, so the
+        // persisted snapshots must be read before the flush.
+        var persistedRows = await LoadCapturedRowDetailsAsync(result.SweepId);
+
         await handlerHost.RunWithServicesAsync(async serviceProvider =>
         {
             var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
             await dispatcher.FlushAsync();
         });
 
-        var persistedRows = await LoadCapturedRowDetailsAsync(result.SweepId);
+        (await CountRemainingCapturedPayloadsAsync(result.SweepId)).Should().Be(0);
+
         var observed = recorder.Load().OrderBy(call => call.EntityId, StringComparer.Ordinal).ToArray();
 
         observed.Should().HaveCount(2);
@@ -2498,7 +2618,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         var result = await handlerHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId),
+            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
             asOf
         );
 
@@ -2579,6 +2699,85 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         statuses[0].Attempt.Should().Be(2);
         statuses[0].CompletedAt.Should().NotBeNull();
         statuses[0].LastError.Should().Contain("Simulated permanent after-dispatch failure.");
+        // Sanitised to root-cause type + message: no stack frames in the audit table.
+        statuses[0].LastError.Should().NotContain("   at ");
+        // Dead-lettering settles the row, so its captured snapshot is scrubbed too.
+        (await CountRemainingCapturedPayloadsAsync(result.SweepId)).Should().Be(0);
+    }
+
+    [Fact]
+    public async Task FlushAsync_Refuses_Snapshot_Payloads_Naming_Types_Outside_The_AllowList()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var recorder = new TypedSnapshotRecorder();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "tampered-payload-target",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:BaseBackoff"] = "00:05:00",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxAttempts"] = "2",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(recorder);
+                services.AddRowHandler<Note, TypedSnapshotNoteHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        // Simulate a tampered captured payload naming a framework type: deserialising it
+        // must be refused rather than materialising an arbitrary CLR type.
+        await using (var connection = new NpgsqlConnection(GetConnectionString()))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText =
+                """
+                UPDATE "sweep_run_row_detail"
+                SET "CapturedPayload" = @payload
+                WHERE "SweepId" = @sweepId
+                """;
+            command.Parameters.AddWithValue(
+                "payload",
+                """{"payload":{"$cohortType":"System.Diagnostics.ProcessStartInfo, System.Diagnostics.Process","$cohortValue":{}}}"""
+            );
+            command.Parameters.AddWithValue("sweepId", result.SweepId);
+            (await command.ExecuteNonQueryAsync()).Should().Be(1);
+        }
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        recorder.Load().Should().BeEmpty();
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().ContainSingle();
+        statuses[0].State.Should().Be(DeadLetteredState);
+        statuses[0].LastError.Should().Contain("snapshot type allow-list");
     }
 
     [Fact]
@@ -2622,7 +2821,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         var result = await handlerHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId),
+            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
             asOf
         );
 
@@ -2645,6 +2844,10 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         statuses[0].Attempt.Should().Be(2);
         statuses[0].CompletedAt.Should().NotBeNull();
         statuses[0].LastError.Should().Contain("Simulated permanent after-dispatch failure.");
+        // Sanitised to root-cause type + message: no stack frames in the audit table.
+        statuses[0].LastError.Should().NotContain("   at ");
+        // Dead-lettering settles the row, so its captured snapshot is scrubbed too.
+        (await CountRemainingCapturedPayloadsAsync(result.SweepId)).Should().Be(0);
     }
 
     [Fact]
@@ -2692,7 +2895,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         var result = await handlerHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId),
+            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
             asOf
         );
 
@@ -2822,6 +3025,22 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         return rows;
     }
 
+    private async Task<long> CountRemainingCapturedPayloadsAsync(Guid sweepId)
+    {
+        await using var connection = new NpgsqlConnection(GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT COUNT(*)
+            FROM "sweep_run_row_detail"
+            WHERE "SweepId" = @sweepId
+              AND "CapturedPayload" IS NOT NULL
+            """;
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        return (long)(await command.ExecuteScalarAsync())!;
+    }
+
     private async Task<IReadOnlyList<HandlerStatusRow>> LoadHandlerStatusesAsync(Guid sweepId)
     {
         await using var connection = new NpgsqlConnection(GetConnectionString());
@@ -2926,6 +3145,26 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     {
         using var db = Host.CreateDbContext();
         return db.Database.GetConnectionString()!;
+    }
+
+    private async Task SetHandlerStatusInFlightAsync(Guid sweepId, DateTimeOffset claimedAt)
+    {
+        await using var connection = new NpgsqlConnection(GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            UPDATE "sweep_row_handler_status" AS status
+            SET "State" = @inFlight,
+                "ClaimedAt" = @claimedAt
+            FROM "sweep_run_row_detail" AS detail
+            WHERE detail."Id" = status."SweepRunRowDetailId"
+              AND detail."SweepId" = @sweepId
+            """;
+        command.Parameters.AddWithValue("inFlight", InFlightState);
+        command.Parameters.AddWithValue("claimedAt", claimedAt);
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        (await command.ExecuteNonQueryAsync()).Should().BeGreaterThan(0);
     }
 
     private async Task SetSweepCompletedAtAsync(Guid sweepId, DateTimeOffset? completedAt)

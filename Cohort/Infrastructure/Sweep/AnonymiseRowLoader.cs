@@ -21,14 +21,26 @@ internal sealed class AnonymiseRowLoader(
         DbConnection conn,
         DbTransaction transaction,
         SqlFilter filter,
+        int? batchSize,
         CancellationToken ct
     )
     {
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = AnonymiseSqlBuilder.BuildCandidateSelectionCommandText(entry, filter);
+        command.CommandText = AnonymiseSqlBuilder.BuildCandidateSelectionCommandText(
+            entry,
+            filter,
+            batchSize
+        );
         AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
         AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenantId);
+        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName);
+        if (batchSize is not null)
+        {
+            command.Parameters.Add(
+                AnonymiseDbParameterFactory.Create(command, "batchSize", Math.Max(1, batchSize.Value))
+            );
+        }
 
         var candidateRecordIds = new List<string>();
         await using var reader = await command.ExecuteReaderAsync(ct);
@@ -43,7 +55,6 @@ internal sealed class AnonymiseRowLoader(
     internal async Task<IReadOnlyList<AnonymiseRowSnapshot>> LoadUpdatableRowsAsync(
         RetentionEntry entry,
         TenantContext tenant,
-        DateTimeOffset now,
         DbConnection conn,
         DbTransaction transaction,
         IReadOnlyList<string> candidateRecordIds,
@@ -60,7 +71,7 @@ internal sealed class AnonymiseRowLoader(
         );
         AnonymiseDbParameterFactory.AddCandidateIdsParameter(command, candidateRecordIds);
         AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
-        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName, now);
+        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName);
 
         var rows = new List<AnonymiseRowSnapshot>();
         await using var reader = await command.ExecuteReaderAsync(ct);
@@ -87,7 +98,6 @@ internal sealed class AnonymiseRowLoader(
     internal Task<List<TEntity>> LoadHandlerRowsAsync<TEntity>(
         RetentionEntry entry,
         TenantContext tenant,
-        DateTimeOffset now,
         DbConnection conn,
         IReadOnlyList<string> candidateRecordIds,
         CancellationToken ct
@@ -103,7 +113,6 @@ internal sealed class AnonymiseRowLoader(
                 candidateRecordIds.ToArray()
             ),
             AnonymiseDbParameterFactory.CreateProviderParameter(conn, "holdTableName", entry.TableName),
-            AnonymiseDbParameterFactory.CreateProviderParameter(conn, "holdAsOf", now),
         };
         if (entry.Tenant is not null)
         {

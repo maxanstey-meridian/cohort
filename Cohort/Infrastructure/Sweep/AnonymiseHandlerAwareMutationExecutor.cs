@@ -62,7 +62,6 @@ internal sealed class AnonymiseHandlerAwareMutationExecutor(
         var rows = await rowLoader.LoadHandlerRowsAsync<TEntity>(
             entry,
             ctx.Tenant,
-            ctx.Now,
             conn,
             candidateRecordIds,
             ct
@@ -173,7 +172,8 @@ internal sealed class AnonymiseHandlerAwareMutationExecutor(
             affectedRecordIds,
             heldCount,
             RowDetailsPersisted: true,
-            SkippedCount: skippedCount
+            SkippedCount: skippedCount,
+            CandidateCount: candidateRecordIds.Count
         );
     }
 }

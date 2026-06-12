@@ -34,10 +34,9 @@ internal static class AnonymiseDbParameterFactory
         }
     }
 
-    internal static void AddHoldParameters(DbCommand command, string tableName, DateTimeOffset now)
+    internal static void AddHoldParameters(DbCommand command, string tableName)
     {
         command.Parameters.Add(Create(command, "holdTableName", tableName));
-        command.Parameters.Add(Create(command, "holdAsOf", now));
     }
 
     internal static void AddCandidateIdsParameter(

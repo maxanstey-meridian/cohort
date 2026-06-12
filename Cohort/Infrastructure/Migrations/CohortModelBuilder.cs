@@ -131,6 +131,8 @@ public static class CohortModelBuilder
         builder.Property<bool>("DryRun").IsRequired();
         builder.Property<Guid>("TenantId").IsRequired();
         builder.Property<int?>("TotalAffected");
+        builder.Property<DateTimeOffset?>("FailedAt");
+        builder.Property<string?>("Error");
         builder.HasKey("SweepId");
     }
 

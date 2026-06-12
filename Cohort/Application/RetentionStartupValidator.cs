@@ -13,7 +13,9 @@ public sealed class RetentionStartupValidator(
     IEnumerable<IAnonymiseValueFactory>? anonymiseValueFactories = null
 )
 {
-    private static readonly NullabilityInfoContext NullabilityInfoContext = new();
+    // Instance field, not static: NullabilityInfoContext is documented as not thread-safe,
+    // and concurrent validations (parallel previews/sweeps/erasures) share statics.
+    private readonly NullabilityInfoContext nullabilityInfoContext = new();
     private static readonly Type[] AllowedSoftDeleteTimestampTypes =
     [
         typeof(DateTime),
@@ -55,6 +57,25 @@ public sealed class RetentionStartupValidator(
                 continue;
             }
 
+            if (entityType.BaseType is not null || entityType.GetDirectlyDerivedTypes().Any())
+            {
+                errors.Add(
+                    $"[Retain] on {clrType.FullName}: entity participates in an EF inheritance hierarchy (TPH/TPT/TPC). Sweep SQL targets the mapped table without a type discriminator, so rows of sibling or derived types would be swept too. Retention on inheritance-mapped entities is not supported."
+                );
+                continue;
+            }
+
+            var schema = entityType.GetSchema() ?? db.Model.GetDefaultSchema();
+            if (schema is not null && !string.Equals(schema, "public", StringComparison.Ordinal))
+            {
+                errors.Add(
+                    $"[Retain] on {clrType.FullName}: entity is mapped to schema '{schema}'. Cohort SQL does not schema-qualify identifiers and resolves tables via the connection search_path, so entities outside the default 'public' schema are not supported."
+                );
+                continue;
+            }
+
+            ValidateMarkerAttributeUniqueness(clrType, errors);
+
             RetentionEntry entry;
             try
             {
@@ -71,6 +92,7 @@ public sealed class RetentionStartupValidator(
             }
 
             ValidateTenantConvention(entry, errors);
+            ValidateTimestampStoreTypes(entityType, entry, errors);
 
             var resolver = await categoryRepository.GetAsync(entry.Category, ct);
             if (resolver is null)
@@ -84,6 +106,11 @@ public sealed class RetentionStartupValidator(
             try
             {
                 var startupRule = resolver.TryResolveAtStartup();
+                if (startupRule is null || startupRule.Strategy == Strategy.Purge)
+                {
+                    ValidateCascadeDeletePaths(entityType, errors);
+                }
+
                 if (entry.AnonymiseFields.Any(field => field is AnonymiseFactoryField))
                 {
                     ValidateFactoryBackedAnonymiseSupport(
@@ -101,6 +128,13 @@ public sealed class RetentionStartupValidator(
                 if (startupRule?.Strategy == Strategy.Anonymise)
                 {
                     ValidateAnonymiseConvention(entry, errors, $"Anonymise convention on {clrType.FullName}:");
+
+                    if (entry.AnonymisedAt is null)
+                    {
+                        errors.Add(
+                            $"Anonymise convention on {clrType.FullName}: retained Anonymise categories require a nullable DateTimeOffset marker property (named AnonymisedAt by convention, or marked with [RetentionAnonymisedAt]). NULL marks rows not yet anonymised; without it anonymisation re-scrubs every expired row on every sweep."
+                        );
+                    }
                 }
             }
             catch (Exception ex)
@@ -163,7 +197,7 @@ public sealed class RetentionStartupValidator(
         errors.AddRange(GetSoftDeleteConventionErrors(entry, messagePrefix));
     }
 
-    private static void ValidateAnonymiseConvention(
+    private void ValidateAnonymiseConvention(
         RetentionEntry entry,
         List<string> errors,
         string messagePrefix
@@ -219,7 +253,7 @@ public sealed class RetentionStartupValidator(
         return errors;
     }
 
-    private static List<string> GetAnonymiseConventionErrors(
+    private List<string> GetAnonymiseConventionErrors(
         RetentionEntry entry,
         string messagePrefix
     )
@@ -273,11 +307,143 @@ public sealed class RetentionStartupValidator(
         return errors;
     }
 
-    private static bool CanAssignNull(PropertyInfo property)
+    private static void ValidateTimestampStoreTypes(
+        Microsoft.EntityFrameworkCore.Metadata.IEntityType entityType,
+        RetentionEntry entry,
+        List<string> errors
+    )
+    {
+        ValidateTimestampStoreType(entityType, entry, entry.AnchorMember, "anchor", errors);
+        ValidateTimestampStoreType(
+            entityType,
+            entry,
+            entry.SoftDelete?.DeletedAtMember,
+            "soft-delete DeletedAt",
+            errors
+        );
+        ValidateTimestampStoreType(
+            entityType,
+            entry,
+            entry.AnonymisedAt?.AnonymisedAtMember,
+            "AnonymisedAt marker",
+            errors
+        );
+    }
+
+    private static void ValidateTimestampStoreType(
+        Microsoft.EntityFrameworkCore.Metadata.IEntityType entityType,
+        RetentionEntry entry,
+        string? memberName,
+        string role,
+        List<string> errors
+    )
+    {
+        if (memberName is null)
+        {
+            return;
+        }
+
+        var property = entityType.FindProperty(memberName);
+        if (property is null)
+        {
+            return;
+        }
+
+        var clrType = Nullable.GetUnderlyingType(property.ClrType) ?? property.ClrType;
+        if (clrType != typeof(DateTime) && clrType != typeof(DateTimeOffset))
+        {
+            return;
+        }
+
+        string storeType;
+        try
+        {
+            storeType = property.GetColumnType();
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or InvalidCastException)
+        {
+            // Non-relational providers (e.g. InMemory in unit tests) expose no store type.
+            return;
+        }
+
+        if (!string.Equals(storeType, "timestamp with time zone", StringComparison.OrdinalIgnoreCase))
+        {
+            errors.Add(
+                $"Timestamp convention on {entry.EntityType.FullName}: {role} property '{memberName}' is mapped to '{storeType}'. Cohort compares and writes retention timestamps as UTC instants, which requires 'timestamp with time zone'; 'timestamp without time zone' silently drifts with the session TimeZone and rejects UTC-kinded parameters. Map the property with HasColumnType(\"timestamptz\") or use DateTimeOffset."
+            );
+        }
+    }
+
+    private static void ValidateCascadeDeletePaths(
+        Microsoft.EntityFrameworkCore.Metadata.IEntityType entityType,
+        List<string> errors
+    )
+    {
+        var visited = new HashSet<Microsoft.EntityFrameworkCore.Metadata.IEntityType> { entityType };
+        var queue = new Queue<Microsoft.EntityFrameworkCore.Metadata.IEntityType>();
+        queue.Enqueue(entityType);
+
+        while (queue.Count > 0)
+        {
+            var current = queue.Dequeue();
+            foreach (var foreignKey in current.GetReferencingForeignKeys())
+            {
+                if (foreignKey.DeleteBehavior != DeleteBehavior.Cascade)
+                {
+                    continue;
+                }
+
+                var dependent = foreignKey.DeclaringEntityType;
+                if (!visited.Add(dependent))
+                {
+                    continue;
+                }
+
+                if (dependent.ClrType.GetCustomAttribute<RetainAttribute>(inherit: false) is not null)
+                {
+                    errors.Add(
+                        $"[Retain] on {entityType.ClrType.FullName}: purging this entity cascades (ON DELETE CASCADE) into retained entity {dependent.ClrType.FullName}, bypassing that entity's retention window, legal holds, and audit trail. Configure the relationship with DeleteBehavior.Restrict or NoAction so dependents are retired by their own retention rules."
+                    );
+                }
+
+                queue.Enqueue(dependent);
+            }
+        }
+    }
+
+    private static void ValidateMarkerAttributeUniqueness(Type clrType, List<string> errors)
+    {
+        AddDuplicateMarkerError<RetentionRecordIdAttribute>(clrType, errors);
+        AddDuplicateMarkerError<RetentionTenantAttribute>(clrType, errors);
+        AddDuplicateMarkerError<RetentionSoftDeleteAttribute>(clrType, errors);
+        AddDuplicateMarkerError<RetentionDeletedAtAttribute>(clrType, errors);
+    }
+
+    private static void AddDuplicateMarkerError<TAttribute>(Type clrType, List<string> errors)
+        where TAttribute : Attribute
+    {
+        var markedPropertyNames = clrType
+            .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+            .Where(property => property.GetCustomAttribute<TAttribute>() is not null)
+            .Select(property => property.Name)
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+
+        if (markedPropertyNames.Length > 1)
+        {
+            var markerName = typeof(TAttribute).Name.Replace("Attribute", "", StringComparison.Ordinal);
+            errors.Add(
+                $"Marker convention on {clrType.FullName}: [{markerName}] is declared on multiple properties ({string.Join(", ", markedPropertyNames)}); exactly one is allowed."
+            );
+        }
+    }
+
+    private bool CanAssignNull(PropertyInfo property)
     {
         if (!property.PropertyType.IsValueType)
         {
-            return NullabilityInfoContext.Create(property).ReadState == NullabilityState.Nullable;
+            return nullabilityInfoContext.Create(property).ReadState == NullabilityState.Nullable;
         }
 
         return !IsNonNullableValueType(property.PropertyType);

@@ -81,7 +81,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         auditWriter.Events[^1].Should().BeOfType<SweepEvent.Completed>();
 
         var started = (SweepEvent.Started)auditWriter.Events[0];
-        started.Trigger.Should().Be(SweepTriggerKind.Scheduled);
+        started.Trigger.Should().Be(SweepTriggerKind.Manual);
         started.DryRun.Should().BeFalse();
         started.TenantId.Should().Be(tenantId);
 
@@ -148,7 +148,9 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                         summary.Category,
                         summary.TenantId,
                         summary.Strategy,
-                        summary.Affected
+                        summary.Affected,
+                        summary.HeldCount,
+                        summary.SkippedCount
                     )
                 )
         );
@@ -263,7 +265,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         );
 
         result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1, HeldCount: 1)
         );
         result.Counts.Should().Contain(
             new EntitySweepCount(
@@ -271,7 +273,8 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                 "soft-delete",
                 tenantId,
                 Strategy.SoftDelete,
-                1
+                1,
+                HeldCount: 1
             )
         );
         result.Counts.Should().Contain(
@@ -280,7 +283,8 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                 "anonymise",
                 tenantId,
                 Strategy.Anonymise,
-                1
+                1,
+                HeldCount: 1
             )
         );
 
@@ -291,7 +295,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         run.SweepId.Should().Be(result.SweepId);
         run.StartedAt.Should().Be(result.StartedAt);
         run.CompletedAt.Should().Be(result.CompletedAt);
-        run.Trigger.Should().Be(SweepTriggerKind.Scheduled);
+        run.Trigger.Should().Be(SweepTriggerKind.Manual);
         run.DryRun.Should().BeFalse();
         run.TenantId.Should().Be(tenantId);
         run.TotalAffected.Should().Be(3);
@@ -366,7 +370,9 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                     summary.Category,
                     summary.TenantId,
                     summary.Strategy,
-                    summary.Affected
+                    summary.Affected,
+                    summary.HeldCount,
+                    summary.SkippedCount
                 )
             )
         );

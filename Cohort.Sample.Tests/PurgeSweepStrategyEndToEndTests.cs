@@ -132,19 +132,17 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
         connection.LastCommand.CommandText.Should().Contain("@tenantId");
         connection.LastCommand.CommandText.Should().Contain("@candidateIds");
         connection.LastCommand.CommandText.Should().Contain("@holdTableName");
-        connection.LastCommand.CommandText.Should().Contain("@holdAsOf");
+        connection.LastCommand.CommandText.Should().Contain("now()");
         connection.LastCommand.CommandText.Should().Contain("NOT EXISTS");
-        connection.LastCommand.Parameters.Count.Should().Be(5);
+        connection.LastCommand.Parameters.Count.Should().Be(4);
         connection.LastCommand.Parameters.Contains("cutoff").Should().BeTrue();
         connection.LastCommand.Parameters.Contains("tenantId").Should().BeTrue();
         connection.LastCommand.Parameters.Contains("candidateIds").Should().BeTrue();
         connection.LastCommand.Parameters.Contains("holdTableName").Should().BeTrue();
-        connection.LastCommand.Parameters.Contains("holdAsOf").Should().BeTrue();
         connection.LastCommand.Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.LastCommand.Parameters["tenantId"].Value.Should().Be(tenantId);
         connection.LastCommand.Parameters["candidateIds"].Value.Should().BeOfType<string[]>();
         connection.LastCommand.Parameters["holdTableName"].Value.Should().Be("purge_candidate_records");
-        connection.LastCommand.Parameters["holdAsOf"].Value.Should().Be(now);
     }
 
     [Fact]
@@ -286,13 +284,12 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
         connection.LastCommand.CommandText.Should().Contain("@cutoff");
         connection.LastCommand.CommandText.Should().Contain("@tenantId");
         connection.LastCommand.CommandText.Should().Contain("@holdTableName");
-        connection.LastCommand.CommandText.Should().Contain("@holdAsOf");
+        connection.LastCommand.CommandText.Should().Contain("now()");
         connection.LastCommand.CommandText.Should().Contain("NOT EXISTS");
-        connection.LastCommand.Parameters.Count.Should().Be(4);
+        connection.LastCommand.Parameters.Count.Should().Be(3);
         connection.LastCommand.Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.LastCommand.Parameters["tenantId"].Value.Should().Be(tenantId);
         connection.LastCommand.Parameters["holdTableName"].Value.Should().Be("purge_candidate_records");
-        connection.LastCommand.Parameters["holdAsOf"].Value.Should().Be(now);
     }
 
     [Fact]
@@ -411,7 +408,6 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
             new[] { selectedId.ToString(), heldId.ToString() }
         );
         connection.Commands[1].Parameters["holdTableName"].Value.Should().Be("purge_candidate_records");
-        connection.Commands[1].Parameters["holdAsOf"].Value.Should().Be(now);
     }
 
     [Fact]
@@ -485,7 +481,6 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
             new[] { selectedId.ToString(), heldId.ToString() }
         );
         connection.Commands[1].Parameters["holdTableName"].Value.Should().Be("purge_candidate_records");
-        connection.Commands[1].Parameters["holdAsOf"].Value.Should().Be(now);
     }
 
     [Fact]
@@ -557,7 +552,6 @@ public sealed class PurgeSweepStrategyEndToEndTests(PostgresFixture fixture)
             new[] { selectedId.ToString(), heldId.ToString() }
         );
         connection.Commands[1].Parameters["holdTableName"].Value.Should().Be("purge_candidate_records");
-        connection.Commands[1].Parameters["holdAsOf"].Value.Should().Be(now);
     }
 
     private static async Task InsertRecordAsync(

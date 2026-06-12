@@ -28,30 +28,6 @@ internal static partial class RetentionTypeIdentity
             );
     }
 
-    public static Type Resolve(string persistedName)
-    {
-        var normalized = Normalize(persistedName);
-
-        var resolved = Type.GetType(normalized, throwOnError: false, ignoreCase: false);
-        if (resolved is not null)
-        {
-            return resolved;
-        }
-
-        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
-        {
-            resolved = assembly.GetType(normalized, throwOnError: false, ignoreCase: false);
-            if (resolved is not null)
-            {
-                return resolved;
-            }
-        }
-
-        throw new InvalidOperationException(
-            $"Retention type '{persistedName}' could not be resolved."
-        );
-    }
-
     [GeneratedRegex(@", Version=[^,\]]+", RegexOptions.CultureInvariant)]
     private static partial Regex VersionPattern();
 

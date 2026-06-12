@@ -12,6 +12,12 @@ public sealed class EfRetentionHoldsRepository(DbContext db) : IRetentionHoldsRe
     public async Task CreateAsync(RetentionHoldRequest request, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
+        ArgumentException.ThrowIfNullOrWhiteSpace(request.RecordId);
+
+        // A hold with a table name or record-id format the sweep-side NOT EXISTS match
+        // never hits would look persisted while protecting nothing. Fail loudly instead.
+        var targetEntityType = FindEntityTypeForTable(request.TableName);
+        var recordId = NormaliseRecordId(targetEntityType, request.RecordId);
 
         var connection = db.Database.GetDbConnection();
         var shouldCloseConnection = connection.State != ConnectionState.Open;
@@ -49,7 +55,7 @@ public sealed class EfRetentionHoldsRepository(DbContext db) : IRetentionHoldsRe
                 """;
             command.Parameters.Add(RetentionHoldSql.CreateParameter(command, "holdId", request.HoldId));
             command.Parameters.Add(RetentionHoldSql.CreateParameter(command, "tableName", request.TableName));
-            command.Parameters.Add(RetentionHoldSql.CreateParameter(command, "recordId", request.RecordId));
+            command.Parameters.Add(RetentionHoldSql.CreateParameter(command, "recordId", recordId));
             command.Parameters.Add(RetentionHoldSql.CreateParameter(command, "tenantId", request.TenantId));
             command.Parameters.Add(RetentionHoldSql.CreateParameter(command, "reason", request.Reason));
             command.Parameters.Add(
@@ -72,6 +78,58 @@ public sealed class EfRetentionHoldsRepository(DbContext db) : IRetentionHoldsRe
                 await db.Database.CloseConnectionAsync();
             }
         }
+    }
+
+    private Microsoft.EntityFrameworkCore.Metadata.IEntityType FindEntityTypeForTable(
+        string tableName
+    )
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(tableName);
+
+        var entityType = db.Model
+            .GetEntityTypes()
+            .FirstOrDefault(candidate =>
+                string.Equals(candidate.GetTableName(), tableName, StringComparison.Ordinal)
+            );
+
+        if (entityType is null)
+        {
+            throw new InvalidOperationException(
+                $"Retention hold table name '{tableName}' does not match any table mapped by the EF model. Holds are matched by exact physical table name; a mismatched name would persist a hold that protects nothing."
+            );
+        }
+
+        return entityType;
+    }
+
+    private static string NormaliseRecordId(
+        Microsoft.EntityFrameworkCore.Metadata.IEntityType entityType,
+        string recordId
+    )
+    {
+        // The sweep-side exclusion compares CAST(id AS text) = "RecordId". Postgres casts
+        // uuid to lowercase hyphenated text, so Guid-keyed holds must be stored in exactly
+        // that format or they silently never match.
+        var primaryKeyProperties = entityType.FindPrimaryKey()?.Properties;
+        if (primaryKeyProperties is not [var keyProperty])
+        {
+            return recordId;
+        }
+
+        var keyClrType = Nullable.GetUnderlyingType(keyProperty.ClrType) ?? keyProperty.ClrType;
+        if (keyClrType != typeof(Guid))
+        {
+            return recordId;
+        }
+
+        if (!Guid.TryParse(recordId, out var parsed))
+        {
+            throw new InvalidOperationException(
+                $"Retention hold record id '{recordId}' for table '{entityType.GetTableName()}' is not a valid Guid, but the table's primary key is Guid-typed. The hold would never match its row."
+            );
+        }
+
+        return parsed.ToString("D");
     }
 
     public async Task RemoveAsync(Guid holdId, DateTimeOffset removedAt, CancellationToken ct)

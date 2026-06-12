@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Reflection;
 using System.Text.Json;
 
 namespace Cohort.Infrastructure.Sweep;
@@ -6,6 +8,37 @@ internal static class RetentionSnapshotSerializer
 {
     private const string EncodedTypeProperty = "$cohortType";
     private const string EncodedValueProperty = "$cohortValue";
+
+    // Persisted payloads name CLR types; resolving arbitrary names AppDomain-wide turns a
+    // tampered payload into a deserialization gadget. Only well-known scalars and the
+    // swept entity's own property types are ever materialised.
+    private static readonly Type[] WellKnownSnapshotTypes =
+    [
+        typeof(bool),
+        typeof(byte),
+        typeof(sbyte),
+        typeof(short),
+        typeof(ushort),
+        typeof(int),
+        typeof(uint),
+        typeof(long),
+        typeof(ulong),
+        typeof(float),
+        typeof(double),
+        typeof(decimal),
+        typeof(char),
+        typeof(string),
+        typeof(Guid),
+        typeof(DateTime),
+        typeof(DateTimeOffset),
+        typeof(TimeSpan),
+        typeof(DateOnly),
+        typeof(TimeOnly),
+        typeof(byte[]),
+    ];
+
+    private static readonly ConcurrentDictionary<Type, IReadOnlyDictionary<string, Type>> AllowedSnapshotTypes =
+        new();
 
     public static string Serialize(IReadOnlyDictionary<string, object?> snapshot)
     {
@@ -20,8 +53,15 @@ internal static class RetentionSnapshotSerializer
         return JsonSerializer.Serialize(encoded);
     }
 
-    public static IReadOnlyDictionary<string, object?> Deserialize(string? capturedPayload)
+    public static IReadOnlyDictionary<string, object?> Deserialize(
+        string? capturedPayload,
+        Type entityType,
+        IEnumerable<Assembly> handlerAssemblies
+    )
     {
+        ArgumentNullException.ThrowIfNull(entityType);
+        ArgumentNullException.ThrowIfNull(handlerAssemblies);
+
         if (string.IsNullOrWhiteSpace(capturedPayload))
         {
             throw new InvalidOperationException(
@@ -37,11 +77,73 @@ internal static class RetentionSnapshotSerializer
             );
         }
 
+        var resolver = new SnapshotTypeResolver(
+            entityType,
+            AllowedSnapshotTypes.GetOrAdd(entityType, BuildAllowedSnapshotTypes),
+            handlerAssemblies.Append(entityType.Assembly).Distinct().ToArray()
+        );
+
         return document.RootElement.EnumerateObject().ToDictionary(
             property => property.Name,
-            property => DecodeValue(property.Value),
+            property => DecodeValue(property.Value, resolver),
             StringComparer.Ordinal
         );
+    }
+
+    private static IReadOnlyDictionary<string, Type> BuildAllowedSnapshotTypes(Type entityType)
+    {
+        var allowed = new Dictionary<string, Type>(StringComparer.Ordinal);
+        var candidates = WellKnownSnapshotTypes.Concat(
+            entityType
+                .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                .SelectMany(property =>
+                {
+                    var underlying = Nullable.GetUnderlyingType(property.PropertyType);
+                    return underlying is null
+                        ? new[] { property.PropertyType }
+                        : [property.PropertyType, underlying];
+                })
+        );
+
+        foreach (var candidate in candidates)
+        {
+            allowed[RetentionTypeIdentity.GetPersistedName(candidate)] = candidate;
+        }
+
+        return allowed;
+    }
+
+    private sealed class SnapshotTypeResolver(
+        Type entityType,
+        IReadOnlyDictionary<string, Type> allowedTypes,
+        Assembly[] allowedAssemblies
+    )
+    {
+        public Type Resolve(string typeName)
+        {
+            var normalized = RetentionTypeIdentity.Normalize(typeName);
+            if (allowedTypes.TryGetValue(normalized, out var known))
+            {
+                return known;
+            }
+
+            // Handler-stashed payload types resolve only inside the entity's and the
+            // registered handlers' own assemblies; framework and third-party assemblies
+            // (where deserialization gadget types live) stay out of reach.
+            var resolved = Type.GetType(
+                normalized,
+                assemblyName => allowedAssemblies.FirstOrDefault(assembly =>
+                    string.Equals(assembly.GetName().Name, assemblyName.Name, StringComparison.Ordinal)
+                ),
+                typeResolver: null,
+                throwOnError: false
+            );
+
+            return resolved
+                ?? throw new InvalidOperationException(
+                    $"Retention snapshot payload names type '{typeName}', which is not in the snapshot type allow-list for entity {entityType.FullName}. Snapshot values round-trip only as well-known scalars, property types of the swept entity, or types declared in the entity's or its registered handlers' assemblies."
+                );
+        }
     }
 
     private static object? EncodeValue(object? value)
@@ -104,7 +206,7 @@ internal static class RetentionSnapshotSerializer
         };
     }
 
-    private static object? DecodeValue(JsonElement element)
+    private static object? DecodeValue(JsonElement element, SnapshotTypeResolver resolver)
     {
         return element.ValueKind switch
         {
@@ -115,27 +217,34 @@ internal static class RetentionSnapshotSerializer
             JsonValueKind.Number when element.TryGetInt64(out var int64Value) => int64Value,
             JsonValueKind.Number when element.TryGetDecimal(out var decimalValue) => decimalValue,
             JsonValueKind.Number => element.GetDouble(),
-            JsonValueKind.Object => DecodeObject(element),
-            JsonValueKind.Array => element.EnumerateArray().Select(DecodeValue).ToArray(),
+            JsonValueKind.Object => DecodeObject(element, resolver),
+            JsonValueKind.Array => element
+                .EnumerateArray()
+                .Select(item => DecodeValue(item, resolver))
+                .ToArray(),
             _ => element.GetRawText(),
         };
     }
 
-    private static object? DecodeObject(JsonElement element)
+    private static object? DecodeObject(JsonElement element, SnapshotTypeResolver resolver)
     {
-        if (TryDecodeTypedValue(element, out var decoded))
+        if (TryDecodeTypedValue(element, resolver, out var decoded))
         {
             return decoded;
         }
 
         return element.EnumerateObject().ToDictionary(
             property => property.Name,
-            property => DecodeValue(property.Value),
+            property => DecodeValue(property.Value, resolver),
             StringComparer.Ordinal
         );
     }
 
-    private static bool TryDecodeTypedValue(JsonElement element, out object? decoded)
+    private static bool TryDecodeTypedValue(
+        JsonElement element,
+        SnapshotTypeResolver resolver,
+        out object? decoded
+    )
     {
         decoded = null;
 
@@ -166,7 +275,7 @@ internal static class RetentionSnapshotSerializer
             );
         }
 
-        var resolvedType = RetentionTypeIdentity.Resolve(typeName);
+        var resolvedType = resolver.Resolve(typeName);
         decoded = JsonSerializer.Deserialize(valueProperty.GetRawText(), resolvedType);
         return true;
     }

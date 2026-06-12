@@ -9,6 +9,16 @@ internal static class CutoffCalculator
 
     public static DateTimeOffset Compute(DateTimeOffset now, TimeSpan period, TimeSpan? legalMin)
     {
-        return now - ResolveEffectivePeriod(period, legalMin);
+        var effectivePeriod = ResolveEffectivePeriod(period, legalMin);
+        if (effectivePeriod < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(period),
+                effectivePeriod,
+                "Effective retention period must be non-negative; refusing to compute a cutoff in the future."
+            );
+        }
+
+        return now - effectivePeriod;
     }
 }

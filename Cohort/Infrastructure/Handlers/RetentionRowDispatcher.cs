@@ -21,9 +21,10 @@ public sealed class RetentionRowDispatcher(
     ILogger<RetentionRowDispatcher> logger
 ) : BackgroundService, IRetentionRowDispatcher
 {
-    public Task FlushAsync(CancellationToken ct = default)
+    public async Task FlushAsync(CancellationToken ct = default)
     {
-        return DrainQueueAsync(DateTimeOffset.MaxValue, ct);
+        await ScrubExpiredPayloadsAsync(ct);
+        await DrainQueueAsync(DateTimeOffset.MaxValue, ct);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -32,7 +33,14 @@ public sealed class RetentionRowDispatcher(
         {
             try
             {
-                await DrainQueueAsync(DateTimeOffset.UtcNow, stoppingToken);
+                var now = DateTimeOffset.UtcNow;
+                if (now - lastPayloadScrubAt >= PayloadScrubInterval)
+                {
+                    lastPayloadScrubAt = now;
+                    await ScrubExpiredPayloadsAsync(stoppingToken);
+                }
+
+                await DrainQueueAsync(now, stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -50,6 +58,104 @@ public sealed class RetentionRowDispatcher(
             }
 
             await Task.Delay(pollInterval, stoppingToken);
+        }
+    }
+
+    private static readonly TimeSpan PayloadScrubInterval = TimeSpan.FromHours(1);
+    private DateTimeOffset lastPayloadScrubAt = DateTimeOffset.MinValue;
+
+    /// <summary>
+    /// Clears a row detail's captured snapshot once every handler for that row has
+    /// reached a terminal state. Snapshots exist solely to feed OnAfterAsync; keeping
+    /// them longer retains exactly the personal data the sweep was meant to remove.
+    /// </summary>
+    private async Task ClearSettledPayloadAsync(long rowDetailId)
+    {
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<DbContext>();
+        var connection = db.Database.GetDbConnection();
+        var shouldCloseConnection = connection.State != ConnectionState.Open;
+
+        if (shouldCloseConnection)
+        {
+            await db.Database.OpenConnectionAsync(CancellationToken.None);
+        }
+
+        try
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText =
+                $"""
+                UPDATE {QuoteIdentifier(CohortTableNames.SweepRunRowDetail)} AS detail
+                SET "CapturedPayload" = NULL
+                WHERE detail."Id" = @rowDetailId
+                  AND detail."CapturedPayload" IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} AS status
+                      WHERE status."SweepRunRowDetailId" = detail."Id"
+                        AND status."State" IN (@pending, @inFlight)
+                  )
+                """;
+            command.Parameters.Add(CreateParameter(command, "rowDetailId", rowDetailId));
+            command.Parameters.Add(
+                CreateParameter(command, "pending", (int)SweepRowHandlerDispatchState.Pending)
+            );
+            command.Parameters.Add(
+                CreateParameter(command, "inFlight", (int)SweepRowHandlerDispatchState.InFlight)
+            );
+
+            await command.ExecuteNonQueryAsync(CancellationToken.None);
+        }
+        finally
+        {
+            if (shouldCloseConnection)
+            {
+                await db.Database.CloseConnectionAsync();
+            }
+        }
+    }
+
+    private async Task ScrubExpiredPayloadsAsync(CancellationToken ct)
+    {
+        var retention = options.CurrentValue.RowHandlerDispatch.PayloadRetention;
+        if (retention < TimeSpan.FromHours(1))
+        {
+            retention = TimeSpan.FromHours(1);
+        }
+
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<DbContext>();
+        var connection = db.Database.GetDbConnection();
+        var shouldCloseConnection = connection.State != ConnectionState.Open;
+
+        if (shouldCloseConnection)
+        {
+            await db.Database.OpenConnectionAsync(ct);
+        }
+
+        try
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText =
+                $"""
+                UPDATE {QuoteIdentifier(CohortTableNames.SweepRunRowDetail)}
+                SET "CapturedPayload" = NULL
+                WHERE "CapturedPayload" IS NOT NULL
+                  AND "At" < @payloadCutoff
+                """;
+            command.Parameters.Add(
+                CreateParameter(command, "payloadCutoff", DateTimeOffset.UtcNow - retention)
+            );
+
+            await command.ExecuteNonQueryAsync(ct);
+        }
+        finally
+        {
+            if (shouldCloseConnection)
+            {
+                await db.Database.CloseConnectionAsync();
+            }
         }
     }
 
@@ -92,7 +198,8 @@ public sealed class RetentionRowDispatcher(
         try
         {
             await using var scope = scopeFactory.CreateAsyncScope();
-            var entityType = ResolveEntityType(claimed.EntityType);
+            var registry = scope.ServiceProvider.GetRequiredService<RetentionRegistry>();
+            var entityType = ResolveEntityType(claimed.EntityType, registry);
             var handlers = RetentionHandlerSupport.ResolveHandlers(scope.ServiceProvider, entityType);
             var claimedHandlerIdentity = RetentionTypeIdentity.Normalize(claimed.HandlerType);
             var handler =
@@ -107,7 +214,11 @@ public sealed class RetentionRowDispatcher(
                     $"Retention row handler '{claimed.HandlerType}' is not registered for entity {claimed.EntityType}."
                 );
 
-            var snapshot = RetentionSnapshotSerializer.Deserialize(claimed.CapturedPayload);
+            var snapshot = RetentionSnapshotSerializer.Deserialize(
+                claimed.CapturedPayload,
+                entityType,
+                handlers.Select(resolved => resolved.Instance.GetType().Assembly)
+            );
             var context = CreateAfterContext(entityType, claimed, currentAttempt, snapshot);
             await InvokeOnAfterAsync(entityType, handler.Instance, context, ct);
             handlerCompleted = true;
@@ -117,6 +228,7 @@ public sealed class RetentionRowDispatcher(
                 DateTimeOffset.UtcNow,
                 CancellationToken.None
             );
+            await ClearSettledPayloadAsync(claimed.RowDetailId);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested && !handlerCompleted)
         {
@@ -125,6 +237,9 @@ public sealed class RetentionRowDispatcher(
         catch (Exception ex)
         {
             await MarkFailureAsync(claimed, currentAttempt, ex, DateTimeOffset.UtcNow, ct);
+            // No-op while any sibling handler is still pending/in-flight (including a
+            // requeue of this one); clears the snapshot once the row is fully settled.
+            await ClearSettledPayloadAsync(claimed.RowDetailId);
         }
     }
 
@@ -204,13 +319,23 @@ public sealed class RetentionRowDispatcher(
                     ON detail."Id" = status."SweepRunRowDetailId"
                 INNER JOIN {QuoteIdentifier(CohortTableNames.SweepRun)} AS run
                     ON run."SweepId" = detail."SweepId"
-                WHERE status."State" = @pending
-                  AND status."NextAttemptAt" <= @dueCutoff
+                WHERE (
+                      (status."State" = @pending AND status."NextAttemptAt" <= @dueCutoff)
+                      OR (
+                          status."State" = @inFlight
+                          AND status."ClaimedAt" IS NOT NULL
+                          AND status."ClaimedAt" <= @leaseCutoff
+                      )
+                  )
                   AND (
                       status."DispatchPhase" = @immediatePhase
                       OR (
                           status."DispatchPhase" = @afterSweepSettledPhase
-                          AND run."CompletedAt" IS NOT NULL
+                          AND (
+                              run."CompletedAt" IS NOT NULL
+                              OR run."FailedAt" IS NOT NULL
+                              OR run."StartedAt" <= @sweepSettledCutoff
+                          )
                       )
                   )
                   AND NOT EXISTS (
@@ -221,12 +346,14 @@ public sealed class RetentionRowDispatcher(
                         AND blocker."State" IN (@pending, @inFlight)
                   )
                 ORDER BY status."NextAttemptAt", status."Id"
-                FOR UPDATE SKIP LOCKED
+                FOR UPDATE OF status SKIP LOCKED
                 LIMIT @batchSize
             )
             UPDATE {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} AS status
             SET "State" = @inFlight,
-                "ClaimedAt" = @claimedAt
+                "ClaimedAt" = @claimedAt,
+                "Attempt" = status."Attempt"
+                    + CASE WHEN status."State" = @inFlight THEN 1 ELSE 0 END
             FROM due
             WHERE status."Id" = due."Id"
             RETURNING status."Id"
@@ -252,6 +379,27 @@ public sealed class RetentionRowDispatcher(
             CreateParameter(command, "inFlight", (int)SweepRowHandlerDispatchState.InFlight)
         );
         command.Parameters.Add(CreateParameter(command, "claimedAt", claimedAt));
+        var claimTimeout = options.CurrentValue.RowHandlerDispatch.ClaimTimeout;
+        if (claimTimeout < TimeSpan.FromSeconds(30))
+        {
+            claimTimeout = TimeSpan.FromSeconds(30);
+        }
+
+        command.Parameters.Add(
+            CreateParameter(command, "leaseCutoff", claimedAt - claimTimeout)
+        );
+
+        // A run that crashed mid-sweep never gets CompletedAt; its committed deferred
+        // work is released after the settle timeout instead of being stuck forever.
+        var settleTimeout = options.CurrentValue.RowHandlerDispatch.SweepSettleTimeout;
+        if (settleTimeout < TimeSpan.FromMinutes(1))
+        {
+            settleTimeout = TimeSpan.FromMinutes(1);
+        }
+
+        command.Parameters.Add(
+            CreateParameter(command, "sweepSettledCutoff", claimedAt - settleTimeout)
+        );
 
         var claimedIds = new List<long>();
         await using var reader = await command.ExecuteReaderAsync(ct);
@@ -355,7 +503,7 @@ public sealed class RetentionRowDispatcher(
     {
         var optionsSnapshot = options.CurrentValue.RowHandlerDispatch;
         var maxAttempts = Math.Max(1, optionsSnapshot.MaxAttempts);
-        var lastError = ex.ToString();
+        var lastError = SanitizeError(ex);
 
         if (attempt >= maxAttempts)
         {
@@ -658,18 +806,18 @@ public sealed class RetentionRowDispatcher(
         return TimeSpan.FromTicks((long)backoffTicks);
     }
 
-    private static Type ResolveEntityType(string entityType)
+    private static Type ResolveEntityType(string entityType, RetentionRegistry registry)
     {
-        var resolved =
-            Type.GetType(entityType, throwOnError: false, ignoreCase: false)
-            ?? AppDomain.CurrentDomain
-                .GetAssemblies()
-                .Select(assembly => assembly.GetType(entityType, throwOnError: false, ignoreCase: false))
-                .FirstOrDefault(type => type is not null);
+        // Persisted names resolve only against the registered retention model, never
+        // AppDomain-wide: a tampered row must not be able to materialise arbitrary types.
+        var resolved = registry
+            .Scan()
+            .Values.Select(entry => entry.EntityType)
+            .FirstOrDefault(type => string.Equals(type.FullName, entityType, StringComparison.Ordinal));
 
         return resolved
             ?? throw new InvalidOperationException(
-                $"Could not resolve retention handler entity type '{entityType}'."
+                $"Could not resolve retention handler entity type '{entityType}': it is not a registered retained entity in the current model."
             );
     }
 
@@ -678,6 +826,16 @@ public sealed class RetentionRowDispatcher(
         return value > DateTimeOffset.MaxValue.AddYears(-1)
             ? DateTimeOffset.MaxValue.AddYears(-1)
             : value;
+    }
+
+    private static string SanitizeError(Exception ex)
+    {
+        // Root-cause type + message only: full ToString() includes stack frames that can
+        // echo row data into a long-lived audit table, and reflection wrappers like
+        // TargetInvocationException would otherwise hide the handler's actual failure.
+        var root = ex.GetBaseException();
+        var error = $"{root.GetType().FullName}: {root.Message}";
+        return error.Length <= 2000 ? error : error[..2000];
     }
 
     private static DbParameter CreateParameter(DbCommand command, string name, object? value)

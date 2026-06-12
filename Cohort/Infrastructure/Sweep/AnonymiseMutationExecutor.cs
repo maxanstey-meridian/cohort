@@ -29,7 +29,6 @@ internal sealed class AnonymiseMutationExecutor(
         var updatableRows = await rowLoader.LoadUpdatableRowsAsync(
             entry,
             tenant,
-            now,
             conn,
             transaction,
             candidateRecordIds,
@@ -37,7 +36,11 @@ internal sealed class AnonymiseMutationExecutor(
         );
         if (updatableRows.Count == 0)
         {
-            return new SweepExecutionResult([], candidateRecordIds.Count);
+            return new SweepExecutionResult(
+                [],
+                candidateRecordIds.Count,
+                CandidateCount: candidateRecordIds.Count
+            );
         }
 
         var staticAssignments = assignmentResolver.CreateStaticAssignments(entry, tenant.Id, now);
@@ -65,7 +68,8 @@ internal sealed class AnonymiseMutationExecutor(
 
         return new SweepExecutionResult(
             affectedRecordIds,
-            candidateRecordIds.Count - affectedRecordIds.Count
+            candidateRecordIds.Count - affectedRecordIds.Count,
+            CandidateCount: candidateRecordIds.Count
         );
     }
 
@@ -90,12 +94,14 @@ internal sealed class AnonymiseMutationExecutor(
         AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
         AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
         AnonymiseDbParameterFactory.AddCandidateIdsParameter(command, candidateRecordIds);
-        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName, now);
+        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName);
+        AddAnonymisedAtParameter(command, entry, now);
 
         var affectedRecordIds = await ReadAffectedRecordIdsAsync(command, ct);
         return new SweepExecutionResult(
             affectedRecordIds,
-            candidateRecordIds.Count - affectedRecordIds.Count
+            candidateRecordIds.Count - affectedRecordIds.Count,
+            CandidateCount: candidateRecordIds.Count
         );
     }
 
@@ -128,7 +134,8 @@ internal sealed class AnonymiseMutationExecutor(
         command.Parameters.Add(AnonymiseDbParameterFactory.Create(command, "recordId", recordId));
         AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
         AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
-        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName, now);
+        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName);
+        AddAnonymisedAtParameter(command, entry, now);
 
         await using var reader = await command.ExecuteReaderAsync(ct);
         return await reader.ReadAsync(ct) ? reader.GetValue(0).ToString() : null;
@@ -147,6 +154,18 @@ internal sealed class AnonymiseMutationExecutor(
         }
 
         return affectedRecordIds;
+    }
+
+    private static void AddAnonymisedAtParameter(
+        DbCommand command,
+        RetentionEntry entry,
+        DateTimeOffset now
+    )
+    {
+        if (entry.AnonymisedAt is not null)
+        {
+            command.Parameters.Add(AnonymiseDbParameterFactory.Create(command, "anonymisedAt", now));
+        }
     }
 
     private static void AddAssignmentParameters(

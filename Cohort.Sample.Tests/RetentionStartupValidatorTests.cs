@@ -671,12 +671,16 @@ public sealed class RetentionStartupValidatorTests
         var act = async () => await CreateValidator(db, repository).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().ContainSingle();
+        exception.Which.Errors.Should().HaveCount(2);
         exception
-            .Which.Errors[0]
-            .Should()
-            .Be(
+            .Which.Errors.Should()
+            .Contain(
                 $"Anonymise convention on {typeof(Note).FullName}: retained Anonymise categories require at least one [Anonymise]-annotated property mapped by EF."
+            );
+        exception
+            .Which.Errors.Should()
+            .Contain(
+                $"Anonymise convention on {typeof(Note).FullName}: retained Anonymise categories require a nullable DateTimeOffset marker property (named AnonymisedAt by convention, or marked with [RetentionAnonymisedAt]). NULL marks rows not yet anonymised; without it anonymisation re-scrubs every expired row on every sweep."
             );
     }
 
@@ -849,6 +853,192 @@ public sealed class RetentionStartupValidatorTests
         );
 
         var act = async () => await new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
+
+        await act.Should().NotThrowAsync();
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Rejects_Retained_Entities_In_Inheritance_Hierarchies()
+    {
+        var options = new DbContextOptionsBuilder<InheritanceDbContext>()
+            .UseInMemoryDatabase($"startup-validator-inheritance-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new InheritanceDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["inheritance-base"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                ),
+            }
+        );
+
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"[Retain] on {typeof(InheritanceBaseRecord).FullName}: entity participates in an EF inheritance hierarchy (TPH/TPT/TPC). Sweep SQL targets the mapped table without a type discriminator, so rows of sibling or derived types would be swept too. Retention on inheritance-mapped entities is not supported."
+            );
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Rejects_Retained_Entities_Mapped_To_NonDefault_Schemas()
+    {
+        var options = new DbContextOptionsBuilder<NonDefaultSchemaDbContext>()
+            .UseInMemoryDatabase($"startup-validator-schema-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new NonDefaultSchemaDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["schema-category"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                ),
+            }
+        );
+
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"[Retain] on {typeof(NonDefaultSchemaRecord).FullName}: entity is mapped to schema 'audit'. Cohort SQL does not schema-qualify identifiers and resolves tables via the connection search_path, so entities outside the default 'public' schema are not supported."
+            );
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Rejects_Cascade_Delete_Paths_Into_Retained_Entities()
+    {
+        var options = new DbContextOptionsBuilder<CascadeDeleteDbContext>()
+            .UseInMemoryDatabase($"startup-validator-cascade-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new CascadeDeleteDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["cascade-parent"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                ),
+                ["cascade-child"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(365), Strategy.Purge)
+                ),
+            }
+        );
+
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"[Retain] on {typeof(CascadeParentRecord).FullName}: purging this entity cascades (ON DELETE CASCADE) into retained entity {typeof(CascadeChildRecord).FullName}, bypassing that entity's retention window, legal holds, and audit trail. Configure the relationship with DeleteBehavior.Restrict or NoAction so dependents are retired by their own retention rules."
+            );
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Allows_Restrict_Delete_Paths_Between_Retained_Entities()
+    {
+        var options = new DbContextOptionsBuilder<RestrictDeleteDbContext>()
+            .UseInMemoryDatabase($"startup-validator-restrict-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new RestrictDeleteDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["cascade-parent"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                ),
+                ["restrict-child"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(365), Strategy.Purge)
+                ),
+            }
+        );
+
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
+
+        await act.Should().NotThrowAsync();
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Rejects_Duplicate_Marker_Attributes()
+    {
+        var options = new DbContextOptionsBuilder<DuplicateTenantMarkerDbContext>()
+            .UseInMemoryDatabase($"startup-validator-duplicate-marker-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new DuplicateTenantMarkerDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["duplicate-tenant-marker"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                ),
+            }
+        );
+
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Marker convention on {typeof(DuplicateTenantMarkerRecord).FullName}: [RetentionTenant] is declared on multiple properties (OrganisationId, OwnerId); exactly one is allowed."
+            );
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Rejects_Naive_Timestamp_Anchor_Columns()
+    {
+        // Npgsql model building works offline; ValidateAsync only inspects metadata.
+        var options = new DbContextOptionsBuilder<NaiveTimestampDbContext>()
+            .UseNpgsql("Host=localhost;Database=cohort-model-only")
+            .Options;
+        await using var db = new NaiveTimestampDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["naive-anchor"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                ),
+            }
+        );
+
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception.Which.Errors[0].Should().Contain("'CreatedAt'");
+        exception.Which.Errors[0].Should().Contain("timestamp without time zone");
+        exception.Which.Errors[0].Should().Contain("timestamp with time zone");
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Allows_Timestamptz_Anchor_Columns()
+    {
+        var options = new DbContextOptionsBuilder<TimestamptzAnchorDbContext>()
+            .UseNpgsql("Host=localhost;Database=cohort-model-only")
+            .Options;
+        await using var db = new TimestamptzAnchorDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["naive-anchor"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                ),
+            }
+        );
+
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
 
         await act.Should().NotThrowAsync();
     }
@@ -1559,6 +1749,8 @@ public sealed class RetentionStartupValidatorTests
 
         [Anonymise(AnonymiseMethod.Null)]
         public int Age { get; init; }
+
+        public DateTimeOffset? AnonymisedAt { get; init; }
     }
 
     [Retain("invalid-empty-string-anonymise", nameof(InvalidEmptyStringAnonymiseRecord.CreatedAt))]
@@ -1570,6 +1762,8 @@ public sealed class RetentionStartupValidatorTests
 
         [Anonymise(AnonymiseMethod.EmptyString)]
         public Guid ExternalId { get; init; }
+
+        public DateTimeOffset? AnonymisedAt { get; init; }
     }
 
     [Retain("invalid-fixed-literal-anonymise", nameof(InvalidFixedLiteralAnonymiseRecord.CreatedAt))]
@@ -1581,6 +1775,8 @@ public sealed class RetentionStartupValidatorTests
 
         [Anonymise(AnonymiseMethod.FixedLiteral, "[redacted]")]
         public DateTimeOffset LastSeenAt { get; init; }
+
+        public DateTimeOffset? AnonymisedAt { get; init; }
     }
 
     [Retain("factory-backed-anonymise", nameof(FactoryBackedAnonymiseRecord.CreatedAt))]
@@ -1592,6 +1788,8 @@ public sealed class RetentionStartupValidatorTests
 
         [AnonymiseWith(typeof(TestAnonymiseValueFactory))]
         public Guid ExternalId { get; init; }
+
+        public DateTimeOffset? AnonymisedAt { get; init; }
     }
 
     [Retain("invalid-factory-type-anonymise", nameof(InvalidFactoryTypeAnonymiseRecord.CreatedAt))]
@@ -1603,6 +1801,8 @@ public sealed class RetentionStartupValidatorTests
 
         [AnonymiseWith(typeof(NotAFactory))]
         public Guid ExternalId { get; init; }
+
+        public DateTimeOffset? AnonymisedAt { get; init; }
     }
 
     [Retain("missing-anonymise-tenant", nameof(MissingAnonymiseTenantRecord.CreatedAt))]
@@ -1624,6 +1824,8 @@ public sealed class RetentionStartupValidatorTests
 
         [Anonymise(AnonymiseMethod.Null)]
         public string? EmailAddress { get; init; }
+
+        public DateTimeOffset? AnonymisedAt { get; init; }
     }
 
     [Retain("invalid-null-reference-anonymise", nameof(InvalidNullReferenceAnonymiseRecord.CreatedAt))]
@@ -1635,6 +1837,155 @@ public sealed class RetentionStartupValidatorTests
 
         [Anonymise(AnonymiseMethod.Null)]
         public string DisplayName { get; init; } = "";
+
+        public DateTimeOffset? AnonymisedAt { get; init; }
+    }
+
+    private sealed class InheritanceDbContext(DbContextOptions<InheritanceDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<InheritanceBaseRecord>(entity =>
+            {
+                entity.ToTable("inheritance_records");
+                entity.HasKey(record => record.Id);
+            });
+            modelBuilder.Entity<InheritanceDerivedRecord>();
+        }
+    }
+
+    private sealed class NonDefaultSchemaDbContext(DbContextOptions<NonDefaultSchemaDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<NonDefaultSchemaRecord>(entity =>
+            {
+                entity.ToTable("non_default_schema_records", "audit");
+                entity.HasKey(record => record.Id);
+            });
+        }
+    }
+
+    private sealed class CascadeDeleteDbContext(DbContextOptions<CascadeDeleteDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<CascadeParentRecord>(entity =>
+            {
+                entity.ToTable("cascade_parent_records");
+                entity.HasKey(record => record.Id);
+            });
+            modelBuilder.Entity<CascadeChildRecord>(entity =>
+            {
+                entity.ToTable("cascade_child_records");
+                entity.HasKey(record => record.Id);
+                entity
+                    .HasOne<CascadeParentRecord>()
+                    .WithMany()
+                    .HasForeignKey(record => record.ParentId)
+                    .OnDelete(DeleteBehavior.Cascade);
+            });
+        }
+    }
+
+    private sealed class RestrictDeleteDbContext(DbContextOptions<RestrictDeleteDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<CascadeParentRecord>(entity =>
+            {
+                entity.ToTable("restrict_parent_records");
+                entity.HasKey(record => record.Id);
+            });
+            modelBuilder.Entity<RestrictChildRecord>(entity =>
+            {
+                entity.ToTable("restrict_child_records");
+                entity.HasKey(record => record.Id);
+                entity
+                    .HasOne<CascadeParentRecord>()
+                    .WithMany()
+                    .HasForeignKey(record => record.ParentId)
+                    .OnDelete(DeleteBehavior.Restrict);
+            });
+        }
+    }
+
+    private sealed class DuplicateTenantMarkerDbContext(
+        DbContextOptions<DuplicateTenantMarkerDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<DuplicateTenantMarkerRecord>(entity =>
+            {
+                entity.ToTable("duplicate_tenant_marker_records");
+                entity.HasKey(record => record.Id);
+            });
+        }
+    }
+
+    [Retain("inheritance-base", nameof(CreatedAt))]
+    private class InheritanceBaseRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    private sealed class InheritanceDerivedRecord : InheritanceBaseRecord
+    {
+        public string Extra { get; init; } = "";
+    }
+
+    [Retain("schema-category", nameof(CreatedAt))]
+    private sealed class NonDefaultSchemaRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    [Retain("cascade-parent", nameof(CreatedAt))]
+    private sealed class CascadeParentRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    [Retain("cascade-child", nameof(CreatedAt))]
+    private sealed class CascadeChildRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public Guid ParentId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    [Retain("restrict-child", nameof(CreatedAt))]
+    private sealed class RestrictChildRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public Guid ParentId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    [Retain("duplicate-tenant-marker", nameof(CreatedAt))]
+    private sealed class DuplicateTenantMarkerRecord
+    {
+        public Guid Id { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+
+        [RetentionTenant]
+        public Guid OrganisationId { get; init; }
+
+        [RetentionTenant]
+        public Guid OwnerId { get; init; }
     }
 
     private sealed class TestAnonymiseValueFactory : IAnonymiseValueFactory
@@ -1643,4 +1994,41 @@ public sealed class RetentionStartupValidatorTests
     }
 
     private sealed class NotAFactory;
+
+    [Retain("naive-anchor", nameof(CreatedAt))]
+    private sealed class NaiveTimestampRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTime CreatedAt { get; init; }
+    }
+
+    private sealed class NaiveTimestampDbContext(DbContextOptions<NaiveTimestampDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<NaiveTimestampRecord>(entity =>
+            {
+                entity.ToTable("naive_timestamp_records");
+                entity.HasKey(record => record.Id);
+                entity
+                    .Property(record => record.CreatedAt)
+                    .HasColumnType("timestamp without time zone");
+            });
+        }
+    }
+
+    private sealed class TimestamptzAnchorDbContext(DbContextOptions<TimestamptzAnchorDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<NaiveTimestampRecord>(entity =>
+            {
+                entity.ToTable("timestamptz_anchor_records");
+                entity.HasKey(record => record.Id);
+            });
+        }
+    }
 }

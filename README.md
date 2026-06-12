@@ -57,6 +57,7 @@ public sealed class CaseContact
     public Guid Id { get; set; }
     public Guid TenantId { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset? AnonymisedAt { get; set; }
 
     [Anonymise(AnonymiseMethod.Null)]
     public string? Email { get; set; }
@@ -120,6 +121,26 @@ Once registered, Cohort can preview, sweep, and right-to-erasure retained entiti
 
 Unannotated entities are implicitly exempt. Use `[ExemptFromRetention("reason")]` if you want that exemption to be explicit in code.
 
+Guardrails enforced at startup validation:
+
+- `Period` and `LegalMin` must be non-negative (`RetentionRule` rejects negative values —
+  a negative period would compute a future cutoff and sweep everything).
+- Retained entities must not participate in an EF inheritance hierarchy (TPH/TPT/TPC):
+  sweep SQL targets the table without a discriminator.
+- Retained entities must live in the default `public` schema; Cohort SQL does not
+  schema-qualify identifiers.
+- No `ON DELETE CASCADE` foreign key may lead from a purgeable retained entity into
+  another retained entity — a cascade would bypass the dependent's retention window,
+  holds, and audit trail.
+- Convention marker attributes (`[RetentionRecordId]`, `[RetentionTenant]`,
+  `[RetentionSoftDelete]`, `[RetentionDeletedAt]`) may each appear on at most one property.
+- Anchor, `DeletedAt`, and `AnonymisedAt` columns must map to `timestamp with time zone`:
+  Cohort compares and writes retention timestamps as UTC instants, and a naive
+  `timestamp without time zone` column silently drifts with the session time zone.
+
+Rows whose anchor column is `NULL` never match a cutoff comparison and are retained
+indefinitely; prefer non-nullable anchors for purge categories.
+
 Retained entities are tenant-scoped by default. They must expose a `TenantId` property, or mark an alternative property with `[RetentionTenant]`, unless they are intentionally global and explicitly marked with `[RetentionTenantless]`.
 
 ### 2. Map categories to rules
@@ -154,6 +175,11 @@ Register your `IRetentionCategoryRepository` before `AddCohort<TDbContext>()`, a
 | `Exempt` | Leaves rows alone | documented non-retained categories |
 
 ## Anonymisation
+
+Anonymise categories require an idempotency marker: a nullable `DateTimeOffset` property
+named `AnonymisedAt` by convention (or marked with `[RetentionAnonymisedAt]`). `NULL`
+means not yet anonymised; the sweep filters on it and stamps it, so rows are scrubbed
+exactly once instead of on every sweep. Startup validation enforces the marker.
 
 For straightforward cases, mark columns with `[Anonymise]`:
 
@@ -206,6 +232,21 @@ Cohort only erases rows that satisfy both conditions:
 
 Active holds still block erasure, and tenant-scoped entities still keep the tenant predicate in the SQL.
 
+Erasure refuses categories that resolve to the SoftDelete strategy: setting a flag leaves
+personal data in the row, which rarely satisfies an erasure request. If it genuinely does,
+opt in explicitly with `new ErasureScope(subject, allowSoftDeleteAsErasure: true)`.
+`ErasureResult.DryRun` tells you whether the call previewed (under `Cohort:DryRun`) or
+actually mutated.
+
+Erasure runs on the same execution model as sweeps (see [Execution model](#execution-model)):
+the `Started` audit row commits before any mutation, rows are erased in independently
+committed batches of `SweepBatchSize`, one entity's failure is recorded
+(`ErasureResult.EntityFailures`, plus the run row's `FailedAt`/`Error`) while erasure
+continues for the subject's data in the remaining entities, and held counts are measured
+directly — in dry runs too. One difference: erasure candidate selects wait on locked rows
+(`FOR UPDATE`) instead of skipping them, because an erasure request must not silently miss
+a row a concurrent transaction happens to hold.
+
 Internally, the erasure contract passes an `ErasureSubjectPredicate`.
 
 ## Conventions and overrides
@@ -216,6 +257,7 @@ By default Cohort assumes common EF names:
 - tenant id: `TenantId`
 - soft-delete flag: `IsDeleted`
 - deleted-at column: `DeletedAt`
+- anonymised-at marker: `AnonymisedAt`
 
 You can override those globally:
 
@@ -238,6 +280,7 @@ Or per entity with marker attributes:
 - `[RetentionTenant]`
 - `[RetentionSoftDelete]`
 - `[RetentionDeletedAt]`
+- `[RetentionAnonymisedAt]`
 
 Priority is:
 
@@ -255,6 +298,27 @@ Handlers run through the dispatcher surface (`IRetentionRowDispatcher` backed by
 - emit domain or integration events
 - capture original values before mutation
 
+The execution contract:
+
+- `OnBeforeAsync` runs inside the open sweep transaction, before the row mutation. Treat it
+  as capture-only: external side effects performed here survive a transaction rollback, and
+  it can run for a row that is subsequently withheld (for example by a hold created mid-sweep).
+- `OnAfterAsync` is dispatched after commit with at-least-once delivery. Handlers must be
+  idempotent; `ctx.Attempt` greater than 1 means a possible retry of completed work.
+- Work stuck `InFlight` after a crash is reclaimed once `RowHandlerDispatch:ClaimTimeout`
+  (default 5 minutes) elapses; the reclaim counts as an attempt.
+- `AfterSweepSettled` work runs once its run records completion or failure, or after
+  `RowHandlerDispatch:SweepSettleTimeout` (default 6 hours) if the run crashed mid-sweep.
+- Captured row snapshots (`CapturedPayload`) can contain pre-anonymisation personal data.
+  They are cleared as soon as every handler for the row reaches a terminal state, with a
+  backstop scrub after `RowHandlerDispatch:PayloadRetention` (default 30 days). Dead-letter
+  `LastError` stores the root-cause exception type and message only — no stack traces.
+- Persisted payloads name CLR types, so deserialisation is allow-listed: snapshot values
+  round-trip only as well-known scalars, property types of the swept entity, or types
+  declared in the entity's or its registered handlers' assemblies. A tampered payload
+  naming anything else dead-letters instead of materialising an arbitrary type, and the
+  persisted entity type resolves only against registered retained entities.
+
 ## Configuration
 
 ```json
@@ -270,10 +334,47 @@ Handlers run through the dispatcher surface (`IRetentionRowDispatcher` backed by
 
 | Key | Default | Description |
 |---|---|---|
-| `Schedule` | `null` | Cron expression. `null` means the worker is disabled. |
-| `DryRun` | `false` | Run sweeps as preview/count-only instead of mutating data. |
+| `Schedule` | `null` | Cron expression, evaluated in **UTC**. `null` means the worker is disabled. |
+| `DryRun` | `false` | Run sweeps as preview/count-only instead of mutating data. While enabled, the worker routes ticks through `IRetentionPreview`, `RetentionSweepEngine.SweepAsync` refuses to run, and `EraseAsync` returns counts without mutating (`ErasureResult.DryRun` is `true`). |
 | `KillSwitch` | `false` | Finish the current iteration, then skip future ticks. |
 | `ApplyMigrations` | `false` | Run `MigrateAsync()` on startup. Cannot combine with `DryRun` or `KillSwitch`. |
+| `SweepBatchSize` | `5000` | Maximum rows selected, locked, and mutated per transaction. Each batch commits independently. |
+
+Worker semantics worth knowing:
+
+- A failed iteration (database outage, runtime misconfiguration) is logged and the worker
+  retries at the next scheduled occurrence. It does not stop the host.
+- The worker sweeps every tenant returned by `IRetentionTenantSource`. The default source
+  adapts a singleton `TenantContext` registration; multi-tenant hosts register their own
+  source enumerating all tenants.
+- Replicas coordinate through a Postgres advisory lock: only one instance sweeps a given
+  occurrence (the others skip and log), and startup migrations cannot race.
+- Missed occurrences are skipped, not caught up: the next occurrence is always computed
+  from the current time.
+- Sweeps triggered by the worker are audited as `Scheduled`; direct calls to
+  `RetentionSweepEngine.SweepAsync` are audited as `Manual` unless you pass a trigger kind.
+
+## Execution model
+
+Sweeps and erasure are batched and incremental:
+
+- Candidate rows are selected with `FOR UPDATE SKIP LOCKED` in batches of `SweepBatchSize`;
+  each batch mutates and **commits independently**, so a large backlog never sits in one
+  unbounded transaction and a failure loses only the current batch.
+- The `Started` audit row commits immediately, before any mutation. `Completed` (and
+  `Failed`, when an entity failed) commit at the end. A run row with both `CompletedAt`
+  and `FailedAt` set is a partial failure; `CompletedAt` still `NULL` long after
+  `StartedAt` means the process died mid-run.
+- One entity's failure is recorded (run row `FailedAt`/`Error`, plus
+  `RetentionSweepResult.EntityFailures` / `ErasureResult.EntityFailures`) and the run
+  continues with the remaining entities.
+- A batch that affects no rows stops the loop for that entity (the remainder is deferred
+  to the next run) — rows persistently skipped by a failing `OnBeforeAsync` handler cannot
+  spin the batch loop forever.
+- `HeldCount` in summaries is measured directly (rows past cutoff with an active hold),
+  not inferred from candidate arithmetic.
+- The mutating sweep is exposed as the `IRetentionSweep` port (mirroring
+  `IRetentionPreview`/`IRetentionErasureService`) so hosts can decorate it.
 
 ## Legal holds
 
@@ -289,7 +390,13 @@ await holdsRepo.CreateAsync(new RetentionHoldRequest(
 ));
 ```
 
-Held records survive all strategies. Holds are checked in SQL via a `NOT EXISTS` subquery, not via an in-memory row pass.
+Held records survive all strategies. Holds are checked in SQL via a `NOT EXISTS` subquery, not via an in-memory row pass. Hold activity is evaluated against the **database wall clock**, not the sweep's logical `now`: a hold created yesterday protects its row even from a backdated sweep.
+
+`CreateAsync` validates its input so a hold cannot silently protect nothing:
+
+- `TableName` must exactly match a table mapped by the EF model, or creation throws.
+- For tables with a Guid primary key, `RecordId` is normalised to the canonical lowercase
+  hyphenated form the sweep compares against; non-Guid values are rejected.
 
 ## Audit trail
 

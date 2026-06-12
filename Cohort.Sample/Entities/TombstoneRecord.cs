@@ -23,4 +23,6 @@ public sealed class TombstoneRecord
     public string? ContactEmail { get; set; }
 
     public string Notes { get; set; } = "";
+
+    public DateTimeOffset? AnonymisedAt { get; set; }
 }

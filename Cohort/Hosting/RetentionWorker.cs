@@ -17,113 +17,301 @@ public sealed class RetentionWorker(
 {
     private static readonly TimeSpan IdlePollInterval = TimeSpan.FromMilliseconds(200);
 
+    // Long schedule gaps are slept in bounded chunks so options reloads (schedule
+    // changes, the kill switch) take effect mid-wait, and so a gap beyond
+    // Task.Delay's ~49.7-day ceiling cannot throw.
+    private static readonly TimeSpan MaxScheduleSleepChunk = TimeSpan.FromMinutes(1);
+
+    // Session-level Postgres advisory lock key ("cohort01" in hex). Two replicas firing
+    // at the same cron instant must not both sweep: double mutations are mostly benign,
+    // but doubled audit runs and doubled handler side effects are not.
+    private const long SweepAdvisoryLockKey = 0x636F_686F_7274_3031;
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         await ApplyMigrationsIfConfiguredAsync(stoppingToken);
 
+        // A retention worker must outlive individual failures: a transient database
+        // outage or a misconfigured category at 02:00 should cost one iteration,
+        // not all future sweeps (or the host, under StopHost behavior).
         while (!stoppingToken.IsCancellationRequested)
         {
-            var currentOptions = options.CurrentValue;
-            if (currentOptions.KillSwitch || string.IsNullOrWhiteSpace(currentOptions.Schedule))
-            {
-                await DelayUntilNextPollAsync(stoppingToken);
-                continue;
-            }
-
-            DateTimeOffset? nextOccurrence;
             try
             {
-                nextOccurrence = CohortScheduleParser.GetNextOccurrence(
-                    currentOptions.Schedule,
-                    DateTimeOffset.UtcNow
-                );
+                await RunScheduleLoopOnceAsync(stoppingToken);
             }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "Cohort worker schedule is invalid at runtime.");
-                await DelayUntilNextPollAsync(stoppingToken);
-                continue;
-            }
-
-            if (nextOccurrence is null)
-            {
-                await DelayUntilNextPollAsync(stoppingToken);
-                continue;
-            }
-
-            var delay = nextOccurrence.Value - DateTimeOffset.UtcNow;
-            if (delay > TimeSpan.Zero)
-            {
-                await Task.Delay(delay, stoppingToken);
-            }
-
-            if (stoppingToken.IsCancellationRequested)
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
                 break;
             }
-
-            currentOptions = options.CurrentValue;
-            if (currentOptions.KillSwitch)
+            catch (Exception ex)
             {
-                continue;
+                logger.LogError(
+                    ex,
+                    "Cohort worker iteration failed. The worker stays alive and will retry at the next scheduled occurrence."
+                );
+                await DelayUntilNextPollAsync(stoppingToken);
+            }
+        }
+    }
+
+    private async Task RunScheduleLoopOnceAsync(CancellationToken stoppingToken)
+    {
+        var currentOptions = options.CurrentValue;
+        if (currentOptions.KillSwitch || string.IsNullOrWhiteSpace(currentOptions.Schedule))
+        {
+            await DelayUntilNextPollAsync(stoppingToken);
+            return;
+        }
+
+        var schedule = currentOptions.Schedule;
+        DateTimeOffset? nextOccurrence;
+        try
+        {
+            nextOccurrence = CohortScheduleParser.GetNextOccurrence(
+                schedule,
+                DateTimeOffset.UtcNow
+            );
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Cohort worker schedule is invalid at runtime.");
+            await DelayUntilNextPollAsync(stoppingToken);
+            return;
+        }
+
+        if (nextOccurrence is null)
+        {
+            await DelayUntilNextPollAsync(stoppingToken);
+            return;
+        }
+
+        if (!await TrySleepUntilAsync(nextOccurrence.Value, schedule, stoppingToken))
+        {
+            return;
+        }
+
+        if (stoppingToken.IsCancellationRequested)
+        {
+            return;
+        }
+
+        currentOptions = options.CurrentValue;
+        if (currentOptions.KillSwitch || string.IsNullOrWhiteSpace(currentOptions.Schedule))
+        {
+            return;
+        }
+
+        await RunIterationAsync(currentOptions.DryRun, stoppingToken);
+    }
+
+    private async Task<bool> TrySleepUntilAsync(
+        DateTimeOffset occurrence,
+        string schedule,
+        CancellationToken ct
+    )
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            var remaining = occurrence - DateTimeOffset.UtcNow;
+            if (remaining <= TimeSpan.Zero)
+            {
+                return true;
             }
 
-            await RunIterationAsync(currentOptions.DryRun, stoppingToken);
+            await Task.Delay(
+                remaining < MaxScheduleSleepChunk ? remaining : MaxScheduleSleepChunk,
+                ct
+            );
+
+            var currentOptions = options.CurrentValue;
+            if (
+                currentOptions.KillSwitch
+                || !string.Equals(currentOptions.Schedule, schedule, StringComparison.Ordinal)
+            )
+            {
+                return false;
+            }
         }
+
+        return false;
     }
 
     private async Task RunIterationAsync(bool dryRun, CancellationToken ct)
     {
         await using var scope = scopeFactory.CreateAsyncScope();
         var services = scope.ServiceProvider;
-        var tenant = services.GetService<TenantContext>();
+        var db = services.GetRequiredService<DbContext>();
 
-        if (tenant is null)
+        // The advisory lock is session-scoped, so the connection must stay open for the
+        // whole iteration; the sweep itself reuses the already-open scoped connection.
+        await db.Database.OpenConnectionAsync(ct);
+        try
         {
-            throw new InvalidOperationException(
-                "RetentionWorker requires a TenantContext registration when scheduling is enabled."
+            if (!await TryAcquireSweepLockAsync(db, ct))
+            {
+                logger.LogInformation(
+                    "Cohort worker skipped this occurrence: another instance holds the sweep advisory lock."
+                );
+                return;
+            }
+
+            try
+            {
+                await RunLockedIterationAsync(services, dryRun, ct);
+            }
+            finally
+            {
+                await ReleaseSweepLockAsync(db);
+            }
+        }
+        finally
+        {
+            await db.Database.CloseConnectionAsync();
+        }
+    }
+
+    private async Task RunLockedIterationAsync(
+        IServiceProvider services,
+        bool dryRun,
+        CancellationToken ct
+    )
+    {
+        var tenantSource = services.GetRequiredService<IRetentionTenantSource>();
+        var tenants = await tenantSource.GetTenantsAsync(ct);
+        if (tenants.Count == 0)
+        {
+            logger.LogWarning(
+                "Cohort worker found no tenants to sweep; the IRetentionTenantSource returned an empty list."
             );
+            return;
         }
 
         var validator = services.GetRequiredService<RetentionStartupValidator>();
         await validator.ValidateAsync(ct);
 
-        RetentionSweepResult result;
-        if (dryRun)
+        foreach (var tenant in tenants)
         {
-            var preview = services.GetRequiredService<IRetentionPreview>();
-            result = await preview.PreviewAsync(tenant, DateTimeOffset.UtcNow, ct);
-        }
-        else
-        {
-            var engine = services.GetRequiredService<RetentionSweepEngine>();
-            result = await engine.SweepAsync(tenant, DateTimeOffset.UtcNow, ct);
-        }
+            RetentionSweepResult result;
+            if (dryRun)
+            {
+                var preview = services.GetRequiredService<IRetentionPreview>();
+                result = await preview.PreviewAsync(tenant, DateTimeOffset.UtcNow, ct);
+            }
+            else
+            {
+                var engine = services.GetRequiredService<RetentionSweepEngine>();
+                result = await engine.SweepAsync(
+                    tenant,
+                    DateTimeOffset.UtcNow,
+                    SweepTriggerKind.Scheduled,
+                    ct
+                );
+            }
 
-        logger.LogInformation(
-            "Cohort worker completed {Mode} iteration for tenant {TenantId} with {EntityCount} entity counts.",
-            dryRun ? "dry-run" : "sweep",
-            tenant.Id,
-            result.Counts.Count
-        );
+            logger.LogInformation(
+                "Cohort worker completed {Mode} iteration for tenant {TenantId} with {EntityCount} entity counts.",
+                dryRun ? "dry-run" : "sweep",
+                tenant.Id,
+                result.Counts.Count
+            );
+        }
+    }
+
+    private static async Task<bool> TryAcquireSweepLockAsync(DbContext db, CancellationToken ct)
+    {
+        await using var command = db.Database.GetDbConnection().CreateCommand();
+        command.CommandText = "SELECT pg_try_advisory_lock(@key)";
+        var parameter = command.CreateParameter();
+        parameter.ParameterName = "key";
+        parameter.Value = SweepAdvisoryLockKey;
+        command.Parameters.Add(parameter);
+
+        return (bool)(await command.ExecuteScalarAsync(ct))!;
+    }
+
+    private static async Task ReleaseSweepLockAsync(DbContext db)
+    {
+        await using var command = db.Database.GetDbConnection().CreateCommand();
+        command.CommandText = "SELECT pg_advisory_unlock(@key)";
+        var parameter = command.CreateParameter();
+        parameter.ParameterName = "key";
+        parameter.Value = SweepAdvisoryLockKey;
+        command.Parameters.Add(parameter);
+
+        await command.ExecuteScalarAsync(CancellationToken.None);
     }
 
     private async Task ApplyMigrationsIfConfiguredAsync(CancellationToken ct)
     {
-        if (!options.CurrentValue.ApplyMigrations)
+        // Retried rather than thrown: a database that is briefly unreachable at boot
+        // must not permanently kill the retention worker (or the host). The advisory
+        // lock stops two replicas racing MigrateAsync against the same database.
+        while (!ct.IsCancellationRequested)
         {
-            return;
+            try
+            {
+                if (!options.CurrentValue.ApplyMigrations)
+                {
+                    return;
+                }
+
+                await using var scope = scopeFactory.CreateAsyncScope();
+                var db = scope.ServiceProvider.GetRequiredService<DbContext>();
+                await db.Database.OpenConnectionAsync(ct);
+                try
+                {
+                    if (!await TryAcquireSweepLockAsync(db, ct))
+                    {
+                        logger.LogInformation(
+                            "Cohort worker is waiting for another instance to finish applying migrations."
+                        );
+                        await DelayUntilNextPollAsync(ct);
+                        continue;
+                    }
+
+                    try
+                    {
+                        await db.Database.MigrateAsync(ct);
+                        logger.LogInformation(
+                            "Cohort worker applied database migrations at startup."
+                        );
+                        return;
+                    }
+                    finally
+                    {
+                        await ReleaseSweepLockAsync(db);
+                    }
+                }
+                finally
+                {
+                    await db.Database.CloseConnectionAsync();
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(
+                    ex,
+                    "Cohort worker failed to apply database migrations at startup; retrying."
+                );
+                await DelayUntilNextPollAsync(ct);
+            }
         }
-
-        await using var scope = scopeFactory.CreateAsyncScope();
-        var db = scope.ServiceProvider.GetRequiredService<DbContext>();
-        await db.Database.MigrateAsync(ct);
-
-        logger.LogInformation("Cohort worker applied database migrations at startup.");
     }
 
-    private static Task DelayUntilNextPollAsync(CancellationToken ct)
+    private static async Task DelayUntilNextPollAsync(CancellationToken ct)
     {
-        return Task.Delay(IdlePollInterval, ct);
+        try
+        {
+            await Task.Delay(IdlePollInterval, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Shutdown during an idle wait is not an error.
+        }
     }
 }

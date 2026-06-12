@@ -13,6 +13,9 @@ internal static class RetentionHoldSql
               AND hold.""TenantId"" = @tenantId"
             : "";
 
+        // Hold activity is deliberately evaluated against the database wall clock, not the
+        // sweep's logical 'now': a litigation hold protects rows from the moment it exists,
+        // even when an operator runs a backdated sweep.
         return
             $"""
             NOT EXISTS (
@@ -20,9 +23,9 @@ internal static class RetentionHoldSql
                 FROM {QuoteIdentifier(TableName)} AS hold
                 WHERE hold."TableName" = @holdTableName
                   AND hold."RecordId" = CAST({targetAlias}.{QuoteIdentifier(recordIdColumn)} AS text){tenantLine}
-                  AND hold."CreatedAt" <= @holdAsOf
-                  AND (hold."ExpiresAt" IS NULL OR hold."ExpiresAt" > @holdAsOf)
-                  AND (hold."RemovedAt" IS NULL OR hold."RemovedAt" > @holdAsOf)
+                  AND hold."CreatedAt" <= now()
+                  AND (hold."ExpiresAt" IS NULL OR hold."ExpiresAt" > now())
+                  AND (hold."RemovedAt" IS NULL OR hold."RemovedAt" > now())
             )
             """;
     }

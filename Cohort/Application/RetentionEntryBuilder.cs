@@ -80,7 +80,8 @@ public sealed class RetentionEntryBuilder(CohortConventions conventions)
             BuildTenantConvention(entityType, storeObject),
             BuildSoftDeleteConvention(entityType, storeObject),
             clrType.GetCustomAttribute<RetentionTenantlessAttribute>(inherit: false) is not null,
-            retain.AuditRowDetail
+            retain.AuditRowDetail,
+            BuildAnonymisedAtConvention(entityType, storeObject)
         );
     }
 
@@ -113,7 +114,64 @@ public sealed class RetentionEntryBuilder(CohortConventions conventions)
                 $"Record-id convention on {clrType.FullName}: '{recordIdMember.Name}' has no mapped table column."
             );
 
-        return new RecordIdConvention(recordIdProperty.Name, recordIdColumn, recordIdMember.PropertyType);
+        return new RecordIdConvention(
+            recordIdProperty.Name,
+            recordIdColumn,
+            recordIdMember.PropertyType,
+            TryGetStoreType(recordIdProperty)
+        );
+    }
+
+    private static string? TryGetStoreType(IProperty property)
+    {
+        // Null on non-relational providers (metadata-only scans); SQL builders fall back
+        // to casting the column to text instead of casting the parameter.
+        try
+        {
+            return property.GetColumnType();
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or InvalidCastException)
+        {
+            // Non-relational providers (metadata-only scans) have no store type.
+            return null;
+        }
+    }
+
+    private AnonymisedAtConvention? BuildAnonymisedAtConvention(
+        IEntityType entityType,
+        StoreObjectIdentifier storeObject
+    )
+    {
+        var clrType = entityType.ClrType;
+        var anonymisedAtMember = clrType
+                .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(p => p.GetCustomAttribute<RetentionAnonymisedAtAttribute>() is not null)
+            ?? ReflectionMemberResolver.FindPropertyByName(clrType, conventions.AnonymisedAtPropertyName);
+        if (anonymisedAtMember is null)
+        {
+            return null;
+        }
+
+        if (anonymisedAtMember.PropertyType != typeof(DateTimeOffset?))
+        {
+            throw new InvalidOperationException(
+                $"AnonymisedAt convention on {clrType.FullName}: '{anonymisedAtMember.Name}' must be a nullable DateTimeOffset — NULL marks rows not yet anonymised, got {anonymisedAtMember.PropertyType.Name}."
+            );
+        }
+
+        var anonymisedAtProperty =
+            entityType.FindProperty(anonymisedAtMember.Name)
+            ?? throw new InvalidOperationException(
+                $"AnonymisedAt convention on {clrType.FullName}: '{anonymisedAtMember.Name}' is not mapped by EF."
+            );
+
+        var anonymisedAtColumn =
+            anonymisedAtProperty.GetColumnName(storeObject)
+            ?? throw new InvalidOperationException(
+                $"AnonymisedAt convention on {clrType.FullName}: '{anonymisedAtMember.Name}' has no mapped table column."
+            );
+
+        return new AnonymisedAtConvention(anonymisedAtProperty.Name, anonymisedAtColumn);
     }
 
     private static IReadOnlyList<AnonymiseField> BuildAnonymiseFields(

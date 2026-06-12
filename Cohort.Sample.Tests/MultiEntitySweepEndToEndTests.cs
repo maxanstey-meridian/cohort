@@ -70,7 +70,7 @@ public sealed class MultiEntitySweepEndToEndTests(PostgresFixture fixture)
         );
 
         result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 0),
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 0, HeldCount: 1),
             because: "the only expired Note is held and must not be purged"
         );
         result.Counts.Should().Contain(

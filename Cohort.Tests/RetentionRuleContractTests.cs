@@ -47,6 +47,35 @@ public sealed class RetentionRuleContractTests
     }
 
     [Fact]
+    public void RetentionRule_Rejects_A_Negative_Period()
+    {
+        var act = () => new RetentionRule(TimeSpan.FromDays(-30), Strategy.Purge);
+
+        act.Should()
+            .Throw<ArgumentOutOfRangeException>()
+            .WithParameterName("Period");
+    }
+
+    [Fact]
+    public void RetentionRule_Rejects_A_Negative_Legal_Min()
+    {
+        var act = () =>
+            new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge, TimeSpan.FromDays(-90));
+
+        act.Should()
+            .Throw<ArgumentOutOfRangeException>()
+            .WithParameterName("LegalMin");
+    }
+
+    [Fact]
+    public void RetentionRule_Allows_A_Zero_Period_As_Sweep_Immediately()
+    {
+        var rule = new RetentionRule(TimeSpan.Zero, Strategy.Purge);
+
+        rule.Period.Should().Be(TimeSpan.Zero);
+    }
+
+    [Fact]
     public void Strategy_Enum_Exposes_The_Planned_Public_Vocabulary()
     {
         Enum.GetNames<Strategy>()

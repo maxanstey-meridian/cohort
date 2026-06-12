@@ -21,6 +21,7 @@ public sealed class EfRetentionAuditWriter(DbContext db) : IRetentionAuditWriter
             SweepEvent.EntitySummary summary => WriteEntitySummaryAsync(summary, ct),
             SweepEvent.RowDetail rowDetail => WriteRowDetailAsync(rowDetail, ct),
             SweepEvent.Completed completed => WriteCompletedAsync(completed, ct),
+            SweepEvent.Failed failed => WriteFailedAsync(failed, ct),
             _ => throw new InvalidOperationException(
                 $"Unsupported sweep event type '{evt.GetType().FullName}'."
             ),
@@ -187,6 +188,25 @@ public sealed class EfRetentionAuditWriter(DbContext db) : IRetentionAuditWriter
                 command.Parameters.Add(
                     CreateParameter(command, "totalAffected", completed.TotalAffected)
                 );
+            },
+            ct
+        );
+    }
+
+    private Task WriteFailedAsync(SweepEvent.Failed failed, CancellationToken ct)
+    {
+        return ExecuteAsync(
+            $"""
+            UPDATE {QuoteIdentifier(CohortTableNames.SweepRun)}
+            SET "FailedAt" = @failedAt,
+                "Error" = @error
+            WHERE "SweepId" = @sweepId
+            """,
+            command =>
+            {
+                command.Parameters.Add(CreateParameter(command, "sweepId", failed.SweepId));
+                command.Parameters.Add(CreateParameter(command, "failedAt", failed.At));
+                command.Parameters.Add(CreateParameter(command, "error", failed.Error));
             },
             ct
         );

@@ -694,6 +694,8 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
 
         [AnonymiseWith(typeof(RegisteredFactory))]
         public Guid ExternalId { get; init; }
+
+        public DateTimeOffset? AnonymisedAt { get; init; }
     }
 
     [Retain("misconfigured-tenant-scope", nameof(MisconfiguredTenantScopedRecord.CreatedAt))]

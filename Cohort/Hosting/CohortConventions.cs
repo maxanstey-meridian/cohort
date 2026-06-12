@@ -6,4 +6,5 @@ public sealed class CohortConventions
     public string TenantPropertyName { get; init; } = "TenantId";
     public string SoftDeletePropertyName { get; init; } = "IsDeleted";
     public string DeletedAtPropertyName { get; init; } = "DeletedAt";
+    public string AnonymisedAtPropertyName { get; init; } = "AnonymisedAt";
 }

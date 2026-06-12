@@ -9,8 +9,16 @@ internal interface IRetentionHandlerRegistration
     internal RowHandlerDispatchPhase DispatchPhase { get; }
 }
 
-internal sealed record RetentionHandlerRegistration(
-    Type EntityType,
-    Type HandlerType,
+// Closed over the entity/handler pair so each AddRowHandler call registers a distinct
+// implementation type. TryAddEnumerable dedupes instance descriptors by the instance's
+// concrete type; a single shared registration type would silently drop the dispatch
+// phase of every AddRowHandler call after the first.
+internal sealed record RetentionHandlerRegistration<TEntity, THandler>(
     RowHandlerDispatchPhase DispatchPhase
-) : IRetentionHandlerRegistration;
+) : IRetentionHandlerRegistration
+    where THandler : IRetentionHandler<TEntity>
+{
+    public Type EntityType { get; } = typeof(TEntity);
+
+    public Type HandlerType { get; } = typeof(THandler);
+}

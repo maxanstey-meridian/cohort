@@ -202,6 +202,72 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task FlushAsync_DeadLetters_Queued_Work_Whose_Payload_The_Retention_Backstop_Scrubbed()
+    {
+        // The payload-retention backstop scrubs snapshots that outlive PayloadRetention
+        // even while handler work is still queued. Orphaned work must dead-letter
+        // immediately with the real reason — not burn MaxAttempts on a misleading
+        // "payload is missing" deserialisation error.
+        var tenantId = Guid.NewGuid();
+        var fileId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var cleanupStore = new BlobCleanupStoreSpy();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.BlobBackedFiles.Add(
+                new BlobBackedFile
+                {
+                    Id = fileId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    StoragePath = "blob://tenant-a/scrubbed/orphan.pdf",
+                    OriginalFileName = "orphan.pdf",
+                    ContentType = "application/pdf",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                ["Cohort:RowHandlerDispatch:PayloadRetention"] = "01:00:00",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(cleanupStore);
+                services.AddRowHandler<BlobBackedFile, BlobBackedFileCleanupHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        // The queued work sits undrained past the payload retention window.
+        await BackdateRowDetailsAsync(result.SweepId, DateTimeOffset.UtcNow.AddHours(-2));
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        cleanupStore.DeletedPaths.Should().BeEmpty();
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().ContainSingle();
+        statuses[0].State.Should().Be(DeadLetteredState);
+        statuses[0].Attempt.Should().Be(1);
+        statuses[0].LastError.Should().Contain("payload-retention backstop");
+
+        (await CountRemainingCapturedPayloadsAsync(result.SweepId)).Should().Be(0);
+    }
+
+    [Fact]
     public async Task FlushAsync_Leaves_Recently_Claimed_InFlight_Work_Alone()
     {
         var tenantId = Guid.NewGuid();
@@ -1293,6 +1359,215 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                 && summary.HeldCount == 0
                 && summary.SkippedCount == 1
         );
+    }
+
+    [Fact]
+    public async Task Multi_Batch_Sweep_Excludes_Persistently_Failing_OnBefore_Rows_From_Later_Batches()
+    {
+        // Regression: a row skipped by a failing OnBefore stays eligible, so the next
+        // batch of the same run used to reselect it, re-fail it, and re-insert its row
+        // detail under the same sweep id — violating the unique index and aborting the
+        // entity with a duplicate-key error that rolled back the batch's real work.
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var failingNoteId = Guid.NewGuid();
+        var firstHealthyNoteId = Guid.NewGuid();
+        var secondHealthyNoteId = Guid.NewGuid();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = failingNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-300), // oldest: first in every batch
+                    Body = SelectivelyFailingNoteHandler.FailingBody,
+                },
+                new Note
+                {
+                    Id = firstHealthyNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-200),
+                    Body = "first-healthy",
+                },
+                new Note
+                {
+                    Id = secondHealthyNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-100),
+                    Body = "second-healthy",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:SweepBatchSize"] = "2",
+            },
+            configureServices: services => services.AddRowHandler<Note, SelectivelyFailingNoteHandler>()
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().Contain(
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 2, SkippedCount: 1)
+        );
+
+        await using (var verify = Host.CreateDbContext())
+        {
+            (await verify.Notes.AnyAsync(note => note.Id == firstHealthyNoteId)).Should().BeFalse();
+            (await verify.Notes.AnyAsync(note => note.Id == secondHealthyNoteId)).Should().BeFalse();
+            (await verify.Notes.AnyAsync(note => note.Id == failingNoteId)).Should().BeTrue();
+        }
+
+        // Exactly one row detail per row: the failing row is dead-lettered once, not
+        // once per batch.
+        var rowDetails = await LoadCapturedRowsAsync(result.SweepId);
+        rowDetails.Select(row => row.EntityId).Should().BeEquivalentTo(
+            [
+                failingNoteId.ToString(),
+                firstHealthyNoteId.ToString(),
+                secondHealthyNoteId.ToString(),
+            ]
+        );
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().HaveCount(3);
+        statuses.Count(status => status.State == DeadLetteredState).Should().Be(1);
+        statuses.Count(status => status.State == PendingState).Should().Be(2);
+    }
+
+    [Fact]
+    public async Task Sweep_Continues_Past_A_Batch_Of_Only_Failing_OnBefore_Rows()
+    {
+        // Regression: with batch size 1, the oldest row failing OnBefore produced a
+        // zero-affected batch, which used to stop the entity's loop — every younger row
+        // was starved on every sweep, forever.
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var failingNoteId = Guid.NewGuid();
+        var healthyNoteId = Guid.NewGuid();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = failingNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-300), // oldest: fills the whole first batch
+                    Body = SelectivelyFailingNoteHandler.FailingBody,
+                },
+                new Note
+                {
+                    Id = healthyNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-100),
+                    Body = "behind-the-failure",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:SweepBatchSize"] = "1",
+            },
+            configureServices: services => services.AddRowHandler<Note, SelectivelyFailingNoteHandler>()
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().Contain(
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1, SkippedCount: 1)
+        );
+
+        await using (var verify = Host.CreateDbContext())
+        {
+            (await verify.Notes.AnyAsync(note => note.Id == healthyNoteId)).Should().BeFalse();
+            (await verify.Notes.AnyAsync(note => note.Id == failingNoteId)).Should().BeTrue();
+        }
+    }
+
+    [Fact]
+    public async Task Multi_Batch_Erasure_Excludes_Persistently_Failing_OnBefore_Rows_From_Later_Batches()
+    {
+        // Erasure mirrors the sweep engine's batching; the same reselection regression
+        // applied to its loop.
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var failingNoteId = Guid.NewGuid();
+        var healthyNoteId = Guid.NewGuid();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = failingNoteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = EligibleErasureCreatedAt(asOf).AddDays(-1), // oldest
+                    Body = SelectivelyFailingErasureNoteHandler.FailingBody,
+                },
+                new Note
+                {
+                    Id = healthyNoteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
+                    Body = "erasable-behind-the-failure",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            CreateHandlerErasureCategoryRepository(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:SweepBatchSize"] = "1",
+            },
+            configureServices: services =>
+                services.AddRowHandler<Note, SelectivelyFailingErasureNoteHandler>()
+        );
+
+        var result = await handlerHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+            asOf
+        );
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().Contain(
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1, SkippedCount: 1)
+        );
+
+        await using (var verify = Host.CreateDbContext())
+        {
+            (await verify.Notes.AnyAsync(note => note.Id == healthyNoteId)).Should().BeFalse();
+            (await verify.Notes.AnyAsync(note => note.Id == failingNoteId)).Should().BeTrue();
+        }
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().HaveCount(2);
+        statuses.Count(status => status.State == DeadLetteredState).Should().Be(1);
     }
 
     [Fact]
@@ -3299,6 +3574,22 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
               AND detail."SweepId" = @sweepId
             """;
         command.Parameters.AddWithValue("handlerType", handlerType);
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        (await command.ExecuteNonQueryAsync()).Should().BeGreaterThan(0);
+    }
+
+    private async Task BackdateRowDetailsAsync(Guid sweepId, DateTimeOffset at)
+    {
+        await using var connection = new NpgsqlConnection(GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            UPDATE "sweep_run_row_detail"
+            SET "At" = @at
+            WHERE "SweepId" = @sweepId
+            """;
+        command.Parameters.AddWithValue("at", at);
         command.Parameters.AddWithValue("sweepId", sweepId);
         (await command.ExecuteNonQueryAsync()).Should().BeGreaterThan(0);
     }

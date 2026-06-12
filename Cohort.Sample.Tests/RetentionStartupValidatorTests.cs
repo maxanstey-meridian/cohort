@@ -998,6 +998,65 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
+    public async Task ValidateAsync_Rejects_Duplicate_AnonymisedAt_Marker_Attributes()
+    {
+        var options = new DbContextOptionsBuilder<DuplicateAnonymisedAtMarkerDbContext>()
+            .UseInMemoryDatabase($"startup-validator-duplicate-anonymised-at-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new DuplicateAnonymisedAtMarkerDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["duplicate-anonymised-at-marker"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                ),
+            }
+        );
+
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Marker convention on {typeof(DuplicateAnonymisedAtMarkerRecord).FullName}: [RetentionAnonymisedAt] is declared on multiple properties (RedactedAt, ScrubbedAt); exactly one is allowed."
+            );
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Rejects_Tenantless_Marker_On_Entities_With_A_Tenant_Property()
+    {
+        // Tenantedness is decided by the resolved tenant convention everywhere; an
+        // entity declaring both would be swept per tenant with the marker silently
+        // ignored.
+        var options = new DbContextOptionsBuilder<ContradictoryTenantlessDbContext>()
+            .UseInMemoryDatabase($"startup-validator-contradictory-tenantless-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new ContradictoryTenantlessDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["contradictory-tenantless"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                ),
+            }
+        );
+
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Tenant convention on {typeof(ContradictoryTenantlessRecord).FullName}: entity is marked [RetentionTenantless] but exposes tenant property 'TenantId'. The tenant property wins and the entity would be swept per tenant, so the marker is contradictory; remove [RetentionTenantless] or the tenant property."
+            );
+    }
+
+    [Fact]
     public async Task ValidateAsync_Rejects_Naive_Timestamp_Anchor_Columns()
     {
         // Npgsql model building works offline; ValidateAsync only inspects metadata.
@@ -1931,6 +1990,34 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
+    private sealed class DuplicateAnonymisedAtMarkerDbContext(
+        DbContextOptions<DuplicateAnonymisedAtMarkerDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<DuplicateAnonymisedAtMarkerRecord>(entity =>
+            {
+                entity.ToTable("duplicate_anonymised_at_marker_records");
+                entity.HasKey(record => record.Id);
+            });
+        }
+    }
+
+    private sealed class ContradictoryTenantlessDbContext(
+        DbContextOptions<ContradictoryTenantlessDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<ContradictoryTenantlessRecord>(entity =>
+            {
+                entity.ToTable("contradictory_tenantless_records");
+                entity.HasKey(record => record.Id);
+            });
+        }
+    }
+
     [Retain("inheritance-base", nameof(CreatedAt))]
     private class InheritanceBaseRecord
     {
@@ -1989,6 +2076,29 @@ public sealed class RetentionStartupValidatorTests
 
         [RetentionTenant]
         public Guid OwnerId { get; init; }
+    }
+
+    [Retain("duplicate-anonymised-at-marker", nameof(CreatedAt))]
+    private sealed class DuplicateAnonymisedAtMarkerRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+
+        [RetentionAnonymisedAt]
+        public DateTimeOffset? ScrubbedAt { get; init; }
+
+        [RetentionAnonymisedAt]
+        public DateTimeOffset? RedactedAt { get; init; }
+    }
+
+    [Retain("contradictory-tenantless", nameof(CreatedAt))]
+    [RetentionTenantless]
+    private sealed class ContradictoryTenantlessRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
     }
 
     private sealed class TestAnonymiseValueFactory : IAnonymiseValueFactory

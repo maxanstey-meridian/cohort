@@ -153,6 +153,18 @@ public sealed class RetentionStartupValidator(
 
     private void ValidateTenantConvention(RetentionEntry entry, List<string> errors)
     {
+        // Tenantedness is decided by the resolved tenant convention everywhere (scope
+        // filtering, SQL tenant clauses, the worker's pass split) — an entity that
+        // declares [RetentionTenantless] while also exposing a tenant property would be
+        // swept per tenant with the attribute silently ignored.
+        if (entry.Tenant is not null && entry.IsExplicitlyTenantless)
+        {
+            errors.Add(
+                $"Tenant convention on {entry.EntityType.FullName}: entity is marked [RetentionTenantless] but exposes tenant property '{entry.Tenant.TenantMember}'. The tenant property wins and the entity would be swept per tenant, so the marker is contradictory; remove [RetentionTenantless] or the tenant property."
+            );
+            return;
+        }
+
         if (entry.Tenant is not null || entry.IsExplicitlyTenantless)
         {
             return;
@@ -417,6 +429,7 @@ public sealed class RetentionStartupValidator(
         AddDuplicateMarkerError<RetentionTenantAttribute>(clrType, errors);
         AddDuplicateMarkerError<RetentionSoftDeleteAttribute>(clrType, errors);
         AddDuplicateMarkerError<RetentionDeletedAtAttribute>(clrType, errors);
+        AddDuplicateMarkerError<RetentionAnonymisedAtAttribute>(clrType, errors);
     }
 
     private static void AddDuplicateMarkerError<TAttribute>(Type clrType, List<string> errors)

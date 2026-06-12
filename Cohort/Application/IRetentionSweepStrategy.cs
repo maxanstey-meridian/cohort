@@ -95,14 +95,32 @@ public sealed record SweepExecutionResult(
     int HeldCount,
     bool RowDetailsPersisted = false,
     int SkippedCount = 0,
-    int CandidateCount = 0
-);
+    int CandidateCount = 0,
+    IReadOnlyList<string>? SkippedRecordIds = null
+)
+{
+    /// <summary>
+    /// Record ids the strategy selected but deliberately did not mutate (e.g. rows whose
+    /// OnBefore handler failed). The engine excludes them from later batches of the same
+    /// run: a skipped row stays eligible, so reselecting it would re-fail it forever and
+    /// re-insert its audit row detail under the same sweep id.
+    /// </summary>
+    public IReadOnlyList<string> SkippedRecordIds { get; init; } = SkippedRecordIds ?? [];
+}
 
 public sealed record SweepMutationContext(
     Guid SweepId,
     DateTimeOffset At,
-    int? BatchSize = null
-);
+    int? BatchSize = null,
+    IReadOnlyList<string>? ExcludedRecordIds = null
+)
+{
+    /// <summary>
+    /// Record ids earlier batches of this run already skipped. Strategies must not
+    /// select them again; they are deferred to the next run.
+    /// </summary>
+    public IReadOnlyList<string> ExcludedRecordIds { get; init; } = ExcludedRecordIds ?? [];
+}
 
 public sealed record ErasureSubjectPredicate
 {

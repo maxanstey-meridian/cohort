@@ -88,7 +88,7 @@ internal sealed class AnonymiseHandlerAwareMutationExecutor(
         var staticAssignments = assignmentResolver.CreateStaticAssignments(entry, ctx.Tenant.Id, ctx.Now);
         var affectedRecordIds = new List<string>();
         var heldCount = candidateRecordIds.Count - rows.Count;
-        var skippedCount = 0;
+        var skippedRecordIds = new List<string>();
 
         foreach (var row in orderedRows)
         {
@@ -116,7 +116,7 @@ internal sealed class AnonymiseHandlerAwareMutationExecutor(
             );
             if (!beforeResult.Succeeded)
             {
-                skippedCount++;
+                skippedRecordIds.Add(recordId);
                 await RetentionHandlerSupport.PersistBeforeFailureAsync(
                     conn,
                     transaction,
@@ -172,8 +172,9 @@ internal sealed class AnonymiseHandlerAwareMutationExecutor(
             affectedRecordIds,
             heldCount,
             RowDetailsPersisted: true,
-            SkippedCount: skippedCount,
-            CandidateCount: candidateRecordIds.Count
+            SkippedCount: skippedRecordIds.Count,
+            CandidateCount: candidateRecordIds.Count,
+            SkippedRecordIds: skippedRecordIds
         );
     }
 }

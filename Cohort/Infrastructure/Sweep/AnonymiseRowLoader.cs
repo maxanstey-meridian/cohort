@@ -22,6 +22,7 @@ internal sealed class AnonymiseRowLoader(
         DbTransaction transaction,
         SqlFilter filter,
         int? batchSize,
+        IReadOnlyList<string>? excludedRecordIds,
         CancellationToken ct
     )
     {
@@ -30,11 +31,23 @@ internal sealed class AnonymiseRowLoader(
         command.CommandText = AnonymiseSqlBuilder.BuildCandidateSelectionCommandText(
             entry,
             filter,
-            batchSize
+            batchSize,
+            hasExcludedRecordIds: excludedRecordIds is { Count: > 0 }
         );
         AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
         AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenantId);
         AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName);
+        if (excludedRecordIds is { Count: > 0 })
+        {
+            command.Parameters.Add(
+                AnonymiseDbParameterFactory.Create(
+                    command,
+                    "excludedRecordIds",
+                    excludedRecordIds.ToArray()
+                )
+            );
+        }
+
         if (batchSize is not null)
         {
             command.Parameters.Add(

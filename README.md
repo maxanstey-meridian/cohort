@@ -141,7 +141,7 @@ Guardrails enforced at startup validation:
 Rows whose anchor column is `NULL` never match a cutoff comparison and are retained
 indefinitely; prefer non-nullable anchors for purge categories.
 
-Retained entities are tenant-scoped by default. They must expose a `TenantId` property, or mark an alternative property with `[RetentionTenant]`, unless they are intentionally global and explicitly marked with `[RetentionTenantless]`.
+Retained entities are tenant-scoped by default. They must expose a `TenantId` property, or mark an alternative property with `[RetentionTenant]`, unless they are intentionally global and explicitly marked with `[RetentionTenantless]`. Declaring `[RetentionTenantless]` on an entity that also exposes a tenant property fails startup validation — the tenant property would win and the marker would be silently ignored.
 
 ### 2. Map categories to rules
 
@@ -311,8 +311,11 @@ The execution contract:
   `RowHandlerDispatch:SweepSettleTimeout` (default 6 hours) if the run crashed mid-sweep.
 - Captured row snapshots (`CapturedPayload`) can contain pre-anonymisation personal data.
   They are cleared as soon as every handler for the row reaches a terminal state, with a
-  backstop scrub after `RowHandlerDispatch:PayloadRetention` (default 30 days). Dead-letter
-  `LastError` stores the root-cause exception type and message only — no stack traces.
+  backstop scrub after `RowHandlerDispatch:PayloadRetention` (default 30 days). Queued
+  handler work whose snapshot the backstop scrubbed can never complete, so it dead-letters
+  immediately with the scrub named as the reason instead of burning its retry budget.
+  Dead-letter `LastError` stores the root-cause exception type and message only — no
+  stack traces.
 - Persisted payloads name CLR types, so deserialisation is allow-listed: snapshot values
   round-trip only as well-known scalars, property types of the swept entity, or types
   declared in the entity's or its registered handlers' assemblies. A tampered payload
@@ -368,9 +371,10 @@ Sweeps and erasure are batched and incremental:
 - One entity's failure is recorded (run row `FailedAt`/`Error`, plus
   `RetentionSweepResult.EntityFailures` / `ErasureResult.EntityFailures`) and the run
   continues with the remaining entities.
-- A batch that affects no rows stops the loop for that entity (the remainder is deferred
-  to the next run) — rows persistently skipped by a failing `OnBeforeAsync` handler cannot
-  spin the batch loop forever.
+- Rows skipped by a failing `OnBeforeAsync` handler are excluded from the remaining
+  batches of the run (they are dead-lettered once and stay behind for the next run), so a
+  failing row neither spins the batch loop nor blocks the eligible rows behind it. A batch
+  that makes no progress at all stops the loop for that entity.
 - `HeldCount` in summaries is measured directly (rows past cutoff with an active hold),
   not inferred from candidate arithmetic.
 - The mutating sweep is exposed as the `IRetentionSweep` port (mirroring
@@ -397,6 +401,10 @@ Held records survive all strategies. Holds are checked in SQL via a `NOT EXISTS`
 - `TableName` must exactly match a table mapped by the EF model, or creation throws.
 - For tables with a Guid primary key, `RecordId` is normalised to the canonical lowercase
   hyphenated form the sweep compares against; non-Guid values are rejected.
+- For retained tenant-scoped tables, if the target row already exists its tenant must
+  match `TenantId` — sweeps only honour holds whose tenant matches the row's, so a
+  mis-scoped hold would persist while protecting nothing. A row that does not exist yet
+  is allowed (holds may be created ahead of their row).
 
 ## Audit trail
 

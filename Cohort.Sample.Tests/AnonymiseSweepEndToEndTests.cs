@@ -924,6 +924,59 @@ public sealed class AnonymiseSweepStrategyCommandTests
     }
 
     [Fact]
+    public async Task SweepAsync_Refuses_Anonymise_Entries_Without_An_AnonymisedAt_Marker()
+    {
+        // The startup validator only enforces the marker for rules it can resolve at
+        // boot; a runtime-resolved Anonymise rule must be refused at execution time too,
+        // or batched anonymisation re-selects the same rows forever.
+        using var db = CreateCommandStrategyDbContext();
+        var strategy = new AnonymiseSweepStrategy(db);
+        var connection = new RecordingDbConnection();
+        var transaction = connection.BeginTransaction();
+        var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var entry = new RetentionEntry(
+            typeof(AnonymisedContact),
+            "anonymised_contacts",
+            "anonymise",
+            nameof(AnonymisedContact.CreatedAt),
+            "CreatedAt",
+            new RecordIdConvention(nameof(AnonymisedContact.Id), "Id", typeof(Guid)),
+            [
+                new AnonymiseLiteralField(
+                    nameof(AnonymisedContact.EmailAddress),
+                    "EmailAddress",
+                    AnonymiseMethod.Null
+                ),
+            ],
+            new TenantConvention(nameof(AnonymisedContact.TenantId), "TenantId"),
+            null
+        );
+        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise);
+        var context = new RetentionResolutionContext(
+            "anonymise",
+            new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
+            now,
+            []
+        );
+
+        var act = async () =>
+            await strategy.SweepAsync(
+                entry,
+                rule,
+                context,
+                connection,
+                transaction,
+                CancellationToken.None
+            );
+
+        await act
+            .Should()
+            .ThrowAsync<InvalidOperationException>()
+            .WithMessage("*no AnonymisedAt marker*");
+        connection.Commands.Should().BeEmpty();
+    }
+
+    [Fact]
     public async Task PreviewAsync_Uses_A_Hold_Aware_Count_Query()
     {
         using var db = CreateCommandStrategyDbContext();
@@ -949,7 +1002,11 @@ public sealed class AnonymiseSweepStrategyCommandTests
                 ),
             ],
             new TenantConvention(nameof(AnonymisedContact.TenantId), "TenantId"),
-            null
+            null,
+            AnonymisedAt: new AnonymisedAtConvention(
+                nameof(AnonymisedContact.AnonymisedAt),
+                "AnonymisedAt"
+            )
         );
         var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise);
         var context = new RetentionResolutionContext(
@@ -1017,7 +1074,11 @@ public sealed class AnonymiseSweepStrategyCommandTests
                 ),
             ],
             new TenantConvention(nameof(AnonymisedContact.TenantId), "TenantId"),
-            null
+            null,
+            AnonymisedAt: new AnonymisedAtConvention(
+                nameof(AnonymisedContact.AnonymisedAt),
+                "AnonymisedAt"
+            )
         );
         var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise);
         var context = new RetentionResolutionContext(
@@ -1049,7 +1110,8 @@ public sealed class AnonymiseSweepStrategyCommandTests
         connection.LastCommand.CommandText.Should().Contain("@holdTableName");
         connection.LastCommand.CommandText.Should().Contain("now()");
         connection.LastCommand.CommandText.Should().Contain("NOT EXISTS");
-        connection.LastCommand.Parameters.Count.Should().Be(7);
+        connection.LastCommand.CommandText.Should().Contain("\"AnonymisedAt\" = @anonymisedAt");
+        connection.LastCommand.Parameters.Count.Should().Be(8);
         GetParameterNames(connection.LastCommand).Should().Equal(
             "value0",
             "value1",
@@ -1057,7 +1119,8 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "cutoff",
             "tenantId",
             "candidateIds",
-            "holdTableName"
+            "holdTableName",
+            "anonymisedAt"
         );
         connection.LastCommand.Parameters.Contains("value0").Should().BeTrue();
         connection.LastCommand.Parameters.Contains("value1").Should().BeTrue();
@@ -1107,7 +1170,11 @@ public sealed class AnonymiseSweepStrategyCommandTests
                 ),
             ],
             new TenantConvention(nameof(AnonymisedContact.TenantId), "TenantId"),
-            null
+            null,
+            AnonymisedAt: new AnonymisedAtConvention(
+                nameof(AnonymisedContact.AnonymisedAt),
+                "AnonymisedAt"
+            )
         );
         var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise);
         var context = new RetentionResolutionContext(
@@ -1146,7 +1213,8 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "cutoff",
             "tenantId",
             "candidateIds",
-            "holdTableName"
+            "holdTableName",
+            "anonymisedAt"
         );
         connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
             new[] { selectedId.ToString() }
@@ -1182,7 +1250,11 @@ public sealed class AnonymiseSweepStrategyCommandTests
                 ),
             ],
             new TenantConvention(nameof(AnonymisedContact.TenantId), "TenantId"),
-            null
+            null,
+            AnonymisedAt: new AnonymisedAtConvention(
+                nameof(AnonymisedContact.AnonymisedAt),
+                "AnonymisedAt"
+            )
         );
         var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise);
         var context = new RetentionResolutionContext(
@@ -1234,7 +1306,11 @@ public sealed class AnonymiseSweepStrategyCommandTests
                 ),
             ],
             new TenantConvention(nameof(AnonymisedContact.TenantId), "TenantId"),
-            null
+            null,
+            AnonymisedAt: new AnonymisedAtConvention(
+                nameof(AnonymisedContact.AnonymisedAt),
+                "AnonymisedAt"
+            )
         );
         var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise);
 
@@ -1306,7 +1382,11 @@ public sealed class AnonymiseSweepStrategyCommandTests
                 ),
             ],
             new TenantConvention(nameof(AnonymisedContact.TenantId), "TenantId"),
-            null
+            null,
+            AnonymisedAt: new AnonymisedAtConvention(
+                nameof(AnonymisedContact.AnonymisedAt),
+                "AnonymisedAt"
+            )
         );
         var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise);
 
@@ -1353,7 +1433,8 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "cutoff",
             "tenantId",
             "candidateIds",
-            "holdTableName"
+            "holdTableName",
+            "anonymisedAt"
         );
         connection.Commands[1].Parameters["subjectValue0"].Value.Should().Be(subjectId);
         connection.Commands[1].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
@@ -1385,7 +1466,8 @@ public sealed class AnonymiseSweepStrategyCommandTests
             new RecordIdConvention(nameof(CommandSetBasedFactoryRecord.Id), "Id", typeof(Guid)),
             [new AnonymiseFactoryField(nameof(CommandSetBasedFactoryRecord.ExternalId), "external_id", typeof(RecordingSetBasedFactory))],
             new TenantConvention(nameof(CommandSetBasedFactoryRecord.TenantId), "tenant_id"),
-            null
+            null,
+            AnonymisedAt: new AnonymisedAtConvention("AnonymisedAt", "anonymised_at_utc")
         );
         var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise);
         var context = new RetentionResolutionContext(
@@ -1415,7 +1497,8 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "cutoff",
             "tenantId",
             "candidateIds",
-            "holdTableName"
+            "holdTableName",
+            "anonymisedAt"
         );
         connection.Commands[1].Parameters["value0"].Value.Should().Be(RecordingSetBasedFactory.ScrubbedValue);
     }
@@ -1455,7 +1538,8 @@ public sealed class AnonymiseSweepStrategyCommandTests
                 new AnonymiseFactoryField(nameof(CommandPerRowFactoryRecord.DisplayName), "display_name", typeof(RecordingPerRowStringFactory)),
             ],
             new TenantConvention(nameof(CommandPerRowFactoryRecord.TenantId), "tenant_id"),
-            null
+            null,
+            AnonymisedAt: new AnonymisedAtConvention("AnonymisedAt", "anonymised_at_utc")
         );
         var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise);
 
@@ -1501,7 +1585,8 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "subjectValue0",
             "cutoff",
             "tenantId",
-            "holdTableName"
+            "holdTableName",
+            "anonymisedAt"
         );
         connection.Commands[2].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[2].Parameters["value0"].Value.Should().Be("alpha-scrubbed");
@@ -1515,7 +1600,8 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "subjectValue0",
             "cutoff",
             "tenantId",
-            "holdTableName"
+            "holdTableName",
+            "anonymisedAt"
         );
         connection.Commands[3].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
         connection.Commands[3].Parameters["value0"].Value.Should().Be("beta-scrubbed");
@@ -1550,7 +1636,11 @@ public sealed class AnonymiseSweepStrategyCommandTests
                 ),
             ],
             new TenantConvention(nameof(AnonymisedContact.TenantId), "TenantId"),
-            null
+            null,
+            AnonymisedAt: new AnonymisedAtConvention(
+                nameof(AnonymisedContact.AnonymisedAt),
+                "AnonymisedAt"
+            )
         );
         var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise);
 
@@ -1629,7 +1719,11 @@ public sealed class AnonymiseSweepStrategyCommandTests
                 ),
             ],
             new TenantConvention(nameof(AnonymisedContact.TenantId), "TenantId"),
-            null
+            null,
+            AnonymisedAt: new AnonymisedAtConvention(
+                nameof(AnonymisedContact.AnonymisedAt),
+                "AnonymisedAt"
+            )
         );
         var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise);
 
@@ -1685,7 +1779,8 @@ public sealed class AnonymiseSweepStrategyCommandTests
             "cutoff",
             "tenantId",
             "candidateIds",
-            "holdTableName"
+            "holdTableName",
+            "anonymisedAt"
         );
         connection.Commands[1].Parameters["tenantId"].Value.Should().Be(tenantId);
         connection.Commands[0].Parameters["subjectValue0"].Value.Should().Be(firstSubjectId);

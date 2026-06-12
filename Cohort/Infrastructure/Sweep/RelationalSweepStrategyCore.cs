@@ -163,6 +163,7 @@ internal sealed class RelationalSweepStrategyCore(
             transaction,
             cutoff,
             execution?.BatchSize,
+            execution?.ExcludedRecordIds,
             ct
         );
 
@@ -243,6 +244,7 @@ internal sealed class RelationalSweepStrategyCore(
             conn,
             transaction: null,
             batchSize: null,
+            excludedRecordIds: null,
             ct
         );
 
@@ -342,6 +344,7 @@ internal sealed class RelationalSweepStrategyCore(
             conn,
             transaction,
             execution?.BatchSize,
+            execution?.ExcludedRecordIds,
             ct
         );
 
@@ -453,7 +456,7 @@ internal sealed class RelationalSweepStrategyCore(
             );
         var affectedRecordIds = new List<string>();
         var heldCount = candidateRecordIds.Count - rows.Count;
-        var skippedCount = 0;
+        var skippedRecordIds = new List<string>();
 
         foreach (var row in rows)
         {
@@ -481,7 +484,7 @@ internal sealed class RelationalSweepStrategyCore(
             );
             if (!beforeResult.Succeeded)
             {
-                skippedCount++;
+                skippedRecordIds.Add(recordId);
                 await RetentionHandlerSupport.PersistBeforeFailureAsync(
                     conn,
                     transaction,
@@ -523,8 +526,9 @@ internal sealed class RelationalSweepStrategyCore(
             affectedRecordIds,
             heldCount,
             RowDetailsPersisted: true,
-            SkippedCount: skippedCount,
-            CandidateCount: candidateRecordIds.Count
+            SkippedCount: skippedRecordIds.Count,
+            CandidateCount: candidateRecordIds.Count,
+            SkippedRecordIds: skippedRecordIds
         );
     }
 
@@ -604,13 +608,16 @@ internal sealed class RelationalSweepStrategyCore(
         DbTransaction transaction,
         DateTimeOffset cutoff,
         int? batchSize,
+        IReadOnlyList<string>? excludedRecordIds,
         CancellationToken ct
     )
     {
         var limitClause = batchSize is not null ? "\nLIMIT @batchSize" : "";
 
         // Held rows are excluded up front so they are neither locked nor re-selected by
-        // every batch; the engine measures them separately for the audit summary.
+        // every batch; the engine measures them separately for the audit summary. Rows
+        // already skipped by an earlier batch of this run are excluded too — they stay
+        // eligible, so reselecting them would re-fail them forever.
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
         command.CommandText =
@@ -620,6 +627,7 @@ internal sealed class RelationalSweepStrategyCore(
             WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {TenantClause(entry)}
               {eligibilityClause(entry)}
+              {ExcludedRecordIdsClause(entry, excludedRecordIds)}
               AND {HoldExclusion(entry)}
             ORDER BY target.{QuoteIdentifier(entry.AnchorColumn)} ASC, CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) ASC
             FOR UPDATE SKIP LOCKED{limitClause}
@@ -627,6 +635,7 @@ internal sealed class RelationalSweepStrategyCore(
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         AddTenantParameter(command, entry, ctx.Tenant.Id);
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
+        AddExcludedRecordIdsParameter(command, excludedRecordIds);
         if (batchSize is not null)
         {
             command.Parameters.Add(
@@ -645,6 +654,7 @@ internal sealed class RelationalSweepStrategyCore(
         DbConnection conn,
         DbTransaction? transaction,
         int? batchSize,
+        IReadOnlyList<string>? excludedRecordIds,
         CancellationToken ct
     )
     {
@@ -664,6 +674,7 @@ internal sealed class RelationalSweepStrategyCore(
               AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {TenantClause(entry)}
               {eligibilityClause(entry)}
+              {ExcludedRecordIdsClause(entry, excludedRecordIds)}
               AND {HoldExclusion(entry)}
             ORDER BY target.{QuoteIdentifier(entry.AnchorColumn)} ASC, CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) ASC{lockClause}
             """;
@@ -671,6 +682,7 @@ internal sealed class RelationalSweepStrategyCore(
         AddSubjectParameters(command, predicate);
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
+        AddExcludedRecordIdsParameter(command, excludedRecordIds);
         if (batchSize is not null)
         {
             command.Parameters.Add(
@@ -725,6 +737,29 @@ internal sealed class RelationalSweepStrategyCore(
             entry.RecordId.RecordIdColumn,
             entry.Tenant?.TenantColumn
         );
+    }
+
+    private static string ExcludedRecordIdsClause(
+        RetentionEntry entry,
+        IReadOnlyList<string>? excludedRecordIds
+    )
+    {
+        return excludedRecordIds is { Count: > 0 }
+            ? $"AND NOT ({RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "excludedRecordIds")})"
+            : "";
+    }
+
+    private static void AddExcludedRecordIdsParameter(
+        DbCommand command,
+        IReadOnlyList<string>? excludedRecordIds
+    )
+    {
+        if (excludedRecordIds is { Count: > 0 })
+        {
+            command.Parameters.Add(
+                CreateParameter(command, "excludedRecordIds", excludedRecordIds.ToArray())
+            );
+        }
     }
 
     private static void AddTenantParameter(DbCommand command, RetentionEntry entry, Guid tenantId)

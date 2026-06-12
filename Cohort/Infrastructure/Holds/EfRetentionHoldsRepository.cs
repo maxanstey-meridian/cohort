@@ -2,12 +2,14 @@ using System.Data;
 
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Infrastructure.Sweep;
 
 using Microsoft.EntityFrameworkCore;
 
 namespace Cohort.Infrastructure.Holds;
 
-public sealed class EfRetentionHoldsRepository(DbContext db) : IRetentionHoldsRepository
+public sealed class EfRetentionHoldsRepository(DbContext db, RetentionRegistry registry)
+    : IRetentionHoldsRepository
 {
     public async Task CreateAsync(RetentionHoldRequest request, CancellationToken ct)
     {
@@ -29,6 +31,13 @@ public sealed class EfRetentionHoldsRepository(DbContext db) : IRetentionHoldsRe
 
         try
         {
+            await ValidateTenantMatchesTargetRowAsync(
+                targetEntityType,
+                recordId,
+                request,
+                ct
+            );
+
             await using var command = connection.CreateCommand();
             command.CommandText =
                 $"""
@@ -78,6 +87,58 @@ public sealed class EfRetentionHoldsRepository(DbContext db) : IRetentionHoldsRe
                 await db.Database.CloseConnectionAsync();
             }
         }
+    }
+
+    /// <summary>
+    /// The sweep-side exclusion on tenanted tables only honours holds whose TenantId
+    /// matches the row's tenant, so a hold created under the wrong tenant would look
+    /// persisted while protecting nothing. When the target row already exists on a
+    /// retained tenanted entity, its tenant must match the request. A row that does not
+    /// exist yet is allowed — holds may legitimately be created ahead of their row.
+    /// </summary>
+    private async Task ValidateTenantMatchesTargetRowAsync(
+        Microsoft.EntityFrameworkCore.Metadata.IEntityType targetEntityType,
+        string recordId,
+        RetentionHoldRequest request,
+        CancellationToken ct
+    )
+    {
+        if (
+            !registry.Scan().TryGetValue(targetEntityType.ClrType, out var entry)
+            || entry.Tenant is null
+        )
+        {
+            // Non-retained tables are never swept, and tenantless entities match holds
+            // regardless of TenantId — nothing to validate either way.
+            return;
+        }
+
+        var connection = db.Database.GetDbConnection();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            $"""
+            SELECT target.{RetentionHoldSql.QuoteIdentifier(entry.Tenant.TenantColumn)}
+            FROM {RetentionHoldSql.QuoteIdentifier(entry.TableName)} AS target
+            WHERE {RecordIdSql.EqualsParameter("target", entry.RecordId, "recordId")}
+            LIMIT 1
+            """;
+        command.Parameters.Add(RetentionHoldSql.CreateParameter(command, "recordId", recordId));
+
+        var rowTenant = await command.ExecuteScalarAsync(ct);
+        if (rowTenant is null)
+        {
+            return;
+        }
+
+        if (rowTenant is Guid tenantId && tenantId == request.TenantId)
+        {
+            return;
+        }
+
+        var actualTenant = rowTenant is DBNull ? "NULL" : rowTenant.ToString();
+        throw new InvalidOperationException(
+            $"Retention hold for table '{request.TableName}', record '{request.RecordId}' was requested under tenant '{request.TenantId}', but the row belongs to tenant '{actualTenant}'. Sweeps only honour holds whose TenantId matches the row's tenant, so this hold would persist while protecting nothing."
+        );
     }
 
     private Microsoft.EntityFrameworkCore.Metadata.IEntityType FindEntityTypeForTable(

@@ -215,6 +215,67 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task CreateAsync_Rejects_Holds_Whose_Tenant_Does_Not_Match_The_Existing_Rows_Tenant()
+    {
+        // The sweep-side exclusion on tenanted tables only honours holds whose TenantId
+        // matches the row's tenant — a hold created under the wrong tenant would look
+        // persisted while protecting nothing.
+        var rowTenantId = Guid.NewGuid();
+        var wrongTenantId = Guid.NewGuid();
+        Guid noteId;
+
+        await using (var db = Host.CreateDbContext())
+        {
+            var note = new Note
+            {
+                Id = Guid.NewGuid(),
+                TenantId = rowTenantId,
+                CreatedAt = new DateTimeOffset(2026, 4, 1, 12, 0, 0, TimeSpan.Zero),
+                Body = "wrong-tenant-hold-target",
+            };
+            noteId = note.Id;
+            db.Notes.Add(note);
+            await db.SaveChangesAsync();
+        }
+
+        var act = async () =>
+            await CreateHoldAsync(
+                new RetentionHoldRequest(
+                    Guid.NewGuid(),
+                    "notes",
+                    noteId.ToString(),
+                    wrongTenantId,
+                    "mis-scoped hold",
+                    new DateTimeOffset(2026, 4, 10, 12, 0, 0, TimeSpan.Zero)
+                )
+            );
+
+        await act
+            .Should()
+            .ThrowAsync<InvalidOperationException>()
+            .WithMessage($"*belongs to tenant '{rowTenantId}'*");
+
+        // The same hold under the row's actual tenant is accepted.
+        await CreateHoldAsync(
+            new RetentionHoldRequest(
+                Guid.NewGuid(),
+                "notes",
+                noteId.ToString(),
+                rowTenantId,
+                "correctly scoped hold",
+                new DateTimeOffset(2026, 4, 10, 12, 0, 0, TimeSpan.Zero)
+            )
+        );
+
+        (await HasActiveHoldAsync(
+            "notes",
+            noteId,
+            rowTenantId,
+            new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero)
+        )).Should().BeTrue();
+    }
+
+    [Fact]
     public async Task CreateAsync_Normalises_Guid_Record_Id_Formats_So_The_Hold_Still_Protects_The_Row()
     {
         var tenantId = Guid.NewGuid();

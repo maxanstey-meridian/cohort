@@ -208,6 +208,24 @@ public sealed class RetentionRowDispatcher(
 
         try
         {
+            if (string.IsNullOrWhiteSpace(claimed.CapturedPayload))
+            {
+                // The payload-retention backstop scrubs captured snapshots that outlive
+                // RowHandlerDispatch:PayloadRetention even while handler work is still
+                // queued — the personal data must not outlive its retention. Without the
+                // snapshot the handler can never succeed, so dead-letter immediately
+                // with the real reason instead of burning the retry budget on a
+                // misleading deserialisation error.
+                await MarkDeadLetteredAsync(
+                    claimed,
+                    currentAttempt,
+                    "Captured row snapshot was scrubbed by the payload-retention backstop (RowHandlerDispatch:PayloadRetention) before this handler ran; the work can no longer complete. Increase PayloadRetention or drain handler work sooner.",
+                    DateTimeOffset.UtcNow,
+                    ct
+                );
+                return;
+            }
+
             await using var scope = scopeFactory.CreateAsyncScope();
             var registry = scope.ServiceProvider.GetRequiredService<RetentionRegistry>();
             var entityType = ResolveEntityType(claimed.EntityType, registry);

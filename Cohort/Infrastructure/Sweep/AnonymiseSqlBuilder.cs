@@ -98,20 +98,26 @@ internal static class AnonymiseSqlBuilder
     internal static string BuildCandidateSelectionCommandText(
         RetentionEntry entry,
         SqlFilter filter,
-        int? batchSize
+        int? batchSize,
+        bool hasExcludedRecordIds = false
     )
     {
         var tenantClause = BuildTenantClause(entry.Tenant?.TenantColumn);
         var limitClause = batchSize is not null ? "\nLIMIT @batchSize" : "";
+        var excludedClause = hasExcludedRecordIds
+            ? $"\n  AND NOT ({RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "excludedRecordIds")})"
+            : "";
 
         // Held rows are excluded up front so they are neither locked nor re-selected by
-        // every batch; the engine measures them separately for the audit summary.
+        // every batch; the engine measures them separately for the audit summary. Rows
+        // already skipped by an earlier batch of this run are excluded too — they stay
+        // eligible, so reselecting them would re-fail them forever.
         return
             $"""
             SELECT target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
             FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE {filter.PredicateSql}
-              {tenantClause}
+              {tenantClause}{excludedClause}
               AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn, entry.Tenant?.TenantColumn)}
             ORDER BY target.{QuoteIdentifier(entry.AnchorColumn)} ASC, CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) ASC
             FOR UPDATE SKIP LOCKED{limitClause}

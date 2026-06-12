@@ -268,6 +268,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             transaction,
             filter,
             execution?.BatchSize,
+            execution?.ExcludedRecordIds,
             ct
         );
 
@@ -333,6 +334,17 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         {
             throw new InvalidOperationException(
                 $"Retention entry for {entry.EntityType.FullName} must expose anonymise metadata for anonymise {operation}."
+            );
+        }
+
+        // The startup validator only enforces the marker for rules it can resolve at
+        // boot (TryResolveAtStartup). A runtime-resolved Anonymise rule on an entity
+        // without the marker would otherwise re-select the same rows every batch — the
+        // mutation never shrinks the candidate filter, so the sweep loop never ends.
+        if (entry.AnonymisedAt is null)
+        {
+            throw new InvalidOperationException(
+                $"Retention entry for {entry.EntityType.FullName} resolves to the Anonymise strategy but has no AnonymisedAt marker (a nullable DateTimeOffset named AnonymisedAt by convention, or marked with [RetentionAnonymisedAt]). Without it anonymisation cannot tell scrubbed rows from pending ones and batched {operation} would never terminate."
             );
         }
     }

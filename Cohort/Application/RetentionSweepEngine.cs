@@ -356,15 +356,18 @@ public sealed class RetentionSweepEngine(
         var connection = db.Database.GetDbConnection();
         var eventAt = DateTimeOffset.UtcNow;
         var resolvedPeriod = CutoffCalculator.ResolveEffectivePeriod(rule.Period, rule.LegalMin);
-        var affectedRecordIds = new List<string>();
+        var effectiveAuditDetail = entry.AuditRowDetail == AuditRowDetail.Inherit
+            ? rule.AuditRowDetail
+            : entry.AuditRowDetail;
+        var affectedCount = 0L;
         var skippedCount = 0L;
         var heldCount = 0L;
         var nullAnchorCount = 0L;
-        var rowDetailsPersisted = false;
 
         if (rule.Strategy != Strategy.Exempt)
         {
             var strategy = strategies[rule.Strategy];
+            var excludedRecordIds = new List<string>();
 
             // Each batch selects, locks, and mutates at most batchSize rows in its own
             // transaction, so a large backlog is retired incrementally and a failure
@@ -383,7 +386,12 @@ public sealed class RetentionSweepEngine(
                         connection,
                         transaction.GetDbTransaction(),
                         ct,
-                        new SweepMutationContext(sweepId, DateTimeOffset.UtcNow, batchSize)
+                        new SweepMutationContext(
+                            sweepId,
+                            DateTimeOffset.UtcNow,
+                            batchSize,
+                            excludedRecordIds
+                        )
                     );
 
                     if (execution.HeldCount < 0)
@@ -400,18 +408,48 @@ public sealed class RetentionSweepEngine(
                         );
                     }
 
+                    // Row-detail audit commits with the batch whose mutations it
+                    // documents: a crash later in the run cannot lose evidence for rows
+                    // already retired, and affected ids never accumulate in memory.
+                    if (
+                        effectiveAuditDetail == AuditRowDetail.PerRow
+                        && !execution.RowDetailsPersisted
+                    )
+                    {
+                        foreach (var recordId in execution.AffectedRecordIds)
+                        {
+                            await auditWriter.WriteAsync(
+                                new SweepEvent.RowDetail(
+                                    sweepId,
+                                    eventAt,
+                                    entry.EntityType,
+                                    recordId,
+                                    entry.Category,
+                                    rule.Strategy,
+                                    tenant.Id
+                                ),
+                                ct
+                            );
+                        }
+                    }
+
                     await transaction.CommitAsync(ct);
                 }
 
-                affectedRecordIds.AddRange(execution.AffectedRecordIds);
+                affectedCount += execution.AffectedRecordIds.Count;
                 skippedCount += execution.SkippedCount;
-                rowDetailsPersisted |= execution.RowDetailsPersisted;
+                // Skipped rows stay eligible (their mutation never ran), so later
+                // batches of this run must not reselect them: re-running their failed
+                // OnBefore would re-insert the same row detail under this sweep id.
+                excludedRecordIds.AddRange(execution.SkippedRecordIds);
 
-                // A batch that affected nothing cannot shrink the candidate filter
-                // (e.g. every row was skipped by a failing OnBefore handler), so
-                // looping again would reselect the same rows forever; the remainder
-                // is deferred to the next sweep.
-                if (execution.CandidateCount < batchSize || execution.AffectedRecordIds.Count == 0)
+                // Progress means the candidate filter shrank: rows were mutated, or
+                // skipped rows joined the exclusion list. A batch with neither (e.g. a
+                // custom strategy that skips without reporting ids) would reselect the
+                // same rows forever; the remainder is deferred to the next sweep.
+                var madeProgress =
+                    execution.AffectedRecordIds.Count > 0 || execution.SkippedRecordIds.Count > 0;
+                if (execution.CandidateCount < batchSize || !madeProgress)
                 {
                     break;
                 }
@@ -423,52 +461,24 @@ public sealed class RetentionSweepEngine(
             nullAnchorCount = await strategy.CountNullAnchorsAsync(entry, rule, context, connection, ct);
         }
 
-        await using (var summaryTransaction = await db.Database.BeginTransactionAsync(ct))
-        {
-            await WriteAuditEventAsync(
-                new SweepEvent.EntitySummary(
-                    sweepId,
-                    eventAt,
-                    entry.EntityType,
-                    entry.Category,
-                    tenant.Id,
-                    rule.Strategy,
-                    resolvedPeriod,
-                    affectedRecordIds.Count,
-                    heldCount,
-                    skippedCount,
-                    nullAnchorCount,
-                    rule.Provenance
-                ),
-                auditEvents,
-                ct
-            );
-
-            var effectiveAuditDetail = entry.AuditRowDetail == AuditRowDetail.Inherit
-                ? rule.AuditRowDetail
-                : entry.AuditRowDetail;
-            if (effectiveAuditDetail == AuditRowDetail.PerRow && !rowDetailsPersisted)
-            {
-                foreach (var recordId in affectedRecordIds)
-                {
-                    await WriteAuditEventAsync(
-                        new SweepEvent.RowDetail(
-                            sweepId,
-                            eventAt,
-                            entry.EntityType,
-                            recordId,
-                            entry.Category,
-                            rule.Strategy,
-                            tenant.Id
-                        ),
-                        auditEvents,
-                        ct
-                    );
-                }
-            }
-
-            await summaryTransaction.CommitAsync(ct);
-        }
+        await WriteAuditEventAsync(
+            new SweepEvent.EntitySummary(
+                sweepId,
+                eventAt,
+                entry.EntityType,
+                entry.Category,
+                tenant.Id,
+                rule.Strategy,
+                resolvedPeriod,
+                affectedCount,
+                heldCount,
+                skippedCount,
+                nullAnchorCount,
+                rule.Provenance
+            ),
+            auditEvents,
+            ct
+        );
     }
 
     private async Task WriteAuditEventAsync(

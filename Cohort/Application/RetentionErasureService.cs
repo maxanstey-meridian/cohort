@@ -204,11 +204,12 @@ public sealed class RetentionErasureService(
     {
         var eventAt = DateTimeOffset.UtcNow;
         var resolvedPeriod = CutoffCalculator.ResolveEffectivePeriod(rule.Period, rule.LegalMin);
-        var affectedRecordIds = new List<string>();
+        var effectiveAuditDetail = entry.AuditRowDetail == AuditRowDetail.Inherit
+            ? rule.AuditRowDetail
+            : entry.AuditRowDetail;
         var affectedCount = 0L;
         var skippedCount = 0L;
         var heldCount = 0L;
-        var rowDetailsPersisted = false;
 
         if (rule.Strategy != Strategy.Exempt)
         {
@@ -231,6 +232,7 @@ public sealed class RetentionErasureService(
                 // Each batch selects, locks, and mutates at most batchSize rows in its own
                 // transaction, mirroring the sweep engine: a failure loses only the
                 // current batch and earlier batches stay erased.
+                var excludedRecordIds = new List<string>();
                 while (true)
                 {
                     ct.ThrowIfCancellationRequested();
@@ -247,7 +249,12 @@ public sealed class RetentionErasureService(
                             connection,
                             transaction.GetDbTransaction(),
                             ct,
-                            new SweepMutationContext(sweepId, DateTimeOffset.UtcNow, batchSize)
+                            new SweepMutationContext(
+                                sweepId,
+                                DateTimeOffset.UtcNow,
+                                batchSize,
+                                excludedRecordIds
+                            )
                         );
 
                         if (execution.HeldCount < 0)
@@ -264,23 +271,54 @@ public sealed class RetentionErasureService(
                             );
                         }
 
+                        // Row-detail audit commits with the batch whose mutations it
+                        // documents: a crash later in the run cannot lose evidence for
+                        // rows already erased, and affected ids never accumulate in
+                        // memory.
+                        if (
+                            effectiveAuditDetail == AuditRowDetail.PerRow
+                            && !execution.RowDetailsPersisted
+                        )
+                        {
+                            foreach (var recordId in execution.AffectedRecordIds)
+                            {
+                                await auditWriter.WriteAsync(
+                                    new SweepEvent.RowDetail(
+                                        sweepId,
+                                        eventAt,
+                                        entry.EntityType,
+                                        recordId,
+                                        entry.Category,
+                                        rule.Strategy,
+                                        tenant.Id
+                                    ),
+                                    ct
+                                );
+                            }
+                        }
+
                         await transaction.CommitAsync(ct);
                     }
 
-                    affectedRecordIds.AddRange(execution.AffectedRecordIds);
+                    affectedCount += execution.AffectedRecordIds.Count;
                     skippedCount += execution.SkippedCount;
-                    rowDetailsPersisted |= execution.RowDetailsPersisted;
+                    // Skipped rows stay eligible (their mutation never ran), so later
+                    // batches of this run must not reselect them: re-running their
+                    // failed OnBefore would re-insert the same row detail under this
+                    // sweep id.
+                    excludedRecordIds.AddRange(execution.SkippedRecordIds);
 
-                    // A batch that affected nothing cannot shrink the candidate filter
-                    // (e.g. every row was skipped by a failing OnBefore handler), so
-                    // looping again would reselect the same rows forever.
-                    if (execution.CandidateCount < batchSize || execution.AffectedRecordIds.Count == 0)
+                    // Progress means the candidate filter shrank: rows were mutated, or
+                    // skipped rows joined the exclusion list. A batch with neither
+                    // (e.g. a custom strategy that skips without reporting ids) would
+                    // reselect the same rows forever.
+                    var madeProgress =
+                        execution.AffectedRecordIds.Count > 0 || execution.SkippedRecordIds.Count > 0;
+                    if (execution.CandidateCount < batchSize || !madeProgress)
                     {
                         break;
                     }
                 }
-
-                affectedCount = affectedRecordIds.Count;
             }
 
             // Held rows are measured directly (subject-matching, past cutoff, actively
@@ -313,29 +351,6 @@ public sealed class RetentionErasureService(
             auditEvents,
             ct
         );
-
-        var effectiveAuditDetail = entry.AuditRowDetail == AuditRowDetail.Inherit
-            ? rule.AuditRowDetail
-            : entry.AuditRowDetail;
-        if (effectiveAuditDetail == AuditRowDetail.PerRow && !rowDetailsPersisted)
-        {
-            foreach (var recordId in affectedRecordIds)
-            {
-                await WriteAuditEventAsync(
-                    new SweepEvent.RowDetail(
-                        sweepId,
-                        eventAt,
-                        entry.EntityType,
-                        recordId,
-                        entry.Category,
-                        rule.Strategy,
-                        tenant.Id
-                    ),
-                    auditEvents,
-                    ct
-                );
-            }
-        }
     }
 
     private static string Truncate(string value, int maxLength)

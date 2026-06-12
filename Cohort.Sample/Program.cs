@@ -1,6 +1,8 @@
 using Cohort.Domain;
 using Cohort.Sample;
+using Cohort.Sample.Entities;
 
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -44,6 +46,36 @@ try
             count.Affected
         );
     }
+
+    // Demonstrate an actual sweep: seed a note past its 30-day category, sweep, verify.
+    var db = scope.ServiceProvider.GetRequiredService<SampleDbContext>();
+    var demoNoteId = Guid.NewGuid();
+    db.Notes.Add(
+        new Note
+        {
+            Id = demoNoteId,
+            TenantId = previewTenant.Id,
+            CreatedAt = DateTimeOffset.UtcNow.AddDays(-120),
+            Body = "sweep-demo",
+        }
+    );
+    await db.SaveChangesAsync();
+
+    var sweep = await startup.RunSweepAsync(previewTenant, DateTimeOffset.UtcNow);
+    foreach (var count in sweep.Counts)
+    {
+        logger.LogInformation(
+            "Sweep {EntityType} → affected={Affected} held={Held} skipped={Skipped} nullAnchors={NullAnchors}",
+            count.EntityType.Name,
+            count.Affected,
+            count.HeldCount,
+            count.SkippedCount,
+            count.NullAnchorCount
+        );
+    }
+
+    var demoNoteRemoved = !await db.Notes.AnyAsync(note => note.Id == demoNoteId);
+    logger.LogInformation("Sweep removed the expired demo note: {Removed}", demoNoteRemoved);
 }
 finally
 {

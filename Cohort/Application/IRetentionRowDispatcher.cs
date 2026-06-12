@@ -20,7 +20,7 @@ public interface IRetentionRowDispatcher
 /// counts rows the flush could not dispatch (deferred-phase rows whose sweep has not
 /// settled, or rows queued behind an in-flight sibling).
 /// </summary>
-public sealed record RowDispatcherFlushResult(int InFlightRemaining, int PendingRemaining)
+public sealed record RowDispatcherFlushResult(long InFlightRemaining, long PendingRemaining)
 {
     public bool Settled => InFlightRemaining == 0 && PendingRemaining == 0;
 }

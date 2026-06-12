@@ -84,6 +84,45 @@ public static class ServiceCollectionExtensions
     {
         ArgumentNullException.ThrowIfNull(services);
 
+        var existingRegistrations = services
+            .Where(descriptor => descriptor.ServiceType == typeof(IRetentionHandlerRegistration))
+            .Select(descriptor => descriptor.ImplementationInstance)
+            .OfType<IRetentionHandlerRegistration>()
+            .ToArray();
+
+        // TryAddEnumerable would silently keep the first registration of this pair, so
+        // a repeat call with a different phase or identity must fail loudly instead of
+        // appearing to take effect. An identical repeat stays idempotent.
+        var samePair = existingRegistrations.FirstOrDefault(registration =>
+            registration.EntityType == typeof(TEntity)
+            && registration.HandlerType == typeof(THandler)
+        );
+        if (
+            samePair is not null
+            && (samePair.DispatchPhase != dispatchPhase || samePair.Identity != identity)
+        )
+        {
+            throw new InvalidOperationException(
+                $"Row handler {typeof(THandler).FullName} for entity {typeof(TEntity).FullName} is already registered with dispatch phase {samePair.DispatchPhase} and identity {samePair.Identity?.ToString() ?? "<none>"}; this call's values ({dispatchPhase}, {identity?.ToString() ?? "<none>"}) would be silently ignored. Register each handler pair once."
+            );
+        }
+
+        // Two handlers persisting queued work under the same identity would have their
+        // rows dispatched interchangeably to whichever resolves first.
+        var identityClash = identity is not null
+            ? existingRegistrations.FirstOrDefault(registration =>
+                registration.EntityType == typeof(TEntity)
+                && registration.HandlerType != typeof(THandler)
+                && registration.Identity == identity
+            )
+            : null;
+        if (identityClash is not null)
+        {
+            throw new InvalidOperationException(
+                $"Row handler identity {identity} for entity {typeof(TEntity).FullName} is already used by {identityClash.HandlerType.FullName}; identities must be unique per entity so queued work dispatches to the handler that persisted it."
+            );
+        }
+
         services.TryAddEnumerable(ServiceDescriptor.Scoped<IRetentionHandler<TEntity>, THandler>());
         services.TryAddEnumerable(
             ServiceDescriptor.Singleton(

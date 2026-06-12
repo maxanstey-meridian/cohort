@@ -249,6 +249,42 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
     }
 
     [Fact]
+    public async Task Worker_Sweeps_Tenantless_Entities_Even_When_The_Tenant_Source_Is_Empty()
+    {
+        // A tenantless-only deployment legitimately has no tenants; the tenantless pass
+        // must not be gated on the tenant source returning at least one.
+        var settings = CreateSettings(
+            fixture.ConnectionString,
+            schedule: "*/1 * * * * *",
+            dryRun: false,
+            killSwitch: false
+        );
+        using var host = BuildHost(
+            settings,
+            CreateTenant(),
+            services =>
+            {
+                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+                services.AddSingleton<IRetentionTenantSource>(new StaticTenantSource());
+            }
+        );
+        await SeedOldTenantlessLogAsync("tenantless-no-tenants-purge");
+
+        await host.Host.StartAsync();
+        await WaitUntilAsync(
+            async () => !await TenantlessLogExistsAsync("tenantless-no-tenants-purge"),
+            TimeSpan.FromSeconds(8)
+        );
+        await host.Host.StopAsync();
+
+        (await TenantlessLogExistsAsync("tenantless-no-tenants-purge")).Should().BeFalse();
+
+        var summaryTenantIds = await LoadEntitySummaryTenantIdsAsync(typeof(TenantlessLog));
+        summaryTenantIds.Should().NotBeEmpty();
+        summaryTenantIds.Should().AllSatisfy(tenantId => tenantId.Should().Be(Guid.Empty));
+    }
+
+    [Fact]
     public async Task Worker_Skips_Occurrences_While_Another_Instance_Holds_The_Sweep_Lock()
     {
         const long sweepAdvisoryLockKey = 0x636F_686F_7274_3031;

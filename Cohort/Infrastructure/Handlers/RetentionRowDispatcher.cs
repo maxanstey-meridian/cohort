@@ -58,8 +58,8 @@ public sealed class RetentionRowDispatcher(
                 await reader.ReadAsync(ct);
 
                 return new RowDispatcherFlushResult(
-                    (int)reader.GetInt64(0),
-                    (int)reader.GetInt64(1)
+                    reader.GetInt64(0),
+                    reader.GetInt64(1)
                 );
             },
             ct

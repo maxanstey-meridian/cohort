@@ -179,13 +179,6 @@ public sealed class RetentionWorker(
     {
         var tenantSource = services.GetRequiredService<IRetentionTenantSource>();
         var tenants = await tenantSource.GetTenantsAsync(ct);
-        if (tenants.Count == 0)
-        {
-            logger.LogWarning(
-                "Cohort worker found no tenants to sweep; the IRetentionTenantSource returned an empty list."
-            );
-            return;
-        }
 
         var validator = services.GetRequiredService<RetentionStartupValidator>();
         await validator.ValidateAsync(ct);
@@ -195,6 +188,16 @@ public sealed class RetentionWorker(
 
         if (entries.Any(entry => entry.Tenant is not null))
         {
+            // An empty tenant list is only a problem when tenanted entities exist; a
+            // tenantless-only deployment legitimately has no tenants, and its pass
+            // below must still run.
+            if (tenants.Count == 0)
+            {
+                logger.LogWarning(
+                    "Cohort worker found no tenants to sweep; the IRetentionTenantSource returned an empty list, so tenanted entities will not be swept this iteration."
+                );
+            }
+
             foreach (var tenant in tenants)
             {
                 if (KillSwitchEngagedMidIteration())

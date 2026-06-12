@@ -45,11 +45,60 @@ public sealed class AddRowHandlerRegistrationTests
         provider.GetServices<IRetentionHandler<FirstEntity>>().Should().ContainSingle();
     }
 
+    [Fact]
+    public void AddRowHandler_Rejects_A_Repeat_Registration_With_A_Different_Phase_Or_Identity()
+    {
+        // TryAddEnumerable keeps the first registration, so a conflicting repeat would
+        // otherwise look like it took effect while silently being ignored.
+        var services = new ServiceCollection();
+        services.AddRowHandler<FirstEntity, FirstHandler>(RowHandlerDispatchPhase.Immediate);
+
+        var differentPhase = () =>
+            services.AddRowHandler<FirstEntity, FirstHandler>(RowHandlerDispatchPhase.AfterSweepSettled);
+        differentPhase.Should().Throw<InvalidOperationException>().WithMessage("*silently ignored*");
+
+        var differentIdentity = () =>
+            services.AddRowHandler<FirstEntity, FirstHandler>(identity: Guid.NewGuid());
+        differentIdentity.Should().Throw<InvalidOperationException>().WithMessage("*silently ignored*");
+    }
+
+    [Fact]
+    public void AddRowHandler_Rejects_Two_Handlers_Sharing_An_Identity_For_The_Same_Entity()
+    {
+        // Both handlers would persist queued work under the same HandlerIdentity, and
+        // dispatch would hand either's rows to whichever resolves first.
+        var identity = Guid.NewGuid();
+        var services = new ServiceCollection();
+        services.AddRowHandler<FirstEntity, FirstHandler>(identity: identity);
+
+        var clash = () =>
+            services.AddRowHandler<FirstEntity, AnotherFirstHandler>(identity: identity);
+
+        clash.Should().Throw<InvalidOperationException>().WithMessage("*unique per entity*");
+    }
+
+    [Fact]
+    public void AddRowHandler_Allows_The_Same_Identity_On_Different_Entities()
+    {
+        // Dispatch resolves handlers per entity type, so identities only need to be
+        // unique within one entity's handler set.
+        var identity = Guid.NewGuid();
+        var services = new ServiceCollection();
+        services.AddRowHandler<FirstEntity, FirstHandler>(identity: identity);
+        services.AddRowHandler<SecondEntity, SecondHandler>(identity: identity);
+
+        using var provider = services.BuildServiceProvider();
+
+        provider.GetServices<IRetentionHandlerRegistration>().Should().HaveCount(2);
+    }
+
     private sealed class FirstEntity;
 
     private sealed class SecondEntity;
 
     private sealed class FirstHandler : IRetentionHandler<FirstEntity>;
+
+    private sealed class AnotherFirstHandler : IRetentionHandler<FirstEntity>;
 
     private sealed class SecondHandler : IRetentionHandler<SecondEntity>;
 }

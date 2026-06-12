@@ -209,6 +209,46 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
     }
 
     [Fact]
+    public async Task Worker_Sweeps_Tenantless_Entities_Once_Under_The_Tenantless_Context()
+    {
+        var tenantA = CreateTenant();
+        var tenantB = CreateTenant();
+        var settings = CreateSettings(
+            fixture.ConnectionString,
+            schedule: "*/1 * * * * *",
+            dryRun: false,
+            killSwitch: false
+        );
+        using var host = BuildHost(
+            settings,
+            tenantA,
+            services =>
+            {
+                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+                services.AddSingleton<IRetentionTenantSource>(
+                    new StaticTenantSource(tenantA, tenantB)
+                );
+            }
+        );
+        await SeedOldTenantlessLogAsync("tenantless-worker-purge");
+
+        await host.Host.StartAsync();
+        await WaitUntilAsync(
+            async () => !await TenantlessLogExistsAsync("tenantless-worker-purge"),
+            TimeSpan.FromSeconds(8)
+        );
+        await host.Host.StopAsync();
+
+        (await TenantlessLogExistsAsync("tenantless-worker-purge")).Should().BeFalse();
+
+        // Tenantless audit summaries are attributed to the dedicated tenantless context,
+        // never to whichever tenant's pass happened to reach the shared table first.
+        var summaryTenantIds = await LoadEntitySummaryTenantIdsAsync(typeof(TenantlessLog));
+        summaryTenantIds.Should().NotBeEmpty();
+        summaryTenantIds.Should().AllSatisfy(tenantId => tenantId.Should().Be(Guid.Empty));
+    }
+
+    [Fact]
     public async Task Worker_Skips_Occurrences_While_Another_Instance_Holds_The_Sweep_Lock()
     {
         const long sweepAdvisoryLockKey = 0x636F_686F_7274_3031;
@@ -628,6 +668,58 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
 
         await using var db = new SampleDbContext(options);
         return await db.Notes.AnyAsync(note => note.Body == body);
+    }
+
+    private async Task SeedOldTenantlessLogAsync(string payload)
+    {
+        var options = new DbContextOptionsBuilder<SampleDbContext>()
+            .UseNpgsql(fixture.ConnectionString)
+            .Options;
+
+        await using var db = new SampleDbContext(options);
+        db.TenantlessLogs.Add(
+            new TenantlessLog
+            {
+                Id = Guid.NewGuid(),
+                CreatedAt = DateTimeOffset.UtcNow.AddDays(-120),
+                Payload = payload,
+            }
+        );
+        await db.SaveChangesAsync();
+    }
+
+    private async Task<bool> TenantlessLogExistsAsync(string payload)
+    {
+        var options = new DbContextOptionsBuilder<SampleDbContext>()
+            .UseNpgsql(fixture.ConnectionString)
+            .Options;
+
+        await using var db = new SampleDbContext(options);
+        return await db.TenantlessLogs.AnyAsync(log => log.Payload == payload);
+    }
+
+    private async Task<IReadOnlyList<Guid>> LoadEntitySummaryTenantIdsAsync(Type entityType)
+    {
+        await using var connection = new NpgsqlConnection(fixture.ConnectionString);
+        await connection.OpenAsync();
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT "TenantId"
+            FROM "sweep_run_entity_summary"
+            WHERE "EntityType" = @entityType
+            """;
+        command.Parameters.AddWithValue("entityType", entityType.FullName ?? entityType.Name);
+
+        var tenantIds = new List<Guid>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            tenantIds.Add(reader.GetGuid(0));
+        }
+
+        return tenantIds;
     }
 
     private static async Task<bool> TableExistsAsync(string connectionString, string tableName)

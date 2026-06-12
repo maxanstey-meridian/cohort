@@ -190,32 +190,89 @@ public sealed class RetentionWorker(
         var validator = services.GetRequiredService<RetentionStartupValidator>();
         await validator.ValidateAsync(ct);
 
-        foreach (var tenant in tenants)
+        if (dryRun)
         {
-            RetentionSweepResult result;
-            if (dryRun)
+            foreach (var tenant in tenants)
             {
                 var preview = services.GetRequiredService<IRetentionPreview>();
-                result = await preview.PreviewAsync(tenant, DateTimeOffset.UtcNow, ct);
-            }
-            else
-            {
-                var engine = services.GetRequiredService<RetentionSweepEngine>();
-                result = await engine.SweepAsync(
-                    tenant,
-                    DateTimeOffset.UtcNow,
-                    SweepTriggerKind.Scheduled,
-                    ct
+                var result = await preview.PreviewAsync(tenant, DateTimeOffset.UtcNow, ct);
+
+                logger.LogInformation(
+                    "Cohort worker completed dry-run iteration for tenant {TenantId} with {EntityCount} entity counts.",
+                    tenant.Id,
+                    result.Counts.Count
                 );
             }
 
+            return;
+        }
+
+        var entries = services.GetRequiredService<RetentionRegistry>().Scan().Values;
+        var engine = services.GetRequiredService<RetentionSweepEngine>();
+
+        if (entries.Any(entry => entry.Tenant is not null))
+        {
+            foreach (var tenant in tenants)
+            {
+                if (KillSwitchEngagedMidIteration())
+                {
+                    return;
+                }
+
+                var result = await engine.SweepAsync(
+                    tenant,
+                    DateTimeOffset.UtcNow,
+                    SweepTriggerKind.Scheduled,
+                    SweepEntityScope.TenantedOnly,
+                    ct
+                );
+
+                logger.LogInformation(
+                    "Cohort worker completed sweep iteration for tenant {TenantId} with {EntityCount} entity counts.",
+                    tenant.Id,
+                    result.Counts.Count
+                );
+            }
+        }
+
+        // Tenantless tables hold one shared row set; sweeping them inside the per-tenant
+        // loop retired nothing after the first pass but attributed the audit run (and
+        // resolved retention rules) under whichever tenant happened to come first.
+        if (entries.Any(entry => entry.Tenant is null))
+        {
+            if (KillSwitchEngagedMidIteration())
+            {
+                return;
+            }
+
+            var result = await engine.SweepAsync(
+                TenantContext.Tenantless,
+                DateTimeOffset.UtcNow,
+                SweepTriggerKind.Scheduled,
+                SweepEntityScope.TenantlessOnly,
+                ct
+            );
+
             logger.LogInformation(
-                "Cohort worker completed {Mode} iteration for tenant {TenantId} with {EntityCount} entity counts.",
-                dryRun ? "dry-run" : "sweep",
-                tenant.Id,
+                "Cohort worker completed tenantless sweep with {EntityCount} entity counts.",
                 result.Counts.Count
             );
         }
+    }
+
+    private bool KillSwitchEngagedMidIteration()
+    {
+        // The kill switch is an emergency brake: an in-flight sweep finishes, but no
+        // further sweep starts — not even the remaining passes of the current iteration.
+        if (!options.CurrentValue.KillSwitch)
+        {
+            return false;
+        }
+
+        logger.LogInformation(
+            "Cohort worker kill switch engaged; skipping the remainder of this iteration."
+        );
+        return true;
     }
 
     private static async Task<bool> TryAcquireSweepLockAsync(DbContext db, CancellationToken ct)

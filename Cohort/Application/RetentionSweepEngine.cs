@@ -34,10 +34,21 @@ public sealed class RetentionSweepEngine(
         return SweepAsync(tenant, now, SweepTriggerKind.Manual, ct);
     }
 
+    public Task<RetentionSweepResult> SweepAsync(
+        TenantContext tenant,
+        DateTimeOffset now,
+        SweepTriggerKind trigger,
+        CancellationToken ct = default
+    )
+    {
+        return SweepAsync(tenant, now, trigger, SweepEntityScope.All, ct);
+    }
+
     public async Task<RetentionSweepResult> SweepAsync(
         TenantContext tenant,
         DateTimeOffset now,
         SweepTriggerKind trigger,
+        SweepEntityScope scope,
         CancellationToken ct = default
     )
     {
@@ -61,6 +72,14 @@ public sealed class RetentionSweepEngine(
 
         foreach (var entry in registry.Scan().Values)
         {
+            if (
+                (scope == SweepEntityScope.TenantedOnly && entry.Tenant is null)
+                || (scope == SweepEntityScope.TenantlessOnly && entry.Tenant is not null)
+            )
+            {
+                continue;
+            }
+
             var resolver = await categoryRepository.GetAsync(entry.Category, ct);
             if (resolver is null)
             {
@@ -350,4 +369,17 @@ public sealed class RetentionSweepEngine(
             entityFailures
         );
     }
+}
+
+/// <summary>
+/// Which retained entities a sweep covers. Direct calls sweep everything; the hosted
+/// worker sweeps tenanted entities per tenant and tenantless entities exactly once,
+/// attributed to <see cref="TenantContext.Tenantless"/>, so a multi-tenant tick does
+/// not re-sweep shared tables under every tenant's identity.
+/// </summary>
+public enum SweepEntityScope
+{
+    All,
+    TenantedOnly,
+    TenantlessOnly,
 }

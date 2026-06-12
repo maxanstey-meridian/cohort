@@ -119,6 +119,9 @@ public static class CohortModelBuilder
         builder.Property<DateTimeOffset?>("RemovedAt");
         builder.HasKey("HoldId");
         builder.HasIndex("TableName", "TenantId", "RecordId");
+        // The tenantless hold probe matches on (TableName, RecordId) only; the index
+        // above cannot serve it because RecordId sits behind the skipped TenantId column.
+        builder.HasIndex("TableName", "RecordId");
     }
 
     private static void ConfigureSweepRunColumns(EntityTypeBuilder builder)

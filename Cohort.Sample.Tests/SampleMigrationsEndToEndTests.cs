@@ -206,6 +206,16 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
                 StringComparison.Ordinal
             )
         );
+
+        var holdIndexes = await GetIndexDefinitionsAsync("retention_holds");
+        holdIndexes.Should().Contain(index =>
+            index.Contains("CREATE INDEX", StringComparison.Ordinal)
+            && index.Contains("(\"TableName\", \"TenantId\", \"RecordId\")", StringComparison.Ordinal)
+        );
+        holdIndexes.Should().Contain(index =>
+            index.Contains("CREATE INDEX", StringComparison.Ordinal)
+            && index.Contains("(\"TableName\", \"RecordId\")", StringComparison.Ordinal)
+        );
     }
 
     [Fact]

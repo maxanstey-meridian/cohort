@@ -66,41 +66,9 @@ public sealed class RetentionSweepEngine(
         var sweepId = Guid.NewGuid();
         var startedAt = DateTimeOffset.UtcNow;
         var batchSize = Math.Max(1, options?.CurrentValue.SweepBatchSize ?? new CohortOptions().SweepBatchSize);
-        var executionPlan = new List<(RetentionEntry Entry, RetentionResolutionContext Context, RetentionRule Rule)>();
+        var executionPlan = await BuildExecutionPlanAsync(tenant, now, scope, ct);
         var auditEvents = new List<SweepEvent>();
         var entityFailures = new List<string>();
-
-        foreach (var entry in registry.Scan().Values)
-        {
-            if (
-                (scope == SweepEntityScope.TenantedOnly && entry.Tenant is null)
-                || (scope == SweepEntityScope.TenantlessOnly && entry.Tenant is not null)
-            )
-            {
-                continue;
-            }
-
-            var resolver = await categoryRepository.GetAsync(entry.Category, ct);
-            if (resolver is null)
-            {
-                throw new InvalidOperationException(
-                    $"Retention category '{entry.Category}' for entity {entry.EntityType.FullName} could not be resolved at runtime."
-                );
-            }
-
-            var context = new RetentionResolutionContext(entry.Category, tenant, now, []);
-            var rule = await resolver.ResolveAsync(context, ct);
-            if (
-                rule.Strategy != Strategy.Exempt && !strategies.ContainsKey(rule.Strategy)
-            )
-            {
-                throw new InvalidOperationException(
-                    $"Retention strategy '{rule.Strategy}' is not registered for sweep execution."
-                );
-            }
-
-            executionPlan.Add((entry, context, rule));
-        }
 
         var connection = db.Database.GetDbConnection();
         var shouldCloseConnection = connection.State != ConnectionState.Open;
@@ -196,6 +164,177 @@ public sealed class RetentionSweepEngine(
         }
 
         return CreateResult(auditEvents, entityFailures);
+    }
+
+    /// <summary>
+    /// Counts what a sweep would do without mutating anything, while writing the same
+    /// audit trail as a real sweep (Started with DryRun, per-entity summaries with
+    /// predicted affected and measured held counts, Completed). This is the audited
+    /// counterpart of <see cref="IRetentionPreview"/>, which writes no audit at all.
+    /// </summary>
+    public async Task<RetentionSweepResult> DryRunAsync(
+        TenantContext tenant,
+        DateTimeOffset now,
+        SweepTriggerKind trigger,
+        SweepEntityScope scope = SweepEntityScope.All,
+        CancellationToken ct = default
+    )
+    {
+        ArgumentNullException.ThrowIfNull(tenant);
+        await validator.ValidateAsync(ct);
+
+        var sweepId = Guid.NewGuid();
+        var startedAt = DateTimeOffset.UtcNow;
+        var executionPlan = await BuildExecutionPlanAsync(tenant, now, scope, ct);
+        var auditEvents = new List<SweepEvent>();
+        var entityFailures = new List<string>();
+
+        var connection = db.Database.GetDbConnection();
+        var shouldCloseConnection = connection.State != ConnectionState.Open;
+
+        if (shouldCloseConnection)
+        {
+            await db.Database.OpenConnectionAsync(ct);
+        }
+
+        try
+        {
+            await WriteAuditEventAsync(
+                new SweepEvent.Started(sweepId, startedAt, trigger, DryRun: true, tenant.Id),
+                auditEvents,
+                ct
+            );
+
+            foreach (
+                var (entry, context, rule) in RetentionExecutionPlanOrderer.Order(
+                    db,
+                    executionPlan,
+                    item => item.Entry
+                )
+            )
+            {
+                try
+                {
+                    var eventAt = DateTimeOffset.UtcNow;
+                    var resolvedPeriod = CutoffCalculator.ResolveEffectivePeriod(rule.Period, rule.LegalMin);
+                    var affected = 0L;
+                    var heldCount = 0L;
+
+                    if (rule.Strategy != Strategy.Exempt)
+                    {
+                        var strategy = strategies[rule.Strategy];
+                        affected = await strategy.PreviewAsync(entry, rule, context, connection, ct);
+                        heldCount = await strategy.CountHeldAsync(entry, rule, context, connection, ct);
+                    }
+
+                    await WriteAuditEventAsync(
+                        new SweepEvent.EntitySummary(
+                            sweepId,
+                            eventAt,
+                            entry.EntityType,
+                            entry.Category,
+                            tenant.Id,
+                            rule.Strategy,
+                            resolvedPeriod,
+                            affected,
+                            heldCount,
+                            0,
+                            rule.Provenance
+                        ),
+                        auditEvents,
+                        ct
+                    );
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    entityFailures.Add($"{entry.EntityType.FullName}: {ex.Message}");
+                    logger?.LogError(
+                        ex,
+                        "Cohort dry run {SweepId} failed for entity {EntityType}; continuing with remaining entities.",
+                        sweepId,
+                        entry.EntityType.FullName
+                    );
+                }
+            }
+
+            var completedAt = DateTimeOffset.UtcNow;
+            var totalAffected = auditEvents.OfType<SweepEvent.EntitySummary>().Sum(summary => summary.Affected);
+            await WriteAuditEventAsync(
+                new SweepEvent.Completed(sweepId, completedAt, completedAt - startedAt, totalAffected),
+                auditEvents,
+                ct
+            );
+
+            if (entityFailures.Count > 0)
+            {
+                await WriteAuditEventAsync(
+                    new SweepEvent.Failed(
+                        sweepId,
+                        completedAt,
+                        Truncate(string.Join("; ", entityFailures), 4000)
+                    ),
+                    auditEvents,
+                    ct
+                );
+            }
+        }
+        finally
+        {
+            if (shouldCloseConnection)
+            {
+                await db.Database.CloseConnectionAsync();
+            }
+        }
+
+        return CreateResult(auditEvents, entityFailures);
+    }
+
+    private async Task<List<(RetentionEntry Entry, RetentionResolutionContext Context, RetentionRule Rule)>> BuildExecutionPlanAsync(
+        TenantContext tenant,
+        DateTimeOffset now,
+        SweepEntityScope scope,
+        CancellationToken ct
+    )
+    {
+        var executionPlan = new List<(RetentionEntry Entry, RetentionResolutionContext Context, RetentionRule Rule)>();
+
+        foreach (var entry in registry.Scan().Values)
+        {
+            if (
+                (scope == SweepEntityScope.TenantedOnly && entry.Tenant is null)
+                || (scope == SweepEntityScope.TenantlessOnly && entry.Tenant is not null)
+            )
+            {
+                continue;
+            }
+
+            var resolver = await categoryRepository.GetAsync(entry.Category, ct);
+            if (resolver is null)
+            {
+                throw new InvalidOperationException(
+                    $"Retention category '{entry.Category}' for entity {entry.EntityType.FullName} could not be resolved at runtime."
+                );
+            }
+
+            var context = new RetentionResolutionContext(entry.Category, tenant, now, []);
+            var rule = await resolver.ResolveAsync(context, ct);
+            if (
+                rule.Strategy != Strategy.Exempt && !strategies.ContainsKey(rule.Strategy)
+            )
+            {
+                throw new InvalidOperationException(
+                    $"Retention strategy '{rule.Strategy}' is not registered for sweep execution."
+                );
+            }
+
+            executionPlan.Add((entry, context, rule));
+        }
+
+        return executionPlan;
     }
 
     private async Task SweepEntityAsync(

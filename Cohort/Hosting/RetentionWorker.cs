@@ -190,23 +190,6 @@ public sealed class RetentionWorker(
         var validator = services.GetRequiredService<RetentionStartupValidator>();
         await validator.ValidateAsync(ct);
 
-        if (dryRun)
-        {
-            foreach (var tenant in tenants)
-            {
-                var preview = services.GetRequiredService<IRetentionPreview>();
-                var result = await preview.PreviewAsync(tenant, DateTimeOffset.UtcNow, ct);
-
-                logger.LogInformation(
-                    "Cohort worker completed dry-run iteration for tenant {TenantId} with {EntityCount} entity counts.",
-                    tenant.Id,
-                    result.Counts.Count
-                );
-            }
-
-            return;
-        }
-
         var entries = services.GetRequiredService<RetentionRegistry>().Scan().Values;
         var engine = services.GetRequiredService<RetentionSweepEngine>();
 
@@ -219,16 +202,17 @@ public sealed class RetentionWorker(
                     return;
                 }
 
-                var result = await engine.SweepAsync(
+                var result = await RunPassAsync(
+                    engine,
                     tenant,
-                    DateTimeOffset.UtcNow,
-                    SweepTriggerKind.Scheduled,
                     SweepEntityScope.TenantedOnly,
+                    dryRun,
                     ct
                 );
 
                 logger.LogInformation(
-                    "Cohort worker completed sweep iteration for tenant {TenantId} with {EntityCount} entity counts.",
+                    "Cohort worker completed {Mode} iteration for tenant {TenantId} with {EntityCount} entity counts.",
+                    dryRun ? "dry-run" : "sweep",
                     tenant.Id,
                     result.Counts.Count
                 );
@@ -245,19 +229,35 @@ public sealed class RetentionWorker(
                 return;
             }
 
-            var result = await engine.SweepAsync(
+            var result = await RunPassAsync(
+                engine,
                 TenantContext.Tenantless,
-                DateTimeOffset.UtcNow,
-                SweepTriggerKind.Scheduled,
                 SweepEntityScope.TenantlessOnly,
+                dryRun,
                 ct
             );
 
             logger.LogInformation(
-                "Cohort worker completed tenantless sweep with {EntityCount} entity counts.",
+                "Cohort worker completed tenantless {Mode} with {EntityCount} entity counts.",
+                dryRun ? "dry run" : "sweep",
                 result.Counts.Count
             );
         }
+    }
+
+    private static Task<RetentionSweepResult> RunPassAsync(
+        RetentionSweepEngine engine,
+        TenantContext tenant,
+        SweepEntityScope scope,
+        bool dryRun,
+        CancellationToken ct
+    )
+    {
+        // Dry runs go through the engine, not IRetentionPreview, so scheduled dry runs
+        // leave the same audit trail as real sweeps (with sweep_run.DryRun set).
+        return dryRun
+            ? engine.DryRunAsync(tenant, DateTimeOffset.UtcNow, SweepTriggerKind.Scheduled, scope, ct)
+            : engine.SweepAsync(tenant, DateTimeOffset.UtcNow, SweepTriggerKind.Scheduled, scope, ct);
     }
 
     private bool KillSwitchEngagedMidIteration()

@@ -334,7 +334,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
     }
 
     [Fact]
-    public async Task Worker_Uses_Preview_When_DryRun_Is_Enabled_And_Leaves_Rows_Untouched()
+    public async Task Worker_DryRun_Leaves_Rows_Untouched_And_Writes_An_Audited_DryRun_Run()
     {
         var tenant = CreateTenant();
         var settings = CreateSettings(
@@ -356,13 +356,62 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
 
         await host.Host.StartAsync();
         await WaitUntilAsync(
-            () => Task.FromResult(categoryRepository.GetAsyncCount > 0),
+            async () => categoryRepository.GetAsyncCount > 0 && await DryRunSweepRunExistsAsync(),
             TimeSpan.FromSeconds(8)
         );
 
         await host.Host.StopAsync();
 
         (await NoteExistsAsync("dry-run-note")).Should().BeTrue();
+
+        // Scheduled dry runs leave a real audit trail: a sweep_run row with DryRun set
+        // and per-entity summaries carrying the predicted counts.
+        var dryRunSummaries = await LoadDryRunNoteSummariesAsync();
+        dryRunSummaries.Should().NotBeEmpty();
+        dryRunSummaries.Should().Contain(affected => affected >= 1);
+    }
+
+    private async Task<bool> DryRunSweepRunExistsAsync()
+    {
+        await using var connection = new NpgsqlConnection(fixture.ConnectionString);
+        await connection.OpenAsync();
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM "sweep_run"
+                WHERE "DryRun" = TRUE AND "CompletedAt" IS NOT NULL
+            )
+            """;
+
+        return (bool)(await command.ExecuteScalarAsync())!;
+    }
+
+    private async Task<IReadOnlyList<long>> LoadDryRunNoteSummariesAsync()
+    {
+        await using var connection = new NpgsqlConnection(fixture.ConnectionString);
+        await connection.OpenAsync();
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT summary."Affected"
+            FROM "sweep_run_entity_summary" AS summary
+            INNER JOIN "sweep_run" AS run ON run."SweepId" = summary."SweepId"
+            WHERE run."DryRun" = TRUE AND summary."EntityType" = @entityType
+            """;
+        command.Parameters.AddWithValue("entityType", typeof(Note).FullName ?? nameof(Note));
+
+        var affectedCounts = new List<long>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            affectedCounts.Add(reader.GetInt64(0));
+        }
+
+        return affectedCounts;
     }
 
     [Fact]

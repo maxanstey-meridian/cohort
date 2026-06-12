@@ -64,7 +64,7 @@ public sealed class PackageReleaseContractTests
 
         try
         {
-            var packageFileName = $"Cohort.{Artifact.Value.PackageVersion}.nupkg";
+            var packageFileName = $"Cohort.{Artifact.Value.PackedVersion}.nupkg";
             File.WriteAllBytes(
                 Path.Combine(packageSourceDirectory, packageFileName),
                 Artifact.Value.PackageBytes
@@ -95,7 +95,7 @@ public sealed class PackageReleaseContractTests
                     <Nullable>enable</Nullable>
                   </PropertyGroup>
                   <ItemGroup>
-                    <PackageReference Include="Cohort" Version="{{Artifact.Value.PackageVersion}}" />
+                    <PackageReference Include="Cohort" Version="{{Artifact.Value.PackedVersion}}" />
                   </ItemGroup>
                 </Project>
                 """
@@ -266,6 +266,10 @@ public sealed class PackageReleaseContractTests
             process.StartInfo.ArgumentList.Add("Release");
             process.StartInfo.ArgumentList.Add("-o");
             process.StartInfo.ArgumentList.Add(outputDirectory);
+            // Packed under a prerelease suffix so the consumer restore can never be
+            // shadowed by an already-published package of the same version sitting in
+            // the global packages folder (used as a restore fallback for offline deps).
+            process.StartInfo.ArgumentList.Add($"/p:Version={ReadCsprojVersion(projectPath)}-releasegate");
 
             process.Start();
             var standardOutput = process.StandardOutput.ReadToEnd();
@@ -305,15 +309,14 @@ public sealed class PackageReleaseContractTests
             }
 
             var packageBytes = File.ReadAllBytes(packagePath);
-            var version = Version.Parse(
-                XDocument.Parse(nuspec)
-                    .Root!
-                    .Descendants()
-                    .Single(element => element.Name.LocalName == "version")
-                    .Value
-            );
+            var packedVersion = XDocument.Parse(nuspec)
+                .Root!
+                .Descendants()
+                .Single(element => element.Name.LocalName == "version")
+                .Value;
+            var version = Version.Parse(packedVersion.Split('-')[0]);
 
-            return new PackedArtifact(version, readme, packageBytes);
+            return new PackedArtifact(version, packedVersion, readme, packageBytes);
         }
         finally
         {
@@ -366,5 +369,19 @@ public sealed class PackageReleaseContractTests
         return Path.Combine(profile, ".nuget", "packages");
     }
 
-    private sealed record PackedArtifact(Version PackageVersion, string Readme, byte[] PackageBytes);
+    private static string ReadCsprojVersion(string projectPath)
+    {
+        return XDocument.Load(projectPath)
+            .Root!
+            .Descendants("Version")
+            .Single()
+            .Value;
+    }
+
+    private sealed record PackedArtifact(
+        Version PackageVersion,
+        string PackedVersion,
+        string Readme,
+        byte[] PackageBytes
+    );
 }

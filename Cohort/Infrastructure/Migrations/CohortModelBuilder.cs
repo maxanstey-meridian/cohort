@@ -26,6 +26,7 @@ public static class CohortModelBuilder
     {
         if (TryFindEntityMappedToTable(modelBuilder, CohortTableNames.RetentionHolds) is { } existing)
         {
+            EnsureAdoptableKey(existing, CohortTableNames.RetentionHolds, "HoldId");
             ConfigureRetentionHoldColumns(modelBuilder.Entity(existing.ClrType));
             return;
         }
@@ -44,6 +45,7 @@ public static class CohortModelBuilder
     {
         if (TryFindEntityMappedToTable(modelBuilder, CohortTableNames.SweepRun) is { } existing)
         {
+            EnsureAdoptableKey(existing, CohortTableNames.SweepRun, "SweepId");
             ConfigureSweepRunColumns(modelBuilder.Entity(existing.ClrType));
             return;
         }
@@ -64,6 +66,15 @@ public static class CohortModelBuilder
             TryFindEntityMappedToTable(modelBuilder, CohortTableNames.SweepRunEntitySummary) is { } existing
         )
         {
+            EnsureAdoptableKey(
+                existing,
+                CohortTableNames.SweepRunEntitySummary,
+                "SweepId",
+                "EntityType",
+                "Category",
+                "TenantId",
+                "Strategy"
+            );
             ConfigureSweepRunEntitySummaryColumns(modelBuilder.Entity(existing.ClrType));
             return;
         }
@@ -84,6 +95,7 @@ public static class CohortModelBuilder
             TryFindEntityMappedToTable(modelBuilder, CohortTableNames.SweepRunRowDetail) is { } existing
         )
         {
+            EnsureAdoptableKey(existing, CohortTableNames.SweepRunRowDetail, "Id");
             ConfigureSweepRunRowDetailColumns(modelBuilder.Entity(existing.ClrType));
             return;
         }
@@ -200,6 +212,34 @@ public static class CohortModelBuilder
             .HasForeignKey(nameof(SweepRowHandlerStatusEntity.SweepRunRowDetailId))
             .HasPrincipalKey("Id")
             .OnDelete(DeleteBehavior.Cascade);
+    }
+
+    /// <summary>
+    /// Adopting a host entity mapped to a Cohort table name is only safe when the host
+    /// already declared the key Cohort expects (or none yet). Anything else means a
+    /// table-name collision, and reconfiguring would silently re-key the host's entity.
+    /// </summary>
+    private static void EnsureAdoptableKey(
+        Microsoft.EntityFrameworkCore.Metadata.IMutableEntityType existing,
+        string tableName,
+        params string[] expectedKeyProperties
+    )
+    {
+        var declaredKey = existing.FindPrimaryKey();
+        if (declaredKey is null)
+        {
+            return;
+        }
+
+        var keyNames = declaredKey.Properties.Select(property => property.Name).ToArray();
+        if (keyNames.SequenceEqual(expectedKeyProperties, StringComparer.Ordinal))
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"Entity {existing.ClrType.FullName} is mapped to table '{tableName}', which Cohort manages, but its primary key ({string.Join(", ", keyNames)}) does not match the key Cohort expects ({string.Join(", ", expectedKeyProperties)}). This looks like a table-name collision rather than an intentional adoption; rename the entity's table, or map it with Cohort's key shape."
+        );
     }
 
     private static Microsoft.EntityFrameworkCore.Metadata.IMutableEntityType? TryFindEntityMappedToTable(

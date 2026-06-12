@@ -145,7 +145,7 @@ public sealed class PackageReleaseContractTests
                         DateTimeOffset,
                         DbConnection,
                         CancellationToken,
-                        Task<int>
+                        Task<long>
                     > method
                 ) => method;
 

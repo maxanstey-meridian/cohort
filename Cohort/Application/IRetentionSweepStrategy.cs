@@ -8,7 +8,7 @@ public interface IRetentionSweepStrategy
 {
     public Strategy HandlesStrategy { get; }
 
-    public Task<int> PreviewAsync(
+    public Task<long> PreviewAsync(
         RetentionEntry entry,
         RetentionRule rule,
         RetentionResolutionContext ctx,
@@ -31,7 +31,7 @@ public interface IRetentionSweepStrategy
     /// strategy) but excluded by an active legal hold. Measured directly so audit
     /// summaries report holds rather than inferring them from candidate arithmetic.
     /// </summary>
-    public Task<int> CountHeldAsync(
+    public Task<long> CountHeldAsync(
         RetentionEntry entry,
         RetentionRule rule,
         RetentionResolutionContext ctx,
@@ -39,7 +39,7 @@ public interface IRetentionSweepStrategy
         CancellationToken ct
     );
 
-    public Task<int> PreviewEraseAsync(
+    public Task<long> PreviewEraseAsync(
         RetentionEntry entry,
         RetentionRule rule,
         ErasureSubjectPredicate predicate,
@@ -54,7 +54,7 @@ public interface IRetentionSweepStrategy
     /// eligible for this strategy) but excluded by an active legal hold. The erasure
     /// counterpart of <see cref="CountHeldAsync"/>.
     /// </summary>
-    public Task<int> CountHeldForEraseAsync(
+    public Task<long> CountHeldForEraseAsync(
         RetentionEntry entry,
         RetentionRule rule,
         ErasureSubjectPredicate predicate,

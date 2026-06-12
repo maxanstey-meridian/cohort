@@ -16,7 +16,7 @@ public sealed record EntitySweepCount(
     string Category,
     Guid TenantId,
     Strategy Strategy,
-    int Affected,
-    int HeldCount = 0,
-    int SkippedCount = 0
+    long Affected,
+    long HeldCount = 0,
+    long SkippedCount = 0
 );

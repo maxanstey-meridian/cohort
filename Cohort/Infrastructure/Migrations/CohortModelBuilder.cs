@@ -130,7 +130,7 @@ public static class CohortModelBuilder
         builder.Property<int>("TriggerKind").IsRequired();
         builder.Property<bool>("DryRun").IsRequired();
         builder.Property<Guid>("TenantId").IsRequired();
-        builder.Property<int?>("TotalAffected");
+        builder.Property<long?>("TotalAffected");
         builder.Property<DateTimeOffset?>("FailedAt");
         builder.Property<string?>("Error");
         builder.HasKey("SweepId");
@@ -145,9 +145,9 @@ public static class CohortModelBuilder
         builder.Property<Guid>("TenantId").IsRequired();
         builder.Property<int>("Strategy").IsRequired();
         builder.Property<TimeSpan>("ResolvedPeriod").IsRequired();
-        builder.Property<int>("Affected").IsRequired();
-        builder.Property<int>("HeldCount").IsRequired();
-        builder.Property<int>("SkippedCount").IsRequired();
+        builder.Property<long>("Affected").IsRequired();
+        builder.Property<long>("HeldCount").IsRequired();
+        builder.Property<long>("SkippedCount").IsRequired();
         builder.Property<string>("RuleSource");
         builder.Property<string>("RuleReason");
         builder.HasKey("SweepId", "EntityType", "Category", "TenantId", "Strategy");

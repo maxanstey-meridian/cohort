@@ -39,7 +39,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
 
     public Strategy HandlesStrategy => Strategy.Anonymise;
 
-    public async Task<int> PreviewAsync(
+    public async Task<long> PreviewAsync(
         RetentionEntry entry,
         RetentionRule rule,
         RetentionResolutionContext ctx,
@@ -65,7 +65,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         );
     }
 
-    public async Task<int> CountHeldAsync(
+    public async Task<long> CountHeldAsync(
         RetentionEntry entry,
         RetentionRule rule,
         RetentionResolutionContext ctx,
@@ -121,7 +121,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         );
     }
 
-    public async Task<int> PreviewEraseAsync(
+    public async Task<long> PreviewEraseAsync(
         RetentionEntry entry,
         RetentionRule rule,
         ErasureSubjectPredicate predicate,
@@ -153,7 +153,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         );
     }
 
-    public async Task<int> CountHeldForEraseAsync(
+    public async Task<long> CountHeldForEraseAsync(
         RetentionEntry entry,
         RetentionRule rule,
         ErasureSubjectPredicate predicate,

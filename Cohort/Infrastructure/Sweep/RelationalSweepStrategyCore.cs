@@ -33,7 +33,7 @@ internal sealed class RelationalSweepStrategyCore(
             BindingFlags.Instance | BindingFlags.NonPublic
         )!;
 
-    public async Task<int> PreviewAsync(
+    public async Task<long> PreviewAsync(
         RetentionEntry entry,
         RetentionRule rule,
         RetentionResolutionContext ctx,
@@ -64,10 +64,10 @@ internal sealed class RelationalSweepStrategyCore(
         AddTenantParameter(command, entry, ctx.Tenant.Id);
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
 
-        return Convert.ToInt32(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
+        return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
 
-    public async Task<int> CountHeldAsync(
+    public async Task<long> CountHeldAsync(
         RetentionEntry entry,
         RetentionRule rule,
         RetentionResolutionContext ctx,
@@ -98,7 +98,7 @@ internal sealed class RelationalSweepStrategyCore(
         AddTenantParameter(command, entry, ctx.Tenant.Id);
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
 
-        return Convert.ToInt32(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
+        return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
 
     public async Task<SweepExecutionResult> SweepAsync(
@@ -179,7 +179,7 @@ internal sealed class RelationalSweepStrategyCore(
         );
     }
 
-    public async Task<int> PreviewEraseAsync(
+    public async Task<long> PreviewEraseAsync(
         RetentionEntry entry,
         RetentionRule rule,
         ErasureSubjectPredicate predicate,
@@ -233,10 +233,10 @@ internal sealed class RelationalSweepStrategyCore(
         command.Parameters.Add(CreateParameter(command, "candidateIds", candidateRecordIds.ToArray()));
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
 
-        return Convert.ToInt32(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
+        return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
 
-    public async Task<int> CountHeldForEraseAsync(
+    public async Task<long> CountHeldForEraseAsync(
         RetentionEntry entry,
         RetentionRule rule,
         ErasureSubjectPredicate predicate,
@@ -272,7 +272,7 @@ internal sealed class RelationalSweepStrategyCore(
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         command.Parameters.Add(CreateParameter(command, "holdTableName", entry.TableName));
 
-        return Convert.ToInt32(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
+        return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
 
     public async Task<SweepExecutionResult> EraseAsync(

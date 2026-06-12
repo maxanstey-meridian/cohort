@@ -569,7 +569,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
             (SweepTriggerKind)reader.GetInt32(4),
             reader.GetBoolean(5),
             reader.GetGuid(6),
-            reader.GetInt32(7)
+            reader.GetInt64(7)
         );
     }
 
@@ -597,9 +597,9 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                     reader.GetGuid(3),
                     (Strategy)reader.GetInt32(4),
                     reader.GetFieldValue<TimeSpan>(5),
-                    reader.GetInt32(6),
-                    reader.GetInt32(7),
-                    reader.GetInt32(8),
+                    reader.GetInt64(6),
+                    reader.GetInt64(7),
+                    reader.GetInt64(8),
                     reader.IsDBNull(9) ? null : reader.GetString(9),
                     reader.IsDBNull(10) ? null : reader.GetString(10)
                 )
@@ -726,7 +726,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         SweepTriggerKind Trigger,
         bool DryRun,
         Guid TenantId,
-        int TotalAffected
+        long TotalAffected
     );
 
     private sealed record SweepRunEntitySummaryRow(
@@ -736,9 +736,9 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         Guid TenantId,
         Strategy Strategy,
         TimeSpan ResolvedPeriod,
-        int Affected,
-        int HeldCount,
-        int SkippedCount = 0,
+        long Affected,
+        long HeldCount,
+        long SkippedCount = 0,
         string? RuleSource = null,
         string? RuleReason = null
     );

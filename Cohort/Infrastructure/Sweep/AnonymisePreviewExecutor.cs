@@ -7,7 +7,7 @@ namespace Cohort.Infrastructure.Sweep;
 
 internal sealed class AnonymisePreviewExecutor
 {
-    internal async Task<int> ExecuteAsync(
+    internal async Task<long> ExecuteAsync(
         RetentionEntry entry,
         SqlFilter filter,
         TenantContext tenant,
@@ -21,10 +21,10 @@ internal sealed class AnonymisePreviewExecutor
         AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
         AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName);
 
-        return Convert.ToInt32(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
+        return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
 
-    internal async Task<int> ExecuteHeldCountAsync(
+    internal async Task<long> ExecuteHeldCountAsync(
         RetentionEntry entry,
         SqlFilter filter,
         TenantContext tenant,
@@ -38,6 +38,6 @@ internal sealed class AnonymisePreviewExecutor
         AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
         AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName);
 
-        return Convert.ToInt32(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
+        return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
 }

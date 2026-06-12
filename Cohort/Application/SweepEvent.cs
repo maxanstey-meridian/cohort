@@ -20,9 +20,9 @@ public abstract record SweepEvent
         Guid TenantId,
         Strategy Strategy,
         TimeSpan ResolvedPeriod,
-        int Affected,
-        int HeldCount,
-        int SkippedCount = 0,
+        long Affected,
+        long HeldCount,
+        long SkippedCount = 0,
         RetentionRuleProvenance? Provenance = null
     ) : SweepEvent;
 
@@ -40,7 +40,7 @@ public abstract record SweepEvent
         Guid SweepId,
         DateTimeOffset At,
         TimeSpan Duration,
-        int TotalAffected
+        long TotalAffected
     ) : SweepEvent;
 
     public sealed record Failed(

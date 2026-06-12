@@ -204,9 +204,9 @@ public sealed class RetentionErasureService(
         var eventAt = DateTimeOffset.UtcNow;
         var resolvedPeriod = CutoffCalculator.ResolveEffectivePeriod(rule.Period, rule.LegalMin);
         var affectedRecordIds = new List<string>();
-        var affectedCount = 0;
-        var skippedCount = 0;
-        var heldCount = 0;
+        var affectedCount = 0L;
+        var skippedCount = 0L;
+        var heldCount = 0L;
         var rowDetailsPersisted = false;
 
         if (rule.Strategy != Strategy.Exempt)

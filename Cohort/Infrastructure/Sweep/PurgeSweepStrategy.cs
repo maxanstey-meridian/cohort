@@ -27,7 +27,7 @@ public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
 
     public Strategy HandlesStrategy => Strategy.Purge;
 
-    public Task<int> PreviewAsync(
+    public Task<long> PreviewAsync(
         RetentionEntry entry,
         RetentionRule rule,
         RetentionResolutionContext ctx,
@@ -38,7 +38,7 @@ public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
         return core.PreviewAsync(entry, rule, ctx, conn, ct);
     }
 
-    public Task<int> CountHeldAsync(
+    public Task<long> CountHeldAsync(
         RetentionEntry entry,
         RetentionRule rule,
         RetentionResolutionContext ctx,
@@ -62,7 +62,7 @@ public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
         return core.SweepAsync(entry, rule, ctx, conn, transaction, ct, execution);
     }
 
-    public Task<int> PreviewEraseAsync(
+    public Task<long> PreviewEraseAsync(
         RetentionEntry entry,
         RetentionRule rule,
         ErasureSubjectPredicate predicate,
@@ -75,7 +75,7 @@ public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
         return core.PreviewEraseAsync(entry, rule, predicate, tenant, now, conn, ct);
     }
 
-    public Task<int> CountHeldForEraseAsync(
+    public Task<long> CountHeldForEraseAsync(
         RetentionEntry entry,
         RetentionRule rule,
         ErasureSubjectPredicate predicate,

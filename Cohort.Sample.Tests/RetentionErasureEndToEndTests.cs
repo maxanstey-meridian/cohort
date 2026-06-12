@@ -2735,7 +2735,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             (SweepTriggerKind)reader.GetInt32(4),
             reader.GetBoolean(5),
             reader.GetGuid(6),
-            reader.GetInt32(7)
+            reader.GetInt64(7)
         );
     }
 
@@ -2763,9 +2763,9 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     reader.GetGuid(3),
                     (Strategy)reader.GetInt32(4),
                     reader.GetFieldValue<TimeSpan>(5),
-                    reader.GetInt32(6),
-                    reader.GetInt32(7),
-                    reader.GetInt32(8),
+                    reader.GetInt64(6),
+                    reader.GetInt64(7),
+                    reader.GetInt64(8),
                     reader.IsDBNull(9) ? null : reader.GetString(9),
                     reader.IsDBNull(10) ? null : reader.GetString(10)
                 )
@@ -2898,7 +2898,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         SweepTriggerKind Trigger,
         bool DryRun,
         Guid TenantId,
-        int TotalAffected
+        long TotalAffected
     );
 
     private sealed record SweepRunEntitySummaryRow(
@@ -2908,9 +2908,9 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         Guid TenantId,
         Strategy Strategy,
         TimeSpan ResolvedPeriod,
-        int Affected,
-        int HeldCount,
-        int SkippedCount = 0,
+        long Affected,
+        long HeldCount,
+        long SkippedCount = 0,
         string? RuleSource = null,
         string? RuleReason = null
     );
@@ -2930,9 +2930,9 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         Guid TenantId,
         Strategy Strategy,
         TimeSpan ResolvedPeriod,
-        int Affected,
-        int HeldCount,
-        int SkippedCount
+        long Affected,
+        long HeldCount,
+        long SkippedCount
     );
 
     private sealed class StaticOptionsMonitor<T>(T currentValue) : IOptionsMonitor<T>
@@ -2955,7 +2955,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         public Strategy HandlesStrategy => Strategy.Purge;
         public List<ErasureSubjectPredicate> CapturedPredicates { get; } = [];
 
-        public Task<int> PreviewAsync(
+        public Task<long> PreviewAsync(
             RetentionEntry entry,
             RetentionRule rule,
             RetentionResolutionContext ctx,
@@ -2979,7 +2979,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             throw new NotSupportedException();
         }
 
-        public Task<int> CountHeldAsync(
+        public Task<long> CountHeldAsync(
             RetentionEntry entry,
             RetentionRule rule,
             RetentionResolutionContext ctx,
@@ -2992,7 +2992,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
 
 
-        public Task<int> CountHeldForEraseAsync(
+        public Task<long> CountHeldForEraseAsync(
             RetentionEntry entry,
             RetentionRule rule,
             ErasureSubjectPredicate predicate,
@@ -3002,10 +3002,10 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             CancellationToken ct
         )
         {
-            return Task.FromResult(0);
+            return Task.FromResult(0L);
         }
 
-        public Task<int> PreviewEraseAsync(
+        public Task<long> PreviewEraseAsync(
             RetentionEntry entry,
             RetentionRule rule,
             ErasureSubjectPredicate predicate,
@@ -3016,7 +3016,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         )
         {
             CapturedPredicates.Add(predicate);
-            return Task.FromResult(0);
+            return Task.FromResult(0L);
         }
 
         public Task<SweepExecutionResult> EraseAsync(

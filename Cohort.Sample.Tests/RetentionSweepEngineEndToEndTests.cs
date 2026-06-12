@@ -665,7 +665,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         public DbTransaction? ReceivedTransaction { get; private set; }
         public DbTransaction? CurrentEfTransactionAtExecution { get; private set; }
 
-        public Task<int> PreviewAsync(
+        public Task<long> PreviewAsync(
             RetentionEntry entry,
             RetentionRule rule,
             RetentionResolutionContext ctx,
@@ -691,7 +691,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             return Task.FromResult<SweepExecutionResult>(new([], 0));
         }
 
-        public Task<int> CountHeldAsync(
+        public Task<long> CountHeldAsync(
             RetentionEntry entry,
             RetentionRule rule,
             RetentionResolutionContext ctx,
@@ -699,12 +699,12 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             CancellationToken ct
         )
         {
-            return Task.FromResult(0);
+            return Task.FromResult(0L);
         }
 
 
 
-        public Task<int> CountHeldForEraseAsync(
+        public Task<long> CountHeldForEraseAsync(
             RetentionEntry entry,
             RetentionRule rule,
             ErasureSubjectPredicate predicate,
@@ -714,10 +714,10 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             CancellationToken ct
         )
         {
-            return Task.FromResult(0);
+            return Task.FromResult(0L);
         }
 
-        public Task<int> PreviewEraseAsync(
+        public Task<long> PreviewEraseAsync(
             RetentionEntry entry,
             RetentionRule rule,
             ErasureSubjectPredicate predicate,

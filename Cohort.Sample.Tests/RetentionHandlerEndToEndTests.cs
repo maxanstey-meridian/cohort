@@ -260,6 +260,131 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Explicit_Handler_Identity_Is_Persisted_And_Dispatched_Under_The_Registered_Uuid()
+    {
+        var tenantId = Guid.NewGuid();
+        var fileId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var cleanupStore = new BlobCleanupStoreSpy();
+        var handlerIdentity = Guid.Parse("0d4dbcc6-9876-4ab8-8e4f-04bcd9a3a1c1");
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.BlobBackedFiles.Add(
+                new BlobBackedFile
+                {
+                    Id = fileId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    StoragePath = "blob://tenant-a/stable/identity.pdf",
+                    OriginalFileName = "identity.pdf",
+                    ContentType = "application/pdf",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
+            {
+                services.AddSingleton(cleanupStore);
+                services.AddRowHandler<BlobBackedFile, BlobBackedFileCleanupHandler>(
+                    identity: handlerIdentity
+                );
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        // Queued work is persisted under the registered UUID, not the CLR type name, so
+        // renaming the handler class cannot strand it.
+        var queuedStatuses = await LoadHandlerStatusesAsync(result.SweepId);
+        queuedStatuses.Should().ContainSingle();
+        queuedStatuses[0].HandlerType.Should().Be(handlerIdentity.ToString("D"));
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        cleanupStore.DeletedPaths.Should().Equal("blob://tenant-a/stable/identity.pdf");
+
+        var completedStatuses = await LoadHandlerStatusesAsync(result.SweepId);
+        completedStatuses.Should().ContainSingle();
+        completedStatuses[0].State.Should().Be(SucceededState);
+    }
+
+    [Fact]
+    public async Task Unknown_Persisted_Handler_Identity_DeadLetters_Immediately_Instead_Of_Burning_Retries()
+    {
+        var tenantId = Guid.NewGuid();
+        var fileId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var cleanupStore = new BlobCleanupStoreSpy();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.BlobBackedFiles.Add(
+                new BlobBackedFile
+                {
+                    Id = fileId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    StoragePath = "blob://tenant-a/renamed/handler.pdf",
+                    OriginalFileName = "handler.pdf",
+                    ContentType = "application/pdf",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxAttempts"] = "5",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(cleanupStore);
+                services.AddRowHandler<BlobBackedFile, BlobBackedFileCleanupHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        // Simulates renaming the handler class without an explicit identity: the
+        // persisted name no longer matches any registration.
+        await RewriteHandlerTypeAsync(result.SweepId, "Legacy.Renamed.CleanupHandler");
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            await dispatcher.FlushAsync();
+        });
+
+        cleanupStore.DeletedPaths.Should().BeEmpty();
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().ContainSingle();
+        statuses[0].State.Should().Be(DeadLetteredState);
+        // One attempt, not the full MaxAttempts budget: an unregistered handler cannot
+        // heal by retrying.
+        statuses[0].Attempt.Should().Be(1);
+        statuses[0].CompletedAt.Should().NotBeNull();
+        statuses[0].LastError.Should().Contain("is not registered");
+        statuses[0].LastError.Should().Contain("explicit identity");
+    }
+
+    [Fact]
     public async Task FlushAsync_Deferred_Row_Handler_Waits_For_Sweep_Completion_But_Immediate_Does_Not()
     {
         var immediateTenantId = Guid.NewGuid();
@@ -3158,6 +3283,24 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     {
         using var db = Host.CreateDbContext();
         return db.Database.GetConnectionString()!;
+    }
+
+    private async Task RewriteHandlerTypeAsync(Guid sweepId, string handlerType)
+    {
+        await using var connection = new NpgsqlConnection(GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            UPDATE "sweep_row_handler_status" AS status
+            SET "HandlerType" = @handlerType
+            FROM "sweep_run_row_detail" AS detail
+            WHERE detail."Id" = status."SweepRunRowDetailId"
+              AND detail."SweepId" = @sweepId
+            """;
+        command.Parameters.AddWithValue("handlerType", handlerType);
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        (await command.ExecuteNonQueryAsync()).Should().BeGreaterThan(0);
     }
 
     private async Task SetHandlerStatusInFlightAsync(Guid sweepId, DateTimeOffset claimedAt)

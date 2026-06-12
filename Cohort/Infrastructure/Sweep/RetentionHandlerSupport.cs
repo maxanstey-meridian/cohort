@@ -35,21 +35,24 @@ internal static class RetentionHandlerSupport
             .Where(registration => registration.EntityType == entityType)
             .ToDictionary(
                 registration => registration.HandlerType,
-                registration => registration.DispatchPhase
+                registration => registration
             );
 
         return registeredHandlers
             .Cast<object>()
             .Select(handler =>
-                new ResolvedRetentionHandler(
+            {
+                var registration = metadata is not null
+                    && metadata.TryGetValue(handler.GetType(), out var matched)
+                        ? matched
+                        : null;
+                return new ResolvedRetentionHandler(
                     handler,
                     handlerInterface,
-                    metadata is not null
-                    && metadata.TryGetValue(handler.GetType(), out var dispatchPhase)
-                        ? dispatchPhase
-                        : RowHandlerDispatchPhase.Immediate
-                )
-            )
+                    registration?.DispatchPhase ?? RowHandlerDispatchPhase.Immediate,
+                    registration?.Identity
+                );
+            })
             .OrderBy(handler => RowHandlerPriorityAttribute.GetPriority(handler.HandlerType))
             .ThenBy(handler => handler.HandlerType.FullName, StringComparer.Ordinal)
             .ToArray();
@@ -281,7 +284,7 @@ internal static class RetentionHandlerSupport
             )
             """;
         command.Parameters.Add(CreateParameter(command, "rowDetailId", rowDetailId));
-        command.Parameters.Add(CreateParameter(command, "handlerType", handler.HandlerTypeName));
+        command.Parameters.Add(CreateParameter(command, "handlerType", handler.HandlerIdentity));
         command.Parameters.Add(
             CreateParameter(command, "dispatchPhase", (int)handler.DispatchPhase)
         );
@@ -335,7 +338,7 @@ internal static class RetentionHandlerSupport
             )
             """;
         command.Parameters.Add(CreateParameter(command, "rowDetailId", rowDetailId));
-        command.Parameters.Add(CreateParameter(command, "handlerType", handler.HandlerTypeName));
+        command.Parameters.Add(CreateParameter(command, "handlerType", handler.HandlerIdentity));
         command.Parameters.Add(
             CreateParameter(command, "dispatchPhase", (int)handler.DispatchPhase)
         );
@@ -378,7 +381,8 @@ internal static class RetentionHandlerSupport
 internal sealed class ResolvedRetentionHandler(
     object instance,
     Type handlerInterface,
-    RowHandlerDispatchPhase dispatchPhase
+    RowHandlerDispatchPhase dispatchPhase,
+    Guid? identity = null
 )
 {
     public object Instance { get; } = instance;
@@ -386,6 +390,15 @@ internal sealed class ResolvedRetentionHandler(
     public Type HandlerType { get; } = instance.GetType();
 
     public string HandlerTypeName { get; } = RetentionTypeIdentity.GetPersistedName(instance.GetType());
+
+    /// <summary>
+    /// What queued work is persisted and matched under: the registration's explicit
+    /// UUID when given, otherwise the CLR type name. Explicit identities survive class
+    /// renames; type-name identities do not.
+    /// </summary>
+    public string HandlerIdentity { get; } =
+        identity?.ToString("D")
+        ?? RetentionTypeIdentity.GetPersistedName(instance.GetType());
 
     public RowHandlerDispatchPhase DispatchPhase { get; } = dispatchPhase;
 

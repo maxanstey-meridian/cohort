@@ -7,6 +7,8 @@ internal interface IRetentionHandlerRegistration
     internal Type HandlerType { get; }
 
     internal RowHandlerDispatchPhase DispatchPhase { get; }
+
+    internal Guid? Identity { get; }
 }
 
 // Closed over the entity/handler pair so each AddRowHandler call registers a distinct
@@ -14,7 +16,8 @@ internal interface IRetentionHandlerRegistration
 // concrete type; a single shared registration type would silently drop the dispatch
 // phase of every AddRowHandler call after the first.
 internal sealed record RetentionHandlerRegistration<TEntity, THandler>(
-    RowHandlerDispatchPhase DispatchPhase
+    RowHandlerDispatchPhase DispatchPhase,
+    Guid? Identity = null
 ) : IRetentionHandlerRegistration
     where THandler : IRetentionHandler<TEntity>
 {

@@ -255,17 +255,39 @@ public sealed class RetentionRowDispatcher(
             var entityType = ResolveEntityType(claimed.EntityType, registry);
             var handlers = RetentionHandlerSupport.ResolveHandlers(scope.ServiceProvider, entityType);
             var claimedHandlerIdentity = RetentionTypeIdentity.Normalize(claimed.HandlerType);
+            // Identity first; type-name fallback so rows queued before a handler gained
+            // an explicit identity still resolve.
             var handler =
                 handlers.FirstOrDefault(candidate =>
+                    string.Equals(
+                        candidate.HandlerIdentity,
+                        claimedHandlerIdentity,
+                        StringComparison.Ordinal
+                    )
+                )
+                ?? handlers.FirstOrDefault(candidate =>
                     string.Equals(
                         candidate.HandlerTypeName,
                         claimedHandlerIdentity,
                         StringComparison.Ordinal
                     )
-                )
-                ?? throw new InvalidOperationException(
-                    $"Retention row handler '{claimed.HandlerType}' is not registered for entity {claimed.EntityType}."
                 );
+
+            if (handler is null)
+            {
+                // A persisted identity with no registered match cannot heal by retrying —
+                // the handler was renamed without an explicit identity, or unregistered.
+                // Dead-letter immediately instead of burning the retry budget.
+                await MarkDeadLetteredAsync(
+                    claimed,
+                    currentAttempt,
+                    $"Retention row handler '{claimed.HandlerType}' is not registered for entity {claimed.EntityType}. If the handler class was renamed, register it with an explicit identity (AddRowHandler<TEntity, THandler>(identity: ...)) so queued work survives renames.",
+                    DateTimeOffset.UtcNow,
+                    ct
+                );
+                await ClearSettledPayloadAsync(claimed.RowDetailId);
+                return;
+            }
 
             var snapshot = RetentionSnapshotSerializer.Deserialize(
                 claimed.CapturedPayload,

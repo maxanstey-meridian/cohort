@@ -68,9 +68,17 @@ public static class ServiceCollectionExtensions
         return services;
     }
 
+    /// <summary>
+    /// Registers a row handler. <paramref name="identity"/> is the stable identity that
+    /// queued handler work is persisted under; without it, the handler's CLR type name
+    /// is used, and renaming the class dead-letters any rows still queued under the old
+    /// name. Give long-lived handlers an explicit UUID so persisted work survives
+    /// refactors.
+    /// </summary>
     public static IServiceCollection AddRowHandler<TEntity, THandler>(
         this IServiceCollection services,
-        RowHandlerDispatchPhase dispatchPhase = RowHandlerDispatchPhase.Immediate
+        RowHandlerDispatchPhase dispatchPhase = RowHandlerDispatchPhase.Immediate,
+        Guid? identity = null
     )
         where THandler : class, IRetentionHandler<TEntity>
     {
@@ -80,7 +88,7 @@ public static class ServiceCollectionExtensions
         services.TryAddEnumerable(
             ServiceDescriptor.Singleton(
                 typeof(IRetentionHandlerRegistration),
-                new RetentionHandlerRegistration<TEntity, THandler>(dispatchPhase)
+                new RetentionHandlerRegistration<TEntity, THandler>(dispatchPhase, identity)
             )
         );
 

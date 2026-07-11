@@ -368,6 +368,86 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
     }
 
     [Fact]
+    public async Task Handler_State_Constraint_Migration_Derives_Missing_Terminal_Completion()
+    {
+        var options = CreateOptions();
+        var sweepId = Guid.NewGuid();
+        var tenantId = Guid.NewGuid();
+        var claimedAt = new DateTimeOffset(2026, 7, 11, 12, 2, 0, TimeSpan.Zero);
+
+        await using (var db = new SampleDbContext(options))
+        {
+            var migrator = db.Database.GetService<IMigrator>();
+            await migrator.MigrateAsync("20260711150000_AddExplicitSweepRunStatus");
+            await SeedHistoricalAuditRowsAsync(sweepId, tenantId);
+            await db.Database.ExecuteSqlRawAsync(
+                """
+                INSERT INTO "sweep_row_handler_status"
+                    ("SweepRunRowDetailId", "HandlerType", "DispatchPhase", "State", "Attempt", "QueuedAt", "NextAttemptAt", "ClaimedAt", "ClaimToken", "CompletedAt")
+                SELECT "Id", {0}, 1, 2, 1, {1}, {1}, {2}, {3}, NULL
+                FROM "sweep_run_row_detail"
+                WHERE "SweepId" = {4}
+                """,
+                "Legacy.TerminalWithoutCompletion",
+                new DateTimeOffset(2026, 7, 11, 12, 0, 0, TimeSpan.Zero),
+                claimedAt,
+                Guid.NewGuid(),
+                sweepId
+            );
+
+            await migrator.MigrateAsync("20260711170000_AddRowHandlerStateConstraints");
+        }
+
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            "SELECT \"CompletedAt\" FROM \"sweep_row_handler_status\" WHERE \"HandlerType\" = 'Legacy.TerminalWithoutCompletion'";
+        await using var reader = await command.ExecuteReaderAsync();
+        (await reader.ReadAsync()).Should().BeTrue();
+        reader.GetFieldValue<DateTimeOffset>(0).Should().Be(claimedAt);
+    }
+
+    [Fact]
+    public async Task Handler_State_Constraint_Migration_Clears_Completion_From_NonTerminal_Work()
+    {
+        var options = CreateOptions();
+        var sweepId = Guid.NewGuid();
+        var tenantId = Guid.NewGuid();
+
+        await using (var db = new SampleDbContext(options))
+        {
+            var migrator = db.Database.GetService<IMigrator>();
+            await migrator.MigrateAsync("20260711150000_AddExplicitSweepRunStatus");
+            await SeedHistoricalAuditRowsAsync(sweepId, tenantId);
+            await db.Database.ExecuteSqlRawAsync(
+                """
+                INSERT INTO "sweep_row_handler_status"
+                    ("SweepRunRowDetailId", "HandlerType", "DispatchPhase", "State", "Attempt", "QueuedAt", "NextAttemptAt", "CompletedAt")
+                SELECT "Id", {0}, 1, 0, 0, {1}, {1}, {2}
+                FROM "sweep_run_row_detail"
+                WHERE "SweepId" = {3}
+                """,
+                "Legacy.PendingWithCompletion",
+                new DateTimeOffset(2026, 7, 11, 12, 0, 0, TimeSpan.Zero),
+                new DateTimeOffset(2026, 7, 11, 12, 1, 0, TimeSpan.Zero),
+                sweepId
+            );
+
+            await migrator.MigrateAsync("20260711170000_AddRowHandlerStateConstraints");
+        }
+
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            "SELECT \"CompletedAt\" FROM \"sweep_row_handler_status\" WHERE \"HandlerType\" = 'Legacy.PendingWithCompletion'";
+        await using var reader = await command.ExecuteReaderAsync();
+        (await reader.ReadAsync()).Should().BeTrue();
+        reader.IsDBNull(0).Should().BeTrue();
+    }
+
+    [Fact]
     public async Task Stable_Entity_Identity_Migration_Rejects_Unmapped_Audit_Entity_Types()
     {
         var options = CreateOptions();

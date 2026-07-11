@@ -277,7 +277,10 @@ public static class CohortModelBuilder
             status.Id,
         });
         builder
-            .HasOne(CohortSharedTypeNames.SweepRunRowDetail, navigationName: null)
+            .HasOne(
+                FindEntityMappedToTable(builder, CohortTableNames.SweepRunRowDetail),
+                navigationName: null
+            )
             .WithMany()
             .HasForeignKey(nameof(SweepRowHandlerStatusEntity.SweepRunRowDetailId))
             .HasPrincipalKey("Id")

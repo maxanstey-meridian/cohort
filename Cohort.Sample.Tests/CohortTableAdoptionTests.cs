@@ -71,6 +71,22 @@ public sealed class CohortTableAdoptionTests
             .WithMessage("*sweep_run_entity_summary*table-name collision*");
     }
 
+    [Fact]
+    public void ConfigureCohortTables_Uses_Adopted_Row_Detail_As_Handler_Status_Principal()
+    {
+        var options = new DbContextOptionsBuilder<AdoptedRowDetailDbContext>()
+            .UseNpgsqlMetadataModel($"adopted-row-detail-{Guid.NewGuid()}")
+            .Options;
+        using var db = new AdoptedRowDetailDbContext(options);
+
+        var handlerStatus = db.Model.GetEntityTypes().Single(entityType =>
+            entityType.GetTableName() == "sweep_row_handler_status"
+        );
+
+        handlerStatus.GetForeignKeys().Single().PrincipalEntityType.ClrType
+            .Should().Be(typeof(HostSweepRunRowDetail));
+    }
+
     private sealed class RogueSweepRunDbContext(DbContextOptions<RogueSweepRunDbContext> options)
         : DbContext(options)
     {
@@ -190,5 +206,34 @@ public sealed class CohortTableAdoptionTests
         public long NullAnchorCount { get; set; }
         public string? RuleSource { get; set; }
         public string? RuleReason { get; set; }
+    }
+
+    private sealed class AdoptedRowDetailDbContext(
+        DbContextOptions<AdoptedRowDetailDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<HostSweepRunRowDetail>(builder =>
+            {
+                builder.ToTable("sweep_run_row_detail");
+                builder.HasKey(detail => detail.Id);
+            });
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    public sealed class HostSweepRunRowDetail
+    {
+        public long Id { get; set; }
+        public Guid SweepId { get; set; }
+        public DateTimeOffset At { get; set; }
+        public string EntityType { get; set; } = "";
+        public Guid RetentionEntityId { get; set; }
+        public string EntityId { get; set; } = "";
+        public string Category { get; set; } = "";
+        public int Strategy { get; set; }
+        public Guid TenantId { get; set; }
+        public string? CapturedPayload { get; set; }
     }
 }

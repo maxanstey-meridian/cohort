@@ -49,8 +49,8 @@ internal sealed class RetentionErasureService(
         var lifecycle = new RetentionRunLifecycle(auditWriter, logger);
         var startedPersisted = false;
         var entityFailures = new List<string>();
-        DbConnection? connection = null;
-        var shouldCloseConnection = false;
+        var connection = db.Database.GetDbConnection();
+        var shouldCloseConnection = connection.State != ConnectionState.Open;
         var runLockAcquired = false;
         var batchSize = Math.Max(1, options.SweepBatchSize);
 
@@ -69,6 +69,13 @@ internal sealed class RetentionErasureService(
                 CancellationToken.None
             );
             startedPersisted = true;
+
+            if (shouldCloseConnection)
+            {
+                await db.Database.OpenConnectionAsync(ct);
+            }
+            await RetentionRunAdvisoryLock.AcquireAsync(connection, sweepId, ct);
+            runLockAcquired = true;
 
             await validator.ValidateAsync(ct);
             foreach (var entry in registry.Scan().Values)
@@ -111,16 +118,6 @@ internal sealed class RetentionErasureService(
                 executionPlan.Add((entry, context, rule, predicate));
             }
 
-            connection = db.Database.GetDbConnection();
-            shouldCloseConnection = connection.State != ConnectionState.Open;
-
-            if (shouldCloseConnection && connection is not null)
-            {
-                await db.Database.OpenConnectionAsync(ct);
-            }
-            await RetentionRunAdvisoryLock.AcquireAsync(connection!, sweepId, ct);
-            runLockAcquired = true;
-
             foreach (
                 var (entry, context, rule, predicate) in RetentionExecutionPlanOrderer.Order(
                     db,
@@ -142,7 +139,7 @@ internal sealed class RetentionErasureService(
                         now,
                         dryRun,
                         batchSize,
-                        connection!,
+                        connection,
                         lifecycle,
                         ct
                     );
@@ -232,7 +229,7 @@ internal sealed class RetentionErasureService(
             if (runLockAcquired)
             {
                 await RetentionRunAdvisoryLock.ReleaseAsync(
-                    connection!,
+                    connection,
                     sweepId,
                     CancellationToken.None
                 );

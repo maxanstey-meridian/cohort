@@ -15,6 +15,16 @@ public sealed class AddRowHandlerStateConstraints : Migration
         migrationBuilder.Sql(
             """
             UPDATE "sweep_row_handler_status"
+            SET "CompletedAt" = COALESCE("ClaimedAt", "NextAttemptAt", "QueuedAt")
+            WHERE "State" IN (2, 3)
+              AND "CompletedAt" IS NULL;
+
+            UPDATE "sweep_row_handler_status"
+            SET "CompletedAt" = NULL
+            WHERE "State" IN (0, 1)
+              AND "CompletedAt" IS NOT NULL;
+
+            UPDATE "sweep_row_handler_status"
             SET "State" = 0,
                 "ClaimedAt" = NULL,
                 "ClaimToken" = NULL,

@@ -103,6 +103,88 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
         exception.Which.Errors.Should().ContainSingle(error => error.Contains(expectedCapability));
     }
 
+    [Fact]
+    public async Task Validation_Rejects_Check_With_Different_Boolean_Grouping()
+    {
+        await ExecuteAsync("""
+            ALTER TABLE "sweep_row_handler_status"
+              DROP CONSTRAINT "CK_sweep_row_handler_status_Claim";
+            ALTER TABLE "sweep_row_handler_status"
+              ADD CONSTRAINT "CK_sweep_row_handler_status_Claim" CHECK (
+                "State" = 1 AND ("ClaimedAt" IS NOT NULL AND "ClaimToken" IS NOT NULL OR "State" <> 1)
+                AND "ClaimedAt" IS NULL AND "ClaimToken" IS NULL
+              )
+            """);
+        using var host = new CohortTestHost(connectionString);
+
+        var act = () => host.RunWithServicesAsync(serviceProvider =>
+            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+        );
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle(error =>
+            error.Contains("sweep_row_handler_status.CK_sweep_row_handler_status_Claim")
+        );
+    }
+
+    [Theory]
+    [InlineData("sweep_run_row_detail")]
+    [InlineData("sweep_row_handler_status")]
+    public async Task Validation_Rejects_NonGenerated_Runtime_Id(string table)
+    {
+        await ExecuteAsync($"ALTER TABLE \"{table}\" ALTER COLUMN \"Id\" DROP IDENTITY");
+        using var host = new CohortTestHost(connectionString);
+
+        var act = () => host.RunWithServicesAsync(serviceProvider =>
+            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+        );
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle(error =>
+            error.Contains($"{table}.\"Id\" int8 NOT NULL GENERATED")
+        );
+    }
+
+    [Theory]
+    [InlineData("sweep_run_row_detail")]
+    [InlineData("sweep_row_handler_status")]
+    public async Task Validation_Rejects_NonGenerating_Runtime_Id_Default(string table)
+    {
+        await ExecuteAsync(
+            $"ALTER TABLE \"{table}\" ALTER COLUMN \"Id\" DROP IDENTITY, ALTER COLUMN \"Id\" SET DEFAULT 0"
+        );
+        using var host = new CohortTestHost(connectionString);
+
+        var act = () => host.RunWithServicesAsync(serviceProvider =>
+            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+        );
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle(error =>
+            error.Contains($"{table}.\"Id\" int8 NOT NULL GENERATED")
+        );
+    }
+
+    [Theory]
+    [InlineData("ALTER TABLE \"sweep_run\" ALTER COLUMN \"DryRun\" TYPE text USING \"DryRun\"::text", "sweep_run.\"DryRun\" bool NOT NULL")]
+    [InlineData("ALTER TABLE \"sweep_run_row_detail\" ALTER COLUMN \"CapturedPayload\" SET NOT NULL", "sweep_run_row_detail.\"CapturedPayload\" text NULL")]
+    [InlineData("ALTER TABLE \"sweep_row_handler_status\" ALTER COLUMN \"QueuedAt\" DROP NOT NULL", "sweep_row_handler_status.\"QueuedAt\" timestamptz NOT NULL")]
+    public async Task Validation_Rejects_Runtime_Critical_Column_Shape(
+        string mutation,
+        string expectedCapability
+    )
+    {
+        await ExecuteAsync(mutation);
+        using var host = new CohortTestHost(connectionString);
+
+        var act = () => host.RunWithServicesAsync(serviceProvider =>
+            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+        );
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle(error => error.Contains(expectedCapability));
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

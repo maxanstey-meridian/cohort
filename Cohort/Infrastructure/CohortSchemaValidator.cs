@@ -50,28 +50,56 @@ internal sealed class CohortSchemaValidator(
         new(CohortTableNames.RetentionHolds, "RetentionEntityId", "uuid", false),
         new(CohortTableNames.RetentionHolds, "RecordId", "text", false),
         new(CohortTableNames.RetentionHolds, "TenantId", "uuid", true),
+        new(CohortTableNames.RetentionHolds, "Reason", "text", false),
+        new(CohortTableNames.RetentionHolds, "CreatedAt", "timestamptz", false),
+        new(CohortTableNames.RetentionHolds, "ExpiresAt", "timestamptz", true),
+        new(CohortTableNames.RetentionHolds, "RemovedAt", "timestamptz", true),
         new(CohortTableNames.SweepRun, "SweepId", "uuid", false),
+        new(CohortTableNames.SweepRun, "StartedAt", "timestamptz", false),
         new(CohortTableNames.SweepRun, "Status", "int4", false),
+        new(CohortTableNames.SweepRun, "SettledAt", "timestamptz", true),
+        new(CohortTableNames.SweepRun, "Duration", "interval", true),
+        new(CohortTableNames.SweepRun, "TriggerKind", "int4", false),
+        new(CohortTableNames.SweepRun, "DryRun", "bool", false),
+        new(CohortTableNames.SweepRun, "TenantId", "uuid", false),
+        new(CohortTableNames.SweepRun, "TotalAffected", "int8", true),
+        new(CohortTableNames.SweepRun, "Error", "text", true),
         new(CohortTableNames.SweepRunEntitySummary, "SweepId", "uuid", false),
+        new(CohortTableNames.SweepRunEntitySummary, "At", "timestamptz", false),
         new(CohortTableNames.SweepRunEntitySummary, "EntityType", "text", false),
         new(CohortTableNames.SweepRunEntitySummary, "RetentionEntityId", "uuid", false),
         new(CohortTableNames.SweepRunEntitySummary, "Category", "text", false),
         new(CohortTableNames.SweepRunEntitySummary, "TenantId", "uuid", false),
         new(CohortTableNames.SweepRunEntitySummary, "Strategy", "int4", false),
-        new(CohortTableNames.SweepRunRowDetail, "Id", "int8", false),
+        new(CohortTableNames.SweepRunEntitySummary, "ResolvedPeriod", "interval", false),
+        new(CohortTableNames.SweepRunEntitySummary, "Affected", "int8", false),
+        new(CohortTableNames.SweepRunEntitySummary, "HeldCount", "int8", false),
+        new(CohortTableNames.SweepRunEntitySummary, "SkippedCount", "int8", false),
+        new(CohortTableNames.SweepRunEntitySummary, "NullAnchorCount", "int8", false),
+        new(CohortTableNames.SweepRunEntitySummary, "RuleSource", "text", true),
+        new(CohortTableNames.SweepRunEntitySummary, "RuleReason", "text", true),
+        new(CohortTableNames.SweepRunRowDetail, "Id", "int8", false, true),
         new(CohortTableNames.SweepRunRowDetail, "SweepId", "uuid", false),
+        new(CohortTableNames.SweepRunRowDetail, "At", "timestamptz", false),
         new(CohortTableNames.SweepRunRowDetail, "EntityType", "text", false),
         new(CohortTableNames.SweepRunRowDetail, "RetentionEntityId", "uuid", false),
         new(CohortTableNames.SweepRunRowDetail, "EntityId", "text", false),
         new(CohortTableNames.SweepRunRowDetail, "Category", "text", false),
         new(CohortTableNames.SweepRunRowDetail, "Strategy", "int4", false),
         new(CohortTableNames.SweepRunRowDetail, "TenantId", "uuid", false),
-        new(CohortTableNames.SweepRowHandlerStatus, "Id", "int8", false),
+        new(CohortTableNames.SweepRunRowDetail, "CapturedPayload", "text", true),
+        new(CohortTableNames.SweepRowHandlerStatus, "Id", "int8", false, true),
         new(CohortTableNames.SweepRowHandlerStatus, "SweepRunRowDetailId", "int8", false),
         new(CohortTableNames.SweepRowHandlerStatus, "HandlerType", "text", false),
+        new(CohortTableNames.SweepRowHandlerStatus, "DispatchPhase", "int4", false),
         new(CohortTableNames.SweepRowHandlerStatus, "State", "int4", false),
+        new(CohortTableNames.SweepRowHandlerStatus, "Attempt", "int4", false),
+        new(CohortTableNames.SweepRowHandlerStatus, "QueuedAt", "timestamptz", false),
         new(CohortTableNames.SweepRowHandlerStatus, "NextAttemptAt", "timestamptz", false),
+        new(CohortTableNames.SweepRowHandlerStatus, "ClaimedAt", "timestamptz", true),
         new(CohortTableNames.SweepRowHandlerStatus, "ClaimToken", "uuid", true),
+        new(CohortTableNames.SweepRowHandlerStatus, "CompletedAt", "timestamptz", true),
+        new(CohortTableNames.SweepRowHandlerStatus, "LastError", "text", true),
     ];
 
     private static readonly IndexRequirement[] RequiredIndexes =
@@ -100,8 +128,8 @@ internal sealed class CohortSchemaValidator(
         new(CohortTableNames.SweepRun, "CK_sweep_run_Terminal_Settled", "Status=0ORSettledAtISNOTNULL"),
         new(CohortTableNames.SweepRun, "CK_sweep_run_TotalAffected_Nonnegative", "TotalAffectedISNULLORTotalAffected>=0"),
         new(CohortTableNames.SweepRun, "CK_sweep_run_Duration_Nonnegative", "DurationISNULLORDuration>=000000INTERVAL"),
-        new(CohortTableNames.SweepRowHandlerStatus, "CK_sweep_row_handler_status_Claim", "State=1ANDClaimedAtISNOTNULLANDClaimTokenISNOTNULLORState<>1ANDClaimedAtISNULLANDClaimTokenISNULL"),
-        new(CohortTableNames.SweepRowHandlerStatus, "CK_sweep_row_handler_status_Completion", "State=ANYARRAY[2,3]ANDCompletedAtISNOTNULLORState=ANYARRAY[0,1]ANDCompletedAtISNULL"),
+        new(CohortTableNames.SweepRowHandlerStatus, "CK_sweep_row_handler_status_Claim", "(State=1ANDClaimedAtISNOTNULLANDClaimTokenISNOTNULL)OR(State<>1ANDClaimedAtISNULLANDClaimTokenISNULL)"),
+        new(CohortTableNames.SweepRowHandlerStatus, "CK_sweep_row_handler_status_Completion", "(State=ANYARRAY[2,3]ANDCompletedAtISNOTNULL)OR(State=ANYARRAY[0,1]ANDCompletedAtISNULL)"),
     ];
 
     private static readonly ForeignKeyRequirement[] RequiredForeignKeys =
@@ -179,10 +207,11 @@ internal sealed class CohortSchemaValidator(
                 }
 
                 if (!IsCompatibleType(requirement.Type, actual.Type)
-                    || actual.Nullable != requirement.Nullable)
+                    || actual.Nullable != requirement.Nullable
+                    || requirement.Generated && !actual.Generated)
                 {
                     missing.Add(
-                        $"column capability '{requirement.Table}.\"{requirement.Column}\" {requirement.Type} {(requirement.Nullable ? "NULL" : "NOT NULL")}'"
+                        $"column capability '{requirement.Table}.\"{requirement.Column}\" {requirement.Type} {(requirement.Nullable ? "NULL" : "NOT NULL")}{(requirement.Generated ? " GENERATED" : "")}'"
                     );
                 }
             }
@@ -304,9 +333,15 @@ internal sealed class CohortSchemaValidator(
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
-            SELECT attrelid, attname, typname, NOT attnotnull
-            FROM pg_attribute
+            SELECT attrelid, attname, typname, NOT attnotnull,
+                   attidentity <> '' OR COALESCE(
+                       pg_get_expr(attrdef.adbin, attrdef.adrelid) LIKE 'nextval(%',
+                       FALSE
+                   )
+            FROM pg_attribute attribute
             JOIN pg_type ON pg_type.oid = atttypid
+            LEFT JOIN pg_attrdef attrdef
+              ON attrdef.adrelid = attrelid AND attrdef.adnum = attnum
             WHERE attrelid = ANY (ARRAY(SELECT value::oid FROM unnest(@tableIds) AS value))
               AND attnum > 0 AND NOT attisdropped
             """;
@@ -318,7 +353,7 @@ internal sealed class CohortSchemaValidator(
         {
             result.Add(
                 (reader.GetFieldValue<uint>(0), reader.GetString(1)),
-                new ColumnStructure(reader.GetString(2), reader.GetBoolean(3))
+                new ColumnStructure(reader.GetString(2), reader.GetBoolean(3), reader.GetBoolean(4))
             );
         }
 
@@ -461,20 +496,76 @@ internal sealed class CohortSchemaValidator(
             : new string(predicate.Where(char.IsLetterOrDigit).ToArray()).ToUpperInvariant();
     }
 
-    private static string NormalizeSql(string sql) =>
-        new(sql
+    private static string NormalizeSql(string sql)
+    {
+        var compact = new string(sql
             .Where(character => !char.IsWhiteSpace(character)
-                && character is not '"' and not '(' and not ')' and not '\'' and not ':')
+                && character is not '"' and not '\'' and not ':')
             .Select(char.ToUpperInvariant)
             .ToArray());
+        return NormalizeParentheses(compact);
+    }
+
+    private static string NormalizeParentheses(string sql)
+    {
+        var result = new System.Text.StringBuilder(sql.Length);
+        for (var index = 0; index < sql.Length; index++)
+        {
+            if (sql[index] != '(')
+            {
+                result.Append(sql[index]);
+                continue;
+            }
+
+            var depth = 1;
+            var end = index + 1;
+            for (; end < sql.Length && depth != 0; end++)
+            {
+                depth += sql[end] switch
+                {
+                    '(' => 1,
+                    ')' => -1,
+                    _ => 0,
+                };
+            }
+
+            if (depth != 0)
+            {
+                return sql;
+            }
+
+            var inner = NormalizeParentheses(sql[(index + 1)..(end - 1)]);
+            var isWholeExpression = index == 0 && end == sql.Length;
+            var groupsBooleanExpression = inner.Contains("AND", StringComparison.Ordinal)
+                || inner.Contains("OR", StringComparison.Ordinal);
+            if (groupsBooleanExpression && !isWholeExpression)
+            {
+                result.Append('(').Append(inner).Append(')');
+            }
+            else
+            {
+                result.Append(inner);
+            }
+
+            index = end - 1;
+        }
+
+        return result.ToString();
+    }
 
     private static bool IsCompatibleType(string required, string actual)
     {
         return actual == required || required == "text" && actual == "varchar";
     }
 
-    private sealed record ColumnRequirement(string Table, string Column, string Type, bool Nullable);
-    private sealed record ColumnStructure(string Type, bool Nullable);
+    private sealed record ColumnRequirement(
+        string Table,
+        string Column,
+        string Type,
+        bool Nullable,
+        bool Generated = false
+    );
+    private sealed record ColumnStructure(string Type, bool Nullable, bool Generated);
     private sealed record IndexRequirement(
         string Table,
         string[] Columns,

@@ -54,6 +54,13 @@ internal sealed class RetentionSweepEngine(
             );
             startedPersisted = true;
 
+            if (shouldCloseConnection)
+            {
+                await db.Database.OpenConnectionAsync(ct);
+            }
+            await RetentionRunAdvisoryLock.AcquireAsync(connection, sweepId, ct);
+            runLockAcquired = true;
+
             if (options?.DryRun == true)
             {
                 throw new InvalidOperationException(
@@ -63,12 +70,6 @@ internal sealed class RetentionSweepEngine(
 
             await validator.ValidateAsync(ct);
             var executionPlan = await BuildExecutionPlanAsync(tenant, now, scope, ct);
-            if (shouldCloseConnection)
-            {
-                await db.Database.OpenConnectionAsync(ct);
-            }
-            await RetentionRunAdvisoryLock.AcquireAsync(connection, sweepId, ct);
-            runLockAcquired = true;
 
             foreach (
                 var (entry, context, rule) in RetentionExecutionPlanOrderer.Order(
@@ -224,14 +225,16 @@ internal sealed class RetentionSweepEngine(
                 CancellationToken.None
             );
             startedPersisted = true;
-            await validator.ValidateAsync(ct);
-            var executionPlan = await BuildExecutionPlanAsync(tenant, now, scope, ct);
+
             if (shouldCloseConnection)
             {
                 await db.Database.OpenConnectionAsync(ct);
             }
             await RetentionRunAdvisoryLock.AcquireAsync(connection, sweepId, ct);
             runLockAcquired = true;
+
+            await validator.ValidateAsync(ct);
+            var executionPlan = await BuildExecutionPlanAsync(tenant, now, scope, ct);
 
             foreach (
                 var (entry, context, rule) in RetentionExecutionPlanOrderer.Order(

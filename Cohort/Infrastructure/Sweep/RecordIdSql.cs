@@ -1,4 +1,4 @@
-using Cohort.Domain;
+using System.Data.Common;
 
 namespace Cohort.Infrastructure.Sweep;
 
@@ -9,13 +9,18 @@ namespace Cohort.Infrastructure.Sweep;
 /// </summary>
 internal static class RecordIdSql
 {
+    internal static string TextExpression(string targetAlias, RecordIdConvention recordId)
+    {
+        return $"CAST({targetAlias}.{Quote(recordId.RecordIdColumn)} AS text)";
+    }
+
     internal static string EqualsParameter(
         string targetAlias,
         RecordIdConvention recordId,
         string parameterName
     )
     {
-        return recordId.RecordIdStoreType is { } storeType
+        return PostgresStoreTypeSql.Validate(recordId.RecordIdStoreType) is { } storeType
             ? $"{targetAlias}.{Quote(recordId.RecordIdColumn)} = CAST(@{parameterName} AS {storeType})"
             : $"CAST({targetAlias}.{Quote(recordId.RecordIdColumn)} AS text) = @{parameterName}";
     }
@@ -26,9 +31,30 @@ internal static class RecordIdSql
         string parameterName
     )
     {
-        return recordId.RecordIdStoreType is { } storeType
+        return PostgresStoreTypeSql.Validate(recordId.RecordIdStoreType) is { } storeType
             ? $"{targetAlias}.{Quote(recordId.RecordIdColumn)} = ANY(CAST(@{parameterName} AS {storeType}[]))"
             : $"CAST({targetAlias}.{Quote(recordId.RecordIdColumn)} AS text) = ANY(@{parameterName})";
+    }
+
+    internal static async Task<string> CanonicalizeAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        RecordIdConvention recordId,
+        object value,
+        CancellationToken ct
+    )
+    {
+        var storeType = PostgresStoreTypeSql.Validate(recordId.RecordIdStoreType);
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            storeType is null
+                ? "SELECT CAST(@recordId AS text)"
+                : $"SELECT CAST(CAST(@recordId AS {storeType}) AS text)";
+        command.Parameters.Add(
+            RelationalSweepStrategyCore.CreateParameter(command, "recordId", value)
+        );
+        return (string)(await command.ExecuteScalarAsync(ct))!;
     }
 
     private static string Quote(string identifier)

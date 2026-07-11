@@ -1,6 +1,5 @@
 using Cohort.Domain;
 using Cohort.Sample.Entities;
-
 using Microsoft.EntityFrameworkCore;
 
 namespace Cohort.Sample.Tests;
@@ -52,19 +51,15 @@ public sealed class BoundaryPrecisionEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(Note),
-                "short-lived",
-                tenantId,
-                Strategy.Purge,
-                1
-            )
-        );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+            );
 
         await using var verify = Host.CreateDbContext();
-        var remaining = await verify.Notes
-            .OrderBy(note => note.Body)
+        var remaining = await verify
+            .Notes.OrderBy(note => note.Body)
             .Select(note => note.Body)
             .ToListAsync();
         remaining.Should().Equal("purge-exact-cutoff", "purge-inside-retention");
@@ -98,12 +93,16 @@ public sealed class BoundaryPrecisionEndToEndTests(PostgresFixture fixture)
         var first = await Host.RunSweepAsync(tenant, asOf);
         var second = await Host.RunSweepAsync(tenant, asOf);
 
-        first.Counts.Should().Contain(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
-        );
-        second.Counts.Should().Contain(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 0)
-        );
+        first
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+            );
+        second
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 0)
+            );
         second.SweepId.Should().NotBe(first.SweepId);
 
         await using var verify = Host.CreateDbContext();
@@ -152,26 +151,30 @@ public sealed class BoundaryPrecisionEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(SoftDeleteRecord),
-                "soft-delete",
-                tenantId,
-                Strategy.SoftDelete,
-                1
-            )
-        );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(SoftDeleteRecord),
+                    "soft-delete",
+                    tenantId,
+                    Strategy.SoftDelete,
+                    1
+                )
+            );
 
         await using var verify = Host.CreateDbContext();
-        var records = await verify.SoftDeleteRecords
-            .OrderBy(record => record.Body)
+        var records = await verify
+            .SoftDeleteRecords.OrderBy(record => record.Body)
             .Select(record => new { record.Body, record.IsDeleted })
             .ToListAsync();
 
-        records.Should().Equal(
-            new { Body = "softdelete-exact-cutoff", IsDeleted = false },
-            new { Body = "softdelete-inside-retention", IsDeleted = false },
-            new { Body = "softdelete-outside-retention", IsDeleted = true }
-        );
+        records
+            .Should()
+            .Equal(
+                new { Body = "softdelete-exact-cutoff", IsDeleted = false },
+                new { Body = "softdelete-inside-retention", IsDeleted = false },
+                new { Body = "softdelete-outside-retention", IsDeleted = true }
+            );
     }
 }

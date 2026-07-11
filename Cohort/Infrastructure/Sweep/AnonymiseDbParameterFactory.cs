@@ -12,7 +12,11 @@ internal static class AnonymiseDbParameterFactory
         return parameter;
     }
 
-    internal static DbParameter CreateProviderParameter(DbConnection conn, string name, object? value)
+    internal static DbParameter CreateProviderParameter(
+        DbConnection conn,
+        string name,
+        object? value
+    )
     {
         using var command = conn.CreateCommand();
         return Create(command, name, value);
@@ -34,9 +38,9 @@ internal static class AnonymiseDbParameterFactory
         }
     }
 
-    internal static void AddHoldParameters(DbCommand command, string tableName)
+    internal static void AddHoldParameters(DbCommand command, Guid retentionEntityId)
     {
-        command.Parameters.Add(Create(command, "holdTableName", tableName));
+        command.Parameters.Add(Create(command, "retentionEntityId", retentionEntityId));
     }
 
     internal static void AddCandidateIdsParameter(

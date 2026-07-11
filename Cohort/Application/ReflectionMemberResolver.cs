@@ -25,7 +25,9 @@ public static class ReflectionMemberResolver
         // whether a base also declares it.
         var declared = clrType
             .GetProperties(PublicInstance | BindingFlags.DeclaredOnly)
-            .FirstOrDefault(property => string.Equals(property.Name, name, StringComparison.Ordinal));
+            .FirstOrDefault(property =>
+                string.Equals(property.Name, name, StringComparison.Ordinal)
+            );
         if (declared is not null)
         {
             return declared;
@@ -36,7 +38,9 @@ public static class ReflectionMemberResolver
         {
             var inherited = cursor
                 .GetProperties(PublicInstance | BindingFlags.DeclaredOnly)
-                .FirstOrDefault(property => string.Equals(property.Name, name, StringComparison.Ordinal));
+                .FirstOrDefault(property =>
+                    string.Equals(property.Name, name, StringComparison.Ordinal)
+                );
             if (inherited is not null)
             {
                 return inherited;

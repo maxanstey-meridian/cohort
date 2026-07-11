@@ -51,9 +51,7 @@ public sealed class RetentionRuleContractTests
     {
         var act = () => new RetentionRule(TimeSpan.FromDays(-30), Strategy.Purge);
 
-        act.Should()
-            .Throw<ArgumentOutOfRangeException>()
-            .WithParameterName("Period");
+        act.Should().Throw<ArgumentOutOfRangeException>().WithParameterName("Period");
     }
 
     [Fact]
@@ -62,9 +60,7 @@ public sealed class RetentionRuleContractTests
         var act = () =>
             new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge, TimeSpan.FromDays(-90));
 
-        act.Should()
-            .Throw<ArgumentOutOfRangeException>()
-            .WithParameterName("LegalMin");
+        act.Should().Throw<ArgumentOutOfRangeException>().WithParameterName("LegalMin");
     }
 
     [Fact]
@@ -75,12 +71,36 @@ public sealed class RetentionRuleContractTests
         rule.Period.Should().Be(TimeSpan.Zero);
     }
 
+    [Theory]
+    [InlineData(99, (int)AuditRowDetail.SummaryOnly, "Strategy")]
+    [InlineData((int)Strategy.Purge, 99, "AuditRowDetail")]
+    public void RetentionRule_Rejects_Undefined_Enum_Values(
+        int strategy,
+        int auditRowDetail,
+        string parameterName
+    )
+    {
+        var act = () =>
+            new RetentionRule(
+                TimeSpan.FromDays(30),
+                (Strategy)strategy,
+                AuditRowDetail: (AuditRowDetail)auditRowDetail
+            );
+
+        act.Should().Throw<ArgumentOutOfRangeException>().WithParameterName(parameterName);
+    }
+
     [Fact]
     public void Strategy_Enum_Exposes_The_Planned_Public_Vocabulary()
     {
         Enum.GetNames<Strategy>()
             .Should()
-            .Equal(nameof(Strategy.Purge), nameof(Strategy.SoftDelete), nameof(Strategy.Anonymise), nameof(Strategy.Exempt));
+            .Equal(
+                nameof(Strategy.Purge),
+                nameof(Strategy.SoftDelete),
+                nameof(Strategy.Anonymise),
+                nameof(Strategy.Exempt)
+            );
     }
 
     [Fact]

@@ -35,7 +35,11 @@ public sealed class SampleCategoryRepository : IRetentionCategoryRepository
             // Category default is SummaryOnly — the entity [Retain] attribute overrides to PerRow,
             // which is exactly what CohortConventionsEndToEndTests / PerRowAuditOverride tests assert.
             ["per-row-audit-override"] = new StaticRetentionRuleResolver(
-                new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge, AuditRowDetail: AuditRowDetail.SummaryOnly)
+                new RetentionRule(
+                    TimeSpan.FromDays(30),
+                    Strategy.Purge,
+                    AuditRowDetail: AuditRowDetail.SummaryOnly
+                )
             ),
         };
 

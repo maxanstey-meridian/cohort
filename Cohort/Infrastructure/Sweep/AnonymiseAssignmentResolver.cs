@@ -1,34 +1,36 @@
 using Cohort.Application;
 using Cohort.Domain;
-
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Infrastructure.Sweep;
 
 internal sealed class AnonymiseAssignmentResolver(
-    DbContext db,
+    [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
     IEnumerable<IAnonymiseValueFactory>? anonymiseValueFactories = null
 )
 {
-    private readonly IReadOnlyDictionary<Type, IAnonymiseValueFactory> factories =
-        (anonymiseValueFactories ?? Array.Empty<IAnonymiseValueFactory>())
-        .GroupBy(factory => factory.GetType())
-        .ToDictionary(group => group.Key, group => group.Last());
+    private readonly IReadOnlyList<IAnonymiseValueFactory> factories = (
+        anonymiseValueFactories ?? Array.Empty<IAnonymiseValueFactory>()
+    ).ToArray();
     private readonly DbContext modelDb = db ?? throw new ArgumentNullException(nameof(db));
 
     internal bool RequiresPerRowExecution(RetentionEntry entry)
     {
-        return entry.AnonymiseFields
-            .OfType<AnonymiseFactoryField>()
-            .Any(field => ResolveFactory(field).RequiresPerRowExecution);
+        return entry
+            .AnonymiseFields.OfType<AnonymiseFactoryField>()
+            .Any(field => ResolveFactory(field).ExecutionMode is not AnonymiseFactoryExecutionMode.Static);
     }
 
     internal IReadOnlyList<AnonymiseFactoryField> GetOriginalValueFields(RetentionEntry entry)
     {
-        return entry.AnonymiseFields
-            .OfType<AnonymiseFactoryField>()
-            .Where(field => ResolveFactory(field).RequiresOriginalValue)
+        return entry
+            .AnonymiseFields.OfType<AnonymiseFactoryField>()
+            .Where(field =>
+                ResolveFactory(field).ExecutionMode
+                is AnonymiseFactoryExecutionMode.PerRowWithOriginalValue
+            )
             .ToArray();
     }
 
@@ -44,17 +46,20 @@ internal sealed class AnonymiseAssignmentResolver(
             values[field.MemberName] = field switch
             {
                 AnonymiseLiteralField literalField => CreateLiteralAssignmentValue(literalField),
-                AnonymiseFactoryField factoryField when !ResolveFactory(factoryField).RequiresPerRowExecution
-                    => ResolveFactory(factoryField)
-                        .Create(
-                            new AnonymiseValueContext(
-                                entry.EntityType,
-                                factoryField.MemberName,
-                                null,
-                                now,
-                                tenantId
-                            )
-                        ),
+                AnonymiseFactoryField factoryField
+                    when ResolveFactory(factoryField).ExecutionMode
+                        is AnonymiseFactoryExecutionMode.Static => ResolveFactory(
+                        factoryField
+                    )
+                    .Create(
+                        new AnonymiseValueContext(
+                            entry.EntityType,
+                            factoryField.MemberName,
+                            null,
+                            now,
+                            tenantId
+                        )
+                    ),
                 AnonymiseFactoryField => null,
                 _ => throw new InvalidOperationException(
                     $"Anonymise field '{field.MemberName}' is not supported."
@@ -72,8 +77,8 @@ internal sealed class AnonymiseAssignmentResolver(
     )
     {
         var staticAssignments = CreateStaticAssignments(entry, tenantId, now);
-        return entry.AnonymiseFields
-            .Select(field =>
+        return entry
+            .AnonymiseFields.Select(field =>
                 ConvertAssignmentValueToProvider(entry, field, staticAssignments[field.MemberName])
             )
             .ToArray();
@@ -87,8 +92,8 @@ internal sealed class AnonymiseAssignmentResolver(
         IReadOnlyDictionary<string, object?> staticAssignments
     )
     {
-        return entry.AnonymiseFields
-            .Select(field =>
+        return entry
+            .AnonymiseFields.Select(field =>
                 ConvertAssignmentValueToProvider(
                     entry,
                     field,
@@ -115,7 +120,7 @@ internal sealed class AnonymiseAssignmentResolver(
         foreach (var field in GetOriginalValueFields(entry))
         {
             var property =
-                entry.EntityType.GetProperty(field.MemberName)
+                ReflectionMemberResolver.FindPropertyByName(entry.EntityType, field.MemberName)
                 ?? throw new InvalidOperationException(
                     $"Property '{field.MemberName}' on {entry.EntityType.FullName} is not mapped by the current EF model."
                 );
@@ -153,19 +158,22 @@ internal sealed class AnonymiseAssignmentResolver(
         return field switch
         {
             AnonymiseLiteralField literalField => CreateLiteralAssignmentValue(literalField),
-            AnonymiseFactoryField factoryField when ResolveFactory(factoryField).RequiresPerRowExecution
-                => ResolveFactory(factoryField)
-                    .Create(
-                        new AnonymiseValueContext(
-                            entry.EntityType,
-                            factoryField.MemberName,
-                            originalValues.TryGetValue(factoryField.MemberName, out var originalValue)
-                                ? originalValue
-                                : null,
-                            now,
-                            tenant.Id
-                        )
-                    ),
+            AnonymiseFactoryField factoryField
+                when ResolveFactory(factoryField).ExecutionMode
+                    is not AnonymiseFactoryExecutionMode.Static => ResolveFactory(
+                    factoryField
+                )
+                .Create(
+                    new AnonymiseValueContext(
+                        entry.EntityType,
+                        factoryField.MemberName,
+                        originalValues.TryGetValue(factoryField.MemberName, out var originalValue)
+                            ? originalValue
+                            : null,
+                        now,
+                        tenant.Id
+                    )
+                ),
             AnonymiseFactoryField factoryField => staticAssignments[factoryField.MemberName],
             _ => throw new InvalidOperationException(
                 $"Anonymise field '{field.MemberName}' is not supported."
@@ -191,7 +199,8 @@ internal sealed class AnonymiseAssignmentResolver(
 
     private IAnonymiseValueFactory ResolveFactory(AnonymiseFactoryField field)
     {
-        if (!factories.TryGetValue(field.FactoryType, out var factory))
+        var factory = factories.SingleOrDefault(candidate => candidate.GetType() == field.FactoryType);
+        if (factory is null)
         {
             throw new InvalidOperationException(
                 $"Anonymise field '{field.MemberName}' requires factory type {field.FactoryType.FullName}, but no matching {nameof(IAnonymiseValueFactory)} is registered."

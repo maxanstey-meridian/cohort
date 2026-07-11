@@ -6,26 +6,32 @@ internal static class RetentionHoldSql
 {
     internal const string TableName = "retention_holds";
 
-    internal static string BuildActiveHoldExclusion(string targetAlias, string recordIdColumn, string? tenantColumn = null)
+    internal static string BuildActiveHoldExclusion(
+        string targetAlias,
+        string recordIdColumn,
+        string? tenantColumn = null
+    )
     {
         var tenantLine = tenantColumn is not null
             ? @"
               AND hold.""TenantId"" = @tenantId"
-            : "";
+            : @"
+              AND hold.""TenantId"" IS NULL";
 
         // Hold activity is deliberately evaluated against the database wall clock, not the
         // sweep's logical 'now': a litigation hold protects rows from the moment it exists,
         // even when an operator runs a backdated sweep.
-        return
-            $"""
+        return $"""
             NOT EXISTS (
                 SELECT 1
                 FROM {QuoteIdentifier(TableName)} AS hold
-                WHERE hold."TableName" = @holdTableName
-                  AND hold."RecordId" = CAST({targetAlias}.{QuoteIdentifier(recordIdColumn)} AS text){tenantLine}
-                  AND hold."CreatedAt" <= now()
-                  AND (hold."ExpiresAt" IS NULL OR hold."ExpiresAt" > now())
-                  AND (hold."RemovedAt" IS NULL OR hold."RemovedAt" > now())
+                WHERE hold."RetentionEntityId" = @retentionEntityId
+                  AND hold."RecordId" = CAST({targetAlias}.{QuoteIdentifier(
+                recordIdColumn
+            )} AS text){tenantLine}
+                  AND hold."CreatedAt" <= statement_timestamp()
+                  AND (hold."ExpiresAt" IS NULL OR hold."ExpiresAt" > statement_timestamp())
+                  AND (hold."RemovedAt" IS NULL OR hold."RemovedAt" > statement_timestamp())
             )
             """;
     }

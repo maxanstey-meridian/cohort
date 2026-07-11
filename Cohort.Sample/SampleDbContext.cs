@@ -1,6 +1,5 @@
-using Cohort.Sample.Entities;
 using Cohort.Infrastructure.Migrations;
-
+using Cohort.Sample.Entities;
 using Microsoft.EntityFrameworkCore;
 
 namespace Cohort.Sample;
@@ -19,6 +18,7 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
     public DbSet<TombstoneRecord> TombstoneRecords => Set<TombstoneRecord>();
     public DbSet<BlobBackedFile> BlobBackedFiles => Set<BlobBackedFile>();
     public DbSet<NullableAnchorEvent> NullableAnchorEvents => Set<NullableAnchorEvent>();
+    public DbSet<ExternalNumberedLog> ExternalNumberedLogs => Set<ExternalNumberedLog>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -93,6 +93,16 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
             b.Property(log => log.Payload).IsRequired();
         });
 
+        modelBuilder.Entity<ExternalNumberedLog>(b =>
+        {
+            b.ToTable("external_numbered_logs");
+            b.HasKey(log => log.Id);
+            b.Property(log => log.ExternalId).IsRequired();
+            b.HasIndex(log => log.ExternalId).IsUnique();
+            b.Property(log => log.CreatedAt).IsRequired();
+            b.Property(log => log.Payload).IsRequired();
+        });
+
         modelBuilder.Entity<TenantlessSoftDelete>(b =>
         {
             b.ToTable("tenantless_soft_deletes");
@@ -141,14 +151,19 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
         {
             b.ToTable("retention_holds");
             b.HasKey(record => record.HoldId);
-            b.Property(record => record.TableName).IsRequired();
+            b.Property(record => record.RetentionEntityId).IsRequired();
             b.Property(record => record.RecordId).IsRequired();
-            b.Property(record => record.TenantId).IsRequired();
+            b.Property(record => record.TenantId);
             b.Property(record => record.Reason).IsRequired();
             b.Property(record => record.CreatedAt).IsRequired();
             b.Property(record => record.ExpiresAt);
             b.Property(record => record.RemovedAt);
-            b.HasIndex(record => new { record.TableName, record.TenantId, record.RecordId });
+            b.HasIndex(record => new
+            {
+                record.RetentionEntityId,
+                record.TenantId,
+                record.RecordId,
+            });
         });
 
         modelBuilder.ConfigureCohortTables();

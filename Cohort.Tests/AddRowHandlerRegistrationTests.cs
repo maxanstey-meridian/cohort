@@ -1,6 +1,5 @@
 using Cohort.Application;
 using Cohort.Hosting;
-
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Tests;
@@ -15,8 +14,12 @@ public sealed class AddRowHandlerRegistrationTests
         // AddRowHandler call after the first silently lost its dispatch phase and
         // fell back to Immediate.
         var services = new ServiceCollection();
-        services.AddRowHandler<FirstEntity, FirstHandler>(RowHandlerDispatchPhase.AfterSweepSettled);
-        services.AddRowHandler<SecondEntity, SecondHandler>(RowHandlerDispatchPhase.AfterSweepSettled);
+        services.AddRowHandler<FirstEntity, FirstHandler>(
+            RowHandlerDispatchPhase.AfterSweepSettled
+        );
+        services.AddRowHandler<SecondEntity, SecondHandler>(
+            RowHandlerDispatchPhase.AfterSweepSettled
+        );
 
         using var provider = services.BuildServiceProvider();
         var registrations = provider.GetServices<IRetentionHandlerRegistration>().ToArray();
@@ -27,7 +30,8 @@ public sealed class AddRowHandlerRegistrationTests
             .OnlyContain(registration =>
                 registration.DispatchPhase == RowHandlerDispatchPhase.AfterSweepSettled
             );
-        registrations.Select(registration => registration.HandlerType)
+        registrations
+            .Select(registration => registration.HandlerType)
             .Should()
             .BeEquivalentTo([typeof(FirstHandler), typeof(SecondHandler)]);
     }
@@ -36,8 +40,12 @@ public sealed class AddRowHandlerRegistrationTests
     public void AddRowHandler_Registers_The_Same_Pair_Only_Once()
     {
         var services = new ServiceCollection();
-        services.AddRowHandler<FirstEntity, FirstHandler>(RowHandlerDispatchPhase.AfterSweepSettled);
-        services.AddRowHandler<FirstEntity, FirstHandler>(RowHandlerDispatchPhase.AfterSweepSettled);
+        services.AddRowHandler<FirstEntity, FirstHandler>(
+            RowHandlerDispatchPhase.AfterSweepSettled
+        );
+        services.AddRowHandler<FirstEntity, FirstHandler>(
+            RowHandlerDispatchPhase.AfterSweepSettled
+        );
 
         using var provider = services.BuildServiceProvider();
 
@@ -54,12 +62,20 @@ public sealed class AddRowHandlerRegistrationTests
         services.AddRowHandler<FirstEntity, FirstHandler>(RowHandlerDispatchPhase.Immediate);
 
         var differentPhase = () =>
-            services.AddRowHandler<FirstEntity, FirstHandler>(RowHandlerDispatchPhase.AfterSweepSettled);
-        differentPhase.Should().Throw<InvalidOperationException>().WithMessage("*silently ignored*");
+            services.AddRowHandler<FirstEntity, FirstHandler>(
+                RowHandlerDispatchPhase.AfterSweepSettled
+            );
+        differentPhase
+            .Should()
+            .Throw<InvalidOperationException>()
+            .WithMessage("*silently ignored*");
 
         var differentIdentity = () =>
             services.AddRowHandler<FirstEntity, FirstHandler>(identity: Guid.NewGuid());
-        differentIdentity.Should().Throw<InvalidOperationException>().WithMessage("*silently ignored*");
+        differentIdentity
+            .Should()
+            .Throw<InvalidOperationException>()
+            .WithMessage("*silently ignored*");
     }
 
     [Fact]
@@ -90,6 +106,17 @@ public sealed class AddRowHandlerRegistrationTests
         using var provider = services.BuildServiceProvider();
 
         provider.GetServices<IRetentionHandlerRegistration>().Should().HaveCount(2);
+    }
+
+    [Fact]
+    public void AddRowHandler_Rejects_An_Undefined_Dispatch_Phase()
+    {
+        var services = new ServiceCollection();
+
+        var act = () =>
+            services.AddRowHandler<FirstEntity, FirstHandler>((RowHandlerDispatchPhase)99);
+
+        act.Should().Throw<ArgumentOutOfRangeException>().WithParameterName("dispatchPhase");
     }
 
     private sealed class FirstEntity;

@@ -1,14 +1,13 @@
 using System.Data;
 using System.Data.Common;
-
 using Cohort.Application;
 using Cohort.Domain;
-
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Infrastructure.Sweep;
 
-public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
+internal sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
 {
     private readonly AnonymiseAssignmentResolver assignmentResolver;
     private readonly AnonymiseHandlerAwareMutationExecutor handlerAwareMutationExecutor;
@@ -18,7 +17,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
     private readonly IServiceProvider? services;
 
     public AnonymiseSweepStrategy(
-        DbContext db,
+        [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
         IEnumerable<IAnonymiseValueFactory>? anonymiseValueFactories = null,
         IServiceProvider? services = null
     )
@@ -142,7 +141,8 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             transaction,
             execution,
             ct,
-            "sweeps"
+            "sweeps",
+            skipLocked: true
         );
     }
 
@@ -242,7 +242,8 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             transaction,
             execution,
             ct,
-            "erasure"
+            "erasure",
+            skipLocked: false
         );
     }
 
@@ -255,7 +256,8 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         DbTransaction transaction,
         SweepMutationContext? execution,
         CancellationToken ct,
-        string operation
+        string operation,
+        bool skipLocked
     )
     {
         ValidateEntry(entry, rule, operation);
@@ -269,6 +271,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             filter,
             execution?.BatchSize,
             execution?.ExcludedRecordIds,
+            skipLocked,
             ct
         );
 
@@ -317,11 +320,7 @@ public sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             );
     }
 
-    private static void ValidateEntry(
-        RetentionEntry entry,
-        RetentionRule rule,
-        string operation
-    )
+    private static void ValidateEntry(RetentionEntry entry, RetentionRule rule, string operation)
     {
         if (rule.Strategy != Strategy.Anonymise)
         {

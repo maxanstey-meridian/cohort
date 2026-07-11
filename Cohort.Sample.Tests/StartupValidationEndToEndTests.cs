@@ -1,9 +1,9 @@
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
+using Cohort.Infrastructure;
 using Cohort.Infrastructure.Migrations;
 using Cohort.Sample.Entities;
-
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -42,9 +42,9 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     [Fact]
-    public async Task Startup_Path_Runs_Validation_Before_Returning_Registry_Entries()
+    public async Task Validation_Returns_Registry_Entries_When_Configuration_Is_Valid()
     {
-        var entries = await Host.RunStartupAsync();
+        var entries = await Host.ValidateAndScanAsync();
 
         entries
             .Should()
@@ -102,7 +102,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     [Fact]
-    public async Task Startup_Fails_When_Retained_Entity_Cannot_Resolve_Tenant_In_TenantScoped_Config()
+    public async Task Validation_Fails_When_Retained_Entity_Cannot_Resolve_Tenant_In_TenantScoped_Config()
     {
         var act = async () =>
             await RunTenantScopeStartupAsync<MisconfiguredTenantScopedDbContext>(
@@ -120,7 +120,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
             .Which.Errors[0]
             .Should()
             .Be(
-                $"Tenant convention on {typeof(MisconfiguredTenantScopedRecord).FullName}: retained entities must expose a public Guid or nullable Guid tenant property named 'TenantId' by convention, or mark the tenant property with [RetentionTenant], unless the entity is explicitly marked with [RetentionTenantless]."
+                $"Tenant convention on {typeof(MisconfiguredTenantScopedRecord).FullName}: retained entities must expose a public non-nullable Guid tenant property named 'TenantId' by convention, or mark the tenant property with [RetentionTenant], unless the entity is explicitly marked with [RetentionTenantless]."
             );
     }
 
@@ -141,7 +141,8 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
             {
                 await using (var seedScope = serviceProvider.CreateAsyncScope())
                 {
-                    var db = seedScope.ServiceProvider.GetRequiredService<MisconfiguredTenantScopedDbContext>();
+                    var db =
+                        seedScope.ServiceProvider.GetRequiredService<MisconfiguredTenantScopedDbContext>();
                     await db.Database.ExecuteSqlRawAsync(
                         """
                         CREATE TABLE IF NOT EXISTS "misconfigured_tenant_scoped_records" (
@@ -165,7 +166,8 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
                 var act = async () =>
                 {
                     await using var startupScope = serviceProvider.CreateAsyncScope();
-                    var startup = startupScope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
+                    var startup =
+                        startupScope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
                     await startup.RunSweepAsync(
                         new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
                         asOf
@@ -178,13 +180,14 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
                     .Which.Errors[0]
                     .Should()
                     .Be(
-                        $"Tenant convention on {typeof(MisconfiguredTenantScopedRecord).FullName}: retained entities must expose a public Guid or nullable Guid tenant property named 'TenantId' by convention, or mark the tenant property with [RetentionTenant], unless the entity is explicitly marked with [RetentionTenantless]."
+                        $"Tenant convention on {typeof(MisconfiguredTenantScopedRecord).FullName}: retained entities must expose a public non-nullable Guid tenant property named 'TenantId' by convention, or mark the tenant property with [RetentionTenant], unless the entity is explicitly marked with [RetentionTenantless]."
                     );
 
                 await using var verifyScope = serviceProvider.CreateAsyncScope();
-                var verifyDb = verifyScope.ServiceProvider.GetRequiredService<MisconfiguredTenantScopedDbContext>();
-                var remaining = await verifyDb.MisconfiguredTenantScopedRecords.SingleAsync(record =>
-                    record.Id == recordId
+                var verifyDb =
+                    verifyScope.ServiceProvider.GetRequiredService<MisconfiguredTenantScopedDbContext>();
+                var remaining = await verifyDb.MisconfiguredTenantScopedRecords.SingleAsync(
+                    record => record.Id == recordId
                 );
 
                 remaining.Payload.Should().Be("still-here-because-validation-failed");
@@ -193,91 +196,63 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     [Fact]
-    public async Task Startup_Path_Fails_When_Category_Resolution_Is_Misconfigured()
+    public async Task Validation_Fails_When_Category_Resolution_Is_Misconfigured()
     {
         await using var db = Host.CreateDbContext();
         var connectionString = db.Database.GetConnectionString()!;
         using var host = new CohortTestHost(connectionString, new EmptyCategoryRepository());
 
-        var act = async () => await host.RunStartupAsync();
+        var act = async () => await host.ValidateAndScanAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().HaveCount(9);
         exception
             .Which.Errors.Should()
-            .Contain(
-                $"Retention category 'short-lived' for entity {typeof(Note).FullName} could not be resolved."
-            );
-        exception
-            .Which.Errors.Should()
-            .Contain(
-                $"Retention category 'blob-cleanup' for entity {typeof(BlobBackedFile).FullName} could not be resolved."
-            );
-        exception
-            .Which.Errors.Should()
-            .Contain(
-                $"Retention category 'soft-delete' for entity {typeof(SoftDeleteRecord).FullName} could not be resolved."
-            );
-        exception
-            .Which.Errors.Should()
-            .Contain(
-                $"Retention category 'anonymise' for entity {typeof(AnonymisedContact).FullName} could not be resolved."
-            );
-        exception
-            .Which.Errors.Should()
-            .Contain(
-                $"Retention category 'tenantless-purge' for entity {typeof(TenantlessLog).FullName} could not be resolved."
-            );
-        exception
-            .Which.Errors.Should()
-            .Contain(
-                $"Retention category 'tenantless-softdelete' for entity {typeof(TenantlessSoftDelete).FullName} could not be resolved."
-            );
-        exception
-            .Which.Errors.Should()
-            .Contain(
-                $"Retention category 'per-row-audit-override' for entity {typeof(PerRowAuditedLog).FullName} could not be resolved."
-            );
-        exception
-            .Which.Errors.Should()
-            .Contain(
-                $"Retention category 'tombstone-anonymise' for entity {typeof(TombstoneRecord).FullName} could not be resolved."
+            .BeEquivalentTo(
+                [
+                    $"Retention category 'short-lived' for entity {typeof(Note).FullName} could not be resolved.",
+                    $"Retention category 'blob-cleanup' for entity {typeof(BlobBackedFile).FullName} could not be resolved.",
+                    $"Retention category 'soft-delete' for entity {typeof(SoftDeleteRecord).FullName} could not be resolved.",
+                    $"Retention category 'anonymise' for entity {typeof(AnonymisedContact).FullName} could not be resolved.",
+                    $"Retention category 'tenantless-purge' for entity {typeof(TenantlessLog).FullName} could not be resolved.",
+                    $"Retention category 'tenantless-purge' for entity {typeof(ExternalNumberedLog).FullName} could not be resolved.",
+                    $"Retention category 'tenantless-softdelete' for entity {typeof(TenantlessSoftDelete).FullName} could not be resolved.",
+                    $"Retention category 'per-row-audit-override' for entity {typeof(PerRowAuditedLog).FullName} could not be resolved.",
+                    $"Retention category 'tombstone-anonymise' for entity {typeof(TombstoneRecord).FullName} could not be resolved.",
+                    $"Retention category 'nullable-anchor-purge' for entity {typeof(NullableAnchorEvent).FullName} could not be resolved.",
+                ]
             );
     }
 
     [Fact]
     public async Task Shared_Test_Host_Uses_The_Cohort_Di_Entry_Point()
     {
-        await Host.RunWithServicesAsync(
-            serviceProvider =>
-            {
-                serviceProvider.GetServices<IHostedService>()
-                    .Should()
-                    .ContainSingle(service => service.GetType() == typeof(RetentionWorker));
+        await Host.RunWithServicesAsync(serviceProvider =>
+        {
+            serviceProvider
+                .GetServices<IHostedService>()
+                .Should()
+                .ContainSingle(service => service.GetType() == typeof(RetentionWorker));
 
-                return Task.CompletedTask;
-            }
-        );
+            return Task.CompletedTask;
+        });
     }
 
     [Fact]
     public async Task Shared_Test_Host_Registers_Row_Handler_Dispatcher_As_Both_Port_And_Hosted_Service_Without_Row_Handlers()
     {
-        await Host.RunWithServicesAsync(
-            serviceProvider =>
-            {
-                var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
-                var hostedDispatcher = serviceProvider.GetServices<IHostedService>().Single(service =>
-                    service is IRetentionRowDispatcher
-                );
-                var noteHandlers = serviceProvider.GetServices<IRetentionHandler<Note>>();
+        await Host.RunWithServicesAsync(serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            var hostedDispatcher = serviceProvider
+                .GetServices<IHostedService>()
+                .Single(service => service is IRetentionRowDispatcher);
+            var noteHandlers = serviceProvider.GetServices<IRetentionHandler<Note>>();
 
-                hostedDispatcher.Should().BeSameAs(dispatcher);
-                noteHandlers.Should().BeEmpty();
+            hostedDispatcher.Should().BeSameAs(dispatcher);
+            noteHandlers.Should().BeEmpty();
 
-                return Task.CompletedTask;
-            }
-        );
+            return Task.CompletedTask;
+        });
     }
 
     [Fact]
@@ -295,20 +270,18 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
             }
         );
 
-        await host.RunWithServicesAsync(
-            serviceProvider =>
-            {
-                var options = serviceProvider.GetRequiredService<IOptions<CohortOptions>>().Value;
+        await host.RunWithServicesAsync(serviceProvider =>
+        {
+            var options = serviceProvider.GetRequiredService<IOptions<CohortOptions>>().Value;
 
-                options.RowHandlerDispatch.PollInterval.Should().Be(TimeSpan.FromSeconds(3));
-                options.RowHandlerDispatch.BatchSize.Should().Be(25);
-                options.RowHandlerDispatch.MaxAttempts.Should().Be(7);
-                options.RowHandlerDispatch.MaxParallelism.Should().Be(6);
-                options.RowHandlerDispatch.BaseBackoff.Should().Be(TimeSpan.FromSeconds(2));
+            options.RowHandlerDispatch.PollInterval.Should().Be(TimeSpan.FromSeconds(3));
+            options.RowHandlerDispatch.BatchSize.Should().Be(25);
+            options.RowHandlerDispatch.MaxAttempts.Should().Be(7);
+            options.RowHandlerDispatch.MaxParallelism.Should().Be(6);
+            options.RowHandlerDispatch.BaseBackoff.Should().Be(TimeSpan.FromSeconds(2));
 
-                return Task.CompletedTask;
-            }
-        );
+            return Task.CompletedTask;
+        });
     }
 
     [Fact]
@@ -324,18 +297,16 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
             }
         );
 
-        await host.RunWithServicesAsync(
-            serviceProvider =>
-            {
-                var handlers = serviceProvider.GetServices<IRetentionHandler<Note>>().ToArray();
+        await host.RunWithServicesAsync(serviceProvider =>
+        {
+            var handlers = serviceProvider.GetServices<IRetentionHandler<Note>>().ToArray();
 
-                handlers.Should().HaveCount(2);
-                handlers[0].Should().BeOfType<FirstNoteHandler>();
-                handlers[1].Should().BeOfType<SecondNoteHandler>();
+            handlers.Should().HaveCount(2);
+            handlers[0].Should().BeOfType<FirstNoteHandler>();
+            handlers[1].Should().BeOfType<SecondNoteHandler>();
 
-                return Task.CompletedTask;
-            }
-        );
+            return Task.CompletedTask;
+        });
     }
 
     [Fact]
@@ -349,14 +320,12 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
             }
         );
 
-        await host.RunWithServicesAsync(
-            async serviceProvider =>
-            {
-                var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+        await host.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
 
-                await dispatcher.FlushAsync();
-            }
-        );
+            await dispatcher.FlushAsync();
+        });
     }
 
     [Fact]
@@ -379,9 +348,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         try
         {
             await using var scope = host.Services.CreateAsyncScope();
-            var startup = scope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
-
-            var entries = await startup.RunAsync();
+            var entries = await ValidateAndScanAsync(scope.ServiceProvider);
             var factoryTypes = entries[typeof(TombstoneRecord)]
                 .AnonymiseFields.OfType<AnonymiseFactoryField>()
                 .Select(field => field.FactoryType)
@@ -398,7 +365,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     [Fact]
-    public async Task Startup_Path_Fails_When_AnonymiseWith_Uses_A_Type_That_Does_Not_Implement_The_Factory_Port()
+    public async Task Validation_Fails_When_AnonymiseWith_Uses_A_Type_That_Does_Not_Implement_The_Factory_Port()
     {
         var act = async () =>
             await RunFactoryValidationStartupAsync<InvalidFactoryTypeStartupDbContext>(
@@ -421,7 +388,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     [Fact]
-    public async Task Startup_Path_Fails_When_AnonymiseWith_Factory_Is_Not_Registered_In_Di()
+    public async Task Validation_Fails_When_AnonymiseWith_Factory_Is_Not_Registered_In_Di()
     {
         var act = async () =>
             await RunFactoryValidationStartupAsync<UnregisteredFactoryStartupDbContext>(
@@ -444,7 +411,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     [Fact]
-    public async Task Startup_Path_Allows_Registered_FactoryBacked_Anonymise_Metadata()
+    public async Task Validation_Allows_Registered_FactoryBacked_Anonymise_Metadata()
     {
         var entries = await RunFactoryValidationStartupAsync<RegisteredFactoryStartupDbContext>(
             new SingleCategoryRepository(
@@ -463,7 +430,68 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     [Fact]
-    public async Task Startup_Path_Allows_Registered_FactoryBacked_Metadata_Even_When_Category_Is_Not_Anonymise()
+    public async Task Validation_Fails_When_The_Same_Anonymise_Factory_Type_Is_Registered_Twice()
+    {
+        var factory = new RegisteredFactory();
+        var act = async () =>
+            await RunFactoryValidationStartupAsync<RegisteredFactoryStartupDbContext>(
+                new SingleCategoryRepository(
+                    "registered-factory",
+                    new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    )
+                ),
+                services =>
+                {
+                    services.AddSingleton<IAnonymiseValueFactory>(factory);
+                    services.AddSingleton<IAnonymiseValueFactory>(factory);
+                }
+            );
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"{nameof(IAnonymiseValueFactory)} concrete runtime type {typeof(RegisteredFactory).FullName} is registered 2 times in DI; exactly one registration per concrete runtime type is allowed."
+            );
+    }
+
+    [Fact]
+    public async Task Validation_Fails_When_Differently_Configured_Instances_Of_The_Same_Anonymise_Factory_Type_Are_Registered()
+    {
+        var act = async () =>
+            await RunFactoryValidationStartupAsync<RegisteredFactoryStartupDbContext>(
+                new SingleCategoryRepository(
+                    "registered-factory",
+                    new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    )
+                ),
+                services =>
+                {
+                    services.AddSingleton<IAnonymiseValueFactory>(
+                        new RegisteredFactory { Value = Guid.Empty }
+                    );
+                    services.AddSingleton<IAnonymiseValueFactory>(
+                        new RegisteredFactory { Value = Guid.NewGuid() }
+                    );
+                }
+            );
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"{nameof(IAnonymiseValueFactory)} concrete runtime type {typeof(RegisteredFactory).FullName} is registered 2 times in DI; exactly one registration per concrete runtime type is allowed."
+            );
+    }
+
+    [Fact]
+    public async Task Validation_Allows_Registered_FactoryBacked_Metadata_Even_When_Category_Is_Not_Anonymise()
     {
         var entries = await RunFactoryValidationStartupAsync<RegisteredFactoryStartupDbContext>(
             new SingleCategoryRepository(
@@ -482,12 +510,14 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     [Fact]
-    public async Task Startup_Path_Allows_Registered_FactoryBacked_Metadata_When_Strategy_Is_Deferred()
+    public async Task Validation_Allows_Registered_FactoryBacked_Metadata_When_Strategy_Is_Deferred()
     {
         var entries = await RunFactoryValidationStartupAsync<RegisteredFactoryStartupDbContext>(
             new SingleCategoryRepository(
                 "registered-factory",
-                new DeferredRuleResolver(new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise))
+                new DeferredRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                )
             ),
             services => services.AddSingleton<IAnonymiseValueFactory, RegisteredFactory>()
         );
@@ -498,7 +528,9 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
             .ContainSingle(field => field is AnonymiseFactoryField);
     }
 
-    private async Task<IReadOnlyDictionary<Type, RetentionEntry>> RunFactoryValidationStartupAsync<TContext>(
+    private async Task<
+        IReadOnlyDictionary<Type, RetentionEntry>
+    > RunFactoryValidationStartupAsync<TContext>(
         IRetentionCategoryRepository categoryRepository,
         Action<IServiceCollection>? registerServices = null
     )
@@ -515,17 +547,15 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         services.AddSingleton(categoryRepository);
         registerServices?.Invoke(services);
         services.AddCohort<TContext>();
-        services.AddScoped<SampleRetentionStartupService>();
 
         await using var serviceProvider = services.BuildServiceProvider(validateScopes: true);
         await using var scope = serviceProvider.CreateAsyncScope();
-        var startup = scope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
-        return await startup.RunAsync();
+        return await ValidateAndScanAsync(scope.ServiceProvider);
     }
 
-    private async Task<IReadOnlyDictionary<Type, RetentionEntry>> RunTenantScopeStartupAsync<TContext>(
-        IRetentionCategoryRepository categoryRepository
-    )
+    private async Task<
+        IReadOnlyDictionary<Type, RetentionEntry>
+    > RunTenantScopeStartupAsync<TContext>(IRetentionCategoryRepository categoryRepository)
         where TContext : DbContext
     {
         IReadOnlyDictionary<Type, RetentionEntry>? entries = null;
@@ -535,12 +565,20 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
             async serviceProvider =>
             {
                 await using var scope = serviceProvider.CreateAsyncScope();
-                var startup = scope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
-                entries = await startup.RunAsync();
+                entries = await ValidateAndScanAsync(scope.ServiceProvider);
             }
         );
 
         return entries!;
+    }
+
+    private static async Task<IReadOnlyDictionary<Type, RetentionEntry>> ValidateAndScanAsync(
+        IServiceProvider services,
+        CancellationToken ct = default
+    )
+    {
+        await services.GetRequiredService<RetentionStartupValidator>().ValidateAsync(ct);
+        return services.GetRequiredService<RetentionRegistry>().Scan();
     }
 
     private async Task RunTenantScopeHostAsync<TContext>(
@@ -574,7 +612,10 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     private sealed class SingleCategoryRepository(string category, IRetentionRuleResolver resolver)
         : IRetentionCategoryRepository
     {
-        public Task<IRetentionRuleResolver?> GetAsync(string requestedCategory, CancellationToken ct)
+        public Task<IRetentionRuleResolver?> GetAsync(
+            string requestedCategory,
+            CancellationToken ct
+        )
         {
             return Task.FromResult<IRetentionRuleResolver?>(
                 requestedCategory == category
@@ -588,8 +629,10 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
 
     private sealed class DeferredRuleResolver(RetentionRule rule) : IRetentionRuleResolver
     {
-        public Task<RetentionRule> ResolveAsync(RetentionResolutionContext ctx, CancellationToken ct) =>
-            Task.FromResult(rule);
+        public Task<RetentionRule> ResolveAsync(
+            RetentionResolutionContext ctx,
+            CancellationToken ct
+        ) => Task.FromResult(rule);
     }
 
     private sealed class InvalidFactoryTypeStartupDbContext(
@@ -647,7 +690,8 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         DbContextOptions<MisconfiguredTenantScopedDbContext> options
     ) : DbContext(options)
     {
-        public DbSet<MisconfiguredTenantScopedRecord> MisconfiguredTenantScopedRecords => Set<MisconfiguredTenantScopedRecord>();
+        public DbSet<MisconfiguredTenantScopedRecord> MisconfiguredTenantScopedRecords =>
+            Set<MisconfiguredTenantScopedRecord>();
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
@@ -664,6 +708,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     [Retain("invalid-factory-type", nameof(InvalidFactoryTypeStartupRecord.CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-00000000003e")]
     private sealed class InvalidFactoryTypeStartupRecord
     {
         public Guid Id { get; init; }
@@ -675,6 +720,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     [Retain("unregistered-factory", nameof(UnregisteredFactoryStartupRecord.CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-00000000003f")]
     private sealed class UnregisteredFactoryStartupRecord
     {
         public Guid Id { get; init; }
@@ -686,6 +732,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     [Retain("registered-factory", nameof(RegisteredFactoryStartupRecord.CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000040")]
     private sealed class RegisteredFactoryStartupRecord
     {
         public Guid Id { get; init; }
@@ -699,6 +746,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     [Retain("misconfigured-tenant-scope", nameof(MisconfiguredTenantScopedRecord.CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000041")]
     private sealed class MisconfiguredTenantScopedRecord
     {
         public Guid Id { get; init; }
@@ -708,7 +756,9 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
 
     private sealed class RegisteredFactory : IAnonymiseValueFactory
     {
-        public object? Create(AnonymiseValueContext context) => Guid.Empty;
+        public Guid Value { get; init; } = Guid.Empty;
+
+        public object? Create(AnonymiseValueContext context) => Value;
     }
 
     private sealed class FirstNoteHandler : IRetentionHandler<Note>;

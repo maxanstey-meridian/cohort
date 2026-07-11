@@ -1,10 +1,9 @@
-using Cohort.Domain;
-
+using Cohort.Application;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Logging;
 using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.Extensions.Logging;
 
-namespace Cohort.Application;
+namespace Cohort.Infrastructure;
 
 internal static class RetentionExecutionPlanOrderer
 {
@@ -24,8 +23,7 @@ internal static class RetentionExecutionPlanOrderer
             return plan;
         }
 
-        var orderedItems = plan
-            .OrderBy(
+        var orderedItems = plan.OrderBy(
                 item => entrySelector(item).EntityType.FullName,
                 StringComparer.Ordinal
             )
@@ -75,9 +73,9 @@ internal static class RetentionExecutionPlanOrderer
         }
 
         var ready = new PriorityQueue<Type, string>(StringComparer.Ordinal);
-        foreach (var entityType in incomingCounts
-                     .Where(pair => pair.Value == 0)
-                     .Select(pair => pair.Key))
+        foreach (
+            var entityType in incomingCounts.Where(pair => pair.Value == 0).Select(pair => pair.Key)
+        )
         {
             ready.Enqueue(entityType, entityType.FullName ?? entityType.Name);
         }
@@ -106,20 +104,16 @@ internal static class RetentionExecutionPlanOrderer
                 .Where(entityType => !resolved.Contains(entityType))
                 .ToArray();
 
-            // A dependency-respecting order does not exist for these entities; they are
-            // appended alphabetically and the operator is told, because a Purge sweep
-            // inside an FK cycle can fail on constraint violations depending on order.
-            logger?.LogWarning(
-                "Retention entities {CycleMembers} form a foreign-key cycle; no dependency-respecting sweep order exists, so they are processed alphabetically.",
+            logger?.LogError(
+                "Retention entities {UnresolvedEntities} cannot be ordered because their foreign-key graph contains a cycle.",
                 string.Join(", ", cycleMembers.Select(entityType => entityType.FullName))
             );
-
-            orderedEntityTypes.AddRange(cycleMembers);
+            throw new RetentionConfigurationException([
+                $"Retained entities {string.Join(", ", cycleMembers.Select(entityType => entityType.FullName))} cannot be ordered because their foreign-key graph contains a cycle. Retained foreign-key cycles are not supported.",
+            ]);
         }
 
-        return orderedEntityTypes
-            .Select(entityType => itemByEntityType[entityType])
-            .ToArray();
+        return orderedEntityTypes.Select(entityType => itemByEntityType[entityType]).ToArray();
     }
 
     private static Type? ResolvePrincipalClrType(IEntityType entityType)
@@ -130,8 +124,6 @@ internal static class RetentionExecutionPlanOrderer
             return clrType;
         }
 
-        return entityType.BaseType is null
-            ? null
-            : ResolvePrincipalClrType(entityType.BaseType);
+        return entityType.BaseType is null ? null : ResolvePrincipalClrType(entityType.BaseType);
     }
 }

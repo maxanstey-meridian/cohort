@@ -1,19 +1,16 @@
 using System.Diagnostics;
 using System.Threading.Channels;
-
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
 using Cohort.Sample.Entities;
-
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-
 using Npgsql;
-
 using Xunit.Sdk;
 
 namespace Cohort.Sample.Tests;
@@ -56,13 +53,16 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
 
         using var scope = host.Host.Services.CreateScope();
 
-        scope.ServiceProvider.GetRequiredService<IRetentionCategoryRepository>()
+        scope
+            .ServiceProvider.GetRequiredService<IRetentionCategoryRepository>()
             .Should()
             .BeOfType<CustomCategoryRepository>();
-        scope.ServiceProvider.GetRequiredService<IRetentionAuditWriter>()
+        scope
+            .ServiceProvider.GetRequiredService<IRetentionAuditWriter>()
             .Should()
             .BeOfType<CustomAuditWriter>();
-        scope.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>()
+        scope
+            .ServiceProvider.GetRequiredService<IRetentionHoldsRepository>()
             .Should()
             .BeOfType<CustomHoldsRepository>();
     }
@@ -77,65 +77,20 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             dryRun: false,
             killSwitch: false
         );
-        using var host = BuildHost(settings, tenant, services =>
-        {
-            services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
-        });
+        using var host = BuildHost(
+            settings,
+            tenant,
+            services =>
+            {
+                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+            }
+        );
 
         var act = async () => await host.Host.StartAsync();
 
-        await act
-            .Should()
+        await act.Should()
             .ThrowAsync<OptionsValidationException>()
             .WithMessage("*schedule*invalid*");
-    }
-
-    [Fact]
-    public async Task AddCohort_Rejects_Applying_Migrations_During_DryRun_At_Startup()
-    {
-        var tenant = CreateTenant();
-        var settings = CreateSettings(
-            fixture.ConnectionString,
-            schedule: "*/1 * * * * *",
-            dryRun: true,
-            killSwitch: false,
-            applyMigrations: true
-        );
-        using var host = BuildHost(settings, tenant, services =>
-        {
-            services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
-        });
-
-        var act = async () => await host.Host.StartAsync();
-
-        await act
-            .Should()
-            .ThrowAsync<OptionsValidationException>()
-            .WithMessage("*apply migrations*DryRun*");
-    }
-
-    [Fact]
-    public async Task AddCohort_Rejects_Applying_Migrations_When_KillSwitch_Is_Enabled_At_Startup()
-    {
-        var tenant = CreateTenant();
-        var settings = CreateSettings(
-            fixture.ConnectionString,
-            schedule: "*/1 * * * * *",
-            dryRun: false,
-            killSwitch: true,
-            applyMigrations: true
-        );
-        using var host = BuildHost(settings, tenant, services =>
-        {
-            services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
-        });
-
-        var act = async () => await host.Host.StartAsync();
-
-        await act
-            .Should()
-            .ThrowAsync<OptionsValidationException>()
-            .WithMessage("*apply migrations*KillSwitch*");
     }
 
     [Fact]
@@ -161,13 +116,99 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
 
         await host.Host.StartAsync();
         await WaitUntilAsync(
-            async () => categoryRepository.GetAsyncCount > 0 && !await NoteExistsAsync("scheduled-delete"),
+            async () =>
+                categoryRepository.GetAsyncCount > 0 && !await NoteExistsAsync("scheduled-delete"),
             TimeSpan.FromSeconds(8)
         );
 
         await host.Host.StopAsync();
 
         (await NoteExistsAsync("scheduled-delete")).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task Worker_Persists_Scheduled_DryRun_For_The_Tenanted_Entity_Scope_Without_Mutating_Rows()
+    {
+        var tenant = CreateTenant();
+        var settings = CreateSettings(
+            fixture.ConnectionString,
+            schedule: "*/1 * * * * *",
+            dryRun: true,
+            killSwitch: false
+        );
+        using var host = BuildHost(
+            settings,
+            tenant,
+            services =>
+            {
+                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+            }
+        );
+        await SeedOldNoteAsync(tenant.Id, "scheduled-dry-run");
+
+        await host.Host.StartAsync();
+        await WaitUntilAsync(
+            async () =>
+            {
+                var run = await LoadLatestRunAsync(tenant.Id);
+                return run is { Status: SweepRunStatus.Succeeded }
+                    && run.Value.EntityTypes.Contains(typeof(Note).FullName!);
+            },
+            TimeSpan.FromSeconds(8)
+        );
+        await host.Host.StopAsync();
+
+        var run = await LoadLatestRunAsync(tenant.Id);
+        run.Should().NotBeNull();
+        run!.Value.Trigger.Should().Be(SweepTriggerKind.Scheduled);
+        run.Value.DryRun.Should().BeTrue();
+        run.Value.Status.Should().Be(SweepRunStatus.Succeeded);
+        run.Value.EntityTypes.Should().Contain(typeof(Note).FullName!);
+        run.Value.EntityTypes.Should().NotContain(typeof(TenantlessLog).FullName!);
+        (await NoteExistsAsync("scheduled-dry-run")).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Worker_Reloads_Schedule_And_Persists_The_New_DryRun_Without_Mutating_Rows()
+    {
+        var tenant = CreateTenant();
+        var settings = CreateSettings(
+            fixture.ConnectionString,
+            schedule: null,
+            dryRun: false,
+            killSwitch: false
+        );
+        using var host = BuildHost(
+            settings,
+            tenant,
+            services =>
+            {
+                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+            }
+        );
+        await SeedOldNoteAsync(tenant.Id, "reloaded-dry-run");
+
+        await host.Host.StartAsync();
+        host.Reload(killSwitch: false, dryRun: true, schedule: "*/1 * * * * *");
+        await WaitUntilAsync(
+            async () =>
+            {
+                var run = await LoadLatestRunAsync(tenant.Id);
+                return run is { Status: SweepRunStatus.Succeeded }
+                    && run.Value.EntityTypes.Contains(typeof(Note).FullName!);
+            },
+            TimeSpan.FromSeconds(8)
+        );
+        await host.Host.StopAsync();
+
+        var run = await LoadLatestRunAsync(tenant.Id);
+        run.Should().NotBeNull();
+        run!.Value.Trigger.Should().Be(SweepTriggerKind.Scheduled);
+        run.Value.DryRun.Should().BeTrue();
+        run.Value.Status.Should().Be(SweepRunStatus.Succeeded);
+        run.Value.EntityTypes.Should().Contain(typeof(Note).FullName!);
+        run.Value.EntityTypes.Should().NotContain(typeof(TenantlessLog).FullName!);
+        (await NoteExistsAsync("reloaded-dry-run")).Should().BeTrue();
     }
 
     [Fact]
@@ -198,7 +239,8 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         await host.Host.StartAsync();
         await WaitUntilAsync(
             async () =>
-                !await NoteExistsAsync("multi-tenant-a") && !await NoteExistsAsync("multi-tenant-b"),
+                !await NoteExistsAsync("multi-tenant-a")
+                && !await NoteExistsAsync("multi-tenant-b"),
             TimeSpan.FromSeconds(8)
         );
 
@@ -288,6 +330,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
     public async Task Worker_Skips_Occurrences_While_Another_Instance_Holds_The_Sweep_Lock()
     {
         const long sweepAdvisoryLockKey = 0x636F_686F_7274_3031;
+        var skippedOccurrenceLog = new SkippedOccurrenceLogProvider();
         var tenant = CreateTenant();
         var settings = CreateSettings(
             fixture.ConnectionString,
@@ -301,6 +344,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             services =>
             {
                 services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+                services.AddSingleton<ILoggerProvider>(skippedOccurrenceLog);
             }
         );
         await SeedOldNoteAsync(tenant.Id, "lock-guarded-note");
@@ -315,8 +359,9 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         }
 
         await host.Host.StartAsync();
-        // Two cron ticks pass while the lock is held elsewhere: nothing may be swept.
-        await Task.Delay(TimeSpan.FromSeconds(2.5));
+        await skippedOccurrenceLog.WaitForOccurrencesAsync(2).WaitAsync(TimeSpan.FromSeconds(8));
+
+        skippedOccurrenceLog.OccurrenceCount.Should().BeGreaterThanOrEqualTo(2);
         (await NoteExistsAsync("lock-guarded-note")).Should().BeTrue();
 
         await using (var release = lockConnection.CreateCommand())
@@ -358,6 +403,8 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         await SeedOldNoteAsync(tenant.Id, "resilient-delete");
 
         await host.Host.StartAsync();
+        await categoryRepository.FailedIteration.WaitAsync(TimeSpan.FromSeconds(8));
+        await categoryRepository.LaterSuccessfulIteration.WaitAsync(TimeSpan.FromSeconds(8));
         await WaitUntilAsync(
             async () => !await NoteExistsAsync("resilient-delete"),
             TimeSpan.FromSeconds(8)
@@ -365,7 +412,6 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
 
         await host.Host.StopAsync();
 
-        categoryRepository.FailureCount.Should().BeGreaterThan(0);
         (await NoteExistsAsync("resilient-delete")).Should().BeFalse();
     }
 
@@ -390,9 +436,17 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         );
         await SeedOldNoteAsync(tenant.Id, "dry-run-note");
 
+        CompletedSweepRun? completedRun = null;
         await host.Host.StartAsync();
         await WaitUntilAsync(
-            async () => categoryRepository.GetAsyncCount > 0 && await DryRunSweepRunExistsAsync(),
+            async () =>
+            {
+                completedRun = await LoadCompletedDryRunAsync(
+                    tenant.Id,
+                    SweepTriggerKind.Scheduled
+                );
+                return categoryRepository.GetAsyncCount > 0 && completedRun is not null;
+            },
             TimeSpan.FromSeconds(8)
         );
 
@@ -402,42 +456,63 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
 
         // Scheduled dry runs leave a real audit trail: a sweep_run row with DryRun set
         // and per-entity summaries carrying the predicted counts.
-        var dryRunSummaries = await LoadDryRunNoteSummariesAsync();
+        completedRun.Should().NotBeNull();
+        completedRun!.TenantId.Should().Be(tenant.Id);
+        completedRun.Trigger.Should().Be(SweepTriggerKind.Scheduled);
+
+        var dryRunSummaries = await LoadDryRunNoteSummariesAsync(completedRun.SweepId);
         dryRunSummaries.Should().NotBeEmpty();
         dryRunSummaries.Should().Contain(affected => affected >= 1);
     }
 
-    private async Task<bool> DryRunSweepRunExistsAsync()
+    private async Task<CompletedSweepRun?> LoadCompletedDryRunAsync(
+        Guid tenantId,
+        SweepTriggerKind trigger
+    )
     {
         await using var connection = new NpgsqlConnection(fixture.ConnectionString);
         await connection.OpenAsync();
 
         await using var command = connection.CreateCommand();
-        command.CommandText =
-            """
-            SELECT EXISTS (
-                SELECT 1
-                FROM "sweep_run"
-                WHERE "DryRun" = TRUE AND "CompletedAt" IS NOT NULL
-            )
+        command.CommandText = """
+            SELECT "SweepId", "TenantId", "TriggerKind"
+            FROM "sweep_run"
+            WHERE "DryRun" = TRUE
+              AND "Status" = 1
+              AND "SettledAt" IS NOT NULL
+              AND "TenantId" = @tenantId
+              AND "TriggerKind" = @triggerKind
+            ORDER BY "SettledAt" DESC
+            LIMIT 1
             """;
+        command.Parameters.AddWithValue("tenantId", tenantId);
+        command.Parameters.AddWithValue("triggerKind", (int)trigger);
 
-        return (bool)(await command.ExecuteScalarAsync())!;
+        await using var reader = await command.ExecuteReaderAsync();
+        if (!await reader.ReadAsync())
+        {
+            return null;
+        }
+
+        return new CompletedSweepRun(
+            reader.GetGuid(0),
+            reader.GetGuid(1),
+            (SweepTriggerKind)reader.GetInt32(2)
+        );
     }
 
-    private async Task<IReadOnlyList<long>> LoadDryRunNoteSummariesAsync()
+    private async Task<IReadOnlyList<long>> LoadDryRunNoteSummariesAsync(Guid sweepId)
     {
         await using var connection = new NpgsqlConnection(fixture.ConnectionString);
         await connection.OpenAsync();
 
         await using var command = connection.CreateCommand();
-        command.CommandText =
-            """
+        command.CommandText = """
             SELECT summary."Affected"
             FROM "sweep_run_entity_summary" AS summary
-            INNER JOIN "sweep_run" AS run ON run."SweepId" = summary."SweepId"
-            WHERE run."DryRun" = TRUE AND summary."EntityType" = @entityType
+            WHERE summary."SweepId" = @sweepId AND summary."EntityType" = @entityType
             """;
+        command.Parameters.AddWithValue("sweepId", sweepId);
         command.Parameters.AddWithValue("entityType", typeof(Note).FullName ?? nameof(Note));
 
         var affectedCounts = new List<long>();
@@ -450,233 +525,55 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         return affectedCounts;
     }
 
-    [Fact]
-    public async Task Worker_Pauses_When_KillSwitch_Is_On_And_Resumes_On_The_Next_Iteration_Boundary()
-    {
-        var tenant = CreateTenant();
-        var settings = CreateSettings(
-            fixture.ConnectionString,
-            schedule: "*/1 * * * * *",
-            dryRun: false,
-            killSwitch: true
-        );
-        var categoryRepository = new CountingCategoryRepository(new SampleCategoryRepository());
-        var optionsMonitor = new MutableCohortOptionsMonitor(
-            new CohortOptions
-            {
-                Schedule = "*/1 * * * * *",
-                DryRun = false,
-                KillSwitch = true,
-                ApplyMigrations = false,
-            }
-        );
-        using var host = BuildHost(
-            settings,
-            tenant,
-            services =>
-            {
-                services.AddSingleton<IRetentionCategoryRepository>(categoryRepository);
-                services.AddSingleton<IOptionsMonitor<CohortOptions>>(optionsMonitor);
-            }
-        );
-        await SeedOldNoteAsync(tenant.Id, "paused-note");
-
-        await host.Host.StartAsync();
-        await Task.Delay(TimeSpan.FromSeconds(2));
-
-        categoryRepository.GetAsyncCount.Should().Be(0);
-        (await NoteExistsAsync("paused-note")).Should().BeTrue();
-
-        optionsMonitor.Update(
-            new CohortOptions
-            {
-                Schedule = "*/1 * * * * *",
-                DryRun = false,
-                KillSwitch = false,
-                ApplyMigrations = false,
-            }
-        );
-
-        await WaitUntilAsync(
-            async () => categoryRepository.GetAsyncCount > 0 && !await NoteExistsAsync("paused-note"),
-            TimeSpan.FromSeconds(8)
-        );
-
-        await host.Host.StopAsync();
-
-        (await NoteExistsAsync("paused-note")).Should().BeFalse();
-    }
+    private sealed record CompletedSweepRun(
+        Guid SweepId,
+        Guid TenantId,
+        SweepTriggerKind Trigger
+    );
 
     [Fact]
-    public async Task Worker_Finishes_The_Current_Sweep_Before_The_KillSwitch_Pauses_Later_Iterations()
+    public async Task Worker_Reloads_KillSwitch_Between_Passes()
     {
-        var tenant = CreateTenant();
+        var tenantA = CreateTenant();
+        var tenantB = CreateTenant();
         var settings = CreateSettings(
             fixture.ConnectionString,
             schedule: "*/1 * * * * *",
             dryRun: false,
             killSwitch: false
         );
-        var optionsMonitor = new MutableCohortOptionsMonitor(
-            new CohortOptions
-            {
-                Schedule = "*/1 * * * * *",
-                DryRun = false,
-                KillSwitch = false,
-                ApplyMigrations = false,
-            }
-        );
-        var blockingWriterState = new BlockingAuditWriterState();
-        using var host = BuildHost(
+        WorkerTestHost? host = null;
+        host = BuildHost(
             settings,
-            tenant,
+            tenantA,
             services =>
             {
                 services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
-                services.AddSingleton<IOptionsMonitor<CohortOptions>>(optionsMonitor);
-                services.AddSingleton(blockingWriterState);
-                services.AddScoped<IRetentionAuditWriter>(sp =>
-                    new BlockingAuditWriter(sp.GetRequiredService<BlockingAuditWriterState>())
+                services.AddSingleton<IRetentionTenantSource>(
+                    new ReloadingTenantSource(
+                        tenantA,
+                        tenantB,
+                        () => host!.Reload(killSwitch: true, dryRun: true)
+                    )
                 );
             }
         );
-        await SeedOldNoteAsync(tenant.Id, "in-flight-note");
+        using (host)
+        {
+            await SeedOldNoteAsync(tenantA.Id, "before-kill-switch");
+            await SeedOldNoteAsync(tenantB.Id, "after-kill-switch");
 
-        await host.Host.StartAsync();
-        await blockingWriterState.CompletedReached.Task.WaitAsync(TimeSpan.FromSeconds(8));
+            await host.Host.StartAsync();
+            await WaitUntilAsync(
+                async () => !await NoteExistsAsync("before-kill-switch"),
+                TimeSpan.FromSeconds(8)
+            );
+            await host.Reloaded.WaitAsync(TimeSpan.FromSeconds(8));
+            await host.Host.StopAsync();
 
-        optionsMonitor.Update(
-            new CohortOptions
-            {
-                Schedule = "*/1 * * * * *",
-                DryRun = false,
-                KillSwitch = true,
-                ApplyMigrations = false,
-            }
-        );
-        blockingWriterState.ReleaseCurrentIteration();
-
-        await WaitUntilAsync(
-            async () => !await NoteExistsAsync("in-flight-note"),
-            TimeSpan.FromSeconds(8)
-        );
-        await Task.Delay(TimeSpan.FromSeconds(2));
-
-        await host.Host.StopAsync();
-
-        (await NoteExistsAsync("in-flight-note")).Should().BeFalse();
-        blockingWriterState.StartedCount.Should().Be(1);
-    }
-
-    [Fact]
-    public async Task Worker_Applies_Migrations_At_Startup_When_Configured()
-    {
-        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
-        var tenant = CreateTenant();
-        var settings = CreateSettings(
-            database.ConnectionString,
-            schedule: null,
-            dryRun: false,
-            killSwitch: false,
-            applyMigrations: true
-        );
-        using var host = BuildHost(
-            settings,
-            tenant,
-            services =>
-            {
-                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
-            }
-        );
-
-        await host.Host.StartAsync();
-        await WaitUntilAsync(
-            () => TableExistsAsync(database.ConnectionString, "notes"),
-            TimeSpan.FromSeconds(8)
-        );
-        await host.Host.StopAsync();
-
-        (await TableExistsAsync(database.ConnectionString, "notes")).Should().BeTrue();
-    }
-
-    [Fact]
-    public async Task Migrated_Host_With_Zero_Row_Handlers_Starts_Cleanly_And_Keeps_The_Dispatcher_Registered()
-    {
-        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
-        await LegacyCohortSchema.BootstrapPreRowDispatchAsync(database.ConnectionString);
-
-        var tenant = CreateTenant();
-        var settings = CreateSettings(
-            database.ConnectionString,
-            schedule: null,
-            dryRun: false,
-            killSwitch: false,
-            applyMigrations: true
-        );
-        using var host = BuildHost(
-            settings,
-            tenant,
-            services =>
-            {
-                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
-            }
-        );
-
-        await host.Host.StartAsync();
-        await WaitUntilAsync(
-            () => TableExistsAsync(database.ConnectionString, "sweep_row_handler_status"),
-            TimeSpan.FromSeconds(8)
-        );
-
-        using var scope = host.Host.Services.CreateScope();
-        var dispatcher = scope.ServiceProvider.GetRequiredService<IRetentionRowDispatcher>();
-        var hostedDispatcher = scope.ServiceProvider.GetServices<IHostedService>().Single(service =>
-            service is IRetentionRowDispatcher
-        );
-
-        hostedDispatcher.Should().BeSameAs(dispatcher);
-
-        await host.Host.StopAsync();
-    }
-
-    [Fact]
-    public async Task FlushAsync_Completes_Against_An_Empty_Migrated_Handler_Queue_And_Creates_No_Status_Rows()
-    {
-        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
-        await LegacyCohortSchema.BootstrapPreRowDispatchAsync(database.ConnectionString);
-
-        var tenant = CreateTenant();
-        var settings = CreateSettings(
-            database.ConnectionString,
-            schedule: null,
-            dryRun: false,
-            killSwitch: false,
-            applyMigrations: true
-        );
-        using var host = BuildHost(
-            settings,
-            tenant,
-            services =>
-            {
-                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
-            }
-        );
-
-        await host.Host.StartAsync();
-        await WaitUntilAsync(
-            () => TableExistsAsync(database.ConnectionString, "sweep_row_handler_status"),
-            TimeSpan.FromSeconds(8)
-        );
-
-        using var scope = host.Host.Services.CreateScope();
-        var dispatcher = scope.ServiceProvider.GetRequiredService<IRetentionRowDispatcher>();
-
-        var flushResult = await dispatcher.FlushAsync();
-
-        flushResult.Settled.Should().BeTrue();
-        (await CountRowsAsync(database.ConnectionString, "sweep_row_handler_status")).Should().Be(0);
-
-        await host.Host.StopAsync();
+            (await NoteExistsAsync("before-kill-switch")).Should().BeFalse();
+            (await NoteExistsAsync("after-kill-switch")).Should().BeTrue();
+        }
     }
 
     private WorkerTestHost BuildHost(
@@ -693,22 +590,23 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         builder.Services.AddSingleton(tenant);
         builder.Services.AddSingleton<GuidTombstoneFactory>();
         builder.Services.AddSingleton<OriginalValueTombstoneFactory>();
-        builder.Services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<GuidTombstoneFactory>());
+        builder.Services.AddSingleton<IAnonymiseValueFactory>(sp =>
+            sp.GetRequiredService<GuidTombstoneFactory>()
+        );
         builder.Services.AddSingleton<IAnonymiseValueFactory>(sp =>
             sp.GetRequiredService<OriginalValueTombstoneFactory>()
         );
         builder.Services.AddCohort<SampleDbContext>();
         configureServices(builder.Services);
 
-        return new WorkerTestHost(builder.Build());
+        return new WorkerTestHost(builder.Build(), builder.Configuration);
     }
 
     private static IReadOnlyDictionary<string, string?> CreateSettings(
         string connectionString,
         string? schedule,
         bool dryRun,
-        bool killSwitch,
-        bool applyMigrations = false
+        bool killSwitch
     )
     {
         return new Dictionary<string, string?>
@@ -717,7 +615,6 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             [$"{CohortOptions.SectionName}:Schedule"] = schedule,
             [$"{CohortOptions.SectionName}:DryRun"] = dryRun.ToString(),
             [$"{CohortOptions.SectionName}:KillSwitch"] = killSwitch.ToString(),
-            [$"{CohortOptions.SectionName}:ApplyMigrations"] = applyMigrations.ToString(),
         };
     }
 
@@ -789,8 +686,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         await connection.OpenAsync();
 
         await using var command = connection.CreateCommand();
-        command.CommandText =
-            """
+        command.CommandText = """
             SELECT "TenantId"
             FROM "sweep_run_entity_summary"
             WHERE "EntityType" = @entityType
@@ -807,35 +703,51 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         return tenantIds;
     }
 
-    private static async Task<bool> TableExistsAsync(string connectionString, string tableName)
+    private async Task<(
+        SweepTriggerKind Trigger,
+        bool DryRun,
+        SweepRunStatus Status,
+        IReadOnlyList<string> EntityTypes
+    )?> LoadLatestRunAsync(Guid tenantId)
     {
-        await using var connection = new NpgsqlConnection(connectionString);
+        await using var connection = new NpgsqlConnection(fixture.ConnectionString);
         await connection.OpenAsync();
 
         await using var command = connection.CreateCommand();
-        command.CommandText =
-            """
-            SELECT EXISTS (
-                SELECT 1
-                FROM information_schema.tables
-                WHERE table_schema = 'public'
-                  AND table_name = @tableName
+        command.CommandText = """
+            SELECT run."TriggerKind", run."DryRun", run."Status", summary."EntityType"
+            FROM "sweep_run" run
+            LEFT JOIN "sweep_run_entity_summary" summary ON summary."SweepId" = run."SweepId"
+            WHERE run."SweepId" = (
+                SELECT "SweepId"
+                FROM "sweep_run"
+                WHERE "TenantId" = @tenantId
+                ORDER BY "StartedAt" DESC
+                LIMIT 1
             )
+            ORDER BY summary."EntityType"
             """;
-        command.Parameters.AddWithValue("tableName", tableName);
+        command.Parameters.AddWithValue("tenantId", tenantId);
 
-        return (bool)(await command.ExecuteScalarAsync())!;
-    }
+        await using var reader = await command.ExecuteReaderAsync();
+        if (!await reader.ReadAsync())
+        {
+            return null;
+        }
 
-    private static async Task<long> CountRowsAsync(string connectionString, string tableName)
-    {
-        await using var connection = new NpgsqlConnection(connectionString);
-        await connection.OpenAsync();
+        var trigger = (SweepTriggerKind)reader.GetInt32(0);
+        var dryRun = reader.GetBoolean(1);
+        var status = (SweepRunStatus)reader.GetInt32(2);
+        var entityTypes = new List<string>();
+        do
+        {
+            if (!reader.IsDBNull(3))
+            {
+                entityTypes.Add(reader.GetString(3));
+            }
+        } while (await reader.ReadAsync());
 
-        await using var command = connection.CreateCommand();
-        command.CommandText = $"""SELECT COUNT(*) FROM "{tableName}" """;
-
-        return (long)(await command.ExecuteScalarAsync())!;
+        return (trigger, dryRun, status, entityTypes);
     }
 
     private static async Task WaitUntilAsync(Func<Task<bool>> predicate, TimeSpan timeout)
@@ -869,8 +781,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         }
     }
 
-    private sealed class StaticTenantSource(params TenantContext[] tenants)
-        : IRetentionTenantSource
+    private sealed class StaticTenantSource(params TenantContext[] tenants) : IRetentionTenantSource
     {
         public Task<IReadOnlyList<TenantContext>> GetTenantsAsync(CancellationToken ct)
         {
@@ -878,23 +789,94 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         }
     }
 
+    private sealed class ReloadingTenantSource(
+        TenantContext first,
+        TenantContext second,
+        Action reload
+    ) : IRetentionTenantSource
+    {
+        public Task<IReadOnlyList<TenantContext>> GetTenantsAsync(CancellationToken ct)
+        {
+            return Task.FromResult<IReadOnlyList<TenantContext>>(
+                new ReloadingTenantList(first, second, reload)
+            );
+        }
+    }
+
+    private sealed class ReloadingTenantList(
+        TenantContext first,
+        TenantContext second,
+        Action reload
+    ) : IReadOnlyList<TenantContext>
+    {
+        public int Count => 2;
+
+        public TenantContext this[int index] => index switch
+        {
+            0 => first,
+            1 => second,
+            _ => throw new ArgumentOutOfRangeException(nameof(index)),
+        };
+
+        public IEnumerator<TenantContext> GetEnumerator()
+        {
+            yield return first;
+            reload();
+            yield return second;
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() =>
+            GetEnumerator();
+    }
+
     private sealed class FailingOnceCategoryRepository(IRetentionCategoryRepository inner)
         : IRetentionCategoryRepository
     {
-        public int FailureCount => failureCount;
+        private readonly TaskCompletionSource failedIteration = new(
+            TaskCreationOptions.RunContinuationsAsynchronously
+        );
+        private readonly TaskCompletionSource laterSuccessfulIteration = new(
+            TaskCreationOptions.RunContinuationsAsynchronously
+        );
+        private int failureInjected;
 
-        private int failureCount;
+        public Task FailedIteration => failedIteration.Task;
 
-        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        public Task LaterSuccessfulIteration => laterSuccessfulIteration.Task;
+
+        public async Task<IRetentionRuleResolver?> GetAsync(
+            string category,
+            CancellationToken ct
+        )
         {
-            if (Interlocked.CompareExchange(ref failureCount, 1, 0) == 0)
+            var resolver = await inner.GetAsync(category, ct);
+            return resolver is null ? null : new FailingOnceResolver(resolver, this);
+        }
+
+        private sealed class FailingOnceResolver(
+            IRetentionRuleResolver inner,
+            FailingOnceCategoryRepository state
+        ) : IRetentionRuleResolver
+        {
+            public async Task<RetentionRule> ResolveAsync(
+                RetentionResolutionContext ctx,
+                CancellationToken ct
+            )
             {
-                throw new InvalidOperationException(
-                    "Simulated transient category repository failure."
-                );
+                if (Interlocked.CompareExchange(ref state.failureInjected, 1, 0) == 0)
+                {
+                    state.failedIteration.TrySetResult();
+                    throw new InvalidOperationException(
+                        "Simulated transient category resolver failure."
+                    );
+                }
+
+                var rule = await inner.ResolveAsync(ctx, ct);
+                state.laterSuccessfulIteration.TrySetResult();
+                return rule;
             }
 
-            return inner.GetAsync(category, ct);
+            public RetentionRule? TryResolveAtStartup() => inner.TryResolveAtStartup();
         }
     }
 
@@ -934,19 +916,24 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
 
     private sealed class CustomHoldsRepository : IRetentionHoldsRepository
     {
-        public Task CreateAsync(RetentionHoldRequest request, CancellationToken ct) => Task.CompletedTask;
+        public Task CreateAsync(RetentionHoldRequest request, CancellationToken ct) =>
+            Task.CompletedTask;
 
-        public Task RemoveAsync(Guid holdId, DateTimeOffset removedAt, CancellationToken ct) => Task.CompletedTask;
+        public Task RemoveAsync(Guid holdId, DateTimeOffset removedAt, CancellationToken ct) =>
+            Task.CompletedTask;
 
-        public Task<IReadOnlyList<RetentionHold>> ListActiveAsync(DateTimeOffset asOf, CancellationToken ct)
+        public Task<IReadOnlyList<RetentionHold>> ListActiveAsync(
+            DateTimeOffset asOf,
+            CancellationToken ct
+        )
         {
             return Task.FromResult<IReadOnlyList<RetentionHold>>([]);
         }
 
         public Task<bool> HasActiveHoldAsync(
-            string tableName,
+            Guid retentionEntityId,
             string recordId,
-            Guid tenantId,
+            Guid? tenantId,
             DateTimeOffset asOf,
             CancellationToken ct
         )
@@ -955,9 +942,27 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         }
     }
 
-    private sealed class WorkerTestHost(IHost host) : IDisposable
+    private sealed class WorkerTestHost(IHost host, IConfigurationRoot configuration) : IDisposable
     {
+        private readonly TaskCompletionSource reloaded = new(
+            TaskCreationOptions.RunContinuationsAsynchronously
+        );
+
         public IHost Host => host;
+
+        public Task Reloaded => reloaded.Task;
+
+        public void Reload(bool killSwitch, bool dryRun, string? schedule = null)
+        {
+            configuration[$"{CohortOptions.SectionName}:KillSwitch"] = killSwitch.ToString();
+            configuration[$"{CohortOptions.SectionName}:DryRun"] = dryRun.ToString();
+            if (schedule is not null)
+            {
+                configuration[$"{CohortOptions.SectionName}:Schedule"] = schedule;
+            }
+            configuration.Reload();
+            reloaded.TrySetResult();
+        }
 
         public void Dispose()
         {
@@ -965,23 +970,69 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         }
     }
 
-    private sealed class MutableCohortOptionsMonitor(CohortOptions currentValue)
-        : IOptionsMonitor<CohortOptions>
+    private sealed class SkippedOccurrenceLogProvider : ILoggerProvider
     {
-        private CohortOptions options = currentValue;
+        private const string WorkerCategory = "Cohort.Hosting.RetentionWorker";
+        private const string SkipMessage =
+            "Cohort worker skipped this occurrence: another instance holds the sweep advisory lock.";
+        private readonly Channel<int> occurrences = Channel.CreateUnbounded<int>();
+        private int occurrenceCount;
 
-        public CohortOptions CurrentValue => options;
+        public int OccurrenceCount => Volatile.Read(ref occurrenceCount);
 
-        public CohortOptions Get(string? name) => options;
-
-        public IDisposable? OnChange(Action<CohortOptions, string?> listener)
+        public ILogger CreateLogger(string categoryName)
         {
-            return null;
+            return new SkippedOccurrenceLogger(this, categoryName);
         }
 
-        public void Update(CohortOptions next)
+        public async Task WaitForOccurrencesAsync(int expectedCount)
         {
-            options = next;
+            while (OccurrenceCount < expectedCount)
+            {
+                await occurrences.Reader.ReadAsync();
+            }
+        }
+
+        public void Dispose() { }
+
+        private void Record(LogLevel level, string categoryName, string message)
+        {
+            if (
+                level != LogLevel.Information
+                || categoryName != WorkerCategory
+                || message != SkipMessage
+            )
+            {
+                return;
+            }
+
+            var count = Interlocked.Increment(ref occurrenceCount);
+            occurrences.Writer.TryWrite(count);
+        }
+
+        private sealed class SkippedOccurrenceLogger(
+            SkippedOccurrenceLogProvider provider,
+            string categoryName
+        ) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state)
+                where TState : notnull
+            {
+                return null;
+            }
+
+            public bool IsEnabled(LogLevel logLevel) => true;
+
+            public void Log<TState>(
+                LogLevel logLevel,
+                EventId eventId,
+                TState state,
+                Exception? exception,
+                Func<TState, Exception?, string> formatter
+            )
+            {
+                provider.Record(logLevel, categoryName, formatter(state, exception));
+            }
         }
     }
 
@@ -994,7 +1045,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         public TaskCompletionSource<bool> CompletedReached { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public int StartedCount => startedCount;
+        public int StartedCount => Volatile.Read(ref startedCount);
 
         public void RecordStarted()
         {
@@ -1017,7 +1068,8 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         }
     }
 
-    private sealed class TemporaryDatabase(string connectionString, string databaseName) : IAsyncDisposable
+    private sealed class TemporaryDatabase(string connectionString, string databaseName)
+        : IAsyncDisposable
     {
         public string ConnectionString => connectionString;
 
@@ -1052,8 +1104,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
 
             await using (var terminate = connection.CreateCommand())
             {
-                terminate.CommandText =
-                    $"""
+                terminate.CommandText = $"""
                     SELECT pg_terminate_backend(pid)
                     FROM pg_stat_activity
                     WHERE datname = '{databaseName}'

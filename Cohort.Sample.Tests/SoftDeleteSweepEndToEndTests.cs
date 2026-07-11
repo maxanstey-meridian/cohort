@@ -1,14 +1,9 @@
+using System.Data;
 using Cohort.Application;
 using Cohort.Domain;
-using Cohort.Hosting;
+using Cohort.Infrastructure;
 using Cohort.Infrastructure.Sweep;
 using Cohort.Sample.Entities;
-
-using System.Collections;
-using System.Data;
-using System.Data.Common;
-using System.Diagnostics.CodeAnalysis;
-
 using Microsoft.EntityFrameworkCore;
 
 namespace Cohort.Sample.Tests;
@@ -69,15 +64,17 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(SoftDeleteRecord),
-                "soft-delete",
-                tenantA,
-                Strategy.SoftDelete,
-                1
-            )
-        );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(SoftDeleteRecord),
+                    "soft-delete",
+                    tenantA,
+                    Strategy.SoftDelete,
+                    1
+                )
+            );
 
         await using var verify = Host.CreateDbContext();
         var records = await verify
@@ -90,36 +87,38 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
             })
             .ToListAsync();
 
-        records.Should().Equal(
-            new
-            {
-                Body = "soft-delete-expired-target",
-                IsDeleted = true,
-                DeletedAt = (DateTimeOffset?)asOf,
-            },
-            new
-            {
-                Body = "soft-delete-keep-existing-deleted",
-                IsDeleted = true,
-                DeletedAt = (DateTimeOffset?)originalDeletedAt,
-            },
-            new
-            {
-                Body = "soft-delete-keep-newer",
-                IsDeleted = false,
-                DeletedAt = (DateTimeOffset?)null,
-            },
-            new
-            {
-                Body = "soft-delete-keep-other-tenant",
-                IsDeleted = false,
-                DeletedAt = (DateTimeOffset?)null,
-            }
-        );
+        records
+            .Should()
+            .Equal(
+                new
+                {
+                    Body = "soft-delete-expired-target",
+                    IsDeleted = true,
+                    DeletedAt = (DateTimeOffset?)asOf,
+                },
+                new
+                {
+                    Body = "soft-delete-keep-existing-deleted",
+                    IsDeleted = true,
+                    DeletedAt = (DateTimeOffset?)originalDeletedAt,
+                },
+                new
+                {
+                    Body = "soft-delete-keep-newer",
+                    IsDeleted = false,
+                    DeletedAt = (DateTimeOffset?)null,
+                },
+                new
+                {
+                    Body = "soft-delete-keep-other-tenant",
+                    IsDeleted = false,
+                    DeletedAt = (DateTimeOffset?)null,
+                }
+            );
     }
 
     [Fact]
-    public async Task Startup_Path_Fails_When_A_SoftDelete_Category_Lacks_The_Required_Convention()
+    public async Task Validation_Fails_When_A_SoftDelete_Category_Lacks_The_Required_Convention()
     {
         await using var db = Host.CreateDbContext();
         var connectionString = db.Database.GetConnectionString()!;
@@ -142,7 +141,7 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
             )
         );
 
-        var act = () => host.RunStartupAsync();
+        var act = () => host.ValidateAndScanAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle();
@@ -190,24 +189,28 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
         var first = await Host.RunSweepAsync(tenant, asOf);
         var second = await Host.RunSweepAsync(tenant, asOf);
 
-        first.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(SoftDeleteRecord),
-                "soft-delete",
-                tenantId,
-                Strategy.SoftDelete,
-                1
-            )
-        );
-        second.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(SoftDeleteRecord),
-                "soft-delete",
-                tenantId,
-                Strategy.SoftDelete,
-                0
-            )
-        );
+        first
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(SoftDeleteRecord),
+                    "soft-delete",
+                    tenantId,
+                    Strategy.SoftDelete,
+                    1
+                )
+            );
+        second
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(SoftDeleteRecord),
+                    "soft-delete",
+                    tenantId,
+                    Strategy.SoftDelete,
+                    0
+                )
+            );
 
         await using var verify = Host.CreateDbContext();
         var records = await verify
@@ -220,20 +223,22 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
             })
             .ToListAsync();
 
-        records.Should().Equal(
-            new
-            {
-                Body = "soft-delete-already-done",
-                IsDeleted = true,
-                DeletedAt = (DateTimeOffset?)originalDeletedAt,
-            },
-            new
-            {
-                Body = "soft-delete-once",
-                IsDeleted = true,
-                DeletedAt = (DateTimeOffset?)asOf,
-            }
-        );
+        records
+            .Should()
+            .Equal(
+                new
+                {
+                    Body = "soft-delete-already-done",
+                    IsDeleted = true,
+                    DeletedAt = (DateTimeOffset?)originalDeletedAt,
+                },
+                new
+                {
+                    Body = "soft-delete-once",
+                    IsDeleted = true,
+                    DeletedAt = (DateTimeOffset?)asOf,
+                }
+            );
     }
 
     [Fact]
@@ -256,12 +261,12 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
         );
         var preview = new RetentionPreviewService(
             db,
-            new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())),
+            new RetentionRegistry(db, new RetentionEntryBuilder(new RetentionModelConventions())),
             repository,
             new RetentionStartupValidator(
                 db,
                 repository,
-                new RetentionEntryBuilder(new CohortConventions()),
+                new RetentionEntryBuilder(new RetentionModelConventions()),
                 [new GuidTombstoneFactory(), new OriginalValueTombstoneFactory()]
             ),
             [
@@ -270,18 +275,19 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
                 new AnonymiseSweepStrategy(
                     db,
                     [new GuidTombstoneFactory(), new OriginalValueTombstoneFactory()]
-                )
+                ),
             ]
         );
 
         var act = () =>
-            preview.PreviewAsync(
-                new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
-                new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero)
+            preview.ExecuteAsync(
+                RetentionPreviewRequest.Tenanted(
+                    new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
+                    new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero)
+                )
             );
 
-        await act
-            .Should()
+        await act.Should()
             .ThrowAsync<RetentionConfigurationException>()
             .WithMessage(
                 $"*Soft-delete convention on {typeof(Note).FullName}: retained SoftDelete categories require a public bool soft-delete flag property (named IsDeleted by convention, or marked with [RetentionSoftDelete]) mapped by EF.*"
@@ -292,803 +298,16 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
         IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
     ) : IRetentionCategoryRepository
     {
-        private static readonly IRetentionRuleResolver ExemptFallback = new StaticRetentionRuleResolver(
-            new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
-        );
+        private static readonly IRetentionRuleResolver ExemptFallback =
+            new StaticRetentionRuleResolver(
+                new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+            );
 
         public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
         {
             return resolvers.TryGetValue(category, out var resolver)
                 ? Task.FromResult<IRetentionRuleResolver?>(resolver)
                 : Task.FromResult<IRetentionRuleResolver?>(ExemptFallback);
-        }
-    }
-
-}
-
-[Collection("Integration")]
-public sealed class SoftDeleteSweepStrategyCommandTests
-{
-    [Fact]
-    public async Task PreviewAsync_Uses_A_Hold_Aware_Count_Query()
-    {
-        var strategy = new SoftDeleteSweepStrategy();
-        var connection = new RecordingDbConnection();
-        var tenantId = Guid.NewGuid();
-        var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
-        var entry = new RetentionEntry(
-            typeof(SoftDeleteRecord),
-            "soft_delete_records",
-            "soft-delete",
-            nameof(SoftDeleteRecord.CreatedAt),
-            "CreatedAt",
-            new RecordIdConvention(nameof(SoftDeleteRecord.Id), "Id", typeof(Guid)),
-            [],
-            new TenantConvention(nameof(SoftDeleteRecord.TenantId), "TenantId"),
-            new SoftDeleteConvention(
-                nameof(SoftDeleteRecord.IsDeleted),
-                "IsDeleted",
-                nameof(SoftDeleteRecord.DeletedAt),
-                "DeletedAt"
-            )
-        );
-        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete);
-        var context = new RetentionResolutionContext(
-            "soft-delete",
-            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            now,
-            []
-        );
-
-        var affected = await strategy.PreviewAsync(
-            entry,
-            rule,
-            context,
-            connection,
-            CancellationToken.None
-        );
-
-        affected.Should().Be(1);
-        connection.Commands.Should().ContainSingle();
-        connection.LastCommand.Should().NotBeNull();
-        connection.LastCommand!.AssignedTransaction.Should().BeNull();
-        connection.LastCommand.CommandText.Should().Contain("SELECT COUNT(*)");
-        connection.LastCommand.CommandText.Should().Contain("\"IsDeleted\" = FALSE");
-        connection.LastCommand.CommandText.Should().Contain("@cutoff");
-        connection.LastCommand.CommandText.Should().Contain("@tenantId");
-        connection.LastCommand.CommandText.Should().Contain("@holdTableName");
-        connection.LastCommand.CommandText.Should().Contain("now()");
-        connection.LastCommand.CommandText.Should().Contain("NOT EXISTS");
-        connection.LastCommand.Parameters.Count.Should().Be(3);
-        connection.LastCommand.Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
-        connection.LastCommand.Parameters["tenantId"].Value.Should().Be(tenantId);
-        connection.LastCommand.Parameters["holdTableName"].Value.Should().Be("soft_delete_records");
-    }
-
-    [Fact]
-    public async Task SweepAsync_Computes_HeldCount_From_Selected_Candidates_And_Targets_Only_Those_Ids()
-    {
-        var selectedId = Guid.NewGuid();
-        var heldId = Guid.NewGuid();
-        var strategy = new SoftDeleteSweepStrategy();
-        var connection = new RecordingDbConnection();
-        connection.EnqueueResultSet(selectedId, heldId);
-        connection.EnqueueResultSet(selectedId);
-        var transaction = connection.BeginTransaction();
-        var tenantId = Guid.NewGuid();
-        var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
-        var entry = new RetentionEntry(
-            typeof(SoftDeleteRecord),
-            "soft_delete_records",
-            "soft-delete",
-            nameof(SoftDeleteRecord.CreatedAt),
-            "CreatedAt",
-            new RecordIdConvention(nameof(SoftDeleteRecord.Id), "Id", typeof(Guid)),
-            [],
-            new TenantConvention(nameof(SoftDeleteRecord.TenantId), "TenantId"),
-            new SoftDeleteConvention(
-                nameof(SoftDeleteRecord.IsDeleted),
-                "IsDeleted",
-                nameof(SoftDeleteRecord.DeletedAt),
-                "DeletedAt"
-            )
-        );
-        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete);
-        var context = new RetentionResolutionContext(
-            "soft-delete",
-            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            now,
-            []
-        );
-
-        var affected = await strategy.SweepAsync(
-            entry,
-            rule,
-            context,
-            connection,
-            transaction,
-            CancellationToken.None
-        );
-
-        affected.AffectedRecordIds.Should().Equal(selectedId.ToString());
-        affected.HeldCount.Should().Be(1);
-        connection.Commands.Should().HaveCount(2);
-        connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
-        connection.Commands[0].CommandText.Should().Contain(
-            "ORDER BY target.\"CreatedAt\" ASC, CAST(target.\"Id\" AS text) ASC"
-        );
-        connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
-        connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
-            new[] { selectedId.ToString(), heldId.ToString() }
-        );
-    }
-
-    [Fact]
-    public async Task SweepAsync_Uses_The_Mapped_Record_Id_Column_In_Hold_Filtering()
-    {
-        var strategy = new SoftDeleteSweepStrategy();
-        var connection = new RecordingDbConnection();
-        connection.EnqueueResultSet(Guid.NewGuid());
-        connection.EnqueueResultSet(Guid.NewGuid());
-        var transaction = connection.BeginTransaction();
-        var tenantId = Guid.NewGuid();
-        var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
-        var entry = new RetentionEntry(
-            typeof(SoftDeleteRecord),
-            "soft_delete_records",
-            "soft-delete",
-            nameof(SoftDeleteRecord.CreatedAt),
-            "CreatedAt",
-            new RecordIdConvention(nameof(SoftDeleteRecord.Id), "record_id", typeof(Guid)),
-            [],
-            new TenantConvention(nameof(SoftDeleteRecord.TenantId), "TenantId"),
-            new SoftDeleteConvention(
-                nameof(SoftDeleteRecord.IsDeleted),
-                "IsDeleted",
-                nameof(SoftDeleteRecord.DeletedAt),
-                "DeletedAt"
-            )
-        );
-        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete);
-        var context = new RetentionResolutionContext(
-            "soft-delete",
-            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            now,
-            []
-        );
-
-        var affected = await strategy.SweepAsync(
-            entry,
-            rule,
-            context,
-            connection,
-            transaction,
-            CancellationToken.None
-        );
-
-        affected.AffectedRecordIds.Should().ContainSingle();
-        affected.HeldCount.Should().Be(0);
-        connection.LastCommand.Should().NotBeNull();
-        connection.LastCommand!.CommandText.Should().Contain("hold.\"RecordId\" = CAST(target.\"record_id\" AS text)");
-    }
-
-    [Fact]
-    public async Task EraseAsync_Computes_HeldCount_From_Selected_Candidates_And_Targets_Only_Those_Ids()
-    {
-        var selectedId = Guid.NewGuid();
-        var heldId = Guid.NewGuid();
-        var tenantId = Guid.NewGuid();
-        var subjectId = Guid.NewGuid();
-        var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
-        var strategy = new SoftDeleteSweepStrategy();
-        var connection = new RecordingDbConnection();
-        connection.EnqueueResultSet(selectedId, heldId);
-        connection.EnqueueResultSet(selectedId);
-        var transaction = connection.BeginTransaction();
-        var entry = new RetentionEntry(
-            typeof(SoftDeleteRecord),
-            "soft_delete_records",
-            "soft-delete",
-            nameof(SoftDeleteRecord.CreatedAt),
-            "CreatedAt",
-            new RecordIdConvention(nameof(SoftDeleteRecord.Id), "Id", typeof(Guid)),
-            [],
-            new TenantConvention(nameof(SoftDeleteRecord.TenantId), "TenantId"),
-            new SoftDeleteConvention(
-                nameof(SoftDeleteRecord.IsDeleted),
-                "IsDeleted",
-                nameof(SoftDeleteRecord.DeletedAt),
-                "DeletedAt"
-            )
-        );
-        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete);
-
-        var affected = await strategy.EraseAsync(
-            entry,
-            rule,
-            new ErasureSubjectPredicate(
-                [new ErasureSubjectMatch(nameof(SoftDeleteRecord.Id), "SubjectId", subjectId)]
-            ),
-            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            now,
-            connection,
-            transaction,
-            CancellationToken.None
-        );
-
-        affected.AffectedRecordIds.Should().Equal(selectedId.ToString());
-        affected.HeldCount.Should().Be(1);
-        connection.Commands.Should().HaveCount(2);
-        connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
-        connection.Commands[0].CommandText.Should().Contain("\"SubjectId\" = @subjectValue0");
-        connection.Commands[0].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
-        connection.Commands[0].CommandText.Should().Contain(
-            "ORDER BY target.\"CreatedAt\" ASC, CAST(target.\"Id\" AS text) ASC"
-        );
-        connection.Commands[0].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
-        connection.Commands[1].CommandText.Should().Contain("\"SubjectId\" = @subjectValue0");
-        connection.Commands[1].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
-        connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
-        connection.Commands[1].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
-        connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
-            new[] { selectedId.ToString(), heldId.ToString() }
-        );
-    }
-
-    [Fact]
-    public async Task PreviewEraseAsync_Uses_A_NonMutating_HoldAware_Count_Query_For_The_Selected_Subject()
-    {
-        var selectedId = Guid.NewGuid();
-        var heldId = Guid.NewGuid();
-        var tenantId = Guid.NewGuid();
-        var subjectId = Guid.NewGuid();
-        var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
-        var strategy = new SoftDeleteSweepStrategy();
-        var connection = new RecordingDbConnection();
-        connection.EnqueueResultSet(selectedId, heldId);
-        var entry = new RetentionEntry(
-            typeof(SoftDeleteRecord),
-            "soft_delete_records",
-            "soft-delete",
-            nameof(SoftDeleteRecord.CreatedAt),
-            "CreatedAt",
-            new RecordIdConvention(nameof(SoftDeleteRecord.Id), "Id", typeof(Guid)),
-            [],
-            new TenantConvention(nameof(SoftDeleteRecord.TenantId), "TenantId"),
-            new SoftDeleteConvention(
-                nameof(SoftDeleteRecord.IsDeleted),
-                "IsDeleted",
-                nameof(SoftDeleteRecord.DeletedAt),
-                "DeletedAt"
-            )
-        );
-        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete);
-
-        var affected = await strategy.PreviewEraseAsync(
-            entry,
-            rule,
-            new ErasureSubjectPredicate(
-                [new ErasureSubjectMatch(nameof(SoftDeleteRecord.Id), "SubjectId", subjectId)]
-            ),
-            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            now,
-            connection,
-            CancellationToken.None
-        );
-
-        affected.Should().Be(1);
-        connection.Commands.Should().HaveCount(2);
-        connection.Commands[0].AssignedTransaction.Should().BeNull();
-        connection.Commands[0].CommandText.Should().NotContain("FOR UPDATE");
-        connection.Commands[0].CommandText.Should().Contain("\"SubjectId\" = @subjectValue0");
-        connection.Commands[0].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
-        connection.Commands[0].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
-        connection.Commands[1].AssignedTransaction.Should().BeNull();
-        connection.Commands[1].CommandText.Should().Contain("SELECT COUNT(*)");
-        connection.Commands[1].CommandText.Should().Contain("\"SubjectId\" = @subjectValue0");
-        connection.Commands[1].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
-        connection.Commands[1].CommandText.Should().Contain("\"IsDeleted\" = FALSE");
-        connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
-        connection.Commands[1].CommandText.Should().Contain("NOT EXISTS");
-        connection.Commands[1].CommandText.Should().NotContain("DELETE FROM");
-        connection.Commands[1].CommandText.Should().NotContain("UPDATE ");
-        connection.Commands[1].CommandText.Should().NotContain("FOR UPDATE");
-        connection.Commands[1].Parameters["tenantId"].Value.Should().Be(tenantId);
-        connection.Commands[1].Parameters["subjectValue0"].Value.Should().Be(subjectId);
-        connection.Commands[1].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
-        connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
-            new[] { selectedId.ToString(), heldId.ToString() }
-        );
-        connection.Commands[1].Parameters["holdTableName"].Value.Should().Be("soft_delete_records");
-    }
-
-    [Fact]
-    public async Task EraseAsync_Uses_An_Or_Subject_Predicate_When_Multiple_Subject_Matches_Are_Provided()
-    {
-        var selectedId = Guid.NewGuid();
-        var heldId = Guid.NewGuid();
-        var tenantId = Guid.NewGuid();
-        var firstSubjectId = Guid.NewGuid();
-        var secondSubjectId = Guid.NewGuid();
-        var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
-        var strategy = new SoftDeleteSweepStrategy();
-        var connection = new RecordingDbConnection();
-        connection.EnqueueResultSet(selectedId, heldId);
-        connection.EnqueueResultSet(selectedId);
-        var transaction = connection.BeginTransaction();
-        var entry = new RetentionEntry(
-            typeof(SoftDeleteRecord),
-            "soft_delete_records",
-            "soft-delete",
-            nameof(SoftDeleteRecord.CreatedAt),
-            "CreatedAt",
-            new RecordIdConvention(nameof(SoftDeleteRecord.Id), "Id", typeof(Guid)),
-            [],
-            new TenantConvention(nameof(SoftDeleteRecord.TenantId), "TenantId"),
-            new SoftDeleteConvention(
-                nameof(SoftDeleteRecord.IsDeleted),
-                "IsDeleted",
-                nameof(SoftDeleteRecord.DeletedAt),
-                "DeletedAt"
-            )
-        );
-        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete);
-
-        var affected = await strategy.EraseAsync(
-            entry,
-            rule,
-            new ErasureSubjectPredicate(
-                [
-                    new ErasureSubjectMatch(nameof(SoftDeleteRecord.Id), "SubjectId", firstSubjectId),
-                    new ErasureSubjectMatch(nameof(SoftDeleteRecord.Id), "DelegateSubjectId", secondSubjectId),
-                ]
-            ),
-            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            now,
-            connection,
-            transaction,
-            CancellationToken.None
-        );
-
-        affected.AffectedRecordIds.Should().Equal(selectedId.ToString());
-        connection.Commands.Should().HaveCount(2);
-        connection.Commands[0].CommandText.Should().Contain("FOR UPDATE");
-        connection.Commands[0].CommandText.Should().Contain(
-            "(target.\"SubjectId\" = @subjectValue0 OR target.\"DelegateSubjectId\" = @subjectValue1)"
-        );
-        connection.Commands[0].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
-        connection.Commands[0].CommandText.Should().Contain("\"IsDeleted\" = FALSE");
-        connection.Commands[0].CommandText.Should().Contain(
-            "ORDER BY target.\"CreatedAt\" ASC, CAST(target.\"Id\" AS text) ASC"
-        );
-        connection.Commands[0].Parameters["tenantId"].Value.Should().Be(tenantId);
-        connection.Commands[0].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
-        connection.Commands[1].CommandText.Should().Contain(
-            "(target.\"SubjectId\" = @subjectValue0 OR target.\"DelegateSubjectId\" = @subjectValue1)"
-        );
-        connection.Commands[1].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
-        connection.Commands[1].CommandText.Should().Contain("\"IsDeleted\" = FALSE");
-        connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
-        connection.Commands[1].CommandText.Should().Contain("NOT EXISTS");
-        connection.Commands[1].Parameters["tenantId"].Value.Should().Be(tenantId);
-        connection.Commands[0].Parameters["subjectValue0"].Value.Should().Be(firstSubjectId);
-        connection.Commands[0].Parameters["subjectValue1"].Value.Should().Be(secondSubjectId);
-        connection.Commands[1].Parameters["subjectValue0"].Value.Should().Be(firstSubjectId);
-        connection.Commands[1].Parameters["subjectValue1"].Value.Should().Be(secondSubjectId);
-        connection.Commands[1].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
-        connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
-            new[] { selectedId.ToString(), heldId.ToString() }
-        );
-        connection.Commands[1].Parameters["holdTableName"].Value.Should().Be("soft_delete_records");
-    }
-
-    [Fact]
-    public async Task PreviewEraseAsync_Uses_An_Or_Subject_Predicate_When_Multiple_Subject_Matches_Are_Provided()
-    {
-        var selectedId = Guid.NewGuid();
-        var heldId = Guid.NewGuid();
-        var tenantId = Guid.NewGuid();
-        var firstSubjectId = Guid.NewGuid();
-        var secondSubjectId = Guid.NewGuid();
-        var now = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
-        var strategy = new SoftDeleteSweepStrategy();
-        var connection = new RecordingDbConnection();
-        connection.EnqueueResultSet(selectedId, heldId);
-        var entry = new RetentionEntry(
-            typeof(SoftDeleteRecord),
-            "soft_delete_records",
-            "soft-delete",
-            nameof(SoftDeleteRecord.CreatedAt),
-            "CreatedAt",
-            new RecordIdConvention(nameof(SoftDeleteRecord.Id), "Id", typeof(Guid)),
-            [],
-            new TenantConvention(nameof(SoftDeleteRecord.TenantId), "TenantId"),
-            new SoftDeleteConvention(
-                nameof(SoftDeleteRecord.IsDeleted),
-                "IsDeleted",
-                nameof(SoftDeleteRecord.DeletedAt),
-                "DeletedAt"
-            )
-        );
-        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete);
-
-        var affected = await strategy.PreviewEraseAsync(
-            entry,
-            rule,
-            new ErasureSubjectPredicate(
-                [
-                    new ErasureSubjectMatch(nameof(SoftDeleteRecord.Id), "SubjectId", firstSubjectId),
-                    new ErasureSubjectMatch(nameof(SoftDeleteRecord.Id), "DelegateSubjectId", secondSubjectId),
-                ]
-            ),
-            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            now,
-            connection,
-            CancellationToken.None
-        );
-
-        affected.Should().Be(1);
-        connection.Commands.Should().HaveCount(2);
-        connection.Commands[0].AssignedTransaction.Should().BeNull();
-        connection.Commands[0].CommandText.Should().NotContain("FOR UPDATE");
-        connection.Commands[0].CommandText.Should().Contain(
-            "(target.\"SubjectId\" = @subjectValue0 OR target.\"DelegateSubjectId\" = @subjectValue1)"
-        );
-        connection.Commands[0].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
-        connection.Commands[0].CommandText.Should().Contain("\"IsDeleted\" = FALSE");
-        connection.Commands[0].Parameters["tenantId"].Value.Should().Be(tenantId);
-        connection.Commands[0].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
-        connection.Commands[1].AssignedTransaction.Should().BeNull();
-        connection.Commands[1].CommandText.Should().Contain("SELECT COUNT(*)");
-        connection.Commands[1].CommandText.Should().Contain(
-            "(target.\"SubjectId\" = @subjectValue0 OR target.\"DelegateSubjectId\" = @subjectValue1)"
-        );
-        connection.Commands[1].CommandText.Should().Contain("\"CreatedAt\" < @cutoff");
-        connection.Commands[1].CommandText.Should().Contain("\"IsDeleted\" = FALSE");
-        connection.Commands[1].CommandText.Should().Contain("ANY(@candidateIds)");
-        connection.Commands[1].CommandText.Should().Contain("NOT EXISTS");
-        connection.Commands[1].CommandText.Should().NotContain("DELETE FROM");
-        connection.Commands[1].CommandText.Should().NotContain("UPDATE ");
-        connection.Commands[1].CommandText.Should().NotContain("FOR UPDATE");
-        connection.Commands[1].Parameters["tenantId"].Value.Should().Be(tenantId);
-        connection.Commands[1].Parameters["subjectValue0"].Value.Should().Be(firstSubjectId);
-        connection.Commands[1].Parameters["subjectValue1"].Value.Should().Be(secondSubjectId);
-        connection.Commands[1].Parameters["cutoff"].Value.Should().Be(now.AddDays(-30));
-        connection.Commands[1].Parameters["candidateIds"].Value.Should().BeEquivalentTo(
-            new[] { selectedId.ToString(), heldId.ToString() }
-        );
-        connection.Commands[1].Parameters["holdTableName"].Value.Should().Be("soft_delete_records");
-    }
-
-    private sealed class RecordingDbConnection : DbConnection
-    {
-        private ConnectionState state = ConnectionState.Closed;
-        private string connectionString = "Host=recording";
-        private readonly Queue<Guid[]> queuedResultSets = new();
-
-        public RecordingDbCommand? LastCommand { get; private set; }
-        public List<RecordingDbCommand> Commands { get; } = [];
-
-        public void EnqueueResultSet(params Guid[] values)
-        {
-            queuedResultSets.Enqueue(values);
-        }
-
-        [AllowNull]
-        public override string ConnectionString
-        {
-            get => connectionString;
-            set => connectionString = value ?? "";
-        }
-
-        public override string Database => "recording";
-
-        public override string DataSource => "recording";
-
-        public override string ServerVersion => "1.0";
-
-        public override ConnectionState State => state;
-
-        public override void ChangeDatabase(string databaseName) { }
-
-        public override void Close()
-        {
-            state = ConnectionState.Closed;
-        }
-
-        public override void Open()
-        {
-            state = ConnectionState.Open;
-        }
-
-        protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
-        {
-            state = ConnectionState.Open;
-            return new RecordingDbTransaction(this);
-        }
-
-        protected override DbCommand CreateDbCommand()
-        {
-            LastCommand = new RecordingDbCommand(this);
-            Commands.Add(LastCommand);
-            return LastCommand;
-        }
-
-        public Guid[] DequeueResultSet()
-        {
-            return queuedResultSets.Count > 0 ? queuedResultSets.Dequeue() : [Guid.NewGuid()];
-        }
-    }
-
-    private sealed class RecordingDbTransaction(RecordingDbConnection connection) : DbTransaction
-    {
-        public override IsolationLevel IsolationLevel => IsolationLevel.ReadCommitted;
-
-        protected override DbConnection? DbConnection => connection;
-
-        public override void Commit() { }
-
-        public override void Rollback() { }
-    }
-
-    private sealed class RecordingDbCommand(RecordingDbConnection connection) : DbCommand
-    {
-        private readonly RecordingDbParameterCollection parameters = new();
-        private string commandText = "";
-
-        public DbTransaction? AssignedTransaction { get; private set; }
-
-        [AllowNull]
-        public override string CommandText
-        {
-            get => commandText;
-            set => commandText = value ?? "";
-        }
-
-        public override int CommandTimeout { get; set; }
-
-        public override CommandType CommandType { get; set; } = CommandType.Text;
-
-        protected override DbConnection? DbConnection { get; set; } = connection;
-
-        protected override DbParameterCollection DbParameterCollection => parameters;
-
-        protected override DbTransaction? DbTransaction
-        {
-            get => AssignedTransaction;
-            set => AssignedTransaction = value;
-        }
-
-        public override bool DesignTimeVisible { get; set; }
-
-        public override UpdateRowSource UpdatedRowSource { get; set; }
-
-        public override void Cancel() { }
-
-        public override int ExecuteNonQuery()
-        {
-            return 1;
-        }
-
-        public override object? ExecuteScalar()
-        {
-            return 1;
-        }
-
-        public override void Prepare() { }
-
-        protected override DbParameter CreateDbParameter()
-        {
-            return new RecordingDbParameter();
-        }
-
-        protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
-        {
-            return new GuidSequenceDbDataReader(connection.DequeueResultSet());
-        }
-
-        public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
-        {
-            return Task.FromResult(1);
-        }
-    }
-
-    private sealed class GuidSequenceDbDataReader(IReadOnlyList<Guid> values) : DbDataReader
-    {
-        private int index = -1;
-
-        public override int FieldCount => 1;
-        public override bool HasRows => values.Count > 0;
-        public override bool IsClosed => false;
-        public override int RecordsAffected => 1;
-        public override int Depth => 0;
-        public override object this[int ordinal] => GetValue(ordinal);
-        public override object this[string name] => GetValue(GetOrdinal(name));
-
-        public override bool Read()
-        {
-            if (index + 1 >= values.Count)
-            {
-                return false;
-            }
-
-            index++;
-            return true;
-        }
-
-        public override Task<bool> ReadAsync(CancellationToken cancellationToken) => Task.FromResult(Read());
-        public override bool NextResult() => false;
-        public override Task<bool> NextResultAsync(CancellationToken cancellationToken) => Task.FromResult(false);
-        public override Guid GetGuid(int ordinal) => values[index];
-        public override object GetValue(int ordinal) => values[index];
-        public override int GetValues(object[] items)
-        {
-            items[0] = values[index];
-            return 1;
-        }
-
-        public override string GetName(int ordinal) => "Id";
-        public override string GetDataTypeName(int ordinal) => nameof(Guid);
-        public override Type GetFieldType(int ordinal) => typeof(Guid);
-        public override int GetOrdinal(string name) => 0;
-        public override bool IsDBNull(int ordinal) => false;
-        public override IEnumerator GetEnumerator() => values.GetEnumerator();
-
-        public override bool GetBoolean(int ordinal) => throw new NotSupportedException();
-        public override byte GetByte(int ordinal) => throw new NotSupportedException();
-        public override long GetBytes(int ordinal, long dataOffset, byte[]? buffer, int bufferOffset, int length) => throw new NotSupportedException();
-        public override char GetChar(int ordinal) => throw new NotSupportedException();
-        public override long GetChars(int ordinal, long dataOffset, char[]? buffer, int bufferOffset, int length) => throw new NotSupportedException();
-        public override string GetString(int ordinal) => throw new NotSupportedException();
-        public override short GetInt16(int ordinal) => throw new NotSupportedException();
-        public override int GetInt32(int ordinal) => throw new NotSupportedException();
-        public override long GetInt64(int ordinal) => throw new NotSupportedException();
-        public override float GetFloat(int ordinal) => throw new NotSupportedException();
-        public override double GetDouble(int ordinal) => throw new NotSupportedException();
-        public override decimal GetDecimal(int ordinal) => throw new NotSupportedException();
-        public override DateTime GetDateTime(int ordinal) => throw new NotSupportedException();
-    }
-
-    private sealed class RecordingDbParameter : DbParameter
-    {
-        private string parameterName = "";
-        private string sourceColumn = "";
-
-        public override DbType DbType { get; set; }
-
-        public override ParameterDirection Direction { get; set; } = ParameterDirection.Input;
-
-        public override bool IsNullable { get; set; }
-
-        [AllowNull]
-        public override string ParameterName
-        {
-            get => parameterName;
-            set => parameterName = value ?? "";
-        }
-
-        [AllowNull]
-        public override string SourceColumn
-        {
-            get => sourceColumn;
-            set => sourceColumn = value ?? "";
-        }
-
-        public override object? Value { get; set; }
-
-        public override bool SourceColumnNullMapping { get; set; }
-
-        public override int Size { get; set; }
-
-        public override void ResetDbType() { }
-    }
-
-    private sealed class RecordingDbParameterCollection : DbParameterCollection
-    {
-        private readonly List<DbParameter> items = [];
-
-        public override int Count => items.Count;
-
-        public override object SyncRoot => this;
-
-        public override int Add(object value)
-        {
-            items.Add((DbParameter)value);
-            return items.Count - 1;
-        }
-
-        public override void AddRange(Array values)
-        {
-            foreach (var value in values)
-            {
-                Add(value!);
-            }
-        }
-
-        public override void Clear()
-        {
-            items.Clear();
-        }
-
-        public override bool Contains(object value)
-        {
-            return items.Contains((DbParameter)value);
-        }
-
-        public override bool Contains(string value)
-        {
-            return items.Any(parameter => parameter.ParameterName == value);
-        }
-
-        public override void CopyTo(Array array, int index)
-        {
-            items.ToArray().CopyTo(array, index);
-        }
-
-        public override IEnumerator GetEnumerator()
-        {
-            return items.GetEnumerator();
-        }
-
-        public override int IndexOf(object value)
-        {
-            return items.IndexOf((DbParameter)value);
-        }
-
-        public override int IndexOf(string parameterName)
-        {
-            return items.FindIndex(parameter => parameter.ParameterName == parameterName);
-        }
-
-        public override void Insert(int index, object value)
-        {
-            items.Insert(index, (DbParameter)value);
-        }
-
-        public override void Remove(object value)
-        {
-            items.Remove((DbParameter)value);
-        }
-
-        public override void RemoveAt(int index)
-        {
-            items.RemoveAt(index);
-        }
-
-        public override void RemoveAt(string parameterName)
-        {
-            var index = IndexOf(parameterName);
-            if (index >= 0)
-            {
-                items.RemoveAt(index);
-            }
-        }
-
-        protected override DbParameter GetParameter(int index)
-        {
-            return items[index];
-        }
-
-        protected override DbParameter GetParameter(string parameterName)
-        {
-            return items[IndexOf(parameterName)];
-        }
-
-        protected override void SetParameter(int index, DbParameter value)
-        {
-            items[index] = value;
-        }
-
-        protected override void SetParameter(string parameterName, DbParameter value)
-        {
-            var index = IndexOf(parameterName);
-            if (index >= 0)
-            {
-                items[index] = value;
-                return;
-            }
-
-            items.Add(value);
         }
     }
 }

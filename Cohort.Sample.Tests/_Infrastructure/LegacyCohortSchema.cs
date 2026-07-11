@@ -24,8 +24,7 @@ internal static class LegacyCohortSchema
 
         await using (var command = connection.CreateCommand())
         {
-            command.CommandText =
-                """
+            command.CommandText = """
                 CREATE TABLE "__EFMigrationsHistory" (
                     "MigrationId" character varying(150) NOT NULL,
                     "ProductVersion" character varying(32) NOT NULL,
@@ -139,8 +138,7 @@ internal static class LegacyCohortSchema
         foreach (var migrationId in AppliedMigrationIds)
         {
             await using var command = connection.CreateCommand();
-            command.CommandText =
-                """
+            command.CommandText = """
                 INSERT INTO "__EFMigrationsHistory" ("MigrationId", "ProductVersion")
                 VALUES (@migrationId, @productVersion)
                 """;

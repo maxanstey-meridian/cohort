@@ -1,4 +1,3 @@
-using Cohort.Domain;
 using Cohort.Infrastructure.Holds;
 
 namespace Cohort.Infrastructure.Sweep;
@@ -9,13 +8,16 @@ internal static class AnonymiseSqlBuilder
     {
         var tenantClause = BuildTenantClause(entry.Tenant?.TenantColumn);
 
-        return
-            $"""
+        return $"""
             SELECT COUNT(*)
             FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE {filter.PredicateSql}
               {tenantClause}
-              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn, entry.Tenant?.TenantColumn)}
+              AND {RetentionHoldSql.BuildActiveHoldExclusion(
+                "target",
+                entry.RecordId.RecordIdColumn,
+                entry.Tenant?.TenantColumn
+            )}
             """;
     }
 
@@ -23,13 +25,16 @@ internal static class AnonymiseSqlBuilder
     {
         var tenantClause = BuildTenantClause(entry.Tenant?.TenantColumn);
 
-        return
-            $"""
+        return $"""
             SELECT COUNT(*)
             FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE {filter.PredicateSql}
               {tenantClause}
-              AND NOT {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn, entry.Tenant?.TenantColumn)}
+              AND NOT {RetentionHoldSql.BuildActiveHoldExclusion(
+                "target",
+                entry.RecordId.RecordIdColumn,
+                entry.Tenant?.TenantColumn
+            )}
             """;
     }
 
@@ -38,8 +43,7 @@ internal static class AnonymiseSqlBuilder
         // No hold exclusion: a held NULL-anchor row is just as invisible to retention.
         var tenantClause = BuildTenantClause(entry.Tenant?.TenantColumn);
 
-        return
-            $"""
+        return $"""
             SELECT COUNT(*)
             FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE {filter.PredicateSql}
@@ -56,19 +60,23 @@ internal static class AnonymiseSqlBuilder
 
     internal static string BuildSetBasedCommandText(RetentionEntry entry, SqlFilter filter)
     {
-        var assignments = entry.AnonymiseFields
-            .Select((field, index) => $"{QuoteIdentifier(field.ColumnName)} = @value{index}");
+        var assignments = entry.AnonymiseFields.Select(
+            (field, index) => $"{QuoteIdentifier(field.ColumnName)} = @value{index}"
+        );
         var tenantClause = BuildTenantClause(entry.Tenant?.TenantColumn);
 
-        return
-            $"""
+        return $"""
             UPDATE {QuoteIdentifier(entry.TableName)} AS target
             SET {string.Join(", ", assignments)}{BuildAnonymisedAtAssignment(entry)}
             WHERE {filter.PredicateSql}
               {tenantClause}
               AND {RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "candidateIds")}
-              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn, entry.Tenant?.TenantColumn)}
-            RETURNING target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
+              AND {RetentionHoldSql.BuildActiveHoldExclusion(
+                "target",
+                entry.RecordId.RecordIdColumn,
+                entry.Tenant?.TenantColumn
+            )}
+            RETURNING {RecordIdSql.TextExpression("target", entry.RecordId)}
             """;
     }
 
@@ -83,15 +91,18 @@ internal static class AnonymiseSqlBuilder
 
         var tenantClause = BuildTenantClause(entry.Tenant?.TenantColumn);
 
-        return
-            $"""
+        return $"""
             UPDATE {QuoteIdentifier(entry.TableName)} AS target
             SET {string.Join(", ", assignments)}{BuildAnonymisedAtAssignment(entry)}
             WHERE {RecordIdSql.EqualsParameter("target", entry.RecordId, "recordId")}
               AND {filter.PredicateSql}
               {tenantClause}
-              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn, entry.Tenant?.TenantColumn)}
-            RETURNING target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
+              AND {RetentionHoldSql.BuildActiveHoldExclusion(
+                "target",
+                entry.RecordId.RecordIdColumn,
+                entry.Tenant?.TenantColumn
+            )}
+            RETURNING {RecordIdSql.TextExpression("target", entry.RecordId)}
             """;
     }
 
@@ -108,19 +119,50 @@ internal static class AnonymiseSqlBuilder
             ? $"\n  AND NOT ({RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "excludedRecordIds")})"
             : "";
 
-        // Held rows are excluded up front so they are neither locked nor re-selected by
+        // Held rows are excluded up front so they are neither selected nor re-selected by
         // every batch; the engine measures them separately for the audit summary. Rows
         // already skipped by an earlier batch of this run are excluded too — they stay
         // eligible, so reselecting them would re-fail them forever.
-        return
-            $"""
-            SELECT target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)}
+        return $"""
+            SELECT {RecordIdSql.TextExpression("target", entry.RecordId)}
             FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE {filter.PredicateSql}
               {tenantClause}{excludedClause}
-              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn, entry.Tenant?.TenantColumn)}
-            ORDER BY target.{QuoteIdentifier(entry.AnchorColumn)} ASC, CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) ASC
-            FOR UPDATE SKIP LOCKED{limitClause}
+              AND {RetentionHoldSql.BuildActiveHoldExclusion(
+                "target",
+                entry.RecordId.RecordIdColumn,
+                entry.Tenant?.TenantColumn
+            )}
+            ORDER BY target.{QuoteIdentifier(entry.AnchorColumn)} ASC, CAST(target.{QuoteIdentifier(
+                entry.RecordId.RecordIdColumn
+            )} AS text) ASC
+            {limitClause}
+            """;
+    }
+
+    internal static string BuildCandidateLockCommandText(
+        RetentionEntry entry,
+        SqlFilter filter,
+        bool skipLocked
+    )
+    {
+        var tenantClause = BuildTenantClause(entry.Tenant?.TenantColumn);
+
+        return $"""
+            SELECT {RecordIdSql.TextExpression("target", entry.RecordId)}
+            FROM {QuoteIdentifier(entry.TableName)} AS target
+            WHERE {filter.PredicateSql}
+              {tenantClause}
+              AND {RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "candidateIds")}
+              AND {RetentionHoldSql.BuildActiveHoldExclusion(
+                "target",
+                entry.RecordId.RecordIdColumn,
+                entry.Tenant?.TenantColumn
+            )}
+            ORDER BY target.{QuoteIdentifier(entry.AnchorColumn)} ASC, CAST(target.{QuoteIdentifier(
+                entry.RecordId.RecordIdColumn
+            )} AS text) ASC
+            FOR UPDATE{(skipLocked ? " SKIP LOCKED" : "")}
             """;
     }
 
@@ -133,18 +175,24 @@ internal static class AnonymiseSqlBuilder
         var selectedColumns = originalValueFields
             .Select(field => $"target.{QuoteIdentifier(field.ColumnName)}")
             .ToArray();
-        var selectList = selectedColumns.Length == 0
-            ? $"CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text)"
-            : $"CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text), {string.Join(", ", selectedColumns)}";
+        var selectList =
+            selectedColumns.Length == 0
+                ? $"CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text)"
+                : $"CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text), {string.Join(", ", selectedColumns)}";
 
-        return
-            $"""
+        return $"""
             SELECT {selectList}
             FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE {RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "candidateIds")}
               {tenantClause}
-              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn, entry.Tenant?.TenantColumn)}
-            ORDER BY target.{QuoteIdentifier(entry.AnchorColumn)} ASC, CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) ASC
+              AND {RetentionHoldSql.BuildActiveHoldExclusion(
+                "target",
+                entry.RecordId.RecordIdColumn,
+                entry.Tenant?.TenantColumn
+            )}
+            ORDER BY target.{QuoteIdentifier(entry.AnchorColumn)} ASC, CAST(target.{QuoteIdentifier(
+                entry.RecordId.RecordIdColumn
+            )} AS text) ASC
             """;
     }
 
@@ -152,14 +200,19 @@ internal static class AnonymiseSqlBuilder
     {
         var tenantClause = BuildTenantClause(entry.Tenant?.TenantColumn);
 
-        return
-            $"""
+        return $"""
             SELECT *
             FROM {QuoteIdentifier(entry.TableName)} AS target
             WHERE {RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "candidateIds")}
               {tenantClause}
-              AND {RetentionHoldSql.BuildActiveHoldExclusion("target", entry.RecordId.RecordIdColumn, entry.Tenant?.TenantColumn)}
-            ORDER BY target.{QuoteIdentifier(entry.AnchorColumn)} ASC, CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) ASC
+              AND {RetentionHoldSql.BuildActiveHoldExclusion(
+                "target",
+                entry.RecordId.RecordIdColumn,
+                entry.Tenant?.TenantColumn
+            )}
+            ORDER BY target.{QuoteIdentifier(entry.AnchorColumn)} ASC, CAST(target.{QuoteIdentifier(
+                entry.RecordId.RecordIdColumn
+            )} AS text) ASC
             """;
     }
 

@@ -1,5 +1,4 @@
 using System.Text.Json;
-
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Design;
 
@@ -33,7 +32,11 @@ public sealed class SampleDbContextFactory : IDesignTimeDbContextFactory<SampleD
 
     private static string ResolveAppSettingsPath()
     {
-        var rootRelativePath = Path.Combine(Directory.GetCurrentDirectory(), "Cohort.Sample", "appsettings.json");
+        var rootRelativePath = Path.Combine(
+            Directory.GetCurrentDirectory(),
+            "Cohort.Sample",
+            "appsettings.json"
+        );
         if (File.Exists(rootRelativePath))
         {
             return rootRelativePath;
@@ -45,6 +48,8 @@ public sealed class SampleDbContextFactory : IDesignTimeDbContextFactory<SampleD
             return localPath;
         }
 
-        throw new FileNotFoundException("Could not locate Cohort.Sample/appsettings.json for design-time DbContext creation.");
+        throw new FileNotFoundException(
+            "Could not locate Cohort.Sample/appsettings.json for design-time DbContext creation."
+        );
     }
 }

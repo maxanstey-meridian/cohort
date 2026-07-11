@@ -1,19 +1,16 @@
 using System.Collections.Concurrent;
 using System.Data.Common;
-
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
 using Cohort.Sample.Entities;
-
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Sample.Tests;
 
-public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
-    : IntegrationTestBase(fixture)
+public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
     public async Task Sweep_Engine_Streams_Started_EntitySummary_RowDetail_And_Completed_To_The_Live_Audit_Writer_In_Order()
@@ -74,9 +71,8 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
             );
         }
 
-        // Expected shape: Started + one EntitySummary per retained sample entity (8) + one RowDetail
-        // for the purged note + Completed. Entity iteration order is model-dependent so we assert
-        // containment rather than positional ordering, except for Started/Completed bookends.
+        // Entity iteration order is model-dependent, so only Started/Completed are positional.
+        // The complete summary identity set below is the audit cardinality contract.
         auditWriter.Events[0].Should().BeOfType<SweepEvent.Started>();
         auditWriter.Events[^1].Should().BeOfType<SweepEvent.Completed>();
 
@@ -86,9 +82,24 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         started.TenantId.Should().Be(tenantId);
 
         var summaries = auditWriter.Events.OfType<SweepEvent.EntitySummary>().ToList();
-        summaries.Should().HaveCount(9);
-        summaries.Should().Contain(
-            s => s.SweepId == started.SweepId
+        summaries
+            .Select(summary => (summary.EntityType, summary.Category, summary.Strategy))
+            .Should()
+            .BeEquivalentTo(
+                [
+                    (typeof(Note), "short-lived", Strategy.Purge),
+                    (typeof(BlobBackedFile), "blob-cleanup", Strategy.Exempt),
+                    (typeof(SoftDeleteRecord), "soft-delete", Strategy.SoftDelete),
+                    (typeof(AnonymisedContact), "anonymise", Strategy.Anonymise),
+                    (typeof(PerRowAuditedLog), "per-row-audit-override", Strategy.Exempt),
+                    (typeof(TombstoneRecord), "tombstone-anonymise", Strategy.Exempt),
+                    (typeof(NullableAnchorEvent), "nullable-anchor-purge", Strategy.Exempt),
+                ]
+            );
+        summaries
+            .Should()
+            .Contain(s =>
+                s.SweepId == started.SweepId
                 && s.EntityType == typeof(AnonymisedContact)
                 && s.Category == "anonymise"
                 && s.TenantId == tenantId
@@ -96,9 +107,11 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                 && s.Affected == 0
                 && s.HeldCount == 0
                 && s.SkippedCount == 0
-        );
-        summaries.Should().Contain(
-            s => s.SweepId == started.SweepId
+            );
+        summaries
+            .Should()
+            .Contain(s =>
+                s.SweepId == started.SweepId
                 && s.EntityType == typeof(Note)
                 && s.Category == "short-lived"
                 && s.TenantId == tenantId
@@ -106,9 +119,11 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                 && s.Affected == 1
                 && s.HeldCount == 0
                 && s.SkippedCount == 0
-        );
-        summaries.Should().Contain(
-            s => s.SweepId == started.SweepId
+            );
+        summaries
+            .Should()
+            .Contain(s =>
+                s.SweepId == started.SweepId
                 && s.EntityType == typeof(SoftDeleteRecord)
                 && s.Category == "soft-delete"
                 && s.TenantId == tenantId
@@ -116,21 +131,24 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                 && s.Affected == 0
                 && s.HeldCount == 0
                 && s.SkippedCount == 0
-        );
+            );
 
         var rowDetails = auditWriter.Events.OfType<SweepEvent.RowDetail>().ToList();
         rowDetails.Should().ContainSingle();
-        rowDetails[0].Should().Be(
-            new SweepEvent.RowDetail(
-                started.SweepId,
-                rowDetails[0].At,
-                typeof(Note),
-                deletedNoteId.ToString(),
-                "short-lived",
-                Strategy.Purge,
-                tenantId
-            )
-        );
+        rowDetails[0]
+            .Should()
+            .Be(
+                new SweepEvent.RowDetail(
+                    started.SweepId,
+                    rowDetails[0].At,
+                    typeof(Note),
+                    Note.RetentionIdentity,
+                    deletedNoteId.ToString(),
+                    "short-lived",
+                    Strategy.Purge,
+                    tenantId
+                )
+            );
 
         var completed = (SweepEvent.Completed)auditWriter.Events[^1];
         completed.SweepId.Should().Be(started.SweepId);
@@ -139,11 +157,12 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         result.SweepId.Should().Be(started.SweepId);
         result.StartedAt.Should().Be(started.At);
         result.CompletedAt.Should().Be(completed.At);
-        result.Counts.Should().BeEquivalentTo(
-            auditWriter.Events
-                .OfType<SweepEvent.EntitySummary>()
-                .Select(summary =>
-                    new EntitySweepCount(
+        result
+            .Counts.Should()
+            .BeEquivalentTo(
+                auditWriter
+                    .Events.OfType<SweepEvent.EntitySummary>()
+                    .Select(summary => new EntitySweepCount(
                         summary.EntityType,
                         summary.Category,
                         summary.TenantId,
@@ -151,9 +170,8 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                         summary.Affected,
                         summary.HeldCount,
                         summary.SkippedCount
-                    )
-                )
-        );
+                    ))
+            );
     }
 
     [Fact]
@@ -264,29 +282,42 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1, HeldCount: 1)
-        );
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(SoftDeleteRecord),
-                "soft-delete",
-                tenantId,
-                Strategy.SoftDelete,
-                1,
-                HeldCount: 1
-            )
-        );
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(AnonymisedContact),
-                "anonymise",
-                tenantId,
-                Strategy.Anonymise,
-                1,
-                HeldCount: 1
-            )
-        );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(Note),
+                    "short-lived",
+                    tenantId,
+                    Strategy.Purge,
+                    1,
+                    HeldCount: 1
+                )
+            );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(SoftDeleteRecord),
+                    "soft-delete",
+                    tenantId,
+                    Strategy.SoftDelete,
+                    1,
+                    HeldCount: 1
+                )
+            );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(AnonymisedContact),
+                    "anonymise",
+                    tenantId,
+                    Strategy.Anonymise,
+                    1,
+                    HeldCount: 1
+                )
+            );
 
         var run = await LoadRunAsync(result.SweepId);
         var summaries = await LoadSummariesAsync(result.SweepId);
@@ -302,70 +333,92 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         run.Duration.Should().NotBeNull();
         run.Duration.Should().BePositive();
 
-        // 3 original retained entities + blob-backed fixture + 3 tenantless/per-row sample additions
-        // + tombstone entity (all later additions are Exempt under this test's restricted dict).
-        summaries.Should().HaveCount(9);
-        summaries.Should().Contain(
-            new SweepRunEntitySummaryRow(
-                result.SweepId,
-                typeof(Note).FullName!,
-                "short-lived",
-                tenantId,
-                Strategy.Purge,
-                TimeSpan.FromDays(30),
-                1,
-                1,
-                0,
-                "retention-policy",
-                "county override"
+        summaries
+            .Select(summary =>
+                (ResolveEntityType(summary.EntityType), summary.Category, summary.Strategy)
             )
-        );
-        summaries.Should().Contain(
-            new SweepRunEntitySummaryRow(
-                result.SweepId,
-                typeof(SoftDeleteRecord).FullName!,
-                "soft-delete",
-                tenantId,
-                Strategy.SoftDelete,
-                TimeSpan.FromDays(30),
-                1,
-                1,
-                0,
-                null,
-                null
-            )
-        );
-        summaries.Should().Contain(
-            new SweepRunEntitySummaryRow(
-                result.SweepId,
-                typeof(AnonymisedContact).FullName!,
-                "anonymise",
-                tenantId,
-                Strategy.Anonymise,
-                TimeSpan.FromDays(30),
-                1,
-                1,
-                0,
-                null,
-                null
-            )
-        );
+            .Should()
+            .BeEquivalentTo(
+                [
+                    (typeof(Note), "short-lived", Strategy.Purge),
+                    (typeof(BlobBackedFile), "blob-cleanup", Strategy.Exempt),
+                    (typeof(SoftDeleteRecord), "soft-delete", Strategy.SoftDelete),
+                    (typeof(AnonymisedContact), "anonymise", Strategy.Anonymise),
+                    (typeof(PerRowAuditedLog), "per-row-audit-override", Strategy.Exempt),
+                    (typeof(TombstoneRecord), "tombstone-anonymise", Strategy.Exempt),
+                    (typeof(NullableAnchorEvent), "nullable-anchor-purge", Strategy.Exempt),
+                ]
+            );
+        summaries
+            .Should()
+            .Contain(
+                new SweepRunEntitySummaryRow(
+                    result.SweepId,
+                    typeof(Note).FullName!,
+                    "short-lived",
+                    tenantId,
+                    Strategy.Purge,
+                    TimeSpan.FromDays(30),
+                    1,
+                    1,
+                    0,
+                    "retention-policy",
+                    "county override"
+                )
+            );
+        summaries
+            .Should()
+            .Contain(
+                new SweepRunEntitySummaryRow(
+                    result.SweepId,
+                    typeof(SoftDeleteRecord).FullName!,
+                    "soft-delete",
+                    tenantId,
+                    Strategy.SoftDelete,
+                    TimeSpan.FromDays(30),
+                    1,
+                    1,
+                    0,
+                    null,
+                    null
+                )
+            );
+        summaries
+            .Should()
+            .Contain(
+                new SweepRunEntitySummaryRow(
+                    result.SweepId,
+                    typeof(AnonymisedContact).FullName!,
+                    "anonymise",
+                    tenantId,
+                    Strategy.Anonymise,
+                    TimeSpan.FromDays(30),
+                    1,
+                    1,
+                    0,
+                    null,
+                    null
+                )
+            );
 
         rowDetails.Should().ContainSingle();
-        rowDetails[0].Should().Be(
-            new SweepRunRowDetailRow(
-                result.SweepId,
-                typeof(Note).FullName!,
-                deletedNoteId.ToString(),
-                "short-lived",
-                Strategy.Purge,
-                tenantId
-            )
-        );
+        rowDetails[0]
+            .Should()
+            .Be(
+                new SweepRunRowDetailRow(
+                    result.SweepId,
+                    typeof(Note).FullName!,
+                    deletedNoteId.ToString(),
+                    "short-lived",
+                    Strategy.Purge,
+                    tenantId
+                )
+            );
 
-        result.Counts.Should().BeEquivalentTo(
-            summaries.Select(summary =>
-                new EntitySweepCount(
+        result
+            .Counts.Should()
+            .BeEquivalentTo(
+                summaries.Select(summary => new EntitySweepCount(
                     ResolveEntityType(summary.EntityType),
                     summary.Category,
                     summary.TenantId,
@@ -373,25 +426,39 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
                     summary.Affected,
                     summary.HeldCount,
                     summary.SkippedCount
-                )
-            )
-        );
+                ))
+            );
 
         await using var verify = Host.CreateDbContext();
         (await verify.Notes.Select(note => note.Body).ToListAsync()).Should().Equal("held-note");
 
-        var softDeleteRecords = await verify.SoftDeleteRecords.OrderBy(record => record.Body).ToListAsync();
+        var softDeleteRecords = await verify
+            .SoftDeleteRecords.OrderBy(record => record.Body)
+            .ToListAsync();
         softDeleteRecords.Should().HaveCount(2);
         softDeleteRecords.Single(record => record.Id == softDeleteId).IsDeleted.Should().BeTrue();
-        softDeleteRecords.Single(record => record.Id == heldSoftDeleteId).IsDeleted.Should().BeFalse();
+        softDeleteRecords
+            .Single(record => record.Id == heldSoftDeleteId)
+            .IsDeleted.Should()
+            .BeFalse();
 
         var contacts = await verify.AnonymisedContacts.OrderBy(contact => contact.Id).ToListAsync();
         contacts.Should().HaveCount(2);
-        contacts.Single(contact => contact.Id == anonymisedContactId).EmailAddress.Should().BeNull();
+        contacts
+            .Single(contact => contact.Id == anonymisedContactId)
+            .EmailAddress.Should()
+            .BeNull();
         contacts.Single(contact => contact.Id == anonymisedContactId).GivenName.Should().BeEmpty();
-        contacts.Single(contact => contact.Id == anonymisedContactId).Surname.Should().Be("[redacted]");
-        contacts.Single(contact => contact.Id == anonymisedContactId).Notes.Should().Be("keep this");
-        contacts.Single(contact => contact.Id == heldAnonymisedContactId)
+        contacts
+            .Single(contact => contact.Id == anonymisedContactId)
+            .Surname.Should()
+            .Be("[redacted]");
+        contacts
+            .Single(contact => contact.Id == anonymisedContactId)
+            .Notes.Should()
+            .Be("keep this");
+        contacts
+            .Single(contact => contact.Id == heldAnonymisedContactId)
             .EmailAddress.Should()
             .Be("held@example.com");
     }
@@ -444,18 +511,20 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         );
         var summaries = await LoadSummariesAsync(result.SweepId);
 
-        summaries.Should().Contain(
-            new SweepRunEntitySummaryRow(
-                result.SweepId,
-                typeof(Note).FullName!,
-                "short-lived",
-                tenantId,
-                Strategy.Purge,
-                TimeSpan.FromDays(90),
-                1,
-                0
-            )
-        );
+        summaries
+            .Should()
+            .Contain(
+                new SweepRunEntitySummaryRow(
+                    result.SweepId,
+                    typeof(Note).FullName!,
+                    "short-lived",
+                    tenantId,
+                    Strategy.Purge,
+                    TimeSpan.FromDays(90),
+                    1,
+                    0
+                )
+            );
     }
 
     [Fact]
@@ -513,14 +582,84 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
 
         var rowDetails = auditWriter.Events.OfType<SweepEvent.RowDetail>().ToList();
 
-        rowDetails.Should().ContainSingle(
-            detail => detail.EntityType == typeof(PerRowAuditedLog) && detail.EntityId == perRowId.ToString(),
-            because: "entity-level AuditRowDetail.PerRow overrides the category rule's SummaryOnly"
+        rowDetails
+            .Should()
+            .ContainSingle(
+                detail =>
+                    detail.EntityType == typeof(PerRowAuditedLog)
+                    && detail.EntityId == perRowId.ToString(),
+                because: "entity-level AuditRowDetail.PerRow overrides the category rule's SummaryOnly"
+            );
+        rowDetails
+            .Should()
+            .NotContain(
+                detail => detail.EntityType == typeof(Note),
+                because: "Note's category rule is SummaryOnly and its [Retain] does not override to PerRow"
+            );
+    }
+
+    [Fact]
+    public async Task WriteAsync_Only_Custom_Writer_Observes_EntityProgress_During_Batched_Erasure()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var auditWriter = new RecordingAuditWriter();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            for (var index = 0; index < 3; index++)
+            {
+                db.Notes.Add(
+                    new Note
+                    {
+                        Id = Guid.NewGuid(),
+                        TenantId = tenantId,
+                        SubjectId = subjectId,
+                        CreatedAt = asOf.AddDays(-120),
+                        Body = $"audit-progress-{index}",
+                    }
+                );
+            }
+
+            await db.SaveChangesAsync();
+        }
+
+        using var erasureHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:DryRun"] = "False",
+                [$"{CohortOptions.SectionName}:SweepBatchSize"] = "1",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(auditWriter);
+                services.AddScoped<IRetentionAuditWriter>(sp =>
+                    sp.GetRequiredService<RecordingAuditWriter>()
+                );
+            }
         );
-        rowDetails.Should().NotContain(
-            detail => detail.EntityType == typeof(Note),
-            because: "Note's category rule is SummaryOnly and its [Retain] does not override to PerRow"
+
+        var result = await erasureHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+            asOf
         );
+
+        auditWriter
+            .Events.OfType<SweepEvent.EntityProgress>()
+            .Where(progress => progress.EntityType == typeof(Note) && progress.Affected > 0)
+            .Should()
+            .HaveCount(3)
+            .And.OnlyContain(progress =>
+                progress.SweepId == result.SweepId
+                && progress.TenantId == tenantId
+                && progress.Category == "short-lived"
+                && progress.Strategy == Strategy.Purge
+                && progress.Affected == 1
+                && progress.SkippedCount == 0
+            );
     }
 
     private async Task CreateHoldAsync(
@@ -536,7 +675,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
             await repository.CreateAsync(
                 new RetentionHoldRequest(
                     Guid.NewGuid(),
-                    tableName,
+                    RetentionEntityIdentity.ForTable(tableName),
                     recordId.ToString(),
                     tenantId,
                     "audit-hold",
@@ -551,9 +690,8 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
     {
         await using var db = Host.CreateDbContext();
         await using var command = await CreateCommandAsync(db, sweepId);
-        command.CommandText =
-            """
-            SELECT "SweepId", "StartedAt", "CompletedAt", "Duration", "TriggerKind", "DryRun", "TenantId", "TotalAffected"
+        command.CommandText = """
+            SELECT "SweepId", "StartedAt", "SettledAt", "Duration", "TriggerKind", "DryRun", "TenantId", "TotalAffected"
             FROM "sweep_run"
             WHERE "SweepId" = @sweepId
             """;
@@ -577,8 +715,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
     {
         await using var db = Host.CreateDbContext();
         await using var command = await CreateCommandAsync(db, sweepId);
-        command.CommandText =
-            """
+        command.CommandText = """
             SELECT "SweepId", "EntityType", "Category", "TenantId", "Strategy", "ResolvedPeriod", "Affected", "HeldCount", "SkippedCount", "RuleSource", "RuleReason"
             FROM "sweep_run_entity_summary"
             WHERE "SweepId" = @sweepId
@@ -613,8 +750,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
     {
         await using var db = Host.CreateDbContext();
         await using var command = await CreateCommandAsync(db, sweepId);
-        command.CommandText =
-            """
+        command.CommandText = """
             SELECT "SweepId", "EntityType", "EntityId", "Category", "Strategy", "TenantId"
             FROM "sweep_run_row_detail"
             WHERE "SweepId" = @sweepId
@@ -655,11 +791,15 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
     {
         var resolved = AppDomain
             .CurrentDomain.GetAssemblies()
-            .Select(assembly => assembly.GetType(entityType, throwOnError: false, ignoreCase: false))
+            .Select(assembly =>
+                assembly.GetType(entityType, throwOnError: false, ignoreCase: false)
+            )
             .FirstOrDefault(type => type is not null);
 
         return resolved
-            ?? throw new InvalidOperationException($"Could not resolve entity type '{entityType}'.");
+            ?? throw new InvalidOperationException(
+                $"Could not resolve entity type '{entityType}'."
+            );
     }
 
     private static ServiceProvider BuildRecordingAuditProvider(
@@ -676,10 +816,14 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         services.AddDbContext<SampleDbContext>(options => options.UseNpgsql(connectionString));
         services.AddSingleton(categoryRepository);
         services.AddSingleton(auditWriter);
-        services.AddScoped<IRetentionAuditWriter>(sp => sp.GetRequiredService<RecordingAuditWriter>());
+        services.AddScoped<IRetentionAuditWriter>(sp =>
+            sp.GetRequiredService<RecordingAuditWriter>()
+        );
         services.AddSingleton<GuidTombstoneFactory>();
         services.AddSingleton<OriginalValueTombstoneFactory>();
-        services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<GuidTombstoneFactory>());
+        services.AddSingleton<IAnonymiseValueFactory>(sp =>
+            sp.GetRequiredService<GuidTombstoneFactory>()
+        );
         services.AddSingleton<IAnonymiseValueFactory>(sp =>
             sp.GetRequiredService<OriginalValueTombstoneFactory>()
         );
@@ -693,9 +837,10 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture)
         IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
     ) : IRetentionCategoryRepository
     {
-        private static readonly IRetentionRuleResolver ExemptFallback = new StaticRetentionRuleResolver(
-            new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
-        );
+        private static readonly IRetentionRuleResolver ExemptFallback =
+            new StaticRetentionRuleResolver(
+                new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+            );
 
         public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
         {

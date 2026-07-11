@@ -18,7 +18,8 @@ public sealed class GuidTombstoneFactory : IAnonymiseValueFactory
 
 public sealed class OriginalValueTombstoneFactory : IAnonymiseValueFactory
 {
-    public bool RequiresOriginalValue => true;
+    public AnonymiseFactoryExecutionMode ExecutionMode =>
+        AnonymiseFactoryExecutionMode.PerRowWithOriginalValue;
 
     public List<AnonymiseValueContext> Contexts { get; } = [];
 

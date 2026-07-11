@@ -4,7 +4,6 @@ using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure.Handlers;
 using Cohort.Infrastructure.Migrations;
-
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Infrastructure.Sweep;
@@ -31,19 +30,17 @@ internal static class RetentionHandlerSupport
             return [];
         }
 
-        var metadata = services.GetService<IEnumerable<IRetentionHandlerRegistration>>()?
-            .Where(registration => registration.EntityType == entityType)
-            .ToDictionary(
-                registration => registration.HandlerType,
-                registration => registration
-            );
+        var metadata = services
+            .GetService<IEnumerable<IRetentionHandlerRegistration>>()
+            ?.Where(registration => registration.EntityType == entityType)
+            .ToDictionary(registration => registration.HandlerType, registration => registration);
 
         return registeredHandlers
             .Cast<object>()
             .Select(handler =>
             {
-                var registration = metadata is not null
-                    && metadata.TryGetValue(handler.GetType(), out var matched)
+                var registration =
+                    metadata is not null && metadata.TryGetValue(handler.GetType(), out var matched)
                         ? matched
                         : null;
                 return new ResolvedRetentionHandler(
@@ -85,7 +82,8 @@ internal static class RetentionHandlerSupport
             {
                 throw;
             }
-            catch (System.Reflection.TargetInvocationException ex) when (ex.InnerException is not null)
+            catch (System.Reflection.TargetInvocationException ex)
+                when (ex.InnerException is not null)
             {
                 return new OnBeforeInvocationResult(handler, ex.InnerException);
             }
@@ -175,7 +173,7 @@ internal static class RetentionHandlerSupport
             strategy,
             tenantId,
             entityId,
-            snapshot,
+            snapshot: null,
             ct
         );
 
@@ -198,18 +196,18 @@ internal static class RetentionHandlerSupport
         Strategy strategy,
         Guid tenantId,
         string entityId,
-        IReadOnlyDictionary<string, object?> snapshot,
+        IReadOnlyDictionary<string, object?>? snapshot,
         CancellationToken ct
     )
     {
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText =
-            $"""
+        command.CommandText = $"""
             INSERT INTO {QuoteIdentifier(CohortTableNames.SweepRunRowDetail)} (
                 "SweepId",
                 "At",
                 "EntityType",
+                "RetentionEntityId",
                 "EntityId",
                 "Category",
                 "Strategy",
@@ -220,6 +218,7 @@ internal static class RetentionHandlerSupport
                 @sweepId,
                 @at,
                 @entityType,
+                @retentionEntityId,
                 @entityId,
                 @category,
                 @strategy,
@@ -231,14 +230,23 @@ internal static class RetentionHandlerSupport
         command.Parameters.Add(CreateParameter(command, "sweepId", execution.SweepId));
         command.Parameters.Add(CreateParameter(command, "at", execution.At));
         command.Parameters.Add(
-            CreateParameter(command, "entityType", entry.EntityType.FullName ?? entry.EntityType.Name)
+            CreateParameter(
+                command,
+                "entityType",
+                entry.EntityType.FullName ?? entry.EntityType.Name
+            )
         );
+        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.EntityId));
         command.Parameters.Add(CreateParameter(command, "entityId", entityId));
         command.Parameters.Add(CreateParameter(command, "category", entry.Category));
         command.Parameters.Add(CreateParameter(command, "strategy", (int)strategy));
         command.Parameters.Add(CreateParameter(command, "tenantId", tenantId));
         command.Parameters.Add(
-            CreateParameter(command, "capturedPayload", RetentionSnapshotSerializer.Serialize(snapshot))
+            CreateParameter(
+                command,
+                "capturedPayload",
+                snapshot is null ? null : RetentionSnapshotSerializer.Serialize(snapshot)
+            )
         );
 
         var insertedId = await command.ExecuteScalarAsync(ct);
@@ -256,8 +264,7 @@ internal static class RetentionHandlerSupport
     {
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText =
-            $"""
+        command.CommandText = $"""
             INSERT INTO {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} (
                 "SweepRunRowDetailId",
                 "HandlerType",
@@ -310,8 +317,7 @@ internal static class RetentionHandlerSupport
     {
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText =
-            $"""
+        command.CommandText = $"""
             INSERT INTO {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} (
                 "SweepRunRowDetailId",
                 "HandlerType",
@@ -389,7 +395,8 @@ internal sealed class ResolvedRetentionHandler(
 
     public Type HandlerType { get; } = instance.GetType();
 
-    public string HandlerTypeName { get; } = RetentionTypeIdentity.GetPersistedName(instance.GetType());
+    public string HandlerTypeName { get; } =
+        RetentionTypeIdentity.GetPersistedName(instance.GetType());
 
     /// <summary>
     /// What queued work is persisted and matched under: the registration's explicit
@@ -397,8 +404,7 @@ internal sealed class ResolvedRetentionHandler(
     /// renames; type-name identities do not.
     /// </summary>
     public string HandlerIdentity { get; } =
-        identity?.ToString("D")
-        ?? RetentionTypeIdentity.GetPersistedName(instance.GetType());
+        identity?.ToString("D") ?? RetentionTypeIdentity.GetPersistedName(instance.GetType());
 
     public RowHandlerDispatchPhase DispatchPhase { get; } = dispatchPhase;
 

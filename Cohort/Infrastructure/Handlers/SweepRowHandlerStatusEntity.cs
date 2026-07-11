@@ -24,6 +24,8 @@ internal sealed class SweepRowHandlerStatusEntity
 
     public DateTimeOffset? ClaimedAt { get; set; }
 
+    public Guid? ClaimToken { get; set; }
+
     public DateTimeOffset? CompletedAt { get; set; }
 
     public string? LastError { get; set; }

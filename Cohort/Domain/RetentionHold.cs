@@ -2,9 +2,9 @@ namespace Cohort.Domain;
 
 public sealed record RetentionHold(
     Guid HoldId,
-    string TableName,
+    Guid RetentionEntityId,
     string RecordId,
-    Guid TenantId,
+    Guid? TenantId,
     string Reason,
     DateTimeOffset CreatedAt,
     DateTimeOffset? ExpiresAt,

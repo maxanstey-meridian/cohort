@@ -1,10 +1,9 @@
 using System.Data.Common;
-
 using Cohort.Domain;
 
-namespace Cohort.Application;
+namespace Cohort.Infrastructure.Sweep;
 
-public interface IRetentionSweepStrategy
+internal interface IRetentionSweepStrategy
 {
     public Strategy HandlesStrategy { get; }
 
@@ -90,7 +89,7 @@ public interface IRetentionSweepStrategy
     );
 }
 
-public sealed record SweepExecutionResult(
+internal sealed record SweepExecutionResult(
     IReadOnlyList<string> AffectedRecordIds,
     int HeldCount,
     bool RowDetailsPersisted = false,
@@ -108,7 +107,7 @@ public sealed record SweepExecutionResult(
     public IReadOnlyList<string> SkippedRecordIds { get; init; } = SkippedRecordIds ?? [];
 }
 
-public sealed record SweepMutationContext(
+internal sealed record SweepMutationContext(
     Guid SweepId,
     DateTimeOffset At,
     int? BatchSize = null,
@@ -122,7 +121,7 @@ public sealed record SweepMutationContext(
     public IReadOnlyList<string> ExcludedRecordIds { get; init; } = ExcludedRecordIds ?? [];
 }
 
-public sealed record ErasureSubjectPredicate
+internal sealed record ErasureSubjectPredicate
 {
     public ErasureSubjectPredicate(IReadOnlyList<ErasureSubjectMatch> matches)
     {
@@ -141,4 +140,8 @@ public sealed record ErasureSubjectPredicate
     public IReadOnlyList<ErasureSubjectMatch> Matches { get; }
 }
 
-public sealed record ErasureSubjectMatch(string SubjectMember, string SubjectColumn, object SubjectValue);
+internal sealed record ErasureSubjectMatch(
+    string SubjectMember,
+    string SubjectColumn,
+    object SubjectValue
+);

@@ -21,11 +21,7 @@ public sealed class StaticRetentionRuleResolverTests
     public async Task Resolve_Async_Preserves_Configured_Provenance()
     {
         var provenance = new RetentionRuleProvenance("policy-alias", "county override");
-        var rule = new RetentionRule(
-            TimeSpan.FromDays(30),
-            Strategy.Purge,
-            Provenance: provenance
-        );
+        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge, Provenance: provenance);
         var resolver = new StaticRetentionRuleResolver(rule);
 
         var resolved = await resolver.ResolveAsync(CreateContext(), CancellationToken.None);
@@ -48,11 +44,7 @@ public sealed class StaticRetentionRuleResolverTests
     public void Try_Resolve_At_Startup_Preserves_Configured_Provenance()
     {
         var provenance = new RetentionRuleProvenance("policy-alias", "county override");
-        var rule = new RetentionRule(
-            TimeSpan.FromDays(30),
-            Strategy.Purge,
-            Provenance: provenance
-        );
+        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge, Provenance: provenance);
         var resolver = new StaticRetentionRuleResolver(rule);
 
         var resolved = resolver.TryResolveAtStartup();
@@ -92,10 +84,7 @@ public sealed class StaticRetentionRuleResolverTests
             new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
         );
         IRetentionCategoryRepository repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
-            {
-                ["short-lived"] = expected,
-            }
+            new Dictionary<string, IRetentionRuleResolver> { ["short-lived"] = expected }
         );
 
         var resolved = await repository.GetAsync("short-lived", CancellationToken.None);
@@ -128,8 +117,10 @@ public sealed class StaticRetentionRuleResolverTests
 
     private sealed class DeferredResolver(RetentionRule rule) : IRetentionRuleResolver
     {
-        public Task<RetentionRule> ResolveAsync(RetentionResolutionContext ctx, CancellationToken ct) =>
-            Task.FromResult(rule);
+        public Task<RetentionRule> ResolveAsync(
+            RetentionResolutionContext ctx,
+            CancellationToken ct
+        ) => Task.FromResult(rule);
     }
 
     private sealed class InMemoryCategoryRepository(

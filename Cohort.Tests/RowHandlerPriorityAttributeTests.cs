@@ -27,7 +27,8 @@ public sealed class RowHandlerPriorityAttributeTests
             new Dictionary<string, object?>()
         );
 
-        var beforeAction = () => handler.OnBeforeAsync(new object(), before, CancellationToken.None);
+        var beforeAction = () =>
+            handler.OnBeforeAsync(new object(), before, CancellationToken.None);
         var afterAction = () => handler.OnAfterAsync(after, CancellationToken.None);
 
         await beforeAction.Should().NotThrowAsync();
@@ -55,10 +56,7 @@ public sealed class RowHandlerPriorityAttributeTests
     [Fact]
     public void Retention_After_Context_Preserves_Immutable_Dispatch_Metadata()
     {
-        var snapshot = new Dictionary<string, object?>
-        {
-            ["StoragePath"] = "blob/row-42",
-        };
+        var snapshot = new Dictionary<string, object?> { ["StoragePath"] = "blob/row-42" };
         var context = new RetentionAfterContext<object>(
             Guid.Parse("fe482ec4-bb4d-4509-b8d6-8a516bd7a1f0"),
             "row-42",
@@ -108,13 +106,17 @@ public sealed class RowHandlerPriorityAttributeTests
             typeof(DefaultPriorityHandler),
             typeof(LowPriorityHandler),
             typeof(HighPriorityHandler),
-        }.OrderBy(RowHandlerPriorityAttribute.GetPriority).ToArray();
+        }
+            .OrderBy(RowHandlerPriorityAttribute.GetPriority)
+            .ToArray();
 
-        ordered.Should().Equal(
-            typeof(HighPriorityHandler),
-            typeof(LowPriorityHandler),
-            typeof(DefaultPriorityHandler)
-        );
+        ordered
+            .Should()
+            .Equal(
+                typeof(HighPriorityHandler),
+                typeof(LowPriorityHandler),
+                typeof(DefaultPriorityHandler)
+            );
     }
 
     [RowHandlerPriority(100)]

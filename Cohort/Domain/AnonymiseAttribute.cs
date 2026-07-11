@@ -6,14 +6,21 @@ public sealed class AnonymiseAttribute(AnonymiseMethod method, string? literal =
     public AnonymiseMethod Method { get; } =
         method switch
         {
-            AnonymiseMethod.FixedLiteral when string.IsNullOrWhiteSpace(literal) => throw new ArgumentException(
-                "A literal value is required when the anonymise method is FixedLiteral.",
-                nameof(literal)
+            _ when !Enum.IsDefined(method) => throw new ArgumentOutOfRangeException(
+                nameof(method),
+                method,
+                "Anonymise method must be defined."
             ),
-            not AnonymiseMethod.FixedLiteral when literal is not null => throw new ArgumentException(
-                "A literal value is only valid when the anonymise method is FixedLiteral.",
-                nameof(literal)
-            ),
+            AnonymiseMethod.FixedLiteral when string.IsNullOrWhiteSpace(literal) =>
+                throw new ArgumentException(
+                    "A literal value is required when the anonymise method is FixedLiteral.",
+                    nameof(literal)
+                ),
+            not AnonymiseMethod.FixedLiteral when literal is not null =>
+                throw new ArgumentException(
+                    "A literal value is only valid when the anonymise method is FixedLiteral.",
+                    nameof(literal)
+                ),
             _ => method,
         };
 

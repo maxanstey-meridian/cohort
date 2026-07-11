@@ -1,5 +1,6 @@
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Infrastructure;
 using Cohort.Infrastructure.Audit;
 using Cohort.Infrastructure.Handlers;
 using Cohort.Infrastructure.Holds;
@@ -23,23 +24,56 @@ public static class ServiceCollectionExtensions
         // Idempotency guard: most registrations below are TryAdd*, but the dispatcher's
         // IHostedService registration cannot be (factory descriptors do not dedupe), and
         // a second registration would start two polling loops on the same dispatcher.
-        if (services.Any(descriptor => descriptor.ServiceType == typeof(CohortRegistrationMarker)))
+        var existingRegistration = services
+            .Where(descriptor => descriptor.ServiceType == typeof(CohortRegistrationMarker))
+            .Select(descriptor => descriptor.ImplementationInstance)
+            .OfType<CohortRegistrationMarker>()
+            .SingleOrDefault();
+        if (existingRegistration is not null)
         {
+            if (existingRegistration.ContextType != typeof(TContext))
+            {
+                throw new InvalidOperationException(
+                    $"Cohort is already registered for DbContext {existingRegistration.ContextType.FullName}; it cannot be registered for a different DbContext ({typeof(TContext).FullName})."
+                );
+            }
+
             return services;
         }
 
-        services.AddSingleton<CohortRegistrationMarker>();
+        services.AddSingleton(new CohortRegistrationMarker(typeof(TContext)));
 
-        services.AddOptions<CohortOptions>().BindConfiguration(CohortOptions.SectionName).ValidateOnStart();
+        services
+            .AddOptions<CohortOptions>()
+            .BindConfiguration(CohortOptions.SectionName)
+            .ValidateOnStart();
         services.TryAddEnumerable(
             ServiceDescriptor.Singleton<IValidateOptions<CohortOptions>, CohortOptionsValidator>()
         );
 
         services.TryAddSingleton(sp =>
-            new RetentionEntryBuilder(sp.GetRequiredService<IOptions<CohortOptions>>().Value.Conventions));
+        {
+            var conventions = sp.GetRequiredService<IOptions<CohortOptions>>().Value.Conventions;
+            return new RetentionEntryBuilder(
+                new RetentionModelConventions
+                {
+                    RecordIdPropertyName = conventions.RecordIdPropertyName,
+                    TenantPropertyName = conventions.TenantPropertyName,
+                    SoftDeletePropertyName = conventions.SoftDeletePropertyName,
+                    DeletedAtPropertyName = conventions.DeletedAtPropertyName,
+                    AnonymisedAtPropertyName = conventions.AnonymisedAtPropertyName,
+                }
+            );
+        });
+        services.TryAddSingleton<IRetentionExecutionSettings, HostingRetentionExecutionSettings>();
 
-        services.TryAddScoped<DbContext>(sp => sp.GetRequiredService<TContext>());
-        services.TryAddSingleton<IRetentionCategoryRepository, MissingRetentionCategoryRepository>();
+        services.AddKeyedScoped<DbContext>(CohortServiceKeys.DbContext, (sp, _) =>
+            sp.GetRequiredService<TContext>()
+        );
+        services.TryAddSingleton<
+            IRetentionCategoryRepository,
+            MissingRetentionCategoryRepository
+        >();
         services.TryAddScoped<IRetentionAuditWriter, EfRetentionAuditWriter>();
         services.TryAddScoped<IRetentionHoldsRepository, EfRetentionHoldsRepository>();
         services.TryAddEnumerable(
@@ -51,18 +85,27 @@ public static class ServiceCollectionExtensions
         services.TryAddEnumerable(
             ServiceDescriptor.Scoped<IRetentionSweepStrategy, AnonymiseSweepStrategy>()
         );
-        services.TryAddScoped<IRetentionPreview, RetentionPreviewService>();
-        services.TryAddScoped<IRetentionErasureService, RetentionErasureService>();
+        services.TryAddScoped<RetentionPreviewService>();
+        services.TryAddSingleton<IRetentionPreview, ScopeOwnedRetentionPreview>();
+        services.TryAddScoped<RetentionErasureService>();
+        services.TryAddSingleton<IRetentionErasureService, ScopeOwnedRetentionErasureService>();
         services.TryAddScoped<RetentionRegistry>();
+        services.TryAddSingleton<RetentionValidationState>();
         services.TryAddScoped<RetentionStartupValidator>();
+        services.TryAddScoped<CohortSchemaValidator>();
         services.TryAddScoped<RetentionSweepEngine>();
-        services.TryAddScoped<IRetentionSweep>(sp => sp.GetRequiredService<RetentionSweepEngine>());
+        services.TryAddSingleton<IRetentionSweep, ScopeOwnedRetentionSweep>();
         services.TryAddScoped<IRetentionTenantSource, SingleTenantContextSource>();
+        services.TryAddEnumerable(
+            ServiceDescriptor.Singleton<IHostedService, RetentionValidationHostedService>()
+        );
         services.TryAddSingleton<RetentionRowDispatcher>();
         services.TryAddSingleton<IRetentionRowDispatcher>(sp =>
             sp.GetRequiredService<RetentionRowDispatcher>()
         );
-        services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<RetentionRowDispatcher>());
+        services.AddSingleton<IHostedService>(sp =>
+            sp.GetRequiredService<RetentionRowDispatcher>()
+        );
         services.TryAddEnumerable(ServiceDescriptor.Singleton<IHostedService, RetentionWorker>());
 
         return services;
@@ -83,6 +126,14 @@ public static class ServiceCollectionExtensions
         where THandler : class, IRetentionHandler<TEntity>
     {
         ArgumentNullException.ThrowIfNull(services);
+        if (!Enum.IsDefined(dispatchPhase))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(dispatchPhase),
+                dispatchPhase,
+                "Row handler dispatch phase must be defined."
+            );
+        }
 
         var existingRegistrations = services
             .Where(descriptor => descriptor.ServiceType == typeof(IRetentionHandlerRegistration))
@@ -134,7 +185,33 @@ public static class ServiceCollectionExtensions
         return services;
     }
 
-    private sealed class CohortRegistrationMarker;
+    private sealed record CohortRegistrationMarker(Type ContextType);
+
+    private sealed class HostingRetentionExecutionSettings(IOptionsMonitor<CohortOptions> options)
+        : IRetentionExecutionSettings
+    {
+        public bool DryRun => options.CurrentValue.DryRun;
+
+        public int SweepBatchSize => options.CurrentValue.SweepBatchSize;
+
+        public RetentionRowHandlerSettings RowHandlerDispatch
+        {
+            get
+            {
+                var value = options.CurrentValue.RowHandlerDispatch;
+                return new RetentionRowHandlerSettings(
+                    value.PollInterval,
+                    value.PayloadRetention,
+                    value.MaxParallelism,
+                    value.BatchSize,
+                    value.MaxAttempts,
+                    value.BaseBackoff,
+                    value.ClaimTimeout,
+                    value.SweepSettleTimeout
+                );
+            }
+        }
+    }
 
     private sealed class SingleTenantContextSource(IServiceProvider services)
         : IRetentionTenantSource
@@ -159,9 +236,9 @@ public static class ServiceCollectionExtensions
         {
             throw new InvalidOperationException(
                 $"No IRetentionCategoryRepository has been registered. "
-                + $"Register one before calling AddCohort<TContext>() via "
-                + $"services.AddSingleton<IRetentionCategoryRepository, YourRepository>(). "
-                + $"(Attempted to resolve category '{category}'.)"
+                    + $"Register one before calling AddCohort<TContext>() via "
+                    + $"services.AddSingleton<IRetentionCategoryRepository, YourRepository>(). "
+                    + $"(Attempted to resolve category '{category}'.)"
             );
         }
     }

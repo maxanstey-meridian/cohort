@@ -1,6 +1,6 @@
 using Cohort.Application;
 using Cohort.Domain;
-
+using Cohort.Infrastructure;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -24,9 +24,8 @@ public sealed class CohortTestHost(
     Action<IServiceCollection>? configureServices = null
 ) : IDisposable
 {
-    private readonly DbContextOptions<SampleDbContext> _options = new DbContextOptionsBuilder<SampleDbContext>()
-        .UseNpgsql(connectionString)
-        .Options;
+    private readonly DbContextOptions<SampleDbContext> _options =
+        new DbContextOptionsBuilder<SampleDbContext>().UseNpgsql(connectionString).Options;
     private readonly ServiceProvider _services = BuildServices(
         connectionString,
         categoryRepository,
@@ -36,13 +35,13 @@ public sealed class CohortTestHost(
 
     public SampleDbContext CreateDbContext() => new(_options);
 
-    public async Task<IReadOnlyDictionary<Type, Domain.RetentionEntry>> RunStartupAsync(
+    internal async Task<IReadOnlyDictionary<Type, RetentionEntry>> ValidateAndScanAsync(
         CancellationToken ct = default
     )
     {
         await using var scope = _services.CreateAsyncScope();
-        var startup = scope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
-        return await startup.RunAsync(ct);
+        await scope.ServiceProvider.GetRequiredService<RetentionStartupValidator>().ValidateAsync(ct);
+        return scope.ServiceProvider.GetRequiredService<RetentionRegistry>().Scan();
     }
 
     public async Task<RetentionSweepResult> RunSweepAsync(
@@ -75,7 +74,8 @@ public sealed class CohortTestHost(
     )
     {
         await using var scopeServices = _services.CreateAsyncScope();
-        var startup = scopeServices.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
+        var startup =
+            scopeServices.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
         return await startup.RunErasureAsync(tenant, scope, now, ct);
     }
 

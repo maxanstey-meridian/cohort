@@ -1,4 +1,4 @@
 namespace Cohort.Domain;
 
-[AttributeUsage(AttributeTargets.Property)]
+[AttributeUsage(AttributeTargets.Property, Inherited = false, AllowMultiple = false)]
 public sealed class RetentionAnonymisedAtAttribute : Attribute;

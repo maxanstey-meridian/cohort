@@ -1,14 +1,13 @@
 using System.Text.Json;
-
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
+using Cohort.Infrastructure;
+using Cohort.Infrastructure.Handlers;
 using Cohort.Sample.Entities;
-
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-
 using Npgsql;
 
 namespace Cohort.Sample.Tests;
@@ -59,24 +58,48 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(BlobBackedFile), "blob-cleanup", tenantId, Strategy.Purge, 1)
-        );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(BlobBackedFile),
+                    "blob-cleanup",
+                    tenantId,
+                    Strategy.Purge,
+                    1
+                )
+            );
 
         var rowDetails = await LoadCapturedRowsAsync(result.SweepId);
         rowDetails.Should().ContainSingle(row => row.EntityType == typeof(BlobBackedFile).FullName);
+        rowDetails[0]
+            .RetentionEntityId.Should()
+            .Be(Guid.Parse("2fb1804d-9ad8-4543-a177-5d4cd14d62ee"));
         using (var payload = JsonDocument.Parse(rowDetails[0].CapturedPayload))
         {
-            payload.RootElement.GetProperty("storagePath").GetString().Should().Be("blob://tenant-a/archive/invoice.pdf");
-            payload.RootElement.GetProperty("originalFileName").GetString().Should().Be("invoice.pdf");
+            payload
+                .RootElement.GetProperty("storagePath")
+                .GetString()
+                .Should()
+                .Be("blob://tenant-a/archive/invoice.pdf");
+            payload
+                .RootElement.GetProperty("originalFileName")
+                .GetString()
+                .Should()
+                .Be("invoice.pdf");
         }
 
         var queuedStatuses = await LoadHandlerStatusesAsync(result.SweepId);
-        queuedStatuses.Should().ContainSingle(status =>
-            status.HandlerType.Contains(nameof(BlobBackedFileCleanupHandler), StringComparison.Ordinal)
-            && status.State == PendingState
-            && status.Attempt == 0
-        );
+        queuedStatuses
+            .Should()
+            .ContainSingle(status =>
+                status.HandlerType.Contains(
+                    nameof(BlobBackedFileCleanupHandler),
+                    StringComparison.Ordinal
+                )
+                && status.State == PendingState
+                && status.Attempt == 0
+            );
         cleanupStore.DeletedPaths.Should().BeEmpty();
 
         await handlerHost.RunWithServicesAsync(async serviceProvider =>
@@ -142,7 +165,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task FlushAsync_Reclaims_Stale_InFlight_Work_And_Counts_The_Reclaim_As_An_Attempt()
+    public async Task FlushAsync_Reclaims_Stale_InFlight_Work_And_Increments_Attempt_Exactly_Once()
     {
         // Simulates a process crash between claiming and completing: the row is stuck
         // InFlight with an old ClaimedAt. The lease must reclaim and execute it.
@@ -197,17 +220,79 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         var statuses = await LoadHandlerStatusesAsync(result.SweepId);
         statuses.Should().ContainSingle();
         statuses[0].State.Should().Be(SucceededState);
-        // One attempt charged for the reclaimed (crashed) claim, one for the successful run.
-        statuses[0].Attempt.Should().Be(2);
+        statuses[0].Attempt.Should().Be(1);
     }
 
     [Fact]
-    public async Task FlushAsync_DeadLetters_Queued_Work_Whose_Payload_The_Retention_Backstop_Scrubbed()
+    public async Task FlushAsync_DeadLetters_An_Expired_Claim_At_MaxAttempts_Without_Reclaiming_It()
     {
-        // The payload-retention backstop scrubs snapshots that outlive PayloadRetention
-        // even while handler work is still queued. Orphaned work must dead-letter
-        // immediately with the real reason — not burn MaxAttempts on a misleading
-        // "payload is missing" deserialisation error.
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var cleanupStore = new BlobCleanupStoreSpy();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.BlobBackedFiles.Add(
+                new BlobBackedFile
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    StoragePath = "blob://tenant-a/exhausted/claimed.pdf",
+                    OriginalFileName = "claimed.pdf",
+                    ContentType = "application/pdf",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxAttempts"] = "2",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(cleanupStore);
+                services.AddRowHandler<BlobBackedFile, BlobBackedFileCleanupHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+        await SetHandlerStatusInFlightAsync(
+            result.SweepId,
+            DateTimeOffset.UtcNow - TimeSpan.FromMinutes(10),
+            attempt: 2
+        );
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            (await dispatcher.FlushAsync()).Settled.Should().BeTrue();
+            (await dispatcher.FlushAsync()).Settled.Should().BeTrue();
+        });
+
+        cleanupStore.DeletedPaths.Should().BeEmpty();
+        var status = (await LoadHandlerStatusesAsync(result.SweepId))
+            .Should()
+            .ContainSingle()
+            .Subject;
+        status.State.Should().Be(DeadLetteredState);
+        status.Attempt.Should().Be(2);
+        status.ClaimedAt.Should().BeNull();
+        status.ClaimToken.Should().BeNull();
+        status.CompletedAt.Should().NotBeNull();
+        status.LastError.Should().Contain("MaxAttempts");
+        (await CountRemainingCapturedPayloadsAsync(result.SweepId)).Should().Be(0);
+    }
+
+    [Fact]
+    public async Task FlushAsync_Scrubs_Expired_Payload_While_Handler_Work_Is_Queued()
+    {
         var tenantId = Guid.NewGuid();
         var fileId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
@@ -558,7 +643,9 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         var pendingStatuses = await LoadHandlerStatusesAsync(deferredResult.SweepId);
         pendingStatuses.Should().ContainSingle();
-        pendingStatuses[0].DispatchPhase.Should().Be((int)RowHandlerDispatchPhase.AfterSweepSettled);
+        pendingStatuses[0]
+            .DispatchPhase.Should()
+            .Be((int)RowHandlerDispatchPhase.AfterSweepSettled);
         pendingStatuses[0].Attempt.Should().Be(0);
         pendingStatuses[0].ClaimedAt.Should().BeNull();
         pendingStatuses[0].CompletedAt.Should().BeNull();
@@ -579,6 +666,202 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         completedStatuses.Should().ContainSingle();
         completedStatuses[0].CompletedAt.Should().NotBeNull();
         completedStatuses[0].Attempt.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task FlushAsync_Recovers_Abandoned_Run_And_Releases_Deferred_Work()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var recorder = new HandlerExecutionSink();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "deferred-settle-timeout",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:PollInterval"] = "1.00:00:00",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(recorder);
+                services.AddRowHandler<Note, DispatchRecordingNoteHandler>(
+                    RowHandlerDispatchPhase.AfterSweepSettled
+                );
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        await SetSweepStartedAtAsync(result.SweepId, DateTimeOffset.UtcNow.AddDays(-1));
+        await using var ownerConnection = new NpgsqlConnection(GetConnectionString());
+        await ownerConnection.OpenAsync();
+        await RetentionRunAdvisoryLock.AcquireAsync(ownerConnection, result.SweepId, default);
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var activeFlush = await serviceProvider
+                .GetRequiredService<IRetentionRowDispatcher>()
+                .FlushAsync();
+            activeFlush.PendingRemaining.Should().Be(1);
+        });
+        recorder.AfterCalls.Should().BeEmpty();
+        await RetentionRunAdvisoryLock.ReleaseAsync(ownerConnection, result.SweepId, default);
+
+        RowDispatcherFlushResult? flushResult = null;
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            flushResult = await serviceProvider
+                .GetRequiredService<IRetentionRowDispatcher>()
+                .FlushAsync();
+        });
+
+        recorder
+            .AfterCalls.Should()
+            .ContainSingle(call => call == "after:deferred-settle-timeout:1");
+        flushResult.Should().NotBeNull();
+        flushResult!.Settled.Should().BeTrue();
+        flushResult.PendingRemaining.Should().Be(0);
+        var completedStatus = (await LoadHandlerStatusesAsync(result.SweepId))
+            .Should()
+            .ContainSingle()
+            .Subject;
+        completedStatus.State.Should().Be(SucceededState);
+        completedStatus.Attempt.Should().Be(1);
+        completedStatus.CompletedAt.Should().NotBeNull();
+        await using var runStatusCommand = ownerConnection.CreateCommand();
+        runStatusCommand.CommandText =
+            "SELECT \"Status\" FROM \"sweep_run\" WHERE \"SweepId\" = @sweepId";
+        runStatusCommand.Parameters.AddWithValue("sweepId", result.SweepId);
+        ((SweepRunStatus)(int)(await runStatusCommand.ExecuteScalarAsync())!)
+            .Should()
+            .Be(SweepRunStatus.Failed);
+    }
+
+    [Fact]
+    public async Task FlushAsync_Does_Not_Release_Deferred_Work_For_A_Nonterminal_Run_Status()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var recorder = new HandlerExecutionSink();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "deferred-invalid-status",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
+            {
+                services.AddSingleton(recorder);
+                services.AddRowHandler<Note, DispatchRecordingNoteHandler>(
+                    RowHandlerDispatchPhase.AfterSweepSettled
+                );
+            }
+        );
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        await SetSweepStatusAsync(result.SweepId, (int)SweepRunStatus.Started, settledAt: null);
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var flush = await serviceProvider
+                .GetRequiredService<IRetentionRowDispatcher>()
+                .FlushAsync();
+            flush.PendingRemaining.Should().Be(1);
+        });
+
+        recorder.AfterCalls.Should().BeEmpty();
+        var pending = (await LoadHandlerStatusesAsync(result.SweepId))
+            .Should()
+            .ContainSingle()
+            .Subject;
+        pending.State.Should().Be(PendingState);
+        pending.Attempt.Should().Be(0);
+    }
+
+    [Theory]
+    [InlineData("UPDATE \"sweep_row_handler_status\" SET \"State\" = 1 WHERE \"Id\" = @id")]
+    [InlineData(
+        "UPDATE \"sweep_row_handler_status\" SET \"ClaimedAt\" = now(), \"ClaimToken\" = gen_random_uuid() WHERE \"Id\" = @id"
+    )]
+    [InlineData("UPDATE \"sweep_row_handler_status\" SET \"State\" = 2 WHERE \"Id\" = @id")]
+    [InlineData(
+        "UPDATE \"sweep_row_handler_status\" SET \"CompletedAt\" = now() WHERE \"Id\" = @id"
+    )]
+    public async Task Handler_State_Check_Constraints_Reject_Invalid_Field_Combinations(string sql)
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "constraint-target",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        var sink = new HandlerExecutionSink();
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
+            {
+                services.AddSingleton(sink);
+                services.AddRowHandler<Note, DispatchRecordingNoteHandler>();
+            }
+        );
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+        var statusId = await LoadHandlerStatusIdAsync(result.SweepId);
+
+        Func<Task> writeInvalidState = async () =>
+        {
+            await using var connection = new NpgsqlConnection(GetConnectionString());
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            command.Parameters.AddWithValue("id", statusId);
+            await command.ExecuteNonQueryAsync();
+        };
+
+        var exception = await writeInvalidState.Should().ThrowAsync<PostgresException>();
+        exception.Which.SqlState.Should().Be(PostgresErrorCodes.CheckViolation);
     }
 
     [Fact]
@@ -622,9 +905,11 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
-        );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+            );
 
         await using (var verify = Host.CreateDbContext())
         {
@@ -635,11 +920,16 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         persistedRows.Should().ContainSingle(row => row.EntityId == noteId.ToString());
 
         var queuedStatuses = await LoadHandlerStatusesAsync(result.SweepId);
-        queuedStatuses.Should().ContainSingle(status =>
-            status.HandlerType.Contains(nameof(ContextCapturingNoteHandler), StringComparison.Ordinal)
-            && status.State == PendingState
-            && status.Attempt == 0
-        );
+        queuedStatuses
+            .Should()
+            .ContainSingle(status =>
+                status.HandlerType.Contains(
+                    nameof(ContextCapturingNoteHandler),
+                    StringComparison.Ordinal
+                )
+                && status.State == PendingState
+                && status.Attempt == 0
+            );
 
         await handlerHost.RunWithServicesAsync(async serviceProvider =>
         {
@@ -661,13 +951,18 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         call.Body.Should().Be(persisted.Body);
 
         var completedStatuses = await LoadHandlerStatusesAsync(result.SweepId);
-        completedStatuses.Should().ContainSingle(status =>
-            status.HandlerType.Contains(nameof(ContextCapturingNoteHandler), StringComparison.Ordinal)
-            && status.State == SucceededState
-            && status.Attempt == 1
-            && status.CompletedAt != null
-            && status.LastError == null
-        );
+        completedStatuses
+            .Should()
+            .ContainSingle(status =>
+                status.HandlerType.Contains(
+                    nameof(ContextCapturingNoteHandler),
+                    StringComparison.Ordinal
+                )
+                && status.State == SucceededState
+                && status.Attempt == 1
+                && status.CompletedAt != null
+                && status.LastError == null
+            );
     }
 
     [Fact]
@@ -724,13 +1019,18 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         call.Payload.Body.Should().Be("typed-snapshot-target");
 
         var statuses = await LoadHandlerStatusesAsync(result.SweepId);
-        statuses.Should().ContainSingle(status =>
-            status.HandlerType.Contains(nameof(TypedSnapshotNoteHandler), StringComparison.Ordinal)
-            && status.State == SucceededState
-            && status.Attempt == 1
-            && status.CompletedAt != null
-            && status.LastError == null
-        );
+        statuses
+            .Should()
+            .ContainSingle(status =>
+                status.HandlerType.Contains(
+                    nameof(TypedSnapshotNoteHandler),
+                    StringComparison.Ordinal
+                )
+                && status.State == SucceededState
+                && status.Attempt == 1
+                && status.CompletedAt != null
+                && status.LastError == null
+            );
         statuses[0].HandlerType.Should().NotContain("Version=");
     }
 
@@ -771,9 +1071,11 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
-        );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+            );
         sink.BeforeCalls.Should().Equal("high", "low");
 
         await using (var verify = Host.CreateDbContext())
@@ -794,8 +1096,18 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         var statuses = await LoadHandlerStatusesAsync(result.SweepId);
         statuses.Should().HaveCount(2);
-        statuses.Select(status => status.HandlerType).Should().Contain(type => type.Contains(nameof(HighPriorityNoteHandler), StringComparison.Ordinal));
-        statuses.Select(status => status.HandlerType).Should().Contain(type => type.Contains(nameof(LowPriorityNoteHandler), StringComparison.Ordinal));
+        statuses
+            .Select(status => status.HandlerType)
+            .Should()
+            .Contain(type =>
+                type.Contains(nameof(HighPriorityNoteHandler), StringComparison.Ordinal)
+            );
+        statuses
+            .Select(status => status.HandlerType)
+            .Should()
+            .Contain(type =>
+                type.Contains(nameof(LowPriorityNoteHandler), StringComparison.Ordinal)
+            );
         statuses.All(status => status.State == 0 && status.Attempt == 0).Should().BeTrue();
     }
 
@@ -838,11 +1150,13 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         );
 
         var pendingStatuses = await LoadHandlerStatusesAsync(result.SweepId);
-        pendingStatuses.Should().ContainSingle(status =>
-            status.HandlerType.Contains(nameof(PerRowAuditHandler), StringComparison.Ordinal)
-            && status.State == PendingState
-            && status.Attempt == 0
-        );
+        pendingStatuses
+            .Should()
+            .ContainSingle(status =>
+                status.HandlerType.Contains(nameof(PerRowAuditHandler), StringComparison.Ordinal)
+                && status.State == PendingState
+                && status.Attempt == 0
+            );
 
         await handlerHost.RunWithServicesAsync(async serviceProvider =>
         {
@@ -851,13 +1165,15 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         });
 
         var completedStatuses = await LoadHandlerStatusesAsync(result.SweepId);
-        completedStatuses.Should().ContainSingle(status =>
-            status.HandlerType.Contains(nameof(PerRowAuditHandler), StringComparison.Ordinal)
-            && status.State == SucceededState
-            && status.Attempt == 1
-            && status.CompletedAt != null
-            && status.LastError == null
-        );
+        completedStatuses
+            .Should()
+            .ContainSingle(status =>
+                status.HandlerType.Contains(nameof(PerRowAuditHandler), StringComparison.Ordinal)
+                && status.State == SucceededState
+                && status.Attempt == 1
+                && status.CompletedAt != null
+                && status.LastError == null
+            );
     }
 
     [Fact]
@@ -903,7 +1219,8 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         var pendingStatuses = await LoadHandlerStatusesAsync(result.SweepId);
         pendingStatuses.Should().HaveCount(2);
-        pendingStatuses.All(status => status.State == PendingState && status.Attempt == 0)
+        pendingStatuses
+            .All(status => status.State == PendingState && status.Attempt == 0)
             .Should()
             .BeTrue();
 
@@ -917,10 +1234,12 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         var completedStatuses = await LoadHandlerStatusesAsync(result.SweepId);
         completedStatuses.Should().HaveCount(2);
-        completedStatuses.All(status => status.State == SucceededState && status.Attempt == 1)
+        completedStatuses
+            .All(status => status.State == SucceededState && status.Attempt == 1)
             .Should()
             .BeTrue();
-        completedStatuses.All(status => status.CompletedAt is not null && status.LastError is null)
+        completedStatuses
+            .All(status => status.CompletedAt is not null && status.LastError is null)
             .Should()
             .BeTrue();
     }
@@ -982,28 +1301,37 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                 row.HandlerType.Contains(
                     nameof(BlockingHighPriorityAfterNoteHandler),
                     StringComparison.Ordinal
-                ) && row.State == InFlightState,
+                )
+                && row.State == InFlightState,
             TimeSpan.FromSeconds(5)
         );
-        inFlightHigh.Attempt.Should().Be(0);
+        inFlightHigh.Attempt.Should().Be(1);
 
         var interimStatuses = await LoadHandlerStatusesAsync(result.SweepId);
-        interimStatuses.Should().ContainSingle(status =>
-            status.HandlerType.Contains(
-                nameof(BlockingHighPriorityAfterNoteHandler),
-                StringComparison.Ordinal
-            ) && status.State == InFlightState
-                && status.Attempt == 0
+        interimStatuses
+            .Should()
+            .ContainSingle(status =>
+                status.HandlerType.Contains(
+                    nameof(BlockingHighPriorityAfterNoteHandler),
+                    StringComparison.Ordinal
+                )
+                && status.State == InFlightState
+                && status.Attempt == 1
                 && status.ClaimedAt != null
                 && status.CompletedAt == null
-        );
-        interimStatuses.Should().ContainSingle(status =>
-            status.HandlerType.Contains(nameof(LowPriorityAfterNoteHandler), StringComparison.Ordinal)
-            && status.State == PendingState
-            && status.Attempt == 0
-            && status.ClaimedAt == null
-            && status.CompletedAt == null
-        );
+            );
+        interimStatuses
+            .Should()
+            .ContainSingle(status =>
+                status.HandlerType.Contains(
+                    nameof(LowPriorityAfterNoteHandler),
+                    StringComparison.Ordinal
+                )
+                && status.State == PendingState
+                && status.Attempt == 0
+                && status.ClaimedAt == null
+                && status.CompletedAt == null
+            );
         sink.AfterCalls.Should().BeEmpty();
 
         gate.Release();
@@ -1013,9 +1341,292 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         var completedStatuses = await LoadHandlerStatusesAsync(result.SweepId);
         completedStatuses.Should().HaveCount(2);
-        completedStatuses.All(status => status.State == SucceededState && status.Attempt == 1)
+        completedStatuses
+            .All(status => status.State == SucceededState && status.Attempt == 1)
             .Should()
             .BeTrue();
+    }
+
+    [Fact]
+    public async Task FlushAsync_Stale_Owner_Cannot_Settle_A_Newer_Claim()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var gate = new DispatchBlockGate();
+        var sink = new HandlerExecutionSink();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "fenced-claim",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
+            {
+                services.AddSingleton(gate);
+                services.AddSingleton(sink);
+                services.AddRowHandler<Note, BlockingHighPriorityAfterNoteHandler>();
+            }
+        );
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        var flushTask = handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            await serviceProvider.GetRequiredService<IRetentionRowDispatcher>().FlushAsync();
+        });
+        await gate.WaitUntilBlockedAsync().WaitAsync(TimeSpan.FromSeconds(5));
+
+        var newerClaimToken = await ReplaceClaimOwnerAsync(result.SweepId);
+        gate.Release();
+        var exception = await Assert.ThrowsAsync<RetentionRowDispatchClaimLostException>(() =>
+            flushTask.WaitAsync(TimeSpan.FromSeconds(5))
+        );
+        exception.StatusId.Should().BeGreaterThan(0);
+
+        var status = (await LoadHandlerStatusesAsync(result.SweepId)).Single();
+        status.State.Should().Be(InFlightState);
+        status.Attempt.Should().Be(2);
+        status.ClaimToken.Should().Be(newerClaimToken);
+        status.CompletedAt.Should().BeNull();
+        status.LastError.Should().BeNull();
+        (await CountRemainingCapturedPayloadsAsync(result.SweepId)).Should().Be(1);
+    }
+
+    [Fact]
+    public async Task FlushAsync_Heartbeat_Claim_Loss_Cancels_The_Running_Handler()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var gate = new DispatchBlockGate();
+        var sink = new HandlerExecutionSink();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "heartbeat-fenced-claim",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:ClaimTimeout"] = "00:00:30",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(gate);
+                services.AddSingleton(sink);
+                services.AddRowHandler<Note, BlockingHighPriorityAfterNoteHandler>();
+            }
+        );
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        var flushTask = handlerHost.RunWithServicesAsync(async serviceProvider =>
+            await serviceProvider.GetRequiredService<IRetentionRowDispatcher>().FlushAsync()
+        );
+        await gate.WaitUntilBlockedAsync().WaitAsync(TimeSpan.FromSeconds(5));
+
+        var newerClaimToken = await ReplaceClaimOwnerAsync(result.SweepId);
+        var exception = await Assert.ThrowsAsync<RetentionRowDispatchClaimLostException>(() =>
+            flushTask.WaitAsync(TimeSpan.FromSeconds(15))
+        );
+
+        exception.StatusId.Should().BeGreaterThan(0);
+        sink.AfterCalls.Should().BeEmpty();
+        var status = (await LoadHandlerStatusesAsync(result.SweepId)).Single();
+        status.State.Should().Be(InFlightState);
+        status.ClaimToken.Should().Be(newerClaimToken);
+        status.CompletedAt.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task FlushAsync_Success_Waits_For_A_Blocked_Heartbeat_Without_Reporting_Claim_Loss()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var sink = new HandlerExecutionSink();
+        var blocker = new StatusUpdateBlocker(GetConnectionString(), holdHandler: true);
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "success-heartbeat-race",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:ClaimTimeout"] = "00:00:30",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(sink);
+                services.AddSingleton(blocker);
+                services.AddRowHandler<Note, LocksStatusThenReturnsNoteHandler>();
+            }
+        );
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        var flushTask = handlerHost.RunWithServicesAsync(async serviceProvider =>
+            await serviceProvider.GetRequiredService<IRetentionRowDispatcher>().FlushAsync()
+        );
+        await blocker.WaitUntilLockedAsync().WaitAsync(TimeSpan.FromSeconds(5));
+
+        await WaitForBlockedStatusUpdatesAsync(blocker.BackendId, expectedCount: 1);
+        blocker.AllowHandlerToReturn();
+        await blocker.ReleaseAsync();
+        await flushTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        sink.AfterCalls.Should().Equal("after:success-heartbeat-race:1");
+        var status = (await LoadHandlerStatusesAsync(result.SweepId)).Single();
+        status.State.Should().Be(SucceededState);
+        status.Attempt.Should().Be(1);
+        status.ClaimToken.Should().BeNull();
+        status.CompletedAt.Should().NotBeNull();
+        status.LastError.Should().BeNull();
+    }
+
+    private async Task WaitForBlockedStatusUpdatesAsync(int blockerBackendId, int expectedCount)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        await using var connection = new NpgsqlConnection(GetConnectionString());
+        await connection.OpenAsync(timeout.Token);
+
+        while (true)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT COUNT(*)
+                FROM pg_stat_activity waiter
+                WHERE waiter.query LIKE '%UPDATE "sweep_row_handler_status"%'
+                  AND (
+                      @blockerBackendId = ANY(pg_blocking_pids(waiter.pid))
+                      OR EXISTS (
+                          SELECT 1
+                          FROM unnest(pg_blocking_pids(waiter.pid)) AS immediate_blocker(pid)
+                          WHERE @blockerBackendId = ANY(pg_blocking_pids(immediate_blocker.pid))
+                      )
+                  )
+                """;
+            command.Parameters.AddWithValue("blockerBackendId", blockerBackendId);
+            if ((long)(await command.ExecuteScalarAsync(timeout.Token))! >= expectedCount)
+            {
+                return;
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(20), timeout.Token);
+        }
+    }
+
+    [Fact]
+    public async Task FlushAsync_Claim_Loss_Requeues_Unprocessed_Claimed_Siblings()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var gate = new DispatchBlockGate();
+        var sink = new HandlerExecutionSink();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "exceptional-batch-first",
+                },
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "exceptional-batch-second",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:BatchSize"] = "10",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxParallelism"] = "1",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:ClaimTimeout"] = "00:00:30",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(gate);
+                services.AddSingleton(sink);
+                services.AddRowHandler<Note, BlockingHighPriorityAfterNoteHandler>();
+            }
+        );
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        var flushTask = handlerHost.RunWithServicesAsync(async serviceProvider =>
+            await serviceProvider.GetRequiredService<IRetentionRowDispatcher>().FlushAsync()
+        );
+        await gate.WaitUntilBlockedAsync().WaitAsync(TimeSpan.FromSeconds(5));
+
+        var newerClaimToken = await ReplaceClaimOwnerAsync(result.SweepId);
+        await Assert.ThrowsAsync<RetentionRowDispatchClaimLostException>(() =>
+            flushTask.WaitAsync(TimeSpan.FromSeconds(15))
+        );
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().HaveCount(2);
+        statuses
+            .Should()
+            .ContainSingle(status =>
+                status.State == InFlightState && status.ClaimToken == newerClaimToken
+            );
+        statuses
+            .Should()
+            .ContainSingle(status =>
+                status.State == PendingState
+                && status.ClaimToken == null
+                && status.ClaimedAt == null
+            );
     }
 
     [Fact]
@@ -1041,7 +1652,8 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         using var handlerHost = new CohortTestHost(
             GetConnectionString(),
-            configureServices: services => services.AddRowHandler<PerRowAuditedLog, PerRowAuditHandler>()
+            configureServices: services =>
+                services.AddRowHandler<PerRowAuditedLog, PerRowAuditHandler>()
         );
 
         var result = await handlerHost.RunSweepAsync(
@@ -1049,15 +1661,17 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(PerRowAuditedLog),
-                "per-row-audit-override",
-                tenantId,
-                Strategy.Purge,
-                1
-            )
-        );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(PerRowAuditedLog),
+                    "per-row-audit-override",
+                    tenantId,
+                    Strategy.Purge,
+                    1
+                )
+            );
 
         var rowDetails = await LoadCapturedRowsAsync(result.SweepId);
         rowDetails
@@ -1066,7 +1680,11 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             .ContainSingle(row => row.EntityId == logId.ToString());
 
         var statuses = await LoadHandlerStatusesAsync(result.SweepId);
-        statuses.Should().ContainSingle(status => status.HandlerType.Contains(nameof(PerRowAuditHandler), StringComparison.Ordinal));
+        statuses
+            .Should()
+            .ContainSingle(status =>
+                status.HandlerType.Contains(nameof(PerRowAuditHandler), StringComparison.Ordinal)
+            );
     }
 
     [Fact]
@@ -1118,32 +1736,40 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(SoftDeleteRecord),
-                "soft-delete",
-                tenantId,
-                Strategy.SoftDelete,
-                1
-            )
-        );
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(AnonymisedContact),
-                "anonymise",
-                tenantId,
-                Strategy.Anonymise,
-                1
-            )
-        );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(SoftDeleteRecord),
+                    "soft-delete",
+                    tenantId,
+                    Strategy.SoftDelete,
+                    1
+                )
+            );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(AnonymisedContact),
+                    "anonymise",
+                    tenantId,
+                    Strategy.Anonymise,
+                    1
+                )
+            );
 
         await using (var verify = Host.CreateDbContext())
         {
-            var softDeleted = await verify.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteId);
+            var softDeleted = await verify.SoftDeleteRecords.SingleAsync(record =>
+                record.Id == softDeleteId
+            );
             softDeleted.IsDeleted.Should().BeTrue();
             softDeleted.DeletedAt.Should().Be(asOf);
 
-            var anonymised = await verify.AnonymisedContacts.SingleAsync(contact => contact.Id == contactId);
+            var anonymised = await verify.AnonymisedContacts.SingleAsync(contact =>
+                contact.Id == contactId
+            );
             anonymised.EmailAddress.Should().BeNull();
             anonymised.GivenName.Should().BeEmpty();
             anonymised.Surname.Should().Be("[redacted]");
@@ -1151,12 +1777,36 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         }
 
         var rowDetails = await LoadCapturedRowsAsync(result.SweepId);
-        rowDetails.Should().Contain(row => row.EntityType == typeof(SoftDeleteRecord).FullName && row.EntityId == softDeleteId.ToString());
-        rowDetails.Should().Contain(row => row.EntityType == typeof(AnonymisedContact).FullName && row.EntityId == contactId.ToString());
+        rowDetails
+            .Should()
+            .Contain(row =>
+                row.EntityType == typeof(SoftDeleteRecord).FullName
+                && row.EntityId == softDeleteId.ToString()
+            );
+        rowDetails
+            .Should()
+            .Contain(row =>
+                row.EntityType == typeof(AnonymisedContact).FullName
+                && row.EntityId == contactId.ToString()
+            );
 
         var statuses = await LoadHandlerStatusesAsync(result.SweepId);
-        statuses.Should().Contain(status => status.HandlerType.Contains(nameof(SoftDeleteRecordHandler), StringComparison.Ordinal));
-        statuses.Should().Contain(status => status.HandlerType.Contains(nameof(AnonymisedContactHandler), StringComparison.Ordinal));
+        statuses
+            .Should()
+            .Contain(status =>
+                status.HandlerType.Contains(
+                    nameof(SoftDeleteRecordHandler),
+                    StringComparison.Ordinal
+                )
+            );
+        statuses
+            .Should()
+            .Contain(status =>
+                status.HandlerType.Contains(
+                    nameof(AnonymisedContactHandler),
+                    StringComparison.Ordinal
+                )
+            );
     }
 
     [Fact]
@@ -1185,9 +1835,11 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
-        );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+            );
 
         await using (var verify = Host.CreateDbContext())
         {
@@ -1238,32 +1890,40 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(SoftDeleteRecord),
-                "soft-delete",
-                tenantId,
-                Strategy.SoftDelete,
-                1
-            )
-        );
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(AnonymisedContact),
-                "anonymise",
-                tenantId,
-                Strategy.Anonymise,
-                1
-            )
-        );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(SoftDeleteRecord),
+                    "soft-delete",
+                    tenantId,
+                    Strategy.SoftDelete,
+                    1
+                )
+            );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(AnonymisedContact),
+                    "anonymise",
+                    tenantId,
+                    Strategy.Anonymise,
+                    1
+                )
+            );
 
         await using (var verify = Host.CreateDbContext())
         {
-            var softDeleted = await verify.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteId);
+            var softDeleted = await verify.SoftDeleteRecords.SingleAsync(record =>
+                record.Id == softDeleteId
+            );
             softDeleted.IsDeleted.Should().BeTrue();
             softDeleted.DeletedAt.Should().Be(asOf);
 
-            var anonymised = await verify.AnonymisedContacts.SingleAsync(contact => contact.Id == contactId);
+            var anonymised = await verify.AnonymisedContacts.SingleAsync(contact =>
+                contact.Id == contactId
+            );
             anonymised.EmailAddress.Should().BeNull();
             anonymised.GivenName.Should().BeEmpty();
             anonymised.Surname.Should().Be("[redacted]");
@@ -1305,7 +1965,8 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         using var handlerHost = new CohortTestHost(
             GetConnectionString(),
-            configureServices: services => services.AddRowHandler<Note, SelectivelyFailingNoteHandler>()
+            configureServices: services =>
+                services.AddRowHandler<Note, SelectivelyFailingNoteHandler>()
         );
 
         var result = await handlerHost.RunSweepAsync(
@@ -1313,9 +1974,18 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1, SkippedCount: 1)
-        );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(Note),
+                    "short-lived",
+                    tenantId,
+                    Strategy.Purge,
+                    1,
+                    SkippedCount: 1
+                )
+            );
 
         await using (var verify = Host.CreateDbContext())
         {
@@ -1328,37 +1998,55 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         rowDetails.Should().Contain(row => row.EntityId == successfulNoteId.ToString());
         rowDetails.Should().Contain(row => row.EntityId == failingNoteId.ToString());
 
-        using (var payload = JsonDocument.Parse(rowDetails.Single(row => row.EntityId == successfulNoteId.ToString()).CapturedPayload))
+        using (
+            var payload = JsonDocument.Parse(
+                rowDetails
+                    .Single(row => row.EntityId == successfulNoteId.ToString())
+                    .CapturedPayload
+            )
+        )
         {
             payload.RootElement.GetProperty("body").GetString().Should().Be("surviving-sibling");
         }
-        using (var payload = JsonDocument.Parse(rowDetails.Single(row => row.EntityId == failingNoteId.ToString()).CapturedPayload))
-        {
-            payload.RootElement.EnumerateObject().Should().BeEmpty();
-        }
+        rowDetails
+            .Single(row => row.EntityId == failingNoteId.ToString())
+            .CapturedPayload.Should()
+            .BeEmpty();
+        (await CountRemainingCapturedPayloadsAsync(result.SweepId)).Should().Be(1);
 
         var statuses = await LoadHandlerStatusesAsync(result.SweepId);
         statuses.Should().HaveCount(2);
-        statuses.Should().Contain(
-            status => status.HandlerType.Contains(nameof(SelectivelyFailingNoteHandler), StringComparison.Ordinal)
+        statuses
+            .Should()
+            .Contain(status =>
+                status.HandlerType.Contains(
+                    nameof(SelectivelyFailingNoteHandler),
+                    StringComparison.Ordinal
+                )
                 && status.State == PendingState
-        );
-        statuses.Should().Contain(
-            status => status.HandlerType.Contains(nameof(SelectivelyFailingNoteHandler), StringComparison.Ordinal)
+            );
+        statuses
+            .Should()
+            .Contain(status =>
+                status.HandlerType.Contains(
+                    nameof(SelectivelyFailingNoteHandler),
+                    StringComparison.Ordinal
+                )
                 && status.State == DeadLetteredState
                 && status.Attempt == 1
                 && status.CompletedAt != null
                 && status.LastError != null
-        );
+            );
 
         var summaries = await LoadEntitySummariesAsync(result.SweepId);
-        summaries.Should().ContainSingle(
-            summary =>
+        summaries
+            .Should()
+            .ContainSingle(summary =>
                 summary.EntityType == typeof(Note).FullName
                 && summary.Affected == 1
                 && summary.HeldCount == 0
                 && summary.SkippedCount == 1
-        );
+            );
     }
 
     [Fact]
@@ -1408,7 +2096,8 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             {
                 [$"{CohortOptions.SectionName}:SweepBatchSize"] = "2",
             },
-            configureServices: services => services.AddRowHandler<Note, SelectivelyFailingNoteHandler>()
+            configureServices: services =>
+                services.AddRowHandler<Note, SelectivelyFailingNoteHandler>()
         );
 
         var result = await handlerHost.RunSweepAsync(
@@ -1417,27 +2106,39 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         );
 
         result.EntityFailures.Should().BeEmpty();
-        result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 2, SkippedCount: 1)
-        );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(Note),
+                    "short-lived",
+                    tenantId,
+                    Strategy.Purge,
+                    2,
+                    SkippedCount: 1
+                )
+            );
 
         await using (var verify = Host.CreateDbContext())
         {
             (await verify.Notes.AnyAsync(note => note.Id == firstHealthyNoteId)).Should().BeFalse();
-            (await verify.Notes.AnyAsync(note => note.Id == secondHealthyNoteId)).Should().BeFalse();
+            (await verify.Notes.AnyAsync(note => note.Id == secondHealthyNoteId))
+                .Should()
+                .BeFalse();
             (await verify.Notes.AnyAsync(note => note.Id == failingNoteId)).Should().BeTrue();
         }
 
         // Exactly one row detail per row: the failing row is dead-lettered once, not
         // once per batch.
         var rowDetails = await LoadCapturedRowsAsync(result.SweepId);
-        rowDetails.Select(row => row.EntityId).Should().BeEquivalentTo(
-            [
+        rowDetails
+            .Select(row => row.EntityId)
+            .Should()
+            .BeEquivalentTo([
                 failingNoteId.ToString(),
                 firstHealthyNoteId.ToString(),
                 secondHealthyNoteId.ToString(),
-            ]
-        );
+            ]);
 
         var statuses = await LoadHandlerStatusesAsync(result.SweepId);
         statuses.Should().HaveCount(3);
@@ -1483,7 +2184,8 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             {
                 [$"{CohortOptions.SectionName}:SweepBatchSize"] = "1",
             },
-            configureServices: services => services.AddRowHandler<Note, SelectivelyFailingNoteHandler>()
+            configureServices: services =>
+                services.AddRowHandler<Note, SelectivelyFailingNoteHandler>()
         );
 
         var result = await handlerHost.RunSweepAsync(
@@ -1492,9 +2194,18 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         );
 
         result.EntityFailures.Should().BeEmpty();
-        result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1, SkippedCount: 1)
-        );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(Note),
+                    "short-lived",
+                    tenantId,
+                    Strategy.Purge,
+                    1,
+                    SkippedCount: 1
+                )
+            );
 
         await using (var verify = Host.CreateDbContext())
         {
@@ -1555,9 +2266,18 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         );
 
         result.EntityFailures.Should().BeEmpty();
-        result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1, SkippedCount: 1)
-        );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(Note),
+                    "short-lived",
+                    tenantId,
+                    Strategy.Purge,
+                    1,
+                    SkippedCount: 1
+                )
+            );
 
         await using (var verify = Host.CreateDbContext())
         {
@@ -1641,7 +2361,8 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     TenantId = tenantId,
                     SubjectId = subjectId,
                     CreatedAt = EligibleErasureCreatedAt(asOf),
-                    EmailAddress = SelectivelyFailingErasureAnonymisedContactHandler.FailingEmailAddress,
+                    EmailAddress =
+                        SelectivelyFailingErasureAnonymisedContactHandler.FailingEmailAddress,
                     GivenName = "Failing",
                     Surname = "Contact",
                     Notes = "keep-failing-notes",
@@ -1656,8 +2377,14 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             configureServices: services =>
             {
                 services.AddRowHandler<Note, SelectivelyFailingErasureNoteHandler>();
-                services.AddRowHandler<SoftDeleteRecord, SelectivelyFailingErasureSoftDeleteHandler>();
-                services.AddRowHandler<AnonymisedContact, SelectivelyFailingErasureAnonymisedContactHandler>();
+                services.AddRowHandler<
+                    SoftDeleteRecord,
+                    SelectivelyFailingErasureSoftDeleteHandler
+                >();
+                services.AddRowHandler<
+                    AnonymisedContact,
+                    SelectivelyFailingErasureAnonymisedContactHandler
+                >();
             }
         );
 
@@ -1667,15 +2394,42 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1, SkippedCount: 1)
-        );
-        result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(SoftDeleteRecord), "soft-delete", tenantId, Strategy.SoftDelete, 1, SkippedCount: 1)
-        );
-        result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(AnonymisedContact), "anonymise", tenantId, Strategy.Anonymise, 1, SkippedCount: 1)
-        );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(Note),
+                    "short-lived",
+                    tenantId,
+                    Strategy.Purge,
+                    1,
+                    SkippedCount: 1
+                )
+            );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(SoftDeleteRecord),
+                    "soft-delete",
+                    tenantId,
+                    Strategy.SoftDelete,
+                    1,
+                    SkippedCount: 1
+                )
+            );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(AnonymisedContact),
+                    "anonymise",
+                    tenantId,
+                    Strategy.Anonymise,
+                    1,
+                    SkippedCount: 1
+                )
+            );
 
         await using (var verify = Host.CreateDbContext())
         {
@@ -1689,7 +2443,8 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             successfulSoftDelete.DeletedAt.Should().Be(asOf);
 
             (await verify.SoftDeleteRecords.SingleAsync(record => record.Id == failingSoftDeleteId))
-                .IsDeleted.Should().BeFalse();
+                .IsDeleted.Should()
+                .BeFalse();
 
             var successfulContact = await verify.AnonymisedContacts.SingleAsync(candidate =>
                 candidate.Id == successfulContactId
@@ -1702,58 +2457,91 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             var failingContact = await verify.AnonymisedContacts.SingleAsync(candidate =>
                 candidate.Id == failingContactId
             );
-            failingContact.EmailAddress.Should().Be(
-                SelectivelyFailingErasureAnonymisedContactHandler.FailingEmailAddress
-            );
+            failingContact
+                .EmailAddress.Should()
+                .Be(SelectivelyFailingErasureAnonymisedContactHandler.FailingEmailAddress);
             failingContact.GivenName.Should().Be("Failing");
             failingContact.Surname.Should().Be("Contact");
             failingContact.Notes.Should().Be("keep-failing-notes");
         }
 
         var rowDetails = await LoadCapturedRowsAsync(result.SweepId);
-        rowDetails.Select(row => row.EntityId).Should().BeEquivalentTo(
-            [
+        rowDetails
+            .Select(row => row.EntityId)
+            .Should()
+            .BeEquivalentTo([
                 successfulNoteId.ToString(),
                 failingNoteId.ToString(),
                 successfulSoftDeleteId.ToString(),
                 failingSoftDeleteId.ToString(),
                 successfulContactId.ToString(),
                 failingContactId.ToString(),
-            ]
-        );
+            ]);
 
         var statuses = await LoadHandlerStatusesAsync(result.SweepId);
         statuses.Should().HaveCount(6);
-        statuses.Select(status => status.HandlerType).Should().Contain(
-            type => type.Contains(nameof(SelectivelyFailingErasureNoteHandler), StringComparison.Ordinal)
-        );
-        statuses.Select(status => status.HandlerType).Should().Contain(
-            type =>
-                type.Contains(nameof(SelectivelyFailingErasureSoftDeleteHandler), StringComparison.Ordinal)
-        );
-        statuses.Select(status => status.HandlerType).Should().Contain(
-            type =>
+        statuses
+            .Select(status => status.HandlerType)
+            .Should()
+            .Contain(type =>
+                type.Contains(
+                    nameof(SelectivelyFailingErasureNoteHandler),
+                    StringComparison.Ordinal
+                )
+            );
+        statuses
+            .Select(status => status.HandlerType)
+            .Should()
+            .Contain(type =>
+                type.Contains(
+                    nameof(SelectivelyFailingErasureSoftDeleteHandler),
+                    StringComparison.Ordinal
+                )
+            );
+        statuses
+            .Select(status => status.HandlerType)
+            .Should()
+            .Contain(type =>
                 type.Contains(
                     nameof(SelectivelyFailingErasureAnonymisedContactHandler),
                     StringComparison.Ordinal
                 )
-        );
+            );
         statuses.Count(status => status.State == PendingState).Should().Be(3);
         statuses.Count(status => status.State == DeadLetteredState).Should().Be(3);
-        statuses.Where(status => status.State == DeadLetteredState)
+        statuses
+            .Where(status => status.State == DeadLetteredState)
             .Should()
-            .OnlyContain(status => status.Attempt == 1 && status.CompletedAt != null && status.LastError != null);
+            .OnlyContain(status =>
+                status.Attempt == 1 && status.CompletedAt != null && status.LastError != null
+            );
 
         var summaries = await LoadEntitySummariesAsync(result.SweepId);
-        summaries.Should().Contain(
-            new EntitySummaryRow(typeof(Note).FullName!, Strategy.Purge, 1, 0, 1)
-        );
-        summaries.Should().Contain(
-            new EntitySummaryRow(typeof(SoftDeleteRecord).FullName!, Strategy.SoftDelete, 1, 0, 1)
-        );
-        summaries.Should().Contain(
-            new EntitySummaryRow(typeof(AnonymisedContact).FullName!, Strategy.Anonymise, 1, 0, 1)
-        );
+        summaries
+            .Should()
+            .Contain(new EntitySummaryRow(typeof(Note).FullName!, Strategy.Purge, 1, 0, 1));
+        summaries
+            .Should()
+            .Contain(
+                new EntitySummaryRow(
+                    typeof(SoftDeleteRecord).FullName!,
+                    Strategy.SoftDelete,
+                    1,
+                    0,
+                    1
+                )
+            );
+        summaries
+            .Should()
+            .Contain(
+                new EntitySummaryRow(
+                    typeof(AnonymisedContact).FullName!,
+                    Strategy.Anonymise,
+                    1,
+                    0,
+                    1
+                )
+            );
     }
 
     [Fact]
@@ -1864,7 +2652,10 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                 services.AddSingleton(sink);
                 services.AddRowHandler<Note, NoteErasureTrackingHandler>();
                 services.AddRowHandler<SoftDeleteRecord, SoftDeleteErasureTrackingHandler>();
-                services.AddRowHandler<AnonymisedContact, AnonymisedContactErasureTrackingHandler>();
+                services.AddRowHandler<
+                    AnonymisedContact,
+                    AnonymisedContactErasureTrackingHandler
+                >();
                 services.AddRowHandler<ErasureSubjectRecord, ExemptErasureTrackingHandler>();
             }
         );
@@ -1875,68 +2666,121 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1, HeldCount: 1)
-        );
-        result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(SoftDeleteRecord), "soft-delete", tenantId, Strategy.SoftDelete, 1, HeldCount: 1)
-        );
-        result.Counts.Should().Contain(
-            // Held counts are measured directly (subject-matching, past cutoff, actively
-            // held), so the anonymise erase path reports the held contact too.
-            new EntitySweepCount(typeof(AnonymisedContact), "anonymise", tenantId, Strategy.Anonymise, 1, HeldCount: 1)
-        );
-        sink.BeforeCalls.Should().BeEquivalentTo(
-            [
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(Note),
+                    "short-lived",
+                    tenantId,
+                    Strategy.Purge,
+                    1,
+                    HeldCount: 1
+                )
+            );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(SoftDeleteRecord),
+                    "soft-delete",
+                    tenantId,
+                    Strategy.SoftDelete,
+                    1,
+                    HeldCount: 1
+                )
+            );
+        result
+            .Counts.Should()
+            .Contain(
+                // Held counts are measured directly (subject-matching, past cutoff, actively
+                // held), so the anonymise erase path reports the held contact too.
+                new EntitySweepCount(
+                    typeof(AnonymisedContact),
+                    "anonymise",
+                    tenantId,
+                    Strategy.Anonymise,
+                    1,
+                    HeldCount: 1
+                )
+            );
+        sink.BeforeCalls.Should()
+            .BeEquivalentTo([
                 "note:erase-note",
                 "soft:erase-soft-delete",
                 "contact:subject@example.com",
-            ]
-        );
+            ]);
 
         await using (var verify = Host.CreateDbContext())
         {
             (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeFalse();
             (await verify.Notes.AnyAsync(note => note.Id == heldNoteId)).Should().BeTrue();
 
-            var softDelete = await verify.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteId);
+            var softDelete = await verify.SoftDeleteRecords.SingleAsync(record =>
+                record.Id == softDeleteId
+            );
             softDelete.IsDeleted.Should().BeTrue();
             softDelete.DeletedAt.Should().Be(asOf);
             (await verify.SoftDeleteRecords.SingleAsync(record => record.Id == heldSoftDeleteId))
-                .IsDeleted.Should().BeFalse();
+                .IsDeleted.Should()
+                .BeFalse();
 
-            var contact = await verify.AnonymisedContacts.SingleAsync(candidate => candidate.Id == contactId);
+            var contact = await verify.AnonymisedContacts.SingleAsync(candidate =>
+                candidate.Id == contactId
+            );
             contact.EmailAddress.Should().BeNull();
             contact.GivenName.Should().BeEmpty();
             contact.Surname.Should().Be("[redacted]");
-            (await verify.AnonymisedContacts.SingleAsync(candidate => candidate.Id == heldContactId))
-                .EmailAddress.Should().Be("held@example.com");
+            (
+                await verify.AnonymisedContacts.SingleAsync(candidate =>
+                    candidate.Id == heldContactId
+                )
+            )
+                .EmailAddress.Should()
+                .Be("held@example.com");
 
             (await verify.ErasureSubjectRecords.SingleAsync(record => record.Id == exemptRecordId))
-                .Body.Should().Be("exempt-erasure-record");
+                .Body.Should()
+                .Be("exempt-erasure-record");
         }
 
         var rowDetails = await LoadCapturedRowsAsync(result.SweepId);
         rowDetails.Should().HaveCount(3);
-        rowDetails.Select(row => row.EntityId).Should().BeEquivalentTo(
-            [noteId.ToString(), softDeleteId.ToString(), contactId.ToString()]
-        );
+        rowDetails
+            .Select(row => row.EntityId)
+            .Should()
+            .BeEquivalentTo([noteId.ToString(), softDeleteId.ToString(), contactId.ToString()]);
 
         var statuses = await LoadHandlerStatusesAsync(result.SweepId);
         statuses.Should().HaveCount(3);
         statuses.All(status => status.State == 0 && status.Attempt == 0).Should().BeTrue();
-        statuses.Select(status => status.HandlerType).Should().Contain(
-            type => type.Contains(nameof(NoteErasureTrackingHandler), StringComparison.Ordinal)
-        );
-        statuses.Select(status => status.HandlerType).Should().Contain(
-            type => type.Contains(nameof(SoftDeleteErasureTrackingHandler), StringComparison.Ordinal)
-        );
-        statuses.Select(status => status.HandlerType).Should().Contain(
-            type => type.Contains(nameof(AnonymisedContactErasureTrackingHandler), StringComparison.Ordinal)
-        );
-        statuses.Select(status => status.HandlerType).Should().NotContain(
-            type => type.Contains(nameof(ExemptErasureTrackingHandler), StringComparison.Ordinal)
-        );
+        statuses
+            .Select(status => status.HandlerType)
+            .Should()
+            .Contain(type =>
+                type.Contains(nameof(NoteErasureTrackingHandler), StringComparison.Ordinal)
+            );
+        statuses
+            .Select(status => status.HandlerType)
+            .Should()
+            .Contain(type =>
+                type.Contains(nameof(SoftDeleteErasureTrackingHandler), StringComparison.Ordinal)
+            );
+        statuses
+            .Select(status => status.HandlerType)
+            .Should()
+            .Contain(type =>
+                type.Contains(
+                    nameof(AnonymisedContactErasureTrackingHandler),
+                    StringComparison.Ordinal
+                )
+            );
+        statuses
+            .Select(status => status.HandlerType)
+            .Should()
+            .NotContain(type =>
+                type.Contains(nameof(ExemptErasureTrackingHandler), StringComparison.Ordinal)
+            );
 
         await handlerHost.RunWithServicesAsync(async serviceProvider =>
         {
@@ -1944,14 +2788,14 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             await dispatcher.FlushAsync();
         });
 
-        sink.AfterCalls.Should().BeEquivalentTo(
-            [
+        sink.AfterCalls.Should()
+            .BeEquivalentTo([
                 "after-note:erase-note:1",
                 "after-soft:erase-soft-delete:1",
                 "after-contact:subject@example.com:1",
-            ]
-        );
-        sink.AfterCalls.Should().NotContain(call => call.Contains("exempt", StringComparison.Ordinal));
+            ]);
+        sink.AfterCalls.Should()
+            .NotContain(call => call.Contains("exempt", StringComparison.Ordinal));
 
         var completedStatuses = await LoadHandlerStatusesAsync(result.SweepId);
         completedStatuses.Should().HaveCount(3);
@@ -1961,15 +2805,31 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         completedStatuses.All(status => status.LastError is null).Should().BeTrue();
 
         var summaries = await LoadEntitySummariesAsync(result.SweepId);
-        summaries.Should().Contain(
-            new EntitySummaryRow(typeof(Note).FullName!, Strategy.Purge, 1, 1, 0)
-        );
-        summaries.Should().Contain(
-            new EntitySummaryRow(typeof(SoftDeleteRecord).FullName!, Strategy.SoftDelete, 1, 1, 0)
-        );
-        summaries.Should().Contain(
-            new EntitySummaryRow(typeof(AnonymisedContact).FullName!, Strategy.Anonymise, 1, 1, 0)
-        );
+        summaries
+            .Should()
+            .Contain(new EntitySummaryRow(typeof(Note).FullName!, Strategy.Purge, 1, 1, 0));
+        summaries
+            .Should()
+            .Contain(
+                new EntitySummaryRow(
+                    typeof(SoftDeleteRecord).FullName!,
+                    Strategy.SoftDelete,
+                    1,
+                    1,
+                    0
+                )
+            );
+        summaries
+            .Should()
+            .Contain(
+                new EntitySummaryRow(
+                    typeof(AnonymisedContact).FullName!,
+                    Strategy.Anonymise,
+                    1,
+                    1,
+                    0
+                )
+            );
     }
 
     [Fact]
@@ -2042,7 +2902,10 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                 services.AddSingleton(sink);
                 services.AddRowHandler<Note, NoteErasureTrackingHandler>();
                 services.AddRowHandler<SoftDeleteRecord, SoftDeleteErasureTrackingHandler>();
-                services.AddRowHandler<AnonymisedContact, AnonymisedContactErasureTrackingHandler>();
+                services.AddRowHandler<
+                    AnonymisedContact,
+                    AnonymisedContactErasureTrackingHandler
+                >();
                 services.AddRowHandler<ErasureSubjectRecord, ExemptErasureTrackingHandler>();
             }
         );
@@ -2053,15 +2916,33 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
-        );
-        result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(SoftDeleteRecord), "soft-delete", tenantId, Strategy.SoftDelete, 1)
-        );
-        result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(AnonymisedContact), "anonymise", tenantId, Strategy.Anonymise, 1)
-        );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+            );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(SoftDeleteRecord),
+                    "soft-delete",
+                    tenantId,
+                    Strategy.SoftDelete,
+                    1
+                )
+            );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(AnonymisedContact),
+                    "anonymise",
+                    tenantId,
+                    Strategy.Anonymise,
+                    1
+                )
+            );
         sink.BeforeCalls.Should().BeEmpty();
         (await LoadCapturedRowsAsync(result.SweepId)).Should().BeEmpty();
         (await LoadHandlerStatusesAsync(result.SweepId)).Should().BeEmpty();
@@ -2077,11 +2958,14 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         await using var verify = Host.CreateDbContext();
         (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
         (await verify.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteId))
-            .IsDeleted.Should().BeFalse();
+            .IsDeleted.Should()
+            .BeFalse();
         (await verify.AnonymisedContacts.SingleAsync(candidate => candidate.Id == contactId))
-            .EmailAddress.Should().Be("dry-run@example.com");
+            .EmailAddress.Should()
+            .Be("dry-run@example.com");
         (await verify.ErasureSubjectRecords.SingleAsync(record => record.Id == exemptRecordId))
-            .Body.Should().Be("dry-run-exempt");
+            .Body.Should()
+            .Be("dry-run-exempt");
     }
 
     [Fact]
@@ -2227,7 +3111,10 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                 services.AddSingleton(sink);
                 services.AddRowHandler<Note, NoteErasureTrackingHandler>();
                 services.AddRowHandler<SoftDeleteRecord, SoftDeleteErasureTrackingHandler>();
-                services.AddRowHandler<AnonymisedContact, AnonymisedContactErasureTrackingHandler>();
+                services.AddRowHandler<
+                    AnonymisedContact,
+                    AnonymisedContactErasureTrackingHandler
+                >();
             }
         );
 
@@ -2237,61 +3124,119 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        previewResult.Counts.Should().Contain(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
-        );
-        previewResult.Counts.Should().Contain(
-            new EntitySweepCount(typeof(SoftDeleteRecord), "soft-delete", tenantId, Strategy.SoftDelete, 1)
-        );
-        previewResult.Counts.Should().Contain(
-            new EntitySweepCount(typeof(AnonymisedContact), "anonymise", tenantId, Strategy.Anonymise, 1)
-        );
+        previewResult
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+            );
+        previewResult
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(SoftDeleteRecord),
+                    "soft-delete",
+                    tenantId,
+                    Strategy.SoftDelete,
+                    1
+                )
+            );
+        previewResult
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(AnonymisedContact),
+                    "anonymise",
+                    tenantId,
+                    Strategy.Anonymise,
+                    1
+                )
+            );
         sink.BeforeCalls.Should().BeEmpty();
         sink.AfterCalls.Should().BeEmpty();
         (await LoadCapturedRowsAsync(previewResult.SweepId)).Should().BeEmpty();
         (await LoadHandlerStatusesAsync(previewResult.SweepId)).Should().BeEmpty();
         var previewSummaries = await LoadEntitySummariesAsync(previewResult.SweepId);
-        previewSummaries.Should().Contain(
-            new EntitySummaryRow(typeof(Note).FullName!, Strategy.Purge, 1, 0, 0)
-        );
-        previewSummaries.Should().Contain(
-            new EntitySummaryRow(typeof(SoftDeleteRecord).FullName!, Strategy.SoftDelete, 1, 0, 0)
-        );
-        previewSummaries.Should().Contain(
-            new EntitySummaryRow(typeof(AnonymisedContact).FullName!, Strategy.Anonymise, 1, 0, 0)
-        );
+        previewSummaries
+            .Should()
+            .Contain(new EntitySummaryRow(typeof(Note).FullName!, Strategy.Purge, 1, 0, 0));
+        previewSummaries
+            .Should()
+            .Contain(
+                new EntitySummaryRow(
+                    typeof(SoftDeleteRecord).FullName!,
+                    Strategy.SoftDelete,
+                    1,
+                    0,
+                    0
+                )
+            );
+        previewSummaries
+            .Should()
+            .Contain(
+                new EntitySummaryRow(
+                    typeof(AnonymisedContact).FullName!,
+                    Strategy.Anonymise,
+                    1,
+                    0,
+                    0
+                )
+            );
 
         await using (var afterPreview = Host.CreateDbContext())
         {
-            (await afterPreview.Notes.AnyAsync(note => note.Id == noteEligibleId)).Should().BeTrue();
-            (await afterPreview.Notes.AnyAsync(note => note.Id == noteWithinPeriodId)).Should().BeTrue();
-            (await afterPreview.Notes.AnyAsync(note => note.Id == noteWithinLegalMinId)).Should().BeTrue();
+            (await afterPreview.Notes.AnyAsync(note => note.Id == noteEligibleId))
+                .Should()
+                .BeTrue();
+            (await afterPreview.Notes.AnyAsync(note => note.Id == noteWithinPeriodId))
+                .Should()
+                .BeTrue();
+            (await afterPreview.Notes.AnyAsync(note => note.Id == noteWithinLegalMinId))
+                .Should()
+                .BeTrue();
 
-            (await afterPreview.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteEligibleId))
-                .IsDeleted.Should()
-                .BeFalse();
-            (await afterPreview.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteWithinPeriodId))
+            (
+                await afterPreview.SoftDeleteRecords.SingleAsync(record =>
+                    record.Id == softDeleteEligibleId
+                )
+            )
                 .IsDeleted.Should()
                 .BeFalse();
             (
-                await afterPreview.SoftDeleteRecords.SingleAsync(
-                    record => record.Id == softDeleteWithinLegalMinId
+                await afterPreview.SoftDeleteRecords.SingleAsync(record =>
+                    record.Id == softDeleteWithinPeriodId
                 )
-            ).IsDeleted.Should().BeFalse();
+            )
+                .IsDeleted.Should()
+                .BeFalse();
+            (
+                await afterPreview.SoftDeleteRecords.SingleAsync(record =>
+                    record.Id == softDeleteWithinLegalMinId
+                )
+            )
+                .IsDeleted.Should()
+                .BeFalse();
 
-            (await afterPreview.AnonymisedContacts.SingleAsync(contact => contact.Id == contactEligibleId))
+            (
+                await afterPreview.AnonymisedContacts.SingleAsync(contact =>
+                    contact.Id == contactEligibleId
+                )
+            )
                 .EmailAddress.Should()
                 .Be("handler-cutoff-eligible@example.com");
             (
-                await afterPreview.AnonymisedContacts.SingleAsync(
-                    contact => contact.Id == contactWithinPeriodId
+                await afterPreview.AnonymisedContacts.SingleAsync(contact =>
+                    contact.Id == contactWithinPeriodId
                 )
-            ).EmailAddress.Should().Be("handler-cutoff-within-period@example.com");
+            )
+                .EmailAddress.Should()
+                .Be("handler-cutoff-within-period@example.com");
             (
-                await afterPreview.AnonymisedContacts.SingleAsync(
-                    contact => contact.Id == contactWithinLegalMinId
+                await afterPreview.AnonymisedContacts.SingleAsync(contact =>
+                    contact.Id == contactWithinLegalMinId
                 )
-            ).EmailAddress.Should().Be("handler-cutoff-within-legal-min@example.com");
+            )
+                .EmailAddress.Should()
+                .Be("handler-cutoff-within-legal-min@example.com");
         }
 
         using var liveHost = new CohortTestHost(
@@ -2310,7 +3255,10 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                 services.AddSingleton(sink);
                 services.AddRowHandler<Note, NoteErasureTrackingHandler>();
                 services.AddRowHandler<SoftDeleteRecord, SoftDeleteErasureTrackingHandler>();
-                services.AddRowHandler<AnonymisedContact, AnonymisedContactErasureTrackingHandler>();
+                services.AddRowHandler<
+                    AnonymisedContact,
+                    AnonymisedContactErasureTrackingHandler
+                >();
             }
         );
 
@@ -2321,51 +3269,88 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         );
 
         liveResult.Counts.Should().BeEquivalentTo(previewResult.Counts);
-        sink.BeforeCalls.Should().BeEquivalentTo(
-            [
+        sink.BeforeCalls.Should()
+            .BeEquivalentTo([
                 "note:handler-cutoff-note-eligible",
                 "soft:handler-cutoff-soft-eligible",
                 "contact:handler-cutoff-eligible@example.com",
-            ]
-        );
+            ]);
 
         var pendingRows = await LoadCapturedRowsAsync(liveResult.SweepId);
         pendingRows.Should().HaveCount(3);
-        pendingRows.Select(row => row.EntityId).Should().BeEquivalentTo(
-            [noteEligibleId.ToString(), softDeleteEligibleId.ToString(), contactEligibleId.ToString()]
-        );
+        pendingRows
+            .Select(row => row.EntityId)
+            .Should()
+            .BeEquivalentTo([
+                noteEligibleId.ToString(),
+                softDeleteEligibleId.ToString(),
+                contactEligibleId.ToString(),
+            ]);
 
         var pendingStatuses = await LoadHandlerStatusesAsync(liveResult.SweepId);
         pendingStatuses.Should().HaveCount(3);
-        pendingStatuses.All(status => status.State == PendingState && status.Attempt == 0).Should().BeTrue();
+        pendingStatuses
+            .All(status => status.State == PendingState && status.Attempt == 0)
+            .Should()
+            .BeTrue();
         var liveSummaries = await LoadEntitySummariesAsync(liveResult.SweepId);
-        liveSummaries.Should().Contain(
-            new EntitySummaryRow(typeof(Note).FullName!, Strategy.Purge, 1, 0, 0)
-        );
-        liveSummaries.Should().Contain(
-            new EntitySummaryRow(typeof(SoftDeleteRecord).FullName!, Strategy.SoftDelete, 1, 0, 0)
-        );
-        liveSummaries.Should().Contain(
-            new EntitySummaryRow(typeof(AnonymisedContact).FullName!, Strategy.Anonymise, 1, 0, 0)
-        );
+        liveSummaries
+            .Should()
+            .Contain(new EntitySummaryRow(typeof(Note).FullName!, Strategy.Purge, 1, 0, 0));
+        liveSummaries
+            .Should()
+            .Contain(
+                new EntitySummaryRow(
+                    typeof(SoftDeleteRecord).FullName!,
+                    Strategy.SoftDelete,
+                    1,
+                    0,
+                    0
+                )
+            );
+        liveSummaries
+            .Should()
+            .Contain(
+                new EntitySummaryRow(
+                    typeof(AnonymisedContact).FullName!,
+                    Strategy.Anonymise,
+                    1,
+                    0,
+                    0
+                )
+            );
 
         await using (var afterLive = Host.CreateDbContext())
         {
             (await afterLive.Notes.AnyAsync(note => note.Id == noteEligibleId)).Should().BeFalse();
-            (await afterLive.Notes.AnyAsync(note => note.Id == noteWithinPeriodId)).Should().BeTrue();
-            (await afterLive.Notes.AnyAsync(note => note.Id == noteWithinLegalMinId)).Should().BeTrue();
+            (await afterLive.Notes.AnyAsync(note => note.Id == noteWithinPeriodId))
+                .Should()
+                .BeTrue();
+            (await afterLive.Notes.AnyAsync(note => note.Id == noteWithinLegalMinId))
+                .Should()
+                .BeTrue();
 
-            (await afterLive.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteEligibleId))
+            (
+                await afterLive.SoftDeleteRecords.SingleAsync(record =>
+                    record.Id == softDeleteEligibleId
+                )
+            )
                 .IsDeleted.Should()
                 .BeTrue();
-            (await afterLive.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteWithinPeriodId))
+            (
+                await afterLive.SoftDeleteRecords.SingleAsync(record =>
+                    record.Id == softDeleteWithinPeriodId
+                )
+            )
                 .IsDeleted.Should()
                 .BeFalse();
             (
-                await afterLive.SoftDeleteRecords.SingleAsync(
-                    record => record.Id == softDeleteWithinLegalMinId
+                await afterLive.SoftDeleteRecords.SingleAsync(record =>
+                    record.Id == softDeleteWithinLegalMinId
                 )
-            ).IsDeleted.Should().BeFalse();
+            )
+                .IsDeleted.Should()
+                .BeFalse();
 
             var eligibleContact = await afterLive.AnonymisedContacts.SingleAsync(contact =>
                 contact.Id == contactEligibleId
@@ -2377,14 +3362,18 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             var withinPeriodContact = await afterLive.AnonymisedContacts.SingleAsync(contact =>
                 contact.Id == contactWithinPeriodId
             );
-            withinPeriodContact.EmailAddress.Should().Be("handler-cutoff-within-period@example.com");
+            withinPeriodContact
+                .EmailAddress.Should()
+                .Be("handler-cutoff-within-period@example.com");
             withinPeriodContact.GivenName.Should().Be("Within");
             withinPeriodContact.Surname.Should().Be("Period");
 
             var withinLegalMinContact = await afterLive.AnonymisedContacts.SingleAsync(contact =>
                 contact.Id == contactWithinLegalMinId
             );
-            withinLegalMinContact.EmailAddress.Should().Be("handler-cutoff-within-legal-min@example.com");
+            withinLegalMinContact
+                .EmailAddress.Should()
+                .Be("handler-cutoff-within-legal-min@example.com");
             withinLegalMinContact.GivenName.Should().Be("Within");
             withinLegalMinContact.Surname.Should().Be("LegalMin");
         }
@@ -2395,17 +3384,17 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             await dispatcher.FlushAsync();
         });
 
-        sink.AfterCalls.Should().BeEquivalentTo(
-            [
+        sink.AfterCalls.Should()
+            .BeEquivalentTo([
                 "after-note:handler-cutoff-note-eligible:1",
                 "after-soft:handler-cutoff-soft-eligible:1",
                 "after-contact:handler-cutoff-eligible@example.com:1",
-            ]
-        );
+            ]);
 
         var completedStatuses = await LoadHandlerStatusesAsync(liveResult.SweepId);
         completedStatuses.Should().HaveCount(3);
-        completedStatuses.All(status => status.State == SucceededState && status.Attempt == 1)
+        completedStatuses
+            .All(status => status.State == SucceededState && status.Attempt == 1)
             .Should()
             .BeTrue();
     }
@@ -2483,6 +3472,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
         var noteId = Guid.NewGuid();
         var sink = new HandlerExecutionSink();
+        var gate = new DispatchBlockGate();
 
         await using (var db = Host.CreateDbContext())
         {
@@ -2503,7 +3493,8 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             configureServices: services =>
             {
                 services.AddSingleton(sink);
-                services.AddRowHandler<Note, DispatchRecordingNoteHandler>();
+                services.AddSingleton(gate);
+                services.AddRowHandler<Note, BlockingDispatchNoteHandler>();
             }
         );
 
@@ -2515,7 +3506,23 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         await handlerHost.RunWithServicesAsync(async serviceProvider =>
         {
             var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
-            await Task.WhenAll(dispatcher.FlushAsync(), dispatcher.FlushAsync());
+            var owningFlush = dispatcher.FlushAsync();
+            await gate.WaitUntilBlockedAsync().WaitAsync(TimeSpan.FromSeconds(5));
+
+            var claimedStatus = (await LoadHandlerStatusesAsync(result.SweepId)).Single();
+            claimedStatus.State.Should().Be(InFlightState);
+            claimedStatus.Attempt.Should().Be(1);
+            claimedStatus.ClaimedAt.Should().NotBeNull();
+            claimedStatus.ClaimToken.Should().NotBeNull();
+
+            var competingResult = await dispatcher.FlushAsync().WaitAsync(TimeSpan.FromSeconds(5));
+            competingResult.Settled.Should().BeFalse();
+            competingResult.InFlightRemaining.Should().Be(1);
+            competingResult.PendingRemaining.Should().Be(0);
+            sink.AfterCalls.Should().BeEmpty();
+
+            gate.Release();
+            await owningFlush.WaitAsync(TimeSpan.FromSeconds(5));
         });
 
         sink.AfterCalls.Should().Equal("after:concurrent-dispatch:1");
@@ -2524,7 +3531,8 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         statuses.Should().ContainSingle();
         statuses[0].State.Should().Be(SucceededState);
         statuses[0].Attempt.Should().Be(1);
-        statuses[0].ClaimedAt.Should().NotBeNull();
+        statuses[0].ClaimedAt.Should().BeNull();
+        statuses[0].ClaimToken.Should().BeNull();
         statuses[0].CompletedAt.Should().NotBeNull();
         statuses[0].LastError.Should().BeNull();
     }
@@ -2581,18 +3589,16 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         );
 
         using var cancellation = new CancellationTokenSource();
-        await handlerHost.RunWithServicesAsync(
-            async serviceProvider =>
-            {
-                var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
-                var flushTask = dispatcher.FlushAsync(cancellation.Token);
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            var flushTask = dispatcher.FlushAsync(cancellation.Token);
 
-                await gate.WaitUntilBlockedAsync();
-                cancellation.Cancel();
+            await gate.WaitUntilBlockedAsync();
+            cancellation.Cancel();
 
-                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => flushTask);
-            }
-        );
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => flushTask);
+        });
 
         gate.Release();
 
@@ -2602,17 +3608,13 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             await dispatcher.FlushAsync();
         });
 
-        sink.AfterCalls.Should().BeEquivalentTo(
-            [
-                "after:cancelled-batch-first:1",
-                "after:cancelled-batch-second:1",
-            ]
-        );
+        sink.AfterCalls.Should()
+            .BeEquivalentTo(["after:cancelled-batch-first:2", "after:cancelled-batch-second:2"]);
 
         var statuses = await LoadHandlerStatusesAsync(result.SweepId);
         statuses.Should().HaveCount(2);
         statuses.All(status => status.State == SucceededState).Should().BeTrue();
-        statuses.All(status => status.Attempt == 1).Should().BeTrue();
+        statuses.All(status => status.Attempt == 2).Should().BeTrue();
         statuses.All(status => status.CompletedAt is not null).Should().BeTrue();
     }
 
@@ -2660,25 +3662,21 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         );
 
         using var cancellation = new CancellationTokenSource();
-        await handlerHost.RunWithServicesAsync(
-            async serviceProvider =>
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            var flushTask = dispatcher.FlushAsync(cancellation.Token);
+
+            await blocker.WaitUntilLockedAsync();
+            cancellation.Cancel();
+            await blocker.ReleaseAsync();
+
+            try
             {
-                var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
-                var flushTask = dispatcher.FlushAsync(cancellation.Token);
-
-                await blocker.WaitUntilLockedAsync();
-                cancellation.Cancel();
-                await blocker.ReleaseAsync();
-
-                try
-                {
-                    await flushTask;
-                }
-                catch (OperationCanceledException)
-                {
-                }
+                await flushTask;
             }
-        );
+            catch (OperationCanceledException) { }
+        });
 
         await handlerHost.RunWithServicesAsync(async serviceProvider =>
         {
@@ -2694,6 +3692,66 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         statuses[0].Attempt.Should().Be(1);
         statuses[0].CompletedAt.Should().NotBeNull();
         statuses[0].LastError.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task Hosted_Dispatcher_Stop_During_Poll_Delay_Completes_Cleanly()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var sink = new HandlerExecutionSink();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "hosted-dispatcher-stop",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:PollInterval"] = "1.00:00:00",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(sink);
+                services.AddRowHandler<Note, LowPriorityAfterNoteHandler>();
+            }
+        );
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var hostedDispatcher = (RetentionRowDispatcher)
+                serviceProvider
+                    .GetServices<IHostedService>()
+                    .Single(service => service is IRetentionRowDispatcher);
+            await hostedDispatcher.StartAsync(CancellationToken.None);
+
+            await WaitForHandlerStatusAsync(
+                result.SweepId,
+                row => row.State == SucceededState && row.Attempt == 1
+            );
+            await hostedDispatcher.PollDelayEntered.WaitAsync(TimeSpan.FromSeconds(5));
+
+            var stop = async () => await hostedDispatcher.StopAsync(CancellationToken.None);
+            await stop.Should().NotThrowAsync();
+        });
+
+        sink.AfterCalls.Should().Equal("after-low");
     }
 
     [Fact]
@@ -2740,26 +3798,26 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         await handlerHost.RunWithServicesAsync(async serviceProvider =>
         {
-            var hostedDispatcher = serviceProvider.GetServices<IHostedService>().Single(service =>
-                service is IRetentionRowDispatcher
-            );
+            var hostedDispatcher = serviceProvider
+                .GetServices<IHostedService>()
+                .Single(service => service is IRetentionRowDispatcher);
             await hostedDispatcher.StartAsync(CancellationToken.None);
 
             try
             {
                 var status = await WaitForHandlerStatusAsync(
                     result.SweepId,
-                    row => row.State == PendingState && row.Attempt == 1 && row.LastError is not null
+                    row =>
+                        row.State == PendingState && row.Attempt == 1 && row.LastError is not null
                 );
                 var failureAt = tracker.LoadLastFailure(noteId.ToString());
 
                 status.ClaimedAt.Should().BeNull();
                 status.CompletedAt.Should().BeNull();
                 failureAt.Should().NotBeNull();
-                status.NextAttemptAt.Should().BeCloseTo(
-                    failureAt!.Value.AddMinutes(5),
-                    TimeSpan.FromSeconds(15)
-                );
+                status
+                    .NextAttemptAt.Should()
+                    .BeCloseTo(failureAt!.Value.AddMinutes(5), TimeSpan.FromSeconds(15));
                 status.LastError.Should().Contain("Simulated permanent after-dispatch failure.");
             }
             finally
@@ -2832,7 +3890,10 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         (await CountRemainingCapturedPayloadsAsync(result.SweepId)).Should().Be(0);
 
-        var observed = recorder.Load().OrderBy(call => call.EntityId, StringComparer.Ordinal).ToArray();
+        var observed = recorder
+            .Load()
+            .OrderBy(call => call.EntityId, StringComparer.Ordinal)
+            .ToArray();
 
         observed.Should().HaveCount(2);
         observed.Select(call => call.ScopeInstanceId).Should().OnlyHaveUniqueItems();
@@ -2913,13 +3974,8 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             await dispatcher.FlushAsync();
         });
 
-        sink.AfterCalls.Should().BeEquivalentTo(
-            [
-                "after:batch-one:1",
-                "after:batch-two:1",
-                "after:batch-three:1",
-            ]
-        );
+        sink.AfterCalls.Should()
+            .BeEquivalentTo(["after:batch-one:1", "after:batch-two:1", "after:batch-three:1"]);
 
         var statuses = await LoadHandlerStatusesAsync(result.SweepId);
         statuses.Should().HaveCount(3);
@@ -3115,7 +4171,9 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         // Sanitised to root-cause type + message: no stack frames in the audit table.
         statuses[0].LastError.Should().NotContain("   at ");
         // Dead-lettering settles the row, so its captured snapshot is scrubbed too.
-        (await CountRemainingCapturedPayloadsAsync(result.SweepId)).Should().Be(0);
+        (await CountRemainingCapturedPayloadsAsync(result.SweepId))
+            .Should()
+            .Be(0);
     }
 
     [Fact]
@@ -3165,8 +4223,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         {
             await connection.OpenAsync();
             await using var command = connection.CreateCommand();
-            command.CommandText =
-                """
+            command.CommandText = """
                 UPDATE "sweep_run_row_detail"
                 SET "CapturedPayload" = @payload
                 WHERE "SweepId" = @sweepId
@@ -3260,7 +4317,9 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         // Sanitised to root-cause type + message: no stack frames in the audit table.
         statuses[0].LastError.Should().NotContain("   at ");
         // Dead-lettering settles the row, so its captured snapshot is scrubbed too.
-        (await CountRemainingCapturedPayloadsAsync(result.SweepId)).Should().Be(0);
+        (await CountRemainingCapturedPayloadsAsync(result.SweepId))
+            .Should()
+            .Be(0);
     }
 
     [Fact]
@@ -3323,25 +4382,38 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         var statuses = await LoadHandlerStatusesAsync(result.SweepId);
         statuses.Should().HaveCount(2);
-        statuses.Should().ContainSingle(status =>
-            status.HandlerType.Contains(
-                nameof(AlwaysFailingHighPriorityDispatchNoteHandler),
-                StringComparison.Ordinal
-            )
-            && status.State == DeadLetteredState
-            && status.Attempt == 2
-            && status.CompletedAt != null
-            && status.LastError != null
-            && status.LastError.Contains("Simulated permanent after-dispatch failure.", StringComparison.Ordinal)
-        );
-        statuses.Should().ContainSingle(status =>
-            status.HandlerType.Contains(nameof(LowPriorityAfterNoteHandler), StringComparison.Ordinal)
-            && status.State == DeadLetteredState
-            && status.Attempt == 0
-            && status.CompletedAt != null
-            && status.LastError != null
-            && status.LastError.Contains("Skipped because an earlier handler for the same row dead-lettered", StringComparison.Ordinal)
-        );
+        statuses
+            .Should()
+            .ContainSingle(status =>
+                status.HandlerType.Contains(
+                    nameof(AlwaysFailingHighPriorityDispatchNoteHandler),
+                    StringComparison.Ordinal
+                )
+                && status.State == DeadLetteredState
+                && status.Attempt == 2
+                && status.CompletedAt != null
+                && status.LastError != null
+                && status.LastError.Contains(
+                    "Simulated permanent after-dispatch failure.",
+                    StringComparison.Ordinal
+                )
+            );
+        statuses
+            .Should()
+            .ContainSingle(status =>
+                status.HandlerType.Contains(
+                    nameof(LowPriorityAfterNoteHandler),
+                    StringComparison.Ordinal
+                )
+                && status.State == DeadLetteredState
+                && status.Attempt == 0
+                && status.CompletedAt != null
+                && status.LastError != null
+                && status.LastError.Contains(
+                    "Skipped because an earlier handler for the same row dead-lettered",
+                    StringComparison.Ordinal
+                )
+            );
     }
 
     private static DateTimeOffset EligibleErasureCreatedAt(DateTimeOffset asOf)
@@ -3362,7 +4434,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             await repository.CreateAsync(
                 new RetentionHoldRequest(
                     Guid.NewGuid(),
-                    tableName,
+                    RetentionEntityIdentity.ForTable(tableName),
                     recordId.ToString(),
                     tenantId,
                     "handler-erasure-hold",
@@ -3378,9 +4450,8 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         await using var connection = new NpgsqlConnection(GetConnectionString());
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
-        command.CommandText =
-            """
-            SELECT "EntityType", "EntityId", COALESCE("CapturedPayload", '')
+        command.CommandText = """
+            SELECT "EntityType", "RetentionEntityId", "EntityId", COALESCE("CapturedPayload", '')
             FROM "sweep_run_row_detail"
             WHERE "SweepId" = @sweepId
             ORDER BY "Id"
@@ -3391,7 +4462,14 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         await using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
         {
-            rows.Add(new CapturedRow(reader.GetString(0), reader.GetString(1), reader.GetString(2)));
+            rows.Add(
+                new CapturedRow(
+                    reader.GetString(0),
+                    reader.GetGuid(1),
+                    reader.GetString(2),
+                    reader.GetString(3)
+                )
+            );
         }
 
         return rows;
@@ -3402,8 +4480,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         await using var connection = new NpgsqlConnection(GetConnectionString());
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
-        command.CommandText =
-            """
+        command.CommandText = """
             SELECT
                 "EntityId",
                 "Category",
@@ -3443,8 +4520,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         await using var connection = new NpgsqlConnection(GetConnectionString());
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
-        command.CommandText =
-            """
+        command.CommandText = """
             SELECT COUNT(*)
             FROM "sweep_run_row_detail"
             WHERE "SweepId" = @sweepId
@@ -3459,8 +4535,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         await using var connection = new NpgsqlConnection(GetConnectionString());
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
-        command.CommandText =
-            """
+        command.CommandText = """
             SELECT
                 status."HandlerType",
                 status."DispatchPhase",
@@ -3468,6 +4543,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                 status."Attempt",
                 status."NextAttemptAt",
                 status."ClaimedAt",
+                status."ClaimToken",
                 status."CompletedAt",
                 status."LastError"
             FROM "sweep_row_handler_status" AS status
@@ -3489,13 +4565,30 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     reader.GetInt32(3),
                     reader.GetFieldValue<DateTimeOffset>(4),
                     reader.IsDBNull(5) ? null : reader.GetFieldValue<DateTimeOffset>(5),
-                    reader.IsDBNull(6) ? null : reader.GetFieldValue<DateTimeOffset>(6),
-                    reader.IsDBNull(7) ? null : reader.GetString(7)
+                    reader.IsDBNull(6) ? null : reader.GetGuid(6),
+                    reader.IsDBNull(7) ? null : reader.GetFieldValue<DateTimeOffset>(7),
+                    reader.IsDBNull(8) ? null : reader.GetString(8)
                 )
             );
         }
 
         return rows;
+    }
+
+    private async Task<long> LoadHandlerStatusIdAsync(Guid sweepId)
+    {
+        await using var connection = new NpgsqlConnection(GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT status."Id"
+            FROM "sweep_row_handler_status" AS status
+            INNER JOIN "sweep_run_row_detail" AS detail
+                ON detail."Id" = status."SweepRunRowDetailId"
+            WHERE detail."SweepId" = @sweepId
+            """;
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        return (long)(await command.ExecuteScalarAsync())!;
     }
 
     private async Task<HandlerStatusRow> WaitForHandlerStatusAsync(
@@ -3527,8 +4620,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         await using var connection = new NpgsqlConnection(GetConnectionString());
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
-        command.CommandText =
-            """
+        command.CommandText = """
             SELECT "EntityType", "Strategy", "Affected", "HeldCount", "SkippedCount"
             FROM "sweep_run_entity_summary"
             WHERE "SweepId" = @sweepId
@@ -3565,8 +4657,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         await using var connection = new NpgsqlConnection(GetConnectionString());
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
-        command.CommandText =
-            """
+        command.CommandText = """
             UPDATE "sweep_row_handler_status" AS status
             SET "HandlerType" = @handlerType
             FROM "sweep_run_row_detail" AS detail
@@ -3583,8 +4674,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         await using var connection = new NpgsqlConnection(GetConnectionString());
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
-        command.CommandText =
-            """
+        command.CommandText = """
             UPDATE "sweep_run_row_detail"
             SET "At" = @at
             WHERE "SweepId" = @sweepId
@@ -3594,24 +4684,48 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         (await command.ExecuteNonQueryAsync()).Should().BeGreaterThan(0);
     }
 
-    private async Task SetHandlerStatusInFlightAsync(Guid sweepId, DateTimeOffset claimedAt)
+    private async Task SetHandlerStatusInFlightAsync(
+        Guid sweepId,
+        DateTimeOffset claimedAt,
+        int? attempt = null
+    )
     {
         await using var connection = new NpgsqlConnection(GetConnectionString());
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
-        command.CommandText =
-            """
+        command.CommandText = """
             UPDATE "sweep_row_handler_status" AS status
             SET "State" = @inFlight,
-                "ClaimedAt" = @claimedAt
+                "ClaimedAt" = @claimedAt,
+                "ClaimToken" = @claimToken,
+                "Attempt" = COALESCE(@attempt, "Attempt")
             FROM "sweep_run_row_detail" AS detail
             WHERE detail."Id" = status."SweepRunRowDetailId"
               AND detail."SweepId" = @sweepId
             """;
         command.Parameters.AddWithValue("inFlight", InFlightState);
         command.Parameters.AddWithValue("claimedAt", claimedAt);
+        command.Parameters.AddWithValue("claimToken", Guid.NewGuid());
+        command.Parameters.AddWithValue("attempt", (object?)attempt ?? DBNull.Value);
         command.Parameters.AddWithValue("sweepId", sweepId);
         (await command.ExecuteNonQueryAsync()).Should().BeGreaterThan(0);
+    }
+
+    private async Task SetSweepStatusAsync(Guid sweepId, int status, DateTimeOffset? settledAt)
+    {
+        await using var connection = new NpgsqlConnection(GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE "sweep_run"
+            SET "Status" = @status,
+                "SettledAt" = @settledAt
+            WHERE "SweepId" = @sweepId
+            """;
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        command.Parameters.AddWithValue("status", status);
+        command.Parameters.AddWithValue("settledAt", (object?)settledAt ?? DBNull.Value);
+        (await command.ExecuteNonQueryAsync()).Should().Be(1);
     }
 
     private async Task SetSweepCompletedAtAsync(Guid sweepId, DateTimeOffset? completedAt)
@@ -3619,15 +4733,68 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         await using var connection = new NpgsqlConnection(GetConnectionString());
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
-        command.CommandText =
-            """
+        command.CommandText = """
             UPDATE "sweep_run"
-            SET "CompletedAt" = @completedAt
+            SET "Status" = @status,
+                "SettledAt" = @completedAt
             WHERE "SweepId" = @sweepId
             """;
         command.Parameters.AddWithValue("sweepId", sweepId);
+        command.Parameters.AddWithValue("status", completedAt is null ? 0 : 1);
         command.Parameters.AddWithValue("completedAt", (object?)completedAt ?? DBNull.Value);
         await command.ExecuteNonQueryAsync();
+    }
+
+    private async Task SetSweepStartedAtAsync(Guid sweepId, DateTimeOffset startedAt)
+    {
+        await using var connection = new NpgsqlConnection(GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE "sweep_run"
+            SET "Status" = @status,
+                "StartedAt" = @startedAt,
+                "SettledAt" = NULL
+            WHERE "SweepId" = @sweepId
+            """;
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        command.Parameters.AddWithValue("status", (int)SweepRunStatus.Started);
+        command.Parameters.AddWithValue("startedAt", startedAt);
+        (await command.ExecuteNonQueryAsync()).Should().Be(1);
+    }
+
+    private async Task<Guid> ReplaceClaimOwnerAsync(Guid sweepId)
+    {
+        var claimToken = Guid.NewGuid();
+        await using var connection = new NpgsqlConnection(GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE "sweep_row_handler_status" AS status
+            SET "ClaimToken" = @claimToken,
+                "ClaimedAt" = @claimedAt,
+                "Attempt" = "Attempt" + 1
+            FROM "sweep_run_row_detail" AS detail
+            WHERE detail."Id" = status."SweepRunRowDetailId"
+              AND detail."SweepId" = @sweepId
+              AND status."State" = @inFlight
+              AND status."Id" = (
+                  SELECT candidate."Id"
+                  FROM "sweep_row_handler_status" AS candidate
+                  INNER JOIN "sweep_run_row_detail" AS candidate_detail
+                      ON candidate_detail."Id" = candidate."SweepRunRowDetailId"
+                  WHERE candidate_detail."SweepId" = @sweepId
+                    AND candidate."State" = @inFlight
+                  ORDER BY candidate."Id"
+                  LIMIT 1
+              )
+            """;
+        command.Parameters.AddWithValue("claimToken", claimToken);
+        command.Parameters.AddWithValue("claimedAt", DateTimeOffset.UtcNow);
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        command.Parameters.AddWithValue("inFlight", InFlightState);
+        (await command.ExecuteNonQueryAsync()).Should().Be(1);
+        return claimToken;
     }
 
     private static IRetentionCategoryRepository CreateHandlerErasureCategoryRepository(
@@ -3665,7 +4832,12 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         };
     }
 
-    private sealed record CapturedRow(string EntityType, string EntityId, string CapturedPayload);
+    private sealed record CapturedRow(
+        string EntityType,
+        Guid RetentionEntityId,
+        string EntityId,
+        string CapturedPayload
+    );
 
     private sealed record CapturedRowDetail(
         string EntityId,
@@ -3683,6 +4855,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         int Attempt,
         DateTimeOffset NextAttemptAt,
         DateTimeOffset? ClaimedAt,
+        Guid? ClaimToken,
         DateTimeOffset? CompletedAt,
         string? LastError
     );
@@ -3699,9 +4872,10 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
     ) : IRetentionCategoryRepository
     {
-        private static readonly IRetentionRuleResolver ExemptFallback = new StaticRetentionRuleResolver(
-            new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
-        );
+        private static readonly IRetentionRuleResolver ExemptFallback =
+            new StaticRetentionRuleResolver(
+                new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+            );
 
         public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
         {
@@ -3773,7 +4947,9 @@ file sealed class DispatchAttemptTracker
 
 file sealed class DispatchBlockGate
 {
-    private readonly TaskCompletionSource blocked = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource blocked = new(
+        TaskCreationOptions.RunContinuationsAsynchronously
+    );
     private volatile bool released;
 
     public Task WaitUntilBlockedAsync()
@@ -3797,11 +4973,21 @@ file sealed class DispatchBlockGate
     }
 }
 
-file sealed class StatusUpdateBlocker(string connectionString) : IAsyncDisposable
+file sealed class StatusUpdateBlocker(string connectionString, bool holdHandler = false)
+    : IAsyncDisposable
 {
-    private readonly TaskCompletionSource locked = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource locked = new(
+        TaskCreationOptions.RunContinuationsAsynchronously
+    );
+    private readonly TaskCompletionSource handlerMayReturn = new(
+        TaskCreationOptions.RunContinuationsAsynchronously
+    );
     private NpgsqlConnection? connection;
     private NpgsqlTransaction? transaction;
+
+    public int BackendId =>
+        connection?.ProcessID
+        ?? throw new InvalidOperationException("The status update lock has not been acquired.");
 
     public Task WaitUntilLockedAsync()
     {
@@ -3819,6 +5005,15 @@ file sealed class StatusUpdateBlocker(string connectionString) : IAsyncDisposabl
         command.CommandText = """LOCK TABLE "sweep_row_handler_status" IN ACCESS EXCLUSIVE MODE""";
         await command.ExecuteNonQueryAsync(ct);
         locked.TrySetResult();
+        if (holdHandler)
+        {
+            await handlerMayReturn.Task.WaitAsync(ct);
+        }
+    }
+
+    public void AllowHandlerToReturn()
+    {
+        handlerMayReturn.TrySetResult();
     }
 
     public async Task ReleaseAsync()
@@ -4301,9 +5496,8 @@ file sealed class RetryOnceDispatchNoteHandler(
     }
 }
 
-file sealed class AlwaysFailingDispatchNoteHandler(
-    DispatchAttemptTracker tracker
-) : IRetentionHandler<Note>
+file sealed class AlwaysFailingDispatchNoteHandler(DispatchAttemptTracker tracker)
+    : IRetentionHandler<Note>
 {
     public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
     {
@@ -4320,9 +5514,8 @@ file sealed class AlwaysFailingDispatchNoteHandler(
 }
 
 [RowHandlerPriority(10)]
-file sealed class AlwaysFailingHighPriorityDispatchNoteHandler(
-    DispatchAttemptTracker tracker
-) : IRetentionHandler<Note>
+file sealed class AlwaysFailingHighPriorityDispatchNoteHandler(DispatchAttemptTracker tracker)
+    : IRetentionHandler<Note>
 {
     public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
     {
@@ -4338,10 +5531,8 @@ file sealed class AlwaysFailingHighPriorityDispatchNoteHandler(
     }
 }
 
-file sealed class BlockingDispatchNoteHandler(
-    HandlerExecutionSink sink,
-    DispatchBlockGate gate
-) : IRetentionHandler<Note>
+file sealed class BlockingDispatchNoteHandler(HandlerExecutionSink sink, DispatchBlockGate gate)
+    : IRetentionHandler<Note>
 {
     public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
     {

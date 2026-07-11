@@ -23,7 +23,8 @@ internal static partial class RetentionTypeIdentity
 
         return PublicKeyTokenPattern()
             .Replace(
-                CulturePattern().Replace(VersionPattern().Replace(persistedName, string.Empty), string.Empty),
+                CulturePattern()
+                    .Replace(VersionPattern().Replace(persistedName, string.Empty), string.Empty),
                 string.Empty
             );
     }

@@ -24,14 +24,10 @@ public sealed class RetentionConfigurationException : Exception
             );
         }
 
-        return
-            """
-            Retention configuration is invalid:
-            """
+        return """
+                Retention configuration is invalid:
+                """
             + Environment.NewLine
-            + string.Join(
-                Environment.NewLine,
-                materializedErrors.Select(error => $"- {error}")
-            );
+            + string.Join(Environment.NewLine, materializedErrors.Select(error => $"- {error}"));
     }
 }

@@ -3,6 +3,7 @@ using Cohort.Domain;
 namespace Cohort.Sample.Entities;
 
 [Retain("tombstone-anonymise", nameof(CreatedAt))]
+[RetentionEntityId("6ebbc096-d3b8-4077-8f21-bf9b4d53c869")]
 public sealed class TombstoneRecord
 {
     public Guid Id { get; set; }

@@ -1,13 +1,15 @@
+using System.Data;
+using System.Data.Common;
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
+using Cohort.Infrastructure;
 using Cohort.Infrastructure.Sweep;
 using Cohort.Sample.Entities;
-
-using System.Data.Common;
-
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Cohort.Sample.Tests;
 
@@ -76,34 +78,31 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(9);
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(Note),
-                "short-lived",
-                tenantA,
-                Strategy.Purge,
-                1
-            )
-        );
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(SoftDeleteRecord),
-                "soft-delete",
-                tenantA,
-                Strategy.SoftDelete,
-                0
-            )
-        );
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(AnonymisedContact),
-                "anonymise",
-                tenantA,
-                Strategy.Anonymise,
-                0
-            )
-        );
+        result
+            .Counts.Should()
+            .Contain(new EntitySweepCount(typeof(Note), "short-lived", tenantA, Strategy.Purge, 1));
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(SoftDeleteRecord),
+                    "soft-delete",
+                    tenantA,
+                    Strategy.SoftDelete,
+                    0
+                )
+            );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(AnonymisedContact),
+                    "anonymise",
+                    tenantA,
+                    Strategy.Anonymise,
+                    0
+                )
+            );
 
         await using var verify = Host.CreateDbContext();
         var remaining = verify.Notes.OrderBy(note => note.Body).Select(note => note.Body).ToArray();
@@ -153,34 +152,33 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(9);
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(Note),
-                "short-lived",
-                tenantId,
-                Strategy.Exempt,
-                0
-            )
-        );
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(SoftDeleteRecord),
-                "soft-delete",
-                tenantId,
-                Strategy.SoftDelete,
-                0
-            )
-        );
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(AnonymisedContact),
-                "anonymise",
-                tenantId,
-                Strategy.Anonymise,
-                0
-            )
-        );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Exempt, 0)
+            );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(SoftDeleteRecord),
+                    "soft-delete",
+                    tenantId,
+                    Strategy.SoftDelete,
+                    0
+                )
+            );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(AnonymisedContact),
+                    "anonymise",
+                    tenantId,
+                    Strategy.Anonymise,
+                    0
+                )
+            );
 
         await using var verify = Host.CreateDbContext();
         var remainingBodies = verify.Notes.Select(note => note.Body).ToArray();
@@ -193,64 +191,115 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         var tenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 11, 12, 0, 0, TimeSpan.Zero);
 
-        await using var db = Host.CreateDbContext();
-        db.Notes.Add(
-            new Note
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "delete-after-resolve",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        TransactionAssertingResolver? resolver = null;
+        using var sweepHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
             {
-                Id = Guid.NewGuid(),
-                TenantId = tenantId,
-                CreatedAt = asOf.AddDays(-120),
-                Body = "delete-after-resolve",
+                services.RemoveAll<IRetentionCategoryRepository>();
+                services.AddScoped<IRetentionCategoryRepository>(provider =>
+                {
+                    resolver = new TransactionAssertingResolver(
+                        provider.GetRequiredService<SampleDbContext>(),
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    );
+                    return new StaticCategoryRepository(
+                        new Dictionary<string, IRetentionRuleResolver>
+                        {
+                            ["short-lived"] = resolver,
+                            ["soft-delete"] = new StaticRetentionRuleResolver(
+                                new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                            ),
+                            ["anonymise"] = new StaticRetentionRuleResolver(
+                                new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                            ),
+                        }
+                    );
+                });
             }
         );
-        await db.SaveChangesAsync();
 
-        var resolver = new TransactionAssertingResolver(
-            db,
-            new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
-        );
-        var repository = new StaticCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
-            {
-                ["short-lived"] = resolver,
-                ["soft-delete"] = new StaticRetentionRuleResolver(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
-                ),
-                ["anonymise"] = new StaticRetentionRuleResolver(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
-                ),
-            }
-        );
-        var engine = new RetentionSweepEngine(
-            db,
-            new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())),
-            repository,
-            new RetentionStartupValidator(
-                db,
-                repository,
-                new RetentionEntryBuilder(new CohortConventions()),
-                CreateSampleFactories()
-            ),
-            new NoOpRetentionAuditWriter(),
-            [
-                new PurgeSweepStrategy(),
-                new SoftDeleteSweepStrategy(),
-                new AnonymiseSweepStrategy(db, CreateSampleFactories())
-            ]
-        );
-
-        var result = await engine.SweepAsync(
+        var result = await sweepHost.RunSweepAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
             asOf
         );
 
-        resolver.SawNoTransactionDuringResolve.Should().BeTrue();
-        result.Counts.Should().Contain(
-            count =>
+        resolver.Should().NotBeNull();
+        resolver!.SawNoTransactionDuringResolve.Should().BeTrue();
+        result
+            .Counts.Should()
+            .Contain(count =>
                 count.EntityType == typeof(Note)
                 && count.Category == "short-lived"
                 && count.Affected == 1
-        );
+            );
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Body == "delete-after-resolve"))
+            .Should()
+            .BeFalse();
+        await AssertAuditOutcomeAsync(result.SweepId, tenantId, expectedAffected: 1);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task Sweep_And_DryRun_Preserve_Connection_Ownership(
+        bool dryRun,
+        bool preOpened
+    )
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var asOf = new DateTimeOffset(2026, 4, 11, 12, 0, 0, TimeSpan.Zero);
+
+        await Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            var engine = services.GetRequiredService<RetentionSweepEngine>();
+
+            if (preOpened)
+            {
+                await db.Database.OpenConnectionAsync();
+            }
+
+            if (dryRun)
+            {
+                await engine.DryRunAsync(
+                    tenant,
+                    asOf,
+                    SweepTriggerKind.Manual,
+                    SweepEntityScope.TenantedOnly
+                );
+            }
+            else
+            {
+                await engine.SweepAsync(
+                    tenant,
+                    asOf,
+                    SweepTriggerKind.Manual,
+                    SweepEntityScope.TenantedOnly
+                );
+            }
+
+            db.Database.GetDbConnection().State.Should().Be(
+                preOpened ? ConnectionState.Open : ConnectionState.Closed
+            );
+        });
     }
 
     [Fact]
@@ -307,9 +356,11 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 3)
-        );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 3)
+            );
         result.EntityFailures.Should().BeEmpty();
 
         await using var verify = Host.CreateDbContext();
@@ -370,12 +421,12 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.EntityFailures.Should().ContainSingle(failure =>
-            failure.Contains(nameof(AnonymisedContact))
-        );
-        result.Counts.Should().Contain(
-            count => count.EntityType == typeof(Note) && count.Affected == 1
-        );
+        result
+            .EntityFailures.Should()
+            .ContainSingle(failure => failure.Contains(nameof(AnonymisedContact)));
+        result
+            .Counts.Should()
+            .Contain(count => count.EntityType == typeof(Note) && count.Affected == 1);
         result.Counts.Should().NotContain(count => count.EntityType == typeof(AnonymisedContact));
 
         await using (var verify = Host.CreateDbContext())
@@ -389,20 +440,22 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         }
 
         var run = await LoadSweepRunFailureAsync(result.SweepId);
-        run.CompletedAt.Should().NotBeNull();
-        run.FailedAt.Should().NotBeNull();
+        run.Status.Should().Be(SweepRunStatus.PartiallyFailed);
+        run.SettledAt.Should().NotBeNull();
         run.Error.Should().Contain(nameof(AnonymisedContact));
     }
 
-    private async Task<(DateTimeOffset? CompletedAt, DateTimeOffset? FailedAt, string? Error)>
-        LoadSweepRunFailureAsync(Guid sweepId)
+    private async Task<(
+        SweepRunStatus Status,
+        DateTimeOffset? SettledAt,
+        string? Error
+    )> LoadSweepRunFailureAsync(Guid sweepId)
     {
         await using var connection = new Npgsql.NpgsqlConnection(GetConnectionString());
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
-        command.CommandText =
-            """
-            SELECT "CompletedAt", "FailedAt", "Error"
+        command.CommandText = """
+            SELECT "Status", "SettledAt", "Error"
             FROM "sweep_run"
             WHERE "SweepId" = @sweepId
             """;
@@ -411,7 +464,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         await using var reader = await command.ExecuteReaderAsync();
         (await reader.ReadAsync()).Should().BeTrue();
         return (
-            reader.IsDBNull(0) ? null : reader.GetFieldValue<DateTimeOffset>(0),
+            (SweepRunStatus)reader.GetInt32(0),
             reader.IsDBNull(1) ? null : reader.GetFieldValue<DateTimeOffset>(1),
             reader.IsDBNull(2) ? null : reader.GetString(2)
         );
@@ -434,56 +487,43 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         var tenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 11, 12, 0, 0, TimeSpan.Zero);
 
-        await using var db = Host.CreateDbContext();
-        db.Notes.Add(
-            new Note
-            {
-                Id = Guid.NewGuid(),
-                TenantId = tenantId,
-                CreatedAt = asOf.AddDays(-120),
-                Body = "dry-run-guarded",
-            }
-        );
-        await db.SaveChangesAsync();
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "dry-run-guarded",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
 
-        var repository = new StaticCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
-            {
-                ["short-lived"] = new StaticRetentionRuleResolver(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
-                ),
-            }
-        );
-        var engine = new RetentionSweepEngine(
-            db,
-            new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())),
-            repository,
-            new RetentionStartupValidator(
-                db,
-                repository,
-                new RetentionEntryBuilder(new CohortConventions()),
-                CreateSampleFactories()
+        using var sweepHost = new CohortTestHost(
+            GetConnectionString(),
+            new StaticCategoryRepository(
+                new Dictionary<string, IRetentionRuleResolver>
+                {
+                    ["short-lived"] = new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    ),
+                }
             ),
-            new NoOpRetentionAuditWriter(),
-            [
-                new PurgeSweepStrategy(),
-                new SoftDeleteSweepStrategy(),
-                new AnonymiseSweepStrategy(db, CreateSampleFactories())
-            ],
-            new StaticEngineOptionsMonitor(new CohortOptions { DryRun = true })
+            new Dictionary<string, string?> { [$"{CohortOptions.SectionName}:DryRun"] = "true" }
         );
 
         var act = async () =>
-            await engine.SweepAsync(
+            await sweepHost.RunSweepAsync(
                 new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
                 asOf
             );
 
-        await act
-            .Should()
-            .ThrowAsync<InvalidOperationException>()
-            .WithMessage("*DryRun*refuses*");
-        (await db.Notes.AnyAsync(note => note.Body == "dry-run-guarded")).Should().BeTrue();
+        await act.Should().ThrowAsync<InvalidOperationException>().WithMessage("*DryRun*refuses*");
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Body == "dry-run-guarded")).Should().BeTrue();
+        await AssertFailedAuditRunAsync(tenantId);
     }
 
     [Fact]
@@ -521,35 +561,38 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         );
         var engine = new RetentionSweepEngine(
             db,
-            new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())),
+            new RetentionRegistry(db, new RetentionEntryBuilder(new RetentionModelConventions())),
             repository,
             new RetentionStartupValidator(
                 db,
                 repository,
-                new RetentionEntryBuilder(new CohortConventions()),
+                new RetentionEntryBuilder(new RetentionModelConventions()),
                 CreateSampleFactories()
             ),
-            new NoOpRetentionAuditWriter(),
+            new Cohort.Infrastructure.Audit.EfRetentionAuditWriter(db),
             [
                 strategy,
                 new SoftDeleteSweepStrategy(),
-                new AnonymiseSweepStrategy(db, CreateSampleFactories())
+                new AnonymiseSweepStrategy(db, CreateSampleFactories()),
             ]
         );
 
         var result = await engine.SweepAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            asOf
+            asOf,
+            SweepTriggerKind.Manual,
+            SweepEntityScope.TenantedOnly
         );
 
         strategy.ReceivedTransaction.Should().NotBeNull();
         strategy.ReceivedTransaction.Should().BeSameAs(strategy.CurrentEfTransactionAtExecution);
-        result.Counts.Should().Contain(
-            count =>
+        result
+            .Counts.Should()
+            .Contain(count =>
                 count.EntityType == typeof(Note)
                 && count.Category == "short-lived"
                 && count.Affected == 0
-        );
+            );
     }
 
     [Fact]
@@ -586,25 +629,27 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         );
         var engine = new RetentionSweepEngine(
             db,
-            new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())),
+            new RetentionRegistry(db, new RetentionEntryBuilder(new RetentionModelConventions())),
             repository,
             new RetentionStartupValidator(
                 db,
                 repository,
-                new RetentionEntryBuilder(new CohortConventions()),
+                new RetentionEntryBuilder(new RetentionModelConventions()),
                 CreateSampleFactories()
             ),
-            new NoOpRetentionAuditWriter(),
+            new Cohort.Infrastructure.Audit.EfRetentionAuditWriter(db),
             [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy()]
         );
 
-        var act = () => engine.SweepAsync(
-            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            asOf
-        );
+        var act = () =>
+            engine.SweepAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                asOf,
+                SweepTriggerKind.Manual,
+                SweepEntityScope.TenantedOnly
+            );
 
-        await act
-            .Should()
+        await act.Should()
             .ThrowAsync<InvalidOperationException>()
             .WithMessage("*not registered for sweep execution*");
 
@@ -617,9 +662,10 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
     ) : IRetentionCategoryRepository
     {
-        private static readonly IRetentionRuleResolver ExemptFallback = new StaticRetentionRuleResolver(
-            new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
-        );
+        private static readonly IRetentionRuleResolver ExemptFallback =
+            new StaticRetentionRuleResolver(
+                new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+            );
 
         public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
         {
@@ -629,15 +675,45 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         }
     }
 
+    private async Task AssertAuditOutcomeAsync(Guid sweepId, Guid tenantId, long expectedAffected)
+    {
+        await using var connection = new Npgsql.NpgsqlConnection(GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            "SELECT \"SettledAt\", \"TotalAffected\" FROM \"sweep_run\" WHERE \"SweepId\" = @sweepId AND \"TenantId\" = @tenantId";
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        command.Parameters.AddWithValue("tenantId", tenantId);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        (await reader.ReadAsync()).Should().BeTrue();
+        reader.IsDBNull(0).Should().BeFalse();
+        reader.GetInt64(1).Should().Be(expectedAffected);
+    }
+
+    private async Task AssertFailedAuditRunAsync(Guid tenantId)
+    {
+        await using var connection = new Npgsql.NpgsqlConnection(GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            "SELECT \"Status\", \"SettledAt\" FROM \"sweep_run\" WHERE \"TenantId\" = @tenantId";
+        command.Parameters.AddWithValue("tenantId", tenantId);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        (await reader.ReadAsync()).Should().BeTrue();
+        ((SweepRunStatus)reader.GetInt32(0)).Should().Be(SweepRunStatus.Failed);
+        reader.IsDBNull(1).Should().BeFalse();
+        (await reader.ReadAsync()).Should().BeFalse();
+    }
+
     private static IAnonymiseValueFactory[] CreateSampleFactories()
     {
         return [new GuidTombstoneFactory(), new OriginalValueTombstoneFactory()];
     }
 
-    private sealed class TransactionAssertingResolver(
-        SampleDbContext db,
-        RetentionRule rule
-    ) : IRetentionRuleResolver
+    private sealed class TransactionAssertingResolver(SampleDbContext db, RetentionRule rule)
+        : IRetentionRuleResolver
     {
         public bool SawNoTransactionDuringResolve { get; private set; }
 
@@ -656,9 +732,8 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         }
     }
 
-    private sealed class TransactionCapturingSweepStrategy(
-        SampleDbContext db
-    ) : IRetentionSweepStrategy
+    private sealed class TransactionCapturingSweepStrategy(SampleDbContext db)
+        : IRetentionSweepStrategy
     {
         public Strategy HandlesStrategy => Strategy.Purge;
 
@@ -713,8 +788,6 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             return Task.FromResult(0L);
         }
 
-
-
         public Task<long> CountHeldForEraseAsync(
             RetentionEntry entry,
             RetentionRule rule,
@@ -761,21 +834,5 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
     {
         using var db = Host.CreateDbContext();
         return db.Database.GetConnectionString()!;
-    }
-
-    private sealed class StaticEngineOptionsMonitor(CohortOptions currentValue)
-        : Microsoft.Extensions.Options.IOptionsMonitor<CohortOptions>
-    {
-        public CohortOptions CurrentValue => currentValue;
-
-        public CohortOptions Get(string? name)
-        {
-            return currentValue;
-        }
-
-        public IDisposable? OnChange(Action<CohortOptions, string?> listener)
-        {
-            return null;
-        }
     }
 }

@@ -33,6 +33,9 @@ namespace Cohort.Sample.Migrations
                     b.Property<int>("Attempt")
                         .HasColumnType("integer");
 
+                    b.Property<Guid?>("ClaimToken")
+                        .HasColumnType("uuid");
+
                     b.Property<DateTimeOffset?>("ClaimedAt")
                         .HasColumnType("timestamp with time zone");
 
@@ -68,7 +71,12 @@ namespace Cohort.Sample.Migrations
 
                     b.HasIndex("State", "NextAttemptAt", "Id");
 
-                    b.ToTable("sweep_row_handler_status", (string)null);
+                    b.ToTable("sweep_row_handler_status", null, t =>
+                        {
+                            t.HasCheckConstraint("CK_sweep_row_handler_status_Claim", "(\"State\" = 1 AND \"ClaimedAt\" IS NOT NULL AND \"ClaimToken\" IS NOT NULL) OR (\"State\" <> 1 AND \"ClaimedAt\" IS NULL AND \"ClaimToken\" IS NULL)");
+
+                            t.HasCheckConstraint("CK_sweep_row_handler_status_Completion", "(\"State\" IN (2, 3) AND \"CompletedAt\" IS NOT NULL) OR (\"State\" IN (0, 1) AND \"CompletedAt\" IS NULL)");
+                        });
                 });
 
             modelBuilder.Entity("Cohort.Sample.Entities.AnonymisedContact", b =>
@@ -180,6 +188,30 @@ namespace Cohort.Sample.Migrations
                     b.ToTable("exempt_documents", (string)null);
                 });
 
+            modelBuilder.Entity("Cohort.Sample.Entities.ExternalNumberedLog", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("ExternalId")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("Payload")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ExternalId")
+                        .IsUnique();
+
+                    b.ToTable("external_numbered_logs", (string)null);
+                });
+
             modelBuilder.Entity("Cohort.Sample.Entities.HeldRecord", b =>
                 {
                     b.Property<Guid>("HoldId")
@@ -202,18 +234,17 @@ namespace Cohort.Sample.Migrations
                     b.Property<DateTimeOffset?>("RemovedAt")
                         .HasColumnType("timestamp with time zone");
 
-                    b.Property<string>("TableName")
-                        .IsRequired()
-                        .HasColumnType("text");
+                    b.Property<Guid>("RetentionEntityId")
+                        .HasColumnType("uuid");
 
-                    b.Property<Guid>("TenantId")
+                    b.Property<Guid?>("TenantId")
                         .HasColumnType("uuid");
 
                     b.HasKey("HoldId");
 
-                    b.HasIndex("TableName", "RecordId");
+                    b.HasIndex("RetentionEntityId", "RecordId");
 
-                    b.HasIndex("TableName", "TenantId", "RecordId");
+                    b.HasIndex("RetentionEntityId", "TenantId", "RecordId");
 
                     b.ToTable("retention_holds", (string)null);
                 });
@@ -234,7 +265,7 @@ namespace Cohort.Sample.Migrations
                     b.Property<Guid?>("SubjectId")
                         .HasColumnType("uuid");
 
-                    b.Property<Guid?>("TenantId")
+                    b.Property<Guid>("TenantId")
                         .HasColumnType("uuid");
 
                     b.HasKey("Id");
@@ -255,7 +286,7 @@ namespace Cohort.Sample.Migrations
                         .IsRequired()
                         .HasColumnType("text");
 
-                    b.Property<Guid?>("TenantId")
+                    b.Property<Guid>("TenantId")
                         .HasColumnType("uuid");
 
                     b.HasKey("Id");
@@ -326,6 +357,9 @@ namespace Cohort.Sample.Migrations
                     b.Property<string>("Payload")
                         .IsRequired()
                         .HasColumnType("text");
+
+                    b.Property<Guid?>("SubjectId")
+                        .HasColumnType("uuid");
 
                     b.HasKey("Id");
 
@@ -398,9 +432,6 @@ namespace Cohort.Sample.Migrations
                     b.Property<Guid>("SweepId")
                         .HasColumnType("uuid");
 
-                    b.Property<DateTimeOffset?>("CompletedAt")
-                        .HasColumnType("timestamp with time zone");
-
                     b.Property<bool>("DryRun")
                         .HasColumnType("boolean");
 
@@ -410,11 +441,14 @@ namespace Cohort.Sample.Migrations
                     b.Property<string>("Error")
                         .HasColumnType("text");
 
-                    b.Property<DateTimeOffset?>("FailedAt")
+                    b.Property<DateTimeOffset?>("SettledAt")
                         .HasColumnType("timestamp with time zone");
 
                     b.Property<DateTimeOffset>("StartedAt")
                         .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("Status")
+                        .HasColumnType("integer");
 
                     b.Property<Guid>("TenantId")
                         .HasColumnType("uuid");
@@ -427,7 +461,18 @@ namespace Cohort.Sample.Migrations
 
                     b.HasKey("SweepId");
 
-                    b.ToTable("sweep_run", (string)null);
+                    b.ToTable("sweep_run", null, t =>
+                        {
+                            t.HasCheckConstraint("CK_sweep_run_Duration_Nonnegative", "\"Duration\" IS NULL OR \"Duration\" >= INTERVAL '0'");
+
+                            t.HasCheckConstraint("CK_sweep_run_Started_Unsettled", "\"Status\" <> 0 OR \"SettledAt\" IS NULL");
+
+                            t.HasCheckConstraint("CK_sweep_run_Status_Range", "\"Status\" BETWEEN 0 AND 4");
+
+                            t.HasCheckConstraint("CK_sweep_run_Terminal_Settled", "\"Status\" = 0 OR \"SettledAt\" IS NOT NULL");
+
+                            t.HasCheckConstraint("CK_sweep_run_TotalAffected_Nonnegative", "\"TotalAffected\" IS NULL OR \"TotalAffected\" >= 0");
+                        });
                 });
 
             modelBuilder.Entity("Cohort.SweepRunEntitySummary", b =>
@@ -435,8 +480,8 @@ namespace Cohort.Sample.Migrations
                     b.Property<Guid>("SweepId")
                         .HasColumnType("uuid");
 
-                    b.Property<string>("EntityType")
-                        .HasColumnType("text");
+                    b.Property<Guid>("RetentionEntityId")
+                        .HasColumnType("uuid");
 
                     b.Property<string>("Category")
                         .HasColumnType("text");
@@ -452,6 +497,10 @@ namespace Cohort.Sample.Migrations
 
                     b.Property<DateTimeOffset>("At")
                         .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("EntityType")
+                        .IsRequired()
+                        .HasColumnType("text");
 
                     b.Property<long>("HeldCount")
                         .HasColumnType("bigint");
@@ -471,7 +520,7 @@ namespace Cohort.Sample.Migrations
                     b.Property<long>("SkippedCount")
                         .HasColumnType("bigint");
 
-                    b.HasKey("SweepId", "EntityType", "Category", "TenantId", "Strategy");
+                    b.HasKey("SweepId", "RetentionEntityId", "Category", "TenantId", "Strategy");
 
                     b.HasIndex("SweepId");
 
@@ -504,6 +553,9 @@ namespace Cohort.Sample.Migrations
                         .IsRequired()
                         .HasColumnType("text");
 
+                    b.Property<Guid>("RetentionEntityId")
+                        .HasColumnType("uuid");
+
                     b.Property<int>("Strategy")
                         .HasColumnType("integer");
 
@@ -517,8 +569,9 @@ namespace Cohort.Sample.Migrations
 
                     b.HasIndex("SweepId");
 
-                    b.HasIndex("SweepId", "EntityType", "EntityId", "Category", "Strategy", "TenantId")
-                        .IsUnique();
+                    b.HasIndex("SweepId", "RetentionEntityId", "EntityId", "Category", "Strategy", "TenantId")
+                        .IsUnique()
+                        .HasDatabaseName("IX_sweep_run_row_detail_StableIdentity");
 
                     b.ToTable("sweep_run_row_detail", (string)null);
                 });
@@ -529,6 +582,24 @@ namespace Cohort.Sample.Migrations
                         .WithMany()
                         .HasForeignKey("SweepRunRowDetailId")
                         .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("Cohort.SweepRunEntitySummary", b =>
+                {
+                    b.HasOne("Cohort.SweepRun", null)
+                        .WithMany()
+                        .HasForeignKey("SweepId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("Cohort.SweepRunRowDetail", b =>
+                {
+                    b.HasOne("Cohort.SweepRun", null)
+                        .WithMany()
+                        .HasForeignKey("SweepId")
+                        .OnDelete(DeleteBehavior.Restrict)
                         .IsRequired();
                 });
 #pragma warning restore 612, 618

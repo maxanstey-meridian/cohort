@@ -10,8 +10,6 @@ public sealed class CohortOptions
 
     public bool KillSwitch { get; init; }
 
-    public bool ApplyMigrations { get; init; }
-
     /// <summary>
     /// Maximum rows a strategy selects, locks, and mutates per transaction. Each batch
     /// commits independently, so a large backlog is retired incrementally instead of in

@@ -1,6 +1,5 @@
-using Cohort.Domain;
+using Cohort.Infrastructure;
 using Cohort.Sample.Entities;
-
 using Microsoft.EntityFrameworkCore;
 
 namespace Cohort.Sample.Tests;
@@ -27,7 +26,7 @@ namespace Cohort.Sample.Tests;
 public sealed class RegistryEndToEndTests(PostgresFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
-    public async Task Startup_Path_Validates_And_Returns_Only_Retained_Entities_Against_Real_Postgres()
+    public async Task Validation_Returns_Only_Retained_Entities_Against_Real_Postgres()
     {
         // Arrange — seed retained and exempt rows through the real DbContext
         await using (var db = Host.CreateDbContext())
@@ -63,7 +62,7 @@ public sealed class RegistryEndToEndTests(PostgresFixture fixture) : Integration
 
         // Act — run the real startup path against the same real DbContext
         IReadOnlyDictionary<Type, RetentionEntry> entries;
-        entries = await Host.RunStartupAsync();
+        entries = await Host.ValidateAndScanAsync();
 
         // Assert — the retained sample entity is present and the exempt sample
         // fixture is ignored by the registry surface.

@@ -1,17 +1,18 @@
 using System.Data.Common;
-
-using Cohort.Application;
 using Cohort.Domain;
-
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Infrastructure.Sweep;
 
-public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
+internal sealed class PurgeSweepStrategy : IRetentionSweepStrategy
 {
     private readonly RelationalSweepStrategyCore core;
 
-    public PurgeSweepStrategy(DbContext? db = null, IServiceProvider? services = null)
+    public PurgeSweepStrategy(
+        [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext? db = null,
+        IServiceProvider? services = null
+    )
     {
         core = new RelationalSweepStrategyCore(
             Strategy.Purge,
@@ -111,6 +112,16 @@ public sealed class PurgeSweepStrategy : IRetentionSweepStrategy
         SweepMutationContext? execution = null
     )
     {
-        return core.EraseAsync(entry, rule, predicate, tenant, now, conn, transaction, ct, execution);
+        return core.EraseAsync(
+            entry,
+            rule,
+            predicate,
+            tenant,
+            now,
+            conn,
+            transaction,
+            ct,
+            execution
+        );
     }
 }

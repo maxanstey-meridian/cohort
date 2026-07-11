@@ -1,8 +1,7 @@
 using Cohort.Application;
 using Cohort.Domain;
-using Cohort.Hosting;
+using Cohort.Infrastructure;
 using Cohort.Sample.Entities;
-
 using Microsoft.EntityFrameworkCore;
 
 namespace Cohort.Sample.Tests;
@@ -10,12 +9,12 @@ namespace Cohort.Sample.Tests;
 // ─── EXEMPLAR #2 — narrow integration test ──────────────────────────────────
 //
 // Pattern: narrow integration (the middle ground). Use ONLY when the code under
-// test crosses one boundary that EF Core's InMemory provider fully serves
-// (reflection over `Model.GetEntityTypes()` and friends, no SQL).
+// test crosses one boundary that Npgsql model metadata fully serves
+// (reflection over `Model.GetEntityTypes()` and friends, no SQL or connection).
 //
 // Appropriate when ALL of:
 //   (a) the thing under test has no SQL path
-//   (b) InMemory's metadata story is enough
+//   (b) Npgsql's metadata model is enough
 //
 // If there is ANY SQL involved → skip this pattern, write EXEMPLAR #3.
 // If in doubt → don't, write EXEMPLAR #3.
@@ -31,11 +30,14 @@ public sealed class RegistryScanTests
     public void Scan_Reads_Retain_Attribute_From_Sample_DbContext_Model()
     {
         var options = new DbContextOptionsBuilder<SampleDbContext>()
-            .UseInMemoryDatabase($"registry-scan-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"registry-scan-{Guid.NewGuid()}")
             .Options;
         using var db = new SampleDbContext(options);
 
-        var entries = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())).Scan();
+        var entries = new RetentionRegistry(
+            db,
+            new RetentionEntryBuilder(new RetentionModelConventions())
+        ).Scan();
 
         // Positive — the one annotated entity is found, with the right shape
         entries
@@ -72,17 +74,21 @@ public sealed class RegistryScanTests
         tombstoneEntry.AnchorMember.Should().Be(nameof(TombstoneRecord.CreatedAt));
         tombstoneEntry.EntityType.Should().Be(typeof(TombstoneRecord));
         tombstoneEntry.AnonymiseFields.Should().HaveCount(3);
-        var tombstoneFactoryFields = tombstoneEntry.AnonymiseFields
-            .OfType<AnonymiseFactoryField>()
+        var tombstoneFactoryFields = tombstoneEntry
+            .AnonymiseFields.OfType<AnonymiseFactoryField>()
             .ToArray();
-        tombstoneFactoryFields.Should().ContainSingle(field =>
-            field.MemberName == nameof(TombstoneRecord.ExternalId)
-            && field.FactoryType == typeof(GuidTombstoneFactory)
-        );
-        tombstoneFactoryFields.Should().ContainSingle(field =>
-            field.MemberName == nameof(TombstoneRecord.DisplayName)
-            && field.FactoryType == typeof(OriginalValueTombstoneFactory)
-        );
+        tombstoneFactoryFields
+            .Should()
+            .ContainSingle(field =>
+                field.MemberName == nameof(TombstoneRecord.ExternalId)
+                && field.FactoryType == typeof(GuidTombstoneFactory)
+            );
+        tombstoneFactoryFields
+            .Should()
+            .ContainSingle(field =>
+                field.MemberName == nameof(TombstoneRecord.DisplayName)
+                && field.FactoryType == typeof(OriginalValueTombstoneFactory)
+            );
         entries
             .Should()
             .Contain(kvp =>
@@ -93,72 +99,107 @@ public sealed class RegistryScanTests
                 && kvp.Value.EntityType == typeof(BlobBackedFile)
             );
 
-        // Negative — nothing else sneaks in
+        // Negative — nothing else sneaks in. The complete key set makes adding or removing a
+        // retained sample entity an intentional registry-contract change.
         entries.Values.Should().NotContain(e => e.Category == "long-lived");
-        // SampleDbContext has 9 retained entities: the original sample categories plus
-        // TenantlessLog/TenantlessSoftDelete/PerRowAuditedLog, the factory-backed tombstone entity,
-        // the blob-backed handler fixture, and the nullable-anchor reporting fixture.
-        entries.Should().HaveCount(9);
+        entries
+            .Keys.Should()
+            .BeEquivalentTo(
+                [
+                    typeof(Note),
+                    typeof(BlobBackedFile),
+                    typeof(SoftDeleteRecord),
+                    typeof(AnonymisedContact),
+                    typeof(TenantlessLog),
+                    typeof(ExternalNumberedLog),
+                    typeof(TenantlessSoftDelete),
+                    typeof(PerRowAuditedLog),
+                    typeof(TombstoneRecord),
+                    typeof(NullableAnchorEvent),
+                ]
+            );
     }
 
     [Fact]
     public void Scan_Derives_Anchor_And_Anonymise_Columns_From_Ef_Model_Metadata()
     {
         var options = new DbContextOptionsBuilder<RegistryMetadataDbContext>()
-            .UseInMemoryDatabase($"registry-metadata-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"registry-metadata-{Guid.NewGuid()}")
             .Options;
         using var db = new RegistryMetadataDbContext(options);
 
-        var entry = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())).Scan()[typeof(RetentionReadyRecord)];
+        var entry = new RetentionRegistry(
+            db,
+            new RetentionEntryBuilder(new RetentionModelConventions())
+        ).Scan()[typeof(RetentionReadyRecord)];
 
         entry.TableName.Should().Be("retention_ready_records");
         entry.AnchorMember.Should().Be(nameof(RetentionReadyRecord.RetainedAt));
         entry.AnchorColumn.Should().Be("retained_at_utc");
-        entry.RecordId.Should().Be(
-            new RecordIdConvention(nameof(RetentionReadyRecord.Id), "record_id", typeof(Guid))
-        );
-        entry.Tenant.Should().Be(
-            new TenantConvention(nameof(RetentionReadyRecord.TenantId), "tenant_uuid")
-        );
+        entry
+            .RecordId.Should()
+            .Be(
+                new RecordIdConvention(
+                    nameof(RetentionReadyRecord.Id),
+                    "record_id",
+                    typeof(Guid),
+                    "uuid"
+                )
+            );
+        entry
+            .Tenant.Should()
+            .Be(new TenantConvention(nameof(RetentionReadyRecord.TenantId), "tenant_uuid"));
         entry.AnonymiseFields.Should().ContainSingle();
-        entry.AnonymiseFields[0].Should().Be(
-            new AnonymiseLiteralField(
-                nameof(RetentionReadyRecord.EmailAddress),
-                "email_address",
-                AnonymiseMethod.FixedLiteral,
-                "[redacted]"
-            )
-        );
+        entry
+            .AnonymiseFields[0]
+            .Should()
+            .Be(
+                new AnonymiseLiteralField(
+                    nameof(RetentionReadyRecord.EmailAddress),
+                    "email_address",
+                    AnonymiseMethod.FixedLiteral,
+                    "[redacted]"
+                )
+            );
     }
 
     [Fact]
     public void Scan_Discovers_Factory_Backed_Anonymise_Metadata_And_Column_Mapping()
     {
         var options = new DbContextOptionsBuilder<FactoryBackedRegistryMetadataDbContext>()
-            .UseInMemoryDatabase($"registry-factory-anonymise-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"registry-factory-anonymise-{Guid.NewGuid()}")
             .Options;
         using var db = new FactoryBackedRegistryMetadataDbContext(options);
 
-        var entry = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())).Scan()[typeof(FactoryBackedRetentionReadyRecord)];
+        var entry = new RetentionRegistry(
+            db,
+            new RetentionEntryBuilder(new RetentionModelConventions())
+        ).Scan()[typeof(FactoryBackedRetentionReadyRecord)];
 
         entry.AnonymiseFields.Should().ContainSingle();
-        entry.AnonymiseFields[0].Should().Be(
-            new AnonymiseFactoryField(
-                nameof(FactoryBackedRetentionReadyRecord.ExternalId),
-                "external_identifier",
-                typeof(TestAnonymiseValueFactory)
-            )
-        );
+        entry
+            .AnonymiseFields[0]
+            .Should()
+            .Be(
+                new AnonymiseFactoryField(
+                    nameof(FactoryBackedRetentionReadyRecord.ExternalId),
+                    "external_identifier",
+                    typeof(TestAnonymiseValueFactory)
+                )
+            );
     }
 
     [Fact]
     public void Scan_Rejects_Properties_With_Both_Literal_And_Factory_Anonymise_Metadata()
     {
         var options = new DbContextOptionsBuilder<ConflictingAnonymiseMetadataDbContext>()
-            .UseInMemoryDatabase($"registry-conflicting-anonymise-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"registry-conflicting-anonymise-{Guid.NewGuid()}")
             .Options;
         using var db = new ConflictingAnonymiseMetadataDbContext(options);
-        var registry = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions()));
+        var registry = new RetentionRegistry(
+            db,
+            new RetentionEntryBuilder(new RetentionModelConventions())
+        );
 
         var act = () => registry.Scan();
 
@@ -173,11 +214,14 @@ public sealed class RegistryScanTests
     public void Scan_Captures_Soft_Delete_Convention_Metadata()
     {
         var options = new DbContextOptionsBuilder<RegistryMetadataDbContext>()
-            .UseInMemoryDatabase($"registry-soft-delete-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"registry-soft-delete-{Guid.NewGuid()}")
             .Options;
         using var db = new RegistryMetadataDbContext(options);
 
-        var entry = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())).Scan()[typeof(RetentionReadyRecord)];
+        var entry = new RetentionRegistry(
+            db,
+            new RetentionEntryBuilder(new RetentionModelConventions())
+        ).Scan()[typeof(RetentionReadyRecord)];
 
         entry.SoftDelete.Should().NotBeNull();
         entry.SoftDelete!.IsDeletedMember.Should().Be(nameof(RetentionReadyRecord.IsDeleted));
@@ -190,11 +234,12 @@ public sealed class RegistryScanTests
     public void Scan_Rejects_Unmapped_Deleted_At_Soft_Delete_Members()
     {
         var options = new DbContextOptionsBuilder<UnmappedDeletedAtDbContext>()
-            .UseInMemoryDatabase($"registry-unmapped-deleted-at-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"registry-unmapped-deleted-at-{Guid.NewGuid()}")
             .Options;
         using var db = new UnmappedDeletedAtDbContext(options);
 
-        var act = () => new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())).Scan();
+        var act = () =>
+            new RetentionRegistry(db, new RetentionEntryBuilder(new RetentionModelConventions())).Scan();
 
         act.Should()
             .Throw<InvalidOperationException>()
@@ -207,10 +252,13 @@ public sealed class RegistryScanTests
     public void Scan_Caches_The_Immutable_Lookup_Per_Registry_Instance()
     {
         var options = new DbContextOptionsBuilder<RegistryMetadataDbContext>()
-            .UseInMemoryDatabase($"registry-cache-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"registry-cache-{Guid.NewGuid()}")
             .Options;
         using var db = new RegistryMetadataDbContext(options);
-        var registry = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions()));
+        var registry = new RetentionRegistry(
+            db,
+            new RetentionEntryBuilder(new RetentionModelConventions())
+        );
 
         var firstScan = registry.Scan();
         var secondScan = registry.Scan();
@@ -228,11 +276,14 @@ public sealed class RegistryScanTests
     public void Scan_Handles_Entity_With_Shadowed_Generic_Id_Property_Without_Crashing()
     {
         var options = new DbContextOptionsBuilder<ShadowedIdDbContext>()
-            .UseInMemoryDatabase($"shadowed-id-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"shadowed-id-{Guid.NewGuid()}")
             .Options;
         using var db = new ShadowedIdDbContext(options);
 
-        var registry = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions()));
+        var registry = new RetentionRegistry(
+            db,
+            new RetentionEntryBuilder(new RetentionModelConventions())
+        );
 
         var act = () => registry.Scan();
 
@@ -250,9 +301,14 @@ public sealed class RegistryScanTests
     }
 
     [Retain("long-lived", nameof(ShadowedIdRecord.RetainedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-00000000000c")]
     private sealed class ShadowedIdRecord : IdentityLikeBase<Guid>
     {
-        public new Guid Id { get => base.Id; set => base.Id = value; }
+        public new Guid Id
+        {
+            get => base.Id;
+            set => base.Id = value;
+        }
         public DateTimeOffset RetainedAt { get; init; }
     }
 
@@ -271,6 +327,7 @@ public sealed class RegistryScanTests
     }
 
     [Retain("long-lived", nameof(RetentionReadyRecord.RetainedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-00000000000d")]
     private sealed class RetentionReadyRecord
     {
         public Guid Id { get; init; }
@@ -285,6 +342,7 @@ public sealed class RegistryScanTests
     }
 
     [Retain("long-lived", nameof(FactoryBackedRetentionReadyRecord.RetainedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-00000000000e")]
     private sealed class FactoryBackedRetentionReadyRecord
     {
         public Guid Id { get; init; }
@@ -295,6 +353,7 @@ public sealed class RegistryScanTests
     }
 
     [Retain("long-lived", nameof(ConflictingAnonymiseMetadataRecord.RetainedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-00000000000f")]
     private sealed class ConflictingAnonymiseMetadataRecord
     {
         public Guid Id { get; init; }
@@ -306,6 +365,7 @@ public sealed class RegistryScanTests
     }
 
     [Retain("long-lived", nameof(SoftDeleteEntityWithUnmappedDeletedAt.RetainedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000010")]
     private sealed class SoftDeleteEntityWithUnmappedDeletedAt
     {
         public Guid Id { get; init; }
@@ -314,8 +374,9 @@ public sealed class RegistryScanTests
         public DateTimeOffset? DeletedAt { get; init; }
     }
 
-    private sealed class RegistryMetadataDbContext(DbContextOptions<RegistryMetadataDbContext> options)
-        : DbContext(options)
+    private sealed class RegistryMetadataDbContext(
+        DbContextOptions<RegistryMetadataDbContext> options
+    ) : DbContext(options)
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
@@ -365,8 +426,9 @@ public sealed class RegistryScanTests
         }
     }
 
-    private sealed class UnmappedDeletedAtDbContext(DbContextOptions<UnmappedDeletedAtDbContext> options)
-        : DbContext(options)
+    private sealed class UnmappedDeletedAtDbContext(
+        DbContextOptions<UnmappedDeletedAtDbContext> options
+    ) : DbContext(options)
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {

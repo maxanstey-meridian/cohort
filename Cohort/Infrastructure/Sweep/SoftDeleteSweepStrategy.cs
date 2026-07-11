@@ -1,18 +1,19 @@
 using System.Data.Common;
-using System.Reflection;
-
 using Cohort.Application;
 using Cohort.Domain;
-
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Infrastructure.Sweep;
 
-public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
+internal sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
 {
     private readonly RelationalSweepStrategyCore core;
 
-    public SoftDeleteSweepStrategy(DbContext? db = null, IServiceProvider? services = null)
+    public SoftDeleteSweepStrategy(
+        [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext? db = null,
+        IServiceProvider? services = null
+    )
     {
         core = new RelationalSweepStrategyCore(
             Strategy.SoftDelete,
@@ -28,10 +29,11 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
                     ? ""
                     : $", {RelationalSweepStrategyCore.QuoteIdentifier(softDelete.DeletedAtColumn)} = @deletedAt";
 
-                return
-                    $"""
+                return $"""
                     UPDATE {RelationalSweepStrategyCore.QuoteIdentifier(entry.TableName)} AS target
-                    SET {RelationalSweepStrategyCore.QuoteIdentifier(softDelete.IsDeletedColumn)} = TRUE{deletedAtAssignment}
+                    SET {RelationalSweepStrategyCore.QuoteIdentifier(
+                        softDelete.IsDeletedColumn
+                    )} = TRUE{deletedAtAssignment}
                     """;
             },
             addMutationParameters: static (command, entry, now) =>
@@ -137,7 +139,17 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
         SweepMutationContext? execution = null
     )
     {
-        return core.EraseAsync(entry, rule, predicate, tenant, now, conn, transaction, ct, execution);
+        return core.EraseAsync(
+            entry,
+            rule,
+            predicate,
+            tenant,
+            now,
+            conn,
+            transaction,
+            ct,
+            execution
+        );
     }
 
     private static SoftDeleteConvention RequireSoftDelete(RetentionEntry entry)
@@ -161,9 +173,9 @@ public sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
             );
         }
 
-        var deletedAtProperty = entry.EntityType.GetProperty(
-            softDelete.DeletedAtMember,
-            BindingFlags.Public | BindingFlags.Instance
+        var deletedAtProperty = ReflectionMemberResolver.FindPropertyByName(
+            entry.EntityType,
+            softDelete.DeletedAtMember
         );
         if (deletedAtProperty is null)
         {

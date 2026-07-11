@@ -1,7 +1,10 @@
-namespace Cohort.Domain;
+using Cohort.Domain;
 
-public sealed record RetentionEntry(
+namespace Cohort.Infrastructure;
+
+internal sealed record RetentionEntry(
     Type EntityType,
+    Guid EntityId,
     string TableName,
     string Category,
     string AnchorMember,
@@ -15,24 +18,18 @@ public sealed record RetentionEntry(
     AnonymisedAtConvention? AnonymisedAt = null
 );
 
-public sealed record RecordIdConvention(
+internal sealed record RecordIdConvention(
     string RecordIdMember,
     string RecordIdColumn,
     Type RecordIdType,
     string? RecordIdStoreType = null
 );
 
-public sealed record AnonymisedAtConvention(
-    string AnonymisedAtMember,
-    string AnonymisedAtColumn
-);
+internal sealed record AnonymisedAtConvention(string AnonymisedAtMember, string AnonymisedAtColumn);
 
-public sealed record TenantConvention(
-    string TenantMember,
-    string TenantColumn
-);
+internal sealed record TenantConvention(string TenantMember, string TenantColumn);
 
-public sealed record SoftDeleteConvention(
+internal sealed record SoftDeleteConvention(
     string IsDeletedMember,
     string IsDeletedColumn,
     string? DeletedAtMember,

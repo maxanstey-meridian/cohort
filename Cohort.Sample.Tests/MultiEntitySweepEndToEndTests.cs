@@ -1,7 +1,6 @@
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Sample.Entities;
-
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -54,7 +53,7 @@ public sealed class MultiEntitySweepEndToEndTests(PostgresFixture fixture)
             await repository.CreateAsync(
                 new RetentionHoldRequest(
                     Guid.NewGuid(),
-                    "notes",
+                    RetentionEntityIdentity.For<Note>(),
                     heldNoteId.ToString(),
                     tenantId,
                     "multi-entity hold",
@@ -69,18 +68,36 @@ public sealed class MultiEntitySweepEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 0, HeldCount: 1),
-            because: "the only expired Note is held and must not be purged"
-        );
-        result.Counts.Should().Contain(
-            new EntitySweepCount(typeof(SoftDeleteRecord), "soft-delete", tenantId, Strategy.SoftDelete, 1),
-            because: "the Note hold must not cascade to the SoftDeleteRecord sweep"
-        );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(Note),
+                    "short-lived",
+                    tenantId,
+                    Strategy.Purge,
+                    0,
+                    HeldCount: 1
+                ),
+                because: "the only expired Note is held and must not be purged"
+            );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(SoftDeleteRecord),
+                    "soft-delete",
+                    tenantId,
+                    Strategy.SoftDelete,
+                    1
+                ),
+                because: "the Note hold must not cascade to the SoftDeleteRecord sweep"
+            );
 
         await using var verify = Host.CreateDbContext();
         (await verify.Notes.Select(note => note.Body).ToListAsync())
-            .Should().Equal("held-note-must-survive");
+            .Should()
+            .Equal("held-note-must-survive");
 
         var records = await verify.SoftDeleteRecords.OrderBy(record => record.Body).ToListAsync();
         records.Should().ContainSingle();

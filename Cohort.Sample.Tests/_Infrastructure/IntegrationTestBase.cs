@@ -6,6 +6,7 @@ namespace Cohort.Sample.Tests;
 public abstract class IntegrationTestBase(PostgresFixture fixture) : IAsyncLifetime
 {
     protected CohortTestHost Host { get; private set; } = default!;
+    protected string ConnectionString => fixture.ConnectionString;
 
     public async Task InitializeAsync()
     {

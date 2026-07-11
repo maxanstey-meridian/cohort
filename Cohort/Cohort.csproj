@@ -1,33 +1,32 @@
 <Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <RootNamespace>Cohort</RootNamespace>
+        <PackageId>Cohort</PackageId>
+        <Version>0.6.0</Version>
+        <Authors>Max Anstey</Authors>
+        <Description>Annotation-driven GDPR retention for EF Core. Purge, soft-delete, or anonymise rows past their retention period.</Description>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
+        <PackageProjectUrl>https://github.com/maxanstey-meridian/cohort</PackageProjectUrl>
+        <RepositoryUrl>https://github.com/maxanstey-meridian/cohort</RepositoryUrl>
+        <PackageTags>dotnet;efcore;gdpr;data-retention;postgresql</PackageTags>
+        <IsPackable>true</IsPackable>
+    </PropertyGroup>
 
-  <PropertyGroup>
-    <RootNamespace>Cohort</RootNamespace>
-    <PackageId>Cohort</PackageId>
-    <Version>0.5.0</Version>
-    <Authors>Max Anstey</Authors>
-    <Description>Annotation-driven GDPR retention for EF Core. Purge, soft-delete, or anonymise rows past their retention period.</Description>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageReadmeFile>README.md</PackageReadmeFile>
-    <PackageProjectUrl>https://github.com/maxanstey-meridian/cohort</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/maxanstey-meridian/cohort</RepositoryUrl>
-    <PackageTags>dotnet;efcore;gdpr;data-retention;postgresql</PackageTags>
-    <IsPackable>true</IsPackable>
-  </PropertyGroup>
+    <ItemGroup>
+        <PackageReference Include="Cronos" />
+        <PackageReference Include="Microsoft.EntityFrameworkCore" />
+        <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" />
+        <PackageReference Include="Microsoft.Extensions.Hosting" />
+        <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" />
+    </ItemGroup>
 
-  <ItemGroup>
-    <PackageReference Include="Cronos" />
-    <PackageReference Include="Microsoft.EntityFrameworkCore" />
-    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" />
-    <PackageReference Include="Microsoft.Extensions.Hosting" />
-    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" />
-  </ItemGroup>
+    <ItemGroup>
+        <InternalsVisibleTo Include="Cohort.Tests" />
+        <InternalsVisibleTo Include="Cohort.Sample.Tests" />
+    </ItemGroup>
 
-  <ItemGroup>
-    <InternalsVisibleTo Include="Cohort.Tests" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <None Include="../README.md" Pack="true" PackagePath="/" />
-  </ItemGroup>
-
+    <ItemGroup>
+        <None Include="../README.md" Pack="true" PackagePath="/" />
+    </ItemGroup>
 </Project>

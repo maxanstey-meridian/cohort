@@ -1,7 +1,6 @@
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
-
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
@@ -30,7 +29,9 @@ public static class SampleServiceCollectionExtensions
         services.AddSingleton(CreatePreviewTenant());
         services.AddSingleton<GuidTombstoneFactory>();
         services.AddSingleton<OriginalValueTombstoneFactory>();
-        services.AddSingleton<IAnonymiseValueFactory>(sp => sp.GetRequiredService<GuidTombstoneFactory>());
+        services.AddSingleton<IAnonymiseValueFactory>(sp =>
+            sp.GetRequiredService<GuidTombstoneFactory>()
+        );
         services.AddSingleton<IAnonymiseValueFactory>(sp =>
             sp.GetRequiredService<OriginalValueTombstoneFactory>()
         );

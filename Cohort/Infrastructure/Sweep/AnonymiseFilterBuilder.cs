@@ -1,6 +1,3 @@
-using Cohort.Application;
-using Cohort.Domain;
-
 namespace Cohort.Infrastructure.Sweep;
 
 internal static class AnonymiseFilterBuilder
@@ -39,13 +36,17 @@ internal static class AnonymiseFilterBuilder
             "("
                 + string.Join(
                     " OR ",
-                    predicate.Matches.Select((match, index) =>
-                        $"target.{AnonymiseSqlBuilder.QuoteIdentifier(match.SubjectColumn)} = @subjectValue{index}"
+                    predicate.Matches.Select(
+                        (match, index) =>
+                            $"target.{AnonymiseSqlBuilder.QuoteIdentifier(match.SubjectColumn)} = @subjectValue{index}"
                     )
                 )
                 + ")",
-            predicate.Matches
-                .Select((match, index) => new SqlFilterParameter($"subjectValue{index}", match.SubjectValue))
+            predicate
+                .Matches.Select(
+                    (match, index) =>
+                        new SqlFilterParameter($"subjectValue{index}", match.SubjectValue)
+                )
                 .ToArray()
         );
     }

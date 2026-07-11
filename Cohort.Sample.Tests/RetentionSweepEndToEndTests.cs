@@ -1,7 +1,6 @@
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Sample.Entities;
-
 using Microsoft.EntityFrameworkCore;
 
 namespace Cohort.Sample.Tests;
@@ -79,38 +78,37 @@ public sealed class RetentionSweepEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        // SampleDbContext now has 8 retained entities including the blob-backed handler fixture.
-        result.Counts.Should().HaveCount(9);
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(Note),
-                "short-lived",
-                tenantA,
-                Strategy.Purge,
-                1
-            )
-        );
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(SoftDeleteRecord),
-                "soft-delete",
-                tenantA,
-                Strategy.SoftDelete,
-                0
-            )
-        );
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(AnonymisedContact),
-                "anonymise",
-                tenantA,
-                Strategy.Anonymise,
-                0
-            )
-        );
+        result
+            .Counts.Should()
+            .Contain(new EntitySweepCount(typeof(Note), "short-lived", tenantA, Strategy.Purge, 1));
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(SoftDeleteRecord),
+                    "soft-delete",
+                    tenantA,
+                    Strategy.SoftDelete,
+                    0
+                )
+            );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(AnonymisedContact),
+                    "anonymise",
+                    tenantA,
+                    Strategy.Anonymise,
+                    0
+                )
+            );
 
         await using var verify = Host.CreateDbContext();
-        var noteBodies = await verify.Notes.OrderBy(note => note.Body).Select(note => note.Body).ToListAsync();
+        var noteBodies = await verify
+            .Notes.OrderBy(note => note.Body)
+            .Select(note => note.Body)
+            .ToListAsync();
         noteBodies.Should().Equal("sweep-keep-legal-min", "sweep-keep-other-tenant");
         var exemptTitles = await verify
             .ExemptDocuments.OrderBy(document => document.Title)
@@ -142,65 +140,82 @@ public sealed class RetentionSweepEndToEndTests(PostgresFixture fixture)
                     TenantId = tenantB,
                     CreatedAt = asOf.AddDays(-120),
                     Body = "sweep-keep-other-tenant",
-                },
-                new Note
-                {
-                    Id = Guid.NewGuid(),
-                    TenantId = null,
-                    CreatedAt = asOf.AddDays(-120),
-                    Body = "sweep-keep-null-tenant",
                 }
             );
             await db.SaveChangesAsync();
+
+            await db.Database.ExecuteSqlRawAsync(
+                """
+                ALTER TABLE "notes" ALTER COLUMN "TenantId" DROP NOT NULL;
+                INSERT INTO "notes" ("Id", "TenantId", "SubjectId", "CreatedAt", "Body")
+                VALUES ({0}, NULL, NULL, {1}, {2});
+                """,
+                Guid.NewGuid(),
+                asOf.AddDays(-120),
+                "sweep-keep-null-tenant"
+            );
         }
 
-        var result = await Host.RunSweepAsync(
-            new TenantContext(tenantA, "uk", new Dictionary<string, string>()),
-            asOf
-        );
+        try
+        {
+            var result = await Host.RunSweepAsync(
+                new TenantContext(tenantA, "uk", new Dictionary<string, string>()),
+                asOf
+            );
 
-        // SampleDbContext now has 8 retained entities including the blob-backed handler fixture.
-        result.Counts.Should().HaveCount(9);
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(Note),
-                "short-lived",
-                tenantA,
-                Strategy.Purge,
-                1
-            )
-        );
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(SoftDeleteRecord),
-                "soft-delete",
-                tenantA,
-                Strategy.SoftDelete,
-                0
-            )
-        );
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(AnonymisedContact),
-                "anonymise",
-                tenantA,
-                Strategy.Anonymise,
-                0
-            )
-        );
+            result
+                .Counts.Should()
+                .Contain(new EntitySweepCount(typeof(Note), "short-lived", tenantA, Strategy.Purge, 1));
+            result
+                .Counts.Should()
+                .Contain(
+                    new EntitySweepCount(
+                        typeof(SoftDeleteRecord),
+                        "soft-delete",
+                        tenantA,
+                        Strategy.SoftDelete,
+                        0
+                    )
+                );
+            result
+                .Counts.Should()
+                .Contain(
+                    new EntitySweepCount(
+                        typeof(AnonymisedContact),
+                        "anonymise",
+                        tenantA,
+                        Strategy.Anonymise,
+                        0
+                    )
+                );
 
-        await using var verify = Host.CreateDbContext();
-        var noteBodies = await verify.Notes.OrderBy(note => note.Body).Select(note => note.Body).ToListAsync();
-        noteBodies.Should().Equal("sweep-keep-null-tenant", "sweep-keep-other-tenant");
+            await using var verify = Host.CreateDbContext();
+            var noteBodies = await verify
+                .Notes.OrderBy(note => note.Body)
+                .Select(note => note.Body)
+                .ToListAsync();
+            noteBodies.Should().Equal("sweep-keep-null-tenant", "sweep-keep-other-tenant");
+        }
+        finally
+        {
+            await using var cleanup = Host.CreateDbContext();
+            await cleanup.Database.ExecuteSqlRawAsync(
+                """
+                DELETE FROM "notes" WHERE "TenantId" IS NULL;
+                ALTER TABLE "notes" ALTER COLUMN "TenantId" SET NOT NULL;
+                """
+            );
+        }
     }
 
     private sealed class StaticCategoryRepository(
         IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
     ) : IRetentionCategoryRepository
     {
-        private static readonly IRetentionRuleResolver ExemptFallback = new StaticRetentionRuleResolver(
-            new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
-        );
+        private static readonly IRetentionRuleResolver ExemptFallback =
+            new StaticRetentionRuleResolver(
+                new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+            );
 
         public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
         {

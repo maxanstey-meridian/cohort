@@ -1,48 +1,27 @@
 using System.Data;
-
+using Cohort.Application;
 using Cohort.Domain;
-using Cohort.Hosting;
-
+using Cohort.Infrastructure.Sweep;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 
-namespace Cohort.Application;
+namespace Cohort.Infrastructure;
 
-public sealed class RetentionSweepEngine(
-    DbContext db,
+internal sealed class RetentionSweepEngine(
+    [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
     RetentionRegistry registry,
     IRetentionCategoryRepository categoryRepository,
     RetentionStartupValidator validator,
     IRetentionAuditWriter auditWriter,
     IEnumerable<IRetentionSweepStrategy> sweepStrategies,
-    IOptionsMonitor<CohortOptions>? options = null,
+    IRetentionExecutionSettings? options = null,
     ILogger<RetentionSweepEngine>? logger = null
-) : IRetentionSweep
+)
 {
-    private readonly IReadOnlyDictionary<Strategy, IRetentionSweepStrategy> strategies = sweepStrategies
-        .ToDictionary(strategy => strategy.HandlesStrategy);
-
-    public Task<RetentionSweepResult> SweepAsync(
-        TenantContext tenant,
-        DateTimeOffset now,
-        CancellationToken ct = default
-    )
-    {
-        // Direct calls are recorded as Manual; the hosted worker passes Scheduled.
-        return SweepAsync(tenant, now, SweepTriggerKind.Manual, ct);
-    }
-
-    public Task<RetentionSweepResult> SweepAsync(
-        TenantContext tenant,
-        DateTimeOffset now,
-        SweepTriggerKind trigger,
-        CancellationToken ct = default
-    )
-    {
-        return SweepAsync(tenant, now, trigger, SweepEntityScope.All, ct);
-    }
+    private readonly IReadOnlyDictionary<Strategy, IRetentionSweepStrategy> strategies =
+        sweepStrategies.ToDictionary(strategy => strategy.HandlesStrategy);
 
     public async Task<RetentionSweepResult> SweepAsync(
         TenantContext tenant,
@@ -54,45 +33,42 @@ public sealed class RetentionSweepEngine(
     {
         ArgumentNullException.ThrowIfNull(tenant);
 
-        if (options?.CurrentValue.DryRun == true)
-        {
-            throw new InvalidOperationException(
-                "Cohort is configured with DryRun enabled. RetentionSweepEngine.SweepAsync mutates data and refuses to run as a safety net; use IRetentionPreview for a count-only pass, or clear Cohort:DryRun."
-            );
-        }
-
-        await validator.ValidateAsync(ct);
-
         var sweepId = Guid.NewGuid();
         var startedAt = DateTimeOffset.UtcNow;
-        var batchSize = Math.Max(1, options?.CurrentValue.SweepBatchSize ?? new CohortOptions().SweepBatchSize);
-        var executionPlan = await BuildExecutionPlanAsync(tenant, now, scope, ct);
-        var auditEvents = new List<SweepEvent>();
+        var batchSize = Math.Max(1, options?.SweepBatchSize ?? 5000);
+        var lifecycle = new RetentionRunLifecycle(auditWriter, logger);
         var entityFailures = new List<string>();
+        var startedPersisted = false;
 
         var connection = db.Database.GetDbConnection();
         var shouldCloseConnection = connection.State != ConnectionState.Open;
-
-        if (shouldCloseConnection)
-        {
-            await db.Database.OpenConnectionAsync(ct);
-        }
+        var runLockAcquired = false;
 
         try
         {
             // Started commits immediately (no ambient transaction): a sweep that later
             // fails or crashes still leaves audit evidence that it was attempted.
-            await WriteAuditEventAsync(
-                new SweepEvent.Started(
-                    sweepId,
-                    startedAt,
-                    trigger,
-                    DryRun: false,
-                    tenant.Id
-                ),
-                auditEvents,
-                ct
+            await lifecycle.WriteDurableAsync(
+                new SweepEvent.Started(sweepId, startedAt, trigger, DryRun: false, tenant.Id),
+                CancellationToken.None
             );
+            startedPersisted = true;
+
+            if (options?.DryRun == true)
+            {
+                throw new InvalidOperationException(
+                    "Cohort is configured with DryRun enabled. RetentionSweepEngine.SweepAsync mutates data and refuses to run as a safety net; use IRetentionPreview for a count-only pass, or clear Cohort:DryRun."
+                );
+            }
+
+            await validator.ValidateAsync(ct);
+            var executionPlan = await BuildExecutionPlanAsync(tenant, now, scope, ct);
+            if (shouldCloseConnection)
+            {
+                await db.Database.OpenConnectionAsync(ct);
+            }
+            await RetentionRunAdvisoryLock.AcquireAsync(connection, sweepId, ct);
+            runLockAcquired = true;
 
             foreach (
                 var (entry, context, rule) in RetentionExecutionPlanOrderer.Order(
@@ -112,11 +88,11 @@ public sealed class RetentionSweepEngine(
                         sweepId,
                         tenant,
                         batchSize,
-                        auditEvents,
+                        lifecycle,
                         ct
                     );
                 }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                catch (OperationCanceledException)
                 {
                     throw;
                 }
@@ -135,36 +111,84 @@ public sealed class RetentionSweepEngine(
                 }
             }
 
+            ct.ThrowIfCancellationRequested();
             var completedAt = DateTimeOffset.UtcNow;
-            var totalAffected = auditEvents.OfType<SweepEvent.EntitySummary>().Sum(summary => summary.Affected);
-            await WriteAuditEventAsync(
-                new SweepEvent.Completed(sweepId, completedAt, completedAt - startedAt, totalAffected),
-                auditEvents,
-                ct
-            );
-
+            var totalAffected = lifecycle.AccumulatedAffectedTotal;
             if (entityFailures.Count > 0)
             {
-                await WriteAuditEventAsync(
-                    new SweepEvent.Failed(
+                await lifecycle.WriteDurableAsync(
+                    new SweepEvent.PartiallyFailed(
                         sweepId,
                         completedAt,
-                        Truncate(string.Join("; ", entityFailures), 4000)
+                        completedAt - startedAt,
+                        totalAffected,
+                        RetentionRunLifecycle.TruncateError(string.Join("; ", entityFailures))
                     ),
-                    auditEvents,
-                    ct
+                    CancellationToken.None
+                );
+            }
+            else
+            {
+                await lifecycle.WriteDurableAsync(
+                    new SweepEvent.Completed(
+                        sweepId,
+                        completedAt,
+                        completedAt - startedAt,
+                        totalAffected
+                    ),
+                    CancellationToken.None
                 );
             }
         }
+        catch (OperationCanceledException ex) when (startedPersisted && ct.IsCancellationRequested)
+        {
+            var cancelledAt = DateTimeOffset.UtcNow;
+            await lifecycle.TrySettleTerminalAsync(
+                new SweepEvent.Cancelled(
+                    sweepId,
+                    cancelledAt,
+                    RetentionRunLifecycle.TruncateError(ex.Message),
+                    cancelledAt - startedAt,
+                    lifecycle.AccumulatedAffectedTotal
+                ),
+                "cancelled sweep",
+                sweepId
+            );
+            throw;
+        }
+        catch (Exception ex) when (startedPersisted)
+        {
+            var failedAt = DateTimeOffset.UtcNow;
+            await lifecycle.TrySettleTerminalAsync(
+                new SweepEvent.Failed(
+                    sweepId,
+                    failedAt,
+                    RetentionRunLifecycle.TruncateError(ex.Message),
+                    failedAt - startedAt,
+                    lifecycle.AccumulatedAffectedTotal
+                ),
+                "failed sweep",
+                sweepId
+            );
+            throw;
+        }
         finally
         {
+            if (runLockAcquired)
+            {
+                await RetentionRunAdvisoryLock.ReleaseAsync(
+                    connection,
+                    sweepId,
+                    CancellationToken.None
+                );
+            }
             if (shouldCloseConnection)
             {
                 await db.Database.CloseConnectionAsync();
             }
         }
 
-        return CreateResult(auditEvents, entityFailures);
+        return lifecycle.CreateSweepResult(entityFailures);
     }
 
     /// <summary>
@@ -177,34 +201,37 @@ public sealed class RetentionSweepEngine(
         TenantContext tenant,
         DateTimeOffset now,
         SweepTriggerKind trigger,
-        SweepEntityScope scope = SweepEntityScope.All,
+        SweepEntityScope scope,
         CancellationToken ct = default
     )
     {
         ArgumentNullException.ThrowIfNull(tenant);
-        await validator.ValidateAsync(ct);
 
         var sweepId = Guid.NewGuid();
         var startedAt = DateTimeOffset.UtcNow;
-        var executionPlan = await BuildExecutionPlanAsync(tenant, now, scope, ct);
-        var auditEvents = new List<SweepEvent>();
+        var lifecycle = new RetentionRunLifecycle(auditWriter, logger);
         var entityFailures = new List<string>();
+        var startedPersisted = false;
 
         var connection = db.Database.GetDbConnection();
         var shouldCloseConnection = connection.State != ConnectionState.Open;
-
-        if (shouldCloseConnection)
-        {
-            await db.Database.OpenConnectionAsync(ct);
-        }
+        var runLockAcquired = false;
 
         try
         {
-            await WriteAuditEventAsync(
+            await lifecycle.WriteDurableAsync(
                 new SweepEvent.Started(sweepId, startedAt, trigger, DryRun: true, tenant.Id),
-                auditEvents,
-                ct
+                CancellationToken.None
             );
+            startedPersisted = true;
+            await validator.ValidateAsync(ct);
+            var executionPlan = await BuildExecutionPlanAsync(tenant, now, scope, ct);
+            if (shouldCloseConnection)
+            {
+                await db.Database.OpenConnectionAsync(ct);
+            }
+            await RetentionRunAdvisoryLock.AcquireAsync(connection, sweepId, ct);
+            runLockAcquired = true;
 
             foreach (
                 var (entry, context, rule) in RetentionExecutionPlanOrderer.Order(
@@ -218,24 +245,35 @@ public sealed class RetentionSweepEngine(
                 try
                 {
                     var eventAt = DateTimeOffset.UtcNow;
-                    var resolvedPeriod = CutoffCalculator.ResolveEffectivePeriod(rule.Period, rule.LegalMin);
+                    var resolvedPeriod = CutoffCalculator.ResolveEffectivePeriod(
+                        rule.Period,
+                        rule.LegalMin
+                    );
                     var affected = 0L;
                     var heldCount = 0L;
                     var nullAnchorCount = 0L;
 
                     if (rule.Strategy != Strategy.Exempt)
                     {
-                        var strategy = strategies[rule.Strategy];
-                        affected = await strategy.PreviewAsync(entry, rule, context, connection, ct);
-                        heldCount = await strategy.CountHeldAsync(entry, rule, context, connection, ct);
-                        nullAnchorCount = await strategy.CountNullAnchorsAsync(entry, rule, context, connection, ct);
+                        var measurement = await RetentionPreviewMeasurement.MeasureAsync(
+                            strategies[rule.Strategy],
+                            entry,
+                            rule,
+                            context,
+                            connection,
+                            ct
+                        );
+                        affected = measurement.Affected;
+                        heldCount = measurement.HeldCount;
+                        nullAnchorCount = measurement.NullAnchorCount;
                     }
 
-                    await WriteAuditEventAsync(
+                    await lifecycle.WriteDurableAsync(
                         new SweepEvent.EntitySummary(
                             sweepId,
                             eventAt,
                             entry.EntityType,
+                            entry.EntityId,
                             entry.Category,
                             tenant.Id,
                             rule.Strategy,
@@ -246,11 +284,10 @@ public sealed class RetentionSweepEngine(
                             nullAnchorCount,
                             rule.Provenance
                         ),
-                        auditEvents,
                         ct
                     );
                 }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                catch (OperationCanceledException)
                 {
                     throw;
                 }
@@ -266,46 +303,101 @@ public sealed class RetentionSweepEngine(
                 }
             }
 
+            ct.ThrowIfCancellationRequested();
             var completedAt = DateTimeOffset.UtcNow;
-            var totalAffected = auditEvents.OfType<SweepEvent.EntitySummary>().Sum(summary => summary.Affected);
-            await WriteAuditEventAsync(
-                new SweepEvent.Completed(sweepId, completedAt, completedAt - startedAt, totalAffected),
-                auditEvents,
-                ct
-            );
-
+            var totalAffected = lifecycle.AccumulatedAffectedTotal;
             if (entityFailures.Count > 0)
             {
-                await WriteAuditEventAsync(
-                    new SweepEvent.Failed(
+                await lifecycle.WriteDurableAsync(
+                    new SweepEvent.PartiallyFailed(
                         sweepId,
                         completedAt,
-                        Truncate(string.Join("; ", entityFailures), 4000)
+                        completedAt - startedAt,
+                        totalAffected,
+                        RetentionRunLifecycle.TruncateError(string.Join("; ", entityFailures))
                     ),
-                    auditEvents,
-                    ct
+                    CancellationToken.None
+                );
+            }
+            else
+            {
+                await lifecycle.WriteDurableAsync(
+                    new SweepEvent.Completed(
+                        sweepId,
+                        completedAt,
+                        completedAt - startedAt,
+                        totalAffected
+                    ),
+                    CancellationToken.None
                 );
             }
         }
+        catch (OperationCanceledException ex) when (startedPersisted && ct.IsCancellationRequested)
+        {
+            var cancelledAt = DateTimeOffset.UtcNow;
+            await lifecycle.TrySettleTerminalAsync(
+                new SweepEvent.Cancelled(
+                    sweepId,
+                    cancelledAt,
+                    RetentionRunLifecycle.TruncateError(ex.Message),
+                    cancelledAt - startedAt,
+                    lifecycle.AccumulatedAffectedTotal
+                ),
+                "cancelled dry run",
+                sweepId
+            );
+            throw;
+        }
+        catch (Exception ex) when (startedPersisted)
+        {
+            var failedAt = DateTimeOffset.UtcNow;
+            await lifecycle.TrySettleTerminalAsync(
+                new SweepEvent.Failed(
+                    sweepId,
+                    failedAt,
+                    RetentionRunLifecycle.TruncateError(ex.Message),
+                    failedAt - startedAt,
+                    lifecycle.AccumulatedAffectedTotal
+                ),
+                "failed dry run",
+                sweepId
+            );
+            throw;
+        }
         finally
         {
+            if (runLockAcquired)
+            {
+                await RetentionRunAdvisoryLock.ReleaseAsync(
+                    connection,
+                    sweepId,
+                    CancellationToken.None
+                );
+            }
             if (shouldCloseConnection)
             {
                 await db.Database.CloseConnectionAsync();
             }
         }
 
-        return CreateResult(auditEvents, entityFailures);
+        return lifecycle.CreateSweepResult(entityFailures);
     }
 
-    private async Task<List<(RetentionEntry Entry, RetentionResolutionContext Context, RetentionRule Rule)>> BuildExecutionPlanAsync(
+    private async Task<
+        List<(RetentionEntry Entry, RetentionResolutionContext Context, RetentionRule Rule)>
+    > BuildExecutionPlanAsync(
         TenantContext tenant,
         DateTimeOffset now,
         SweepEntityScope scope,
         CancellationToken ct
     )
     {
-        var executionPlan = new List<(RetentionEntry Entry, RetentionResolutionContext Context, RetentionRule Rule)>();
+        var executionPlan =
+            new List<(
+                RetentionEntry Entry,
+                RetentionResolutionContext Context,
+                RetentionRule Rule
+            )>();
 
         foreach (var entry in registry.Scan().Values)
         {
@@ -327,9 +419,7 @@ public sealed class RetentionSweepEngine(
 
             var context = new RetentionResolutionContext(entry.Category, tenant, now, []);
             var rule = await resolver.ResolveAsync(context, ct);
-            if (
-                rule.Strategy != Strategy.Exempt && !strategies.ContainsKey(rule.Strategy)
-            )
+            if (rule.Strategy != Strategy.Exempt && !strategies.ContainsKey(rule.Strategy))
             {
                 throw new InvalidOperationException(
                     $"Retention strategy '{rule.Strategy}' is not registered for sweep execution."
@@ -349,16 +439,17 @@ public sealed class RetentionSweepEngine(
         Guid sweepId,
         TenantContext tenant,
         int batchSize,
-        List<SweepEvent> auditEvents,
+        RetentionRunLifecycle lifecycle,
         CancellationToken ct
     )
     {
         var connection = db.Database.GetDbConnection();
         var eventAt = DateTimeOffset.UtcNow;
         var resolvedPeriod = CutoffCalculator.ResolveEffectivePeriod(rule.Period, rule.LegalMin);
-        var effectiveAuditDetail = entry.AuditRowDetail == AuditRowDetail.Inherit
-            ? rule.AuditRowDetail
-            : entry.AuditRowDetail;
+        var effectiveAuditDetail =
+            entry.AuditRowDetail == AuditRowDetail.Inherit
+                ? rule.AuditRowDetail
+                : entry.AuditRowDetail;
         var affectedCount = 0L;
         var skippedCount = 0L;
         var heldCount = 0L;
@@ -423,6 +514,7 @@ public sealed class RetentionSweepEngine(
                                     sweepId,
                                     eventAt,
                                     entry.EntityType,
+                                    entry.EntityId,
                                     recordId,
                                     entry.Category,
                                     rule.Strategy,
@@ -433,11 +525,37 @@ public sealed class RetentionSweepEngine(
                         }
                     }
 
+                    await auditWriter.WriteAsync(
+                        new SweepEvent.EntityProgress(
+                            sweepId,
+                            eventAt,
+                            entry.EntityType,
+                            entry.EntityId,
+                            entry.Category,
+                            tenant.Id,
+                            rule.Strategy,
+                            resolvedPeriod,
+                            execution.AffectedRecordIds.Count,
+                            execution.SkippedCount,
+                            rule.Provenance
+                        ),
+                        ct
+                    );
+
                     await transaction.CommitAsync(ct);
                 }
 
                 affectedCount += execution.AffectedRecordIds.Count;
                 skippedCount += execution.SkippedCount;
+                lifecycle.ReplaceEntityCount(
+                    entry,
+                    tenant.Id,
+                    rule.Strategy,
+                    affectedCount,
+                    heldCount,
+                    skippedCount,
+                    nullAnchorCount
+                );
                 // Skipped rows stay eligible (their mutation never ran), so later
                 // batches of this run must not reselect them: re-running their failed
                 // OnBefore would re-insert the same row detail under this sweep id.
@@ -458,14 +576,30 @@ public sealed class RetentionSweepEngine(
             // Held rows are measured directly (eligible AND actively held) instead of
             // being inferred from candidate arithmetic.
             heldCount = await strategy.CountHeldAsync(entry, rule, context, connection, ct);
-            nullAnchorCount = await strategy.CountNullAnchorsAsync(entry, rule, context, connection, ct);
+            nullAnchorCount = await strategy.CountNullAnchorsAsync(
+                entry,
+                rule,
+                context,
+                connection,
+                ct
+            );
         }
 
-        await WriteAuditEventAsync(
+        lifecycle.ReplaceEntityCount(
+            entry,
+            tenant.Id,
+            rule.Strategy,
+            affectedCount,
+            heldCount,
+            skippedCount,
+            nullAnchorCount
+        );
+        await lifecycle.WriteDurableAsync(
             new SweepEvent.EntitySummary(
                 sweepId,
                 eventAt,
                 entry.EntityType,
+                entry.EntityId,
                 entry.Category,
                 tenant.Id,
                 rule.Strategy,
@@ -476,68 +610,17 @@ public sealed class RetentionSweepEngine(
                 nullAnchorCount,
                 rule.Provenance
             ),
-            auditEvents,
             ct
-        );
-    }
-
-    private async Task WriteAuditEventAsync(
-        SweepEvent evt,
-        ICollection<SweepEvent> auditEvents,
-        CancellationToken ct
-    )
-    {
-        await auditWriter.WriteAsync(evt, ct);
-        auditEvents.Add(evt);
-    }
-
-    private static string Truncate(string value, int maxLength)
-    {
-        return value.Length <= maxLength ? value : value[..maxLength];
-    }
-
-    private static RetentionSweepResult CreateResult(
-        IEnumerable<SweepEvent> auditEvents,
-        IReadOnlyList<string> entityFailures
-    )
-    {
-        var started = auditEvents.OfType<SweepEvent.Started>().Single();
-        var completed = auditEvents.OfType<SweepEvent.Completed>().Single();
-        var counts = auditEvents
-            .OfType<SweepEvent.EntitySummary>()
-            .Select(summary =>
-                new EntitySweepCount(
-                    summary.EntityType,
-                    summary.Category,
-                    summary.TenantId,
-                    summary.Strategy,
-                    summary.Affected,
-                    summary.HeldCount,
-                    summary.SkippedCount,
-                    summary.NullAnchorCount
-                )
-            )
-            .ToArray();
-
-        return new RetentionSweepResult(
-            started.SweepId,
-            started.At,
-            completed.At,
-            counts,
-            entityFailures
         );
     }
 }
 
 /// <summary>
-/// Which retained entities a sweep covers. Direct calls sweep everything; the hosted
-/// worker sweeps tenanted entities per tenant and tenantless entities exactly once,
-/// attributed to <see cref="TenantContext.Tenantless"/>, so a multi-tenant tick does
-/// not re-sweep shared tables under every tenant's identity.
+/// Which retained entities a sweep covers. Every internal caller must choose explicitly
+/// so tenantless rows cannot be swept as an accidental side effect of a tenanted pass.
 /// </summary>
-public enum SweepEntityScope
+internal enum SweepEntityScope
 {
-    All,
     TenantedOnly,
     TenantlessOnly,
 }

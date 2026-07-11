@@ -1,9 +1,6 @@
 using Microsoft.EntityFrameworkCore;
-
 using Npgsql;
-
 using Respawn;
-
 using Testcontainers.PostgreSql;
 
 namespace Cohort.Sample.Tests;
@@ -21,7 +18,9 @@ public sealed class PostgresFixture : IAsyncLifetime
     {
         await _container.StartAsync();
 
-        var options = new DbContextOptionsBuilder<SampleDbContext>().UseNpgsql(ConnectionString).Options;
+        var options = new DbContextOptionsBuilder<SampleDbContext>()
+            .UseNpgsql(ConnectionString)
+            .Options;
         await using var db = new SampleDbContext(options);
         await db.Database.MigrateAsync();
 

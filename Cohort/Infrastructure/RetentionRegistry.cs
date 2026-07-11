@@ -1,8 +1,8 @@
 using System.Collections.Frozen;
-
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 
-namespace Cohort.Application;
+namespace Cohort.Infrastructure;
 
 /// Walks an EF Core model, reads `[Retain]` attributes, validates anchors, and returns
 /// an immutable lookup of `RetentionEntry` records keyed by CLR type.
@@ -13,17 +13,20 @@ namespace Cohort.Application;
 ///
 /// Crude error handling: throws `InvalidOperationException` on the first failure.
 /// Multi-error aggregation via `RetentionConfigurationException` is Milestone A.
-public sealed class RetentionRegistry(DbContext db, RetentionEntryBuilder entryBuilder)
+internal sealed class RetentionRegistry(
+    [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
+    RetentionEntryBuilder entryBuilder
+)
 {
-    private FrozenDictionary<Type, Domain.RetentionEntry>? cachedEntries;
+    private FrozenDictionary<Type, RetentionEntry>? cachedEntries;
 
-    public IReadOnlyDictionary<Type, Domain.RetentionEntry> Scan()
+    public IReadOnlyDictionary<Type, RetentionEntry> Scan()
     {
         return cachedEntries ??= db
             .Model.GetEntityTypes()
             .Select(entityType => entryBuilder.TryBuild(entityType))
             .Where(entry => entry is not null)
-            .Cast<Domain.RetentionEntry>()
+            .Cast<RetentionEntry>()
             .ToFrozenDictionary(entry => entry.EntityType);
     }
 }

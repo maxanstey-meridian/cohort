@@ -1,29 +1,39 @@
 using System.Data;
-
+using Cohort.Application;
 using Cohort.Domain;
-
+using Cohort.Infrastructure.Sweep;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 
-namespace Cohort.Application;
+namespace Cohort.Infrastructure;
 
-public sealed class RetentionPreviewService(
-    DbContext db,
+internal sealed class RetentionPreviewService(
+    [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
     RetentionRegistry registry,
     IRetentionCategoryRepository categoryRepository,
     RetentionStartupValidator validator,
     IEnumerable<IRetentionSweepStrategy> sweepStrategies
-) : IRetentionPreview
+)
 {
-    private readonly IReadOnlyDictionary<Strategy, IRetentionSweepStrategy> strategies = sweepStrategies
-        .ToDictionary(strategy => strategy.HandlesStrategy);
+    private readonly IReadOnlyDictionary<Strategy, IRetentionSweepStrategy> strategies =
+        sweepStrategies.ToDictionary(strategy => strategy.HandlesStrategy);
 
-    public async Task<RetentionSweepResult> PreviewAsync(
-        TenantContext tenant,
-        DateTimeOffset now,
+    public async Task<RetentionSweepResult> ExecuteAsync(
+        RetentionPreviewRequest request,
         CancellationToken ct = default
     )
     {
-        ArgumentNullException.ThrowIfNull(tenant);
+        ArgumentNullException.ThrowIfNull(request);
+
+        var (tenant, includeEntry) = request switch
+        {
+            RetentionPreviewRequest.TenantedRequest tenanted =>
+                (tenanted.Tenant, (Func<RetentionEntry, bool>)(entry => entry.Tenant is not null)),
+            RetentionPreviewRequest.TenantlessRequest =>
+                (TenantContext.Tenantless, entry => entry.Tenant is null),
+            _ => throw new ArgumentOutOfRangeException(nameof(request)),
+        };
+
         await validator.ValidateAsync(ct);
 
         var startedAt = DateTimeOffset.UtcNow;
@@ -41,7 +51,8 @@ public sealed class RetentionPreviewService(
             foreach (
                 var entry in registry
                     .Scan()
-                    .Values.OrderBy(entry => entry.EntityType.FullName, StringComparer.Ordinal)
+                    .Values.Where(includeEntry)
+                    .OrderBy(entry => entry.EntityType.FullName, StringComparer.Ordinal)
             )
             {
                 var resolver = await categoryRepository.GetAsync(entry.Category, ct);
@@ -52,7 +63,7 @@ public sealed class RetentionPreviewService(
                     );
                 }
 
-                var context = new RetentionResolutionContext(entry.Category, tenant, now, []);
+                var context = new RetentionResolutionContext(entry.Category, tenant, request.At, []);
                 var rule = await resolver.ResolveAsync(context, ct);
                 if (rule.Strategy != Strategy.Exempt && !strategies.ContainsKey(rule.Strategy))
                 {
@@ -61,11 +72,17 @@ public sealed class RetentionPreviewService(
                     );
                 }
 
-                var affected = rule.Strategy switch
-                {
-                    Strategy.Exempt => 0,
-                    _ => await strategies[rule.Strategy].PreviewAsync(entry, rule, context, connection, ct),
-                };
+                var measurement =
+                    rule.Strategy == Strategy.Exempt
+                        ? (Affected: 0L, HeldCount: 0L, NullAnchorCount: 0L)
+                        : await RetentionPreviewMeasurement.MeasureAsync(
+                            strategies[rule.Strategy],
+                            entry,
+                            rule,
+                            context,
+                            connection,
+                            ct
+                        );
 
                 counts.Add(
                     new EntitySweepCount(
@@ -73,7 +90,9 @@ public sealed class RetentionPreviewService(
                         entry.Category,
                         tenant.Id,
                         rule.Strategy,
-                        affected
+                        measurement.Affected,
+                        measurement.HeldCount,
+                        NullAnchorCount: measurement.NullAnchorCount
                     )
                 );
             }

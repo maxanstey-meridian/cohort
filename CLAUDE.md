@@ -14,7 +14,7 @@ Three patterns. Each has a header comment in its exemplar file. Pick one, copy t
 
 2. **Pure unit test in `Cohort.Tests/`** — only when the code under test is a static function with no I/O, no DbContext, no time source beyond parameters, no randomness. `[Theory]` + `[InlineData]` rows. **Copy `CutoffCalculatorTests.cs`.** No async. No fixtures. No DI. No `IClock` abstraction — never invent an abstraction to test a pure function.
 
-3. **Narrow integration test in `Cohort.Sample.Tests/` (the middle ground)** — only when the code under test crosses one boundary that EF Core's InMemory provider fully serves (reflection over `Model.GetEntityTypes()` and friends). If there is **any** SQL involved, skip this and write pattern #1 instead. **Copy `RegistryScanTests.cs`. If in doubt, don't — write pattern #1.**
+3. **Narrow integration test in `Cohort.Sample.Tests/` (the middle ground)** — only when the code under test crosses one boundary that Npgsql model metadata fully serves without opening a connection (reflection over `Model.GetEntityTypes()` and friends). If there is **any** SQL involved, skip this and write pattern #1 instead. **Copy `RegistryScanTests.cs`. If in doubt, don't — write pattern #1.**
 
 ### The mock ban is structural, not policy
 

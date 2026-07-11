@@ -1,16 +1,17 @@
 using System.Reflection;
-
+using Cohort.Application;
 using Cohort.Domain;
-
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 
-namespace Cohort.Application;
+namespace Cohort.Infrastructure;
 
-public sealed class RetentionStartupValidator(
-    DbContext db,
+internal sealed class RetentionStartupValidator(
+    [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
     IRetentionCategoryRepository categoryRepository,
     RetentionEntryBuilder entryBuilder,
-    IEnumerable<IAnonymiseValueFactory>? anonymiseValueFactories = null
+    IEnumerable<IAnonymiseValueFactory>? anonymiseValueFactories = null,
+    RetentionValidationState? sharedState = null
 )
 {
     // Instance field, not static: NullabilityInfoContext is documented as not thread-safe,
@@ -23,15 +24,37 @@ public sealed class RetentionStartupValidator(
         typeof(DateTimeOffset),
         typeof(DateTimeOffset?),
     ];
-    private readonly HashSet<Type> registeredAnonymiseFactoryTypes = new(
-        (anonymiseValueFactories ?? Array.Empty<IAnonymiseValueFactory>()).Select(factory =>
-            factory.GetType()
-        )
-    );
+    private readonly IReadOnlyDictionary<Type, int> registeredAnonymiseFactoryTypeCounts = (
+        anonymiseValueFactories ?? Array.Empty<IAnonymiseValueFactory>()
+    )
+        .GroupBy(factory => factory.GetType())
+        .ToDictionary(group => group.Key, group => group.Count());
+    private readonly RetentionValidationState validationState = sharedState ?? new();
 
     public async Task ValidateAsync(CancellationToken ct = default)
     {
-        var errors = new List<string>();
+        if (validationState.Validated)
+        {
+            return;
+        }
+
+        await validationState.Gate.WaitAsync(ct);
+        try
+        {
+            if (validationState.Validated)
+            {
+                return;
+            }
+
+        var errors = registeredAnonymiseFactoryTypeCounts
+            .Where(pair => pair.Value > 1)
+            .OrderBy(pair => pair.Key.FullName, StringComparer.Ordinal)
+            .Select(pair =>
+                $"{nameof(IAnonymiseValueFactory)} concrete runtime type {pair.Key.FullName} is registered {pair.Value} times in DI; exactly one registration per concrete runtime type is allowed."
+            )
+            .ToList();
+        var entityIdOwners = new Dictionary<Guid, Type>();
+        var retainedEntries = new List<RetentionEntry>();
 
         foreach (var entityType in db.Model.GetEntityTypes())
         {
@@ -91,8 +114,20 @@ public sealed class RetentionStartupValidator(
                 continue;
             }
 
-            ValidateTenantConvention(entry, errors);
+            ValidateTenantConvention(entityType, entry, errors);
+            retainedEntries.Add(entry);
+            ValidateRecordIdConvention(entityType, entry, errors);
             ValidateTimestampStoreTypes(entityType, entry, errors);
+            if (entityIdOwners.TryGetValue(entry.EntityId, out var existingEntityType))
+            {
+                errors.Add(
+                    $"[RetentionEntityId] on {clrType.FullName}: identity '{entry.EntityId}' is already used by retained entity {existingEntityType.FullName}; identities must be unique in the DbContext model."
+                );
+            }
+            else
+            {
+                entityIdOwners.Add(entry.EntityId, clrType);
+            }
 
             var resolver = await categoryRepository.GetAsync(entry.Category, ct);
             if (resolver is null)
@@ -122,12 +157,21 @@ public sealed class RetentionStartupValidator(
 
                 if (startupRule?.Strategy == Strategy.SoftDelete)
                 {
-                    ValidateSoftDeleteConvention(entry, errors, $"Soft-delete convention on {clrType.FullName}:");
+                    ValidateSoftDeleteConvention(
+                        entry,
+                        errors,
+                        $"Soft-delete convention on {clrType.FullName}:"
+                    );
                 }
 
                 if (startupRule?.Strategy == Strategy.Anonymise)
                 {
-                    ValidateAnonymiseConvention(entry, errors, $"Anonymise convention on {clrType.FullName}:");
+                    ValidateAnonymiseConvention(
+                        entityType,
+                        entry,
+                        errors,
+                        $"Anonymise convention on {clrType.FullName}:"
+                    );
 
                     if (entry.AnonymisedAt is null)
                     {
@@ -137,6 +181,10 @@ public sealed class RetentionStartupValidator(
                     }
                 }
             }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
             catch (Exception ex)
             {
                 errors.Add(
@@ -145,13 +193,33 @@ public sealed class RetentionStartupValidator(
             }
         }
 
+        try
+        {
+            RetentionExecutionPlanOrderer.Order(db, retainedEntries, entry => entry);
+        }
+        catch (RetentionConfigurationException ex)
+        {
+            errors.AddRange(ex.Errors);
+        }
+
         if (errors.Count > 0)
         {
             throw new RetentionConfigurationException(errors);
         }
+
+        validationState.Validated = true;
+        }
+        finally
+        {
+            validationState.Gate.Release();
+        }
     }
 
-    private void ValidateTenantConvention(RetentionEntry entry, List<string> errors)
+    private void ValidateTenantConvention(
+        Microsoft.EntityFrameworkCore.Metadata.IEntityType entityType,
+        RetentionEntry entry,
+        List<string> errors
+    )
     {
         // Tenantedness is decided by the resolved tenant convention everywhere (scope
         // filtering, SQL tenant clauses, the worker's pass split) — an entity that
@@ -165,14 +233,75 @@ public sealed class RetentionStartupValidator(
             return;
         }
 
+        if (entry.Tenant is not null)
+        {
+            var tenantMember = ReflectionMemberResolver.FindPropertyByName(
+                entry.EntityType,
+                entry.Tenant.TenantMember
+            );
+            var tenantProperty = entityType.FindProperty(entry.Tenant.TenantMember);
+            if (
+                tenantMember is null
+                || CanAssignNull(tenantMember)
+                || tenantProperty?.IsNullable != false
+            )
+            {
+                errors.Add(
+                    $"Tenant convention on {entry.EntityType.FullName}: tenant property '{entry.Tenant.TenantMember}' must be non-nullable in CLR and EF metadata."
+                );
+            }
+        }
+
         if (entry.Tenant is not null || entry.IsExplicitlyTenantless)
         {
             return;
         }
 
         errors.Add(
-            $"Tenant convention on {entry.EntityType.FullName}: retained entities must expose a public Guid or nullable Guid tenant property named '{entryBuilder.ExpectedTenantPropertyName}' by convention, or mark the tenant property with [RetentionTenant], unless the entity is explicitly marked with [RetentionTenantless]."
+            $"Tenant convention on {entry.EntityType.FullName}: retained entities must expose a public non-nullable Guid tenant property named '{entryBuilder.ExpectedTenantPropertyName}' by convention, or mark the tenant property with [RetentionTenant], unless the entity is explicitly marked with [RetentionTenantless]."
         );
+    }
+
+    private void ValidateRecordIdConvention(
+        Microsoft.EntityFrameworkCore.Metadata.IEntityType entityType,
+        RetentionEntry entry,
+        List<string> errors
+    )
+    {
+        var recordIdProperty = entityType.FindProperty(entry.RecordId.RecordIdMember);
+        if (recordIdProperty is null)
+        {
+            return;
+        }
+
+        var recordIdMember = ReflectionMemberResolver.FindPropertyByName(
+            entry.EntityType,
+            entry.RecordId.RecordIdMember
+        );
+        if (recordIdMember is null || CanAssignNull(recordIdMember) || recordIdProperty.IsNullable)
+        {
+            errors.Add(
+                $"Record-id convention on {entry.EntityType.FullName}: record-id property '{entry.RecordId.RecordIdMember}' must be non-nullable in CLR and EF metadata."
+            );
+            return;
+        }
+
+        var isSingleColumnKey = entityType
+            .GetKeys()
+            .Any(key => key.Properties.Count == 1 && key.Properties[0] == recordIdProperty);
+        var isSingleColumnUniqueIndex = entityType
+            .GetIndexes()
+            .Any(index =>
+                index.IsUnique
+                && index.Properties.Count == 1
+                && index.Properties[0] == recordIdProperty
+            );
+        if (!isSingleColumnKey && !isSingleColumnUniqueIndex)
+        {
+            errors.Add(
+                $"Record-id convention on {entry.EntityType.FullName}: record-id property '{entry.RecordId.RecordIdMember}' must uniquely identify rows via a single-column primary key, alternate key, or unique index."
+            );
+        }
     }
 
     private void ValidateFactoryBackedAnonymiseSupport(
@@ -191,7 +320,7 @@ public sealed class RetentionStartupValidator(
                 continue;
             }
 
-            if (!registeredAnonymiseFactoryTypes.Contains(field.FactoryType))
+            if (!registeredAnonymiseFactoryTypeCounts.ContainsKey(field.FactoryType))
             {
                 errors.Add(
                     $"{messagePrefix} [AnonymiseWith] member {field.MemberName} specifies factory type {field.FactoryType.FullName} but no matching {nameof(IAnonymiseValueFactory)} is registered in DI."
@@ -210,12 +339,13 @@ public sealed class RetentionStartupValidator(
     }
 
     private void ValidateAnonymiseConvention(
+        Microsoft.EntityFrameworkCore.Metadata.IEntityType entityType,
         RetentionEntry entry,
         List<string> errors,
         string messagePrefix
     )
     {
-        errors.AddRange(GetAnonymiseConventionErrors(entry, messagePrefix));
+        errors.AddRange(GetAnonymiseConventionErrors(entityType, entry, messagePrefix));
     }
 
     private static bool IsNonNullableValueType(Type type)
@@ -239,7 +369,10 @@ public sealed class RetentionStartupValidator(
         }
 
         var clrType = entry.EntityType;
-        var isDeletedMember = ReflectionMemberResolver.FindPropertyByName(clrType, entry.SoftDelete.IsDeletedMember);
+        var isDeletedMember = ReflectionMemberResolver.FindPropertyByName(
+            clrType,
+            entry.SoftDelete.IsDeletedMember
+        );
         if (isDeletedMember is null || isDeletedMember.PropertyType != typeof(bool))
         {
             errors.Add(
@@ -250,7 +383,10 @@ public sealed class RetentionStartupValidator(
 
         if (entry.SoftDelete.DeletedAtMember is not null)
         {
-            var deletedAtMember = ReflectionMemberResolver.FindPropertyByName(clrType, entry.SoftDelete.DeletedAtMember);
+            var deletedAtMember = ReflectionMemberResolver.FindPropertyByName(
+                clrType,
+                entry.SoftDelete.DeletedAtMember
+            );
             if (
                 deletedAtMember is not null
                 && !AllowedSoftDeleteTimestampTypes.Contains(deletedAtMember.PropertyType)
@@ -266,6 +402,7 @@ public sealed class RetentionStartupValidator(
     }
 
     private List<string> GetAnonymiseConventionErrors(
+        Microsoft.EntityFrameworkCore.Metadata.IEntityType entityType,
         RetentionEntry entry,
         string messagePrefix
     )
@@ -282,7 +419,18 @@ public sealed class RetentionStartupValidator(
 
         foreach (var field in entry.AnonymiseFields)
         {
-            var property = ReflectionMemberResolver.FindPropertyByName(entry.EntityType, field.MemberName);
+            var structuralRole = GetStructuralRole(entry, field.MemberName);
+            if (structuralRole is not null)
+            {
+                errors.Add(
+                    $"{messagePrefix} [Anonymise] member {field.MemberName} overlaps the retention {structuralRole} field and must not be anonymised."
+                );
+            }
+
+            var property = ReflectionMemberResolver.FindPropertyByName(
+                entry.EntityType,
+                field.MemberName
+            );
             if (property is null)
             {
                 errors.Add(
@@ -303,6 +451,12 @@ public sealed class RetentionStartupValidator(
                         $"{messagePrefix} [Anonymise] member {property.Name} uses Null but {property.PropertyType.Name} is not nullable."
                     );
                     break;
+                case AnonymiseMethod.Null
+                    when entityType.FindProperty(field.MemberName)?.IsNullable != true:
+                    errors.Add(
+                        $"{messagePrefix} [Anonymise] member {property.Name} uses Null but its EF metadata is non-nullable."
+                    );
+                    break;
                 case AnonymiseMethod.EmptyString when property.PropertyType != typeof(string):
                     errors.Add(
                         $"{messagePrefix} [Anonymise] member {property.Name} uses EmptyString but {property.PropertyType.Name} is not string."
@@ -317,6 +471,35 @@ public sealed class RetentionStartupValidator(
         }
 
         return errors;
+    }
+
+    private static string? GetStructuralRole(RetentionEntry entry, string memberName)
+    {
+        if (memberName == entry.RecordId.RecordIdMember)
+        {
+            return "record ID";
+        }
+        if (memberName == entry.Tenant?.TenantMember)
+        {
+            return "tenant";
+        }
+        if (memberName == entry.AnchorMember)
+        {
+            return "anchor";
+        }
+        if (
+            memberName == entry.SoftDelete?.IsDeletedMember
+            || memberName == entry.SoftDelete?.DeletedAtMember
+        )
+        {
+            return "soft-delete";
+        }
+        if (memberName == entry.AnonymisedAt?.AnonymisedAtMember)
+        {
+            return "AnonymisedAt";
+        }
+
+        return null;
     }
 
     private static void ValidateTimestampStoreTypes(
@@ -374,11 +557,17 @@ public sealed class RetentionStartupValidator(
         }
         catch (Exception ex) when (ex is InvalidOperationException or InvalidCastException)
         {
-            // Non-relational providers (e.g. InMemory in unit tests) expose no store type.
+            // Non-relational providers expose no store type.
             return;
         }
 
-        if (!string.Equals(storeType, "timestamp with time zone", StringComparison.OrdinalIgnoreCase))
+        if (
+            !string.Equals(
+                storeType,
+                "timestamp with time zone",
+                StringComparison.OrdinalIgnoreCase
+            )
+        )
         {
             errors.Add(
                 $"Timestamp convention on {entry.EntityType.FullName}: {role} property '{memberName}' is mapped to '{storeType}'. Cohort compares and writes retention timestamps as UTC instants, which requires 'timestamp with time zone'; 'timestamp without time zone' silently drifts with the session TimeZone and rejects UTC-kinded parameters. Map the property with HasColumnType(\"timestamptz\") or use DateTimeOffset."
@@ -391,7 +580,10 @@ public sealed class RetentionStartupValidator(
         List<string> errors
     )
     {
-        var visited = new HashSet<Microsoft.EntityFrameworkCore.Metadata.IEntityType> { entityType };
+        var visited = new HashSet<Microsoft.EntityFrameworkCore.Metadata.IEntityType>
+        {
+            entityType,
+        };
         var queue = new Queue<Microsoft.EntityFrameworkCore.Metadata.IEntityType>();
         queue.Enqueue(entityType);
 
@@ -411,7 +603,10 @@ public sealed class RetentionStartupValidator(
                     continue;
                 }
 
-                if (dependent.ClrType.GetCustomAttribute<RetainAttribute>(inherit: false) is not null)
+                if (
+                    dependent.ClrType.GetCustomAttribute<RetainAttribute>(inherit: false)
+                    is not null
+                )
                 {
                     errors.Add(
                         $"[Retain] on {entityType.ClrType.FullName}: purging this entity cascades (ON DELETE CASCADE) into retained entity {dependent.ClrType.FullName}, bypassing that entity's retention window, legal holds, and audit trail. Configure the relationship with DeleteBehavior.Restrict or NoAction so dependents are retired by their own retention rules."
@@ -445,7 +640,11 @@ public sealed class RetentionStartupValidator(
 
         if (markedPropertyNames.Length > 1)
         {
-            var markerName = typeof(TAttribute).Name.Replace("Attribute", "", StringComparison.Ordinal);
+            var markerName = typeof(TAttribute).Name.Replace(
+                "Attribute",
+                "",
+                StringComparison.Ordinal
+            );
             errors.Add(
                 $"Marker convention on {clrType.FullName}: [{markerName}] is declared on multiple properties ({string.Join(", ", markedPropertyNames)}); exactly one is allowed."
             );
@@ -461,4 +660,11 @@ public sealed class RetentionStartupValidator(
 
         return !IsNonNullableValueType(property.PropertyType);
     }
+}
+
+internal sealed class RetentionValidationState
+{
+    internal SemaphoreSlim Gate { get; } = new(1, 1);
+
+    internal bool Validated { get; set; }
 }

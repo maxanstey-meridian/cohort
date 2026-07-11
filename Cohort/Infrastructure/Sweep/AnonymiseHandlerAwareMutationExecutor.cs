@@ -1,6 +1,5 @@
 using System.Data.Common;
 using System.Reflection;
-
 using Cohort.Application;
 using Cohort.Domain;
 
@@ -37,12 +36,24 @@ internal sealed class AnonymiseHandlerAwareMutationExecutor(
         CancellationToken ct
     )
     {
-        return (Task<SweepExecutionResult>)ExecuteCoreMethod
-            .MakeGenericMethod(entry.EntityType)
-            .Invoke(
-                this,
-                [entry, rule, ctx, conn, transaction, candidateRecordIds, filter, handlers, execution, ct]
-            )!;
+        return (Task<SweepExecutionResult>)
+            ExecuteCoreMethod
+                .MakeGenericMethod(entry.EntityType)
+                .Invoke(
+                    this,
+                    [
+                        entry,
+                        rule,
+                        ctx,
+                        conn,
+                        transaction,
+                        candidateRecordIds,
+                        filter,
+                        handlers,
+                        execution,
+                        ct,
+                    ]
+                )!;
     }
 
     private async Task<SweepExecutionResult> ExecuteCoreAsync<TEntity>(
@@ -67,39 +78,62 @@ internal sealed class AnonymiseHandlerAwareMutationExecutor(
             ct
         );
         var recordIdProperty =
-            typeof(TEntity).GetProperty(entry.RecordId.RecordIdMember)
+            ReflectionMemberResolver.FindPropertyByName(
+                typeof(TEntity),
+                entry.RecordId.RecordIdMember
+            )
             ?? throw new InvalidOperationException(
                 $"Retention entry for {entry.EntityType.FullName} references missing record-id member '{entry.RecordId.RecordIdMember}'."
             );
-        var candidateOrder = candidateRecordIds
-            .Select((recordId, index) => new KeyValuePair<string, int>(recordId, index))
-            .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
-        var orderedRows = rows
-            .OrderBy(
-                row =>
-                {
-                    var recordId = recordIdProperty.GetValue(row)?.ToString();
-                    return recordId is not null && candidateOrder.TryGetValue(recordId, out var index)
-                        ? index
-                        : int.MaxValue;
-                }
-            )
-            .ToArray();
-        var staticAssignments = assignmentResolver.CreateStaticAssignments(entry, ctx.Tenant.Id, ctx.Now);
-        var affectedRecordIds = new List<string>();
-        var heldCount = candidateRecordIds.Count - rows.Count;
-        var skippedRecordIds = new List<string>();
-
-        foreach (var row in orderedRows)
+        var canonicalRows = new List<(TEntity Row, string RecordId)>(rows.Count);
+        var recordIdConverter = rowLoader
+            .Model.FindEntityType(typeof(TEntity))
+            ?.FindProperty(entry.RecordId.RecordIdMember)
+            ?.GetTypeMapping()
+            .Converter;
+        foreach (var row in rows)
         {
-            var recordId = recordIdProperty.GetValue(row)?.ToString();
-            if (string.IsNullOrWhiteSpace(recordId))
+            var recordIdValue = recordIdProperty.GetValue(row);
+            if (recordIdValue is null)
             {
                 throw new InvalidOperationException(
                     $"Retention row for {entry.EntityType.FullName} produced an empty record id for member '{entry.RecordId.RecordIdMember}'."
                 );
             }
+            canonicalRows.Add(
+                (
+                    row,
+                    await RecordIdSql.CanonicalizeAsync(
+                        conn,
+                        transaction,
+                        entry.RecordId,
+                        recordIdConverter?.ConvertToProvider(recordIdValue) ?? recordIdValue,
+                        ct
+                    )
+                )
+            );
+        }
+        var candidateOrder = candidateRecordIds
+            .Select((recordId, index) => new KeyValuePair<string, int>(recordId, index))
+            .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
+        var orderedRows = canonicalRows.OrderBy(item =>
+            {
+                return candidateOrder.TryGetValue(item.RecordId, out var index)
+                    ? index
+                    : int.MaxValue;
+            })
+            .ToArray();
+        var staticAssignments = assignmentResolver.CreateStaticAssignments(
+            entry,
+            ctx.Tenant.Id,
+            ctx.Now
+        );
+        var affectedRecordIds = new List<string>();
+        var heldCount = candidateRecordIds.Count - rows.Count;
+        var skippedRecordIds = new List<string>();
 
+        foreach (var (row, recordId) in orderedRows)
+        {
             var beforeContext = new RetentionBeforeContext(
                 execution.SweepId,
                 entry.Category,
@@ -146,7 +180,8 @@ internal sealed class AnonymiseHandlerAwareMutationExecutor(
                     staticAssignments,
                     filter,
                     ct
-                ) is null
+                )
+                is null
             )
             {
                 heldCount++;

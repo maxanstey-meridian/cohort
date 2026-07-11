@@ -1,11 +1,8 @@
 using Cohort.Application;
 using Cohort.Domain;
-using Cohort.Hosting;
-using Cohort.Infrastructure.Sweep;
+using Cohort.Infrastructure;
 using Cohort.Sample.Entities;
-
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Options;
 
 namespace Cohort.Sample.Tests;
 
@@ -19,7 +16,7 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Succeeds_For_Retained_Entities_With_Static_Resolvers()
     {
         var options = new DbContextOptionsBuilder<SampleDbContext>()
-            .UseInMemoryDatabase($"startup-validator-static-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-static-{Guid.NewGuid()}")
             .Options;
         await using var db = new SampleDbContext(options);
         var repository = new GuardedSampleCategoryRepository();
@@ -30,10 +27,28 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
+    public async Task ValidateAsync_Does_Not_Repeat_A_Successful_Full_Validation_In_The_Same_Scope()
+    {
+        var options = new DbContextOptionsBuilder<SampleDbContext>()
+            .UseNpgsqlMetadataModel($"startup-validator-once-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new SampleDbContext(options);
+        var repository = new CountingCategoryRepository(new GuardedSampleCategoryRepository());
+        var validator = CreateValidator(db, repository);
+
+        await validator.ValidateAsync();
+        var callsAfterFirstValidation = repository.GetAsyncCount;
+        await validator.ValidateAsync();
+
+        callsAfterFirstValidation.Should().BeGreaterThan(0);
+        repository.GetAsyncCount.Should().Be(callsAfterFirstValidation);
+    }
+
+    [Fact]
     public async Task ValidateAsync_Allows_Deferred_Resolvers_At_Startup()
     {
         var options = new DbContextOptionsBuilder<SampleDbContext>()
-            .UseInMemoryDatabase($"startup-validator-deferred-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-deferred-{Guid.NewGuid()}")
             .Options;
         await using var db = new SampleDbContext(options);
         var repository = new DeferredSampleCategoryRepository();
@@ -47,13 +62,12 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Allows_Opaque_Deferred_Resolvers_Without_Declaring_Possible_Strategies()
     {
         var options = new DbContextOptionsBuilder<SampleDbContext>()
-            .UseInMemoryDatabase($"startup-validator-opaque-deferred-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-opaque-deferred-{Guid.NewGuid()}")
             .Options;
         await using var db = new SampleDbContext(options);
 
         var act = async () =>
-            await CreateValidator(db, new OpaqueDeferredSampleCategoryRepository())
-                .ValidateAsync();
+            await CreateValidator(db, new OpaqueDeferredSampleCategoryRepository()).ValidateAsync();
 
         await act.Should().NotThrowAsync();
     }
@@ -62,7 +76,7 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Allows_Opaque_Deferred_Resolvers_On_Entities_With_Only_Anonymise_Convention()
     {
         var options = new DbContextOptionsBuilder<SampleDbContext>()
-            .UseInMemoryDatabase($"startup-validator-opaque-anonymise-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-opaque-anonymise-{Guid.NewGuid()}")
             .Options;
         await using var db = new SampleDbContext(options);
 
@@ -77,7 +91,7 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Allows_Exempt_Sample_Entities_Without_Category_Resolution()
     {
         var options = new DbContextOptionsBuilder<SampleDbContext>()
-            .UseInMemoryDatabase($"startup-validator-exempt-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-exempt-{Guid.NewGuid()}")
             .Options;
         await using var db = new SampleDbContext(options);
 
@@ -91,26 +105,75 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Passes_For_Unannotated_Entities_As_Implicitly_Exempt()
     {
         var options = new DbContextOptionsBuilder<MissingAttributeDbContext>()
-            .UseInMemoryDatabase($"startup-validator-missing-attribute-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-missing-attribute-{Guid.NewGuid()}")
             .Options;
         await using var db = new MissingAttributeDbContext(options);
 
         var act = async () =>
-            await new RetentionStartupValidator(db, InMemoryCategoryRepository.Empty, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
+            await new RetentionStartupValidator(
+                db,
+                InMemoryCategoryRepository.Empty,
+                new RetentionEntryBuilder(new RetentionModelConventions())
+            ).ValidateAsync();
 
         await act.Should().NotThrowAsync();
     }
 
     [Fact]
+    public async Task ValidateAsync_Rejects_A_Retained_Entity_Without_A_Stable_Identity()
+    {
+        var options = new DbContextOptionsBuilder<MissingRetentionIdentityDbContext>()
+            .UseNpgsqlMetadataModel($"startup-validator-missing-identity-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new MissingRetentionIdentityDbContext(options);
+
+        var act = async () =>
+            await CreateValidator(db, IdentityCategoryRepository()).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception
+            .Which.Errors.Should()
+            .ContainSingle(error =>
+                error.Contains("must declare [RetentionEntityId", StringComparison.Ordinal)
+            );
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Rejects_Duplicate_Retention_Entity_Identities()
+    {
+        var options = new DbContextOptionsBuilder<DuplicateRetentionIdentityDbContext>()
+            .UseNpgsqlMetadataModel($"startup-validator-duplicate-identity-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new DuplicateRetentionIdentityDbContext(options);
+
+        var act = async () =>
+            await CreateValidator(db, IdentityCategoryRepository()).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception
+            .Which.Errors.Should()
+            .ContainSingle(error =>
+                error.Contains("identities must be unique", StringComparison.Ordinal)
+            );
+    }
+
+    private static InMemoryCategoryRepository IdentityCategoryRepository() =>
+        new(new Dictionary<string, IRetentionRuleResolver> { ["identity"] = ExemptResolver });
+
+    [Fact]
     public async Task ValidateAsync_Rejects_Entities_With_Both_Retention_And_Exemption_Metadata()
     {
         var options = new DbContextOptionsBuilder<ConflictingAttributeDbContext>()
-            .UseInMemoryDatabase($"startup-validator-conflicting-attribute-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-conflicting-attribute-{Guid.NewGuid()}")
             .Options;
         await using var db = new ConflictingAttributeDbContext(options);
 
         var act = async () =>
-            await new RetentionStartupValidator(db, InMemoryCategoryRepository.Empty, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
+            await new RetentionStartupValidator(
+                db,
+                InMemoryCategoryRepository.Empty,
+                new RetentionEntryBuilder(new RetentionModelConventions())
+            ).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle();
@@ -127,7 +190,7 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Rejects_Invalid_Retention_Anchor_Metadata()
     {
         var options = new DbContextOptionsBuilder<BrokenAnnotationDbContext>()
-            .UseInMemoryDatabase($"startup-validator-invalid-anchor-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-invalid-anchor-{Guid.NewGuid()}")
             .Options;
         await using var db = new BrokenAnnotationDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -139,7 +202,12 @@ public sealed class RetentionStartupValidatorTests
             }
         );
 
-        var act = async () => await new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
+        var act = async () =>
+            await new RetentionStartupValidator(
+                db,
+                repository,
+                new RetentionEntryBuilder(new RetentionModelConventions())
+            ).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle();
@@ -156,54 +224,33 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Rejects_Missing_Category_Resolvers()
     {
         var options = new DbContextOptionsBuilder<SampleDbContext>()
-            .UseInMemoryDatabase($"startup-validator-missing-category-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-missing-category-{Guid.NewGuid()}")
             .Options;
         await using var db = new SampleDbContext(options);
 
         var act = async () =>
-            await new RetentionStartupValidator(db, InMemoryCategoryRepository.Empty, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
+            await new RetentionStartupValidator(
+                db,
+                InMemoryCategoryRepository.Empty,
+                new RetentionEntryBuilder(new RetentionModelConventions())
+            ).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().HaveCount(9);
         exception
             .Which.Errors.Should()
-            .Contain(
-                $"Retention category 'short-lived' for entity {typeof(Note).FullName} could not be resolved."
-            );
-        exception
-            .Which.Errors.Should()
-            .Contain(
-                $"Retention category 'blob-cleanup' for entity {typeof(BlobBackedFile).FullName} could not be resolved."
-            );
-        exception
-            .Which.Errors.Should()
-            .Contain(
-                $"Retention category 'soft-delete' for entity {typeof(SoftDeleteRecord).FullName} could not be resolved."
-            );
-        exception
-            .Which.Errors.Should()
-            .Contain(
-                $"Retention category 'anonymise' for entity {typeof(AnonymisedContact).FullName} could not be resolved."
-            );
-        exception
-            .Which.Errors.Should()
-            .Contain(
-                $"Retention category 'tenantless-purge' for entity {typeof(TenantlessLog).FullName} could not be resolved."
-            );
-        exception
-            .Which.Errors.Should()
-            .Contain(
-                $"Retention category 'tenantless-softdelete' for entity {typeof(TenantlessSoftDelete).FullName} could not be resolved."
-            );
-        exception
-            .Which.Errors.Should()
-            .Contain(
-                $"Retention category 'per-row-audit-override' for entity {typeof(PerRowAuditedLog).FullName} could not be resolved."
-            );
-        exception
-            .Which.Errors.Should()
-            .Contain(
-                $"Retention category 'tombstone-anonymise' for entity {typeof(TombstoneRecord).FullName} could not be resolved."
+            .BeEquivalentTo(
+                [
+                    $"Retention category 'short-lived' for entity {typeof(Note).FullName} could not be resolved.",
+                    $"Retention category 'blob-cleanup' for entity {typeof(BlobBackedFile).FullName} could not be resolved.",
+                    $"Retention category 'soft-delete' for entity {typeof(SoftDeleteRecord).FullName} could not be resolved.",
+                    $"Retention category 'anonymise' for entity {typeof(AnonymisedContact).FullName} could not be resolved.",
+                    $"Retention category 'tenantless-purge' for entity {typeof(TenantlessLog).FullName} could not be resolved.",
+                    $"Retention category 'tenantless-purge' for entity {typeof(ExternalNumberedLog).FullName} could not be resolved.",
+                    $"Retention category 'tenantless-softdelete' for entity {typeof(TenantlessSoftDelete).FullName} could not be resolved.",
+                    $"Retention category 'per-row-audit-override' for entity {typeof(PerRowAuditedLog).FullName} could not be resolved.",
+                    $"Retention category 'tombstone-anonymise' for entity {typeof(TombstoneRecord).FullName} could not be resolved.",
+                    $"Retention category 'nullable-anchor-purge' for entity {typeof(NullableAnchorEvent).FullName} could not be resolved.",
+                ]
             );
         exception.Which.Message.Should().Contain("short-lived");
         exception.Which.Message.Should().Contain("soft-delete");
@@ -214,7 +261,7 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Aggregates_Multiple_Independent_Failures()
     {
         var options = new DbContextOptionsBuilder<AggregateFailureDbContext>()
-            .UseInMemoryDatabase($"startup-validator-aggregate-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-aggregate-{Guid.NewGuid()}")
             .Options;
         await using var db = new AggregateFailureDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -248,7 +295,7 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Aggregates_Throwing_Startup_Resolvers_With_Other_Failures()
     {
         var options = new DbContextOptionsBuilder<ThrowingResolverAggregateDbContext>()
-            .UseInMemoryDatabase($"startup-validator-throwing-resolver-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-throwing-resolver-{Guid.NewGuid()}")
             .Options;
         await using var db = new ThrowingResolverAggregateDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -271,218 +318,10 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
-    public async Task Startup_Service_Validates_Before_Scanning_Registry_Metadata()
-    {
-        var options = new DbContextOptionsBuilder<BrokenAnnotationDbContext>()
-            .UseInMemoryDatabase($"startup-service-invalid-anchor-{Guid.NewGuid()}")
-            .Options;
-        await using var db = new BrokenAnnotationDbContext(options);
-        var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
-            {
-                ["broken-sample"] = new StaticRetentionRuleResolver(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
-                ),
-            }
-        );
-        var startup = CreateStartupService(db, repository);
-
-        var act = async () => await startup.RunAsync();
-
-        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().ContainSingle();
-        exception
-            .Which.Errors[0]
-            .Should()
-            .Be(
-                $"[Retain] on {typeof(BrokenAnnotationEntity).FullName}: anchor '{nameof(BrokenAnnotationEntity.Body)}' must be DateTime or DateTimeOffset (nullable allowed), got String."
-            );
-    }
-
-    [Fact]
-    public async Task Startup_Service_Validates_Before_Previewing_Sweep_Candidates()
-    {
-        var options = new DbContextOptionsBuilder<BrokenAnnotationDbContext>()
-            .UseInMemoryDatabase($"startup-service-preview-invalid-anchor-{Guid.NewGuid()}")
-            .Options;
-        await using var db = new BrokenAnnotationDbContext(options);
-        var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
-            {
-                ["broken-sample"] = new StaticRetentionRuleResolver(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
-                ),
-            }
-        );
-        var startup = CreateStartupService(db, repository);
-
-        var act = async () =>
-            await startup.RunPreviewAsync(
-                new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
-                DateTimeOffset.UtcNow
-            );
-
-        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().ContainSingle();
-        exception
-            .Which.Errors[0]
-            .Should()
-            .Be(
-                $"[Retain] on {typeof(BrokenAnnotationEntity).FullName}: anchor '{nameof(BrokenAnnotationEntity.Body)}' must be DateTime or DateTimeOffset (nullable allowed), got String."
-            );
-    }
-
-    [Fact]
-    public async Task Startup_Service_Validates_Before_Sweeping_Retained_Entities()
-    {
-        var options = new DbContextOptionsBuilder<BrokenAnnotationDbContext>()
-            .UseInMemoryDatabase($"startup-service-sweep-invalid-anchor-{Guid.NewGuid()}")
-            .Options;
-        await using var db = new BrokenAnnotationDbContext(options);
-        var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
-            {
-                ["broken-sample"] = new StaticRetentionRuleResolver(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
-                ),
-            }
-        );
-        var startup = CreateStartupService(db, repository);
-
-        var act = async () =>
-            await startup.RunSweepAsync(
-                new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
-                DateTimeOffset.UtcNow
-            );
-
-        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().ContainSingle();
-        exception
-            .Which.Errors[0]
-            .Should()
-            .Be(
-                $"[Retain] on {typeof(BrokenAnnotationEntity).FullName}: anchor '{nameof(BrokenAnnotationEntity.Body)}' must be DateTime or DateTimeOffset (nullable allowed), got String."
-            );
-    }
-
-    [Fact]
-    public async Task Startup_Service_Validates_Before_Erasing_Subject_Matched_Entities()
-    {
-        var options = new DbContextOptionsBuilder<BrokenAnnotationDbContext>()
-            .UseInMemoryDatabase($"startup-service-erasure-invalid-anchor-{Guid.NewGuid()}")
-            .Options;
-        await using var db = new BrokenAnnotationDbContext(options);
-        var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
-            {
-                ["broken-sample"] = new StaticRetentionRuleResolver(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
-                ),
-            }
-        );
-        var startup = CreateStartupService(db, repository);
-
-        var act = async () =>
-            await startup.RunErasureAsync(
-                new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
-                new ErasureScope(Guid.NewGuid()),
-                DateTimeOffset.UtcNow
-            );
-
-        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().ContainSingle();
-        exception
-            .Which.Errors[0]
-            .Should()
-            .Be(
-                $"[Retain] on {typeof(BrokenAnnotationEntity).FullName}: anchor '{nameof(BrokenAnnotationEntity.Body)}' must be DateTime or DateTimeOffset (nullable allowed), got String."
-            );
-    }
-
-    [Fact]
-    public async Task Sweep_Engine_Validates_Before_Sweeping_Retained_Entities()
-    {
-        var options = new DbContextOptionsBuilder<BrokenAnnotationDbContext>()
-            .UseInMemoryDatabase($"sweep-engine-invalid-anchor-{Guid.NewGuid()}")
-            .Options;
-        await using var db = new BrokenAnnotationDbContext(options);
-        var repository = CreateBrokenAnnotationRepository();
-        var engine = CreateSweepEngine(db, repository);
-
-        var act = async () =>
-            await engine.SweepAsync(
-                new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
-                DateTimeOffset.UtcNow
-            );
-
-        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().ContainSingle();
-        exception
-            .Which.Errors[0]
-            .Should()
-            .Be(
-                $"[Retain] on {typeof(BrokenAnnotationEntity).FullName}: anchor '{nameof(BrokenAnnotationEntity.Body)}' must be DateTime or DateTimeOffset (nullable allowed), got String."
-            );
-    }
-
-    [Fact]
-    public async Task Preview_Service_Validates_Before_Previewing_Sweep_Candidates()
-    {
-        var options = new DbContextOptionsBuilder<BrokenAnnotationDbContext>()
-            .UseInMemoryDatabase($"preview-service-invalid-anchor-{Guid.NewGuid()}")
-            .Options;
-        await using var db = new BrokenAnnotationDbContext(options);
-        var repository = CreateBrokenAnnotationRepository();
-        var preview = CreatePreviewService(db, repository);
-
-        var act = async () =>
-            await preview.PreviewAsync(
-                new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
-                DateTimeOffset.UtcNow
-            );
-
-        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().ContainSingle();
-        exception
-            .Which.Errors[0]
-            .Should()
-            .Be(
-                $"[Retain] on {typeof(BrokenAnnotationEntity).FullName}: anchor '{nameof(BrokenAnnotationEntity.Body)}' must be DateTime or DateTimeOffset (nullable allowed), got String."
-            );
-    }
-
-    [Fact]
-    public async Task Erasure_Service_Validates_Before_Erasing_Subject_Matched_Entities()
-    {
-        var options = new DbContextOptionsBuilder<BrokenAnnotationDbContext>()
-            .UseInMemoryDatabase($"erasure-service-invalid-anchor-{Guid.NewGuid()}")
-            .Options;
-        await using var db = new BrokenAnnotationDbContext(options);
-        var repository = CreateBrokenAnnotationRepository();
-        var erasure = CreateErasureService(db, repository);
-
-        var act = async () =>
-            await erasure.EraseAsync(
-                new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
-                new ErasureScope(Guid.NewGuid()),
-                DateTimeOffset.UtcNow
-            );
-
-        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().ContainSingle();
-        exception
-            .Which.Errors[0]
-            .Should()
-            .Be(
-                $"[Retain] on {typeof(BrokenAnnotationEntity).FullName}: anchor '{nameof(BrokenAnnotationEntity.Body)}' must be DateTime or DateTimeOffset (nullable allowed), got String."
-            );
-    }
-
-    [Fact]
     public async Task ValidateAsync_Rejects_Invalid_Tenant_Metadata()
     {
         var options = new DbContextOptionsBuilder<InvalidTenantDbContext>()
-            .UseInMemoryDatabase($"startup-validator-invalid-tenant-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-invalid-tenant-{Guid.NewGuid()}")
             .Options;
         await using var db = new InvalidTenantDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -502,32 +341,140 @@ public sealed class RetentionStartupValidatorTests
             .Which.Errors[0]
             .Should()
             .Be(
-                $"Tenant convention on {typeof(InvalidTenantRecord).FullName}: TenantId must be Guid or nullable Guid, got String."
+                $"Tenant convention on {typeof(InvalidTenantRecord).FullName}: TenantId must be a non-nullable Guid, got String."
             );
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Rejects_Nullable_Clr_Tenant_Properties()
+    {
+        var options = new DbContextOptionsBuilder<NullableClrTenantDbContext>()
+            .UseNpgsqlMetadataModel($"startup-validator-nullable-clr-tenant-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new NullableClrTenantDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver> { ["nullable-tenant"] = ExemptResolver }
+        );
+
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Tenant convention on {typeof(NullableClrTenantRecord).FullName}: TenantId must be a non-nullable Guid, got Nullable`1."
+            );
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Rejects_Record_Id_Properties_That_Do_Not_Uniquely_Identify_Rows()
+    {
+        var options = new DbContextOptionsBuilder<NonUniqueRecordIdDbContext>()
+            .UseNpgsqlMetadataModel($"startup-validator-non-unique-record-id-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new NonUniqueRecordIdDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver> { ["record-id"] = ExemptResolver }
+        );
+
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Record-id convention on {typeof(NonUniqueRecordIdRecord).FullName}: record-id property 'ExternalId' must uniquely identify rows via a single-column primary key, alternate key, or unique index."
+            );
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Rejects_Nullable_Record_Id_Properties()
+    {
+        var options = new DbContextOptionsBuilder<NullableRecordIdDbContext>()
+            .UseNpgsqlMetadataModel($"startup-validator-nullable-record-id-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new NullableRecordIdDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver> { ["record-id"] = ExemptResolver }
+        );
+
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Record-id convention on {typeof(NullableRecordIdRecord).FullName}: record-id property 'ExternalId' must be non-nullable in CLR and EF metadata."
+            );
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Rejects_Record_Id_Properties_That_Are_Only_Part_Of_A_Composite_Key()
+    {
+        var options = new DbContextOptionsBuilder<CompositeRecordIdDbContext>()
+            .UseNpgsqlMetadataModel($"startup-validator-composite-record-id-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new CompositeRecordIdDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver> { ["record-id"] = ExemptResolver }
+        );
+
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle();
+        exception
+            .Which.Errors[0]
+            .Should()
+            .Be(
+                $"Record-id convention on {typeof(CompositeRecordIdRecord).FullName}: record-id property 'ExternalId' must uniquely identify rows via a single-column primary key, alternate key, or unique index."
+            );
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Allows_Record_Id_Properties_With_Single_Column_Alternate_Keys_Or_Unique_Indexes()
+    {
+        var options = new DbContextOptionsBuilder<UniqueRecordIdDbContext>()
+            .UseNpgsqlMetadataModel($"startup-validator-unique-record-id-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new UniqueRecordIdDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver> { ["record-id"] = ExemptResolver }
+        );
+
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
+
+        await act.Should().NotThrowAsync();
     }
 
     [Fact]
     public void Scan_Leaves_Tenant_Metadata_Null_But_Only_Records_Explicit_Tenantless_Intent_When_Marked()
     {
         var explicitOptions = new DbContextOptionsBuilder<ExplicitTenantlessSoftDeleteDbContext>()
-            .UseInMemoryDatabase($"registry-explicit-tenantless-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"registry-explicit-tenantless-{Guid.NewGuid()}")
             .Options;
         using var explicitDb = new ExplicitTenantlessSoftDeleteDbContext(explicitOptions);
         var explicitEntry = new RetentionRegistry(
             explicitDb,
-            new RetentionEntryBuilder(new CohortConventions())
+            new RetentionEntryBuilder(new RetentionModelConventions())
         ).Scan()[typeof(ExplicitTenantlessSoftDeleteRecord)];
 
         explicitEntry.Tenant.Should().BeNull();
         explicitEntry.IsExplicitlyTenantless.Should().BeTrue();
 
         var missingOptions = new DbContextOptionsBuilder<MissingSoftDeleteTenantDbContext>()
-            .UseInMemoryDatabase($"registry-missing-tenant-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"registry-missing-tenant-{Guid.NewGuid()}")
             .Options;
         using var missingDb = new MissingSoftDeleteTenantDbContext(missingOptions);
         var missingEntry = new RetentionRegistry(
             missingDb,
-            new RetentionEntryBuilder(new CohortConventions())
+            new RetentionEntryBuilder(new RetentionModelConventions())
         ).Scan()[typeof(MissingSoftDeleteTenantRecord)];
 
         missingEntry.Tenant.Should().BeNull();
@@ -538,7 +485,7 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Rejects_SoftDelete_Categories_Without_A_Public_Bool_IsDeleted_Property()
     {
         var options = new DbContextOptionsBuilder<InvalidSoftDeleteIsDeletedDbContext>()
-            .UseInMemoryDatabase($"startup-validator-invalid-soft-delete-flag-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-invalid-soft-delete-flag-{Guid.NewGuid()}")
             .Options;
         await using var db = new InvalidSoftDeleteIsDeletedDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -566,7 +513,9 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Rejects_SoftDelete_Categories_With_Invalid_DeletedAt_Types()
     {
         var options = new DbContextOptionsBuilder<InvalidSoftDeleteDeletedAtDbContext>()
-            .UseInMemoryDatabase($"startup-validator-invalid-soft-delete-deleted-at-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel(
+                $"startup-validator-invalid-soft-delete-deleted-at-{Guid.NewGuid()}"
+            )
             .Options;
         await using var db = new InvalidSoftDeleteDeletedAtDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -594,7 +543,9 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Rejects_Retained_Entities_Without_Tenant_Metadata_Unless_Explicitly_Tenantless()
     {
         var options = new DbContextOptionsBuilder<MissingSoftDeleteTenantDbContext>()
-            .UseInMemoryDatabase($"startup-validator-missing-soft-delete-tenant-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel(
+                $"startup-validator-missing-soft-delete-tenant-{Guid.NewGuid()}"
+            )
             .Options;
         await using var db = new MissingSoftDeleteTenantDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -614,7 +565,7 @@ public sealed class RetentionStartupValidatorTests
             .Which.Errors[0]
             .Should()
             .Be(
-                $"Tenant convention on {typeof(MissingSoftDeleteTenantRecord).FullName}: retained entities must expose a public Guid or nullable Guid tenant property named 'TenantId' by convention, or mark the tenant property with [RetentionTenant], unless the entity is explicitly marked with [RetentionTenantless]."
+                $"Tenant convention on {typeof(MissingSoftDeleteTenantRecord).FullName}: retained entities must expose a public non-nullable Guid tenant property named 'TenantId' by convention, or mark the tenant property with [RetentionTenant], unless the entity is explicitly marked with [RetentionTenantless]."
             );
     }
 
@@ -622,7 +573,9 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Allows_Explicitly_Tenantless_SoftDelete_Categories()
     {
         var options = new DbContextOptionsBuilder<ExplicitTenantlessSoftDeleteDbContext>()
-            .UseInMemoryDatabase($"startup-validator-explicit-tenantless-soft-delete-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel(
+                $"startup-validator-explicit-tenantless-soft-delete-{Guid.NewGuid()}"
+            )
             .Options;
         await using var db = new ExplicitTenantlessSoftDeleteDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -643,7 +596,7 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Rejects_Anonymise_Categories_Without_Annotated_Fields()
     {
         var options = new DbContextOptionsBuilder<SampleDbContext>()
-            .UseInMemoryDatabase($"startup-validator-missing-anonymise-fields-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-missing-anonymise-fields-{Guid.NewGuid()}")
             .Options;
         await using var db = new SampleDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -689,7 +642,7 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Rejects_Anonymise_Categories_With_Invalid_Method_Type_Mismatches()
     {
         var options = new DbContextOptionsBuilder<InvalidAnonymiseMethodDbContext>()
-            .UseInMemoryDatabase($"startup-validator-invalid-anonymise-methods-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-invalid-anonymise-methods-{Guid.NewGuid()}")
             .Options;
         await using var db = new InvalidAnonymiseMethodDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -707,7 +660,12 @@ public sealed class RetentionStartupValidatorTests
             }
         );
 
-        var act = async () => await new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
+        var act = async () =>
+            await new RetentionStartupValidator(
+                db,
+                repository,
+                new RetentionEntryBuilder(new RetentionModelConventions())
+            ).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().HaveCount(3);
@@ -732,7 +690,9 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Rejects_FactoryBacked_Anonymise_Fields_With_Invalid_Factory_Types()
     {
         var options = new DbContextOptionsBuilder<InvalidFactoryTypeAnonymiseDbContext>()
-            .UseInMemoryDatabase($"startup-validator-factory-backed-invalid-type-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel(
+                $"startup-validator-factory-backed-invalid-type-{Guid.NewGuid()}"
+            )
             .Options;
         await using var db = new InvalidFactoryTypeAnonymiseDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -744,8 +704,7 @@ public sealed class RetentionStartupValidatorTests
             }
         );
 
-        var act = async () =>
-            await CreateValidator(db, repository).ValidateAsync();
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle();
@@ -761,7 +720,9 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Rejects_FactoryBacked_Anonymise_Fields_That_Are_Not_Registered()
     {
         var options = new DbContextOptionsBuilder<FactoryBackedAnonymiseDbContext>()
-            .UseInMemoryDatabase($"startup-validator-factory-backed-unregistered-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel(
+                $"startup-validator-factory-backed-unregistered-{Guid.NewGuid()}"
+            )
             .Options;
         await using var db = new FactoryBackedAnonymiseDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -773,8 +734,7 @@ public sealed class RetentionStartupValidatorTests
             }
         );
 
-        var act = async () =>
-            await CreateValidator(db, repository).ValidateAsync();
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle();
@@ -790,7 +750,9 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Rejects_Null_Anonymise_On_NonNullable_Reference_Types()
     {
         var options = new DbContextOptionsBuilder<InvalidNullReferenceAnonymiseDbContext>()
-            .UseInMemoryDatabase($"startup-validator-invalid-null-reference-anonymise-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel(
+                $"startup-validator-invalid-null-reference-anonymise-{Guid.NewGuid()}"
+            )
             .Options;
         await using var db = new InvalidNullReferenceAnonymiseDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -802,7 +764,12 @@ public sealed class RetentionStartupValidatorTests
             }
         );
 
-        var act = async () => await new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
+        var act = async () =>
+            await new RetentionStartupValidator(
+                db,
+                repository,
+                new RetentionEntryBuilder(new RetentionModelConventions())
+            ).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle();
@@ -815,10 +782,80 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
+    public async Task ValidateAsync_Rejects_Null_Anonymise_When_EF_Property_Is_Required()
+    {
+        var options = new DbContextOptionsBuilder<RequiredNullableAnonymiseDbContext>()
+            .UseNpgsqlMetadataModel($"startup-validator-required-null-anonymise-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new RequiredNullableAnonymiseDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["required-null-anonymise"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                ),
+            }
+        );
+
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception
+            .Which.Errors.Should()
+            .ContainSingle()
+            .Which.Should()
+            .Contain("EF metadata is non-nullable");
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Rejects_Anonymise_Fields_That_Overlap_Structural_Roles()
+    {
+        var options = new DbContextOptionsBuilder<StructuralAnonymiseDbContext>()
+            .UseNpgsqlMetadataModel($"startup-validator-structural-anonymise-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new StructuralAnonymiseDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, IRetentionRuleResolver>
+            {
+                ["structural-anonymise"] = new StaticRetentionRuleResolver(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                ),
+            }
+        );
+
+        var act = async () =>
+            await new RetentionStartupValidator(
+                db,
+                repository,
+                new RetentionEntryBuilder(new RetentionModelConventions()),
+                [new TestAnonymiseValueFactory()]
+            ).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception
+            .Which.Errors.Should()
+            .Contain(error => error.Contains("record ID") && error.Contains("Id"));
+        exception
+            .Which.Errors.Should()
+            .Contain(error => error.Contains("tenant") && error.Contains("TenantId"));
+        exception
+            .Which.Errors.Should()
+            .Contain(error => error.Contains("anchor") && error.Contains("CreatedAt"));
+        exception
+            .Which.Errors.Should()
+            .Contain(error => error.Contains("soft-delete") && error.Contains("IsDeleted"));
+        exception
+            .Which.Errors.Should()
+            .Contain(error => error.Contains("AnonymisedAt") && error.Contains("AnonymisedAt"));
+    }
+
+    [Fact]
     public async Task ValidateAsync_Allows_Explicitly_Tenantless_Anonymise_Categories()
     {
         var options = new DbContextOptionsBuilder<ExplicitTenantlessAnonymiseDbContext>()
-            .UseInMemoryDatabase($"startup-validator-explicit-tenantless-anonymise-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel(
+                $"startup-validator-explicit-tenantless-anonymise-{Guid.NewGuid()}"
+            )
             .Options;
         await using var db = new ExplicitTenantlessAnonymiseDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -830,7 +867,12 @@ public sealed class RetentionStartupValidatorTests
             }
         );
 
-        var act = async () => await new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
+        var act = async () =>
+            await new RetentionStartupValidator(
+                db,
+                repository,
+                new RetentionEntryBuilder(new RetentionModelConventions())
+            ).ValidateAsync();
 
         await act.Should().NotThrowAsync();
     }
@@ -839,7 +881,7 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Allows_Opaque_Deferred_Explicitly_Tenantless_SoftDelete_Categories()
     {
         var options = new DbContextOptionsBuilder<ExplicitTenantlessSoftDeleteDbContext>()
-            .UseInMemoryDatabase(
+            .UseNpgsqlMetadataModel(
                 $"startup-validator-opaque-explicit-tenantless-soft-delete-{Guid.NewGuid()}"
             )
             .Options;
@@ -853,7 +895,12 @@ public sealed class RetentionStartupValidatorTests
             }
         );
 
-        var act = async () => await new RetentionStartupValidator(db, repository, new RetentionEntryBuilder(new CohortConventions())).ValidateAsync();
+        var act = async () =>
+            await new RetentionStartupValidator(
+                db,
+                repository,
+                new RetentionEntryBuilder(new RetentionModelConventions())
+            ).ValidateAsync();
 
         await act.Should().NotThrowAsync();
     }
@@ -862,7 +909,7 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Rejects_Retained_Entities_In_Inheritance_Hierarchies()
     {
         var options = new DbContextOptionsBuilder<InheritanceDbContext>()
-            .UseInMemoryDatabase($"startup-validator-inheritance-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-inheritance-{Guid.NewGuid()}")
             .Options;
         await using var db = new InheritanceDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -890,7 +937,7 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Rejects_Retained_Entities_Mapped_To_NonDefault_Schemas()
     {
         var options = new DbContextOptionsBuilder<NonDefaultSchemaDbContext>()
-            .UseInMemoryDatabase($"startup-validator-schema-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-schema-{Guid.NewGuid()}")
             .Options;
         await using var db = new NonDefaultSchemaDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -918,7 +965,7 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Rejects_Cascade_Delete_Paths_Into_Retained_Entities()
     {
         var options = new DbContextOptionsBuilder<CascadeDeleteDbContext>()
-            .UseInMemoryDatabase($"startup-validator-cascade-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-cascade-{Guid.NewGuid()}")
             .Options;
         await using var db = new CascadeDeleteDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -949,7 +996,7 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Allows_Restrict_Delete_Paths_Between_Retained_Entities()
     {
         var options = new DbContextOptionsBuilder<RestrictDeleteDbContext>()
-            .UseInMemoryDatabase($"startup-validator-restrict-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-restrict-{Guid.NewGuid()}")
             .Options;
         await using var db = new RestrictDeleteDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -973,7 +1020,7 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Rejects_Duplicate_Marker_Attributes()
     {
         var options = new DbContextOptionsBuilder<DuplicateTenantMarkerDbContext>()
-            .UseInMemoryDatabase($"startup-validator-duplicate-marker-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-duplicate-marker-{Guid.NewGuid()}")
             .Options;
         await using var db = new DuplicateTenantMarkerDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -1001,7 +1048,7 @@ public sealed class RetentionStartupValidatorTests
     public async Task ValidateAsync_Rejects_Duplicate_AnonymisedAt_Marker_Attributes()
     {
         var options = new DbContextOptionsBuilder<DuplicateAnonymisedAtMarkerDbContext>()
-            .UseInMemoryDatabase($"startup-validator-duplicate-anonymised-at-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-duplicate-anonymised-at-{Guid.NewGuid()}")
             .Options;
         await using var db = new DuplicateAnonymisedAtMarkerDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -1032,7 +1079,7 @@ public sealed class RetentionStartupValidatorTests
         // entity declaring both would be swept per tenant with the marker silently
         // ignored.
         var options = new DbContextOptionsBuilder<ContradictoryTenantlessDbContext>()
-            .UseInMemoryDatabase($"startup-validator-contradictory-tenantless-{Guid.NewGuid()}")
+            .UseNpgsqlMetadataModel($"startup-validator-contradictory-tenantless-{Guid.NewGuid()}")
             .Options;
         await using var db = new ContradictoryTenantlessDbContext(options);
         var repository = new InMemoryCategoryRepository(
@@ -1103,137 +1150,12 @@ public sealed class RetentionStartupValidatorTests
         await act.Should().NotThrowAsync();
     }
 
-    private static InMemoryCategoryRepository CreateBrokenAnnotationRepository()
-    {
-        return new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
-            {
-                ["broken-sample"] = new StaticRetentionRuleResolver(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
-                ),
-            }
-        );
-    }
-
-    private static SampleRetentionStartupService CreateStartupService(
-        DbContext db,
-        IRetentionCategoryRepository repository
-    )
-    {
-        var registry = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions()));
-        var validator = CreateValidator(db, repository);
-
-        return new SampleRetentionStartupService(
-            registry,
-            validator,
-            new RetentionSweepEngine(
-                db,
-                registry,
-                repository,
-                validator,
-                new NoOpRetentionAuditWriter(),
-                CreateSweepStrategies(db)
-            ),
-            new RetentionPreviewService(
-                db,
-                registry,
-                repository,
-                validator,
-                CreateSweepStrategies(db)
-            ),
-            new RetentionErasureService(
-                db,
-                registry,
-                repository,
-                validator,
-                new NoOpRetentionAuditWriter(),
-                CreateSweepStrategies(db),
-                new StaticOptionsMonitor<CohortOptions>(new CohortOptions())
-            )
-        );
-    }
-
-    private static RetentionSweepEngine CreateSweepEngine(
-        DbContext db,
-        IRetentionCategoryRepository repository
-    )
-    {
-        var registry = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions()));
-        var validator = CreateValidator(db, repository);
-
-        return new RetentionSweepEngine(
-            db,
-            registry,
-            repository,
-            validator,
-            new NoOpRetentionAuditWriter(),
-            CreateSweepStrategies(db)
-        );
-    }
-
-    private static IRetentionPreview CreatePreviewService(
-        DbContext db,
-        IRetentionCategoryRepository repository
-    )
-    {
-        var registry = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions()));
-        var validator = CreateValidator(db, repository);
-
-        return new RetentionPreviewService(
-            db,
-            registry,
-            repository,
-            validator,
-            CreateSweepStrategies(db)
-        );
-    }
-
-    private static IRetentionErasureService CreateErasureService(
-        DbContext db,
-        IRetentionCategoryRepository repository
-    )
-    {
-        var registry = new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions()));
-        var validator = CreateValidator(db, repository);
-
-        return new RetentionErasureService(
-            db,
-            registry,
-            repository,
-            validator,
-            new NoOpRetentionAuditWriter(),
-            CreateSweepStrategies(db),
-            new StaticOptionsMonitor<CohortOptions>(new CohortOptions())
-        );
-    }
-
-    private static IRetentionSweepStrategy[] CreateSweepStrategies(DbContext db)
-    {
-        return [new PurgeSweepStrategy(), new SoftDeleteSweepStrategy(), new AnonymiseSweepStrategy(db)];
-    }
-
-    private sealed class StaticOptionsMonitor<T>(T currentValue) : IOptionsMonitor<T>
-    {
-        public T CurrentValue => currentValue;
-
-        public T Get(string? name)
-        {
-            return currentValue;
-        }
-
-        public IDisposable? OnChange(Action<T, string?> listener)
-        {
-            return null;
-        }
-    }
-
     private sealed class InMemoryCategoryRepository(
         IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
     ) : IRetentionCategoryRepository
     {
-        public static InMemoryCategoryRepository Empty { get; } = new(
-            new Dictionary<string, IRetentionRuleResolver>()
-        );
+        public static InMemoryCategoryRepository Empty { get; } =
+            new(new Dictionary<string, IRetentionRuleResolver>());
 
         public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
         {
@@ -1242,17 +1164,20 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
-
     private sealed class DeferredRuleResolver(RetentionRule rule) : IRetentionRuleResolver
     {
-        public Task<RetentionRule> ResolveAsync(RetentionResolutionContext ctx, CancellationToken ct) =>
-            Task.FromResult(rule);
+        public Task<RetentionRule> ResolveAsync(
+            RetentionResolutionContext ctx,
+            CancellationToken ct
+        ) => Task.FromResult(rule);
     }
 
     private sealed class OpaqueDeferredRuleResolver(RetentionRule rule) : IRetentionRuleResolver
     {
-        public Task<RetentionRule> ResolveAsync(RetentionResolutionContext ctx, CancellationToken ct) =>
-            Task.FromResult(rule);
+        public Task<RetentionRule> ResolveAsync(
+            RetentionResolutionContext ctx,
+            CancellationToken ct
+        ) => Task.FromResult(rule);
     }
 
     private static RetentionStartupValidator CreateValidator(
@@ -1263,7 +1188,7 @@ public sealed class RetentionStartupValidatorTests
         return new RetentionStartupValidator(
             db,
             repository,
-            new RetentionEntryBuilder(new CohortConventions()),
+            new RetentionEntryBuilder(new RetentionModelConventions()),
             [new GuidTombstoneFactory(), new OriginalValueTombstoneFactory()]
         );
     }
@@ -1280,7 +1205,9 @@ public sealed class RetentionStartupValidatorTests
             )
             {
                 return Task.FromResult<IRetentionRuleResolver?>(
-                    new StaticRetentionRuleResolver(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge))
+                    new StaticRetentionRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    )
                 );
             }
 
@@ -1334,7 +1261,9 @@ public sealed class RetentionStartupValidatorTests
             )
             {
                 return Task.FromResult<IRetentionRuleResolver?>(
-                    new DeferredRuleResolver(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge))
+                    new DeferredRuleResolver(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    )
                 );
             }
 
@@ -1364,8 +1293,10 @@ public sealed class RetentionStartupValidatorTests
 
     private sealed class ThrowingStartupRuleResolver(string message) : IRetentionRuleResolver
     {
-        public Task<RetentionRule> ResolveAsync(RetentionResolutionContext ctx, CancellationToken ct) =>
-            Task.FromResult(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge));
+        public Task<RetentionRule> ResolveAsync(
+            RetentionResolutionContext ctx,
+            CancellationToken ct
+        ) => Task.FromResult(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge));
 
         public RetentionRule? TryResolveAtStartup() => throw new InvalidOperationException(message);
     }
@@ -1376,17 +1307,21 @@ public sealed class RetentionStartupValidatorTests
         {
             return category switch
             {
-                "short-lived" or "blob-cleanup" or "tenantless-purge" or "nullable-anchor-purge" or "per-row-audit-override" =>
-                    Task.FromResult<IRetentionRuleResolver?>(
-                        new OpaqueDeferredRuleResolver(
-                            new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
-                        )
-                    ),
-                "soft-delete" or "tenantless-softdelete" => Task.FromResult<IRetentionRuleResolver?>(
+                "short-lived"
+                or "blob-cleanup"
+                or "tenantless-purge"
+                or "nullable-anchor-purge"
+                or "per-row-audit-override" => Task.FromResult<IRetentionRuleResolver?>(
                     new OpaqueDeferredRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                     )
                 ),
+                "soft-delete" or "tenantless-softdelete" =>
+                    Task.FromResult<IRetentionRuleResolver?>(
+                        new OpaqueDeferredRuleResolver(
+                            new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                        )
+                    ),
                 "anonymise" or "tombstone-anonymise" => Task.FromResult<IRetentionRuleResolver?>(
                     new StaticRetentionRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
@@ -1406,17 +1341,21 @@ public sealed class RetentionStartupValidatorTests
         {
             return category switch
             {
-                "short-lived" or "blob-cleanup" or "tenantless-purge" or "nullable-anchor-purge" or "per-row-audit-override" =>
-                    Task.FromResult<IRetentionRuleResolver?>(
-                        new StaticRetentionRuleResolver(
-                            new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
-                        )
-                    ),
-                "soft-delete" or "tenantless-softdelete" => Task.FromResult<IRetentionRuleResolver?>(
+                "short-lived"
+                or "blob-cleanup"
+                or "tenantless-purge"
+                or "nullable-anchor-purge"
+                or "per-row-audit-override" => Task.FromResult<IRetentionRuleResolver?>(
                     new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                     )
                 ),
+                "soft-delete" or "tenantless-softdelete" =>
+                    Task.FromResult<IRetentionRuleResolver?>(
+                        new StaticRetentionRuleResolver(
+                            new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                        )
+                    ),
                 "anonymise" or "tombstone-anonymise" => Task.FromResult<IRetentionRuleResolver?>(
                     new OpaqueDeferredRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
@@ -1429,8 +1368,9 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
-    private sealed class MissingAttributeDbContext(DbContextOptions<MissingAttributeDbContext> options)
-        : DbContext(options)
+    private sealed class MissingAttributeDbContext(
+        DbContextOptions<MissingAttributeDbContext> options
+    ) : DbContext(options)
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
@@ -1458,8 +1398,9 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
-    private sealed class BrokenAnnotationDbContext(DbContextOptions<BrokenAnnotationDbContext> options)
-        : DbContext(options)
+    private sealed class BrokenAnnotationDbContext(
+        DbContextOptions<BrokenAnnotationDbContext> options
+    ) : DbContext(options)
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
@@ -1473,8 +1414,9 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
-    private sealed class AggregateFailureDbContext(DbContextOptions<AggregateFailureDbContext> options)
-        : DbContext(options)
+    private sealed class AggregateFailureDbContext(
+        DbContextOptions<AggregateFailureDbContext> options
+    ) : DbContext(options)
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
@@ -1529,6 +1471,84 @@ public sealed class RetentionStartupValidatorTests
                 entity.HasKey(record => record.Id);
                 entity.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
                 entity.Property(record => record.TenantId).HasColumnName("tenant_id");
+            });
+        }
+    }
+
+    private sealed class NullableClrTenantDbContext(
+        DbContextOptions<NullableClrTenantDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<NullableClrTenantRecord>(entity =>
+            {
+                entity.ToTable("nullable_clr_tenant_records");
+                entity.HasKey(record => record.Id);
+            });
+        }
+    }
+
+    private sealed class NonUniqueRecordIdDbContext(
+        DbContextOptions<NonUniqueRecordIdDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<NonUniqueRecordIdRecord>(entity =>
+            {
+                entity.ToTable("non_unique_record_id_records");
+                entity.HasKey(record => record.InternalKey);
+            });
+        }
+    }
+
+    private sealed class NullableRecordIdDbContext(
+        DbContextOptions<NullableRecordIdDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<NullableRecordIdRecord>(entity =>
+            {
+                entity.ToTable("nullable_record_id_records");
+                entity.HasKey(record => record.InternalKey);
+                entity.HasIndex(record => record.ExternalId).IsUnique();
+            });
+        }
+    }
+
+    private sealed class CompositeRecordIdDbContext(
+        DbContextOptions<CompositeRecordIdDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<CompositeRecordIdRecord>(entity =>
+            {
+                entity.ToTable("composite_record_id_records");
+                entity.HasKey(record => record.InternalKey);
+                entity.HasAlternateKey(record => new { record.ExternalId, record.TenantId });
+            });
+        }
+    }
+
+    private sealed class UniqueRecordIdDbContext(DbContextOptions<UniqueRecordIdDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<AlternateKeyRecordIdRecord>(entity =>
+            {
+                entity.ToTable("alternate_key_record_id_records");
+                entity.HasKey(record => record.InternalKey);
+                entity.HasAlternateKey(record => record.ExternalId);
+            });
+            modelBuilder.Entity<UniqueIndexRecordIdRecord>(entity =>
+            {
+                entity.ToTable("unique_index_record_id_records");
+                entity.HasKey(record => record.InternalKey);
+                entity.HasIndex(record => record.ExternalId).IsUnique();
             });
         }
     }
@@ -1718,6 +1738,33 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
+    private sealed class RequiredNullableAnonymiseDbContext(
+        DbContextOptions<RequiredNullableAnonymiseDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<RequiredNullableAnonymiseRecord>(entity =>
+            {
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.DisplayName).IsRequired();
+            });
+        }
+    }
+
+    private sealed class StructuralAnonymiseDbContext(
+        DbContextOptions<StructuralAnonymiseDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<StructuralAnonymiseRecord>(entity =>
+            {
+                entity.HasKey(record => record.Id);
+            });
+        }
+    }
+
     private sealed class UnannotatedRecord
     {
         public Guid Id { get; init; }
@@ -1725,6 +1772,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Retain("conflict-category", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-00000000001c")]
     [ExemptFromRetention("covered by statutory retention")]
     private sealed class ConflictingRecord
     {
@@ -1733,6 +1781,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Retain("missing-category", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-00000000001d")]
     private sealed class MissingCategoryRecord
     {
         public Guid Id { get; init; }
@@ -1741,6 +1790,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Retain("valid-category", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-00000000001e")]
     private sealed class ValidRetainedRecord
     {
         public Guid Id { get; init; }
@@ -1749,6 +1799,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Retain("throwing-category", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-00000000001f")]
     private sealed class ThrowingResolverRecord
     {
         public Guid Id { get; init; }
@@ -1757,6 +1808,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Retain("tenant-category", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000020")]
     private sealed class InvalidTenantRecord
     {
         public Guid Id { get; init; }
@@ -1764,7 +1816,82 @@ public sealed class RetentionStartupValidatorTests
         public DateTimeOffset CreatedAt { get; init; }
     }
 
+    [Retain("nullable-tenant", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000021")]
+    private sealed class NullableClrTenantRecord
+    {
+        public Guid Id { get; init; }
+        public Guid? TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    [Retain("record-id", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000022")]
+    private sealed class NonUniqueRecordIdRecord
+    {
+        public Guid InternalKey { get; init; }
+
+        [RetentionRecordId]
+        public Guid ExternalId { get; init; }
+
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    [Retain("record-id", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000023")]
+    private sealed class NullableRecordIdRecord
+    {
+        public Guid InternalKey { get; init; }
+
+        [RetentionRecordId]
+        public Guid? ExternalId { get; init; }
+
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    [Retain("record-id", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000024")]
+    private sealed class CompositeRecordIdRecord
+    {
+        public Guid InternalKey { get; init; }
+
+        [RetentionRecordId]
+        public Guid ExternalId { get; init; }
+
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    [Retain("record-id", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000025")]
+    private sealed class AlternateKeyRecordIdRecord
+    {
+        public Guid InternalKey { get; init; }
+
+        [RetentionRecordId]
+        public Guid ExternalId { get; init; }
+
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    [Retain("record-id", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000026")]
+    private sealed class UniqueIndexRecordIdRecord
+    {
+        public Guid InternalKey { get; init; }
+
+        [RetentionRecordId]
+        public Guid ExternalId { get; init; }
+
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
     [Retain("invalid-soft-delete", nameof(InvalidSoftDeleteIsDeletedRecord.CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000027")]
     private sealed class InvalidSoftDeleteIsDeletedRecord
     {
         public Guid Id { get; init; }
@@ -1774,6 +1901,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Retain("invalid-soft-delete", nameof(InvalidSoftDeleteDeletedAtRecord.CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000028")]
     private sealed class InvalidSoftDeleteDeletedAtRecord
     {
         public Guid Id { get; init; }
@@ -1784,6 +1912,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Retain("missing-soft-delete-tenant", nameof(MissingSoftDeleteTenantRecord.CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000029")]
     private sealed class MissingSoftDeleteTenantRecord
     {
         public Guid Id { get; init; }
@@ -1792,7 +1921,11 @@ public sealed class RetentionStartupValidatorTests
         public DateTimeOffset? DeletedAt { get; init; }
     }
 
-    [Retain("explicit-tenantless-soft-delete", nameof(ExplicitTenantlessSoftDeleteRecord.CreatedAt))]
+    [Retain(
+        "explicit-tenantless-soft-delete",
+        nameof(ExplicitTenantlessSoftDeleteRecord.CreatedAt)
+    )]
+    [RetentionEntityId("00000000-0000-0000-0001-00000000002a")]
     [RetentionTenantless]
     private sealed class ExplicitTenantlessSoftDeleteRecord
     {
@@ -1803,6 +1936,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Retain("invalid-null-anonymise", nameof(InvalidNullAnonymiseRecord.CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-00000000002b")]
     private sealed class InvalidNullAnonymiseRecord
     {
         public Guid Id { get; init; }
@@ -1816,6 +1950,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Retain("invalid-empty-string-anonymise", nameof(InvalidEmptyStringAnonymiseRecord.CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-00000000002c")]
     private sealed class InvalidEmptyStringAnonymiseRecord
     {
         public Guid Id { get; init; }
@@ -1828,7 +1963,11 @@ public sealed class RetentionStartupValidatorTests
         public DateTimeOffset? AnonymisedAt { get; init; }
     }
 
-    [Retain("invalid-fixed-literal-anonymise", nameof(InvalidFixedLiteralAnonymiseRecord.CreatedAt))]
+    [Retain(
+        "invalid-fixed-literal-anonymise",
+        nameof(InvalidFixedLiteralAnonymiseRecord.CreatedAt)
+    )]
+    [RetentionEntityId("00000000-0000-0000-0001-00000000002d")]
     private sealed class InvalidFixedLiteralAnonymiseRecord
     {
         public Guid Id { get; init; }
@@ -1842,6 +1981,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Retain("factory-backed-anonymise", nameof(FactoryBackedAnonymiseRecord.CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-00000000002e")]
     private sealed class FactoryBackedAnonymiseRecord
     {
         public Guid Id { get; init; }
@@ -1855,6 +1995,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Retain("invalid-factory-type-anonymise", nameof(InvalidFactoryTypeAnonymiseRecord.CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-00000000002f")]
     private sealed class InvalidFactoryTypeAnonymiseRecord
     {
         public Guid Id { get; init; }
@@ -1868,6 +2009,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Retain("missing-anonymise-tenant", nameof(MissingAnonymiseTenantRecord.CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000030")]
     private sealed class MissingAnonymiseTenantRecord
     {
         public Guid Id { get; init; }
@@ -1878,6 +2020,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Retain("explicit-tenantless-anonymise", nameof(ExplicitTenantlessAnonymiseRecord.CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000031")]
     [RetentionTenantless]
     private sealed class ExplicitTenantlessAnonymiseRecord
     {
@@ -1890,7 +2033,11 @@ public sealed class RetentionStartupValidatorTests
         public DateTimeOffset? AnonymisedAt { get; init; }
     }
 
-    [Retain("invalid-null-reference-anonymise", nameof(InvalidNullReferenceAnonymiseRecord.CreatedAt))]
+    [Retain(
+        "invalid-null-reference-anonymise",
+        nameof(InvalidNullReferenceAnonymiseRecord.CreatedAt)
+    )]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000032")]
     private sealed class InvalidNullReferenceAnonymiseRecord
     {
         public Guid Id { get; init; }
@@ -1900,6 +2047,40 @@ public sealed class RetentionStartupValidatorTests
         [Anonymise(AnonymiseMethod.Null)]
         public string DisplayName { get; init; } = "";
 
+        public DateTimeOffset? AnonymisedAt { get; init; }
+    }
+
+    [Retain("required-null-anonymise", nameof(RequiredNullableAnonymiseRecord.CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000033")]
+    private sealed class RequiredNullableAnonymiseRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+
+        [Anonymise(AnonymiseMethod.Null)]
+        public string? DisplayName { get; init; }
+
+        public DateTimeOffset? AnonymisedAt { get; init; }
+    }
+
+    [Retain("structural-anonymise", nameof(StructuralAnonymiseRecord.CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000034")]
+    private sealed class StructuralAnonymiseRecord
+    {
+        [AnonymiseWith(typeof(TestAnonymiseValueFactory))]
+        public Guid Id { get; init; }
+
+        [AnonymiseWith(typeof(TestAnonymiseValueFactory))]
+        public Guid TenantId { get; init; }
+
+        [AnonymiseWith(typeof(TestAnonymiseValueFactory))]
+        public DateTimeOffset CreatedAt { get; init; }
+
+        [AnonymiseWith(typeof(TestAnonymiseValueFactory))]
+        public bool IsDeleted { get; init; }
+
+        [AnonymiseWith(typeof(TestAnonymiseValueFactory))]
         public DateTimeOffset? AnonymisedAt { get; init; }
     }
 
@@ -1917,8 +2098,9 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
-    private sealed class NonDefaultSchemaDbContext(DbContextOptions<NonDefaultSchemaDbContext> options)
-        : DbContext(options)
+    private sealed class NonDefaultSchemaDbContext(
+        DbContextOptions<NonDefaultSchemaDbContext> options
+    ) : DbContext(options)
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
@@ -2019,6 +2201,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Retain("inheritance-base", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000035")]
     private class InheritanceBaseRecord
     {
         public Guid Id { get; init; }
@@ -2032,6 +2215,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Retain("schema-category", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000036")]
     private sealed class NonDefaultSchemaRecord
     {
         public Guid Id { get; init; }
@@ -2040,6 +2224,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Retain("cascade-parent", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000037")]
     private sealed class CascadeParentRecord
     {
         public Guid Id { get; init; }
@@ -2048,6 +2233,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Retain("cascade-child", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000038")]
     private sealed class CascadeChildRecord
     {
         public Guid Id { get; init; }
@@ -2057,6 +2243,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Retain("restrict-child", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000039")]
     private sealed class RestrictChildRecord
     {
         public Guid Id { get; init; }
@@ -2066,6 +2253,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Retain("duplicate-tenant-marker", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-00000000003a")]
     private sealed class DuplicateTenantMarkerRecord
     {
         public Guid Id { get; init; }
@@ -2079,6 +2267,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Retain("duplicate-anonymised-at-marker", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-00000000003b")]
     private sealed class DuplicateAnonymisedAtMarkerRecord
     {
         public Guid Id { get; init; }
@@ -2093,6 +2282,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Retain("contradictory-tenantless", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-00000000003c")]
     [RetentionTenantless]
     private sealed class ContradictoryTenantlessRecord
     {
@@ -2109,6 +2299,7 @@ public sealed class RetentionStartupValidatorTests
     private sealed class NotAFactory;
 
     [Retain("naive-anchor", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-00000000003d")]
     private sealed class NaiveTimestampRecord
     {
         public Guid Id { get; init; }
@@ -2132,8 +2323,9 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
-    private sealed class TimestamptzAnchorDbContext(DbContextOptions<TimestamptzAnchorDbContext> options)
-        : DbContext(options)
+    private sealed class TimestamptzAnchorDbContext(
+        DbContextOptions<TimestamptzAnchorDbContext> options
+    ) : DbContext(options)
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
@@ -2142,6 +2334,71 @@ public sealed class RetentionStartupValidatorTests
                 entity.ToTable("timestamptz_anchor_records");
                 entity.HasKey(record => record.Id);
             });
+        }
+    }
+
+    private sealed class MissingRetentionIdentityDbContext(
+        DbContextOptions<MissingRetentionIdentityDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<MissingRetentionIdentityRecord>().HasKey(record => record.Id);
+        }
+    }
+
+    [Retain("identity", nameof(CreatedAt))]
+    [RetentionTenantless]
+    private sealed class MissingRetentionIdentityRecord
+    {
+        public Guid Id { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    private sealed class DuplicateRetentionIdentityDbContext(
+        DbContextOptions<DuplicateRetentionIdentityDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder
+                .Entity<FirstDuplicateRetentionIdentityRecord>()
+                .HasKey(record => record.Id);
+            modelBuilder
+                .Entity<SecondDuplicateRetentionIdentityRecord>()
+                .HasKey(record => record.Id);
+        }
+    }
+
+    [Retain("identity", nameof(CreatedAt))]
+    [RetentionEntityId("e5701795-cdba-4482-a1ea-0497d2353e78")]
+    [RetentionTenantless]
+    private sealed class FirstDuplicateRetentionIdentityRecord
+    {
+        public Guid Id { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    [Retain("identity", nameof(CreatedAt))]
+    [RetentionEntityId("e5701795-cdba-4482-a1ea-0497d2353e78")]
+    [RetentionTenantless]
+    private sealed class SecondDuplicateRetentionIdentityRecord
+    {
+        public Guid Id { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    private sealed class CountingCategoryRepository(IRetentionCategoryRepository inner)
+        : IRetentionCategoryRepository
+    {
+        private int getAsyncCount;
+
+        public int GetAsyncCount => Volatile.Read(ref getAsyncCount);
+
+        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        {
+            Interlocked.Increment(ref getAsyncCount);
+            return inner.GetAsync(category, ct);
         }
     }
 }

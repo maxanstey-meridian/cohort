@@ -1,7 +1,6 @@
 using Cohort.Domain;
 using Cohort.Sample;
 using Cohort.Sample.Entities;
-
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -11,6 +10,13 @@ var builder = Host.CreateApplicationBuilder(args);
 builder.Services.AddSampleRetentionServices();
 
 var host = builder.Build();
+
+await using (var migrationScope = host.Services.CreateAsyncScope())
+{
+    var db = migrationScope.ServiceProvider.GetRequiredService<SampleDbContext>();
+    await db.Database.MigrateAsync();
+}
+
 await host.StartAsync();
 
 try
@@ -20,20 +26,12 @@ try
     var previewTenant = scope.ServiceProvider.GetRequiredService<TenantContext>();
     var startup = scope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
 
-    var entries = await startup.RunAsync();
     var preview = await startup.RunPreviewAsync(previewTenant, DateTimeOffset.UtcNow);
 
-    logger.LogInformation("Found {Count} retention entries", entries.Count);
-    foreach (var entry in entries.Values)
-    {
-        logger.LogInformation(
-            "  {EntityType} → table={Table} category={Category} anchor={Anchor}",
-            entry.EntityType.Name,
-            entry.TableName,
-            entry.Category,
-            entry.AnchorMember
-        );
-    }
+    logger.LogInformation(
+        "Attributes wired: found {Count} retention entries",
+        preview.Counts.Count
+    );
 
     foreach (var count in preview.Counts)
     {

@@ -1,14 +1,12 @@
 using System.Reflection;
-
+using Cohort.Application;
 using Cohort.Domain;
-using Cohort.Hosting;
-
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata;
 
-namespace Cohort.Application;
+namespace Cohort.Infrastructure;
 
-public sealed class RetentionEntryBuilder(CohortConventions conventions)
+internal sealed class RetentionEntryBuilder(RetentionModelConventions conventions)
 {
     private static readonly Type[] AllowedAnchorTypes =
     [
@@ -17,7 +15,7 @@ public sealed class RetentionEntryBuilder(CohortConventions conventions)
         typeof(DateTimeOffset),
         typeof(DateTimeOffset?),
     ];
-    private static readonly Type[] AllowedTenantTypes = [typeof(Guid), typeof(Guid?)];
+    private static readonly Type[] AllowedTenantTypes = [typeof(Guid)];
 
     public string ExpectedTenantPropertyName => conventions.TenantPropertyName;
 
@@ -71,6 +69,10 @@ public sealed class RetentionEntryBuilder(CohortConventions conventions)
 
         return new RetentionEntry(
             clrType,
+            clrType.GetCustomAttribute<RetentionEntityIdAttribute>(inherit: false)?.Id
+                ?? throw new InvalidOperationException(
+                    $"[Retain] on {clrType.FullName}: retained entities must declare [RetentionEntityId(\"uuid\")] with a stable non-empty UUID."
+                ),
             tableName,
             retain.Category,
             retain.AnchorMember,
@@ -91,10 +93,14 @@ public sealed class RetentionEntryBuilder(CohortConventions conventions)
     )
     {
         var clrType = entityType.ClrType;
-        var recordIdMember = clrType
+        var recordIdMember =
+            clrType
                 .GetProperties(BindingFlags.Public | BindingFlags.Instance)
                 .FirstOrDefault(p => p.GetCustomAttribute<RetentionRecordIdAttribute>() is not null)
-            ?? ReflectionMemberResolver.FindPropertyByName(clrType, conventions.RecordIdPropertyName);
+            ?? ReflectionMemberResolver.FindPropertyByName(
+                clrType,
+                conventions.RecordIdPropertyName
+            );
         if (recordIdMember is null)
         {
             throw new InvalidOperationException(
@@ -143,10 +149,16 @@ public sealed class RetentionEntryBuilder(CohortConventions conventions)
     )
     {
         var clrType = entityType.ClrType;
-        var anonymisedAtMember = clrType
+        var anonymisedAtMember =
+            clrType
                 .GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                .FirstOrDefault(p => p.GetCustomAttribute<RetentionAnonymisedAtAttribute>() is not null)
-            ?? ReflectionMemberResolver.FindPropertyByName(clrType, conventions.AnonymisedAtPropertyName);
+                .FirstOrDefault(p =>
+                    p.GetCustomAttribute<RetentionAnonymisedAtAttribute>() is not null
+                )
+            ?? ReflectionMemberResolver.FindPropertyByName(
+                clrType,
+                conventions.AnonymisedAtPropertyName
+            );
         if (anonymisedAtMember is null)
         {
             return null;
@@ -225,11 +237,7 @@ public sealed class RetentionEntryBuilder(CohortConventions conventions)
             }
 
             fields.Add(
-                new AnonymiseFactoryField(
-                    property.Name,
-                    columnName,
-                    anonymiseWith!.FactoryType
-                )
+                new AnonymiseFactoryField(property.Name, columnName, anonymiseWith!.FactoryType)
             );
         }
 
@@ -242,7 +250,8 @@ public sealed class RetentionEntryBuilder(CohortConventions conventions)
     )
     {
         var clrType = entityType.ClrType;
-        var tenantMember = clrType
+        var tenantMember =
+            clrType
                 .GetProperties(BindingFlags.Public | BindingFlags.Instance)
                 .FirstOrDefault(p => p.GetCustomAttribute<RetentionTenantAttribute>() is not null)
             ?? ReflectionMemberResolver.FindPropertyByName(clrType, conventions.TenantPropertyName);
@@ -254,7 +263,7 @@ public sealed class RetentionEntryBuilder(CohortConventions conventions)
         if (!AllowedTenantTypes.Contains(tenantMember.PropertyType))
         {
             throw new InvalidOperationException(
-                $"Tenant convention on {clrType.FullName}: TenantId must be Guid or nullable Guid, got {tenantMember.PropertyType.Name}."
+                $"Tenant convention on {clrType.FullName}: TenantId must be a non-nullable Guid, got {tenantMember.PropertyType.Name}."
             );
         }
 
@@ -279,10 +288,16 @@ public sealed class RetentionEntryBuilder(CohortConventions conventions)
     )
     {
         var clrType = entityType.ClrType;
-        var isDeletedMember = clrType
+        var isDeletedMember =
+            clrType
                 .GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                .FirstOrDefault(p => p.GetCustomAttribute<RetentionSoftDeleteAttribute>() is not null)
-            ?? ReflectionMemberResolver.FindPropertyByName(clrType, conventions.SoftDeletePropertyName);
+                .FirstOrDefault(p =>
+                    p.GetCustomAttribute<RetentionSoftDeleteAttribute>() is not null
+                )
+            ?? ReflectionMemberResolver.FindPropertyByName(
+                clrType,
+                conventions.SoftDeletePropertyName
+            );
         if (isDeletedMember is null)
         {
             return null;
@@ -300,24 +315,31 @@ public sealed class RetentionEntryBuilder(CohortConventions conventions)
                 $"Soft-delete convention on {clrType.FullName}: IsDeleted has no mapped table column."
             );
 
-        var deletedAtMember = clrType
+        var deletedAtMember =
+            clrType
                 .GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                .FirstOrDefault(p => p.GetCustomAttribute<RetentionDeletedAtAttribute>() is not null)
-            ?? ReflectionMemberResolver.FindPropertyByName(clrType, conventions.DeletedAtPropertyName);
-        var deletedAtProperty =
-            deletedAtMember is null
-                ? null
-                : entityType.FindProperty(deletedAtMember.Name)
-                    ?? throw new InvalidOperationException(
-                        $"Soft-delete convention on {clrType.FullName}: DeletedAt is not mapped by EF."
-                    );
+                .FirstOrDefault(p =>
+                    p.GetCustomAttribute<RetentionDeletedAtAttribute>() is not null
+                )
+            ?? ReflectionMemberResolver.FindPropertyByName(
+                clrType,
+                conventions.DeletedAtPropertyName
+            );
+        var deletedAtProperty = deletedAtMember is null
+            ? null
+            : entityType.FindProperty(deletedAtMember.Name)
+                ?? throw new InvalidOperationException(
+                    $"Soft-delete convention on {clrType.FullName}: DeletedAt is not mapped by EF."
+                );
         var deletedAtColumn =
             deletedAtProperty?.GetColumnName(storeObject)
-            ?? (deletedAtProperty is null
-                ? null
-                : throw new InvalidOperationException(
-                    $"Soft-delete convention on {clrType.FullName}: DeletedAt has no mapped table column."
-                ));
+            ?? (
+                deletedAtProperty is null
+                    ? null
+                    : throw new InvalidOperationException(
+                        $"Soft-delete convention on {clrType.FullName}: DeletedAt has no mapped table column."
+                    )
+            );
 
         return new SoftDeleteConvention(
             isDeletedProperty.Name,

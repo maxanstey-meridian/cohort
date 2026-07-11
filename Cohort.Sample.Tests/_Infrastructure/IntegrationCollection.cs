@@ -1,4 +1,4 @@
 namespace Cohort.Sample.Tests;
 
-[CollectionDefinition("Integration")]
+[CollectionDefinition("Integration", DisableParallelization = true)]
 public sealed class IntegrationCollection : ICollectionFixture<PostgresFixture>;

@@ -1,5 +1,4 @@
 using System.Reflection;
-
 using Cohort.Application;
 
 namespace Cohort.Tests;
@@ -72,7 +71,11 @@ public sealed class ReflectionMemberResolverTests
 
     private sealed class DerivedWithShadowedGenericId : GenericBase<Guid>
     {
-        public new Guid Id { get => base.Id; set => base.Id = value; }
+        public new Guid Id
+        {
+            get => base.Id;
+            set => base.Id = value;
+        }
     }
 
     private class BaseEntity
@@ -89,6 +92,10 @@ public sealed class ReflectionMemberResolverTests
 
     private sealed class DerivedWithShadowedStringProperty : BaseWithStringProperty
     {
-        public new string? Label { get => base.Label; set => base.Label = value; }
+        public new string? Label
+        {
+            get => base.Label;
+            set => base.Label = value;
+        }
     }
 }

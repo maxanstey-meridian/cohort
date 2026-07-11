@@ -1,6 +1,5 @@
 using System.Data.Common;
 using System.Globalization;
-
 using Cohort.Domain;
 
 namespace Cohort.Infrastructure.Sweep;
@@ -18,8 +17,12 @@ internal sealed class AnonymisePreviewExecutor
         await using var command = conn.CreateCommand();
         command.CommandText = AnonymiseSqlBuilder.BuildPreviewCountCommandText(entry, filter);
         AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
-        AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
-        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName);
+        AnonymiseDbParameterFactory.AddTenantParameter(
+            command,
+            entry.Tenant?.TenantColumn,
+            tenant.Id
+        );
+        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.EntityId);
 
         return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
@@ -35,7 +38,11 @@ internal sealed class AnonymisePreviewExecutor
         await using var command = conn.CreateCommand();
         command.CommandText = AnonymiseSqlBuilder.BuildNullAnchorCountCommandText(entry, filter);
         AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
-        AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
+        AnonymiseDbParameterFactory.AddTenantParameter(
+            command,
+            entry.Tenant?.TenantColumn,
+            tenant.Id
+        );
 
         return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
@@ -51,8 +58,12 @@ internal sealed class AnonymisePreviewExecutor
         await using var command = conn.CreateCommand();
         command.CommandText = AnonymiseSqlBuilder.BuildHeldCountCommandText(entry, filter);
         AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
-        AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
-        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName);
+        AnonymiseDbParameterFactory.AddTenantParameter(
+            command,
+            entry.Tenant?.TenantColumn,
+            tenant.Id
+        );
+        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.EntityId);
 
         return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }

@@ -1,6 +1,6 @@
 using Cohort.Application;
 using Cohort.Domain;
-
+using Cohort.Infrastructure;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -9,17 +9,16 @@ using Microsoft.Extensions.Options;
 
 namespace Cohort.Hosting;
 
-public sealed class RetentionWorker(
+internal sealed class RetentionWorker(
     IServiceScopeFactory scopeFactory,
-    IOptionsMonitor<CohortOptions> options,
+    IOptionsMonitor<CohortOptions> optionsMonitor,
     ILogger<RetentionWorker> logger
 ) : BackgroundService
 {
     private static readonly TimeSpan IdlePollInterval = TimeSpan.FromMilliseconds(200);
 
-    // Long schedule gaps are slept in bounded chunks so options reloads (schedule
-    // changes, the kill switch) take effect mid-wait, and so a gap beyond
-    // Task.Delay's ~49.7-day ceiling cannot throw.
+    // Long schedule gaps are slept in bounded chunks so a gap beyond Task.Delay's
+    // ~49.7-day ceiling cannot throw.
     private static readonly TimeSpan MaxScheduleSleepChunk = TimeSpan.FromMinutes(1);
 
     // Session-level Postgres advisory lock key ("cohort01" in hex). Two replicas firing
@@ -29,8 +28,6 @@ public sealed class RetentionWorker(
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        await ApplyMigrationsIfConfiguredAsync(stoppingToken);
-
         // A retention worker must outlive individual failures: a transient database
         // outage or a misconfigured category at 02:00 should cost one iteration,
         // not all future sweeps (or the host, under StopHost behavior).
@@ -57,8 +54,11 @@ public sealed class RetentionWorker(
 
     private async Task RunScheduleLoopOnceAsync(CancellationToken stoppingToken)
     {
-        var currentOptions = options.CurrentValue;
-        if (currentOptions.KillSwitch || string.IsNullOrWhiteSpace(currentOptions.Schedule))
+        var currentOptions = optionsMonitor.CurrentValue;
+        if (
+            currentOptions.KillSwitch
+            || string.IsNullOrWhiteSpace(currentOptions.Schedule)
+        )
         {
             await DelayUntilNextPollAsync(stoppingToken);
             return;
@@ -91,18 +91,17 @@ public sealed class RetentionWorker(
             return;
         }
 
-        if (stoppingToken.IsCancellationRequested)
+        var executionOptions = optionsMonitor.CurrentValue;
+        if (
+            stoppingToken.IsCancellationRequested
+            || executionOptions.KillSwitch
+            || !string.Equals(executionOptions.Schedule, schedule, StringComparison.Ordinal)
+        )
         {
             return;
         }
 
-        currentOptions = options.CurrentValue;
-        if (currentOptions.KillSwitch || string.IsNullOrWhiteSpace(currentOptions.Schedule))
-        {
-            return;
-        }
-
-        await RunIterationAsync(currentOptions.DryRun, stoppingToken);
+        await RunIterationAsync(executionOptions.DryRun, stoppingToken);
     }
 
     private async Task<bool> TrySleepUntilAsync(
@@ -111,6 +110,21 @@ public sealed class RetentionWorker(
         CancellationToken ct
     )
     {
+        var currentKillSwitch = optionsMonitor.CurrentValue.KillSwitch;
+        var scheduleChanged = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously
+        );
+        using var registration = optionsMonitor.OnChange(updated =>
+        {
+            if (
+                updated.KillSwitch != currentKillSwitch
+                || !string.Equals(updated.Schedule, schedule, StringComparison.Ordinal)
+            )
+            {
+                scheduleChanged.TrySetResult();
+            }
+        });
+
         while (!ct.IsCancellationRequested)
         {
             var remaining = occurrence - DateTimeOffset.UtcNow;
@@ -119,19 +133,15 @@ public sealed class RetentionWorker(
                 return true;
             }
 
-            await Task.Delay(
+            var delay = Task.Delay(
                 remaining < MaxScheduleSleepChunk ? remaining : MaxScheduleSleepChunk,
                 ct
             );
-
-            var currentOptions = options.CurrentValue;
-            if (
-                currentOptions.KillSwitch
-                || !string.Equals(currentOptions.Schedule, schedule, StringComparison.Ordinal)
-            )
+            if (await Task.WhenAny(delay, scheduleChanged.Task) == scheduleChanged.Task)
             {
                 return false;
             }
+            await delay;
         }
 
         return false;
@@ -141,7 +151,7 @@ public sealed class RetentionWorker(
     {
         await using var scope = scopeFactory.CreateAsyncScope();
         var services = scope.ServiceProvider;
-        var db = services.GetRequiredService<DbContext>();
+        var db = services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext);
 
         // The advisory lock is session-scoped, so the connection must stay open for the
         // whole iteration; the sweep itself reuses the already-open scoped connection.
@@ -177,16 +187,14 @@ public sealed class RetentionWorker(
         CancellationToken ct
     )
     {
-        var tenantSource = services.GetRequiredService<IRetentionTenantSource>();
-        var tenants = await tenantSource.GetTenantsAsync(ct);
-
-        var validator = services.GetRequiredService<RetentionStartupValidator>();
-        await validator.ValidateAsync(ct);
-
         var entries = services.GetRequiredService<RetentionRegistry>().Scan().Values;
         var engine = services.GetRequiredService<RetentionSweepEngine>();
+        var hasTenantedEntries = entries.Any(entry => entry.Tenant is not null);
+        var tenants = hasTenantedEntries
+            ? await services.GetRequiredService<IRetentionTenantSource>().GetTenantsAsync(ct)
+            : [];
 
-        if (entries.Any(entry => entry.Tenant is not null))
+        if (hasTenantedEntries)
         {
             // An empty tenant list is only a problem when tenanted entities exist; a
             // tenantless-only deployment legitimately has no tenants, and its pass
@@ -256,18 +264,28 @@ public sealed class RetentionWorker(
         CancellationToken ct
     )
     {
-        // Dry runs go through the engine, not IRetentionPreview, so scheduled dry runs
-        // leave the same audit trail as real sweeps (with sweep_run.DryRun set).
         return dryRun
-            ? engine.DryRunAsync(tenant, DateTimeOffset.UtcNow, SweepTriggerKind.Scheduled, scope, ct)
-            : engine.SweepAsync(tenant, DateTimeOffset.UtcNow, SweepTriggerKind.Scheduled, scope, ct);
+            ? engine.DryRunAsync(
+                tenant,
+                DateTimeOffset.UtcNow,
+                SweepTriggerKind.Scheduled,
+                scope,
+                ct
+            )
+            : engine.SweepAsync(
+                tenant,
+                DateTimeOffset.UtcNow,
+                SweepTriggerKind.Scheduled,
+                scope,
+                ct
+            );
     }
 
     private bool KillSwitchEngagedMidIteration()
     {
         // The kill switch is an emergency brake: an in-flight sweep finishes, but no
         // further sweep starts — not even the remaining passes of the current iteration.
-        if (!options.CurrentValue.KillSwitch)
+        if (!optionsMonitor.CurrentValue.KillSwitch)
         {
             return false;
         }
@@ -300,67 +318,6 @@ public sealed class RetentionWorker(
         command.Parameters.Add(parameter);
 
         await command.ExecuteScalarAsync(CancellationToken.None);
-    }
-
-    private async Task ApplyMigrationsIfConfiguredAsync(CancellationToken ct)
-    {
-        // Retried rather than thrown: a database that is briefly unreachable at boot
-        // must not permanently kill the retention worker (or the host). The advisory
-        // lock stops two replicas racing MigrateAsync against the same database.
-        while (!ct.IsCancellationRequested)
-        {
-            try
-            {
-                if (!options.CurrentValue.ApplyMigrations)
-                {
-                    return;
-                }
-
-                await using var scope = scopeFactory.CreateAsyncScope();
-                var db = scope.ServiceProvider.GetRequiredService<DbContext>();
-                await db.Database.OpenConnectionAsync(ct);
-                try
-                {
-                    if (!await TryAcquireSweepLockAsync(db, ct))
-                    {
-                        logger.LogInformation(
-                            "Cohort worker is waiting for another instance to finish applying migrations."
-                        );
-                        await DelayUntilNextPollAsync(ct);
-                        continue;
-                    }
-
-                    try
-                    {
-                        await db.Database.MigrateAsync(ct);
-                        logger.LogInformation(
-                            "Cohort worker applied database migrations at startup."
-                        );
-                        return;
-                    }
-                    finally
-                    {
-                        await ReleaseSweepLockAsync(db);
-                    }
-                }
-                finally
-                {
-                    await db.Database.CloseConnectionAsync();
-                }
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                return;
-            }
-            catch (Exception ex)
-            {
-                logger.LogError(
-                    ex,
-                    "Cohort worker failed to apply database migrations at startup; retrying."
-                );
-                await DelayUntilNextPollAsync(ct);
-            }
-        }
     }
 
     private static async Task DelayUntilNextPollAsync(CancellationToken ct)

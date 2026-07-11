@@ -1,19 +1,20 @@
 using System.Data.Common;
-
 using Cohort.Domain;
-
+using Cohort.Infrastructure.Holds;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Infrastructure.Sweep;
 
 internal sealed class AnonymiseRowLoader(
-    DbContext db,
+    [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
     AnonymiseAssignmentResolver assignmentResolver
 )
 {
     private readonly DbContext modelDb = db ?? throw new ArgumentNullException(nameof(db));
     private readonly AnonymiseAssignmentResolver assignmentResolver =
         assignmentResolver ?? throw new ArgumentNullException(nameof(assignmentResolver));
+    internal Microsoft.EntityFrameworkCore.Metadata.IModel Model => modelDb.Model;
 
     internal async Task<IReadOnlyList<string>> SelectCandidateRecordIdsAsync(
         RetentionEntry entry,
@@ -23,6 +24,70 @@ internal sealed class AnonymiseRowLoader(
         SqlFilter filter,
         int? batchSize,
         IReadOnlyList<string>? excludedRecordIds,
+        bool skipLocked,
+        CancellationToken ct
+    )
+    {
+        var lockedRecordIds = new List<string>();
+        var attemptedRecordIds = excludedRecordIds?.ToList() ?? [];
+        var targetCount = batchSize is null ? int.MaxValue : Math.Max(1, batchSize.Value);
+
+        while (lockedRecordIds.Count < targetCount)
+        {
+            var remaining = batchSize is null ? (int?)null : targetCount - lockedRecordIds.Count;
+            var candidateRecordIds = await DiscoverCandidateRecordIdsAsync(
+                entry,
+                tenantId,
+                conn,
+                transaction,
+                filter,
+                remaining,
+                attemptedRecordIds,
+                ct
+            );
+            if (candidateRecordIds.Count == 0)
+            {
+                break;
+            }
+
+            await RetentionEntityLockSql.AcquireAsync(
+                conn,
+                transaction,
+                entry.EntityId,
+                entry.Tenant is not null ? tenantId : null,
+                candidateRecordIds,
+                ct
+            );
+            lockedRecordIds.AddRange(
+                await LockCandidateRecordIdsAsync(
+                    entry,
+                    tenantId,
+                    conn,
+                    transaction,
+                    filter,
+                    candidateRecordIds,
+                    skipLocked,
+                    ct
+                )
+            );
+            attemptedRecordIds.AddRange(candidateRecordIds);
+            if (batchSize is null || candidateRecordIds.Count < remaining)
+            {
+                break;
+            }
+        }
+
+        return lockedRecordIds;
+    }
+
+    private static async Task<List<string>> DiscoverCandidateRecordIdsAsync(
+        RetentionEntry entry,
+        Guid tenantId,
+        DbConnection conn,
+        DbTransaction transaction,
+        SqlFilter filter,
+        int? batchSize,
+        IReadOnlyList<string> excludedRecordIds,
         CancellationToken ct
     )
     {
@@ -32,12 +97,16 @@ internal sealed class AnonymiseRowLoader(
             entry,
             filter,
             batchSize,
-            hasExcludedRecordIds: excludedRecordIds is { Count: > 0 }
+            hasExcludedRecordIds: excludedRecordIds.Count > 0
         );
         AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
-        AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenantId);
-        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName);
-        if (excludedRecordIds is { Count: > 0 })
+        AnonymiseDbParameterFactory.AddTenantParameter(
+            command,
+            entry.Tenant?.TenantColumn,
+            tenantId
+        );
+        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.EntityId);
+        if (excludedRecordIds.Count > 0)
         {
             command.Parameters.Add(
                 AnonymiseDbParameterFactory.Create(
@@ -47,22 +116,58 @@ internal sealed class AnonymiseRowLoader(
                 )
             );
         }
-
         if (batchSize is not null)
         {
             command.Parameters.Add(
-                AnonymiseDbParameterFactory.Create(command, "batchSize", Math.Max(1, batchSize.Value))
+                AnonymiseDbParameterFactory.Create(command, "batchSize", batchSize.Value)
             );
         }
 
-        var candidateRecordIds = new List<string>();
+        return await ReadRecordIdsAsync(command, ct);
+    }
+
+    private static async Task<List<string>> LockCandidateRecordIdsAsync(
+        RetentionEntry entry,
+        Guid tenantId,
+        DbConnection conn,
+        DbTransaction transaction,
+        SqlFilter filter,
+        IReadOnlyList<string> candidateRecordIds,
+        bool skipLocked,
+        CancellationToken ct
+    )
+    {
+        await using var command = conn.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = AnonymiseSqlBuilder.BuildCandidateLockCommandText(
+            entry,
+            filter,
+            skipLocked
+        );
+        AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
+        AnonymiseDbParameterFactory.AddTenantParameter(
+            command,
+            entry.Tenant?.TenantColumn,
+            tenantId
+        );
+        AnonymiseDbParameterFactory.AddCandidateIdsParameter(command, candidateRecordIds);
+        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.EntityId);
+        return await ReadRecordIdsAsync(command, ct);
+    }
+
+    private static async Task<List<string>> ReadRecordIdsAsync(
+        DbCommand command,
+        CancellationToken ct
+    )
+    {
+        var recordIds = new List<string>();
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
         {
-            candidateRecordIds.Add(reader.GetValue(0).ToString()!);
+            recordIds.Add(reader.GetValue(0).ToString()!);
         }
 
-        return candidateRecordIds;
+        return recordIds;
     }
 
     internal async Task<IReadOnlyList<AnonymiseRowSnapshot>> LoadUpdatableRowsAsync(
@@ -83,8 +188,12 @@ internal sealed class AnonymiseRowLoader(
             originalValueFields
         );
         AnonymiseDbParameterFactory.AddCandidateIdsParameter(command, candidateRecordIds);
-        AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
-        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName);
+        AnonymiseDbParameterFactory.AddTenantParameter(
+            command,
+            entry.Tenant?.TenantColumn,
+            tenant.Id
+        );
+        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.EntityId);
 
         var rows = new List<AnonymiseRowSnapshot>();
         await using var reader = await command.ExecuteReaderAsync(ct);
@@ -125,7 +234,11 @@ internal sealed class AnonymiseRowLoader(
                 "candidateIds",
                 candidateRecordIds.ToArray()
             ),
-            AnonymiseDbParameterFactory.CreateProviderParameter(conn, "holdTableName", entry.TableName),
+            AnonymiseDbParameterFactory.CreateProviderParameter(
+                conn,
+                "retentionEntityId",
+                entry.EntityId
+            ),
         };
         if (entry.Tenant is not null)
         {

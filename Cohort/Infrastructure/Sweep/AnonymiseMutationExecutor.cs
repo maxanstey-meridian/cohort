@@ -1,6 +1,4 @@
 using System.Data.Common;
-
-using Cohort.Application;
 using Cohort.Domain;
 
 namespace Cohort.Infrastructure.Sweep;
@@ -92,9 +90,13 @@ internal sealed class AnonymiseMutationExecutor(
             assignmentResolver.CreateSetBasedAssignmentValues(entry, tenant.Id, now)
         );
         AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
-        AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
+        AnonymiseDbParameterFactory.AddTenantParameter(
+            command,
+            entry.Tenant?.TenantColumn,
+            tenant.Id
+        );
         AnonymiseDbParameterFactory.AddCandidateIdsParameter(command, candidateRecordIds);
-        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName);
+        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.EntityId);
         AddAnonymisedAtParameter(command, entry, now);
 
         var affectedRecordIds = await ReadAffectedRecordIdsAsync(command, ct);
@@ -133,8 +135,12 @@ internal sealed class AnonymiseMutationExecutor(
         );
         command.Parameters.Add(AnonymiseDbParameterFactory.Create(command, "recordId", recordId));
         AnonymiseDbParameterFactory.AddFilterParameters(command, filter);
-        AnonymiseDbParameterFactory.AddTenantParameter(command, entry.Tenant?.TenantColumn, tenant.Id);
-        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.TableName);
+        AnonymiseDbParameterFactory.AddTenantParameter(
+            command,
+            entry.Tenant?.TenantColumn,
+            tenant.Id
+        );
+        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.EntityId);
         AddAnonymisedAtParameter(command, entry, now);
 
         await using var reader = await command.ExecuteReaderAsync(ct);
@@ -164,7 +170,9 @@ internal sealed class AnonymiseMutationExecutor(
     {
         if (entry.AnonymisedAt is not null)
         {
-            command.Parameters.Add(AnonymiseDbParameterFactory.Create(command, "anonymisedAt", now));
+            command.Parameters.Add(
+                AnonymiseDbParameterFactory.Create(command, "anonymisedAt", now)
+            );
         }
     }
 
@@ -176,7 +184,11 @@ internal sealed class AnonymiseMutationExecutor(
         for (var index = 0; index < assignmentValues.Count; index++)
         {
             command.Parameters.Add(
-                AnonymiseDbParameterFactory.Create(command, $"value{index}", assignmentValues[index])
+                AnonymiseDbParameterFactory.Create(
+                    command,
+                    $"value{index}",
+                    assignmentValues[index]
+                )
             );
         }
     }

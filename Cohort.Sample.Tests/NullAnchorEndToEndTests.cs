@@ -1,7 +1,7 @@
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Infrastructure;
 using Cohort.Sample.Entities;
-
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -50,16 +50,18 @@ public sealed class NullAnchorEndToEndTests(PostgresFixture fixture) : Integrati
 
         // NULL anchors never match a cutoff: the rows survive, and the summary says so
         // instead of letting them accumulate invisibly.
-        result.Counts.Should().Contain(count =>
-            count.EntityType == typeof(NullableAnchorEvent)
-            && count.Category == "nullable-anchor-purge"
-            && count.Affected == 1
-            && count.NullAnchorCount == 2
-        );
+        result
+            .Counts.Should()
+            .Contain(count =>
+                count.EntityType == typeof(NullableAnchorEvent)
+                && count.Category == "nullable-anchor-purge"
+                && count.Affected == 1
+                && count.NullAnchorCount == 2
+            );
 
         await using var verify = Host.CreateDbContext();
-        var remaining = await verify.NullableAnchorEvents
-            .OrderBy(record => record.Payload)
+        var remaining = await verify
+            .NullableAnchorEvents.OrderBy(record => record.Payload)
             .Select(record => record.Payload)
             .ToListAsync();
         remaining.Should().Equal("null-anchor-invisible", "null-anchor-invisible-too");
@@ -92,16 +94,19 @@ public sealed class NullAnchorEndToEndTests(PostgresFixture fixture) : Integrati
             result = await engine.DryRunAsync(
                 new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
                 asOf,
-                SweepTriggerKind.Manual
+                SweepTriggerKind.Manual,
+                SweepEntityScope.TenantedOnly
             );
         });
 
         result.Should().NotBeNull();
-        result!.Counts.Should().Contain(count =>
-            count.EntityType == typeof(NullableAnchorEvent)
-            && count.Affected == 0
-            && count.NullAnchorCount == 1
-        );
+        result!
+            .Counts.Should()
+            .Contain(count =>
+                count.EntityType == typeof(NullableAnchorEvent)
+                && count.Affected == 0
+                && count.NullAnchorCount == 1
+            );
 
         await using var verify = Host.CreateDbContext();
         (await verify.NullableAnchorEvents.CountAsync()).Should().Be(1);

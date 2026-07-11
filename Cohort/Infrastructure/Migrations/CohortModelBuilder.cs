@@ -1,7 +1,6 @@
 #nullable enable
 
 using Cohort.Infrastructure.Handlers;
-
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata.Builders;
 
@@ -24,7 +23,10 @@ public static class CohortModelBuilder
 
     private static void ConfigureHoldTable(ModelBuilder modelBuilder)
     {
-        if (TryFindEntityMappedToTable(modelBuilder, CohortTableNames.RetentionHolds) is { } existing)
+        if (
+            TryFindEntityMappedToTable(modelBuilder, CohortTableNames.RetentionHolds) is
+            { } existing
+        )
         {
             EnsureAdoptableKey(existing, CohortTableNames.RetentionHolds, "HoldId");
             ConfigureRetentionHoldColumns(modelBuilder.Entity(existing.ClrType));
@@ -63,14 +65,15 @@ public static class CohortModelBuilder
     private static void ConfigureSweepRunEntitySummaryTable(ModelBuilder modelBuilder)
     {
         if (
-            TryFindEntityMappedToTable(modelBuilder, CohortTableNames.SweepRunEntitySummary) is { } existing
+            TryFindEntityMappedToTable(modelBuilder, CohortTableNames.SweepRunEntitySummary) is
+            { } existing
         )
         {
             EnsureAdoptableKey(
                 existing,
                 CohortTableNames.SweepRunEntitySummary,
                 "SweepId",
-                "EntityType",
+                "RetentionEntityId",
                 "Category",
                 "TenantId",
                 "Strategy"
@@ -92,7 +95,8 @@ public static class CohortModelBuilder
     private static void ConfigureSweepRunRowDetailTable(ModelBuilder modelBuilder)
     {
         if (
-            TryFindEntityMappedToTable(modelBuilder, CohortTableNames.SweepRunRowDetail) is { } existing
+            TryFindEntityMappedToTable(modelBuilder, CohortTableNames.SweepRunRowDetail) is
+            { } existing
         )
         {
             EnsureAdoptableKey(existing, CohortTableNames.SweepRunRowDetail, "Id");
@@ -114,7 +118,20 @@ public static class CohortModelBuilder
     {
         modelBuilder.Entity<SweepRowHandlerStatusEntity>(builder =>
         {
-            builder.ToTable(CohortTableNames.SweepRowHandlerStatus);
+            builder.ToTable(
+                CohortTableNames.SweepRowHandlerStatus,
+                tableBuilder =>
+                {
+                    tableBuilder.HasCheckConstraint(
+                        "CK_sweep_row_handler_status_Claim",
+                        "(\"State\" = 1 AND \"ClaimedAt\" IS NOT NULL AND \"ClaimToken\" IS NOT NULL) OR (\"State\" <> 1 AND \"ClaimedAt\" IS NULL AND \"ClaimToken\" IS NULL)"
+                    );
+                    tableBuilder.HasCheckConstraint(
+                        "CK_sweep_row_handler_status_Completion",
+                        "(\"State\" IN (2, 3) AND \"CompletedAt\" IS NOT NULL) OR (\"State\" IN (0, 1) AND \"CompletedAt\" IS NULL)"
+                    );
+                }
+            );
             ConfigureSweepRowHandlerStatusColumns(builder);
         });
     }
@@ -122,31 +139,54 @@ public static class CohortModelBuilder
     private static void ConfigureRetentionHoldColumns(EntityTypeBuilder builder)
     {
         builder.Property<Guid>("HoldId").ValueGeneratedNever();
-        builder.Property<string>("TableName").IsRequired();
+        builder.Property<Guid>("RetentionEntityId").IsRequired();
         builder.Property<string>("RecordId").IsRequired();
-        builder.Property<Guid>("TenantId").IsRequired();
+        builder.Property<Guid?>("TenantId");
         builder.Property<string>("Reason").IsRequired();
         builder.Property<DateTimeOffset>("CreatedAt").IsRequired();
         builder.Property<DateTimeOffset?>("ExpiresAt");
         builder.Property<DateTimeOffset?>("RemovedAt");
         builder.HasKey("HoldId");
-        builder.HasIndex("TableName", "TenantId", "RecordId");
-        // The tenantless hold probe matches on (TableName, RecordId) only; the index
+        builder.HasIndex("RetentionEntityId", "TenantId", "RecordId");
+        // The tenantless hold probe matches on (RetentionEntityId, RecordId) only; the index
         // above cannot serve it because RecordId sits behind the skipped TenantId column.
-        builder.HasIndex("TableName", "RecordId");
+        builder.HasIndex("RetentionEntityId", "RecordId");
     }
 
     private static void ConfigureSweepRunColumns(EntityTypeBuilder builder)
     {
+        builder.ToTable(
+            CohortTableNames.SweepRun,
+            table =>
+            {
+                table.HasCheckConstraint("CK_sweep_run_Status_Range", "\"Status\" BETWEEN 0 AND 4");
+                table.HasCheckConstraint(
+                    "CK_sweep_run_Started_Unsettled",
+                    "\"Status\" <> 0 OR \"SettledAt\" IS NULL"
+                );
+                table.HasCheckConstraint(
+                    "CK_sweep_run_Terminal_Settled",
+                    "\"Status\" = 0 OR \"SettledAt\" IS NOT NULL"
+                );
+                table.HasCheckConstraint(
+                    "CK_sweep_run_TotalAffected_Nonnegative",
+                    "\"TotalAffected\" IS NULL OR \"TotalAffected\" >= 0"
+                );
+                table.HasCheckConstraint(
+                    "CK_sweep_run_Duration_Nonnegative",
+                    "\"Duration\" IS NULL OR \"Duration\" >= INTERVAL '0'"
+                );
+            }
+        );
         builder.Property<Guid>("SweepId").ValueGeneratedNever();
         builder.Property<DateTimeOffset>("StartedAt").IsRequired();
-        builder.Property<DateTimeOffset?>("CompletedAt");
+        builder.Property<int>("Status").IsRequired();
+        builder.Property<DateTimeOffset?>("SettledAt");
         builder.Property<TimeSpan?>("Duration");
         builder.Property<int>("TriggerKind").IsRequired();
         builder.Property<bool>("DryRun").IsRequired();
         builder.Property<Guid>("TenantId").IsRequired();
         builder.Property<long?>("TotalAffected");
-        builder.Property<DateTimeOffset?>("FailedAt");
         builder.Property<string?>("Error");
         builder.HasKey("SweepId");
     }
@@ -156,6 +196,7 @@ public static class CohortModelBuilder
         builder.Property<Guid>("SweepId").ValueGeneratedNever();
         builder.Property<DateTimeOffset>("At").IsRequired();
         builder.Property<string>("EntityType").IsRequired();
+        builder.Property<Guid>("RetentionEntityId").IsRequired();
         builder.Property<string>("Category").IsRequired();
         builder.Property<Guid>("TenantId").IsRequired();
         builder.Property<int>("Strategy").IsRequired();
@@ -166,8 +207,14 @@ public static class CohortModelBuilder
         builder.Property<long>("NullAnchorCount").IsRequired();
         builder.Property<string>("RuleSource");
         builder.Property<string>("RuleReason");
-        builder.HasKey("SweepId", "EntityType", "Category", "TenantId", "Strategy");
+        builder.HasKey("SweepId", "RetentionEntityId", "Category", "TenantId", "Strategy");
         builder.HasIndex("SweepId");
+        builder
+            .HasOne(FindEntityMappedToTable(builder, CohortTableNames.SweepRun), navigationName: null)
+            .WithMany()
+            .HasForeignKey("SweepId")
+            .HasPrincipalKey("SweepId")
+            .OnDelete(DeleteBehavior.Restrict);
     }
 
     private static void ConfigureSweepRunRowDetailColumns(EntityTypeBuilder builder)
@@ -176,6 +223,7 @@ public static class CohortModelBuilder
         builder.Property<Guid>("SweepId").ValueGeneratedNever();
         builder.Property<DateTimeOffset>("At").IsRequired();
         builder.Property<string>("EntityType").IsRequired();
+        builder.Property<Guid>("RetentionEntityId").IsRequired();
         builder.Property<string>("EntityId").IsRequired();
         builder.Property<string>("Category").IsRequired();
         builder.Property<int>("Strategy").IsRequired();
@@ -184,8 +232,22 @@ public static class CohortModelBuilder
         builder.HasKey("Id");
         builder.HasIndex("SweepId");
         builder
-            .HasIndex("SweepId", "EntityType", "EntityId", "Category", "Strategy", "TenantId")
-            .IsUnique();
+            .HasIndex(
+                "SweepId",
+                "RetentionEntityId",
+                "EntityId",
+                "Category",
+                "Strategy",
+                "TenantId"
+            )
+            .IsUnique()
+            .HasDatabaseName("IX_sweep_run_row_detail_StableIdentity");
+        builder
+            .HasOne(FindEntityMappedToTable(builder, CohortTableNames.SweepRun), navigationName: null)
+            .WithMany()
+            .HasForeignKey("SweepId")
+            .HasPrincipalKey("SweepId")
+            .OnDelete(DeleteBehavior.Restrict);
     }
 
     private static void ConfigureSweepRowHandlerStatusColumns(
@@ -201,11 +263,19 @@ public static class CohortModelBuilder
         builder.Property(status => status.QueuedAt).IsRequired();
         builder.Property(status => status.NextAttemptAt).IsRequired();
         builder.Property(status => status.ClaimedAt);
+        builder.Property(status => status.ClaimToken);
         builder.Property(status => status.CompletedAt);
         builder.Property(status => status.LastError);
         builder.HasKey(status => status.Id);
-        builder.HasIndex(status => new { status.SweepRunRowDetailId, status.HandlerType }).IsUnique();
-        builder.HasIndex(status => new { status.State, status.NextAttemptAt, status.Id });
+        builder
+            .HasIndex(status => new { status.SweepRunRowDetailId, status.HandlerType })
+            .IsUnique();
+        builder.HasIndex(status => new
+        {
+            status.State,
+            status.NextAttemptAt,
+            status.Id,
+        });
         builder
             .HasOne(CohortSharedTypeNames.SweepRunRowDetail, navigationName: null)
             .WithMany()
@@ -249,7 +319,18 @@ public static class CohortModelBuilder
     {
         return modelBuilder
             .Model.GetEntityTypes()
-            .FirstOrDefault(entityType => string.Equals(entityType.GetTableName(), tableName, StringComparison.Ordinal));
+            .FirstOrDefault(entityType =>
+                string.Equals(entityType.GetTableName(), tableName, StringComparison.Ordinal)
+            );
+    }
+
+    private static string FindEntityMappedToTable(EntityTypeBuilder builder, string tableName)
+    {
+        return builder.Metadata.Model.GetEntityTypes()
+            .Single(entityType =>
+                string.Equals(entityType.GetTableName(), tableName, StringComparison.Ordinal)
+            )
+            .Name;
     }
 }
 

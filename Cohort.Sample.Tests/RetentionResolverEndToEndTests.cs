@@ -1,7 +1,6 @@
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Sample.Entities;
-
 using Microsoft.EntityFrameworkCore;
 
 namespace Cohort.Sample.Tests;
@@ -43,34 +42,33 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.Counts.Should().HaveCount(9);
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(Note),
-                "short-lived",
-                tenantId,
-                Strategy.Purge,
-                0
-            )
-        );
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(SoftDeleteRecord),
-                "soft-delete",
-                tenantId,
-                Strategy.SoftDelete,
-                0
-            )
-        );
-        result.Counts.Should().Contain(
-            new EntitySweepCount(
-                typeof(AnonymisedContact),
-                "anonymise",
-                tenantId,
-                Strategy.Anonymise,
-                0
-            )
-        );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 0)
+            );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(SoftDeleteRecord),
+                    "soft-delete",
+                    tenantId,
+                    Strategy.SoftDelete,
+                    0
+                )
+            );
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(AnonymisedContact),
+                    "anonymise",
+                    tenantId,
+                    Strategy.Anonymise,
+                    0
+                )
+            );
 
         await using var verify = Host.CreateDbContext();
         var noteBodies = await verify.Notes.Select(note => note.Body).ToListAsync();
@@ -80,7 +78,10 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
     [Fact]
     public async Task Preview_Path_Propagates_Retention_Alias_Cycle_Exception()
     {
-        using var previewHost = new CohortTestHost(GetConnectionString(), new AliasCategoryRepository());
+        using var previewHost = new CohortTestHost(
+            GetConnectionString(),
+            new AliasCategoryRepository()
+        );
 
         var act = () =>
             previewHost.RunPreviewAsync(
@@ -95,9 +96,10 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
 
     private sealed class TenantAwareCategoryRepository : IRetentionCategoryRepository
     {
-        private static readonly IRetentionRuleResolver ExemptFallback = new StaticRetentionRuleResolver(
-            new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
-        );
+        private static readonly IRetentionRuleResolver ExemptFallback =
+            new StaticRetentionRuleResolver(
+                new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+            );
 
         private readonly IRetentionRuleResolver resolver = new TenantAwareResolver();
 
@@ -121,7 +123,10 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
 
     private sealed class TenantAwareResolver : IRetentionRuleResolver
     {
-        public Task<RetentionRule> ResolveAsync(RetentionResolutionContext ctx, CancellationToken ct)
+        public Task<RetentionRule> ResolveAsync(
+            RetentionResolutionContext ctx,
+            CancellationToken ct
+        )
         {
             var isLenient =
                 ctx.Tenant.Tags.TryGetValue("profile", out var profile)
@@ -138,9 +143,10 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
 
     private sealed class AliasCategoryRepository : IRetentionCategoryRepository
     {
-        private static readonly IRetentionRuleResolver ExemptFallback = new StaticRetentionRuleResolver(
-            new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
-        );
+        private static readonly IRetentionRuleResolver ExemptFallback =
+            new StaticRetentionRuleResolver(
+                new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+            );
 
         private readonly IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers;
 

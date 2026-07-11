@@ -10,7 +10,8 @@ public sealed class MigrationModelEndToEndTests(PostgresFixture fixture)
     public void Sample_Model_Contains_Cohort_Audit_And_Hold_Tables()
     {
         using var db = Host.CreateDbContext();
-        var tables = db.Model.GetEntityTypes()
+        var tables = db
+            .Model.GetEntityTypes()
             .Select(entityType => entityType.GetTableName())
             .Where(tableName => tableName is not null)
             .Cast<string>()
@@ -23,45 +24,92 @@ public sealed class MigrationModelEndToEndTests(PostgresFixture fixture)
         tables.Should().Contain("sweep_row_handler_status");
         tables.Should().Contain("erasure_subject_records");
 
-        var sweepRunEntity = db.Model.GetEntityTypes().Single(entityType =>
-            string.Equals(entityType.GetTableName(), "sweep_run", StringComparison.Ordinal)
-        );
+        var sweepRunEntity = db
+            .Model.GetEntityTypes()
+            .Single(entityType =>
+                string.Equals(entityType.GetTableName(), "sweep_run", StringComparison.Ordinal)
+            );
         sweepRunEntity.FindProperty("TriggerKind").Should().NotBeNull();
 
-        var entitySummaryEntity = db.Model.GetEntityTypes().Single(entityType =>
-            string.Equals(entityType.GetTableName(), "sweep_run_entity_summary", StringComparison.Ordinal)
-        );
+        var entitySummaryEntity = db
+            .Model.GetEntityTypes()
+            .Single(entityType =>
+                string.Equals(
+                    entityType.GetTableName(),
+                    "sweep_run_entity_summary",
+                    StringComparison.Ordinal
+                )
+            );
         entitySummaryEntity.FindProperty("SkippedCount")!.IsNullable.Should().BeFalse();
         entitySummaryEntity.FindProperty("RuleSource")!.IsNullable.Should().BeTrue();
         entitySummaryEntity.FindProperty("RuleReason")!.IsNullable.Should().BeTrue();
-        entitySummaryEntity.FindPrimaryKey()!.Properties.Select(property => property.Name)
+        entitySummaryEntity
+            .FindPrimaryKey()!
+            .Properties.Select(property => property.Name)
             .Should()
-            .Equal("SweepId", "EntityType", "Category", "TenantId", "Strategy");
+            .Equal("SweepId", "RetentionEntityId", "Category", "TenantId", "Strategy");
 
-        var rowDetailEntity = db.Model.GetEntityTypes().Single(entityType =>
-            string.Equals(entityType.GetTableName(), "sweep_run_row_detail", StringComparison.Ordinal)
-        );
-        rowDetailEntity.FindPrimaryKey()!.Properties.Select(property => property.Name).Should().Equal("Id");
+        var rowDetailEntity = db
+            .Model.GetEntityTypes()
+            .Single(entityType =>
+                string.Equals(
+                    entityType.GetTableName(),
+                    "sweep_run_row_detail",
+                    StringComparison.Ordinal
+                )
+            );
+        rowDetailEntity
+            .FindPrimaryKey()!
+            .Properties.Select(property => property.Name)
+            .Should()
+            .Equal("Id");
         rowDetailEntity.FindProperty("Id")!.ValueGenerated.Should().Be(ValueGenerated.OnAdd);
         rowDetailEntity.FindProperty("SweepId")!.IsNullable.Should().BeFalse();
         rowDetailEntity.FindProperty("TenantId")!.IsNullable.Should().BeFalse();
         rowDetailEntity.FindProperty("CapturedPayload")!.IsNullable.Should().BeTrue();
+        rowDetailEntity.FindProperty("RetentionEntityId")!.IsNullable.Should().BeFalse();
         rowDetailEntity.FindProperty("RuleSource").Should().BeNull();
         rowDetailEntity.FindProperty("RuleReason").Should().BeNull();
-        rowDetailEntity.GetIndexes().Any(index =>
-            !index.IsUnique && index.Properties.Select(property => property.Name).SequenceEqual(["SweepId"])
-        ).Should().BeTrue();
-        rowDetailEntity.GetIndexes().Any(index =>
-            index.IsUnique
-            && index.Properties.Select(property => property.Name).SequenceEqual(
-                ["SweepId", "EntityType", "EntityId", "Category", "Strategy", "TenantId"]
+        rowDetailEntity
+            .GetIndexes()
+            .Any(index =>
+                !index.IsUnique
+                && index.Properties.Select(property => property.Name).SequenceEqual(["SweepId"])
             )
-        ).Should().BeTrue();
+            .Should()
+            .BeTrue();
+        rowDetailEntity
+            .GetIndexes()
+            .Any(index =>
+                index.IsUnique
+                && index
+                    .Properties.Select(property => property.Name)
+                    .SequenceEqual([
+                        "SweepId",
+                        "RetentionEntityId",
+                        "EntityId",
+                        "Category",
+                        "Strategy",
+                        "TenantId",
+                    ])
+            )
+            .Should()
+            .BeTrue();
 
-        var handlerStatusEntity = db.Model.GetEntityTypes().Single(entityType =>
-            string.Equals(entityType.GetTableName(), "sweep_row_handler_status", StringComparison.Ordinal)
-        );
-        handlerStatusEntity.FindPrimaryKey()!.Properties.Select(property => property.Name).Should().Equal("Id");
+        var handlerStatusEntity = db
+            .Model.GetEntityTypes()
+            .Single(entityType =>
+                string.Equals(
+                    entityType.GetTableName(),
+                    "sweep_row_handler_status",
+                    StringComparison.Ordinal
+                )
+            );
+        handlerStatusEntity
+            .FindPrimaryKey()!
+            .Properties.Select(property => property.Name)
+            .Should()
+            .Equal("Id");
         handlerStatusEntity.FindProperty("Id")!.ValueGenerated.Should().Be(ValueGenerated.OnAdd);
         handlerStatusEntity.FindProperty("SweepRunRowDetailId")!.IsNullable.Should().BeFalse();
         handlerStatusEntity.FindProperty("HandlerType")!.IsNullable.Should().BeFalse();
@@ -76,22 +124,36 @@ public sealed class MigrationModelEndToEndTests(PostgresFixture fixture)
 
         var rowDetailForeignKey = handlerStatusEntity.GetForeignKeys().Single();
         rowDetailForeignKey.PrincipalEntityType.GetTableName().Should().Be("sweep_run_row_detail");
-        rowDetailForeignKey.PrincipalKey.Properties.Select(property => property.Name).Should().Equal("Id");
-        rowDetailForeignKey.Properties.Select(property => property.Name).Should().Equal("SweepRunRowDetailId");
+        rowDetailForeignKey
+            .PrincipalKey.Properties.Select(property => property.Name)
+            .Should()
+            .Equal("Id");
+        rowDetailForeignKey
+            .Properties.Select(property => property.Name)
+            .Should()
+            .Equal("SweepRunRowDetailId");
         rowDetailForeignKey.IsRequired.Should().BeTrue();
         rowDetailForeignKey.DeleteBehavior.Should().Be(DeleteBehavior.Cascade);
 
-        handlerStatusEntity.GetIndexes().Any(index =>
-            index.IsUnique
-            && index.Properties.Select(property => property.Name).SequenceEqual(
-                ["SweepRunRowDetailId", "HandlerType"]
+        handlerStatusEntity
+            .GetIndexes()
+            .Any(index =>
+                index.IsUnique
+                && index
+                    .Properties.Select(property => property.Name)
+                    .SequenceEqual(["SweepRunRowDetailId", "HandlerType"])
             )
-        ).Should().BeTrue();
-        handlerStatusEntity.GetIndexes().Any(index =>
-            !index.IsUnique
-            && index.Properties.Select(property => property.Name).SequenceEqual(
-                ["State", "NextAttemptAt", "Id"]
+            .Should()
+            .BeTrue();
+        handlerStatusEntity
+            .GetIndexes()
+            .Any(index =>
+                !index.IsUnique
+                && index
+                    .Properties.Select(property => property.Name)
+                    .SequenceEqual(["State", "NextAttemptAt", "Id"])
             )
-        ).Should().BeTrue();
+            .Should()
+            .BeTrue();
     }
 }

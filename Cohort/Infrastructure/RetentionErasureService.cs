@@ -1,31 +1,30 @@
 using System.Data;
 using System.Data.Common;
 using System.Reflection;
-
+using Cohort.Application;
 using Cohort.Domain;
-using Cohort.Hosting;
-
+using Cohort.Infrastructure.Sweep;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Storage;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 
-namespace Cohort.Application;
+namespace Cohort.Infrastructure;
 
-public sealed class RetentionErasureService(
-    DbContext db,
+internal sealed class RetentionErasureService(
+    [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
     RetentionRegistry registry,
     IRetentionCategoryRepository categoryRepository,
     RetentionStartupValidator validator,
     IRetentionAuditWriter auditWriter,
     IEnumerable<IRetentionSweepStrategy> sweepStrategies,
-    IOptionsMonitor<CohortOptions> options,
+    IRetentionExecutionSettings options,
     ILogger<RetentionErasureService>? logger = null
-) : IRetentionErasureService
+)
 {
-    private readonly IReadOnlyDictionary<Strategy, IRetentionSweepStrategy> strategies = sweepStrategies
-        .ToDictionary(strategy => strategy.HandlesStrategy);
+    private readonly IReadOnlyDictionary<Strategy, IRetentionSweepStrategy> strategies =
+        sweepStrategies.ToDictionary(strategy => strategy.HandlesStrategy);
 
     public async Task<ErasureResult> EraseAsync(
         TenantContext tenant,
@@ -36,70 +35,30 @@ public sealed class RetentionErasureService(
     {
         ArgumentNullException.ThrowIfNull(tenant);
         ArgumentNullException.ThrowIfNull(scope);
-        await validator.ValidateAsync(ct);
-        var dryRun = options.CurrentValue.DryRun;
+        var dryRun = options.DryRun;
 
         var sweepId = Guid.NewGuid();
         var startedAt = DateTimeOffset.UtcNow;
-        var executionPlan = new List<(
-            RetentionEntry Entry,
-            RetentionResolutionContext Context,
-            RetentionRule Rule,
-            ErasureSubjectPredicate Predicate
-        )>();
-        var auditEvents = new List<SweepEvent>();
-
-        foreach (var entry in registry.Scan().Values)
-        {
-            var predicate = ResolveMatch(entry, scope);
-            if (predicate is null)
-            {
-                continue;
-            }
-
-            var resolver = await categoryRepository.GetAsync(entry.Category, ct);
-            if (resolver is null)
-            {
-                throw new InvalidOperationException(
-                    $"Retention category '{entry.Category}' for entity {entry.EntityType.FullName} could not be resolved at runtime."
-                );
-            }
-
-            var context = new RetentionResolutionContext(entry.Category, tenant, now, []);
-            var rule = await resolver.ResolveAsync(context, ct);
-            if (rule.Strategy != Strategy.Exempt && !strategies.ContainsKey(rule.Strategy))
-            {
-                throw new InvalidOperationException(
-                    $"Retention strategy '{rule.Strategy}' is not registered for erasure execution."
-                );
-            }
-
-            if (rule.Strategy == Strategy.SoftDelete && !scope.AllowSoftDeleteAsErasure)
-            {
-                throw new InvalidOperationException(
-                    $"Erasure for entity {entry.EntityType.FullName} (category '{entry.Category}') resolves to the SoftDelete strategy, which only sets the soft-delete flag and leaves personal data in place. If that genuinely satisfies the erasure request, opt in with new ErasureScope(subject, allowSoftDeleteAsErasure: true)."
-                );
-            }
-
-            executionPlan.Add((entry, context, rule, predicate));
-        }
-
-        var connection = db.Database.GetDbConnection();
-        var shouldCloseConnection = connection.State != ConnectionState.Open;
-
-        if (shouldCloseConnection)
-        {
-            await db.Database.OpenConnectionAsync(ct);
-        }
-
-        var batchSize = Math.Max(1, options.CurrentValue.SweepBatchSize);
+        var executionPlan =
+            new List<(
+                RetentionEntry Entry,
+                RetentionResolutionContext Context,
+                RetentionRule Rule,
+                ErasureSubjectPredicate Predicate
+            )>();
+        var lifecycle = new RetentionRunLifecycle(auditWriter, logger);
+        var startedPersisted = false;
         var entityFailures = new List<string>();
+        DbConnection? connection = null;
+        var shouldCloseConnection = false;
+        var runLockAcquired = false;
+        var batchSize = Math.Max(1, options.SweepBatchSize);
 
         try
         {
             // Started commits immediately (no ambient transaction): an erasure that later
             // fails or crashes still leaves audit evidence that it was attempted.
-            await WriteAuditEventAsync(
+            await lifecycle.WriteDurableAsync(
                 new SweepEvent.Started(
                     sweepId,
                     startedAt,
@@ -107,9 +66,60 @@ public sealed class RetentionErasureService(
                     DryRun: dryRun,
                     tenant.Id
                 ),
-                auditEvents,
-                ct
+                CancellationToken.None
             );
+            startedPersisted = true;
+
+            await validator.ValidateAsync(ct);
+            foreach (var entry in registry.Scan().Values)
+            {
+                if (entry.Tenant is null)
+                {
+                    continue;
+                }
+
+                var predicate = ResolveMatch(entry, scope);
+                if (predicate is null)
+                {
+                    continue;
+                }
+
+                var resolver = await categoryRepository.GetAsync(entry.Category, ct);
+                if (resolver is null)
+                {
+                    throw new InvalidOperationException(
+                        $"Retention category '{entry.Category}' for entity {entry.EntityType.FullName} could not be resolved at runtime."
+                    );
+                }
+
+                var context = new RetentionResolutionContext(entry.Category, tenant, now, []);
+                var rule = await resolver.ResolveAsync(context, ct);
+                if (rule.Strategy != Strategy.Exempt && !strategies.ContainsKey(rule.Strategy))
+                {
+                    throw new InvalidOperationException(
+                        $"Retention strategy '{rule.Strategy}' is not registered for erasure execution."
+                    );
+                }
+
+                if (rule.Strategy == Strategy.SoftDelete && !scope.AllowSoftDeleteAsErasure)
+                {
+                    throw new InvalidOperationException(
+                        $"Erasure for entity {entry.EntityType.FullName} (category '{entry.Category}') resolves to the SoftDelete strategy, which only sets the soft-delete flag and leaves personal data in place. If that genuinely satisfies the erasure request, opt in with new ErasureScope(subject, allowSoftDeleteAsErasure: true)."
+                    );
+                }
+
+                executionPlan.Add((entry, context, rule, predicate));
+            }
+
+            connection = db.Database.GetDbConnection();
+            shouldCloseConnection = connection.State != ConnectionState.Open;
+
+            if (shouldCloseConnection && connection is not null)
+            {
+                await db.Database.OpenConnectionAsync(ct);
+            }
+            await RetentionRunAdvisoryLock.AcquireAsync(connection!, sweepId, ct);
+            runLockAcquired = true;
 
             foreach (
                 var (entry, context, rule, predicate) in RetentionExecutionPlanOrderer.Order(
@@ -132,12 +142,12 @@ public sealed class RetentionErasureService(
                         now,
                         dryRun,
                         batchSize,
-                        connection,
-                        auditEvents,
+                        connection!,
+                        lifecycle,
                         ct
                     );
                 }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                catch (OperationCanceledException)
                 {
                     throw;
                 }
@@ -156,36 +166,84 @@ public sealed class RetentionErasureService(
                 }
             }
 
+            ct.ThrowIfCancellationRequested();
             var completedAt = DateTimeOffset.UtcNow;
-            var totalAffected = auditEvents.OfType<SweepEvent.EntitySummary>().Sum(summary => summary.Affected);
-            await WriteAuditEventAsync(
-                new SweepEvent.Completed(sweepId, completedAt, completedAt - startedAt, totalAffected),
-                auditEvents,
-                ct
-            );
-
+            var totalAffected = lifecycle.AccumulatedAffectedTotal;
             if (entityFailures.Count > 0)
             {
-                await WriteAuditEventAsync(
-                    new SweepEvent.Failed(
+                await lifecycle.WriteDurableAsync(
+                    new SweepEvent.PartiallyFailed(
                         sweepId,
                         completedAt,
-                        Truncate(string.Join("; ", entityFailures), 4000)
+                        completedAt - startedAt,
+                        totalAffected,
+                        RetentionRunLifecycle.TruncateError(string.Join("; ", entityFailures))
                     ),
-                    auditEvents,
-                    ct
+                    CancellationToken.None
+                );
+            }
+            else
+            {
+                await lifecycle.WriteDurableAsync(
+                    new SweepEvent.Completed(
+                        sweepId,
+                        completedAt,
+                        completedAt - startedAt,
+                        totalAffected
+                    ),
+                    CancellationToken.None
                 );
             }
         }
+        catch (OperationCanceledException ex) when (startedPersisted && ct.IsCancellationRequested)
+        {
+            var cancelledAt = DateTimeOffset.UtcNow;
+            await lifecycle.TrySettleTerminalAsync(
+                new SweepEvent.Cancelled(
+                    sweepId,
+                    cancelledAt,
+                    RetentionRunLifecycle.TruncateError(ex.Message),
+                    cancelledAt - startedAt,
+                    lifecycle.AccumulatedAffectedTotal
+                ),
+                "cancelled erasure",
+                sweepId
+            );
+            throw;
+        }
+        catch (Exception ex) when (startedPersisted)
+        {
+            var failedAt = DateTimeOffset.UtcNow;
+            await lifecycle.TrySettleTerminalAsync(
+                new SweepEvent.Failed(
+                    sweepId,
+                    failedAt,
+                    RetentionRunLifecycle.TruncateError(ex.Message),
+                    failedAt - startedAt,
+                    lifecycle.AccumulatedAffectedTotal
+                ),
+                "failed erasure",
+                sweepId
+            );
+            throw;
+        }
         finally
         {
+            if (runLockAcquired)
+            {
+                await RetentionRunAdvisoryLock.ReleaseAsync(
+                    connection!,
+                    sweepId,
+                    CancellationToken.None
+                );
+            }
             if (shouldCloseConnection)
             {
                 await db.Database.CloseConnectionAsync();
             }
         }
 
-        return CreateResult(auditEvents, scope, entityFailures);
+        return lifecycle.CreateErasureResult(scope, entityFailures);
     }
 
     private async Task EraseEntityAsync(
@@ -198,15 +256,16 @@ public sealed class RetentionErasureService(
         bool dryRun,
         int batchSize,
         DbConnection connection,
-        List<SweepEvent> auditEvents,
+        RetentionRunLifecycle lifecycle,
         CancellationToken ct
     )
     {
         var eventAt = DateTimeOffset.UtcNow;
         var resolvedPeriod = CutoffCalculator.ResolveEffectivePeriod(rule.Period, rule.LegalMin);
-        var effectiveAuditDetail = entry.AuditRowDetail == AuditRowDetail.Inherit
-            ? rule.AuditRowDetail
-            : entry.AuditRowDetail;
+        var effectiveAuditDetail =
+            entry.AuditRowDetail == AuditRowDetail.Inherit
+                ? rule.AuditRowDetail
+                : entry.AuditRowDetail;
         var affectedCount = 0L;
         var skippedCount = 0L;
         var heldCount = 0L;
@@ -287,6 +346,7 @@ public sealed class RetentionErasureService(
                                         sweepId,
                                         eventAt,
                                         entry.EntityType,
+                                        entry.EntityId,
                                         recordId,
                                         entry.Category,
                                         rule.Strategy,
@@ -297,11 +357,36 @@ public sealed class RetentionErasureService(
                             }
                         }
 
+                        await auditWriter.WriteAsync(
+                            new SweepEvent.EntityProgress(
+                                sweepId,
+                                eventAt,
+                                entry.EntityType,
+                                entry.EntityId,
+                                entry.Category,
+                                tenant.Id,
+                                rule.Strategy,
+                                resolvedPeriod,
+                                execution.AffectedRecordIds.Count,
+                                execution.SkippedCount,
+                                rule.Provenance
+                            ),
+                            ct
+                        );
+
                         await transaction.CommitAsync(ct);
                     }
 
                     affectedCount += execution.AffectedRecordIds.Count;
                     skippedCount += execution.SkippedCount;
+                    lifecycle.ReplaceEntityCount(
+                        entry,
+                        tenant.Id,
+                        rule.Strategy,
+                        affectedCount,
+                        heldCount,
+                        skippedCount
+                    );
                     // Skipped rows stay eligible (their mutation never ran), so later
                     // batches of this run must not reselect them: re-running their
                     // failed OnBefore would re-insert the same row detail under this
@@ -313,7 +398,8 @@ public sealed class RetentionErasureService(
                     // (e.g. a custom strategy that skips without reporting ids) would
                     // reselect the same rows forever.
                     var madeProgress =
-                        execution.AffectedRecordIds.Count > 0 || execution.SkippedRecordIds.Count > 0;
+                        execution.AffectedRecordIds.Count > 0
+                        || execution.SkippedRecordIds.Count > 0;
                     if (execution.CandidateCount < batchSize || !madeProgress)
                     {
                         break;
@@ -334,11 +420,23 @@ public sealed class RetentionErasureService(
             );
         }
 
-        await WriteAuditEventAsync(
+        if (!dryRun)
+        {
+            lifecycle.ReplaceEntityCount(
+                entry,
+                tenant.Id,
+                rule.Strategy,
+                affectedCount,
+                heldCount,
+                skippedCount
+            );
+        }
+        await lifecycle.WriteDurableAsync(
             new SweepEvent.EntitySummary(
                 sweepId,
                 eventAt,
                 entry.EntityType,
+                entry.EntityId,
                 entry.Category,
                 tenant.Id,
                 rule.Strategy,
@@ -348,20 +446,25 @@ public sealed class RetentionErasureService(
                 skippedCount,
                 Provenance: rule.Provenance
             ),
-            auditEvents,
             ct
         );
-    }
-
-    private static string Truncate(string value, int maxLength)
-    {
-        return value.Length <= maxLength ? value : value[..maxLength];
+        if (dryRun)
+        {
+            lifecycle.ReplaceEntityCount(
+                entry,
+                tenant.Id,
+                rule.Strategy,
+                affectedCount,
+                heldCount,
+                skippedCount
+            );
+        }
     }
 
     private ErasureSubjectPredicate? ResolveMatch(RetentionEntry entry, ErasureScope scope)
     {
-        var subjectProperties = entry.EntityType
-            .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+        var subjectProperties = entry
+            .EntityType.GetProperties(BindingFlags.Public | BindingFlags.Instance)
             .Where(property => property.IsDefined(typeof(ErasureSubjectAttribute), inherit: false))
             .OrderBy(property => property.Name, StringComparer.Ordinal)
             .ToArray();
@@ -383,7 +486,9 @@ public sealed class RetentionErasureService(
             );
 
         var effectiveTypes = subjectProperties
-            .Select(property => Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType)
+            .Select(property =>
+                Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType
+            )
             .Distinct()
             .ToArray();
         if (effectiveTypes.Length > 1)
@@ -410,7 +515,12 @@ public sealed class RetentionErasureService(
                 return new ErasureSubjectMatch(
                     subjectProperty.Name,
                     subjectColumn,
-                    ConvertSubjectValue(entry.EntityType, subjectProperty, efProperty, scope.Subject)
+                    ConvertSubjectValue(
+                        entry.EntityType,
+                        subjectProperty,
+                        efProperty,
+                        scope.Subject
+                    )
                 );
             })
             .ToArray();
@@ -437,47 +547,4 @@ public sealed class RetentionErasureService(
         );
     }
 
-    private async Task WriteAuditEventAsync(
-        SweepEvent evt,
-        ICollection<SweepEvent> auditEvents,
-        CancellationToken ct
-    )
-    {
-        await auditWriter.WriteAsync(evt, ct);
-        auditEvents.Add(evt);
-    }
-
-    private static ErasureResult CreateResult(
-        IEnumerable<SweepEvent> auditEvents,
-        ErasureScope scope,
-        IReadOnlyList<string> entityFailures
-    )
-    {
-        var started = auditEvents.OfType<SweepEvent.Started>().Single();
-        var completed = auditEvents.OfType<SweepEvent.Completed>().Single();
-        var counts = auditEvents
-            .OfType<SweepEvent.EntitySummary>()
-            .Select(summary =>
-                new EntitySweepCount(
-                    summary.EntityType,
-                    summary.Category,
-                    summary.TenantId,
-                    summary.Strategy,
-                    summary.Affected,
-                    summary.HeldCount,
-                    summary.SkippedCount
-                )
-            )
-            .ToArray();
-
-        return new ErasureResult(
-            started.SweepId,
-            started.At,
-            completed.At,
-            scope,
-            counts,
-            started.DryRun,
-            entityFailures
-        );
-    }
 }

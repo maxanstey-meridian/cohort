@@ -476,6 +476,9 @@ public sealed class PackageReleaseContractTests
         Artifact.Value.Readme.Should().Contain("Valid range: 1 to 10000");
         Artifact.Value.Readme.Should().Contain("Valid range: 1 to 256");
         Artifact.Value.Readme.Should().Contain("Valid range: 1 to 1000");
+        Artifact.Value.Readme.Should().Contain("| `RowHandlerDispatch:BatchSize` | `50` |");
+        Artifact.Value.Readme.Should().Contain("| `RowHandlerDispatch:MaxAttempts` | `10` |");
+        Artifact.Value.Readme.Should().Contain("`RowHandlerDispatch:PayloadRetention` | `30.00:00:00`");
         Artifact.Value.Readme.Should().NotContain("run row's `FailedAt`");
         Artifact.Value.Readme.Should().NotContain("both `CompletedAt`");
     }
@@ -488,6 +491,9 @@ public sealed class PackageReleaseContractTests
         Artifact.Value.Readme.Should().Contain("AnonymiseWithAttribute");
         Artifact.Value.Readme.Should().Contain("IRetentionRowDispatcher");
         Artifact.Value.Readme.Should().Contain("RetentionHoldRequest");
+        Artifact.Value.Readme.Should().Contain("generate a host-owned EF Core migration");
+        Artifact.Value.Readme.Should().Contain("Give long-lived handlers an explicit stable UUID");
+        Artifact.Value.Readme.Should().Contain("AnonymisedAtPropertyName");
         Artifact
             .Value.Readme.Should()
             .Contain("[RetentionEntityId(\"a3f467fe-c5d0-4f17-9897-83c373cc1dc8\")]");

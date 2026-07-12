@@ -111,6 +111,10 @@ protected override void OnModelCreating(ModelBuilder modelBuilder)
 }
 ```
 
+After adding `ConfigureCohortTables()`, generate a host-owned EF Core migration containing all
+five Cohort tables and apply it before startup or any direct Cohort operation. Cohort validates
+the installed schema but never creates or upgrades it at runtime.
+
 What happens:
 
 - old `SessionNote` rows are deleted
@@ -353,7 +357,8 @@ You can override those globally:
       "RecordIdPropertyName": "Id",
       "TenantPropertyName": "OrganisationId",
       "SoftDeletePropertyName": "IsDeleted",
-      "DeletedAtPropertyName": "DeletedAt"
+      "DeletedAtPropertyName": "DeletedAt",
+      "AnonymisedAtPropertyName": "AnonymisedAt"
     }
   }
 }
@@ -376,6 +381,10 @@ Priority is:
 ## Row handlers
 
 If you need side effects around mutated rows, register handlers with `AddRowHandler<TEntity, THandler>()`.
+
+Give long-lived handlers an explicit stable UUID through the `identity` argument. Without one,
+queued work uses the handler's CLR type name; renaming that class dead-letters work still queued
+under the old name.
 
 Handlers run through the dispatcher surface (`IRetentionRowDispatcher` backed by `RetentionRowDispatcher`) and let you do things like:
 
@@ -431,9 +440,14 @@ The execution contract:
 | `KillSwitch` | `false` | Finish the current iteration, then skip future ticks. |
 | `SweepBatchSize` | `5000` | Maximum rows selected, locked, and mutated per transaction. Each batch commits independently. |
 | `AuditObservers:Timeout` | `00:00:05` | Maximum time Cohort waits for each observer to handle one committed event. Each observer has an independent timeout. |
-| `RowHandlerDispatch:BatchSize` | `100` | Maximum queued handler statuses claimed in one dispatcher batch. Valid range: 1 to 10000. |
+| `RowHandlerDispatch:PollInterval` | `00:00:10` | Delay between dispatcher polling passes. |
+| `RowHandlerDispatch:BatchSize` | `50` | Maximum queued handler statuses claimed in one dispatcher batch. Valid range: 1 to 10000. |
 | `RowHandlerDispatch:MaxParallelism` | `4` | Maximum rows dispatched concurrently. Handlers for one row remain ordered. Valid range: 1 to 256. |
-| `RowHandlerDispatch:MaxAttempts` | `5` | Maximum delivery attempts before dead-lettering. Valid range: 1 to 1000. |
+| `RowHandlerDispatch:MaxAttempts` | `10` | Maximum delivery attempts before dead-lettering. Valid range: 1 to 1000. |
+| `RowHandlerDispatch:BaseBackoff` | `00:00:01` | Base delay for exponential retry backoff. |
+| `RowHandlerDispatch:ClaimTimeout` | `00:05:00` | Visibility timeout before abandoned in-flight work is reclaimed. |
+| `RowHandlerDispatch:SweepSettleTimeout` | `01:00:00` | Age after which an unowned `Started` run is recovered as failed. |
+| `RowHandlerDispatch:PayloadRetention` | `30.00:00:00` | Backstop retention for potentially sensitive captured row snapshots. |
 
 Worker semantics worth knowing:
 
@@ -545,16 +559,27 @@ Sweeps and erasure are batched and incremental:
 
 ## Legal holds
 
-```text
-await holdsRepo.CreateAsync(new RetentionHoldRequest(
-    holdId: Guid.NewGuid(),
-    retentionEntityId: Guid.Parse("a3f467fe-c5d0-4f17-9897-83c373cc1dc8"),
-    recordId: noteId.ToString(),
-    tenantId: tenantId,
-    reason: "Litigation hold - case #12345",
-    createdAt: DateTimeOffset.UtcNow,
-    expiresAt: DateTimeOffset.UtcNow.AddYears(1)
-));
+<!-- package-contract:compile -->
+```csharp
+public static class ReadmeLegalHolds
+{
+    public static Task CreateAsync(
+        IRetentionHoldsRepository holds,
+        Guid noteId,
+        Guid tenantId,
+        DateTimeOffset now,
+        CancellationToken ct) =>
+        holds.CreateAsync(
+            new RetentionHoldRequest(
+                holdId: Guid.NewGuid(),
+                retentionEntityId: Guid.Parse("a3f467fe-c5d0-4f17-9897-83c373cc1dc8"),
+                recordId: noteId.ToString(),
+                tenantId: tenantId,
+                reason: "Litigation hold - case #12345",
+                createdAt: now,
+                expiresAt: now.AddYears(1)),
+            ct);
+}
 ```
 
 Held records survive all strategies. Holds are checked in SQL via a `NOT EXISTS` subquery, not via an in-memory row pass. Hold activity is evaluated against the **database wall clock**, not the sweep's logical `now`: a hold created yesterday protects its row even from a backdated sweep.
@@ -563,8 +588,9 @@ Held records survive all strategies. Holds are checked in SQL via a `NOT EXISTS`
 
 - `RetentionEntityId` must identify a retained entity in the current EF model, or creation
   throws.
-- For tables with a Guid primary key, `RecordId` is normalised to the canonical lowercase
-  hyphenated form the sweep compares against; non-Guid values are rejected.
+- `RecordId` is parsed and canonicalized using the mapped key's PostgreSQL store type. For a
+  Guid key, malformed Guid values are rejected; integer, string, and provider-converted keys
+  retain their own canonical PostgreSQL representation.
 - For retained tenant-scoped tables, if the target row already exists its tenant must
   match `TenantId` — sweeps only honour holds whose tenant matches the row's, so a
   mis-scoped hold would persist while protecting nothing.

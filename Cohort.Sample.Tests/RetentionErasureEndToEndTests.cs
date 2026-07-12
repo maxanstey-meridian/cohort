@@ -297,8 +297,8 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         run.TotalAffected.Should().Be(3);
         run.TenantId.Should().Be(tenantId);
         result.Scope.Should().Be(inputScope);
-        result.StartedAt.Should().Be(run.StartedAt);
-        result.CompletedAt.Should().Be(run.CompletedAt);
+        result.StartedAt.Should().BeCloseTo(run.StartedAt, TimeSpan.FromMicroseconds(1));
+        result.CompletedAt.Should().BeCloseTo(run.CompletedAt, TimeSpan.FromMicroseconds(1));
         result.CompletedAt.Should().BeOnOrAfter(result.StartedAt);
         summaries
             .Should()

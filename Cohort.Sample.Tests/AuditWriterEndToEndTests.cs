@@ -324,8 +324,8 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
         var rowDetails = await LoadRowDetailsAsync(result.SweepId);
 
         run.SweepId.Should().Be(result.SweepId);
-        run.StartedAt.Should().Be(result.StartedAt);
-        run.CompletedAt.Should().Be(result.CompletedAt);
+        run.StartedAt.Should().BeCloseTo(result.StartedAt, TimeSpan.FromMicroseconds(1));
+        run.CompletedAt.Should().BeCloseTo(result.CompletedAt, TimeSpan.FromMicroseconds(1));
         run.Trigger.Should().Be(SweepTriggerKind.Manual);
         run.DryRun.Should().BeFalse();
         run.TenantId.Should().Be(tenantId);

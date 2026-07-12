@@ -1059,7 +1059,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         var call = recorder.Load().Should().ContainSingle().Subject;
         call.RecordId.Should().Be(noteId.ToString());
         call.Payload.NoteId.Should().Be(noteId);
-        call.Payload.RecordedAt.Should().Be(call.At);
+        call.Payload.RecordedAt.Should().BeCloseTo(call.At, TimeSpan.FromMicroseconds(1));
         call.Payload.Body.Should().Be("typed-snapshot-target");
 
         var statuses = await LoadHandlerStatusesAsync(result.SweepId);

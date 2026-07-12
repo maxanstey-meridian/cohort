@@ -41,10 +41,12 @@ internal static class RetentionEntityLockSql
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
-            SELECT pg_advisory_xact_lock(hashtextextended(ordered.lock_key, @hashSeed))
+            SELECT pg_catalog.pg_advisory_xact_lock(
+                pg_catalog.hashtextextended(ordered.lock_key, @hashSeed)
+            )
             FROM (
                 SELECT lock_key
-                FROM unnest(@lockKeys) AS keys(lock_key)
+                FROM pg_catalog.unnest(@lockKeys) AS keys(lock_key)
                 ORDER BY lock_key
             ) AS ordered
             """;

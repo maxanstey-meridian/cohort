@@ -70,11 +70,9 @@ public static class ServiceCollectionExtensions
         services.AddKeyedScoped<DbContext>(CohortServiceKeys.DbContext, (sp, _) =>
             sp.GetRequiredService<TContext>()
         );
-        services.TryAddSingleton<
-            IRetentionCategoryRepository,
-            MissingRetentionCategoryRepository
-        >();
-        services.TryAddScoped<IRetentionAuditWriter, EfRetentionAuditWriter>();
+        services.TryAddSingleton<IRetentionRuleProvider, MissingRetentionRuleProvider>();
+        services.AddScoped<EfRetentionAuditWriter>();
+        services.AddScoped<RetentionAuditNotifier>();
         services.TryAddScoped<IRetentionHoldsRepository, EfRetentionHoldsRepository>();
         services.TryAddEnumerable(
             ServiceDescriptor.Scoped<IRetentionSweepStrategy, PurgeSweepStrategy>()
@@ -90,9 +88,12 @@ public static class ServiceCollectionExtensions
         services.TryAddScoped<RetentionErasureService>();
         services.TryAddSingleton<IRetentionErasureService, ScopeOwnedRetentionErasureService>();
         services.TryAddScoped<RetentionRegistry>();
+        services.TryAddScoped<ErasureSubjectMetadataResolver>();
         services.TryAddSingleton<RetentionValidationState>();
         services.TryAddScoped<RetentionStartupValidator>();
         services.TryAddScoped<CohortSchemaValidator>();
+        services.TryAddSingleton<RetentionRuntimeReadinessState>();
+        services.TryAddScoped<RetentionRuntimeReadinessValidator>();
         services.TryAddScoped<RetentionSweepEngine>();
         services.TryAddSingleton<IRetentionSweep, ScopeOwnedRetentionSweep>();
         services.TryAddScoped<IRetentionTenantSource, SingleTenantContextSource>();
@@ -187,18 +188,28 @@ public static class ServiceCollectionExtensions
 
     private sealed record CohortRegistrationMarker(Type ContextType);
 
-    private sealed class HostingRetentionExecutionSettings(IOptionsMonitor<CohortOptions> options)
-        : IRetentionExecutionSettings
+    private sealed class HostingRetentionExecutionSettings : IRetentionExecutionSettings, IDisposable
     {
-        public bool DryRun => options.CurrentValue.DryRun;
+        private CohortOptions current;
+        private readonly IDisposable? reloadSubscription;
 
-        public int SweepBatchSize => options.CurrentValue.SweepBatchSize;
+        public HostingRetentionExecutionSettings(IOptionsMonitor<CohortOptions> options)
+        {
+            current = options.CurrentValue;
+            reloadSubscription = options.OnChange(updated => Volatile.Write(ref current, updated));
+        }
+
+        public bool DryRun => Volatile.Read(ref current).DryRun;
+
+        public int SweepBatchSize => Volatile.Read(ref current).SweepBatchSize;
+
+        public TimeSpan AuditObserverTimeout => Volatile.Read(ref current).AuditObservers.Timeout;
 
         public RetentionRowHandlerSettings RowHandlerDispatch
         {
             get
             {
-                var value = options.CurrentValue.RowHandlerDispatch;
+                var value = Volatile.Read(ref current).RowHandlerDispatch;
                 return new RetentionRowHandlerSettings(
                     value.PollInterval,
                     value.PayloadRetention,
@@ -210,6 +221,11 @@ public static class ServiceCollectionExtensions
                     value.SweepSettleTimeout
                 );
             }
+        }
+
+        public void Dispose()
+        {
+            reloadSubscription?.Dispose();
         }
     }
 
@@ -230,16 +246,21 @@ public static class ServiceCollectionExtensions
         }
     }
 
-    private sealed class MissingRetentionCategoryRepository : IRetentionCategoryRepository
+    private sealed class MissingRetentionRuleProvider : IRetentionRuleProvider
     {
-        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        public RetentionCategoryCapabilities? GetCapabilities(string category)
         {
             throw new InvalidOperationException(
-                $"No IRetentionCategoryRepository has been registered. "
+                $"No IRetentionRuleProvider has been registered. "
                     + $"Register one before calling AddCohort<TContext>() via "
-                    + $"services.AddSingleton<IRetentionCategoryRepository, YourRepository>(). "
+                    + $"services.AddSingleton<IRetentionRuleProvider, YourProvider>(). "
                     + $"(Attempted to resolve category '{category}'.)"
             );
         }
+
+        public Task<RetentionRule?> ResolveAsync(
+            RetentionResolutionContext context,
+            CancellationToken ct
+        ) => throw new InvalidOperationException("No IRetentionRuleProvider has been registered.");
     }
 }

@@ -127,7 +127,7 @@ public abstract record SweepEvent
             DateTimeOffset At,
             Type EntityType,
             Guid RetentionEntityId,
-            string EntityId,
+            string RecordId,
             string Category,
             Strategy Strategy,
             Guid TenantId
@@ -137,7 +137,7 @@ public abstract record SweepEvent
             this.At = At;
             this.EntityType = EntityType ?? throw new ArgumentNullException(nameof(EntityType));
             this.RetentionEntityId = RequiredId(RetentionEntityId, nameof(RetentionEntityId));
-            this.EntityId = RequiredText(EntityId, nameof(EntityId));
+            this.RecordId = RequiredText(RecordId, nameof(RecordId));
             this.Category = RequiredText(Category, nameof(Category));
             this.Strategy = Defined(Strategy, nameof(Strategy));
             this.TenantId = TenantId;
@@ -147,7 +147,7 @@ public abstract record SweepEvent
         public DateTimeOffset At { get; }
         public Type EntityType { get; }
         public Guid RetentionEntityId { get; }
-        public string EntityId { get; }
+        public string RecordId { get; }
         public string Category { get; }
         public Strategy Strategy { get; }
         public Guid TenantId { get; }

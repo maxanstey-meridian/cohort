@@ -1,6 +1,7 @@
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure;
+using Cohort.Infrastructure.Migrations;
 using Cohort.Sample.Entities;
 using Microsoft.EntityFrameworkCore;
 
@@ -8,7 +9,7 @@ namespace Cohort.Sample.Tests;
 
 public sealed class RetentionStartupValidatorTests
 {
-    private static readonly IRetentionRuleResolver ExemptResolver = new StaticRetentionRuleResolver(
+    private static readonly ITestRetentionRule ExemptResolver = new StaticTestRetentionRule(
         new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
     );
 
@@ -158,7 +159,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     private static InMemoryCategoryRepository IdentityCategoryRepository() =>
-        new(new Dictionary<string, IRetentionRuleResolver> { ["identity"] = ExemptResolver });
+        new(new Dictionary<string, ITestRetentionRule> { ["identity"] = ExemptResolver });
 
     [Fact]
     public async Task ValidateAsync_Rejects_Entities_With_Both_Retention_And_Exemption_Metadata()
@@ -194,9 +195,9 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new BrokenAnnotationDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["broken-sample"] = new StaticRetentionRuleResolver(
+                ["broken-sample"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(90), Strategy.Purge)
                 ),
             }
@@ -221,7 +222,7 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
-    public async Task ValidateAsync_Rejects_Missing_Category_Resolvers()
+    public async Task ValidateAsync_Rejects_Missing_Category_Capabilities()
     {
         var options = new DbContextOptionsBuilder<SampleDbContext>()
             .UseNpgsqlMetadataModel($"startup-validator-missing-category-{Guid.NewGuid()}")
@@ -265,9 +266,9 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new AggregateFailureDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["valid-category"] = new StaticRetentionRuleResolver(
+                ["valid-category"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                 ),
             }
@@ -299,7 +300,7 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new ThrowingResolverAggregateDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
                 ["throwing-category"] = new ThrowingStartupRuleResolver("resolver exploded"),
             }
@@ -312,7 +313,7 @@ public sealed class RetentionStartupValidatorTests
         exception
             .Which.Errors.Should()
             .Contain(
-                $"Retention category 'throwing-category' for entity {typeof(ThrowingResolverRecord).FullName} failed startup validation: resolver exploded"
+                $"Retention category 'throwing-category' for entity {typeof(ThrowingResolverRecord).FullName} failed capability resolution: resolver exploded"
             );
         exception.Which.Message.Should().Contain("throwing-category");
     }
@@ -325,9 +326,9 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new InvalidTenantDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["tenant-category"] = new StaticRetentionRuleResolver(
+                ["tenant-category"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                 ),
             }
@@ -353,7 +354,7 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new NullableClrTenantDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver> { ["nullable-tenant"] = ExemptResolver }
+            new Dictionary<string, ITestRetentionRule> { ["nullable-tenant"] = ExemptResolver }
         );
 
         var act = async () => await CreateValidator(db, repository).ValidateAsync();
@@ -376,7 +377,7 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new NonUniqueRecordIdDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver> { ["record-id"] = ExemptResolver }
+            new Dictionary<string, ITestRetentionRule> { ["record-id"] = ExemptResolver }
         );
 
         var act = async () => await CreateValidator(db, repository).ValidateAsync();
@@ -399,7 +400,7 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new NullableRecordIdDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver> { ["record-id"] = ExemptResolver }
+            new Dictionary<string, ITestRetentionRule> { ["record-id"] = ExemptResolver }
         );
 
         var act = async () => await CreateValidator(db, repository).ValidateAsync();
@@ -422,7 +423,7 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new CompositeRecordIdDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver> { ["record-id"] = ExemptResolver }
+            new Dictionary<string, ITestRetentionRule> { ["record-id"] = ExemptResolver }
         );
 
         var act = async () => await CreateValidator(db, repository).ValidateAsync();
@@ -445,7 +446,7 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new UniqueRecordIdDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver> { ["record-id"] = ExemptResolver }
+            new Dictionary<string, ITestRetentionRule> { ["record-id"] = ExemptResolver }
         );
 
         var act = async () => await CreateValidator(db, repository).ValidateAsync();
@@ -489,9 +490,9 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new InvalidSoftDeleteIsDeletedDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["invalid-soft-delete"] = new StaticRetentionRuleResolver(
+                ["invalid-soft-delete"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                 ),
             }
@@ -519,9 +520,9 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new InvalidSoftDeleteDeletedAtDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["invalid-soft-delete"] = new StaticRetentionRuleResolver(
+                ["invalid-soft-delete"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                 ),
             }
@@ -549,9 +550,9 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new MissingSoftDeleteTenantDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["missing-soft-delete-tenant"] = new StaticRetentionRuleResolver(
+                ["missing-soft-delete-tenant"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                 ),
             }
@@ -579,9 +580,9 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new ExplicitTenantlessSoftDeleteDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["explicit-tenantless-soft-delete"] = new StaticRetentionRuleResolver(
+                ["explicit-tenantless-soft-delete"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                 ),
             }
@@ -600,15 +601,15 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new SampleDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["short-lived"] = new StaticRetentionRuleResolver(
+                ["short-lived"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                 ),
-                ["soft-delete"] = new StaticRetentionRuleResolver(
+                ["soft-delete"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                 ),
-                ["anonymise"] = new StaticRetentionRuleResolver(
+                ["anonymise"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                 ),
                 // Other sample entities in SampleDbContext aren't the subject of this test;
@@ -646,15 +647,15 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new InvalidAnonymiseMethodDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["invalid-null-anonymise"] = new StaticRetentionRuleResolver(
+                ["invalid-null-anonymise"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                 ),
-                ["invalid-empty-string-anonymise"] = new StaticRetentionRuleResolver(
+                ["invalid-empty-string-anonymise"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                 ),
-                ["invalid-fixed-literal-anonymise"] = new StaticRetentionRuleResolver(
+                ["invalid-fixed-literal-anonymise"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                 ),
             }
@@ -696,9 +697,9 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new InvalidFactoryTypeAnonymiseDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["invalid-factory-type-anonymise"] = new StaticRetentionRuleResolver(
+                ["invalid-factory-type-anonymise"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                 ),
             }
@@ -726,9 +727,9 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new FactoryBackedAnonymiseDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["factory-backed-anonymise"] = new StaticRetentionRuleResolver(
+                ["factory-backed-anonymise"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                 ),
             }
@@ -756,9 +757,9 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new InvalidNullReferenceAnonymiseDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["invalid-null-reference-anonymise"] = new StaticRetentionRuleResolver(
+                ["invalid-null-reference-anonymise"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                 ),
             }
@@ -789,9 +790,9 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new RequiredNullableAnonymiseDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["required-null-anonymise"] = new StaticRetentionRuleResolver(
+                ["required-null-anonymise"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                 ),
             }
@@ -815,9 +816,9 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new StructuralAnonymiseDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["structural-anonymise"] = new StaticRetentionRuleResolver(
+                ["structural-anonymise"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                 ),
             }
@@ -859,9 +860,9 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new ExplicitTenantlessAnonymiseDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["explicit-tenantless-anonymise"] = new StaticRetentionRuleResolver(
+                ["explicit-tenantless-anonymise"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                 ),
             }
@@ -887,7 +888,7 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new ExplicitTenantlessSoftDeleteDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
                 ["explicit-tenantless-soft-delete"] = new OpaqueDeferredRuleResolver(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
@@ -913,9 +914,9 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new InheritanceDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["inheritance-base"] = new StaticRetentionRuleResolver(
+                ["inheritance-base"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                 ),
             }
@@ -934,16 +935,16 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
-    public async Task ValidateAsync_Rejects_Retained_Entities_Mapped_To_NonDefault_Schemas()
+    public async Task ValidateAsync_Allows_Retained_Entities_Mapped_To_NonDefault_Schemas()
     {
         var options = new DbContextOptionsBuilder<NonDefaultSchemaDbContext>()
             .UseNpgsqlMetadataModel($"startup-validator-schema-{Guid.NewGuid()}")
             .Options;
         await using var db = new NonDefaultSchemaDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["schema-category"] = new StaticRetentionRuleResolver(
+                ["schema-category"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                 ),
             }
@@ -951,14 +952,10 @@ public sealed class RetentionStartupValidatorTests
 
         var act = async () => await CreateValidator(db, repository).ValidateAsync();
 
-        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().ContainSingle();
-        exception
-            .Which.Errors[0]
-            .Should()
-            .Be(
-                $"[Retain] on {typeof(NonDefaultSchemaRecord).FullName}: entity is mapped to schema 'audit'. Cohort SQL does not schema-qualify identifiers and resolves tables via the connection search_path, so entities outside the default 'public' schema are not supported."
-            );
+        await act.Should().NotThrowAsync();
+        new RetentionEntryBuilder(new RetentionModelConventions())
+            .TryBuild(db.Model.FindEntityType(typeof(NonDefaultSchemaRecord))!)!
+            .Table.Schema.Should().Be("audit");
     }
 
     [Fact]
@@ -969,12 +966,12 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new CascadeDeleteDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["cascade-parent"] = new StaticRetentionRuleResolver(
+                ["cascade-parent"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                 ),
-                ["cascade-child"] = new StaticRetentionRuleResolver(
+                ["cascade-child"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(365), Strategy.Purge)
                 ),
             }
@@ -1000,12 +997,12 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new RestrictDeleteDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["cascade-parent"] = new StaticRetentionRuleResolver(
+                ["cascade-parent"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                 ),
-                ["restrict-child"] = new StaticRetentionRuleResolver(
+                ["restrict-child"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(365), Strategy.Purge)
                 ),
             }
@@ -1024,9 +1021,9 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new DuplicateTenantMarkerDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["duplicate-tenant-marker"] = new StaticRetentionRuleResolver(
+                ["duplicate-tenant-marker"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                 ),
             }
@@ -1052,9 +1049,9 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new DuplicateAnonymisedAtMarkerDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["duplicate-anonymised-at-marker"] = new StaticRetentionRuleResolver(
+                ["duplicate-anonymised-at-marker"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                 ),
             }
@@ -1083,9 +1080,9 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new ContradictoryTenantlessDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["contradictory-tenantless"] = new StaticRetentionRuleResolver(
+                ["contradictory-tenantless"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                 ),
             }
@@ -1112,9 +1109,9 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new NaiveTimestampDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["naive-anchor"] = new StaticRetentionRuleResolver(
+                ["naive-anchor"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                 ),
             }
@@ -1137,9 +1134,9 @@ public sealed class RetentionStartupValidatorTests
             .Options;
         await using var db = new TimestamptzAnchorDbContext(options);
         var repository = new InMemoryCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["naive-anchor"] = new StaticRetentionRuleResolver(
+                ["naive-anchor"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                 ),
             }
@@ -1151,20 +1148,20 @@ public sealed class RetentionStartupValidatorTests
     }
 
     private sealed class InMemoryCategoryRepository(
-        IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
-    ) : IRetentionCategoryRepository
+        IReadOnlyDictionary<string, ITestRetentionRule> resolvers
+    ) : ITestRetentionRuleProvider
     {
         public static InMemoryCategoryRepository Empty { get; } =
-            new(new Dictionary<string, IRetentionRuleResolver>());
+            new(new Dictionary<string, ITestRetentionRule>());
 
-        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct)
         {
             resolvers.TryGetValue(category, out var resolver);
             return Task.FromResult(resolver);
         }
     }
 
-    private sealed class DeferredRuleResolver(RetentionRule rule) : IRetentionRuleResolver
+    private sealed class DeferredRuleResolver(RetentionRule rule) : ITestRetentionRule
     {
         public Task<RetentionRule> ResolveAsync(
             RetentionResolutionContext ctx,
@@ -1172,7 +1169,7 @@ public sealed class RetentionStartupValidatorTests
         ) => Task.FromResult(rule);
     }
 
-    private sealed class OpaqueDeferredRuleResolver(RetentionRule rule) : IRetentionRuleResolver
+    private sealed class OpaqueDeferredRuleResolver(RetentionRule rule) : ITestRetentionRule
     {
         public Task<RetentionRule> ResolveAsync(
             RetentionResolutionContext ctx,
@@ -1182,7 +1179,7 @@ public sealed class RetentionStartupValidatorTests
 
     private static RetentionStartupValidator CreateValidator(
         DbContext db,
-        IRetentionCategoryRepository repository
+        ITestRetentionRuleProvider repository
     )
     {
         return new RetentionStartupValidator(
@@ -1193,9 +1190,9 @@ public sealed class RetentionStartupValidatorTests
         );
     }
 
-    private sealed class GuardedSampleCategoryRepository : IRetentionCategoryRepository
+    private sealed class GuardedSampleCategoryRepository : ITestRetentionRuleProvider
     {
-        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct)
         {
             if (
                 category == "short-lived"
@@ -1204,8 +1201,8 @@ public sealed class RetentionStartupValidatorTests
                 || category == "nullable-anchor-purge"
             )
             {
-                return Task.FromResult<IRetentionRuleResolver?>(
-                    new StaticRetentionRuleResolver(
+                return Task.FromResult<ITestRetentionRule?>(
+                    new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                     )
                 );
@@ -1213,8 +1210,8 @@ public sealed class RetentionStartupValidatorTests
 
             if (category == "soft-delete" || category == "tenantless-softdelete")
             {
-                return Task.FromResult<IRetentionRuleResolver?>(
-                    new StaticRetentionRuleResolver(
+                return Task.FromResult<ITestRetentionRule?>(
+                    new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     )
                 );
@@ -1222,8 +1219,8 @@ public sealed class RetentionStartupValidatorTests
 
             if (category == "anonymise" || category == "tombstone-anonymise")
             {
-                return Task.FromResult<IRetentionRuleResolver?>(
-                    new StaticRetentionRuleResolver(
+                return Task.FromResult<ITestRetentionRule?>(
+                    new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     )
                 );
@@ -1231,8 +1228,8 @@ public sealed class RetentionStartupValidatorTests
 
             if (category == "per-row-audit-override")
             {
-                return Task.FromResult<IRetentionRuleResolver?>(
-                    new StaticRetentionRuleResolver(
+                return Task.FromResult<ITestRetentionRule?>(
+                    new StaticTestRetentionRule(
                         new RetentionRule(
                             TimeSpan.FromDays(30),
                             Strategy.Purge,
@@ -1248,9 +1245,9 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
-    private sealed class DeferredSampleCategoryRepository : IRetentionCategoryRepository
+    private sealed class DeferredSampleCategoryRepository : ITestRetentionRuleProvider
     {
-        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct)
         {
             if (
                 category == "short-lived"
@@ -1260,7 +1257,7 @@ public sealed class RetentionStartupValidatorTests
                 || category == "per-row-audit-override"
             )
             {
-                return Task.FromResult<IRetentionRuleResolver?>(
+                return Task.FromResult<ITestRetentionRule?>(
                     new DeferredRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                     )
@@ -1269,7 +1266,7 @@ public sealed class RetentionStartupValidatorTests
 
             if (category == "soft-delete" || category == "tenantless-softdelete")
             {
-                return Task.FromResult<IRetentionRuleResolver?>(
+                return Task.FromResult<ITestRetentionRule?>(
                     new DeferredRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     )
@@ -1278,7 +1275,7 @@ public sealed class RetentionStartupValidatorTests
 
             if (category == "anonymise" || category == "tombstone-anonymise")
             {
-                return Task.FromResult<IRetentionRuleResolver?>(
+                return Task.FromResult<ITestRetentionRule?>(
                     new DeferredRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     )
@@ -1291,7 +1288,7 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
-    private sealed class ThrowingStartupRuleResolver(string message) : IRetentionRuleResolver
+    private sealed class ThrowingStartupRuleResolver(string message) : ITestRetentionRule
     {
         public Task<RetentionRule> ResolveAsync(
             RetentionResolutionContext ctx,
@@ -1301,9 +1298,9 @@ public sealed class RetentionStartupValidatorTests
         public RetentionRule? TryResolveAtStartup() => throw new InvalidOperationException(message);
     }
 
-    private sealed class OpaqueDeferredSampleCategoryRepository : IRetentionCategoryRepository
+    private sealed class OpaqueDeferredSampleCategoryRepository : ITestRetentionRuleProvider
     {
-        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct)
         {
             return category switch
             {
@@ -1311,19 +1308,19 @@ public sealed class RetentionStartupValidatorTests
                 or "blob-cleanup"
                 or "tenantless-purge"
                 or "nullable-anchor-purge"
-                or "per-row-audit-override" => Task.FromResult<IRetentionRuleResolver?>(
+                or "per-row-audit-override" => Task.FromResult<ITestRetentionRule?>(
                     new OpaqueDeferredRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                     )
                 ),
                 "soft-delete" or "tenantless-softdelete" =>
-                    Task.FromResult<IRetentionRuleResolver?>(
+                    Task.FromResult<ITestRetentionRule?>(
                         new OpaqueDeferredRuleResolver(
                             new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                         )
                     ),
-                "anonymise" or "tombstone-anonymise" => Task.FromResult<IRetentionRuleResolver?>(
-                    new StaticRetentionRuleResolver(
+                "anonymise" or "tombstone-anonymise" => Task.FromResult<ITestRetentionRule?>(
+                    new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     )
                 ),
@@ -1335,9 +1332,9 @@ public sealed class RetentionStartupValidatorTests
     }
 
     private sealed class OpaqueDeferredAnonymiseSampleCategoryRepository
-        : IRetentionCategoryRepository
+        : ITestRetentionRuleProvider
     {
-        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct)
         {
             return category switch
             {
@@ -1345,18 +1342,18 @@ public sealed class RetentionStartupValidatorTests
                 or "blob-cleanup"
                 or "tenantless-purge"
                 or "nullable-anchor-purge"
-                or "per-row-audit-override" => Task.FromResult<IRetentionRuleResolver?>(
-                    new StaticRetentionRuleResolver(
+                or "per-row-audit-override" => Task.FromResult<ITestRetentionRule?>(
+                    new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                     )
                 ),
                 "soft-delete" or "tenantless-softdelete" =>
-                    Task.FromResult<IRetentionRuleResolver?>(
-                        new StaticRetentionRuleResolver(
+                    Task.FromResult<ITestRetentionRule?>(
+                        new StaticTestRetentionRule(
                             new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                         )
                     ),
-                "anonymise" or "tombstone-anonymise" => Task.FromResult<IRetentionRuleResolver?>(
+                "anonymise" or "tombstone-anonymise" => Task.FromResult<ITestRetentionRule?>(
                     new OpaqueDeferredRuleResolver(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     )
@@ -1374,6 +1371,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<UnannotatedRecord>(entity =>
             {
                 entity.ToTable("unannotated_records");
@@ -1389,6 +1387,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<ConflictingRecord>(entity =>
             {
                 entity.ToTable("conflicting_records");
@@ -1404,6 +1403,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<BrokenAnnotationEntity>(entity =>
             {
                 entity.ToTable("broken_annotation_entities");
@@ -1420,6 +1420,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<BrokenAnnotationEntity>(entity =>
             {
                 entity.ToTable("aggregate_invalid_anchor_records");
@@ -1450,6 +1451,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<ThrowingResolverRecord>(entity =>
             {
                 entity.ToTable("throwing_resolver_records");
@@ -1465,6 +1467,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<InvalidTenantRecord>(entity =>
             {
                 entity.ToTable("invalid_tenant_records");
@@ -1481,6 +1484,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<NullableClrTenantRecord>(entity =>
             {
                 entity.ToTable("nullable_clr_tenant_records");
@@ -1495,6 +1499,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<NonUniqueRecordIdRecord>(entity =>
             {
                 entity.ToTable("non_unique_record_id_records");
@@ -1509,6 +1514,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<NullableRecordIdRecord>(entity =>
             {
                 entity.ToTable("nullable_record_id_records");
@@ -1524,6 +1530,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<CompositeRecordIdRecord>(entity =>
             {
                 entity.ToTable("composite_record_id_records");
@@ -1538,6 +1545,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<AlternateKeyRecordIdRecord>(entity =>
             {
                 entity.ToTable("alternate_key_record_id_records");
@@ -1559,6 +1567,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<InvalidSoftDeleteIsDeletedRecord>(entity =>
             {
                 entity.ToTable("invalid_soft_delete_is_deleted_records");
@@ -1576,6 +1585,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<InvalidSoftDeleteDeletedAtRecord>(entity =>
             {
                 entity.ToTable("invalid_soft_delete_deleted_at_records");
@@ -1594,6 +1604,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<MissingSoftDeleteTenantRecord>(entity =>
             {
                 entity.ToTable("missing_soft_delete_tenant_records");
@@ -1611,6 +1622,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<ExplicitTenantlessSoftDeleteRecord>(entity =>
             {
                 entity.ToTable("explicit_tenantless_soft_delete_records");
@@ -1628,6 +1640,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<InvalidNullAnonymiseRecord>(entity =>
             {
                 entity.ToTable("invalid_null_anonymise_records");
@@ -1661,6 +1674,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<FactoryBackedAnonymiseRecord>(entity =>
             {
                 entity.ToTable("factory_backed_anonymise_records");
@@ -1678,6 +1692,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<InvalidFactoryTypeAnonymiseRecord>(entity =>
             {
                 entity.ToTable("invalid_factory_type_anonymise_records");
@@ -1695,6 +1710,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<MissingAnonymiseTenantRecord>(entity =>
             {
                 entity.ToTable("missing_anonymise_tenant_records");
@@ -1711,6 +1727,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<ExplicitTenantlessAnonymiseRecord>(entity =>
             {
                 entity.ToTable("explicit_tenantless_anonymise_records");
@@ -1727,6 +1744,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<InvalidNullReferenceAnonymiseRecord>(entity =>
             {
                 entity.ToTable("invalid_null_reference_anonymise_records");
@@ -1744,6 +1762,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<RequiredNullableAnonymiseRecord>(entity =>
             {
                 entity.HasKey(record => record.Id);
@@ -1758,6 +1777,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<StructuralAnonymiseRecord>(entity =>
             {
                 entity.HasKey(record => record.Id);
@@ -2089,6 +2109,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<InheritanceBaseRecord>(entity =>
             {
                 entity.ToTable("inheritance_records");
@@ -2104,6 +2125,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<NonDefaultSchemaRecord>(entity =>
             {
                 entity.ToTable("non_default_schema_records", "audit");
@@ -2117,6 +2139,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<CascadeParentRecord>(entity =>
             {
                 entity.ToTable("cascade_parent_records");
@@ -2140,6 +2163,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<CascadeParentRecord>(entity =>
             {
                 entity.ToTable("restrict_parent_records");
@@ -2164,6 +2188,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<DuplicateTenantMarkerRecord>(entity =>
             {
                 entity.ToTable("duplicate_tenant_marker_records");
@@ -2178,6 +2203,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<DuplicateAnonymisedAtMarkerRecord>(entity =>
             {
                 entity.ToTable("duplicate_anonymised_at_marker_records");
@@ -2192,6 +2218,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<ContradictoryTenantlessRecord>(entity =>
             {
                 entity.ToTable("contradictory_tenantless_records");
@@ -2312,6 +2339,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<NaiveTimestampRecord>(entity =>
             {
                 entity.ToTable("naive_timestamp_records");
@@ -2329,6 +2357,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<NaiveTimestampRecord>(entity =>
             {
                 entity.ToTable("timestamptz_anchor_records");
@@ -2343,6 +2372,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<MissingRetentionIdentityRecord>().HasKey(record => record.Id);
         }
     }
@@ -2361,6 +2391,7 @@ public sealed class RetentionStartupValidatorTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder
                 .Entity<FirstDuplicateRetentionIdentityRecord>()
                 .HasKey(record => record.Id);
@@ -2388,14 +2419,14 @@ public sealed class RetentionStartupValidatorTests
         public DateTimeOffset CreatedAt { get; init; }
     }
 
-    private sealed class CountingCategoryRepository(IRetentionCategoryRepository inner)
-        : IRetentionCategoryRepository
+    private sealed class CountingCategoryRepository(ITestRetentionRuleProvider inner)
+        : ITestRetentionRuleProvider
     {
         private int getAsyncCount;
 
         public int GetAsyncCount => Volatile.Read(ref getAsyncCount);
 
-        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct)
         {
             Interlocked.Increment(ref getAsyncCount);
             return inner.GetAsync(category, ct);

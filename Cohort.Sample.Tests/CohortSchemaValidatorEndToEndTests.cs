@@ -55,6 +55,47 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
 
     [Theory]
     [InlineData(
+        "ALTER TABLE \"retention_holds\" DROP CONSTRAINT \"PK_retention_holds\"",
+        "primary key capability 'retention_holds(HoldId)' on table '\"public\".\"retention_holds\"'"
+    )]
+    [InlineData(
+        "DROP INDEX \"IX_retention_holds_RetentionEntityId_RecordId\"",
+        "index capability 'retention_holds(RetentionEntityId, RecordId)' on table '\"public\".\"retention_holds\"'"
+    )]
+    public async Task Validation_Rejects_Missing_Key_And_Index_Capabilities(
+        string mutation,
+        string expectedCapability
+    )
+    {
+        await ExecuteAsync(mutation);
+        using var host = new CohortTestHost(connectionString);
+
+        var act = () => host.RunWithServicesAsync(serviceProvider =>
+            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+        );
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle(error => error.Contains(expectedCapability));
+    }
+
+    [Fact]
+    public async Task Validation_Reports_The_Exact_Mapped_Table_When_A_Table_Is_Missing()
+    {
+        await ExecuteAsync("ALTER TABLE \"retention_holds\" RENAME TO \"retention_holds_missing\"");
+        using var host = new CohortTestHost(connectionString);
+
+        var act = () => host.RunWithServicesAsync(serviceProvider =>
+            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+        );
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle(error =>
+            error.Contains("table '\"public\".\"retention_holds\"'")
+        );
+    }
+
+    [Theory]
+    [InlineData(
         "ALTER TABLE \"sweep_run\" DROP CONSTRAINT \"CK_sweep_run_Terminal_Settled\"",
         "sweep_run.CK_sweep_run_Terminal_Settled"
     )]
@@ -183,6 +224,24 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle(error => error.Contains(expectedCapability));
+    }
+
+    [Fact]
+    public async Task Validation_Rejects_Bounded_Varchar_For_Required_Unbounded_Text()
+    {
+        await ExecuteAsync(
+            "ALTER TABLE \"retention_holds\" ALTER COLUMN \"Reason\" TYPE varchar(100)"
+        );
+        using var host = new CohortTestHost(connectionString);
+
+        var act = () => host.RunWithServicesAsync(serviceProvider =>
+            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+        );
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception
+            .Which.Errors.Should()
+            .ContainSingle(error => error.Contains("retention_holds.\"Reason\" text NOT NULL"));
     }
 
     [Theory]

@@ -1,6 +1,7 @@
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure;
+using Cohort.Infrastructure.Migrations;
 using Cohort.Sample.Entities;
 using Microsoft.EntityFrameworkCore;
 
@@ -317,6 +318,7 @@ public sealed class RegistryScanTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<ShadowedIdRecord>(entity =>
             {
                 entity.ToTable("shadowed_id_records");
@@ -380,6 +382,7 @@ public sealed class RegistryScanTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<RetentionReadyRecord>(entity =>
             {
                 entity.ToTable("retention_ready_records");
@@ -400,6 +403,7 @@ public sealed class RegistryScanTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<FactoryBackedRetentionReadyRecord>(entity =>
             {
                 entity.ToTable("factory_backed_retention_ready_records");
@@ -416,6 +420,7 @@ public sealed class RegistryScanTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<ConflictingAnonymiseMetadataRecord>(entity =>
             {
                 entity.ToTable("conflicting_anonymise_metadata_records");
@@ -432,6 +437,7 @@ public sealed class RegistryScanTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<SoftDeleteEntityWithUnmappedDeletedAt>(entity =>
             {
                 entity.ToTable("retention_ready_records");

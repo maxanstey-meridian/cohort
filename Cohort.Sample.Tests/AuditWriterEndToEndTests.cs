@@ -13,12 +13,12 @@ namespace Cohort.Sample.Tests;
 public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
-    public async Task Sweep_Engine_Streams_Started_EntitySummary_RowDetail_And_Completed_To_The_Live_Audit_Writer_In_Order()
+    public async Task Sweep_Observers_Receive_Committed_Started_EntitySummary_RowDetail_And_Completed_In_Order()
     {
         var tenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
         var deletedNoteId = Guid.NewGuid();
-        var auditWriter = new RecordingAuditWriter();
+        var observer = new RecordingAuditObserver();
 
         await using (var db = Host.CreateDbContext())
         {
@@ -37,9 +37,9 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
         await using var services = BuildRecordingAuditProvider(
             GetConnectionString(),
             new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
+                new Dictionary<string, ITestRetentionRule>
                 {
-                    ["short-lived"] = new StaticRetentionRuleResolver(
+                    ["short-lived"] = new StaticTestRetentionRule(
                         new RetentionRule(
                             TimeSpan.FromDays(30),
                             Strategy.Purge,
@@ -50,22 +50,22 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
                             )
                         )
                     ),
-                    ["soft-delete"] = new StaticRetentionRuleResolver(
+                    ["soft-delete"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     ),
-                    ["anonymise"] = new StaticRetentionRuleResolver(
+                    ["anonymise"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
                 }
             ),
-            auditWriter
+            observer
         );
 
         RetentionSweepResult result;
         await using (var scope = services.CreateAsyncScope())
         {
-            var startup = scope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
-            result = await startup.RunSweepAsync(
+            var sweep = scope.ServiceProvider.GetRequiredService<IRetentionSweep>();
+            result = await sweep.SweepAsync(
                 new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
                 asOf
             );
@@ -73,15 +73,15 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
 
         // Entity iteration order is model-dependent, so only Started/Completed are positional.
         // The complete summary identity set below is the audit cardinality contract.
-        auditWriter.Events[0].Should().BeOfType<SweepEvent.Started>();
-        auditWriter.Events[^1].Should().BeOfType<SweepEvent.Completed>();
+        observer.Events[0].Should().BeOfType<SweepEvent.Started>();
+        observer.Events[^1].Should().BeOfType<SweepEvent.Completed>();
 
-        var started = (SweepEvent.Started)auditWriter.Events[0];
+        var started = (SweepEvent.Started)observer.Events[0];
         started.Trigger.Should().Be(SweepTriggerKind.Manual);
         started.DryRun.Should().BeFalse();
         started.TenantId.Should().Be(tenantId);
 
-        var summaries = auditWriter.Events.OfType<SweepEvent.EntitySummary>().ToList();
+        var summaries = observer.Events.OfType<SweepEvent.EntitySummary>().ToList();
         summaries
             .Select(summary => (summary.EntityType, summary.Category, summary.Strategy))
             .Should()
@@ -133,7 +133,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
                 && s.SkippedCount == 0
             );
 
-        var rowDetails = auditWriter.Events.OfType<SweepEvent.RowDetail>().ToList();
+        var rowDetails = observer.Events.OfType<SweepEvent.RowDetail>().ToList();
         rowDetails.Should().ContainSingle();
         rowDetails[0]
             .Should()
@@ -150,7 +150,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
                 )
             );
 
-        var completed = (SweepEvent.Completed)auditWriter.Events[^1];
+        var completed = (SweepEvent.Completed)observer.Events[^1];
         completed.SweepId.Should().Be(started.SweepId);
         completed.TotalAffected.Should().Be(1);
 
@@ -160,7 +160,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
         result
             .Counts.Should()
             .BeEquivalentTo(
-                auditWriter
+                observer
                     .Events.OfType<SweepEvent.EntitySummary>()
                     .Select(summary => new EntitySweepCount(
                         summary.EntityType,
@@ -254,9 +254,9 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
         using var auditHost = new CohortTestHost(
             GetConnectionString(),
             new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
+                new Dictionary<string, ITestRetentionRule>
                 {
-                    ["short-lived"] = new StaticRetentionRuleResolver(
+                    ["short-lived"] = new StaticTestRetentionRule(
                         new RetentionRule(
                             TimeSpan.FromDays(30),
                             Strategy.Purge,
@@ -267,10 +267,10 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
                             )
                         )
                     ),
-                    ["soft-delete"] = new StaticRetentionRuleResolver(
+                    ["soft-delete"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     ),
-                    ["anonymise"] = new StaticRetentionRuleResolver(
+                    ["anonymise"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
                 }
@@ -486,19 +486,19 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
         using var auditHost = new CohortTestHost(
             GetConnectionString(),
             new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
+                new Dictionary<string, ITestRetentionRule>
                 {
-                    ["short-lived"] = new StaticRetentionRuleResolver(
+                    ["short-lived"] = new StaticTestRetentionRule(
                         new RetentionRule(
                             TimeSpan.FromDays(30),
                             Strategy.Purge,
                             TimeSpan.FromDays(90)
                         )
                     ),
-                    ["soft-delete"] = new StaticRetentionRuleResolver(
+                    ["soft-delete"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     ),
-                    ["anonymise"] = new StaticRetentionRuleResolver(
+                    ["anonymise"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
                 }
@@ -540,7 +540,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
         var perRowId = Guid.NewGuid();
         var noteId = Guid.NewGuid();
-        var auditWriter = new RecordingAuditWriter();
+        var observer = new RecordingAuditObserver();
 
         await using (var db = Host.CreateDbContext())
         {
@@ -567,27 +567,27 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
 
         await using var services = BuildRecordingAuditProvider(
             GetConnectionString(),
-            new SampleCategoryRepository(),
-            auditWriter
+            new SampleRetentionRuleProvider(),
+            observer
         );
 
         await using (var scope = services.CreateAsyncScope())
         {
-            var startup = scope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
-            await startup.RunSweepAsync(
+            var sweep = scope.ServiceProvider.GetRequiredService<IRetentionSweep>();
+            await sweep.SweepAsync(
                 new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
                 asOf
             );
         }
 
-        var rowDetails = auditWriter.Events.OfType<SweepEvent.RowDetail>().ToList();
+        var rowDetails = observer.Events.OfType<SweepEvent.RowDetail>().ToList();
 
         rowDetails
             .Should()
             .ContainSingle(
                 detail =>
                     detail.EntityType == typeof(PerRowAuditedLog)
-                    && detail.EntityId == perRowId.ToString(),
+                    && detail.RecordId == perRowId.ToString(),
                 because: "entity-level AuditRowDetail.PerRow overrides the category rule's SummaryOnly"
             );
         rowDetails
@@ -599,12 +599,12 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
     }
 
     [Fact]
-    public async Task WriteAsync_Only_Custom_Writer_Observes_EntityProgress_During_Batched_Erasure()
+    public async Task Observer_Receives_EntityProgress_After_Each_Committed_Erasure_Batch()
     {
         var tenantId = Guid.NewGuid();
         var subjectId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
-        var auditWriter = new RecordingAuditWriter();
+        var observer = new RecordingAuditObserver();
 
         await using (var db = Host.CreateDbContext())
         {
@@ -634,9 +634,9 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
             },
             configureServices: services =>
             {
-                services.AddSingleton(auditWriter);
-                services.AddScoped<IRetentionAuditWriter>(sp =>
-                    sp.GetRequiredService<RecordingAuditWriter>()
+                services.AddSingleton(observer);
+                services.AddSingleton<IRetentionAuditObserver>(sp =>
+                    sp.GetRequiredService<RecordingAuditObserver>()
                 );
             }
         );
@@ -647,7 +647,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
             asOf
         );
 
-        auditWriter
+        observer
             .Events.OfType<SweepEvent.EntityProgress>()
             .Where(progress => progress.EntityType == typeof(Note) && progress.Affected > 0)
             .Should()
@@ -751,10 +751,10 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
         await using var db = Host.CreateDbContext();
         await using var command = await CreateCommandAsync(db, sweepId);
         command.CommandText = """
-            SELECT "SweepId", "EntityType", "EntityId", "Category", "Strategy", "TenantId"
+            SELECT "SweepId", "EntityType", "RecordId", "Category", "Strategy", "TenantId"
             FROM "sweep_run_row_detail"
             WHERE "SweepId" = @sweepId
-            ORDER BY "EntityType", "EntityId"
+            ORDER BY "EntityType", "RecordId"
             """;
 
         var rows = new List<SweepRunRowDetailRow>();
@@ -804,8 +804,8 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
 
     private static ServiceProvider BuildRecordingAuditProvider(
         string connectionString,
-        IRetentionCategoryRepository categoryRepository,
-        RecordingAuditWriter auditWriter
+        IRetentionRuleProvider ruleProvider,
+        RecordingAuditObserver observer
     )
     {
         var services = new ServiceCollection();
@@ -814,10 +814,10 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
         services.AddSingleton<IConfiguration>(configuration);
         services.AddLogging();
         services.AddDbContext<SampleDbContext>(options => options.UseNpgsql(connectionString));
-        services.AddSingleton(categoryRepository);
-        services.AddSingleton(auditWriter);
-        services.AddScoped<IRetentionAuditWriter>(sp =>
-            sp.GetRequiredService<RecordingAuditWriter>()
+        services.AddSingleton<IRetentionRuleProvider>(ruleProvider);
+        services.AddSingleton(observer);
+        services.AddSingleton<IRetentionAuditObserver>(sp =>
+            sp.GetRequiredService<RecordingAuditObserver>()
         );
         services.AddSingleton<GuidTombstoneFactory>();
         services.AddSingleton<OriginalValueTombstoneFactory>();
@@ -828,35 +828,34 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
             sp.GetRequiredService<OriginalValueTombstoneFactory>()
         );
         services.AddCohort<SampleDbContext>();
-        services.AddScoped<SampleRetentionStartupService>();
 
         return services.BuildServiceProvider(validateScopes: true);
     }
 
     private sealed class StaticCategoryRepository(
-        IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
-    ) : IRetentionCategoryRepository
+        IReadOnlyDictionary<string, ITestRetentionRule> resolvers
+    ) : ITestRetentionRuleProvider
     {
-        private static readonly IRetentionRuleResolver ExemptFallback =
-            new StaticRetentionRuleResolver(
+        private static readonly ITestRetentionRule ExemptFallback =
+            new StaticTestRetentionRule(
                 new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
             );
 
-        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct)
         {
             return resolvers.TryGetValue(category, out var resolver)
-                ? Task.FromResult<IRetentionRuleResolver?>(resolver)
-                : Task.FromResult<IRetentionRuleResolver?>(ExemptFallback);
+                ? Task.FromResult<ITestRetentionRule?>(resolver)
+                : Task.FromResult<ITestRetentionRule?>(ExemptFallback);
         }
     }
 
-    private sealed class RecordingAuditWriter : IRetentionAuditWriter
+    private sealed class RecordingAuditObserver : IRetentionAuditObserver
     {
         private readonly ConcurrentQueue<SweepEvent> events = new();
 
         public IReadOnlyList<SweepEvent> Events => events.ToArray();
 
-        public Task WriteAsync(SweepEvent evt, CancellationToken ct)
+        public Task OnCommittedAsync(SweepEvent evt, CancellationToken ct)
         {
             events.Enqueue(evt);
             return Task.CompletedTask;
@@ -891,7 +890,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
     private sealed record SweepRunRowDetailRow(
         Guid SweepId,
         string EntityType,
-        string EntityId,
+        string RecordId,
         string Category,
         Strategy Strategy,
         Guid TenantId

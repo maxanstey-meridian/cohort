@@ -5,6 +5,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Npgsql;
 
 namespace Cohort.Sample.Tests;
 
@@ -13,24 +14,28 @@ namespace Cohort.Sample.Tests;
 /// Mirrors the role of <c>CompilationHelper</c> in rivet — every end-to-end test
 /// calls <see cref="CreateDbContext"/> and gets a fresh <see cref="SampleDbContext"/>
 /// pointed at the fixture connection string.
-///
-/// When Milestone A's sweep engine lands, register it here once and every future
-/// e2e test gets it for free.
 /// </summary>
 public sealed class CohortTestHost(
     string connectionString,
-    IRetentionCategoryRepository? categoryRepository = null,
+    IRetentionRuleProvider? ruleProvider = null,
     IReadOnlyDictionary<string, string?>? configurationOverrides = null,
-    Action<IServiceCollection>? configureServices = null
+    Action<IServiceCollection>? configureServices = null,
+    PostgreSqlCommandRecorder? commandRecorder = null
 ) : IDisposable
 {
+    private readonly NpgsqlDataSource? _dataSource = commandRecorder?.CreateDataSource(connectionString);
     private readonly DbContextOptions<SampleDbContext> _options =
-        new DbContextOptionsBuilder<SampleDbContext>().UseNpgsql(connectionString).Options;
+        commandRecorder is null
+            ? new DbContextOptionsBuilder<SampleDbContext>().UseNpgsql(connectionString).Options
+            : new DbContextOptionsBuilder<SampleDbContext>()
+                .UseNpgsql(commandRecorder.DataSource!)
+                .Options;
     private readonly ServiceProvider _services = BuildServices(
         connectionString,
-        categoryRepository,
+        ruleProvider,
         configurationOverrides,
-        configureServices
+        configureServices,
+        commandRecorder
     );
 
     public SampleDbContext CreateDbContext() => new(_options);
@@ -51,8 +56,8 @@ public sealed class CohortTestHost(
     )
     {
         await using var scope = _services.CreateAsyncScope();
-        var startup = scope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
-        return await startup.RunSweepAsync(tenant, now, ct);
+        var sweep = scope.ServiceProvider.GetRequiredService<IRetentionSweep>();
+        return await sweep.SweepAsync(tenant, now, ct);
     }
 
     public async Task<RetentionSweepResult> RunPreviewAsync(
@@ -62,8 +67,8 @@ public sealed class CohortTestHost(
     )
     {
         await using var scope = _services.CreateAsyncScope();
-        var startup = scope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
-        return await startup.RunPreviewAsync(tenant, now, ct);
+        var preview = scope.ServiceProvider.GetRequiredService<IRetentionPreview>();
+        return await preview.PreviewAsync(tenant, now, ct);
     }
 
     public async Task<ErasureResult> RunErasureAsync(
@@ -74,9 +79,8 @@ public sealed class CohortTestHost(
     )
     {
         await using var scopeServices = _services.CreateAsyncScope();
-        var startup =
-            scopeServices.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
-        return await startup.RunErasureAsync(tenant, scope, now, ct);
+        var erasure = scopeServices.ServiceProvider.GetRequiredService<IRetentionErasureService>();
+        return await erasure.EraseAsync(tenant, scope, now, ct);
     }
 
     public async Task<TResult> RunWithServicesAsync<TResult>(
@@ -96,13 +100,15 @@ public sealed class CohortTestHost(
     public void Dispose()
     {
         _services.Dispose();
+        _dataSource?.Dispose();
     }
 
     private static ServiceProvider BuildServices(
         string connectionString,
-        IRetentionCategoryRepository? categoryRepository,
+        IRetentionRuleProvider? ruleProvider,
         IReadOnlyDictionary<string, string?>? configurationOverrides,
-        Action<IServiceCollection>? configureServices
+        Action<IServiceCollection>? configureServices,
+        PostgreSqlCommandRecorder? commandRecorder
     )
     {
         var services = new ServiceCollection();
@@ -127,9 +133,15 @@ public sealed class CohortTestHost(
         services.AddSingleton<IConfiguration>(configuration);
         services.AddLogging();
         services.AddSampleRetentionServices();
-        services.RemoveAll<IRetentionCategoryRepository>();
-        services.AddSingleton<IRetentionCategoryRepository>(
-            categoryRepository ?? new SampleCategoryRepository()
+        if (commandRecorder is not null)
+        {
+            services.AddDbContext<SampleDbContext>(options =>
+                options.UseNpgsql(commandRecorder.DataSource!)
+            );
+        }
+        services.RemoveAll<IRetentionRuleProvider>();
+        services.AddSingleton<IRetentionRuleProvider>(
+            ruleProvider ?? new SampleRetentionRuleProvider()
         );
         configureServices?.Invoke(services);
 

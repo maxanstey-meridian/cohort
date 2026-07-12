@@ -1,4 +1,5 @@
 using Cohort.Domain;
+using Cohort.Application;
 using Cohort.Sample;
 using Cohort.Sample.Entities;
 using Microsoft.EntityFrameworkCore;
@@ -24,9 +25,10 @@ try
     using var scope = host.Services.CreateScope();
     var logger = scope.ServiceProvider.GetRequiredService<ILogger<Program>>();
     var previewTenant = scope.ServiceProvider.GetRequiredService<TenantContext>();
-    var startup = scope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
+    var previewService = scope.ServiceProvider.GetRequiredService<IRetentionPreview>();
+    var sweepService = scope.ServiceProvider.GetRequiredService<IRetentionSweep>();
 
-    var preview = await startup.RunPreviewAsync(previewTenant, DateTimeOffset.UtcNow);
+    var preview = await previewService.PreviewAsync(previewTenant, DateTimeOffset.UtcNow);
 
     logger.LogInformation(
         "Attributes wired: found {Count} retention entries",
@@ -59,7 +61,7 @@ try
     );
     await db.SaveChangesAsync();
 
-    var sweep = await startup.RunSweepAsync(previewTenant, DateTimeOffset.UtcNow);
+    var sweep = await sweepService.SweepAsync(previewTenant, DateTimeOffset.UtcNow);
     foreach (var count in sweep.Counts)
     {
         logger.LogInformation(

@@ -2,10 +2,11 @@ using System.Data;
 using System.Data.Common;
 using System.Globalization;
 using System.Reflection;
-using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure.Holds;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace Cohort.Infrastructure.Sweep;
 
@@ -25,6 +26,9 @@ internal sealed class RelationalSweepStrategyCore(
     Action<DbCommand, RetentionEntry, DateTimeOffset> addMutationParameters
 )
 {
+    private readonly ILogger? logger = services
+        ?.GetService<ILoggerFactory>()
+        ?.CreateLogger(typeof(RetentionHandlerSupport).FullName!);
     private static readonly MethodInfo ExecuteHandlerAwareSweepCoreMethod =
         typeof(RelationalSweepStrategyCore).GetMethod(
             nameof(ExecuteHandlerAwareSweepCoreAsync),
@@ -57,8 +61,8 @@ internal sealed class RelationalSweepStrategyCore(
 
         await using var command = conn.CreateCommand();
         command.CommandText = $"""
-            SELECT COUNT(*)
-            FROM {QuoteIdentifier(entry.TableName)} AS target
+            SELECT pg_catalog.count(*)
+            FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
             WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {TenantClause(entry)}
               {eligibilityClause(entry)}
@@ -66,7 +70,7 @@ internal sealed class RelationalSweepStrategyCore(
             """;
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         AddTenantParameter(command, entry, ctx.Tenant.Id);
-        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.EntityId));
+        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.RetentionEntityId));
 
         return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
@@ -90,8 +94,8 @@ internal sealed class RelationalSweepStrategyCore(
 
         await using var command = conn.CreateCommand();
         command.CommandText = $"""
-            SELECT COUNT(*)
-            FROM {QuoteIdentifier(entry.TableName)} AS target
+            SELECT pg_catalog.count(*)
+            FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
             WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {TenantClause(entry)}
               {eligibilityClause(entry)}
@@ -99,7 +103,7 @@ internal sealed class RelationalSweepStrategyCore(
             """;
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         AddTenantParameter(command, entry, ctx.Tenant.Id);
-        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.EntityId));
+        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.RetentionEntityId));
 
         return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
@@ -123,8 +127,8 @@ internal sealed class RelationalSweepStrategyCore(
         // a held NULL-anchor row is just as invisible to retention either way.
         await using var command = conn.CreateCommand();
         command.CommandText = $"""
-            SELECT COUNT(*)
-            FROM {QuoteIdentifier(entry.TableName)} AS target
+            SELECT pg_catalog.count(*)
+            FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
             WHERE target.{QuoteIdentifier(entry.AnchorColumn)} IS NULL
               {TenantClause(entry)}
               {eligibilityClause(entry)}
@@ -159,8 +163,7 @@ internal sealed class RelationalSweepStrategyCore(
             conn,
             transaction,
             cutoff,
-            execution?.BatchSize,
-            execution?.ExcludedRecordIds,
+            execution,
             ct
         );
 
@@ -203,7 +206,7 @@ internal sealed class RelationalSweepStrategyCore(
         command.Parameters.Add(
             CreateParameter(command, "candidateIds", candidateRecordIds.ToArray())
         );
-        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.EntityId));
+        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.RetentionEntityId));
         addMutationParameters(command, entry, ctx.Now);
 
         var affectedRecordIds = await ReadRecordIdsAsync(command, ct);
@@ -233,7 +236,7 @@ internal sealed class RelationalSweepStrategyCore(
         EnsureStrategy(rule);
         await EnsureConnectionOpenAsync(conn, ct);
 
-        var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
+        var cutoff = CutoffCalculator.ComputeErasureCutoff(now, rule.LegalMin);
         var subjectPredicateSql = BuildSubjectPredicateSql(predicate);
         var candidateRecordIds = await SelectErasureCandidateRecordIdsAsync(
             entry,
@@ -242,8 +245,7 @@ internal sealed class RelationalSweepStrategyCore(
             cutoff,
             conn,
             transaction: null,
-            batchSize: null,
-            excludedRecordIds: null,
+            execution: null,
             ct
         );
 
@@ -254,10 +256,10 @@ internal sealed class RelationalSweepStrategyCore(
 
         await using var command = conn.CreateCommand();
         command.CommandText = $"""
-            SELECT COUNT(*)
-            FROM {QuoteIdentifier(entry.TableName)} AS target
+            SELECT pg_catalog.count(*)
+            FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
             WHERE {subjectPredicateSql}
-              AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
+              {ErasureAnchorClause(entry, cutoff)}
               {TenantClause(entry)}
               {eligibilityClause(entry)}
               AND {RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "candidateIds")}
@@ -265,11 +267,11 @@ internal sealed class RelationalSweepStrategyCore(
             """;
         AddTenantParameter(command, entry, tenant.Id);
         AddSubjectParameters(command, predicate);
-        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
+        AddErasureCutoffParameter(command, cutoff);
         command.Parameters.Add(
             CreateParameter(command, "candidateIds", candidateRecordIds.ToArray())
         );
-        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.EntityId));
+        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.RetentionEntityId));
 
         return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
@@ -292,22 +294,54 @@ internal sealed class RelationalSweepStrategyCore(
         EnsureStrategy(rule);
         await EnsureConnectionOpenAsync(conn, ct);
 
-        var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
+        var cutoff = CutoffCalculator.ComputeErasureCutoff(now, rule.LegalMin);
 
         await using var command = conn.CreateCommand();
         command.CommandText = $"""
-            SELECT COUNT(*)
-            FROM {QuoteIdentifier(entry.TableName)} AS target
+            SELECT pg_catalog.count(*)
+            FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
             WHERE {BuildSubjectPredicateSql(predicate)}
-              AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
+              {ErasureAnchorClause(entry, cutoff)}
               {TenantClause(entry)}
               {eligibilityClause(entry)}
               AND NOT {HoldExclusion(entry)}
             """;
         AddTenantParameter(command, entry, tenant.Id);
         AddSubjectParameters(command, predicate);
-        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
-        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.EntityId));
+        AddErasureCutoffParameter(command, cutoff);
+        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.RetentionEntityId));
+
+        return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
+    }
+
+    public async Task<long> CountNullAnchorsForEraseAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        ErasureSubjectPredicate predicate,
+        TenantContext tenant,
+        DbConnection conn,
+        CancellationToken ct
+    )
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+        ArgumentNullException.ThrowIfNull(rule);
+        ArgumentNullException.ThrowIfNull(predicate);
+        ArgumentNullException.ThrowIfNull(tenant);
+        ArgumentNullException.ThrowIfNull(conn);
+        EnsureStrategy(rule);
+        await EnsureConnectionOpenAsync(conn, ct);
+
+        await using var command = conn.CreateCommand();
+        command.CommandText = $"""
+            SELECT pg_catalog.count(*)
+            FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
+            WHERE {BuildSubjectPredicateSql(predicate)}
+              AND target.{QuoteIdentifier(entry.AnchorColumn)} IS NULL
+              {TenantClause(entry)}
+              {eligibilityClause(entry)}
+            """;
+        AddTenantParameter(command, entry, tenant.Id);
+        AddSubjectParameters(command, predicate);
 
         return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
@@ -333,7 +367,7 @@ internal sealed class RelationalSweepStrategyCore(
         EnsureStrategy(rule);
         await EnsureConnectionOpenAsync(conn, ct);
 
-        var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
+        var cutoff = CutoffCalculator.ComputeErasureCutoff(now, rule.LegalMin);
         var subjectPredicateSql = BuildSubjectPredicateSql(predicate);
         var candidateRecordIds = await SelectErasureCandidateRecordIdsAsync(
             entry,
@@ -342,8 +376,7 @@ internal sealed class RelationalSweepStrategyCore(
             cutoff,
             conn,
             transaction,
-            execution?.BatchSize,
-            execution?.ExcludedRecordIds,
+            execution,
             ct
         );
 
@@ -375,7 +408,7 @@ internal sealed class RelationalSweepStrategyCore(
         command.CommandText = $"""
             {mutationHead(entry)}
             WHERE {subjectPredicateSql}
-              AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
+              {ErasureAnchorClause(entry, cutoff)}
               {TenantClause(entry)}
               {eligibilityClause(entry)}
               AND {RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "candidateIds")}
@@ -384,11 +417,11 @@ internal sealed class RelationalSweepStrategyCore(
             """;
         AddTenantParameter(command, entry, tenant.Id);
         AddSubjectParameters(command, predicate);
-        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
+        AddErasureCutoffParameter(command, cutoff);
         command.Parameters.Add(
             CreateParameter(command, "candidateIds", candidateRecordIds.ToArray())
         );
-        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.EntityId));
+        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.RetentionEntityId));
         addMutationParameters(command, entry, now);
 
         var affectedRecordIds = await ReadRecordIdsAsync(command, ct);
@@ -407,7 +440,7 @@ internal sealed class RelationalSweepStrategyCore(
         DbConnection conn,
         DbTransaction transaction,
         IReadOnlyList<string> candidateRecordIds,
-        DateTimeOffset cutoff,
+        DateTimeOffset? cutoff,
         IReadOnlyList<ResolvedRetentionHandler> handlers,
         SweepMutationContext execution,
         ErasureSubjectPredicate? subjectPredicate,
@@ -445,7 +478,7 @@ internal sealed class RelationalSweepStrategyCore(
         DbConnection conn,
         DbTransaction transaction,
         IReadOnlyList<string> candidateRecordIds,
-        DateTimeOffset cutoff,
+        DateTimeOffset? cutoff,
         IReadOnlyList<ResolvedRetentionHandler> handlers,
         SweepMutationContext execution,
         ErasureSubjectPredicate? subjectPredicate,
@@ -464,6 +497,7 @@ internal sealed class RelationalSweepStrategyCore(
             ctx.Tenant,
             conn,
             candidateRecordIds,
+            cutoff,
             subjectPredicate,
             ct
         );
@@ -529,6 +563,7 @@ internal sealed class RelationalSweepStrategyCore(
                     new Dictionary<string, object?>(beforeContext.Snapshot, StringComparer.Ordinal),
                     beforeResult.FailedHandler!,
                     beforeResult.Failure!,
+                    logger,
                     ct
                 );
                 continue;
@@ -582,6 +617,7 @@ internal sealed class RelationalSweepStrategyCore(
         TenantContext tenant,
         DbConnection conn,
         IReadOnlyList<string> candidateRecordIds,
+        DateTimeOffset? cutoff,
         ErasureSubjectPredicate? subjectPredicate,
         CancellationToken ct
     )
@@ -589,11 +625,12 @@ internal sealed class RelationalSweepStrategyCore(
     {
         var sql = $"""
             SELECT *
-            FROM {QuoteIdentifier(entry.TableName)} AS target
+            FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
             WHERE {RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "candidateIds")}
               {TenantClause(entry)}
               {eligibilityClause(entry)}
               {SubjectPredicateClause(subjectPredicate)}
+              {ErasureAnchorClause(entry, cutoff)}
               AND {HoldExclusion(entry)}
             ORDER BY target.{QuoteIdentifier(entry.AnchorColumn)} ASC, CAST(target.{QuoteIdentifier(
                 entry.RecordId.RecordIdColumn
@@ -602,7 +639,7 @@ internal sealed class RelationalSweepStrategyCore(
         var parameters = new List<object>
         {
             CreateProviderParameter(conn, "candidateIds", candidateRecordIds.ToArray()),
-            CreateProviderParameter(conn, "retentionEntityId", entry.EntityId),
+            CreateProviderParameter(conn, "retentionEntityId", entry.RetentionEntityId),
         };
         if (entry.Tenant is not null)
         {
@@ -611,6 +648,10 @@ internal sealed class RelationalSweepStrategyCore(
         if (subjectPredicate is not null)
         {
             AddSubjectParameters(parameters, conn, subjectPredicate);
+        }
+        if (cutoff is not null)
+        {
+            parameters.Add(CreateProviderParameter(conn, "cutoff", cutoff.Value));
         }
 
         return await runtimeDb
@@ -627,7 +668,7 @@ internal sealed class RelationalSweepStrategyCore(
         DbConnection conn,
         DbTransaction transaction,
         string recordId,
-        DateTimeOffset cutoff,
+        DateTimeOffset? cutoff,
         ErasureSubjectPredicate? subjectPredicate,
         CancellationToken ct
     )
@@ -637,7 +678,7 @@ internal sealed class RelationalSweepStrategyCore(
         command.CommandText = $"""
             {mutationHead(entry)}
             WHERE {RecordIdSql.EqualsParameter("target", entry.RecordId, "recordId")}
-              AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
+              {ErasureAnchorClause(entry, cutoff)}
               {TenantClause(entry)}
               {eligibilityClause(entry)}
               {SubjectPredicateClause(subjectPredicate)}
@@ -645,13 +686,13 @@ internal sealed class RelationalSweepStrategyCore(
             RETURNING {RecordIdSql.TextExpression("target", entry.RecordId)}
             """;
         command.Parameters.Add(CreateParameter(command, "recordId", recordId));
-        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
+        AddErasureCutoffParameter(command, cutoff);
         AddTenantParameter(command, entry, ctx.Tenant.Id);
         if (subjectPredicate is not null)
         {
             AddSubjectParameters(command, subjectPredicate);
         }
-        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.EntityId));
+        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.RetentionEntityId));
         addMutationParameters(command, entry, ctx.Now);
 
         await using var reader = await command.ExecuteReaderAsync(ct);
@@ -664,8 +705,7 @@ internal sealed class RelationalSweepStrategyCore(
         DbConnection conn,
         DbTransaction transaction,
         DateTimeOffset cutoff,
-        int? batchSize,
-        IReadOnlyList<string>? excludedRecordIds,
+        SweepMutationContext? execution,
         CancellationToken ct
     )
     {
@@ -674,12 +714,16 @@ internal sealed class RelationalSweepStrategyCore(
         // already skipped by an earlier batch of this run are excluded too — they stay
         // eligible, so reselecting them would re-fail them forever.
         var selectedRecordIds = new List<string>();
-        var attemptedRecordIds = excludedRecordIds?.ToList() ?? [];
-        var targetCount = batchSize is null ? int.MaxValue : Math.Max(1, batchSize.Value);
+        var attemptedRecordIds = new List<string>();
+        var targetCount = execution?.BatchSize is null
+            ? int.MaxValue
+            : Math.Max(1, execution.BatchSize.Value);
 
         while (selectedRecordIds.Count < targetCount)
         {
-            var remaining = batchSize is null ? (int?)null : targetCount - selectedRecordIds.Count;
+            var remaining = execution?.BatchSize is null
+                ? (int?)null
+                : targetCount - selectedRecordIds.Count;
             var discoveredRecordIds = await DiscoverSweepCandidateRecordIdsAsync(
                 entry,
                 ctx,
@@ -688,6 +732,7 @@ internal sealed class RelationalSweepStrategyCore(
                 cutoff,
                 remaining,
                 attemptedRecordIds,
+                execution,
                 ct
             );
             if (discoveredRecordIds.Count == 0)
@@ -698,7 +743,7 @@ internal sealed class RelationalSweepStrategyCore(
             await RetentionEntityLockSql.AcquireAsync(
                 conn,
                 transaction,
-                entry.EntityId,
+                entry.RetentionEntityId,
                 entry.Tenant is not null ? ctx.Tenant.Id : null,
                 discoveredRecordIds,
                 ct
@@ -715,7 +760,7 @@ internal sealed class RelationalSweepStrategyCore(
                 )
             );
             attemptedRecordIds.AddRange(discoveredRecordIds);
-            if (batchSize is null || discoveredRecordIds.Count < remaining)
+            if (execution?.BatchSize is null || discoveredRecordIds.Count < remaining)
             {
                 break;
             }
@@ -728,11 +773,10 @@ internal sealed class RelationalSweepStrategyCore(
         RetentionEntry entry,
         ErasureSubjectPredicate predicate,
         TenantContext erasureTenant,
-        DateTimeOffset cutoff,
+        DateTimeOffset? cutoff,
         DbConnection conn,
         DbTransaction? transaction,
-        int? batchSize,
-        IReadOnlyList<string>? excludedRecordIds,
+        SweepMutationContext? execution,
         CancellationToken ct
     )
     {
@@ -743,8 +787,9 @@ internal sealed class RelationalSweepStrategyCore(
             cutoff,
             conn,
             transaction,
-            batchSize,
-            excludedRecordIds,
+            execution?.BatchSize,
+            [],
+            execution,
             ct
         );
         if (transaction is null)
@@ -753,14 +798,16 @@ internal sealed class RelationalSweepStrategyCore(
         }
 
         var selectedRecordIds = new List<string>();
-        var attemptedRecordIds = excludedRecordIds?.ToList() ?? [];
-        var targetCount = batchSize is null ? int.MaxValue : Math.Max(1, batchSize.Value);
+        var attemptedRecordIds = new List<string>();
+        var targetCount = execution?.BatchSize is null
+            ? int.MaxValue
+            : Math.Max(1, execution.BatchSize.Value);
         while (discoveredRecordIds.Count > 0)
         {
             await RetentionEntityLockSql.AcquireAsync(
                 conn,
                 transaction,
-                entry.EntityId,
+                entry.RetentionEntityId,
                 entry.Tenant is not null ? erasureTenant.Id : null,
                 discoveredRecordIds,
                 ct
@@ -778,7 +825,7 @@ internal sealed class RelationalSweepStrategyCore(
                 )
             );
             attemptedRecordIds.AddRange(discoveredRecordIds);
-            if (batchSize is null || selectedRecordIds.Count >= targetCount)
+            if (execution?.BatchSize is null || selectedRecordIds.Count >= targetCount)
             {
                 break;
             }
@@ -792,6 +839,7 @@ internal sealed class RelationalSweepStrategyCore(
                 transaction,
                 targetCount - selectedRecordIds.Count,
                 attemptedRecordIds,
+                execution,
                 ct
             );
         }
@@ -806,7 +854,8 @@ internal sealed class RelationalSweepStrategyCore(
         DbTransaction transaction,
         DateTimeOffset cutoff,
         int? limit,
-        IReadOnlyList<string>? excludedRecordIds,
+        IReadOnlyList<string> attemptedRecordIds,
+        SweepMutationContext? execution,
         CancellationToken ct
     )
     {
@@ -814,19 +863,21 @@ internal sealed class RelationalSweepStrategyCore(
         command.Transaction = transaction;
         command.CommandText = $"""
             SELECT {RecordIdSql.TextExpression("target", entry.RecordId)}
-            FROM {QuoteIdentifier(entry.TableName)} AS target
+            FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
             WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {TenantClause(entry)}
               {eligibilityClause(entry)}
-              {ExcludedRecordIdsClause(entry, excludedRecordIds)}
+              {AttemptedRecordIdsClause(entry, attemptedRecordIds)}
+              {CommittedRowDetailExclusion(entry, execution)}
               AND {HoldExclusion(entry)}
             ORDER BY target.{QuoteIdentifier(entry.AnchorColumn)} ASC, CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) ASC
             {(limit is null ? "" : "LIMIT @batchSize")}
             """;
         command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
         AddTenantParameter(command, entry, ctx.Tenant.Id);
-        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.EntityId));
-        AddExcludedRecordIdsParameter(command, excludedRecordIds);
+        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.RetentionEntityId));
+        AddAttemptedRecordIdsParameter(command, attemptedRecordIds);
+        AddCommittedRowDetailParameters(command, entry, ctx.Tenant.Id, execution);
         if (limit is not null)
         {
             command.Parameters.Add(CreateParameter(command, "batchSize", limit.Value));
@@ -838,11 +889,12 @@ internal sealed class RelationalSweepStrategyCore(
         RetentionEntry entry,
         ErasureSubjectPredicate predicate,
         TenantContext tenant,
-        DateTimeOffset cutoff,
+        DateTimeOffset? cutoff,
         DbConnection conn,
         DbTransaction? transaction,
         int? limit,
-        IReadOnlyList<string>? excludedRecordIds,
+        IReadOnlyList<string> attemptedRecordIds,
+        SweepMutationContext? execution,
         CancellationToken ct
     )
     {
@@ -850,21 +902,23 @@ internal sealed class RelationalSweepStrategyCore(
         command.Transaction = transaction;
         command.CommandText = $"""
             SELECT {RecordIdSql.TextExpression("target", entry.RecordId)}
-            FROM {QuoteIdentifier(entry.TableName)} AS target
+            FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
             WHERE {BuildSubjectPredicateSql(predicate)}
-              AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
+              {ErasureAnchorClause(entry, cutoff)}
               {TenantClause(entry)}
               {eligibilityClause(entry)}
-              {ExcludedRecordIdsClause(entry, excludedRecordIds)}
+              {AttemptedRecordIdsClause(entry, attemptedRecordIds)}
+              {CommittedRowDetailExclusion(entry, execution)}
               AND {HoldExclusion(entry)}
             ORDER BY target.{QuoteIdentifier(entry.AnchorColumn)} ASC, CAST(target.{QuoteIdentifier(entry.RecordId.RecordIdColumn)} AS text) ASC
             {(limit is null ? "" : "LIMIT @batchSize")}
             """;
         AddTenantParameter(command, entry, tenant.Id);
         AddSubjectParameters(command, predicate);
-        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
-        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.EntityId));
-        AddExcludedRecordIdsParameter(command, excludedRecordIds);
+        AddErasureCutoffParameter(command, cutoff);
+        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.RetentionEntityId));
+        AddAttemptedRecordIdsParameter(command, attemptedRecordIds);
+        AddCommittedRowDetailParameters(command, entry, tenant.Id, execution);
         if (limit is not null)
         {
             command.Parameters.Add(CreateParameter(command, "batchSize", Math.Max(1, limit.Value)));
@@ -891,7 +945,7 @@ internal sealed class RelationalSweepStrategyCore(
         command.Transaction = transaction;
         command.CommandText = $"""
             SELECT {RecordIdSql.TextExpression("target", entry.RecordId)}
-            FROM {QuoteIdentifier(entry.TableName)} AS target
+            FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
             WHERE target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
               {TenantClause(entry)}
               {eligibilityClause(entry)}
@@ -907,7 +961,7 @@ internal sealed class RelationalSweepStrategyCore(
         command.Parameters.Add(
             CreateParameter(command, "candidateIds", discoveredRecordIds.ToArray())
         );
-        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.EntityId));
+        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.RetentionEntityId));
         return await ReadRecordIdsAsync(command, ct);
     }
 
@@ -915,7 +969,7 @@ internal sealed class RelationalSweepStrategyCore(
         RetentionEntry entry,
         ErasureSubjectPredicate predicate,
         TenantContext tenant,
-        DateTimeOffset cutoff,
+        DateTimeOffset? cutoff,
         DbConnection conn,
         DbTransaction transaction,
         IReadOnlyList<string> discoveredRecordIds,
@@ -931,9 +985,9 @@ internal sealed class RelationalSweepStrategyCore(
         command.Transaction = transaction;
         command.CommandText = $"""
             SELECT {RecordIdSql.TextExpression("target", entry.RecordId)}
-            FROM {QuoteIdentifier(entry.TableName)} AS target
+            FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
             WHERE {BuildSubjectPredicateSql(predicate)}
-              AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff
+              {ErasureAnchorClause(entry, cutoff)}
               {TenantClause(entry)}
               {eligibilityClause(entry)}
               AND {RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "candidateIds")}
@@ -945,11 +999,11 @@ internal sealed class RelationalSweepStrategyCore(
             """;
         AddTenantParameter(command, entry, tenant.Id);
         AddSubjectParameters(command, predicate);
-        command.Parameters.Add(CreateParameter(command, "cutoff", cutoff));
+        AddErasureCutoffParameter(command, cutoff);
         command.Parameters.Add(
             CreateParameter(command, "candidateIds", discoveredRecordIds.ToArray())
         );
-        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.EntityId));
+        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.RetentionEntityId));
         return await ReadRecordIdsAsync(command, ct);
     }
 
@@ -996,33 +1050,76 @@ internal sealed class RelationalSweepStrategyCore(
     private static string HoldExclusion(RetentionEntry entry)
     {
         return RetentionHoldSql.BuildActiveHoldExclusion(
+            entry.CohortTables.RetentionHolds,
             "target",
             entry.RecordId.RecordIdColumn,
             entry.Tenant?.TenantColumn
         );
     }
 
-    private static string ExcludedRecordIdsClause(
+    private static string AttemptedRecordIdsClause(
         RetentionEntry entry,
-        IReadOnlyList<string>? excludedRecordIds
+        IReadOnlyList<string> attemptedRecordIds
     )
     {
-        return excludedRecordIds is { Count: > 0 }
-            ? $"AND NOT ({RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "excludedRecordIds")})"
+        return attemptedRecordIds.Count > 0
+            ? $"AND NOT ({RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "attemptedRecordIds")})"
             : "";
     }
 
-    private static void AddExcludedRecordIdsParameter(
+    private static void AddAttemptedRecordIdsParameter(
         DbCommand command,
-        IReadOnlyList<string>? excludedRecordIds
+        IReadOnlyList<string> attemptedRecordIds
     )
     {
-        if (excludedRecordIds is { Count: > 0 })
+        if (attemptedRecordIds.Count > 0)
         {
             command.Parameters.Add(
-                CreateParameter(command, "excludedRecordIds", excludedRecordIds.ToArray())
+                CreateParameter(command, "attemptedRecordIds", attemptedRecordIds.ToArray())
             );
         }
+    }
+
+    private string CommittedRowDetailExclusion(
+        RetentionEntry entry,
+        SweepMutationContext? execution
+    )
+    {
+        return execution is null
+            ? ""
+            : $"""
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM {PostgreSqlIdentifier.Format(entry.CohortTables.SweepRunRowDetail)} AS prior_detail
+                    WHERE prior_detail."SweepId" = @excludedSweepId
+                      AND prior_detail."RetentionEntityId" = @excludedRetentionEntityId
+                      AND prior_detail."RecordId" = {RecordIdSql.TextExpression("target", entry.RecordId)}
+                      AND prior_detail."Category" = @excludedCategory
+                      AND prior_detail."Strategy" = @excludedStrategy
+                      AND prior_detail."TenantId" = @excludedTenantId
+                )
+                """;
+    }
+
+    private void AddCommittedRowDetailParameters(
+        DbCommand command,
+        RetentionEntry entry,
+        Guid tenantId,
+        SweepMutationContext? execution
+    )
+    {
+        if (execution is null)
+        {
+            return;
+        }
+
+        command.Parameters.Add(CreateParameter(command, "excludedSweepId", execution.SweepId));
+        command.Parameters.Add(
+            CreateParameter(command, "excludedRetentionEntityId", entry.RetentionEntityId)
+        );
+        command.Parameters.Add(CreateParameter(command, "excludedCategory", entry.Category));
+        command.Parameters.Add(CreateParameter(command, "excludedStrategy", (int)strategy));
+        command.Parameters.Add(CreateParameter(command, "excludedTenantId", tenantId));
     }
 
     private static void AddTenantParameter(DbCommand command, RetentionEntry entry, Guid tenantId)
@@ -1049,7 +1146,7 @@ internal sealed class RelationalSweepStrategyCore(
 
     internal static string QuoteIdentifier(string identifier)
     {
-        return $"\"{identifier.Replace("\"", "\"\"")}\"";
+        return PostgreSqlIdentifier.Quote(identifier);
     }
 
     private static string BuildSubjectPredicateSql(ErasureSubjectPredicate predicate)
@@ -1068,6 +1165,21 @@ internal sealed class RelationalSweepStrategyCore(
     private static string SubjectPredicateClause(ErasureSubjectPredicate? predicate)
     {
         return predicate is null ? "" : $"AND {BuildSubjectPredicateSql(predicate)}";
+    }
+
+    private static string ErasureAnchorClause(RetentionEntry entry, DateTimeOffset? cutoff)
+    {
+        return cutoff is null
+            ? ""
+            : $"AND target.{QuoteIdentifier(entry.AnchorColumn)} < @cutoff";
+    }
+
+    private static void AddErasureCutoffParameter(DbCommand command, DateTimeOffset? cutoff)
+    {
+        if (cutoff is not null)
+        {
+            command.Parameters.Add(CreateParameter(command, "cutoff", cutoff.Value));
+        }
     }
 
     private static void AddSubjectParameters(DbCommand command, ErasureSubjectPredicate predicate)

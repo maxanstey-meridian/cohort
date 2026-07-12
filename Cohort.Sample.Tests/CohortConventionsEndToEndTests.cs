@@ -1,5 +1,6 @@
 using Cohort.Domain;
 using Cohort.Infrastructure;
+using Cohort.Infrastructure.Migrations;
 using Microsoft.EntityFrameworkCore;
 
 namespace Cohort.Sample.Tests;
@@ -127,6 +128,7 @@ public sealed class CohortConventionsEndToEndTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<OrganisationTenantRecord>(entity =>
             {
                 entity.ToTable("organisation_tenant_records");
@@ -142,6 +144,7 @@ public sealed class CohortConventionsEndToEndTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<OrganisationScopedRecord>(entity =>
             {
                 entity.ToTable("organisation_scoped_records");
@@ -157,6 +160,7 @@ public sealed class CohortConventionsEndToEndTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<AttributeOverrideRecord>(entity =>
             {
                 entity.ToTable("attribute_override_records");
@@ -173,6 +177,7 @@ public sealed class CohortConventionsEndToEndTests
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<DefaultTenantRecord>(entity =>
             {
                 entity.ToTable("default_tenant_records");

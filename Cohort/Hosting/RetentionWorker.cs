@@ -9,11 +9,7 @@ using Microsoft.Extensions.Options;
 
 namespace Cohort.Hosting;
 
-internal sealed class RetentionWorker(
-    IServiceScopeFactory scopeFactory,
-    IOptionsMonitor<CohortOptions> optionsMonitor,
-    ILogger<RetentionWorker> logger
-) : BackgroundService
+internal sealed class RetentionWorker : BackgroundService
 {
     private static readonly TimeSpan IdlePollInterval = TimeSpan.FromMilliseconds(200);
 
@@ -25,6 +21,26 @@ internal sealed class RetentionWorker(
     // at the same cron instant must not both sweep: double mutations are mostly benign,
     // but doubled audit runs and doubled handler side effects are not.
     private const long SweepAdvisoryLockKey = 0x636F_686F_7274_3031;
+    private readonly IServiceScopeFactory scopeFactory;
+    private readonly IOptionsMonitor<CohortOptions> optionsMonitor;
+    private readonly ILogger<RetentionWorker> logger;
+    private readonly IDisposable? optionsReloadSubscription;
+    private CohortOptions currentOptions;
+
+    public RetentionWorker(
+        IServiceScopeFactory scopeFactory,
+        IOptionsMonitor<CohortOptions> optionsMonitor,
+        ILogger<RetentionWorker> logger
+    )
+    {
+        this.scopeFactory = scopeFactory;
+        this.optionsMonitor = optionsMonitor;
+        this.logger = logger;
+        currentOptions = optionsMonitor.CurrentValue;
+        optionsReloadSubscription = optionsMonitor.OnChange(updated =>
+            Volatile.Write(ref currentOptions, updated)
+        );
+    }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -54,7 +70,7 @@ internal sealed class RetentionWorker(
 
     private async Task RunScheduleLoopOnceAsync(CancellationToken stoppingToken)
     {
-        var currentOptions = optionsMonitor.CurrentValue;
+        var currentOptions = Volatile.Read(ref this.currentOptions);
         if (
             currentOptions.KillSwitch
             || string.IsNullOrWhiteSpace(currentOptions.Schedule)
@@ -91,7 +107,7 @@ internal sealed class RetentionWorker(
             return;
         }
 
-        var executionOptions = optionsMonitor.CurrentValue;
+        var executionOptions = Volatile.Read(ref this.currentOptions);
         if (
             stoppingToken.IsCancellationRequested
             || executionOptions.KillSwitch
@@ -110,7 +126,7 @@ internal sealed class RetentionWorker(
         CancellationToken ct
     )
     {
-        var currentKillSwitch = optionsMonitor.CurrentValue.KillSwitch;
+        var currentKillSwitch = Volatile.Read(ref currentOptions).KillSwitch;
         var scheduleChanged = new TaskCompletionSource(
             TaskCreationOptions.RunContinuationsAsynchronously
         );
@@ -151,14 +167,24 @@ internal sealed class RetentionWorker(
     {
         await using var scope = scopeFactory.CreateAsyncScope();
         var services = scope.ServiceProvider;
+        await services
+            .GetRequiredService<RetentionRuntimeReadinessValidator>()
+            .ValidateAsync(ct);
         var db = services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext);
 
         // The advisory lock is session-scoped, so the connection must stay open for the
         // whole iteration; the sweep itself reuses the already-open scoped connection.
         await db.Database.OpenConnectionAsync(ct);
+        var lockAcquired = false;
+        Exception? primaryException = null;
         try
         {
-            if (!await TryAcquireSweepLockAsync(db, ct))
+            lockAcquired = await RetentionRunAdvisoryLock.TryAcquireAsync(
+                db.Database.GetDbConnection(),
+                SweepAdvisoryLockKey,
+                ct
+            );
+            if (!lockAcquired)
             {
                 logger.LogInformation(
                     "Cohort worker skipped this occurrence: another instance holds the sweep advisory lock."
@@ -166,18 +192,28 @@ internal sealed class RetentionWorker(
                 return;
             }
 
-            try
-            {
-                await RunLockedIterationAsync(services, dryRun, ct);
-            }
-            finally
-            {
-                await ReleaseSweepLockAsync(db);
-            }
+            await RunLockedIterationAsync(services, dryRun, ct);
+        }
+        catch (Exception ex)
+        {
+            primaryException = ex;
+            throw;
         }
         finally
         {
-            await db.Database.CloseConnectionAsync();
+            await OperationalConnectionCleanup.RunAsync(
+                lockAcquired
+                    ? cleanupToken =>
+                        RetentionRunAdvisoryLock.ReleaseAsync(
+                            db.Database.GetDbConnection(),
+                            SweepAdvisoryLockKey,
+                            cleanupToken
+                        )
+                    : null,
+                cleanupToken => db.Database.CloseConnectionAsync().WaitAsync(cleanupToken),
+                primaryException,
+                logger
+            );
         }
     }
 
@@ -191,7 +227,9 @@ internal sealed class RetentionWorker(
         var engine = services.GetRequiredService<RetentionSweepEngine>();
         var hasTenantedEntries = entries.Any(entry => entry.Tenant is not null);
         var tenants = hasTenantedEntries
-            ? await services.GetRequiredService<IRetentionTenantSource>().GetTenantsAsync(ct)
+            ? MaterializeTenants(
+                await services.GetRequiredService<IRetentionTenantSource>().GetTenantsAsync(ct)
+            )
             : [];
 
         if (hasTenantedEntries)
@@ -213,20 +251,36 @@ internal sealed class RetentionWorker(
                     return;
                 }
 
-                var result = await RunPassAsync(
-                    engine,
-                    tenant,
-                    SweepEntityScope.TenantedOnly,
-                    dryRun,
-                    ct
-                );
+                try
+                {
+                    var result = await RunPassAsync(
+                        engine,
+                        tenant,
+                        SweepEntityScope.TenantedOnly,
+                        dryRun,
+                        ct
+                    );
 
-                logger.LogInformation(
-                    "Cohort worker completed {Mode} iteration for tenant {TenantId} with {EntityCount} entity counts.",
-                    dryRun ? "dry-run" : "sweep",
-                    tenant.Id,
-                    result.Counts.Count
-                );
+                    logger.LogInformation(
+                        "Cohort worker completed {Mode} iteration for tenant {TenantId} with {EntityCount} entity counts.",
+                        dryRun ? "dry-run" : "sweep",
+                        tenant.Id,
+                        result.Counts.Count
+                    );
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(
+                        ex,
+                        "Cohort worker {Mode} failed for tenant {TenantId}; continuing with remaining passes.",
+                        dryRun ? "dry run" : "sweep",
+                        tenant.Id
+                    );
+                }
             }
         }
 
@@ -240,20 +294,81 @@ internal sealed class RetentionWorker(
                 return;
             }
 
-            var result = await RunPassAsync(
-                engine,
-                TenantContext.Tenantless,
-                SweepEntityScope.TenantlessOnly,
-                dryRun,
-                ct
-            );
+            try
+            {
+                var result = await RunPassAsync(
+                    engine,
+                    TenantContext.Tenantless,
+                    SweepEntityScope.TenantlessOnly,
+                    dryRun,
+                    ct
+                );
 
-            logger.LogInformation(
-                "Cohort worker completed tenantless {Mode} with {EntityCount} entity counts.",
-                dryRun ? "dry run" : "sweep",
-                result.Counts.Count
-            );
+                logger.LogInformation(
+                    "Cohort worker completed tenantless {Mode} with {EntityCount} entity counts.",
+                    dryRun ? "dry run" : "sweep",
+                    result.Counts.Count
+                );
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(
+                    ex,
+                    "Cohort worker tenantless {Mode} failed; the next scheduled occurrence will retry it.",
+                    dryRun ? "dry run" : "sweep"
+                );
+            }
         }
+    }
+
+    private IReadOnlyList<TenantContext> MaterializeTenants(
+        IReadOnlyList<TenantContext> source
+    )
+    {
+        ArgumentNullException.ThrowIfNull(source);
+
+        var tenants = new List<TenantContext>(source.Count);
+        var firstById = new Dictionary<Guid, TenantContext>();
+        foreach (var tenant in source)
+        {
+            if (tenant is null)
+            {
+                throw new InvalidOperationException(
+                    "IRetentionTenantSource returned a null tenant context."
+                );
+            }
+
+            if (!firstById.TryAdd(tenant.Id, tenant))
+            {
+                var first = firstById[tenant.Id];
+                if (!ContextsMatch(first, tenant))
+                {
+                    logger.LogWarning(
+                        "IRetentionTenantSource returned conflicting contexts for tenant {TenantId}; Cohort will use the first context.",
+                        tenant.Id
+                    );
+                }
+                continue;
+            }
+
+            tenants.Add(tenant);
+        }
+
+        return tenants;
+    }
+
+    private static bool ContextsMatch(TenantContext first, TenantContext duplicate)
+    {
+        return string.Equals(first.Jurisdiction, duplicate.Jurisdiction, StringComparison.Ordinal)
+            && first.Tags.Count == duplicate.Tags.Count
+            && first.Tags.All(pair =>
+                duplicate.Tags.TryGetValue(pair.Key, out var value)
+                && string.Equals(pair.Value, value, StringComparison.Ordinal)
+            );
     }
 
     private static Task<RetentionSweepResult> RunPassAsync(
@@ -285,7 +400,7 @@ internal sealed class RetentionWorker(
     {
         // The kill switch is an emergency brake: an in-flight sweep finishes, but no
         // further sweep starts — not even the remaining passes of the current iteration.
-        if (!optionsMonitor.CurrentValue.KillSwitch)
+        if (!Volatile.Read(ref currentOptions).KillSwitch)
         {
             return false;
         }
@@ -294,30 +409,6 @@ internal sealed class RetentionWorker(
             "Cohort worker kill switch engaged; skipping the remainder of this iteration."
         );
         return true;
-    }
-
-    private static async Task<bool> TryAcquireSweepLockAsync(DbContext db, CancellationToken ct)
-    {
-        await using var command = db.Database.GetDbConnection().CreateCommand();
-        command.CommandText = "SELECT pg_try_advisory_lock(@key)";
-        var parameter = command.CreateParameter();
-        parameter.ParameterName = "key";
-        parameter.Value = SweepAdvisoryLockKey;
-        command.Parameters.Add(parameter);
-
-        return (bool)(await command.ExecuteScalarAsync(ct))!;
-    }
-
-    private static async Task ReleaseSweepLockAsync(DbContext db)
-    {
-        await using var command = db.Database.GetDbConnection().CreateCommand();
-        command.CommandText = "SELECT pg_advisory_unlock(@key)";
-        var parameter = command.CreateParameter();
-        parameter.ParameterName = "key";
-        parameter.Value = SweepAdvisoryLockKey;
-        command.Parameters.Add(parameter);
-
-        await command.ExecuteScalarAsync(CancellationToken.None);
     }
 
     private static async Task DelayUntilNextPollAsync(CancellationToken ct)
@@ -330,5 +421,11 @@ internal sealed class RetentionWorker(
         {
             // Shutdown during an idle wait is not an error.
         }
+    }
+
+    public override void Dispose()
+    {
+        optionsReloadSubscription?.Dispose();
+        base.Dispose();
     }
 }

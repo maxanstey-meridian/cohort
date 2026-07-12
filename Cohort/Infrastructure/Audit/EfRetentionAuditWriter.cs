@@ -1,7 +1,6 @@
 using System.Data;
 using System.Data.Common;
 using Cohort.Application;
-using Cohort.Infrastructure.Migrations;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
@@ -10,8 +9,10 @@ namespace Cohort.Infrastructure.Audit;
 
 internal sealed class EfRetentionAuditWriter(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db
-) : IRetentionAuditWriter
+)
 {
+    private readonly CohortStoreTables tables = CohortStoreTables.FromModel(db.Model);
+
     private const string TerminalTransitionError =
         "Sweep run does not exist or is no longer in the Started state.";
 
@@ -42,7 +43,7 @@ internal sealed class EfRetentionAuditWriter(
     {
         return ExecuteAsync(
             $"""
-            INSERT INTO {QuoteIdentifier(CohortTableNames.SweepRun)} (
+            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRun)} (
                 "SweepId",
                 "StartedAt",
                 "Status",
@@ -86,7 +87,7 @@ internal sealed class EfRetentionAuditWriter(
     {
         return ExecuteAsync(
             $"""
-            INSERT INTO {QuoteIdentifier(CohortTableNames.SweepRunEntitySummary)} (
+            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRunEntitySummary)} AS current_summary (
                 "SweepId",
                 "At",
                 "EntityType",
@@ -168,7 +169,7 @@ internal sealed class EfRetentionAuditWriter(
         return ExecuteAsync(
             $"""
             WITH upserted_summary AS (
-            INSERT INTO {QuoteIdentifier(CohortTableNames.SweepRunEntitySummary)} (
+            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRunEntitySummary)} AS current_summary (
                 "SweepId", "At", "EntityType", "RetentionEntityId", "Category", "TenantId", "Strategy",
                 "ResolvedPeriod", "Affected", "HeldCount", "SkippedCount", "NullAnchorCount",
                 "RuleSource", "RuleReason"
@@ -179,15 +180,11 @@ internal sealed class EfRetentionAuditWriter(
             ON CONFLICT ("SweepId", "RetentionEntityId", "Category", "TenantId", "Strategy")
             DO UPDATE SET
                 "EntityType" = EXCLUDED."EntityType",
-                "Affected" = {QuoteIdentifier(
-                CohortTableNames.SweepRunEntitySummary
-            )}."Affected" + EXCLUDED."Affected",
-                "SkippedCount" = {QuoteIdentifier(
-                CohortTableNames.SweepRunEntitySummary
-            )}."SkippedCount" + EXCLUDED."SkippedCount"
+                "Affected" = current_summary."Affected" + EXCLUDED."Affected",
+                "SkippedCount" = current_summary."SkippedCount" + EXCLUDED."SkippedCount"
             RETURNING 1
             )
-            UPDATE {QuoteIdentifier(CohortTableNames.SweepRun)}
+            UPDATE {PostgreSqlIdentifier.Format(tables.SweepRun)}
             SET "TotalAffected" = "TotalAffected" + @affected
             WHERE "SweepId" = @sweepId
               AND EXISTS (SELECT 1 FROM upserted_summary)
@@ -229,12 +226,12 @@ internal sealed class EfRetentionAuditWriter(
     {
         return ExecuteAsync(
             $"""
-            INSERT INTO {QuoteIdentifier(CohortTableNames.SweepRunRowDetail)} (
+            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRunRowDetail)} (
                 "SweepId",
                 "At",
                 "EntityType",
                 "RetentionEntityId",
-                "EntityId",
+                "RecordId",
                 "Category",
                 "Strategy",
                 "TenantId"
@@ -244,7 +241,7 @@ internal sealed class EfRetentionAuditWriter(
                 @at,
                 @entityType,
                 @retentionEntityId,
-                @entityId,
+                @recordId,
                 @category,
                 @strategy,
                 @tenantId
@@ -260,7 +257,7 @@ internal sealed class EfRetentionAuditWriter(
                 command.Parameters.Add(
                     CreateParameter(command, "retentionEntityId", rowDetail.RetentionEntityId)
                 );
-                command.Parameters.Add(CreateParameter(command, "entityId", rowDetail.EntityId));
+                command.Parameters.Add(CreateParameter(command, "recordId", rowDetail.RecordId));
                 command.Parameters.Add(CreateParameter(command, "category", rowDetail.Category));
                 command.Parameters.Add(
                     CreateParameter(command, "strategy", (int)rowDetail.Strategy)
@@ -275,7 +272,7 @@ internal sealed class EfRetentionAuditWriter(
     {
         return ExecuteAsync(
             $"""
-            UPDATE {QuoteIdentifier(CohortTableNames.SweepRun)}
+            UPDATE {PostgreSqlIdentifier.Format(tables.SweepRun)}
             SET "Status" = @status,
                 "SettledAt" = @completedAt,
                 "Duration" = @duration,
@@ -320,7 +317,7 @@ internal sealed class EfRetentionAuditWriter(
     {
         return ExecuteAsync(
             $"""
-            UPDATE {QuoteIdentifier(CohortTableNames.SweepRun)}
+            UPDATE {PostgreSqlIdentifier.Format(tables.SweepRun)}
             SET "Status" = @status,
                 "SettledAt" = @failedAt,
                 "Duration" = @duration,
@@ -378,7 +375,7 @@ internal sealed class EfRetentionAuditWriter(
     {
         return ExecuteAsync(
             $"""
-            UPDATE {QuoteIdentifier(CohortTableNames.SweepRun)}
+            UPDATE {PostgreSqlIdentifier.Format(tables.SweepRun)}
             SET "Status" = @status,
                 "SettledAt" = @settledAt,
                 "Duration" = @duration,
@@ -413,14 +410,15 @@ internal sealed class EfRetentionAuditWriter(
     {
         var connection = db.Database.GetDbConnection();
         var shouldCloseConnection = connection.State != ConnectionState.Open;
-
-        if (shouldCloseConnection)
-        {
-            await db.Database.OpenConnectionAsync(ct);
-        }
+        Exception? primaryException = null;
 
         try
         {
+            if (shouldCloseConnection)
+            {
+                await db.Database.OpenConnectionAsync(ct);
+            }
+
             await using var command = connection.CreateCommand();
             command.CommandText = commandText;
             command.Transaction = db.Database.CurrentTransaction?.GetDbTransaction();
@@ -431,12 +429,21 @@ internal sealed class EfRetentionAuditWriter(
                 throw new InvalidOperationException(zeroRowsError);
             }
         }
+        catch (Exception ex)
+        {
+            primaryException = ex;
+            throw;
+        }
         finally
         {
-            if (shouldCloseConnection)
-            {
-                await db.Database.CloseConnectionAsync();
-            }
+            await OperationalConnectionCleanup.RunAsync(
+                null,
+                shouldCloseConnection
+                    ? cleanupToken => db.Database.CloseConnectionAsync().WaitAsync(cleanupToken)
+                    : null,
+                primaryException,
+                null
+            );
         }
     }
 
@@ -453,8 +460,4 @@ internal sealed class EfRetentionAuditWriter(
         return entityType.FullName ?? entityType.Name;
     }
 
-    private static string QuoteIdentifier(string identifier)
-    {
-        return $"\"{identifier.Replace("\"", "\"\"")}\"";
-    }
 }

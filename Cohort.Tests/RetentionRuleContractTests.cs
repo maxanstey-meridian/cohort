@@ -91,6 +91,31 @@ public sealed class RetentionRuleContractTests
     }
 
     [Fact]
+    public void RetentionRule_Rejects_Inherited_Audit_Row_Detail()
+    {
+        var act = () =>
+            new RetentionRule(
+                TimeSpan.FromDays(30),
+                Strategy.Purge,
+                AuditRowDetail: AuditRowDetail.Inherit
+            );
+
+        act.Should().Throw<ArgumentOutOfRangeException>().WithParameterName("AuditRowDetail");
+    }
+
+    [Fact]
+    public void RetentionRule_Has_Get_Only_Properties_And_No_Public_Deconstruct()
+    {
+        var properties = typeof(RetentionRule).GetProperties();
+
+        properties.All(property => property.SetMethod is null).Should().BeTrue();
+        typeof(RetentionRule)
+            .GetMethods()
+            .Should()
+            .NotContain(method => method.Name == "Deconstruct" && method.IsPublic);
+    }
+
+    [Fact]
     public void Strategy_Enum_Exposes_The_Planned_Public_Vocabulary()
     {
         Enum.GetNames<Strategy>()
@@ -155,7 +180,7 @@ public sealed class RetentionRuleContractTests
         var sweepId = Guid.NewGuid();
         var tenantId = Guid.NewGuid();
         var count = new EntitySweepCount(
-            typeof(string),
+            typeof(CountedEntity),
             "short-lived",
             tenantId,
             Strategy.Purge,
@@ -170,10 +195,25 @@ public sealed class RetentionRuleContractTests
 
         result.SweepId.Should().Be(sweepId);
         result.Counts.Should().ContainSingle();
-        result.Counts[0].EntityType.Should().Be(typeof(string));
+        result.Counts[0].EntityType.Should().Be(typeof(CountedEntity));
+        result.Counts[0]
+            .RetentionEntityId.Should()
+            .Be(Guid.Parse("370ca3b1-4f67-44a6-8e92-74ac92e519ed"));
         result.Counts[0].Category.Should().Be("short-lived");
         result.Counts[0].TenantId.Should().Be(tenantId);
         result.Counts[0].Strategy.Should().Be(Strategy.Purge);
         result.Counts[0].Affected.Should().Be(3);
     }
+
+    [Fact]
+    public void Entity_Sweep_Count_Rejects_A_Type_Without_A_Retention_Entity_Id()
+    {
+        var act = () =>
+            new EntitySweepCount(typeof(string), "short-lived", Guid.NewGuid(), Strategy.Purge, 1);
+
+        act.Should().Throw<ArgumentException>().WithParameterName("EntityType");
+    }
+
+    [RetentionEntityId("370ca3b1-4f67-44a6-8e92-74ac92e519ed")]
+    private sealed class CountedEntity;
 }

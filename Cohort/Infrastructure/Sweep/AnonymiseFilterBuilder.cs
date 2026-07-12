@@ -51,6 +51,28 @@ internal static class AnonymiseFilterBuilder
         );
     }
 
+    internal static SqlFilter CreateErasureFilter(
+        RetentionEntry entry,
+        ErasureSubjectPredicate predicate,
+        DateTimeOffset? cutoff
+    )
+    {
+        var strategyEligibility = entry.AnonymisedAt is { } anonymisedAt
+            ? $"target.{AnonymiseSqlBuilder.QuoteIdentifier(anonymisedAt.AnonymisedAtColumn)} IS NULL"
+            : "TRUE";
+        var filters = new List<SqlFilter>
+        {
+            CreateSubjectFilter(predicate),
+            new(strategyEligibility, []),
+        };
+        if (cutoff is not null)
+        {
+            filters.Add(CreateCutoffFilter(entry, cutoff.Value));
+        }
+
+        return Combine(filters.ToArray());
+    }
+
     internal static SqlFilter Combine(params SqlFilter[] filters)
     {
         return new SqlFilter(

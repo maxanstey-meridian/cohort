@@ -17,6 +17,8 @@ public sealed class CohortOptions
     /// </summary>
     public int SweepBatchSize { get; init; } = 5000;
 
+    public AuditObserverOptions AuditObservers { get; init; } = new();
+
     public RowHandlerDispatchOptions RowHandlerDispatch { get; init; } = new();
 
     public CohortConventions Conventions { get; init; } = new();

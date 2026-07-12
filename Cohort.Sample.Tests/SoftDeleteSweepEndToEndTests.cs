@@ -5,6 +5,9 @@ using Cohort.Infrastructure;
 using Cohort.Infrastructure.Sweep;
 using Cohort.Sample.Entities;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Cohort.Sample.Tests;
 
@@ -122,26 +125,35 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
     {
         await using var db = Host.CreateDbContext();
         var connectionString = db.Database.GetConnectionString()!;
-
-        using var host = new CohortTestHost(
-            connectionString,
+        var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder();
+        builder.Configuration.AddInMemoryCollection(
+            new Dictionary<string, string?>
+            {
+                [$"{SampleOptions.SectionName}:{nameof(SampleOptions.ConnectionString)}"] =
+                    connectionString,
+            }
+        );
+        builder.Services.AddSampleRetentionServices();
+        builder.Services.RemoveAll<IRetentionRuleProvider>();
+        builder.Services.AddSingleton<IRetentionRuleProvider>(
             new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
+                new Dictionary<string, ITestRetentionRule>
                 {
-                    ["short-lived"] = new StaticRetentionRuleResolver(
+                    ["short-lived"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     ),
-                    ["soft-delete"] = new StaticRetentionRuleResolver(
+                    ["soft-delete"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     ),
-                    ["anonymise"] = new StaticRetentionRuleResolver(
+                    ["anonymise"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
                 }
             )
         );
+        using var host = builder.Build();
 
-        var act = () => host.ValidateAndScanAsync();
+        var act = () => host.StartAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle();
@@ -246,15 +258,15 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
     {
         await using var db = Host.CreateDbContext();
         var repository = new StaticCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["short-lived"] = new StaticRetentionRuleResolver(
+                ["short-lived"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                 ),
-                ["soft-delete"] = new StaticRetentionRuleResolver(
+                ["soft-delete"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                 ),
-                ["anonymise"] = new StaticRetentionRuleResolver(
+                ["anonymise"] = new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                 ),
             }
@@ -263,11 +275,16 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
             db,
             new RetentionRegistry(db, new RetentionEntryBuilder(new RetentionModelConventions())),
             repository,
-            new RetentionStartupValidator(
+            new RetentionRuntimeReadinessValidator(
                 db,
-                repository,
-                new RetentionEntryBuilder(new RetentionModelConventions()),
-                [new GuidTombstoneFactory(), new OriginalValueTombstoneFactory()]
+                new RetentionStartupValidator(
+                    db,
+                    repository,
+                    new RetentionEntryBuilder(new RetentionModelConventions()),
+                    [new GuidTombstoneFactory(), new OriginalValueTombstoneFactory()]
+                ),
+                new CohortSchemaValidator(db),
+                new RetentionRuntimeReadinessState()
             ),
             [
                 new PurgeSweepStrategy(),
@@ -295,19 +312,19 @@ public sealed class SoftDeleteSweepEndToEndTests(PostgresFixture fixture)
     }
 
     private sealed class StaticCategoryRepository(
-        IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
-    ) : IRetentionCategoryRepository
+        IReadOnlyDictionary<string, ITestRetentionRule> resolvers
+    ) : ITestRetentionRuleProvider
     {
-        private static readonly IRetentionRuleResolver ExemptFallback =
-            new StaticRetentionRuleResolver(
+        private static readonly ITestRetentionRule ExemptFallback =
+            new StaticTestRetentionRule(
                 new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
             );
 
-        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct)
         {
             return resolvers.TryGetValue(category, out var resolver)
-                ? Task.FromResult<IRetentionRuleResolver?>(resolver)
-                : Task.FromResult<IRetentionRuleResolver?>(ExemptFallback);
+                ? Task.FromResult<ITestRetentionRule?>(resolver)
+                : Task.FromResult<ITestRetentionRule?>(ExemptFallback);
         }
     }
 }

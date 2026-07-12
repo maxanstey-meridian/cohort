@@ -2,7 +2,6 @@ using System.Data;
 using System.Data.Common;
 using Cohort.Application;
 using Cohort.Domain;
-using Cohort.Infrastructure.Migrations;
 using Cohort.Infrastructure.Sweep;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
@@ -47,14 +46,14 @@ internal sealed class RetentionRowDispatcher(
     private Task<RowDispatcherFlushResult> CountRemainingWorkAsync(CancellationToken ct)
     {
         return WithScopedConnectionAsync(
-            async (_, connection) =>
+            async (_, connection, tables) =>
             {
                 await using var command = connection.CreateCommand();
                 command.CommandText = $"""
                     SELECT
-                        COUNT(*) FILTER (WHERE "State" = @inFlight),
-                        COUNT(*) FILTER (WHERE "State" = @pending)
-                    FROM {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)}
+                        pg_catalog.count(*) FILTER (WHERE "State" = @inFlight),
+                        pg_catalog.count(*) FILTER (WHERE "State" = @pending)
+                    FROM {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)}
                     """;
                 command.Parameters.Add(
                     CreateParameter(command, "inFlight", (int)SweepRowHandlerDispatchState.InFlight)
@@ -106,7 +105,7 @@ internal sealed class RetentionRowDispatcher(
             try
             {
                 pollDelayEntered.TrySetResult();
-                await Task.Delay(pollInterval, stoppingToken);
+                await OperationalTime.DelayAsync(pollInterval, stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -126,17 +125,17 @@ internal sealed class RetentionRowDispatcher(
     private Task ClearSettledPayloadAsync(long rowDetailId)
     {
         return WithScopedConnectionAsync(
-            async (_, connection) =>
+            async (_, connection, tables) =>
             {
                 await using var command = connection.CreateCommand();
                 command.CommandText = $"""
-                    UPDATE {QuoteIdentifier(CohortTableNames.SweepRunRowDetail)} AS detail
+                    UPDATE {PostgreSqlIdentifier.Format(tables.SweepRunRowDetail)} AS detail
                     SET "CapturedPayload" = NULL
                     WHERE detail."Id" = @rowDetailId
                       AND detail."CapturedPayload" IS NOT NULL
                       AND NOT EXISTS (
                           SELECT 1
-                          FROM {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} AS status
+                          FROM {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)} AS status
                           WHERE status."SweepRunRowDetailId" = detail."Id"
                             AND status."State" IN (@pending, @inFlight)
                       )
@@ -164,17 +163,21 @@ internal sealed class RetentionRowDispatcher(
         }
 
         return WithScopedConnectionAsync(
-            async (_, connection) =>
+            async (_, connection, tables) =>
             {
                 await using var command = connection.CreateCommand();
                 command.CommandText = $"""
-                    UPDATE {QuoteIdentifier(CohortTableNames.SweepRunRowDetail)} AS detail
+                    UPDATE {PostgreSqlIdentifier.Format(tables.SweepRunRowDetail)} AS detail
                     SET "CapturedPayload" = NULL
                     WHERE detail."CapturedPayload" IS NOT NULL
                       AND detail."At" < @payloadCutoff
                     """;
                 command.Parameters.Add(
-                    CreateParameter(command, "payloadCutoff", DateTimeOffset.UtcNow - retention)
+                    CreateParameter(
+                        command,
+                        "payloadCutoff",
+                        OperationalTime.SubtractSaturating(DateTimeOffset.UtcNow, retention)
+                    )
                 );
 
                 await command.ExecuteNonQueryAsync(ct);
@@ -192,14 +195,14 @@ internal sealed class RetentionRowDispatcher(
         }
 
         return WithScopedConnectionAsync(
-            async (_, connection) =>
+            async (_, connection, tables) =>
             {
                 var staleSweepIds = new List<Guid>();
                 await using (var command = connection.CreateCommand())
                 {
                     command.CommandText = $"""
                         SELECT "SweepId"
-                        FROM {QuoteIdentifier(CohortTableNames.SweepRun)}
+                        FROM {PostgreSqlIdentifier.Format(tables.SweepRun)}
                         WHERE "Status" = @started
                           AND "StartedAt" <= @cutoff
                         ORDER BY "StartedAt"
@@ -207,7 +210,13 @@ internal sealed class RetentionRowDispatcher(
                     command.Parameters.Add(
                         CreateParameter(command, "started", (int)SweepRunStatus.Started)
                     );
-                    command.Parameters.Add(CreateParameter(command, "cutoff", now - settleTimeout));
+                    command.Parameters.Add(
+                        CreateParameter(
+                            command,
+                            "cutoff",
+                            OperationalTime.SubtractSaturating(now, settleTimeout)
+                        )
+                    );
                     await using var reader = await command.ExecuteReaderAsync(ct);
                     while (await reader.ReadAsync(ct))
                     {
@@ -222,11 +231,12 @@ internal sealed class RetentionRowDispatcher(
                         continue;
                     }
 
+                    Exception? primaryException = null;
                     try
                     {
                         await using var command = connection.CreateCommand();
                         command.CommandText = $"""
-                            UPDATE {QuoteIdentifier(CohortTableNames.SweepRun)}
+                            UPDATE {PostgreSqlIdentifier.Format(tables.SweepRun)}
                             SET "Status" = @failed,
                                 "SettledAt" = @settledAt,
                                 "Duration" = @settledAt - "StartedAt",
@@ -257,9 +267,24 @@ internal sealed class RetentionRowDispatcher(
                             );
                         }
                     }
+                    catch (Exception ex)
+                    {
+                        primaryException = ex;
+                        throw;
+                    }
                     finally
                     {
-                        await RetentionRunAdvisoryLock.ReleaseAsync(connection, sweepId, ct);
+                        await OperationalConnectionCleanup.RunAsync(
+                            cleanupToken =>
+                                RetentionRunAdvisoryLock.ReleaseAsync(
+                                    connection,
+                                    sweepId,
+                                    cleanupToken
+                                ),
+                            close: null,
+                            primaryException,
+                            logger
+                        );
                     }
                 }
             },
@@ -290,7 +315,7 @@ internal sealed class RetentionRowDispatcher(
                     ProcessClaimedRowAsync
                 );
             }
-            catch (Exception ex)
+            catch (Exception)
             {
                 try
                 {
@@ -301,8 +326,7 @@ internal sealed class RetentionRowDispatcher(
                 {
                     logger.LogWarning(
                         cleanupException,
-                        "Cohort could not requeue owned row-handler claims after dispatch failed; claim leases will recover them. Original failure: {OriginalFailure}",
-                        ex.Message
+                        "Cohort could not requeue owned row-handler claims after dispatch failed; claim leases will recover them."
                     );
                 }
                 throw;
@@ -376,7 +400,7 @@ internal sealed class RetentionRowDispatcher(
                 await MarkDeadLetteredAsync(
                     claimed,
                     currentAttempt,
-                    $"Retention row handler '{claimed.HandlerType}' is not registered for entity {claimed.EntityType}. If the handler class was renamed, register it with an explicit identity (AddRowHandler<TEntity, THandler>(identity: ...)) so queued work survives renames.",
+                    "The queued retention row handler is not registered. If it was renamed, register it with an explicit identity so queued work survives renames.",
                     DateTimeOffset.UtcNow,
                     ct
                 );
@@ -455,7 +479,7 @@ internal sealed class RetentionRowDispatcher(
     )
     {
         return WithScopedConnectionAsync<IReadOnlyList<ClaimedHandlerRow>>(
-            async (db, connection) =>
+            async (db, connection, tables) =>
             {
                 await using var transaction = await db.Database.BeginTransactionAsync(ct);
                 var claimedAt = DateTimeOffset.UtcNow;
@@ -463,12 +487,14 @@ internal sealed class RetentionRowDispatcher(
                 await DeadLetterExhaustedExpiredClaimsAsync(
                     connection,
                     transaction.GetDbTransaction(),
+                    tables,
                     claimedAt,
                     ct
                 );
                 var claimedIds = await ClaimBatchIdsAsync(
                     connection,
                     transaction.GetDbTransaction(),
+                    tables,
                     claimedAt,
                     claimToken,
                     dueCutoff,
@@ -483,6 +509,7 @@ internal sealed class RetentionRowDispatcher(
                 var claimedRows = await LoadClaimedRowsAsync(
                     connection,
                     transaction.GetDbTransaction(),
+                    tables,
                     claimedIds,
                     claimToken,
                     ct
@@ -504,6 +531,7 @@ internal sealed class RetentionRowDispatcher(
     private async Task DeadLetterExhaustedExpiredClaimsAsync(
         DbConnection connection,
         DbTransaction transaction,
+        CohortStoreTables tables,
         DateTimeOffset now,
         CancellationToken ct
     )
@@ -519,14 +547,14 @@ internal sealed class RetentionRowDispatcher(
         command.CommandText = $"""
             WITH exhausted AS (
                 SELECT status."Id", status."SweepRunRowDetailId", status."HandlerType"
-                FROM {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} AS status
+                FROM {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)} AS status
                 WHERE status."State" = @inFlight
                   AND status."Attempt" >= @maxAttempts
                   AND status."ClaimedAt" <= @leaseCutoff
                 FOR UPDATE SKIP LOCKED
             ),
             dead_lettered AS (
-                UPDATE {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} AS status
+                UPDATE {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)} AS status
                 SET "State" = @deadLettered,
                     "ClaimedAt" = NULL,
                     "ClaimToken" = NULL,
@@ -537,12 +565,12 @@ internal sealed class RetentionRowDispatcher(
                 RETURNING status."Id", status."SweepRunRowDetailId", status."HandlerType"
             ),
             dependent_dead_lettered AS (
-                UPDATE {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} AS dependent
+                UPDATE {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)} AS dependent
                 SET "State" = @deadLettered,
                     "ClaimedAt" = NULL,
                     "ClaimToken" = NULL,
                     "CompletedAt" = @completedAt,
-                    "LastError" = 'Skipped because an earlier handler for the same row exhausted its claim attempts: ' || dead_lettered."HandlerType"
+                    "LastError" = 'Skipped because an earlier handler for the same row exhausted its claim attempts.'
                 FROM dead_lettered
                 WHERE dependent."SweepRunRowDetailId" = dead_lettered."SweepRunRowDetailId"
                   AND dependent."Id" > dead_lettered."Id"
@@ -554,14 +582,14 @@ internal sealed class RetentionRowDispatcher(
                 UNION
                 SELECT "Id", "SweepRunRowDetailId" FROM dependent_dead_lettered
             )
-            UPDATE {QuoteIdentifier(CohortTableNames.SweepRunRowDetail)} AS detail
+            UPDATE {PostgreSqlIdentifier.Format(tables.SweepRunRowDetail)} AS detail
             SET "CapturedPayload" = NULL
             WHERE detail."Id" IN (
                   SELECT "SweepRunRowDetailId" FROM affected_statuses
               )
               AND NOT EXISTS (
                   SELECT 1
-                  FROM {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} AS unsettled
+                  FROM {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)} AS unsettled
                   WHERE unsettled."SweepRunRowDetailId" = detail."Id"
                     AND unsettled."State" IN (@pending, @inFlight)
                     AND unsettled."Id" NOT IN (SELECT "Id" FROM affected_statuses)
@@ -583,7 +611,13 @@ internal sealed class RetentionRowDispatcher(
                 Math.Max(1, options.RowHandlerDispatch.MaxAttempts)
             )
         );
-        command.Parameters.Add(CreateParameter(command, "leaseCutoff", now - claimTimeout));
+        command.Parameters.Add(
+            CreateParameter(
+                command,
+                "leaseCutoff",
+                OperationalTime.SubtractSaturating(now, claimTimeout)
+            )
+        );
         command.Parameters.Add(CreateParameter(command, "completedAt", now));
         command.Parameters.Add(
             CreateParameter(
@@ -598,6 +632,7 @@ internal sealed class RetentionRowDispatcher(
     private async Task<IReadOnlyList<long>> ClaimBatchIdsAsync(
         DbConnection connection,
         DbTransaction transaction,
+        CohortStoreTables tables,
         DateTimeOffset claimedAt,
         Guid claimToken,
         DateTimeOffset dueCutoff,
@@ -609,10 +644,10 @@ internal sealed class RetentionRowDispatcher(
         command.CommandText = $"""
             WITH due AS (
                 SELECT status."Id"
-                FROM {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} AS status
-                INNER JOIN {QuoteIdentifier(CohortTableNames.SweepRunRowDetail)} AS detail
+                FROM {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)} AS status
+                INNER JOIN {PostgreSqlIdentifier.Format(tables.SweepRunRowDetail)} AS detail
                     ON detail."Id" = status."SweepRunRowDetailId"
-                INNER JOIN {QuoteIdentifier(CohortTableNames.SweepRun)} AS run
+                INNER JOIN {PostgreSqlIdentifier.Format(tables.SweepRun)} AS run
                     ON run."SweepId" = detail."SweepId"
                 WHERE (
                       (status."State" = @pending AND status."NextAttemptAt" <= @dueCutoff)
@@ -638,7 +673,7 @@ internal sealed class RetentionRowDispatcher(
                   )
                   AND NOT EXISTS (
                       SELECT 1
-                      FROM {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} AS blocker
+                      FROM {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)} AS blocker
                       WHERE blocker."SweepRunRowDetailId" = status."SweepRunRowDetailId"
                         AND blocker."Id" < status."Id"
                         AND blocker."State" IN (@pending, @inFlight)
@@ -647,7 +682,7 @@ internal sealed class RetentionRowDispatcher(
                 FOR UPDATE OF status SKIP LOCKED
                 LIMIT @batchSize
             )
-            UPDATE {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} AS status
+            UPDATE {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)} AS status
             SET "State" = @inFlight,
                 "ClaimedAt" = @claimedAt,
                 "ClaimToken" = @claimToken,
@@ -705,7 +740,13 @@ internal sealed class RetentionRowDispatcher(
             claimTimeout = TimeSpan.FromSeconds(30);
         }
 
-        command.Parameters.Add(CreateParameter(command, "leaseCutoff", claimedAt - claimTimeout));
+        command.Parameters.Add(
+            CreateParameter(
+                command,
+                "leaseCutoff",
+                OperationalTime.SubtractSaturating(claimedAt, claimTimeout)
+            )
+        );
 
         var claimedIds = new List<long>();
         await using var reader = await command.ExecuteReaderAsync(ct);
@@ -720,6 +761,7 @@ internal sealed class RetentionRowDispatcher(
     private static async Task<IReadOnlyList<ClaimedHandlerRow>> LoadClaimedRowsAsync(
         DbConnection connection,
         DbTransaction transaction,
+        CohortStoreTables tables,
         IReadOnlyList<long> claimedIds,
         Guid claimToken,
         CancellationToken ct
@@ -738,13 +780,13 @@ internal sealed class RetentionRowDispatcher(
                 detail."At",
                 detail."EntityType",
                 detail."RetentionEntityId",
-                detail."EntityId",
+                detail."RecordId",
                 detail."Category",
                 detail."Strategy",
                 detail."TenantId",
                 detail."CapturedPayload"
-            FROM {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} AS status
-            INNER JOIN {QuoteIdentifier(CohortTableNames.SweepRunRowDetail)} AS detail
+            FROM {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)} AS status
+            INNER JOIN {PostgreSqlIdentifier.Format(tables.SweepRunRowDetail)} AS detail
                 ON detail."Id" = status."SweepRunRowDetailId"
             WHERE status."Id" = ANY(@claimedIds)
               AND status."ClaimToken" = @claimToken
@@ -817,7 +859,14 @@ internal sealed class RetentionRowDispatcher(
     {
         var optionsSnapshot = options.RowHandlerDispatch;
         var maxAttempts = Math.Max(1, optionsSnapshot.MaxAttempts);
-        var lastError = SanitizeError(ex);
+        var diagnostic = RetentionFailureDiagnostic.Create(ex);
+        var lastError = diagnostic.ToString();
+        logger.LogError(
+            ex.GetBaseException(),
+            "Cohort row handler failed for sweep {SweepId}. Diagnostic {DiagnosticId}.",
+            claimed.SweepId,
+            diagnostic.DiagnosticIdText
+        );
 
         if (attempt >= maxAttempts)
         {
@@ -861,7 +910,7 @@ internal sealed class RetentionRowDispatcher(
     )
     {
         return WithScopedConnectionAsync(
-            async (db, connection) =>
+            async (db, connection, tables) =>
             {
                 await using var transaction = await db.Database.BeginTransactionAsync(ct);
 
@@ -869,7 +918,7 @@ internal sealed class RetentionRowDispatcher(
                 {
                     currentCommand.Transaction = transaction.GetDbTransaction();
                     currentCommand.CommandText = $"""
-                        UPDATE {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)}
+                        UPDATE {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)}
                         SET "State" = @state,
                             "Attempt" = @attempt,
                             "ClaimedAt" = NULL,
@@ -922,7 +971,7 @@ internal sealed class RetentionRowDispatcher(
                 {
                     dependentCommand.Transaction = transaction.GetDbTransaction();
                     dependentCommand.CommandText = $"""
-                        UPDATE {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)}
+                        UPDATE {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)}
                         SET "State" = @state,
                             "ClaimedAt" = NULL,
                             "ClaimToken" = NULL,
@@ -946,7 +995,7 @@ internal sealed class RetentionRowDispatcher(
                         CreateParameter(
                             dependentCommand,
                             "lastError",
-                            $"Skipped because an earlier handler for the same row dead-lettered: {claimed.HandlerType}"
+                            "Skipped because an earlier handler for the same row dead-lettered."
                         )
                     );
                     dependentCommand.Parameters.Add(
@@ -990,7 +1039,7 @@ internal sealed class RetentionRowDispatcher(
         }
 
         return WithScopedConnectionAsync(
-            async (db, connection) =>
+            async (db, connection, tables) =>
             {
                 await using var transaction = await db.Database.BeginTransactionAsync(ct);
                 foreach (var claim in claims)
@@ -998,7 +1047,7 @@ internal sealed class RetentionRowDispatcher(
                     await using var command = connection.CreateCommand();
                     command.Transaction = transaction.GetDbTransaction();
                     command.CommandText = $"""
-                        UPDATE {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)}
+                        UPDATE {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)}
                         SET "State" = @pending,
                             "ClaimedAt" = NULL,
                             "ClaimToken" = NULL
@@ -1040,13 +1089,13 @@ internal sealed class RetentionRowDispatcher(
     )
     {
         return WithScopedConnectionAsync(
-            async (db, connection) =>
+            async (db, connection, tables) =>
             {
                 await using var transaction = await db.Database.BeginTransactionAsync(ct);
                 await using var command = connection.CreateCommand();
                 command.Transaction = transaction.GetDbTransaction();
                 command.CommandText = $"""
-                    UPDATE {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)}
+                    UPDATE {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)}
                     SET {setClause}
                     WHERE "Id" = @statusId
                       AND "State" = @expectedState
@@ -1097,13 +1146,13 @@ internal sealed class RetentionRowDispatcher(
         {
             while (true)
             {
-                await Task.Delay(interval, ct);
+                await OperationalTime.DelayAsync(interval, ct);
                 await WithScopedConnectionAsync(
-                    async (_, connection) =>
+                    async (_, connection, tables) =>
                     {
                         await using var command = connection.CreateCommand();
                         command.CommandText = $"""
-                            UPDATE {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)}
+                            UPDATE {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)}
                             SET "ClaimedAt" = @claimedAt
                             WHERE "Id" = @statusId
                               AND "State" = @inFlight
@@ -1156,11 +1205,14 @@ internal sealed class RetentionRowDispatcher(
     /// opening it when closed and restoring its state afterwards.
     /// </summary>
     private async Task<TResult> WithScopedConnectionAsync<TResult>(
-        Func<DbContext, DbConnection, Task<TResult>> action,
+        Func<DbContext, DbConnection, CohortStoreTables, Task<TResult>> action,
         CancellationToken ct
     )
     {
         await using var scope = scopeFactory.CreateAsyncScope();
+        await scope.ServiceProvider
+            .GetRequiredService<RetentionRuntimeReadinessValidator>()
+            .ValidateAsync(ct);
         var db = scope.ServiceProvider.GetRequiredKeyedService<DbContext>(
             CohortServiceKeys.DbContext
         );
@@ -1172,28 +1224,38 @@ internal sealed class RetentionRowDispatcher(
             await db.Database.OpenConnectionAsync(ct);
         }
 
+        Exception? primaryException = null;
         try
         {
-            return await action(db, connection);
+            return await action(db, connection, CohortStoreTables.FromModel(db.Model));
+        }
+        catch (Exception ex)
+        {
+            primaryException = ex;
+            throw;
         }
         finally
         {
-            if (shouldCloseConnection)
-            {
-                await db.Database.CloseConnectionAsync();
-            }
+            await OperationalConnectionCleanup.RunAsync(
+                unlock: null,
+                shouldCloseConnection
+                    ? cleanupToken => db.Database.CloseConnectionAsync().WaitAsync(cleanupToken)
+                    : null,
+                primaryException,
+                logger
+            );
         }
     }
 
     private async Task WithScopedConnectionAsync(
-        Func<DbContext, DbConnection, Task> action,
+        Func<DbContext, DbConnection, CohortStoreTables, Task> action,
         CancellationToken ct
     )
     {
         await WithScopedConnectionAsync<bool>(
-            async (db, connection) =>
+            async (db, connection, tables) =>
             {
-                await action(db, connection);
+                await action(db, connection, tables);
                 return true;
             },
             ct
@@ -1211,7 +1273,7 @@ internal sealed class RetentionRowDispatcher(
         return Activator.CreateInstance(
                 contextType,
                 claimed.SweepId,
-                claimed.EntityId,
+                claimed.RecordId,
                 claimed.Category,
                 claimed.Strategy,
                 claimed.TenantId,
@@ -1303,7 +1365,7 @@ internal sealed class RetentionRowDispatcher(
     {
         var entries = registry.Scan().Values;
         var resolved = entries
-            .FirstOrDefault(entry => entry.EntityId == retentionEntityId)
+            .FirstOrDefault(entry => entry.RetentionEntityId == retentionEntityId)
             ?.EntityType;
 
         return resolved
@@ -1319,16 +1381,6 @@ internal sealed class RetentionRowDispatcher(
             : value;
     }
 
-    private static string SanitizeError(Exception ex)
-    {
-        // Root-cause type + message only: full ToString() includes stack frames that can
-        // echo row data into a long-lived audit table, and reflection wrappers like
-        // TargetInvocationException would otherwise hide the handler's actual failure.
-        var root = ex.GetBaseException();
-        var error = $"{root.GetType().FullName}: {root.Message}";
-        return error.Length <= 2000 ? error : error[..2000];
-    }
-
     private static DbParameter CreateParameter(DbCommand command, string name, object? value)
     {
         var parameter = command.CreateParameter();
@@ -1337,10 +1389,6 @@ internal sealed class RetentionRowDispatcher(
         return parameter;
     }
 
-    private static string QuoteIdentifier(string identifier)
-    {
-        return $"\"{identifier.Replace("\"", "\"\"")}\"";
-    }
 
     private sealed record ClaimedHandlerRow(
         long StatusId,
@@ -1352,7 +1400,7 @@ internal sealed class RetentionRowDispatcher(
         DateTimeOffset At,
         string EntityType,
         Guid RetentionEntityId,
-        string EntityId,
+        string RecordId,
         string Category,
         Strategy Strategy,
         Guid TenantId,

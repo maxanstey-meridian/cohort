@@ -21,7 +21,7 @@ internal sealed class PurgeSweepStrategy : IRetentionSweepStrategy
             services,
             eligibilityClause: static _ => "",
             mutationHead: static entry =>
-                $"DELETE FROM {RelationalSweepStrategyCore.QuoteIdentifier(entry.TableName)} AS target",
+                $"DELETE FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target",
             addMutationParameters: static (_, _, _) => { }
         );
     }
@@ -98,6 +98,18 @@ internal sealed class PurgeSweepStrategy : IRetentionSweepStrategy
     )
     {
         return core.CountHeldForEraseAsync(entry, rule, predicate, tenant, now, conn, ct);
+    }
+
+    public Task<long> CountNullAnchorsForEraseAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        ErasureSubjectPredicate predicate,
+        TenantContext tenant,
+        DbConnection conn,
+        CancellationToken ct
+    )
+    {
+        return core.CountNullAnchorsForEraseAsync(entry, rule, predicate, tenant, conn, ct);
     }
 
     public Task<SweepExecutionResult> EraseAsync(

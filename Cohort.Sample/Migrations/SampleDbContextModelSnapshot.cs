@@ -71,12 +71,14 @@ namespace Cohort.Sample.Migrations
 
                     b.HasIndex("State", "NextAttemptAt", "Id");
 
-                    b.ToTable("sweep_row_handler_status", null, t =>
+                    b.ToTable("sweep_row_handler_status", "public", t =>
                         {
                             t.HasCheckConstraint("CK_sweep_row_handler_status_Claim", "(\"State\" = 1 AND \"ClaimedAt\" IS NOT NULL AND \"ClaimToken\" IS NOT NULL) OR (\"State\" <> 1 AND \"ClaimedAt\" IS NULL AND \"ClaimToken\" IS NULL)");
 
                             t.HasCheckConstraint("CK_sweep_row_handler_status_Completion", "(\"State\" IN (2, 3) AND \"CompletedAt\" IS NOT NULL) OR (\"State\" IN (0, 1) AND \"CompletedAt\" IS NULL)");
                         });
+
+                    b.HasAnnotation("Cohort:TableRole", "sweep_row_handler_status");
                 });
 
             modelBuilder.Entity("Cohort.Sample.Entities.AnonymisedContact", b =>
@@ -246,7 +248,9 @@ namespace Cohort.Sample.Migrations
 
                     b.HasIndex("RetentionEntityId", "TenantId", "RecordId");
 
-                    b.ToTable("retention_holds", (string)null);
+                    b.ToTable("retention_holds", "public");
+
+                    b.HasAnnotation("Cohort:TableRole", "retention_holds");
                 });
 
             modelBuilder.Entity("Cohort.Sample.Entities.Note", b =>
@@ -461,7 +465,7 @@ namespace Cohort.Sample.Migrations
 
                     b.HasKey("SweepId");
 
-                    b.ToTable("sweep_run", null, t =>
+                    b.ToTable("sweep_run", "public", t =>
                         {
                             t.HasCheckConstraint("CK_sweep_run_Duration_Nonnegative", "\"Duration\" IS NULL OR \"Duration\" >= INTERVAL '0'");
 
@@ -473,6 +477,8 @@ namespace Cohort.Sample.Migrations
 
                             t.HasCheckConstraint("CK_sweep_run_TotalAffected_Nonnegative", "\"TotalAffected\" IS NULL OR \"TotalAffected\" >= 0");
                         });
+
+                    b.HasAnnotation("Cohort:TableRole", "sweep_run");
                 });
 
             modelBuilder.Entity("Cohort.SweepRunEntitySummary", b =>
@@ -524,7 +530,9 @@ namespace Cohort.Sample.Migrations
 
                     b.HasIndex("SweepId");
 
-                    b.ToTable("sweep_run_entity_summary", (string)null);
+                    b.ToTable("sweep_run_entity_summary", "public");
+
+                    b.HasAnnotation("Cohort:TableRole", "sweep_run_entity_summary");
                 });
 
             modelBuilder.Entity("Cohort.SweepRunRowDetail", b =>
@@ -545,11 +553,11 @@ namespace Cohort.Sample.Migrations
                         .IsRequired()
                         .HasColumnType("text");
 
-                    b.Property<string>("EntityId")
+                    b.Property<string>("EntityType")
                         .IsRequired()
                         .HasColumnType("text");
 
-                    b.Property<string>("EntityType")
+                    b.Property<string>("RecordId")
                         .IsRequired()
                         .HasColumnType("text");
 
@@ -569,11 +577,13 @@ namespace Cohort.Sample.Migrations
 
                     b.HasIndex("SweepId");
 
-                    b.HasIndex("SweepId", "RetentionEntityId", "EntityId", "Category", "Strategy", "TenantId")
+                    b.HasIndex("SweepId", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId")
                         .IsUnique()
                         .HasDatabaseName("IX_sweep_run_row_detail_StableIdentity");
 
-                    b.ToTable("sweep_run_row_detail", (string)null);
+                    b.ToTable("sweep_run_row_detail", "public");
+
+                    b.HasAnnotation("Cohort:TableRole", "sweep_run_row_detail");
                 });
 
             modelBuilder.Entity("Cohort.Infrastructure.Handlers.SweepRowHandlerStatusEntity", b =>

@@ -22,7 +22,7 @@ internal sealed class AnonymisePreviewExecutor
             entry.Tenant?.TenantColumn,
             tenant.Id
         );
-        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.EntityId);
+        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.RetentionEntityId);
 
         return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
@@ -63,7 +63,7 @@ internal sealed class AnonymisePreviewExecutor
             entry.Tenant?.TenantColumn,
             tenant.Id
         );
-        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.EntityId);
+        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.RetentionEntityId);
 
         return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }

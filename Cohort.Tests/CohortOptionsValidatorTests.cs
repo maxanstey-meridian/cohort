@@ -4,6 +4,45 @@ namespace Cohort.Tests;
 
 public sealed class CohortOptionsValidatorTests
 {
+    [Fact]
+    public void Audit_Observer_Timeout_Defaults_To_Five_Seconds()
+    {
+        new CohortOptions().AuditObservers.Timeout.Should().Be(TimeSpan.FromSeconds(5));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void Validate_Rejects_Non_Positive_Audit_Observer_Timeout(int milliseconds)
+    {
+        var options = new CohortOptions
+        {
+            AuditObservers = new AuditObserverOptions
+            {
+                Timeout = TimeSpan.FromMilliseconds(milliseconds),
+            },
+        };
+
+        var result = new CohortOptionsValidator().Validate(null, options);
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().ContainSingle(message => message.Contains("AuditObservers Timeout"));
+    }
+
+    [Fact]
+    public void Validate_Rejects_Audit_Observer_Timeout_Above_Safe_Ceiling()
+    {
+        var options = new CohortOptions
+        {
+            AuditObservers = new AuditObserverOptions { Timeout = TimeSpan.FromHours(1).Add(TimeSpan.FromTicks(1)) },
+        };
+
+        var result = new CohortOptionsValidator().Validate(null, options);
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().ContainSingle(message => message.Contains("AuditObservers Timeout"));
+    }
+
     [Theory]
     [InlineData("Conventions")]
     [InlineData("RowHandlerDispatch")]
@@ -62,6 +101,51 @@ public sealed class CohortOptionsValidatorTests
 
         result.Failed.Should().BeTrue();
         result.Failures.Should().ContainSingle(message => message.Contains(option));
+    }
+
+    [Theory]
+    [InlineData("BatchSize")]
+    [InlineData("MaxAttempts")]
+    [InlineData("MaxParallelism")]
+    public void Validate_Rejects_Row_Handler_Dispatch_Options_Above_Safe_Ceilings(
+        string option
+    )
+    {
+        var dispatch = option switch
+        {
+            "BatchSize" => new RowHandlerDispatchOptions { BatchSize = 10_001 },
+            "MaxAttempts" => new RowHandlerDispatchOptions { MaxAttempts = 1_001 },
+            "MaxParallelism" => new RowHandlerDispatchOptions { MaxParallelism = 257 },
+            _ => throw new ArgumentOutOfRangeException(nameof(option)),
+        };
+
+        var result = new CohortOptionsValidator().Validate(
+            null,
+            new CohortOptions { RowHandlerDispatch = dispatch }
+        );
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().ContainSingle(message => message.Contains(option));
+    }
+
+    [Theory]
+    [InlineData("BatchSize")]
+    [InlineData("MaxAttempts")]
+    [InlineData("MaxParallelism")]
+    public void Validate_Accepts_Row_Handler_Dispatch_Options_At_Safe_Ceilings(string option)
+    {
+        var dispatch = option switch
+        {
+            "BatchSize" => new RowHandlerDispatchOptions { BatchSize = 10_000 },
+            "MaxAttempts" => new RowHandlerDispatchOptions { MaxAttempts = 1_000 },
+            "MaxParallelism" => new RowHandlerDispatchOptions { MaxParallelism = 256 },
+            _ => throw new ArgumentOutOfRangeException(nameof(option)),
+        };
+
+        new CohortOptionsValidator()
+            .Validate(null, new CohortOptions { RowHandlerDispatch = dispatch })
+            .Succeeded.Should()
+            .BeTrue();
     }
 
     [Theory]

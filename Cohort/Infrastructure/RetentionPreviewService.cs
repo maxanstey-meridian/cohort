@@ -10,8 +10,8 @@ namespace Cohort.Infrastructure;
 internal sealed class RetentionPreviewService(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
     RetentionRegistry registry,
-    IRetentionCategoryRepository categoryRepository,
-    RetentionStartupValidator validator,
+    IRetentionRuleProvider ruleProvider,
+    RetentionRuntimeReadinessValidator readinessValidator,
     IEnumerable<IRetentionSweepStrategy> sweepStrategies
 )
 {
@@ -34,20 +34,21 @@ internal sealed class RetentionPreviewService(
             _ => throw new ArgumentOutOfRangeException(nameof(request)),
         };
 
-        await validator.ValidateAsync(ct);
+        await readinessValidator.ValidateAsync(ct);
 
         var startedAt = DateTimeOffset.UtcNow;
         var counts = new List<EntitySweepCount>();
         var connection = db.Database.GetDbConnection();
         var shouldCloseConnection = connection.State != ConnectionState.Open;
-
-        if (shouldCloseConnection)
-        {
-            await db.Database.OpenConnectionAsync(ct);
-        }
+        Exception? primaryException = null;
 
         try
         {
+            if (shouldCloseConnection)
+            {
+                await db.Database.OpenConnectionAsync(ct);
+            }
+
             foreach (
                 var entry in registry
                     .Scan()
@@ -55,16 +56,13 @@ internal sealed class RetentionPreviewService(
                     .OrderBy(entry => entry.EntityType.FullName, StringComparer.Ordinal)
             )
             {
-                var resolver = await categoryRepository.GetAsync(entry.Category, ct);
-                if (resolver is null)
-                {
-                    throw new InvalidOperationException(
-                        $"Retention category '{entry.Category}' for entity {entry.EntityType.FullName} could not be resolved at runtime."
-                    );
-                }
-
                 var context = new RetentionResolutionContext(entry.Category, tenant, request.At, []);
-                var rule = await resolver.ResolveAsync(context, ct);
+                var rule = await RetentionRuleProviderResolution.ResolveAsync(
+                    ruleProvider,
+                    readinessValidator.ValidatedCapabilities,
+                    context,
+                    ct
+                );
                 if (rule.Strategy != Strategy.Exempt && !strategies.ContainsKey(rule.Strategy))
                 {
                     throw new InvalidOperationException(
@@ -97,12 +95,21 @@ internal sealed class RetentionPreviewService(
                 );
             }
         }
+        catch (Exception ex)
+        {
+            primaryException = ex;
+            throw;
+        }
         finally
         {
-            if (shouldCloseConnection)
-            {
-                await db.Database.CloseConnectionAsync();
-            }
+            await OperationalConnectionCleanup.RunAsync(
+                null,
+                shouldCloseConnection
+                    ? cleanupToken => db.Database.CloseConnectionAsync().WaitAsync(cleanupToken)
+                    : null,
+                primaryException,
+                null
+            );
         }
 
         return new RetentionSweepResult(Guid.NewGuid(), startedAt, DateTimeOffset.UtcNow, counts);

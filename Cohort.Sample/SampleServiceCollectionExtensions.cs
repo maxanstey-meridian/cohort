@@ -25,7 +25,7 @@ public static class SampleServiceCollectionExtensions
             }
         );
 
-        services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+        services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
         services.AddSingleton(CreatePreviewTenant());
         services.AddSingleton<GuidTombstoneFactory>();
         services.AddSingleton<OriginalValueTombstoneFactory>();
@@ -36,7 +36,6 @@ public static class SampleServiceCollectionExtensions
             sp.GetRequiredService<OriginalValueTombstoneFactory>()
         );
         services.AddCohort<SampleDbContext>();
-        services.AddScoped<SampleRetentionStartupService>();
 
         return services;
     }

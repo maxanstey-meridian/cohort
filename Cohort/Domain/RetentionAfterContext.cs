@@ -6,7 +6,7 @@ public sealed class RetentionAfterContext<TEntity>
 {
     public RetentionAfterContext(
         Guid sweepId,
-        string entityId,
+        string recordId,
         string category,
         Strategy strategy,
         Guid tenantId,
@@ -15,12 +15,12 @@ public sealed class RetentionAfterContext<TEntity>
         IReadOnlyDictionary<string, object?> snapshot
     )
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(entityId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(recordId);
         ArgumentException.ThrowIfNullOrWhiteSpace(category);
         ArgumentNullException.ThrowIfNull(snapshot);
 
         SweepId = sweepId;
-        EntityId = entityId;
+        RecordId = recordId;
         Category = category;
         Strategy = strategy;
         TenantId = tenantId;
@@ -33,7 +33,7 @@ public sealed class RetentionAfterContext<TEntity>
 
     public Guid SweepId { get; }
 
-    public string EntityId { get; }
+    public string RecordId { get; }
 
     public string Category { get; }
 

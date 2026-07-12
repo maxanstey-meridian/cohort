@@ -69,11 +69,11 @@ public sealed class SweepEventTests
     [InlineData(null)]
     [InlineData("")]
     [InlineData("   ")]
-    public void Row_Detail_Rejects_Blank_Entity_Ids(string? entityId)
+    public void Row_Detail_Rejects_Blank_Record_Ids(string? recordId)
     {
-        var act = () => ValidRowDetail(entityId: entityId!);
+        var act = () => ValidRowDetail(recordId: recordId!);
 
-        act.Should().Throw<ArgumentException>().WithParameterName("EntityId");
+        act.Should().Throw<ArgumentException>().WithParameterName("RecordId");
     }
 
     [Theory]
@@ -375,7 +375,7 @@ public sealed class SweepEventTests
         Guid? retentionEntityId = null,
         string category = "category",
         Strategy strategy = Strategy.Purge,
-        string entityId = "entity-id",
+        string recordId = "record-id",
         Guid? sweepId = null
     ) =>
         new(
@@ -383,7 +383,7 @@ public sealed class SweepEventTests
             At,
             entityType ?? typeof(object),
             retentionEntityId ?? RetentionEntityId,
-            entityId,
+            recordId,
             category,
             strategy,
             TenantId

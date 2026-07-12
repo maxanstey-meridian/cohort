@@ -9,11 +9,12 @@ internal static class AnonymiseSqlBuilder
         var tenantClause = BuildTenantClause(entry.Tenant?.TenantColumn);
 
         return $"""
-            SELECT COUNT(*)
-            FROM {QuoteIdentifier(entry.TableName)} AS target
+            SELECT pg_catalog.count(*)
+            FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
             WHERE {filter.PredicateSql}
               {tenantClause}
               AND {RetentionHoldSql.BuildActiveHoldExclusion(
+                entry.CohortTables.RetentionHolds,
                 "target",
                 entry.RecordId.RecordIdColumn,
                 entry.Tenant?.TenantColumn
@@ -26,11 +27,12 @@ internal static class AnonymiseSqlBuilder
         var tenantClause = BuildTenantClause(entry.Tenant?.TenantColumn);
 
         return $"""
-            SELECT COUNT(*)
-            FROM {QuoteIdentifier(entry.TableName)} AS target
+            SELECT pg_catalog.count(*)
+            FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
             WHERE {filter.PredicateSql}
               {tenantClause}
               AND NOT {RetentionHoldSql.BuildActiveHoldExclusion(
+                entry.CohortTables.RetentionHolds,
                 "target",
                 entry.RecordId.RecordIdColumn,
                 entry.Tenant?.TenantColumn
@@ -44,8 +46,8 @@ internal static class AnonymiseSqlBuilder
         var tenantClause = BuildTenantClause(entry.Tenant?.TenantColumn);
 
         return $"""
-            SELECT COUNT(*)
-            FROM {QuoteIdentifier(entry.TableName)} AS target
+            SELECT pg_catalog.count(*)
+            FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
             WHERE {filter.PredicateSql}
               {tenantClause}
             """;
@@ -66,12 +68,13 @@ internal static class AnonymiseSqlBuilder
         var tenantClause = BuildTenantClause(entry.Tenant?.TenantColumn);
 
         return $"""
-            UPDATE {QuoteIdentifier(entry.TableName)} AS target
+            UPDATE {PostgreSqlIdentifier.Format(entry.Table)} AS target
             SET {string.Join(", ", assignments)}{BuildAnonymisedAtAssignment(entry)}
             WHERE {filter.PredicateSql}
               {tenantClause}
               AND {RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "candidateIds")}
               AND {RetentionHoldSql.BuildActiveHoldExclusion(
+                entry.CohortTables.RetentionHolds,
                 "target",
                 entry.RecordId.RecordIdColumn,
                 entry.Tenant?.TenantColumn
@@ -92,12 +95,13 @@ internal static class AnonymiseSqlBuilder
         var tenantClause = BuildTenantClause(entry.Tenant?.TenantColumn);
 
         return $"""
-            UPDATE {QuoteIdentifier(entry.TableName)} AS target
+            UPDATE {PostgreSqlIdentifier.Format(entry.Table)} AS target
             SET {string.Join(", ", assignments)}{BuildAnonymisedAtAssignment(entry)}
             WHERE {RecordIdSql.EqualsParameter("target", entry.RecordId, "recordId")}
               AND {filter.PredicateSql}
               {tenantClause}
               AND {RetentionHoldSql.BuildActiveHoldExclusion(
+                entry.CohortTables.RetentionHolds,
                 "target",
                 entry.RecordId.RecordIdColumn,
                 entry.Tenant?.TenantColumn
@@ -110,13 +114,29 @@ internal static class AnonymiseSqlBuilder
         RetentionEntry entry,
         SqlFilter filter,
         int? batchSize,
-        bool hasExcludedRecordIds = false
+        bool hasAttemptedRecordIds = false,
+        bool excludeCommittedRowDetails = false
     )
     {
         var tenantClause = BuildTenantClause(entry.Tenant?.TenantColumn);
         var limitClause = batchSize is not null ? "\nLIMIT @batchSize" : "";
-        var excludedClause = hasExcludedRecordIds
-            ? $"\n  AND NOT ({RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "excludedRecordIds")})"
+        var attemptedClause = hasAttemptedRecordIds
+            ? $"\n  AND NOT ({RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "attemptedRecordIds")})"
+            : "";
+        var committedClause = excludeCommittedRowDetails
+            ? $"""
+
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {PostgreSqlIdentifier.Format(entry.CohortTables.SweepRunRowDetail)} AS prior_detail
+                  WHERE prior_detail."SweepId" = @excludedSweepId
+                    AND prior_detail."RetentionEntityId" = @excludedRetentionEntityId
+                    AND prior_detail."RecordId" = {RecordIdSql.TextExpression("target", entry.RecordId)}
+                    AND prior_detail."Category" = @excludedCategory
+                    AND prior_detail."Strategy" = @excludedStrategy
+                    AND prior_detail."TenantId" = @excludedTenantId
+              )
+              """
             : "";
 
         // Held rows are excluded up front so they are neither selected nor re-selected by
@@ -125,10 +145,11 @@ internal static class AnonymiseSqlBuilder
         // eligible, so reselecting them would re-fail them forever.
         return $"""
             SELECT {RecordIdSql.TextExpression("target", entry.RecordId)}
-            FROM {QuoteIdentifier(entry.TableName)} AS target
+            FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
             WHERE {filter.PredicateSql}
-              {tenantClause}{excludedClause}
+              {tenantClause}{attemptedClause}{committedClause}
               AND {RetentionHoldSql.BuildActiveHoldExclusion(
+                entry.CohortTables.RetentionHolds,
                 "target",
                 entry.RecordId.RecordIdColumn,
                 entry.Tenant?.TenantColumn
@@ -150,11 +171,12 @@ internal static class AnonymiseSqlBuilder
 
         return $"""
             SELECT {RecordIdSql.TextExpression("target", entry.RecordId)}
-            FROM {QuoteIdentifier(entry.TableName)} AS target
+            FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
             WHERE {filter.PredicateSql}
               {tenantClause}
               AND {RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "candidateIds")}
               AND {RetentionHoldSql.BuildActiveHoldExclusion(
+                entry.CohortTables.RetentionHolds,
                 "target",
                 entry.RecordId.RecordIdColumn,
                 entry.Tenant?.TenantColumn
@@ -168,7 +190,8 @@ internal static class AnonymiseSqlBuilder
 
     internal static string BuildLoadUpdatableRowsCommandText(
         RetentionEntry entry,
-        IReadOnlyList<AnonymiseFactoryField> originalValueFields
+        IReadOnlyList<AnonymiseFactoryField> originalValueFields,
+        SqlFilter filter
     )
     {
         var tenantClause = BuildTenantClause(entry.Tenant?.TenantColumn);
@@ -182,10 +205,12 @@ internal static class AnonymiseSqlBuilder
 
         return $"""
             SELECT {selectList}
-            FROM {QuoteIdentifier(entry.TableName)} AS target
+            FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
             WHERE {RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "candidateIds")}
+              AND {filter.PredicateSql}
               {tenantClause}
               AND {RetentionHoldSql.BuildActiveHoldExclusion(
+                entry.CohortTables.RetentionHolds,
                 "target",
                 entry.RecordId.RecordIdColumn,
                 entry.Tenant?.TenantColumn
@@ -196,16 +221,18 @@ internal static class AnonymiseSqlBuilder
             """;
     }
 
-    internal static string BuildLoadHandlerRowsCommandText(RetentionEntry entry)
+    internal static string BuildLoadHandlerRowsCommandText(RetentionEntry entry, SqlFilter filter)
     {
         var tenantClause = BuildTenantClause(entry.Tenant?.TenantColumn);
 
         return $"""
             SELECT *
-            FROM {QuoteIdentifier(entry.TableName)} AS target
+            FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
             WHERE {RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "candidateIds")}
+              AND {filter.PredicateSql}
               {tenantClause}
               AND {RetentionHoldSql.BuildActiveHoldExclusion(
+                entry.CohortTables.RetentionHolds,
                 "target",
                 entry.RecordId.RecordIdColumn,
                 entry.Tenant?.TenantColumn
@@ -218,7 +245,7 @@ internal static class AnonymiseSqlBuilder
 
     internal static string QuoteIdentifier(string identifier)
     {
-        return $"\"{identifier.Replace("\"", "\"\"")}\"";
+        return PostgreSqlIdentifier.Quote(identifier);
     }
 
     private static string BuildTenantClause(string? tenantColumn)

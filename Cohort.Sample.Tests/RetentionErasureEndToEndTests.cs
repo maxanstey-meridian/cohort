@@ -3,6 +3,7 @@ using System.Data.Common;
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
+using Cohort.Infrastructure;
 using Cohort.Infrastructure.Migrations;
 using Cohort.Sample.Entities;
 using Microsoft.EntityFrameworkCore;
@@ -308,7 +309,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     "short-lived",
                     tenantId,
                     Strategy.Purge,
-                    TimeSpan.FromDays(30),
+                    TimeSpan.Zero,
                     1,
                     1,
                     0,
@@ -325,7 +326,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     "soft-delete",
                     tenantId,
                     Strategy.SoftDelete,
-                    TimeSpan.FromDays(30),
+                    TimeSpan.Zero,
                     1,
                     1,
                     0,
@@ -342,7 +343,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     "anonymise",
                     tenantId,
                     Strategy.Anonymise,
-                    TimeSpan.FromDays(30),
+                    TimeSpan.Zero,
                     1,
                     1,
                     0,
@@ -806,6 +807,16 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             await db.SaveChangesAsync();
         }
 
+        using var erasureHost = new CohortTestHost(
+            GetConnectionString(),
+            CreateErasureCategoryRepository(),
+            CreateCohortSettings(dryRun: true)
+        );
+        await erasureHost.RunPreviewAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
         await using var summaryLockConnection = new NpgsqlConnection(GetConnectionString());
         await summaryLockConnection.OpenAsync();
         await using var summaryLockTransaction =
@@ -817,12 +828,6 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                 """LOCK TABLE "sweep_run_entity_summary" IN ACCESS EXCLUSIVE MODE""";
             await lockCommand.ExecuteNonQueryAsync();
         }
-
-        using var erasureHost = new CohortTestHost(
-            GetConnectionString(),
-            CreateErasureCategoryRepository(),
-            CreateCohortSettings(dryRun: true)
-        );
 
         var erasureTask = erasureHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
@@ -877,7 +882,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task Erase_Does_Not_Touch_Row_Within_Period()
+    public async Task Erase_Ignores_Ordinary_Period()
     {
         var tenantId = Guid.NewGuid();
         var subjectId = Guid.NewGuid();
@@ -922,13 +927,13 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         result
             .Counts.Should()
             .Contain(
-                new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+                new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 2)
             );
 
         var run = await LoadRunAsync(result.SweepId);
         var summaries = await LoadSummariesAsync(result.SweepId);
 
-        run.TotalAffected.Should().Be(1);
+        run.TotalAffected.Should().Be(2);
         summaries
             .Should()
             .Contain(
@@ -938,8 +943,8 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     "short-lived",
                     tenantId,
                     Strategy.Purge,
-                    TimeSpan.FromDays(30),
-                    1,
+                    TimeSpan.Zero,
+                    2,
                     0,
                     0
                 )
@@ -947,12 +952,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
         await using var verify = Host.CreateDbContext();
         (await verify.Notes.AnyAsync(note => note.Id == eligibleNoteId)).Should().BeFalse();
-
-        var withinPeriodNote = await verify.Notes.SingleAsync(note =>
-            note.Id == withinPeriodNoteId
-        );
-        withinPeriodNote.Body.Should().Be("within-period-note");
-        withinPeriodNote.CreatedAt.Should().Be(asOf.AddDays(-10));
+        (await verify.Notes.AnyAsync(note => note.Id == withinPeriodNoteId)).Should().BeFalse();
     }
 
     [Fact]
@@ -1138,11 +1138,11 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         var previewSummaries = await LoadSummariesAsync(previewResult.SweepId);
 
         previewRun.DryRun.Should().BeTrue();
-        previewRun.TotalAffected.Should().Be(3);
+        previewRun.TotalAffected.Should().Be(6);
         previewResult
             .Counts.Should()
             .Contain(
-                new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+                new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 2)
             );
         previewResult
             .Counts.Should()
@@ -1152,7 +1152,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     "soft-delete",
                     tenantId,
                     Strategy.SoftDelete,
-                    1
+                    2
                 )
             );
         previewResult
@@ -1163,7 +1163,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     "anonymise",
                     tenantId,
                     Strategy.Anonymise,
-                    1
+                    2
                 )
             );
 
@@ -1215,7 +1215,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         var liveSummaries = await LoadSummariesAsync(liveResult.SweepId);
 
         liveRun.DryRun.Should().BeFalse();
-        liveRun.TotalAffected.Should().Be(3);
+        liveRun.TotalAffected.Should().Be(6);
         previewResult.Counts.Should().BeEquivalentTo(liveResult.Counts);
         previewSummaries
             .Select(ProjectSummary)
@@ -1224,7 +1224,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
         await using var afterLive = Host.CreateDbContext();
         (await afterLive.Notes.AnyAsync(note => note.Id == noteEligibleId)).Should().BeFalse();
-        (await afterLive.Notes.AnyAsync(note => note.Id == noteWithinPeriodId)).Should().BeTrue();
+        (await afterLive.Notes.AnyAsync(note => note.Id == noteWithinPeriodId)).Should().BeFalse();
 
         (await afterLive.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteEligibleId))
             .IsDeleted.Should()
@@ -1235,7 +1235,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             )
         )
             .IsDeleted.Should()
-            .BeFalse();
+            .BeTrue();
 
         var liveEligibleContact = await afterLive.AnonymisedContacts.SingleAsync(contact =>
             contact.Id == contactEligibleId
@@ -1247,9 +1247,9 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         var liveWithinPeriodContact = await afterLive.AnonymisedContacts.SingleAsync(contact =>
             contact.Id == contactWithinPeriodId
         );
-        liveWithinPeriodContact.EmailAddress.Should().Be("within-period@example.com");
-        liveWithinPeriodContact.GivenName.Should().Be("Within");
-        liveWithinPeriodContact.Surname.Should().Be("Period");
+        liveWithinPeriodContact.EmailAddress.Should().BeNull();
+        liveWithinPeriodContact.GivenName.Should().BeEmpty();
+        liveWithinPeriodContact.Surname.Should().Be("[redacted]");
     }
 
     [Fact]
@@ -1481,7 +1481,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             CreateErasureCategoryRepository(
                 shortLivedRule: legalMinRule,
                 softDeleteRule: new RetentionRule(
-                    TimeSpan.FromDays(30),
+                    TimeSpan.Zero,
                     Strategy.SoftDelete,
                     TimeSpan.FromDays(90)
                 ),
@@ -1542,7 +1542,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task Erase_Still_Respects_Active_Holds_After_Cutoff_Gating()
+    public async Task Erase_Still_Respects_Active_Holds_When_Period_Is_Ignored()
     {
         var tenantId = Guid.NewGuid();
         var subjectId = Guid.NewGuid();
@@ -1609,7 +1609,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     "short-lived",
                     tenantId,
                     Strategy.Purge,
-                    TimeSpan.FromDays(30),
+                    TimeSpan.Zero,
                     1,
                     1,
                     0
@@ -1625,7 +1625,125 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task Erasure_Path_Fails_When_The_Scope_Subject_Cannot_Be_Expressed_Against_The_Marked_Property()
+    public async Task Erasure_Final_Mutation_Revalidates_Hold_Subject_Tenant_And_LegalMin_After_Lock_Wait()
+    {
+        var tenantId = Guid.NewGuid();
+        var replacementTenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var replacementSubjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var subjectChangedNoteId = Guid.NewGuid();
+        var heldNoteId = Guid.NewGuid();
+        var tenantChangedSoftDeleteId = Guid.NewGuid();
+        var anchorChangedContactId = Guid.NewGuid();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note { Id = subjectChangedNoteId, TenantId = tenantId, SubjectId = subjectId, CreatedAt = asOf.AddDays(-120), Body = "subject-race" },
+                new Note { Id = heldNoteId, TenantId = tenantId, SubjectId = subjectId, CreatedAt = asOf.AddDays(-120), Body = "hold-race" }
+            );
+            db.SoftDeleteRecords.Add(
+                new SoftDeleteRecord { Id = tenantChangedSoftDeleteId, TenantId = tenantId, SubjectId = subjectId, CreatedAt = asOf.AddDays(-120), Body = "tenant-race" }
+            );
+            db.AnonymisedContacts.Add(
+                new AnonymisedContact
+                {
+                    Id = anchorChangedContactId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-120),
+                    EmailAddress = "anchor-race@example.com",
+                    GivenName = "Anchor",
+                    Surname = "Race",
+                    Notes = "must survive",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        var legalMin = TimeSpan.FromDays(90);
+        using var erasureHost = new CohortTestHost(
+            GetConnectionString(),
+            CreateErasureCategoryRepository(
+                shortLivedRule: new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge, legalMin),
+                softDeleteRule: new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete, legalMin),
+                anonymiseRule: new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise, legalMin)
+            )
+        );
+        await using var blocker = new NpgsqlConnection(GetConnectionString());
+        await blocker.OpenAsync();
+        await using var blockerTransaction = await blocker.BeginTransactionAsync();
+        await using (var lockCommand = blocker.CreateCommand())
+        {
+            lockCommand.Transaction = blockerTransaction;
+            lockCommand.CommandText = """
+                SELECT "Id" FROM "notes" WHERE "Id" = ANY(@noteIds) FOR UPDATE;
+                SELECT "Id" FROM "soft_delete_records" WHERE "Id" = @softDeleteId FOR UPDATE;
+                SELECT "Id" FROM "anonymised_contacts" WHERE "Id" = @contactId FOR UPDATE;
+                """;
+            lockCommand.Parameters.AddWithValue("noteIds", new[] { subjectChangedNoteId, heldNoteId });
+            lockCommand.Parameters.AddWithValue("softDeleteId", tenantChangedSoftDeleteId);
+            lockCommand.Parameters.AddWithValue("contactId", anchorChangedContactId);
+            await lockCommand.ExecuteNonQueryAsync();
+        }
+
+        var erasure = erasureHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+            asOf
+        );
+        await WaitForBlockedRowMutationAsync(blocker.ProcessID);
+
+        await using (var changeEligibility = blocker.CreateCommand())
+        {
+            changeEligibility.Transaction = blockerTransaction;
+            changeEligibility.CommandText = """
+                UPDATE "notes" SET "SubjectId" = @replacementSubjectId WHERE "Id" = @subjectChangedNoteId;
+                UPDATE "soft_delete_records" SET "TenantId" = @replacementTenantId WHERE "Id" = @softDeleteId;
+                UPDATE "anonymised_contacts" SET "CreatedAt" = @boundary WHERE "Id" = @contactId;
+                INSERT INTO "retention_holds"
+                    ("HoldId", "RetentionEntityId", "RecordId", "TenantId", "Reason", "CreatedAt", "ExpiresAt", "RemovedAt")
+                VALUES
+                    (@holdId, @retentionEntityId, @recordId, @tenantId, @reason, @createdAt, NULL, NULL);
+                """;
+            changeEligibility.Parameters.AddWithValue("replacementSubjectId", replacementSubjectId);
+            changeEligibility.Parameters.AddWithValue("subjectChangedNoteId", subjectChangedNoteId);
+            changeEligibility.Parameters.AddWithValue("replacementTenantId", replacementTenantId);
+            changeEligibility.Parameters.AddWithValue("softDeleteId", tenantChangedSoftDeleteId);
+            changeEligibility.Parameters.AddWithValue("boundary", asOf - legalMin);
+            changeEligibility.Parameters.AddWithValue("contactId", anchorChangedContactId);
+            changeEligibility.Parameters.AddWithValue("holdId", Guid.NewGuid());
+            changeEligibility.Parameters.AddWithValue("retentionEntityId", RetentionEntityIdentity.For<Note>());
+            changeEligibility.Parameters.AddWithValue("recordId", heldNoteId.ToString());
+            changeEligibility.Parameters.AddWithValue("tenantId", tenantId);
+            changeEligibility.Parameters.AddWithValue("reason", "concurrent erasure hold");
+            changeEligibility.Parameters.AddWithValue("createdAt", asOf);
+            await changeEligibility.ExecuteNonQueryAsync();
+        }
+        await blockerTransaction.CommitAsync();
+
+        var result = await erasure.WaitAsync(TimeSpan.FromSeconds(10));
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Where(count => count.Strategy != Strategy.Exempt)
+            .Should()
+            .OnlyContain(count => count.Affected == 0);
+        result.Counts.Should().Contain(count => count.EntityType == typeof(Note) && count.HeldCount == 1);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.CountAsync(note => note.Id == subjectChangedNoteId || note.Id == heldNoteId))
+            .Should()
+            .Be(2);
+        (await verify.SoftDeleteRecords.SingleAsync(record => record.Id == tenantChangedSoftDeleteId))
+            .IsDeleted.Should()
+            .BeFalse();
+        var contact = await verify.AnonymisedContacts.SingleAsync(record => record.Id == anchorChangedContactId);
+        contact.EmailAddress.Should().Be("anchor-race@example.com");
+        contact.AnonymisedAt.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task Predicate_Construction_Failures_Are_Sanitized_Entity_Failures()
     {
         var tenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
@@ -1645,16 +1763,20 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             await db.SaveChangesAsync();
         }
 
-        var act = () =>
-            Host.RunErasureAsync(
+        var result = await Host.RunErasureAsync(
                 new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope("not-a-guid"),
+                new ErasureScope("not-a-guid", allowSoftDeleteAsErasure: true),
                 asOf
             );
 
-        await act.Should()
-            .ThrowAsync<InvalidOperationException>()
-            .WithMessage("*SubjectId*expects Guid*");
+        result.EntityFailures.Should().NotBeEmpty();
+        result.EntityFailures.Should().AllSatisfy(failure =>
+        {
+            failure.Should().MatchRegex(
+                "^type=System\\.InvalidOperationException;code=hresult:0x80131509;diagnosticId=[0-9a-f]{32}$"
+            );
+            failure.Should().NotContain("SubjectId");
+        });
     }
 
     [Fact]
@@ -1664,12 +1786,12 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         await using var services = BuildPredicateResolutionServiceProvider<SinglePredicateResolutionDbContext>(
             database.ConnectionString,
             new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
+                new Dictionary<string, ITestRetentionRule>
                 {
-                    ["single-subject-erasure"] = new StaticRetentionRuleResolver(
+                    ["single-subject-erasure"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge, AuditRowDetail: AuditRowDetail.PerRow)
                     ),
-                    ["subjectless-erasure"] = new StaticRetentionRuleResolver(
+                    ["subjectless-erasure"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                     ),
                 }
@@ -1716,7 +1838,134 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             .Should().BeEquivalentTo([nonMatchingId, wrongTenantIdRecord]);
         (await verify.SubjectlessRecords.Select(record => record.Id).ToListAsync()).Should().ContainSingle().Which.Should().Be(subjectlessId);
         (await LoadSummariesAsync(verify, result.SweepId)).Should().ContainSingle().Which.Affected.Should().Be(1);
-        (await LoadRowDetailsAsync(verify, result.SweepId)).Should().ContainSingle().Which.EntityId.Should().Be(matchingId.ToString());
+        (await LoadRowDetailsAsync(verify, result.SweepId)).Should().ContainSingle().Which.RecordId.Should().Be(matchingId.ToString());
+    }
+
+    [Fact]
+    public async Task Erasure_Anchor_Eligibility_Depends_Only_On_Positive_LegalMin()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var database = await TemporaryDatabase.CreateAsync(GetConnectionString()))
+        await using (var services = BuildPredicateResolutionServiceProvider<SinglePredicateResolutionDbContext>(
+            database.ConnectionString,
+            new StaticCategoryRepository(
+                new Dictionary<string, ITestRetentionRule>
+                {
+                    ["single-subject-erasure"] = new StaticTestRetentionRule(
+                        new RetentionRule(TimeSpan.FromDays(365), Strategy.Purge)
+                    ),
+                }
+            )
+        ))
+        {
+            await using (var seedScope = services.CreateAsyncScope())
+            {
+                var db = seedScope.ServiceProvider.GetRequiredService<SinglePredicateResolutionDbContext>();
+                await db.Database.EnsureCreatedAsync();
+                db.SingleSubjectRecords.AddRange(
+                    new SingleSubjectPredicateRecord { Id = Guid.NewGuid(), TenantId = tenantId, CustomerReference = subjectId, CreatedAt = null },
+                    new SingleSubjectPredicateRecord { Id = Guid.NewGuid(), TenantId = tenantId, CustomerReference = subjectId, CreatedAt = asOf.AddDays(1) }
+                );
+                await db.SaveChangesAsync();
+            }
+
+            ErasureResult result;
+            await using (var executionScope = services.CreateAsyncScope())
+            {
+                result = await executionScope.ServiceProvider
+                    .GetRequiredService<IRetentionErasureService>()
+                    .EraseAsync(
+                        new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                        new ErasureScope(subjectId),
+                        asOf
+                    );
+            }
+
+            result.Counts.Should().ContainSingle().Which.Should().Be(
+                new EntitySweepCount(
+                    typeof(SingleSubjectPredicateRecord),
+                    "single-subject-erasure",
+                    tenantId,
+                    Strategy.Purge,
+                    2
+                )
+            );
+            await using var verifyScope = services.CreateAsyncScope();
+            var verify = verifyScope.ServiceProvider.GetRequiredService<SinglePredicateResolutionDbContext>();
+            (await verify.SingleSubjectRecords.CountAsync()).Should().Be(0);
+            var summary = (await LoadSummariesAsync(verify, result.SweepId)).Should().ContainSingle().Which;
+            summary.ResolvedPeriod.Should().Be(TimeSpan.Zero);
+            summary.NullAnchorCount.Should().Be(0);
+        }
+
+        await using (var database = await TemporaryDatabase.CreateAsync(GetConnectionString()))
+        await using (var services = BuildPredicateResolutionServiceProvider<SinglePredicateResolutionDbContext>(
+            database.ConnectionString,
+            new StaticCategoryRepository(
+                new Dictionary<string, ITestRetentionRule>
+                {
+                    ["single-subject-erasure"] = new StaticTestRetentionRule(
+                        new RetentionRule(
+                            TimeSpan.FromDays(365),
+                            Strategy.Purge,
+                            TimeSpan.FromDays(90)
+                        )
+                    ),
+                }
+            )
+        ))
+        {
+            var nullAnchorId = Guid.NewGuid();
+            var exactBoundaryId = Guid.NewGuid();
+            var eligibleId = Guid.NewGuid();
+            var futureAnchorId = Guid.NewGuid();
+            await using (var seedScope = services.CreateAsyncScope())
+            {
+                var db = seedScope.ServiceProvider.GetRequiredService<SinglePredicateResolutionDbContext>();
+                await db.Database.EnsureCreatedAsync();
+                db.SingleSubjectRecords.AddRange(
+                    new SingleSubjectPredicateRecord { Id = nullAnchorId, TenantId = tenantId, CustomerReference = subjectId, CreatedAt = null },
+                    new SingleSubjectPredicateRecord { Id = exactBoundaryId, TenantId = tenantId, CustomerReference = subjectId, CreatedAt = asOf.AddDays(-90) },
+                    new SingleSubjectPredicateRecord { Id = eligibleId, TenantId = tenantId, CustomerReference = subjectId, CreatedAt = asOf.AddDays(-90).AddTicks(-1) },
+                    new SingleSubjectPredicateRecord { Id = futureAnchorId, TenantId = tenantId, CustomerReference = subjectId, CreatedAt = asOf.AddDays(1) }
+                );
+                await db.SaveChangesAsync();
+            }
+
+            ErasureResult result;
+            await using (var executionScope = services.CreateAsyncScope())
+            {
+                result = await executionScope.ServiceProvider
+                    .GetRequiredService<IRetentionErasureService>()
+                    .EraseAsync(
+                        new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                        new ErasureScope(subjectId),
+                        asOf
+                    );
+            }
+
+            result.Counts.Should().ContainSingle().Which.Should().Be(
+                new EntitySweepCount(
+                    typeof(SingleSubjectPredicateRecord),
+                    "single-subject-erasure",
+                    tenantId,
+                    Strategy.Purge,
+                    1,
+                    NullAnchorCount: 1
+                )
+            );
+            await using var verifyScope = services.CreateAsyncScope();
+            var verify = verifyScope.ServiceProvider.GetRequiredService<SinglePredicateResolutionDbContext>();
+            (await verify.SingleSubjectRecords.Select(record => record.Id).ToListAsync())
+                .Should()
+                .BeEquivalentTo([nullAnchorId, exactBoundaryId, futureAnchorId]);
+            var summary = (await LoadSummariesAsync(verify, result.SweepId)).Should().ContainSingle().Which;
+            summary.ResolvedPeriod.Should().Be(TimeSpan.FromDays(90));
+            summary.NullAnchorCount.Should().Be(1);
+        }
     }
 
     [Fact]
@@ -1726,9 +1975,9 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         await using var services = BuildPredicateResolutionServiceProvider<MultiPredicateResolutionDbContext>(
             database.ConnectionString,
             new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
+                new Dictionary<string, ITestRetentionRule>
                 {
-                    ["multi-subject-erasure"] = new StaticRetentionRuleResolver(
+                    ["multi-subject-erasure"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge, AuditRowDetail: AuditRowDetail.PerRow)
                     ),
                 }
@@ -1770,20 +2019,20 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         var verify = verifyScope.ServiceProvider.GetRequiredService<MultiPredicateResolutionDbContext>();
         (await verify.Records.Select(record => record.Id).ToListAsync()).Should().BeEquivalentTo([nonMatchId, wrongTenantId]);
         (await LoadSummariesAsync(verify, result.SweepId)).Should().ContainSingle().Which.Affected.Should().Be(2);
-        (await LoadRowDetailsAsync(verify, result.SweepId)).Select(detail => detail.EntityId)
+        (await LoadRowDetailsAsync(verify, result.SweepId)).Select(detail => detail.RecordId)
             .Should().BeEquivalentTo(primaryMatchId.ToString(), alternateMatchId.ToString());
     }
 
     [Fact]
-    public async Task Erasure_Service_Fails_When_Multi_Subject_Metadata_Uses_Incompatible_Effective_Types()
+    public async Task Startup_Validation_Fails_When_Multi_Subject_Metadata_Uses_Incompatible_Effective_Types()
     {
         await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
         await using var services = BuildPredicateResolutionServiceProvider<IncompatiblePredicateResolutionDbContext>(
             database.ConnectionString,
             new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
+                new Dictionary<string, ITestRetentionRule>
                 {
-                    ["incompatible-multi-subject-erasure"] = new StaticRetentionRuleResolver(
+                    ["incompatible-multi-subject-erasure"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                     ),
                 }
@@ -1792,18 +2041,14 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
         await using var scope = services.CreateAsyncScope();
         await scope.ServiceProvider.GetRequiredService<IncompatiblePredicateResolutionDbContext>().Database.EnsureCreatedAsync();
-        var service = scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
-        var act = () => service.EraseAsync(
-                new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
-                new ErasureScope(Guid.Parse("33333333-3333-3333-3333-333333333333")),
-                new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero)
-            );
+        var validator = scope.ServiceProvider.GetRequiredService<RetentionStartupValidator>();
+        var act = () => validator.ValidateAsync();
 
-        await act.Should()
-            .ThrowAsync<InvalidOperationException>()
-            .WithMessage(
-                "*incompatible [ErasureSubject] properties*AlternateSubjectId:String*PrimarySubjectId:Guid*"
-            );
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        var error = exception.Which.Errors.Should().ContainSingle().Which;
+        error.Should().Contain("incompatible [ErasureSubject] properties");
+        error.Should().Contain("AlternateSubjectId:String");
+        error.Should().Contain("PrimarySubjectId:Guid");
     }
 
     [Fact]
@@ -2233,7 +2478,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task Erasure_Path_DryRun_And_Live_MultiSubject_Matches_Report_The_Same_Eligible_Count_While_Cutoff_And_Holds_Block_Mutation()
+    public async Task Erasure_Path_DryRun_And_Live_MultiSubject_Matches_Ignore_Period_While_Holds_Block_Mutation()
     {
         await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
         await using var previewServices = BuildMultiSubjectServiceProvider(
@@ -2345,7 +2590,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     "short-lived",
                     tenantId,
                     Strategy.Purge,
-                    1,
+                    2,
                     HeldCount: 1
                 )
             );
@@ -2395,7 +2640,6 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             )
                 .Should()
                 .Equal(
-                    "cutoff-blocked-delegate-match",
                     "held-delegate-match",
                     "other-subject",
                     "other-tenant"
@@ -2403,13 +2647,9 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             (await verify.MultiSubjectFixtureRecords.AnyAsync(record => record.Id == eligibleId))
                 .Should()
                 .BeFalse();
-            (
-                await verify.MultiSubjectFixtureRecords.AnyAsync(record =>
-                    record.Id == cutoffBlockedId
-                )
-            )
+            (await verify.MultiSubjectFixtureRecords.AnyAsync(record => record.Id == cutoffBlockedId))
                 .Should()
-                .BeTrue();
+                .BeFalse();
             (await verify.MultiSubjectFixtureRecords.AnyAsync(record => record.Id == heldId))
                 .Should()
                 .BeTrue();
@@ -2777,19 +3017,19 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         using var erasureHost = new CohortTestHost(
             GetConnectionString(),
             new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
+                new Dictionary<string, ITestRetentionRule>
                 {
-                    ["short-lived"] = new StaticRetentionRuleResolver(
+                    ["short-lived"] = new StaticTestRetentionRule(
                         new RetentionRule(
                             TimeSpan.FromDays(30),
                             Strategy.Purge,
                             TimeSpan.FromDays(90)
                         )
                     ),
-                    ["soft-delete"] = new StaticRetentionRuleResolver(
+                    ["soft-delete"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     ),
-                    ["anonymise"] = new StaticRetentionRuleResolver(
+                    ["anonymise"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
                 }
@@ -2907,7 +3147,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task Erase_Records_Entity_Failures_And_Continues_With_Remaining_Entities()
+    public async Task Erasure_Startup_Rejects_A_Declared_Strategy_Whose_Metadata_Is_Invalid()
     {
         var tenantId = Guid.NewGuid();
         var subjectId = Guid.NewGuid();
@@ -2946,9 +3186,9 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         using var erasureHost = new CohortTestHost(
             GetConnectionString(),
             new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
+                new Dictionary<string, ITestRetentionRule>
                 {
-                    ["short-lived"] = new StaticRetentionRuleResolver(
+                    ["short-lived"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                     ),
                     // Opaque deferred resolver: passes startup validation, then resolves
@@ -2959,32 +3199,24 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             CreateCohortSettings(dryRun: false)
         );
 
-        var result = await erasureHost.RunErasureAsync(
-            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
-            asOf
-        );
+        var act = () => erasureHost.ValidateAndScanAsync();
 
-        result
-            .EntityFailures.Should()
-            .ContainSingle(failure => failure.Contains(nameof(AnonymisedContact)));
-        result
-            .Counts.Should()
-            .Contain(count => count.EntityType == typeof(Note) && count.Affected == 1);
-        result.Counts.Should().NotContain(count => count.EntityType == typeof(AnonymisedContact));
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception
+            .Which.Errors.Should()
+            .ContainSingle(error =>
+                error.Contains(nameof(AnonymisedContact), StringComparison.Ordinal)
+                && error.Contains("Soft-delete convention", StringComparison.Ordinal)
+            );
 
         await using (var verify = Host.CreateDbContext())
         {
-            (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeFalse();
+            (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
             (await verify.AnonymisedContacts.SingleAsync(contact => contact.Id == contactId))
                 .EmailAddress.Should()
                 .Be("kept@example.org");
         }
 
-        var (status, settledAt, error) = await LoadRunFailureAsync(result.SweepId);
-        status.Should().Be(SweepRunStatus.PartiallyFailed);
-        settledAt.Should().NotBeNull();
-        error.Should().Contain(nameof(AnonymisedContact));
     }
 
     [Fact]
@@ -3146,33 +3378,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         }
     }
 
-    private async Task<(
-        SweepRunStatus Status,
-        DateTimeOffset? SettledAt,
-        string? Error
-    )> LoadRunFailureAsync(Guid sweepId)
-    {
-        await using var connection = new NpgsqlConnection(GetConnectionString());
-        await connection.OpenAsync();
-        await using var command = connection.CreateCommand();
-        command.CommandText = """
-            SELECT "Status", "SettledAt", "Error"
-            FROM "sweep_run"
-            WHERE "SweepId" = @sweepId
-            """;
-        command.Parameters.AddWithValue("sweepId", sweepId);
-
-        await using var reader = await command.ExecuteReaderAsync();
-        (await reader.ReadAsync()).Should().BeTrue();
-
-        return (
-            (SweepRunStatus)reader.GetInt32(0),
-            reader.IsDBNull(1) ? null : reader.GetFieldValue<DateTimeOffset>(1),
-            reader.IsDBNull(2) ? null : reader.GetString(2)
-        );
-    }
-
-    private sealed class OpaqueSoftDeleteRuleResolver : IRetentionRuleResolver
+    private sealed class OpaqueSoftDeleteRuleResolver : ITestRetentionRule
     {
         public Task<RetentionRule> ResolveAsync(
             RetentionResolutionContext ctx,
@@ -3221,7 +3427,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     {
         await using var command = await CreateCommandAsync(db, sweepId);
         command.CommandText = """
-            SELECT "SweepId", "EntityType", "Category", "TenantId", "Strategy", "ResolvedPeriod", "Affected", "HeldCount", "SkippedCount", "RuleSource", "RuleReason"
+            SELECT "SweepId", "EntityType", "Category", "TenantId", "Strategy", "ResolvedPeriod", "Affected", "HeldCount", "SkippedCount", "RuleSource", "RuleReason", "NullAnchorCount"
             FROM "sweep_run_entity_summary"
             WHERE "SweepId" = @sweepId
             ORDER BY "EntityType"
@@ -3243,7 +3449,8 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     reader.GetInt64(7),
                     reader.GetInt64(8),
                     reader.IsDBNull(9) ? null : reader.GetString(9),
-                    reader.IsDBNull(10) ? null : reader.GetString(10)
+                    reader.IsDBNull(10) ? null : reader.GetString(10),
+                    reader.GetInt64(11)
                 )
             );
         }
@@ -3264,10 +3471,10 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     {
         await using var command = await CreateCommandAsync(db, sweepId);
         command.CommandText = """
-            SELECT "SweepId", "EntityType", "EntityId", "Category", "Strategy", "TenantId"
+            SELECT "SweepId", "EntityType", "RecordId", "Category", "Strategy", "TenantId"
             FROM "sweep_run_row_detail"
             WHERE "SweepId" = @sweepId
-            ORDER BY "EntityType", "EntityId"
+            ORDER BY "EntityType", "RecordId"
             """;
 
         var rows = new List<SweepRunRowDetailRow>();
@@ -3317,7 +3524,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
     private static ServiceProvider BuildPredicateResolutionServiceProvider<TContext>(
         string connectionString,
-        IRetentionCategoryRepository repository
+        ITestRetentionRuleProvider repository
     )
         where TContext : DbContext
     {
@@ -3325,7 +3532,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         services.AddSingleton<IConfiguration>(new ConfigurationBuilder().AddInMemoryCollection().Build());
         services.AddLogging();
         services.AddDbContext<TContext>(options => options.UseNpgsql(connectionString));
-        services.AddSingleton(repository);
+        services.AddSingleton<IRetentionRuleProvider>(repository);
         services.AddCohort<TContext>();
         return services.BuildServiceProvider(validateScopes: true);
     }
@@ -3340,24 +3547,25 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             summary.ResolvedPeriod,
             summary.Affected,
             summary.HeldCount,
-            summary.SkippedCount
+            summary.SkippedCount,
+            summary.NullAnchorCount
         );
     }
 
     private sealed class StaticCategoryRepository(
-        IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
-    ) : IRetentionCategoryRepository
+        IReadOnlyDictionary<string, ITestRetentionRule> resolvers
+    ) : ITestRetentionRuleProvider
     {
-        private static readonly IRetentionRuleResolver ExemptFallback =
-            new StaticRetentionRuleResolver(
+        private static readonly ITestRetentionRule ExemptFallback =
+            new StaticTestRetentionRule(
                 new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
             );
 
-        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct)
         {
             return resolvers.TryGetValue(category, out var resolver)
-                ? Task.FromResult<IRetentionRuleResolver?>(resolver)
-                : Task.FromResult<IRetentionRuleResolver?>(ExemptFallback);
+                ? Task.FromResult<ITestRetentionRule?>(resolver)
+                : Task.FromResult<ITestRetentionRule?>(ExemptFallback);
         }
     }
 
@@ -3383,13 +3591,14 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         long HeldCount,
         long SkippedCount = 0,
         string? RuleSource = null,
-        string? RuleReason = null
+        string? RuleReason = null,
+        long NullAnchorCount = 0
     );
 
     private sealed record SweepRunRowDetailRow(
         Guid SweepId,
         string EntityType,
-        string EntityId,
+        string RecordId,
         string Category,
         Strategy Strategy,
         Guid TenantId
@@ -3403,7 +3612,8 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         TimeSpan ResolvedPeriod,
         long Affected,
         long HeldCount,
-        long SkippedCount
+        long SkippedCount,
+        long NullAnchorCount
     );
 
     private sealed class StaticOptionsMonitor<T>(T currentValue) : IOptionsMonitor<T>
@@ -3421,22 +3631,47 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         }
     }
 
+    private async Task WaitForBlockedRowMutationAsync(int blockerBackendId)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await using var observer = new NpgsqlConnection(GetConnectionString());
+        await observer.OpenAsync(timeout.Token);
+        while (true)
+        {
+            await using var command = observer.CreateCommand();
+            command.CommandText = """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_stat_activity waiter
+                    WHERE @blockerBackendId = ANY(pg_blocking_pids(waiter.pid))
+                )
+                """;
+            command.Parameters.AddWithValue("blockerBackendId", blockerBackendId);
+            if ((bool)(await command.ExecuteScalarAsync(timeout.Token))!)
+            {
+                return;
+            }
+
+            await Task.Delay(10, timeout.Token);
+        }
+    }
+
     private string GetConnectionString()
     {
         using var db = Host.CreateDbContext();
         return db.Database.GetConnectionString()!;
     }
 
-    private static IRetentionCategoryRepository CreateErasureCategoryRepository(
+    private static ITestRetentionRuleProvider CreateErasureCategoryRepository(
         RetentionRule? shortLivedRule = null,
         RetentionRule? softDeleteRule = null,
         RetentionRule? anonymiseRule = null
     )
     {
         return new StaticCategoryRepository(
-            new Dictionary<string, IRetentionRuleResolver>
+            new Dictionary<string, ITestRetentionRule>
             {
-                ["short-lived"] = new StaticRetentionRuleResolver(
+                ["short-lived"] = new StaticTestRetentionRule(
                     shortLivedRule
                         ?? new RetentionRule(
                             TimeSpan.FromDays(30),
@@ -3444,10 +3679,10 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                             AuditRowDetail: AuditRowDetail.PerRow
                         )
                 ),
-                ["soft-delete"] = new StaticRetentionRuleResolver(
+                ["soft-delete"] = new StaticTestRetentionRule(
                     softDeleteRule ?? new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                 ),
-                ["anonymise"] = new StaticRetentionRuleResolver(
+                ["anonymise"] = new StaticTestRetentionRule(
                     anonymiseRule ?? new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                 ),
             }
@@ -3472,20 +3707,20 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         services.AddDbContext<FactoryBackedErasureDbContext>(options =>
             options.UseNpgsql(connectionString)
         );
-        services.AddSingleton<IRetentionCategoryRepository>(
+        services.AddSingleton<IRetentionRuleProvider>(
             new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
+                new Dictionary<string, ITestRetentionRule>
                 {
-                    ["factory-backed-set-based-erasure"] = new StaticRetentionRuleResolver(
+                    ["factory-backed-set-based-erasure"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
-                    ["factory-backed-per-row-erasure"] = new StaticRetentionRuleResolver(
+                    ["factory-backed-per-row-erasure"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
-                    ["converted-set-based-erasure"] = new StaticRetentionRuleResolver(
+                    ["converted-set-based-erasure"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
-                    ["converted-original-value-erasure"] = new StaticRetentionRuleResolver(
+                    ["converted-original-value-erasure"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
                 }
@@ -3526,11 +3761,11 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         services.AddDbContext<AliasSubjectDbContext>(options =>
             options.UseNpgsql(connectionString)
         );
-        services.AddSingleton<IRetentionCategoryRepository>(
+        services.AddSingleton<IRetentionRuleProvider>(
             new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
+                new Dictionary<string, ITestRetentionRule>
                 {
-                    ["short-lived"] = new StaticRetentionRuleResolver(
+                    ["short-lived"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                     ),
                 }
@@ -3556,11 +3791,11 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         services.AddDbContext<MultiSubjectDbContext>(options =>
             options.UseNpgsql(connectionString)
         );
-        services.AddSingleton<IRetentionCategoryRepository>(
+        services.AddSingleton<IRetentionRuleProvider>(
             new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
+                new Dictionary<string, ITestRetentionRule>
                 {
-                    ["short-lived"] = new StaticRetentionRuleResolver(
+                    ["short-lived"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                     ),
                 }
@@ -3583,11 +3818,11 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         services.AddDbContext<ConvertedErasureSubjectDbContext>(options =>
             options.UseNpgsql(connectionString)
         );
-        services.AddSingleton<IRetentionCategoryRepository>(
+        services.AddSingleton<IRetentionRuleProvider>(
             new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
+                new Dictionary<string, ITestRetentionRule>
                 {
-                    ["short-lived"] = new StaticRetentionRuleResolver(
+                    ["short-lived"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                     ),
                 }
@@ -3988,7 +4223,7 @@ internal sealed class SingleSubjectPredicateRecord
     [ErasureSubject]
     public Guid? CustomerReference { get; set; }
 
-    public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset? CreatedAt { get; set; }
 }
 
 [Retain("subjectless-erasure", nameof(CreatedAt))]

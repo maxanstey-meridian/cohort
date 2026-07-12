@@ -3,8 +3,8 @@ using System.Data.Common;
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure.Handlers;
-using Cohort.Infrastructure.Migrations;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace Cohort.Infrastructure.Sweep;
 
@@ -50,7 +50,7 @@ internal static class RetentionHandlerSupport
                     registration?.Identity
                 );
             })
-            .OrderBy(handler => RowHandlerPriorityAttribute.GetPriority(handler.HandlerType))
+            .OrderBy(handler => RowHandlerPriority.Get(handler.HandlerType))
             .ThenBy(handler => handler.HandlerType.FullName, StringComparer.Ordinal)
             .ToArray();
     }
@@ -103,7 +103,7 @@ internal static class RetentionHandlerSupport
         RetentionEntry entry,
         Strategy strategy,
         Guid tenantId,
-        string entityId,
+        string recordId,
         IReadOnlyDictionary<string, object?> snapshot,
         IReadOnlyList<ResolvedRetentionHandler> handlers,
         CancellationToken ct
@@ -113,7 +113,7 @@ internal static class RetentionHandlerSupport
         ArgumentNullException.ThrowIfNull(transaction);
         ArgumentNullException.ThrowIfNull(execution);
         ArgumentNullException.ThrowIfNull(entry);
-        ArgumentException.ThrowIfNullOrWhiteSpace(entityId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(recordId);
         ArgumentNullException.ThrowIfNull(snapshot);
         ArgumentNullException.ThrowIfNull(handlers);
 
@@ -124,7 +124,7 @@ internal static class RetentionHandlerSupport
             entry,
             strategy,
             tenantId,
-            entityId,
+            recordId,
             snapshot,
             ct
         );
@@ -134,6 +134,7 @@ internal static class RetentionHandlerSupport
             await InsertPendingHandlerStatusAsync(
                 conn,
                 transaction,
+                entry.CohortTables,
                 rowDetailId,
                 handler,
                 execution.At,
@@ -149,10 +150,11 @@ internal static class RetentionHandlerSupport
         RetentionEntry entry,
         Strategy strategy,
         Guid tenantId,
-        string entityId,
+        string recordId,
         IReadOnlyDictionary<string, object?> snapshot,
         ResolvedRetentionHandler failedHandler,
         Exception failure,
+        ILogger? logger,
         CancellationToken ct
     )
     {
@@ -160,7 +162,7 @@ internal static class RetentionHandlerSupport
         ArgumentNullException.ThrowIfNull(transaction);
         ArgumentNullException.ThrowIfNull(execution);
         ArgumentNullException.ThrowIfNull(entry);
-        ArgumentException.ThrowIfNullOrWhiteSpace(entityId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(recordId);
         ArgumentNullException.ThrowIfNull(snapshot);
         ArgumentNullException.ThrowIfNull(failedHandler);
         ArgumentNullException.ThrowIfNull(failure);
@@ -172,18 +174,27 @@ internal static class RetentionHandlerSupport
             entry,
             strategy,
             tenantId,
-            entityId,
+            recordId,
             snapshot: null,
             ct
         );
 
+        var diagnostic = RetentionFailureDiagnostic.Create(failure);
+        logger?.LogError(
+            failure,
+            "Cohort row handler failed before mutation for sweep {SweepId} and entity {EntityType}. Diagnostic {DiagnosticId}.",
+            execution.SweepId,
+            entry.EntityType.FullName,
+            diagnostic.DiagnosticIdText
+        );
         await InsertDeadLetteredHandlerStatusAsync(
             conn,
             transaction,
+            entry.CohortTables,
             rowDetailId,
             failedHandler,
             execution.At,
-            failure,
+            diagnostic.ToString(),
             ct
         );
     }
@@ -195,7 +206,7 @@ internal static class RetentionHandlerSupport
         RetentionEntry entry,
         Strategy strategy,
         Guid tenantId,
-        string entityId,
+        string recordId,
         IReadOnlyDictionary<string, object?>? snapshot,
         CancellationToken ct
     )
@@ -203,12 +214,12 @@ internal static class RetentionHandlerSupport
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = $"""
-            INSERT INTO {QuoteIdentifier(CohortTableNames.SweepRunRowDetail)} (
+            INSERT INTO {PostgreSqlIdentifier.Format(entry.CohortTables.SweepRunRowDetail)} (
                 "SweepId",
                 "At",
                 "EntityType",
                 "RetentionEntityId",
-                "EntityId",
+                "RecordId",
                 "Category",
                 "Strategy",
                 "TenantId",
@@ -219,7 +230,7 @@ internal static class RetentionHandlerSupport
                 @at,
                 @entityType,
                 @retentionEntityId,
-                @entityId,
+                @recordId,
                 @category,
                 @strategy,
                 @tenantId,
@@ -236,8 +247,8 @@ internal static class RetentionHandlerSupport
                 entry.EntityType.FullName ?? entry.EntityType.Name
             )
         );
-        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.EntityId));
-        command.Parameters.Add(CreateParameter(command, "entityId", entityId));
+        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.RetentionEntityId));
+        command.Parameters.Add(CreateParameter(command, "recordId", recordId));
         command.Parameters.Add(CreateParameter(command, "category", entry.Category));
         command.Parameters.Add(CreateParameter(command, "strategy", (int)strategy));
         command.Parameters.Add(CreateParameter(command, "tenantId", tenantId));
@@ -256,6 +267,7 @@ internal static class RetentionHandlerSupport
     private static async Task InsertPendingHandlerStatusAsync(
         DbConnection conn,
         DbTransaction transaction,
+        CohortStoreTables tables,
         long rowDetailId,
         ResolvedRetentionHandler handler,
         DateTimeOffset queuedAt,
@@ -265,7 +277,7 @@ internal static class RetentionHandlerSupport
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = $"""
-            INSERT INTO {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} (
+            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)} (
                 "SweepRunRowDetailId",
                 "HandlerType",
                 "DispatchPhase",
@@ -308,17 +320,18 @@ internal static class RetentionHandlerSupport
     private static async Task InsertDeadLetteredHandlerStatusAsync(
         DbConnection conn,
         DbTransaction transaction,
+        CohortStoreTables tables,
         long rowDetailId,
         ResolvedRetentionHandler handler,
         DateTimeOffset failedAt,
-        Exception failure,
+        string failureDiagnostic,
         CancellationToken ct
     )
     {
         await using var command = conn.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = $"""
-            INSERT INTO {QuoteIdentifier(CohortTableNames.SweepRowHandlerStatus)} (
+            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)} (
                 "SweepRunRowDetailId",
                 "HandlerType",
                 "DispatchPhase",
@@ -355,17 +368,7 @@ internal static class RetentionHandlerSupport
         command.Parameters.Add(CreateParameter(command, "queuedAt", failedAt));
         command.Parameters.Add(CreateParameter(command, "nextAttemptAt", failedAt));
         command.Parameters.Add(CreateParameter(command, "completedAt", failedAt));
-        // Type + message only: full ToString() includes stack frames and inner-exception
-        // dumps that can echo row data into a long-lived audit table.
-        var rootFailure = failure.GetBaseException();
-        var sanitizedError = $"{rootFailure.GetType().FullName}: {rootFailure.Message}";
-        command.Parameters.Add(
-            CreateParameter(
-                command,
-                "lastError",
-                sanitizedError.Length <= 2000 ? sanitizedError : sanitizedError[..2000]
-            )
-        );
+        command.Parameters.Add(CreateParameter(command, "lastError", failureDiagnostic));
 
         await command.ExecuteNonQueryAsync(ct);
     }
@@ -378,10 +381,6 @@ internal static class RetentionHandlerSupport
         return parameter;
     }
 
-    private static string QuoteIdentifier(string identifier)
-    {
-        return $"\"{identifier.Replace("\"", "\"\"")}\"";
-    }
 }
 
 internal sealed class ResolvedRetentionHandler(

@@ -10,292 +10,145 @@ public static class CohortModelBuilder
 {
     public static ModelBuilder ConfigureCohortTables(this ModelBuilder modelBuilder)
     {
-        ArgumentNullException.ThrowIfNull(modelBuilder);
+        return ConfigureCohortTables(modelBuilder, "public");
+    }
 
-        ConfigureHoldTable(modelBuilder);
-        ConfigureSweepRunTable(modelBuilder);
-        ConfigureSweepRunEntitySummaryTable(modelBuilder);
-        ConfigureSweepRunRowDetailTable(modelBuilder);
-        ConfigureSweepRowHandlerStatusTable(modelBuilder);
+    public static ModelBuilder ConfigureCohortTables(this ModelBuilder modelBuilder, string schema)
+    {
+        ArgumentNullException.ThrowIfNull(modelBuilder);
+        ArgumentException.ThrowIfNullOrWhiteSpace(schema);
+
+        foreach (var table in CohortSchemaContract.Tables)
+        {
+            ConfigureTable(modelBuilder, schema, table);
+        }
+
+        foreach (var table in CohortSchemaContract.Tables)
+        {
+            ConfigureForeignKeys(modelBuilder, schema, table);
+        }
 
         return modelBuilder;
     }
 
-    private static void ConfigureHoldTable(ModelBuilder modelBuilder)
-    {
-        if (
-            TryFindEntityMappedToTable(modelBuilder, CohortTableNames.RetentionHolds) is
-            { } existing
-        )
-        {
-            EnsureAdoptableKey(existing, CohortTableNames.RetentionHolds, "HoldId");
-            ConfigureRetentionHoldColumns(modelBuilder.Entity(existing.ClrType));
-            return;
-        }
-
-        modelBuilder.SharedTypeEntity<Dictionary<string, object>>(
-            CohortSharedTypeNames.RetentionHold,
-            builder =>
-            {
-                builder.ToTable(CohortTableNames.RetentionHolds);
-                ConfigureRetentionHoldColumns(builder);
-            }
-        );
-    }
-
-    private static void ConfigureSweepRunTable(ModelBuilder modelBuilder)
-    {
-        if (TryFindEntityMappedToTable(modelBuilder, CohortTableNames.SweepRun) is { } existing)
-        {
-            EnsureAdoptableKey(existing, CohortTableNames.SweepRun, "SweepId");
-            ConfigureSweepRunColumns(modelBuilder.Entity(existing.ClrType));
-            return;
-        }
-
-        modelBuilder.SharedTypeEntity<Dictionary<string, object>>(
-            CohortSharedTypeNames.SweepRun,
-            builder =>
-            {
-                builder.ToTable(CohortTableNames.SweepRun);
-                ConfigureSweepRunColumns(builder);
-            }
-        );
-    }
-
-    private static void ConfigureSweepRunEntitySummaryTable(ModelBuilder modelBuilder)
-    {
-        if (
-            TryFindEntityMappedToTable(modelBuilder, CohortTableNames.SweepRunEntitySummary) is
-            { } existing
-        )
-        {
-            EnsureAdoptableKey(
-                existing,
-                CohortTableNames.SweepRunEntitySummary,
-                "SweepId",
-                "RetentionEntityId",
-                "Category",
-                "TenantId",
-                "Strategy"
-            );
-            ConfigureSweepRunEntitySummaryColumns(modelBuilder.Entity(existing.ClrType));
-            return;
-        }
-
-        modelBuilder.SharedTypeEntity<Dictionary<string, object>>(
-            CohortSharedTypeNames.SweepRunEntitySummary,
-            builder =>
-            {
-                builder.ToTable(CohortTableNames.SweepRunEntitySummary);
-                ConfigureSweepRunEntitySummaryColumns(builder);
-            }
-        );
-    }
-
-    private static void ConfigureSweepRunRowDetailTable(ModelBuilder modelBuilder)
-    {
-        if (
-            TryFindEntityMappedToTable(modelBuilder, CohortTableNames.SweepRunRowDetail) is
-            { } existing
-        )
-        {
-            EnsureAdoptableKey(existing, CohortTableNames.SweepRunRowDetail, "Id");
-            ConfigureSweepRunRowDetailColumns(modelBuilder.Entity(existing.ClrType));
-            return;
-        }
-
-        modelBuilder.SharedTypeEntity<Dictionary<string, object>>(
-            CohortSharedTypeNames.SweepRunRowDetail,
-            builder =>
-            {
-                builder.ToTable(CohortTableNames.SweepRunRowDetail);
-                ConfigureSweepRunRowDetailColumns(builder);
-            }
-        );
-    }
-
-    private static void ConfigureSweepRowHandlerStatusTable(ModelBuilder modelBuilder)
-    {
-        modelBuilder.Entity<SweepRowHandlerStatusEntity>(builder =>
-        {
-            builder.ToTable(
-                CohortTableNames.SweepRowHandlerStatus,
-                tableBuilder =>
-                {
-                    tableBuilder.HasCheckConstraint(
-                        "CK_sweep_row_handler_status_Claim",
-                        "(\"State\" = 1 AND \"ClaimedAt\" IS NOT NULL AND \"ClaimToken\" IS NOT NULL) OR (\"State\" <> 1 AND \"ClaimedAt\" IS NULL AND \"ClaimToken\" IS NULL)"
-                    );
-                    tableBuilder.HasCheckConstraint(
-                        "CK_sweep_row_handler_status_Completion",
-                        "(\"State\" IN (2, 3) AND \"CompletedAt\" IS NOT NULL) OR (\"State\" IN (0, 1) AND \"CompletedAt\" IS NULL)"
-                    );
-                }
-            );
-            ConfigureSweepRowHandlerStatusColumns(builder);
-        });
-    }
-
-    private static void ConfigureRetentionHoldColumns(EntityTypeBuilder builder)
-    {
-        builder.Property<Guid>("HoldId").ValueGeneratedNever();
-        builder.Property<Guid>("RetentionEntityId").IsRequired();
-        builder.Property<string>("RecordId").IsRequired();
-        builder.Property<Guid?>("TenantId");
-        builder.Property<string>("Reason").IsRequired();
-        builder.Property<DateTimeOffset>("CreatedAt").IsRequired();
-        builder.Property<DateTimeOffset?>("ExpiresAt");
-        builder.Property<DateTimeOffset?>("RemovedAt");
-        builder.HasKey("HoldId");
-        builder.HasIndex("RetentionEntityId", "TenantId", "RecordId");
-        // The tenantless hold probe matches on (RetentionEntityId, RecordId) only; the index
-        // above cannot serve it because RecordId sits behind the skipped TenantId column.
-        builder.HasIndex("RetentionEntityId", "RecordId");
-    }
-
-    private static void ConfigureSweepRunColumns(EntityTypeBuilder builder)
-    {
-        builder.ToTable(
-            CohortTableNames.SweepRun,
-            table =>
-            {
-                table.HasCheckConstraint("CK_sweep_run_Status_Range", "\"Status\" BETWEEN 0 AND 4");
-                table.HasCheckConstraint(
-                    "CK_sweep_run_Started_Unsettled",
-                    "\"Status\" <> 0 OR \"SettledAt\" IS NULL"
-                );
-                table.HasCheckConstraint(
-                    "CK_sweep_run_Terminal_Settled",
-                    "\"Status\" = 0 OR \"SettledAt\" IS NOT NULL"
-                );
-                table.HasCheckConstraint(
-                    "CK_sweep_run_TotalAffected_Nonnegative",
-                    "\"TotalAffected\" IS NULL OR \"TotalAffected\" >= 0"
-                );
-                table.HasCheckConstraint(
-                    "CK_sweep_run_Duration_Nonnegative",
-                    "\"Duration\" IS NULL OR \"Duration\" >= INTERVAL '0'"
-                );
-            }
-        );
-        builder.Property<Guid>("SweepId").ValueGeneratedNever();
-        builder.Property<DateTimeOffset>("StartedAt").IsRequired();
-        builder.Property<int>("Status").IsRequired();
-        builder.Property<DateTimeOffset?>("SettledAt");
-        builder.Property<TimeSpan?>("Duration");
-        builder.Property<int>("TriggerKind").IsRequired();
-        builder.Property<bool>("DryRun").IsRequired();
-        builder.Property<Guid>("TenantId").IsRequired();
-        builder.Property<long?>("TotalAffected");
-        builder.Property<string?>("Error");
-        builder.HasKey("SweepId");
-    }
-
-    private static void ConfigureSweepRunEntitySummaryColumns(EntityTypeBuilder builder)
-    {
-        builder.Property<Guid>("SweepId").ValueGeneratedNever();
-        builder.Property<DateTimeOffset>("At").IsRequired();
-        builder.Property<string>("EntityType").IsRequired();
-        builder.Property<Guid>("RetentionEntityId").IsRequired();
-        builder.Property<string>("Category").IsRequired();
-        builder.Property<Guid>("TenantId").IsRequired();
-        builder.Property<int>("Strategy").IsRequired();
-        builder.Property<TimeSpan>("ResolvedPeriod").IsRequired();
-        builder.Property<long>("Affected").IsRequired();
-        builder.Property<long>("HeldCount").IsRequired();
-        builder.Property<long>("SkippedCount").IsRequired();
-        builder.Property<long>("NullAnchorCount").IsRequired();
-        builder.Property<string>("RuleSource");
-        builder.Property<string>("RuleReason");
-        builder.HasKey("SweepId", "RetentionEntityId", "Category", "TenantId", "Strategy");
-        builder.HasIndex("SweepId");
-        builder
-            .HasOne(FindEntityMappedToTable(builder, CohortTableNames.SweepRun), navigationName: null)
-            .WithMany()
-            .HasForeignKey("SweepId")
-            .HasPrincipalKey("SweepId")
-            .OnDelete(DeleteBehavior.Restrict);
-    }
-
-    private static void ConfigureSweepRunRowDetailColumns(EntityTypeBuilder builder)
-    {
-        builder.Property<long>("Id").ValueGeneratedOnAdd();
-        builder.Property<Guid>("SweepId").ValueGeneratedNever();
-        builder.Property<DateTimeOffset>("At").IsRequired();
-        builder.Property<string>("EntityType").IsRequired();
-        builder.Property<Guid>("RetentionEntityId").IsRequired();
-        builder.Property<string>("EntityId").IsRequired();
-        builder.Property<string>("Category").IsRequired();
-        builder.Property<int>("Strategy").IsRequired();
-        builder.Property<Guid>("TenantId").IsRequired();
-        builder.Property<string>("CapturedPayload");
-        builder.HasKey("Id");
-        builder.HasIndex("SweepId");
-        builder
-            .HasIndex(
-                "SweepId",
-                "RetentionEntityId",
-                "EntityId",
-                "Category",
-                "Strategy",
-                "TenantId"
-            )
-            .IsUnique()
-            .HasDatabaseName("IX_sweep_run_row_detail_StableIdentity");
-        builder
-            .HasOne(FindEntityMappedToTable(builder, CohortTableNames.SweepRun), navigationName: null)
-            .WithMany()
-            .HasForeignKey("SweepId")
-            .HasPrincipalKey("SweepId")
-            .OnDelete(DeleteBehavior.Restrict);
-    }
-
-    private static void ConfigureSweepRowHandlerStatusColumns(
-        EntityTypeBuilder<SweepRowHandlerStatusEntity> builder
+    private static void ConfigureTable(
+        ModelBuilder modelBuilder,
+        string schema,
+        CohortSchemaContract.TableRequirement table
     )
     {
-        builder.Property(status => status.Id).ValueGeneratedOnAdd();
-        builder.Property(status => status.SweepRunRowDetailId).IsRequired();
-        builder.Property(status => status.HandlerType).IsRequired();
-        builder.Property(status => status.DispatchPhase).IsRequired();
-        builder.Property(status => status.State).IsRequired();
-        builder.Property(status => status.Attempt).IsRequired();
-        builder.Property(status => status.QueuedAt).IsRequired();
-        builder.Property(status => status.NextAttemptAt).IsRequired();
-        builder.Property(status => status.ClaimedAt);
-        builder.Property(status => status.ClaimToken);
-        builder.Property(status => status.CompletedAt);
-        builder.Property(status => status.LastError);
-        builder.HasKey(status => status.Id);
-        builder
-            .HasIndex(status => new { status.SweepRunRowDetailId, status.HandlerType })
-            .IsUnique();
-        builder.HasIndex(status => new
+        EntityTypeBuilder builder;
+        var existing = TryFindEntityMappedToTable(modelBuilder, schema, table.Name);
+
+        if (table.Role == CohortTableNames.SweepRowHandlerStatus)
         {
-            status.State,
-            status.NextAttemptAt,
-            status.Id,
-        });
-        builder
-            .HasOne(
-                FindEntityMappedToTable(builder, CohortTableNames.SweepRunRowDetail),
-                navigationName: null
-            )
-            .WithMany()
-            .HasForeignKey(nameof(SweepRowHandlerStatusEntity.SweepRunRowDetailId))
-            .HasPrincipalKey("Id")
-            .OnDelete(DeleteBehavior.Cascade);
+            if (existing is not null && existing.ClrType != typeof(SweepRowHandlerStatusEntity))
+            {
+                throw new InvalidOperationException(
+                    $"Entity {existing.ClrType.FullName} is mapped to table '{table.Name}', which Cohort manages with its runtime handler-status entity. This is a table-name collision; rename the host entity's table."
+                );
+            }
+
+            builder = modelBuilder.Entity<SweepRowHandlerStatusEntity>();
+        }
+        else if (existing is not null)
+        {
+            EnsureAdoptableKey(existing, table);
+            builder = modelBuilder.Entity(existing.ClrType);
+        }
+        else
+        {
+            builder = modelBuilder.SharedTypeEntity<Dictionary<string, object>>(
+                table.SharedTypeName!
+            );
+        }
+
+        builder.ToTable(
+            table.Name,
+            schema,
+            tableBuilder =>
+            {
+                foreach (var check in table.RequiredChecks)
+                {
+                    tableBuilder.HasCheckConstraint(check.Name, check.Sql);
+                }
+            }
+        );
+
+        foreach (var column in table.Columns)
+        {
+            var property = builder
+                .Property(column.ClrType, column.Name)
+                .HasColumnType(column.StoreType)
+                .IsRequired(!column.Nullable);
+            if (column.Generated)
+            {
+                property.ValueGeneratedOnAdd();
+            }
+            else
+            {
+                property.ValueGeneratedNever();
+            }
+        }
+
+        builder.HasKey(table.PrimaryKey.ToArray());
+        foreach (var index in table.RequiredIndexes)
+        {
+            var indexBuilder = builder.HasIndex(index.Columns.ToArray()).IsUnique(index.Unique);
+            if (index.Predicate is not null)
+            {
+                indexBuilder.HasFilter(index.Predicate);
+            }
+            if (index.Name is not null)
+            {
+                indexBuilder.HasDatabaseName(index.Name);
+            }
+        }
+
+        builder.Metadata.SetAnnotation(CohortStoreTables.TableRoleAnnotation, table.Role);
     }
 
-    /// <summary>
-    /// Adopting a host entity mapped to a Cohort table name is only safe when the host
-    /// already declared the key Cohort expects (or none yet). Anything else means a
-    /// table-name collision, and reconfiguring would silently re-key the host's entity.
-    /// </summary>
+    private static void ConfigureForeignKeys(
+        ModelBuilder modelBuilder,
+        string schema,
+        CohortSchemaContract.TableRequirement table
+    )
+    {
+        if (table.RequiredForeignKeys.Count == 0)
+        {
+            return;
+        }
+
+        var entityType = TryFindEntityMappedToTable(modelBuilder, schema, table.Name)
+            ?? throw new InvalidOperationException(
+                $"Cohort could not resolve its mapped table '{schema}.{table.Name}'."
+            );
+        var builder = entityType.HasSharedClrType
+            ? modelBuilder.SharedTypeEntity<Dictionary<string, object>>(entityType.Name)
+            : modelBuilder.Entity(entityType.ClrType);
+
+        foreach (var foreignKey in table.RequiredForeignKeys)
+        {
+            builder
+                .HasOne(
+                    FindEntityMappedToTable(modelBuilder, schema, foreignKey.PrincipalTable),
+                    navigationName: null
+                )
+                .WithMany()
+                .HasForeignKey(foreignKey.Columns.ToArray())
+                .HasPrincipalKey(foreignKey.PrincipalColumns.ToArray())
+                .OnDelete(foreignKey.DeleteAction switch
+                {
+                    CohortSchemaContract.ForeignKeyDeleteAction.Restrict => DeleteBehavior.Restrict,
+                    CohortSchemaContract.ForeignKeyDeleteAction.Cascade => DeleteBehavior.Cascade,
+                    _ => throw new ArgumentOutOfRangeException(nameof(foreignKey.DeleteAction)),
+                });
+        }
+    }
+
     private static void EnsureAdoptableKey(
         Microsoft.EntityFrameworkCore.Metadata.IMutableEntityType existing,
-        string tableName,
-        params string[] expectedKeyProperties
+        CohortSchemaContract.TableRequirement table
     )
     {
         var declaredKey = existing.FindPrimaryKey();
@@ -305,18 +158,19 @@ public static class CohortModelBuilder
         }
 
         var keyNames = declaredKey.Properties.Select(property => property.Name).ToArray();
-        if (keyNames.SequenceEqual(expectedKeyProperties, StringComparer.Ordinal))
+        if (keyNames.SequenceEqual(table.PrimaryKey, StringComparer.Ordinal))
         {
             return;
         }
 
         throw new InvalidOperationException(
-            $"Entity {existing.ClrType.FullName} is mapped to table '{tableName}', which Cohort manages, but its primary key ({string.Join(", ", keyNames)}) does not match the key Cohort expects ({string.Join(", ", expectedKeyProperties)}). This looks like a table-name collision rather than an intentional adoption; rename the entity's table, or map it with Cohort's key shape."
+            $"Entity {existing.ClrType.FullName} is mapped to table '{table.Name}', which Cohort manages, but its primary key ({string.Join(", ", keyNames)}) does not match the key Cohort expects ({string.Join(", ", table.PrimaryKey)}). This looks like a table-name collision rather than an intentional adoption; rename the entity's table, or map it with Cohort's key shape."
         );
     }
 
     private static Microsoft.EntityFrameworkCore.Metadata.IMutableEntityType? TryFindEntityMappedToTable(
         ModelBuilder modelBuilder,
+        string schema,
         string tableName
     )
     {
@@ -324,32 +178,23 @@ public static class CohortModelBuilder
             .Model.GetEntityTypes()
             .FirstOrDefault(entityType =>
                 string.Equals(entityType.GetTableName(), tableName, StringComparison.Ordinal)
+                && string.Equals(
+                    entityType.GetSchema() ?? modelBuilder.Model.GetDefaultSchema() ?? "public",
+                    schema,
+                    StringComparison.Ordinal
+                )
             );
     }
 
-    private static string FindEntityMappedToTable(EntityTypeBuilder builder, string tableName)
+    private static string FindEntityMappedToTable(
+        ModelBuilder modelBuilder,
+        string schema,
+        string tableName
+    )
     {
-        return builder.Metadata.Model.GetEntityTypes()
-            .Single(entityType =>
-                string.Equals(entityType.GetTableName(), tableName, StringComparison.Ordinal)
-            )
-            .Name;
+        return TryFindEntityMappedToTable(modelBuilder, schema, tableName)?.Name
+            ?? throw new InvalidOperationException(
+                $"Cohort could not resolve its mapped table '{schema}.{tableName}'."
+            );
     }
-}
-
-internal static class CohortTableNames
-{
-    internal const string RetentionHolds = "retention_holds";
-    internal const string SweepRun = "sweep_run";
-    internal const string SweepRunEntitySummary = "sweep_run_entity_summary";
-    internal const string SweepRunRowDetail = "sweep_run_row_detail";
-    internal const string SweepRowHandlerStatus = "sweep_row_handler_status";
-}
-
-internal static class CohortSharedTypeNames
-{
-    internal const string RetentionHold = "Cohort.RetentionHold";
-    internal const string SweepRun = "Cohort.SweepRun";
-    internal const string SweepRunEntitySummary = "Cohort.SweepRunEntitySummary";
-    internal const string SweepRunRowDetail = "Cohort.SweepRunRowDetail";
 }

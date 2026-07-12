@@ -18,6 +18,9 @@ internal sealed class ScopeOwnedRetentionErasureService(IServiceScopeFactory sco
         ArgumentNullException.ThrowIfNull(scope);
 
         await using var executionScope = scopeFactory.CreateAsyncScope();
+        await executionScope.ServiceProvider
+            .GetRequiredService<RetentionRuntimeReadinessValidator>()
+            .ValidateAsync(ct);
         var service = executionScope.ServiceProvider.GetRequiredService<RetentionErasureService>();
         return await service.EraseAsync(tenant, scope, now, ct);
     }

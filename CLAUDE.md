@@ -4,7 +4,7 @@ Project-specific agent instructions. Read this before writing tests or adding fe
 
 ## What Cohort is
 
-Standalone .NET 9 class library. Annotation-driven retention for EF Core consumers (Postgres-only SQL). Hosts annotate entities with `[Retain(category, anchor)]`, register an `IRetentionCategoryRepository`, and Cohort sweeps rows past their cutoff via configurable strategies (Purge, SoftDelete, Anonymise, Exempt). All three milestones (A/B/C) are implemented.
+Standalone .NET 9 class library. Annotation-driven retention for EF Core consumers (Postgres-only SQL). Hosts annotate entities with `[Retain(category, anchor)]`, register an `IRetentionRuleProvider` with declared strategy capabilities, and Cohort previews, sweeps, or erases rows through public application ports. Ordinary retention uses `max(Period, LegalMin)`; subject erasure ignores `Period` but remains blocked by positive `LegalMin` and active holds.
 
 ## Test-writing rules — READ BEFORE WRITING ANY TEST
 
@@ -62,7 +62,7 @@ The dependency rule is enforced by `using` statements, not project boundaries. R
 
 **Layer placement test**: if a type has no dependency on a port, an external system's shape, or a framework — it's Domain. If it does — it's Application (defines/orchestrates the port) or Infrastructure (implements one).
 
-**Worked example**: `StaticRetentionRuleResolver` has zero runtime dependencies but **implements `IRetentionRuleResolver` (an Application port)** — therefore it lives in `Application/`, not `Domain/`. The layer is determined by what a type *binds to*, not by how much code it contains.
+**Worked example**: `IRetentionRuleProvider` lives in Application because it is a host I/O boundary, while its invariant-safe `RetentionCategoryCapabilities` value lives in Domain. The layer is determined by what a type binds to, not by how much code it contains.
 
 ## Conventions
 
@@ -87,7 +87,9 @@ These follow the same pattern as `[Anonymise]` — property-level, discovered by
 
 ## Record ID types
 
-Cohort is PK-type-agnostic. Entity record IDs can be `Guid`, `int`, `long`, `string`, or any other type. Cohort stores record IDs as `text` in its own infrastructure tables (`retention_holds.RecordId`, `sweep_run_row_detail.EntityId`) and returns them as `string` in `SweepExecutionResult.AffectedRecordIds`. Hold-table joins cast the column to text (`hold."RecordId" = CAST(target."pk_col" AS text)`); candidate-id matching casts the **parameter** to the column's store type when EF metadata exposes one (`RecordIdSql`, index-friendly), falling back to the column-to-text cast otherwise.
+Cohort is PK-type-agnostic. Entity record IDs can be `Guid`, `int`, `long`, `string`, or any other type. Cohort stores canonical record IDs as `text` in its own infrastructure tables (`retention_holds.RecordId`, `sweep_run_row_detail.RecordId`). Hold-table joins cast the column to text (`hold."RecordId" = CAST(target."pk_col" AS text)`); candidate-id matching casts the **parameter** to the column's store type when EF metadata exposes one (`RecordIdSql`, index-friendly), falling back to the column-to-text cast otherwise.
+
+`RetentionEntityId` always means the stable UUID assigned to a retained entity type. `RecordId` always means one row's canonical text identity. Hold creation canonicalizes the mapped ID, requires the target row to exist, validates tenant ownership, and uses the same advisory-lock key as mutation. Tenantless targets require a null tenant ID.
 
 ## Entity annotation
 
@@ -95,12 +97,20 @@ Cohort is PK-type-agnostic. Entity record IDs can be `Guid`, `int`, `long`, `str
 - Entities annotated with `[ExemptFromRetention]` are explicitly documented as exempt (optional sugar).
 - **Unannotated entities are implicitly exempt.** No annotation required to opt out.
 - Entities with **both** `[Retain]` and `[ExemptFromRetention]` fail startup validation.
+- Retained owned types, shared-table mappings, entity/table splitting, and inheritance mappings are unsupported and fail startup before mutation.
+- All raw relation names are schema-qualified. `ConfigureCohortTables()` maps Cohort tables to `public`; `ConfigureCohortTables(schema)` maps all five together.
 
-## What is NOT in this repo yet
+## Runtime contracts
 
-All three milestones (A/B/C) are implemented. The following are explicitly out of scope for v1:
+- `IRetentionRuleProvider.GetCapabilities` declares every possible strategy; startup validates their union and runtime rejects undeclared strategies.
+- Startup validates `[ErasureSubject]` mapping and provider conversion metadata.
+- `IRetentionSweep`, `IRetentionPreview`, `IRetentionErasureService`, `IRetentionHoldsRepository`, and row dispatch enforce PostgreSQL/model/schema readiness even without host startup.
+- The EF audit ledger is internal and unconditional. `IRetentionAuditObserver` is post-commit, bounded, isolated, and best effort.
+- Externally-derived failures use a sanitized type/code/diagnostic-ID envelope; Cohort-defined safe machine reasons may be plain. Diagnostic error text excludes subject/raw exception data, but row-detail observers deliberately receive sensitive `RecordId` and `TenantId`. Original exceptions remain only in correlated structured logs.
 
-- No `ConditionalRetentionRuleResolver`, `AliasRetentionRuleResolver`, `CachingRetentionRuleResolver` — hosts build these when needed
+## Out of scope
+
+- No built-in conditional, alias, or caching rule providers — hosts build these when needed
 - No hash/format-preserving anonymisation — v1 is `Null`/`EmptyString`/`FixedLiteral` only
 - No SQL Server or SQLite support — Postgres-only SQL (`RETURNING`, `= ANY()`, `FOR UPDATE`)
 - No source generator — reflection is fine for a daily sweep

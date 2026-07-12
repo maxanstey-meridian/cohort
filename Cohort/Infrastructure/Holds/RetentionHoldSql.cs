@@ -4,9 +4,8 @@ namespace Cohort.Infrastructure.Holds;
 
 internal static class RetentionHoldSql
 {
-    internal const string TableName = "retention_holds";
-
     internal static string BuildActiveHoldExclusion(
+        RelationalObjectName holdsTable,
         string targetAlias,
         string recordIdColumn,
         string? tenantColumn = null
@@ -24,14 +23,14 @@ internal static class RetentionHoldSql
         return $"""
             NOT EXISTS (
                 SELECT 1
-                FROM {QuoteIdentifier(TableName)} AS hold
+                FROM {PostgreSqlIdentifier.Format(holdsTable)} AS hold
                 WHERE hold."RetentionEntityId" = @retentionEntityId
                   AND hold."RecordId" = CAST({targetAlias}.{QuoteIdentifier(
                 recordIdColumn
             )} AS text){tenantLine}
-                  AND hold."CreatedAt" <= statement_timestamp()
-                  AND (hold."ExpiresAt" IS NULL OR hold."ExpiresAt" > statement_timestamp())
-                  AND (hold."RemovedAt" IS NULL OR hold."RemovedAt" > statement_timestamp())
+                  AND hold."CreatedAt" <= pg_catalog.statement_timestamp()
+                  AND (hold."ExpiresAt" IS NULL OR hold."ExpiresAt" > pg_catalog.statement_timestamp())
+                  AND (hold."RemovedAt" IS NULL OR hold."RemovedAt" > pg_catalog.statement_timestamp())
             )
             """;
     }
@@ -46,6 +45,6 @@ internal static class RetentionHoldSql
 
     internal static string QuoteIdentifier(string identifier)
     {
-        return $"\"{identifier.Replace("\"", "\"\"")}\"";
+        return PostgreSqlIdentifier.Quote(identifier);
     }
 }

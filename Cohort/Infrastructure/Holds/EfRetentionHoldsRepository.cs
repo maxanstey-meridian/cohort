@@ -11,10 +11,13 @@ namespace Cohort.Infrastructure.Holds;
 
 internal sealed class EfRetentionHoldsRepository(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
-    RetentionRegistry registry
+    RetentionRegistry registry,
+    RetentionRuntimeReadinessValidator readinessValidator
 )
     : IRetentionHoldsRepository
 {
+    private readonly CohortStoreTables tables = CohortStoreTables.FromModel(db.Model);
+
     public async Task CreateAsync(RetentionHoldRequest request, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -23,17 +26,19 @@ internal sealed class EfRetentionHoldsRepository(
         // never hits would look persisted while protecting nothing. Fail loudly instead.
         var entry = ResolveTarget(request.RetentionEntityId);
         ValidateTenantOwnership(entry, request.TenantId);
+        await readinessValidator.ValidateAsync(ct);
 
         var connection = db.Database.GetDbConnection();
         var shouldCloseConnection = connection.State != ConnectionState.Open;
-
-        if (shouldCloseConnection)
-        {
-            await db.Database.OpenConnectionAsync(ct);
-        }
+        Exception? primaryException = null;
 
         try
         {
+            if (shouldCloseConnection)
+            {
+                await db.Database.OpenConnectionAsync(ct);
+            }
+
             var existingTransaction = db.Database.CurrentTransaction;
             await using var ownedTransaction = existingTransaction is null
                 ? await db.Database.BeginTransactionAsync(ct)
@@ -48,12 +53,12 @@ internal sealed class EfRetentionHoldsRepository(
             await RetentionEntityLockSql.AcquireAsync(
                 connection,
                 transaction,
-                entry.EntityId,
+                entry.RetentionEntityId,
                 request.TenantId,
                 recordId,
                 ct
             );
-            await ValidateTenantMatchesTargetRowAsync(
+            await ValidateTargetRowAsync(
                 entry,
                 recordId,
                 request,
@@ -64,7 +69,7 @@ internal sealed class EfRetentionHoldsRepository(
             await using var command = connection.CreateCommand();
             command.Transaction = transaction;
             command.CommandText = $"""
-                INSERT INTO {RetentionHoldSql.QuoteIdentifier(RetentionHoldSql.TableName)} (
+                INSERT INTO {PostgreSqlIdentifier.Format(tables.RetentionHolds)} (
                     "HoldId",
                     "RetentionEntityId",
                     "RecordId",
@@ -115,23 +120,18 @@ internal sealed class EfRetentionHoldsRepository(
                 await ownedTransaction.CommitAsync(ct);
             }
         }
+        catch (Exception ex)
+        {
+            primaryException = ex;
+            throw;
+        }
         finally
         {
-            if (shouldCloseConnection)
-            {
-                await db.Database.CloseConnectionAsync();
-            }
+            await CloseOwnedConnectionAsync(shouldCloseConnection, primaryException);
         }
     }
 
-    /// <summary>
-    /// The sweep-side exclusion on tenanted tables only honours holds whose TenantId
-    /// matches the row's tenant, so a hold created under the wrong tenant would look
-    /// persisted while protecting nothing. When the target row already exists on a
-    /// retained tenanted entity, its tenant must match the request. A row that does not
-    /// exist yet is allowed — holds may legitimately be created ahead of their row.
-    /// </summary>
-    private async Task ValidateTenantMatchesTargetRowAsync(
+    private async Task ValidateTargetRowAsync(
         RetentionEntry entry,
         string recordId,
         RetentionHoldRequest request,
@@ -139,17 +139,15 @@ internal sealed class EfRetentionHoldsRepository(
         CancellationToken ct
     )
     {
-        if (entry.Tenant is null)
-        {
-            return;
-        }
-
         var connection = db.Database.GetDbConnection();
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
+        var targetValue = entry.Tenant is null
+            ? "1"
+            : $"target.{RetentionHoldSql.QuoteIdentifier(entry.Tenant.TenantColumn)}";
         command.CommandText = $"""
-            SELECT target.{RetentionHoldSql.QuoteIdentifier(entry.Tenant.TenantColumn)}
-            FROM {RetentionHoldSql.QuoteIdentifier(entry.TableName)} AS target
+            SELECT {targetValue}
+            FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
             WHERE {RecordIdSql.EqualsParameter("target", entry.RecordId, "recordId")}
             LIMIT 1
             """;
@@ -157,6 +155,13 @@ internal sealed class EfRetentionHoldsRepository(
 
         var rowTenant = await command.ExecuteScalarAsync(ct);
         if (rowTenant is null)
+        {
+            throw new InvalidOperationException(
+                $"Retention hold for entity '{request.RetentionEntityId}', target record '{recordId}' does not exist."
+            );
+        }
+
+        if (entry.Tenant is null)
         {
             return;
         }
@@ -174,7 +179,7 @@ internal sealed class EfRetentionHoldsRepository(
 
     private RetentionEntry ResolveTarget(Guid retentionEntityId)
     {
-        return registry.Scan().Values.SingleOrDefault(entry => entry.EntityId == retentionEntityId)
+        return registry.Scan().Values.SingleOrDefault(entry => entry.RetentionEntityId == retentionEntityId)
             ?? throw new InvalidOperationException(
                 $"Retention entity ID '{retentionEntityId}' does not match a retained entity in the EF model."
             );
@@ -185,14 +190,14 @@ internal sealed class EfRetentionHoldsRepository(
         if (entry.Tenant is not null && (tenantId is null || tenantId == Guid.Empty))
         {
             throw new InvalidOperationException(
-                $"Retention hold for tenanted entity '{entry.EntityId}' requires a non-empty tenant ID."
+                $"Retention hold for tenanted entity '{entry.RetentionEntityId}' requires a non-empty tenant ID."
             );
         }
 
         if (entry.Tenant is null && tenantId is not null)
         {
             throw new InvalidOperationException(
-                $"Retention hold for tenantless entity '{entry.EntityId}' requires a null tenant ID."
+                $"Retention hold for tenantless entity '{entry.RetentionEntityId}' requires a null tenant ID."
             );
         }
     }
@@ -210,7 +215,7 @@ internal sealed class EfRetentionHoldsRepository(
         if (keyClrType == typeof(Guid) && !Guid.TryParse(recordId, out _))
         {
             throw new InvalidOperationException(
-                $"Retention hold record id '{recordId}' for entity '{entry.EntityId}' is not a valid Guid. The hold would never match its row."
+                $"Retention hold record id '{recordId}' for entity '{entry.RetentionEntityId}' is not a valid Guid. The hold would never match its row."
             );
         }
 
@@ -231,7 +236,7 @@ internal sealed class EfRetentionHoldsRepository(
         catch (DbException exception) when (exception.SqlState?.StartsWith("22", StringComparison.Ordinal) == true)
         {
             throw new InvalidOperationException(
-                $"Retention hold record id '{recordId}' for entity '{entry.EntityId}' is not valid for provider type '{storeType}'. The hold would never match its row.",
+                $"Retention hold record id '{recordId}' for entity '{entry.RetentionEntityId}' is not valid for provider type '{storeType}'. The hold would never match its row.",
                 exception
             );
         }
@@ -239,20 +244,22 @@ internal sealed class EfRetentionHoldsRepository(
 
     public async Task RemoveAsync(Guid holdId, DateTimeOffset removedAt, CancellationToken ct)
     {
+        await readinessValidator.ValidateAsync(ct);
         var connection = db.Database.GetDbConnection();
         var shouldCloseConnection = connection.State != ConnectionState.Open;
-
-        if (shouldCloseConnection)
-        {
-            await db.Database.OpenConnectionAsync(ct);
-        }
+        Exception? primaryException = null;
 
         try
         {
+            if (shouldCloseConnection)
+            {
+                await db.Database.OpenConnectionAsync(ct);
+            }
+
             await using var command = connection.CreateCommand();
             command.Transaction = db.Database.CurrentTransaction?.GetDbTransaction();
             command.CommandText = $"""
-                UPDATE {RetentionHoldSql.QuoteIdentifier(RetentionHoldSql.TableName)}
+                UPDATE {PostgreSqlIdentifier.Format(tables.RetentionHolds)}
                 SET "RemovedAt" = @removedAt
                 WHERE "HoldId" = @holdId
                   AND "RemovedAt" IS NULL
@@ -270,12 +277,14 @@ internal sealed class EfRetentionHoldsRepository(
                 );
             }
         }
+        catch (Exception ex)
+        {
+            primaryException = ex;
+            throw;
+        }
         finally
         {
-            if (shouldCloseConnection)
-            {
-                await db.Database.CloseConnectionAsync();
-            }
+            await CloseOwnedConnectionAsync(shouldCloseConnection, primaryException);
         }
     }
 
@@ -284,21 +293,23 @@ internal sealed class EfRetentionHoldsRepository(
         CancellationToken ct
     )
     {
+        await readinessValidator.ValidateAsync(ct);
         var connection = db.Database.GetDbConnection();
         var shouldCloseConnection = connection.State != ConnectionState.Open;
-
-        if (shouldCloseConnection)
-        {
-            await db.Database.OpenConnectionAsync(ct);
-        }
+        Exception? primaryException = null;
 
         try
         {
+            if (shouldCloseConnection)
+            {
+                await db.Database.OpenConnectionAsync(ct);
+            }
+
             await using var command = connection.CreateCommand();
             command.Transaction = db.Database.CurrentTransaction?.GetDbTransaction();
             command.CommandText = $"""
                 SELECT "HoldId", "RetentionEntityId", "RecordId", "TenantId", "Reason", "CreatedAt", "ExpiresAt", "RemovedAt"
-                FROM {RetentionHoldSql.QuoteIdentifier(RetentionHoldSql.TableName)}
+                FROM {PostgreSqlIdentifier.Format(tables.RetentionHolds)}
                 WHERE "CreatedAt" <= @asOf
                   AND ("ExpiresAt" IS NULL OR "ExpiresAt" > @asOf)
                   AND ("RemovedAt" IS NULL OR "RemovedAt" > @asOf)
@@ -326,12 +337,14 @@ internal sealed class EfRetentionHoldsRepository(
 
             return holds;
         }
+        catch (Exception ex)
+        {
+            primaryException = ex;
+            throw;
+        }
         finally
         {
-            if (shouldCloseConnection)
-            {
-                await db.Database.CloseConnectionAsync();
-            }
+            await CloseOwnedConnectionAsync(shouldCloseConnection, primaryException);
         }
     }
 
@@ -346,16 +359,18 @@ internal sealed class EfRetentionHoldsRepository(
         ArgumentException.ThrowIfNullOrWhiteSpace(recordId);
         var entry = ResolveTarget(retentionEntityId);
         ValidateTenantOwnership(entry, tenantId);
+        await readinessValidator.ValidateAsync(ct);
         var connection = db.Database.GetDbConnection();
         var shouldCloseConnection = connection.State != ConnectionState.Open;
-
-        if (shouldCloseConnection)
-        {
-            await db.Database.OpenConnectionAsync(ct);
-        }
+        Exception? primaryException = null;
 
         try
         {
+            if (shouldCloseConnection)
+            {
+                await db.Database.OpenConnectionAsync(ct);
+            }
+
             var transaction = db.Database.CurrentTransaction?.GetDbTransaction();
             var canonicalRecordId = await CanonicaliseRecordIdAsync(
                 entry,
@@ -370,7 +385,7 @@ internal sealed class EfRetentionHoldsRepository(
                 : "AND \"TenantId\" IS NULL";
             command.CommandText = $"""
                 SELECT 1
-                FROM {RetentionHoldSql.QuoteIdentifier(RetentionHoldSql.TableName)}
+                FROM {PostgreSqlIdentifier.Format(tables.RetentionHolds)}
                 WHERE "RetentionEntityId" = @retentionEntityId
                   AND "RecordId" = @recordId
                   {tenantPredicate}
@@ -396,12 +411,27 @@ internal sealed class EfRetentionHoldsRepository(
             var result = await command.ExecuteScalarAsync(ct);
             return result is not null;
         }
+        catch (Exception ex)
+        {
+            primaryException = ex;
+            throw;
+        }
         finally
         {
-            if (shouldCloseConnection)
-            {
-                await db.Database.CloseConnectionAsync();
-            }
+            await CloseOwnedConnectionAsync(shouldCloseConnection, primaryException);
         }
     }
+
+    private Task CloseOwnedConnectionAsync(
+        bool shouldCloseConnection,
+        Exception? primaryException
+    ) =>
+        OperationalConnectionCleanup.RunAsync(
+            null,
+            shouldCloseConnection
+                ? cleanupToken => db.Database.CloseConnectionAsync().WaitAsync(cleanupToken)
+                : null,
+            primaryException,
+            null
+        );
 }

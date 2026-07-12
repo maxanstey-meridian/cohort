@@ -259,9 +259,9 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
         Erasure,
     }
 
-    private sealed class BlockingCategoryRepository : IRetentionCategoryRepository
+    private sealed class BlockingCategoryRepository : IRetentionRuleProvider
     {
-        private readonly SampleCategoryRepository inner = new();
+        private readonly SampleRetentionRuleProvider inner = new();
         private readonly TaskCompletionSource resolutionEntered = new(
             TaskCreationOptions.RunContinuationsAsynchronously
         );
@@ -271,11 +271,17 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
 
         public Task ResolutionEntered => resolutionEntered.Task;
 
-        public async Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        public RetentionCategoryCapabilities? GetCapabilities(string category) =>
+            inner.GetCapabilities(category);
+
+        public async Task<RetentionRule?> ResolveAsync(
+            RetentionResolutionContext context,
+            CancellationToken ct
+        )
         {
             resolutionEntered.TrySetResult();
             await releaseResolution.Task.WaitAsync(ct);
-            return await inner.GetAsync(category, ct);
+            return await inner.ResolveAsync(context, ct);
         }
 
         public void ReleaseResolution() => releaseResolution.TrySetResult();

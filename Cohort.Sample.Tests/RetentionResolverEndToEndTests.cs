@@ -5,11 +5,11 @@ using Microsoft.EntityFrameworkCore;
 
 namespace Cohort.Sample.Tests;
 
-public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
+public sealed class RetentionRuleProviderEndToEndTests(PostgresFixture fixture)
     : IntegrationTestBase(fixture)
 {
     [Fact]
-    public async Task Sweep_Path_Uses_The_Injected_Custom_Resolver()
+    public async Task Sweep_Path_Uses_The_Injected_Dynamic_Provider()
     {
         var tenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
@@ -30,7 +30,7 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
 
         using var sweepHost = new CohortTestHost(
             GetConnectionString(),
-            new TenantAwareCategoryRepository()
+            new TenantAwareRuleProvider()
         );
 
         var result = await sweepHost.RunSweepAsync(
@@ -80,7 +80,7 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
     {
         using var previewHost = new CohortTestHost(
             GetConnectionString(),
-            new AliasCategoryRepository()
+            new AliasRuleProvider()
         );
 
         var act = () =>
@@ -94,121 +94,246 @@ public sealed class RetentionResolverEndToEndTests(PostgresFixture fixture)
         exception.Which.Message.Should().Contain("policy-b");
     }
 
-    private sealed class TenantAwareCategoryRepository : IRetentionCategoryRepository
+    [Fact]
+    public async Task Preview_Path_Rejects_A_Strategy_Not_Declared_By_The_Provider()
     {
-        private static readonly IRetentionRuleResolver ExemptFallback =
-            new StaticRetentionRuleResolver(
-                new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+        using var previewHost = new CohortTestHost(
+            GetConnectionString(),
+            new UndeclaredStrategyRuleProvider()
+        );
+
+        var act = () =>
+            previewHost.RunPreviewAsync(
+                new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
+                new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero)
             );
 
-        private readonly IRetentionRuleResolver resolver = new TenantAwareResolver();
-
-        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
-        {
-            return Task.FromResult<IRetentionRuleResolver?>(
-                category switch
-                {
-                    "short-lived" => resolver,
-                    "soft-delete" => new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
-                    ),
-                    "anonymise" => new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
-                    ),
-                    _ => ExemptFallback,
-                }
-            );
-        }
+        await act.Should()
+            .ThrowAsync<InvalidOperationException>()
+            .WithMessage("*resolved strategy 'SoftDelete'*not declared*");
     }
 
-    private sealed class TenantAwareResolver : IRetentionRuleResolver
+    [Fact]
+    public async Task Preview_Path_Uses_The_Capabilities_Validated_At_Startup()
     {
-        public Task<RetentionRule> ResolveAsync(
-            RetentionResolutionContext ctx,
+        var provider = new MutableCapabilityRuleProvider();
+        using var previewHost = new CohortTestHost(GetConnectionString(), provider);
+        await previewHost.ValidateAndScanAsync();
+        provider.ChangeShortLivedStrategyToSoftDelete();
+
+        var act = () =>
+            previewHost.RunPreviewAsync(
+                new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
+                new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero)
+            );
+
+        await act.Should()
+            .ThrowAsync<InvalidOperationException>()
+            .WithMessage("*resolved strategy 'SoftDelete'*startup-validated capabilities*");
+    }
+
+    [Fact]
+    public async Task Preview_Path_Uses_The_Startup_Snapshot_When_Provider_Capabilities_Disappear()
+    {
+        using var previewHost = new CohortTestHost(
+            GetConnectionString(),
+            new DisappearingCategoryRuleProvider()
+        );
+
+        var tenantId = Guid.NewGuid();
+
+        var result = await previewHost.RunPreviewAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero)
+        );
+
+        result.Counts.Should().Contain(count =>
+            count.EntityType == typeof(Note)
+            && count.Category == "short-lived"
+            && count.Strategy == Strategy.Purge
+        );
+    }
+
+    [Fact]
+    public async Task Preview_Path_Rejects_An_Unresolved_Runtime_Rule()
+    {
+        using var previewHost = new CohortTestHost(
+            GetConnectionString(),
+            new UnresolvedRuleProvider()
+        );
+
+        var act = () =>
+            previewHost.RunPreviewAsync(
+                new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
+                new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero)
+            );
+
+        await act.Should()
+            .ThrowAsync<InvalidOperationException>()
+            .WithMessage("*category 'short-lived' could not be resolved at runtime*");
+    }
+
+    private sealed class TenantAwareRuleProvider : IRetentionRuleProvider
+    {
+        public RetentionCategoryCapabilities? GetCapabilities(string category) =>
+            category switch
+            {
+                "short-lived" => new([Strategy.Purge]),
+                "soft-delete" => new([Strategy.SoftDelete]),
+                "anonymise" => new([Strategy.Anonymise]),
+                _ => new([Strategy.Exempt]),
+            };
+
+        public Task<RetentionRule?> ResolveAsync(
+            RetentionResolutionContext context,
             CancellationToken ct
         )
         {
             var isLenient =
-                ctx.Tenant.Tags.TryGetValue("profile", out var profile)
+                context.Tenant.Tags.TryGetValue("profile", out var profile)
                 && StringComparer.Ordinal.Equals(profile, "lenient");
 
-            return Task.FromResult(
+            var strategy = context.Category switch
+            {
+                "short-lived" => Strategy.Purge,
+                "soft-delete" => Strategy.SoftDelete,
+                "anonymise" => Strategy.Anonymise,
+                _ => Strategy.Exempt,
+            };
+            return Task.FromResult<RetentionRule?>(
                 new RetentionRule(
                     isLenient ? TimeSpan.FromDays(60) : TimeSpan.FromDays(30),
-                    Strategy.Purge
+                    strategy
                 )
             );
         }
     }
 
-    private sealed class AliasCategoryRepository : IRetentionCategoryRepository
+    private sealed class AliasRuleProvider : IRetentionRuleProvider
     {
-        private static readonly IRetentionRuleResolver ExemptFallback =
-            new StaticRetentionRuleResolver(
-                new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
-            );
-
-        private readonly IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers;
-
-        public AliasCategoryRepository()
-        {
-            resolvers = new Dictionary<string, IRetentionRuleResolver>
+        public RetentionCategoryCapabilities? GetCapabilities(string category) =>
+            category switch
             {
-                ["short-lived"] = new AliasResolver(this, "policy-a"),
-                ["soft-delete"] = new StaticRetentionRuleResolver(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
-                ),
-                ["anonymise"] = new StaticRetentionRuleResolver(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
-                ),
-                ["policy-a"] = new AliasResolver(this, "policy-b"),
-                ["policy-b"] = new AliasResolver(this, "policy-a"),
+                "short-lived" or "policy-a" or "policy-b" => new([Strategy.Purge]),
+                "soft-delete" => new([Strategy.SoftDelete]),
+                "anonymise" => new([Strategy.Anonymise]),
+                _ => new([Strategy.Exempt]),
             };
-        }
 
-        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
-        {
-            return resolvers.TryGetValue(category, out var resolver)
-                ? Task.FromResult<IRetentionRuleResolver?>(resolver)
-                : Task.FromResult<IRetentionRuleResolver?>(ExemptFallback);
-        }
-    }
-
-    private sealed class AliasResolver(
-        AliasCategoryRepository categoryRepository,
-        string nextCategory
-    ) : IRetentionRuleResolver
-    {
-        public async Task<RetentionRule> ResolveAsync(
-            RetentionResolutionContext ctx,
+        public async Task<RetentionRule?> ResolveAsync(
+            RetentionResolutionContext context,
             CancellationToken ct
         )
         {
-            if (ctx.AliasPath.Contains(nextCategory, StringComparer.Ordinal))
+            var nextCategory = context.Category switch
+            {
+                "short-lived" => "policy-a",
+                "policy-a" => "policy-b",
+                "policy-b" => "policy-a",
+                _ => null,
+            };
+            if (nextCategory is null)
+            {
+                var strategy = GetCapabilities(context.Category)!.Strategies.Single();
+                return new RetentionRule(TimeSpan.FromDays(30), strategy);
+            }
+
+            if (context.AliasPath.Contains(nextCategory, StringComparer.Ordinal))
             {
                 throw new RetentionAliasCycleException(
-                    $"Retention alias cycle detected: {string.Join(" -> ", [.. ctx.AliasPath, ctx.Category, nextCategory])}"
+                    $"Retention alias cycle detected: {string.Join(" -> ", [.. context.AliasPath, context.Category, nextCategory])}"
                 );
             }
 
-            var resolver = await categoryRepository.GetAsync(nextCategory, ct);
-            if (resolver is null)
-            {
-                throw new InvalidOperationException(
-                    $"Retention category '{nextCategory}' could not be resolved."
-                );
-            }
-
-            return await resolver.ResolveAsync(
+            return await ResolveAsync(
                 new RetentionResolutionContext(
                     nextCategory,
-                    ctx.Tenant,
-                    ctx.Now,
-                    [.. ctx.AliasPath, ctx.Category]
+                    context.Tenant,
+                    context.Now,
+                    [.. context.AliasPath, context.Category]
                 ),
                 ct
             );
         }
+    }
+
+    private sealed class UndeclaredStrategyRuleProvider : IRetentionRuleProvider
+    {
+        public RetentionCategoryCapabilities? GetCapabilities(string category) =>
+            new([Strategy.Purge]);
+
+        public Task<RetentionRule?> ResolveAsync(
+            RetentionResolutionContext context,
+            CancellationToken ct
+        ) => Task.FromResult<RetentionRule?>(
+            new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+        );
+    }
+
+    private sealed class DisappearingCategoryRuleProvider : IRetentionRuleProvider
+    {
+        private readonly SampleRetentionRuleProvider inner = new();
+        private int shortLivedCapabilityRequests;
+
+        public RetentionCategoryCapabilities? GetCapabilities(string category)
+        {
+            if (
+                category == "short-lived"
+                && Interlocked.Increment(ref shortLivedCapabilityRequests) > 1
+            )
+            {
+                return null;
+            }
+
+            return inner.GetCapabilities(category);
+        }
+
+        public Task<RetentionRule?> ResolveAsync(
+            RetentionResolutionContext context,
+            CancellationToken ct
+        ) => inner.ResolveAsync(context, ct);
+    }
+
+    private sealed class MutableCapabilityRuleProvider : IRetentionRuleProvider
+    {
+        private readonly SampleRetentionRuleProvider inner = new();
+        private bool changed;
+
+        public RetentionCategoryCapabilities? GetCapabilities(string category) =>
+            changed && category == "short-lived"
+                ? new([Strategy.SoftDelete])
+                : inner.GetCapabilities(category);
+
+        public Task<RetentionRule?> ResolveAsync(
+            RetentionResolutionContext context,
+            CancellationToken ct
+        ) =>
+            changed && context.Category == "short-lived"
+                ? Task.FromResult<RetentionRule?>(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                )
+                : inner.ResolveAsync(context, ct);
+
+        public void ChangeShortLivedStrategyToSoftDelete()
+        {
+            changed = true;
+        }
+    }
+
+    private sealed class UnresolvedRuleProvider : IRetentionRuleProvider
+    {
+        private readonly SampleRetentionRuleProvider inner = new();
+
+        public RetentionCategoryCapabilities? GetCapabilities(string category) =>
+            inner.GetCapabilities(category);
+
+        public Task<RetentionRule?> ResolveAsync(
+            RetentionResolutionContext context,
+            CancellationToken ct
+        ) =>
+            context.Category == "short-lived"
+                ? Task.FromResult<RetentionRule?>(null)
+                : inner.ResolveAsync(context, ct);
     }
 
     private string GetConnectionString()

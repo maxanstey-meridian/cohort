@@ -22,30 +22,36 @@ internal sealed class ScopeOwnedRetentionSweep(IServiceScopeFactory scopeFactory
             _ => throw new ArgumentOutOfRangeException(nameof(request)),
         };
 
-        return ExecuteAsync(engine =>
-            request.DryRun
-                ? engine.DryRunAsync(
-                    tenant,
-                    request.At,
-                    request.Trigger,
-                    scope,
-                    ct
-                )
-                : engine.SweepAsync(
-                    tenant,
-                    request.At,
-                    request.Trigger,
-                    scope,
-                    ct
-                )
+        return ExecuteAsync(
+            engine =>
+                request.DryRun
+                    ? engine.DryRunAsync(
+                        tenant,
+                        request.At,
+                        request.Trigger,
+                        scope,
+                        ct
+                    )
+                    : engine.SweepAsync(
+                        tenant,
+                        request.At,
+                        request.Trigger,
+                        scope,
+                        ct
+                    ),
+            ct
         );
     }
 
     private async Task<RetentionSweepResult> ExecuteAsync(
-        Func<RetentionSweepEngine, Task<RetentionSweepResult>> execute
+        Func<RetentionSweepEngine, Task<RetentionSweepResult>> execute,
+        CancellationToken ct
     )
     {
         await using var scope = scopeFactory.CreateAsyncScope();
+        await scope.ServiceProvider
+            .GetRequiredService<RetentionRuntimeReadinessValidator>()
+            .ValidateAsync(ct);
         var engine = scope.ServiceProvider.GetRequiredService<RetentionSweepEngine>();
         return await execute(engine);
     }

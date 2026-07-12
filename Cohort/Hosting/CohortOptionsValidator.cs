@@ -32,6 +32,19 @@ internal sealed class CohortOptionsValidator : IValidateOptions<CohortOptions>
             errors.Add("Cohort SweepBatchSize must be at least 1.");
         }
 
+        if (options.AuditObservers is null)
+        {
+            errors.Add("Cohort AuditObservers cannot be null.");
+        }
+        else if (options.AuditObservers.Timeout <= TimeSpan.Zero)
+        {
+            errors.Add("Cohort AuditObservers Timeout must be greater than zero.");
+        }
+        else if (options.AuditObservers.Timeout > AuditObserverOptions.MaximumTimeout)
+        {
+            errors.Add("Cohort AuditObservers Timeout must not exceed 1 hour.");
+        }
+
         var conventions = options.Conventions;
         if (conventions is null)
         {
@@ -80,13 +93,25 @@ internal sealed class CohortOptionsValidator : IValidateOptions<CohortOptions>
         {
             errors.Add("Cohort RowHandlerDispatch BatchSize must be at least 1.");
         }
+        else if (dispatch.BatchSize > 10_000)
+        {
+            errors.Add("Cohort RowHandlerDispatch BatchSize must not exceed 10000.");
+        }
         if (dispatch.MaxAttempts < 1)
         {
             errors.Add("Cohort RowHandlerDispatch MaxAttempts must be at least 1.");
         }
+        else if (dispatch.MaxAttempts > 1_000)
+        {
+            errors.Add("Cohort RowHandlerDispatch MaxAttempts must not exceed 1000.");
+        }
         if (dispatch.MaxParallelism < 1)
         {
             errors.Add("Cohort RowHandlerDispatch MaxParallelism must be at least 1.");
+        }
+        else if (dispatch.MaxParallelism > 256)
+        {
+            errors.Add("Cohort RowHandlerDispatch MaxParallelism must not exceed 256.");
         }
         if (dispatch.BaseBackoff <= TimeSpan.Zero)
         {

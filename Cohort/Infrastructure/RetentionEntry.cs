@@ -4,8 +4,9 @@ namespace Cohort.Infrastructure;
 
 internal sealed record RetentionEntry(
     Type EntityType,
-    Guid EntityId,
-    string TableName,
+    Guid RetentionEntityId,
+    RelationalObjectName Table,
+    CohortStoreTables CohortTables,
     string Category,
     string AnchorMember,
     string AnchorColumn,
@@ -16,7 +17,41 @@ internal sealed record RetentionEntry(
     bool IsExplicitlyTenantless = false,
     AuditRowDetail AuditRowDetail = AuditRowDetail.Inherit,
     AnonymisedAtConvention? AnonymisedAt = null
-);
+)
+{
+    internal RetentionEntry(
+        Type entityType,
+        Guid retentionEntityId,
+        string tableName,
+        string category,
+        string anchorMember,
+        string anchorColumn,
+        RecordIdConvention recordId,
+        IReadOnlyList<AnonymiseField> anonymiseFields,
+        TenantConvention? tenant,
+        SoftDeleteConvention? softDelete,
+        bool isExplicitlyTenantless = false,
+        AuditRowDetail auditRowDetail = AuditRowDetail.Inherit,
+        AnonymisedAtConvention? anonymisedAt = null
+    ) : this(
+        entityType,
+        retentionEntityId,
+        new RelationalObjectName("public", tableName),
+        CohortStoreTables.Public,
+        category,
+        anchorMember,
+        anchorColumn,
+        recordId,
+        anonymiseFields,
+        tenant,
+        softDelete,
+        isExplicitlyTenantless,
+        auditRowDetail,
+        anonymisedAt
+    ) { }
+
+    internal string TableName => Table.Name;
+}
 
 internal sealed record RecordIdConvention(
     string RecordIdMember,

@@ -15,6 +15,12 @@
         <ProjectReference Include="..\Cohort\Cohort.csproj" />
     </ItemGroup>
 
+    <ItemGroup>
+        <None Update="PublicApi.approved.txt" CopyToOutputDirectory="PreserveNewest" />
+        <None Update="HistoricalMigrations.approved.txt" CopyToOutputDirectory="PreserveNewest" />
+        <None Include="..\corpus\compliance-manifest.json" Link="compliance-manifest.json" CopyToOutputDirectory="PreserveNewest" />
+    </ItemGroup>
+
     <!--
     Deliberately absent: NSubstitute, Moq, FakeItEasy, Testcontainers, Respawn.
     The mock ban is structural, not policy. See CLAUDE.md.

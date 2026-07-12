@@ -59,6 +59,6 @@ internal static class RecordIdSql
 
     private static string Quote(string identifier)
     {
-        return $"\"{identifier.Replace("\"", "\"\"")}\"";
+        return PostgreSqlIdentifier.Quote(identifier);
     }
 }

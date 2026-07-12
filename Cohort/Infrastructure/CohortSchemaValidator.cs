@@ -5,6 +5,7 @@ using Cohort.Application;
 using Cohort.Infrastructure.Migrations;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Infrastructure;
@@ -13,166 +14,26 @@ internal sealed class CohortSchemaValidator(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db
 )
 {
-    private static readonly IReadOnlyDictionary<string, string[]> RequiredColumns =
-        new Dictionary<string, string[]>(StringComparer.Ordinal)
-        {
-            [CohortTableNames.RetentionHolds] =
-            [
-                "HoldId", "RetentionEntityId", "RecordId", "TenantId", "Reason", "CreatedAt",
-                "ExpiresAt", "RemovedAt",
-            ],
-            [CohortTableNames.SweepRun] =
-            [
-                "SweepId", "StartedAt", "Status", "SettledAt", "Duration", "TriggerKind",
-                "DryRun", "TenantId", "TotalAffected", "Error",
-            ],
-            [CohortTableNames.SweepRunEntitySummary] =
-            [
-                "SweepId", "At", "EntityType", "RetentionEntityId", "Category", "TenantId",
-                "Strategy", "ResolvedPeriod", "Affected", "HeldCount", "SkippedCount",
-                "NullAnchorCount", "RuleSource", "RuleReason",
-            ],
-            [CohortTableNames.SweepRunRowDetail] =
-            [
-                "Id", "SweepId", "At", "EntityType", "RetentionEntityId", "EntityId",
-                "Category", "Strategy", "TenantId", "CapturedPayload",
-            ],
-            [CohortTableNames.SweepRowHandlerStatus] =
-            [
-                "Id", "SweepRunRowDetailId", "HandlerType", "DispatchPhase", "State", "Attempt",
-                "QueuedAt", "NextAttemptAt", "ClaimedAt", "ClaimToken", "CompletedAt", "LastError",
-            ],
-        };
-
-    private static readonly ColumnRequirement[] RequiredColumnStructures =
-    [
-        new(CohortTableNames.RetentionHolds, "HoldId", "uuid", false),
-        new(CohortTableNames.RetentionHolds, "RetentionEntityId", "uuid", false),
-        new(CohortTableNames.RetentionHolds, "RecordId", "text", false),
-        new(CohortTableNames.RetentionHolds, "TenantId", "uuid", true),
-        new(CohortTableNames.RetentionHolds, "Reason", "text", false),
-        new(CohortTableNames.RetentionHolds, "CreatedAt", "timestamptz", false),
-        new(CohortTableNames.RetentionHolds, "ExpiresAt", "timestamptz", true),
-        new(CohortTableNames.RetentionHolds, "RemovedAt", "timestamptz", true),
-        new(CohortTableNames.SweepRun, "SweepId", "uuid", false),
-        new(CohortTableNames.SweepRun, "StartedAt", "timestamptz", false),
-        new(CohortTableNames.SweepRun, "Status", "int4", false),
-        new(CohortTableNames.SweepRun, "SettledAt", "timestamptz", true),
-        new(CohortTableNames.SweepRun, "Duration", "interval", true),
-        new(CohortTableNames.SweepRun, "TriggerKind", "int4", false),
-        new(CohortTableNames.SweepRun, "DryRun", "bool", false),
-        new(CohortTableNames.SweepRun, "TenantId", "uuid", false),
-        new(CohortTableNames.SweepRun, "TotalAffected", "int8", true),
-        new(CohortTableNames.SweepRun, "Error", "text", true),
-        new(CohortTableNames.SweepRunEntitySummary, "SweepId", "uuid", false),
-        new(CohortTableNames.SweepRunEntitySummary, "At", "timestamptz", false),
-        new(CohortTableNames.SweepRunEntitySummary, "EntityType", "text", false),
-        new(CohortTableNames.SweepRunEntitySummary, "RetentionEntityId", "uuid", false),
-        new(CohortTableNames.SweepRunEntitySummary, "Category", "text", false),
-        new(CohortTableNames.SweepRunEntitySummary, "TenantId", "uuid", false),
-        new(CohortTableNames.SweepRunEntitySummary, "Strategy", "int4", false),
-        new(CohortTableNames.SweepRunEntitySummary, "ResolvedPeriod", "interval", false),
-        new(CohortTableNames.SweepRunEntitySummary, "Affected", "int8", false),
-        new(CohortTableNames.SweepRunEntitySummary, "HeldCount", "int8", false),
-        new(CohortTableNames.SweepRunEntitySummary, "SkippedCount", "int8", false),
-        new(CohortTableNames.SweepRunEntitySummary, "NullAnchorCount", "int8", false),
-        new(CohortTableNames.SweepRunEntitySummary, "RuleSource", "text", true),
-        new(CohortTableNames.SweepRunEntitySummary, "RuleReason", "text", true),
-        new(CohortTableNames.SweepRunRowDetail, "Id", "int8", false, true),
-        new(CohortTableNames.SweepRunRowDetail, "SweepId", "uuid", false),
-        new(CohortTableNames.SweepRunRowDetail, "At", "timestamptz", false),
-        new(CohortTableNames.SweepRunRowDetail, "EntityType", "text", false),
-        new(CohortTableNames.SweepRunRowDetail, "RetentionEntityId", "uuid", false),
-        new(CohortTableNames.SweepRunRowDetail, "EntityId", "text", false),
-        new(CohortTableNames.SweepRunRowDetail, "Category", "text", false),
-        new(CohortTableNames.SweepRunRowDetail, "Strategy", "int4", false),
-        new(CohortTableNames.SweepRunRowDetail, "TenantId", "uuid", false),
-        new(CohortTableNames.SweepRunRowDetail, "CapturedPayload", "text", true),
-        new(CohortTableNames.SweepRowHandlerStatus, "Id", "int8", false, true),
-        new(CohortTableNames.SweepRowHandlerStatus, "SweepRunRowDetailId", "int8", false),
-        new(CohortTableNames.SweepRowHandlerStatus, "HandlerType", "text", false),
-        new(CohortTableNames.SweepRowHandlerStatus, "DispatchPhase", "int4", false),
-        new(CohortTableNames.SweepRowHandlerStatus, "State", "int4", false),
-        new(CohortTableNames.SweepRowHandlerStatus, "Attempt", "int4", false),
-        new(CohortTableNames.SweepRowHandlerStatus, "QueuedAt", "timestamptz", false),
-        new(CohortTableNames.SweepRowHandlerStatus, "NextAttemptAt", "timestamptz", false),
-        new(CohortTableNames.SweepRowHandlerStatus, "ClaimedAt", "timestamptz", true),
-        new(CohortTableNames.SweepRowHandlerStatus, "ClaimToken", "uuid", true),
-        new(CohortTableNames.SweepRowHandlerStatus, "CompletedAt", "timestamptz", true),
-        new(CohortTableNames.SweepRowHandlerStatus, "LastError", "text", true),
-    ];
-
-    private static readonly IndexRequirement[] RequiredIndexes =
-    [
-        new(CohortTableNames.RetentionHolds, ["HoldId"], true, true),
-        new(CohortTableNames.RetentionHolds, ["RetentionEntityId", "TenantId", "RecordId"]),
-        new(CohortTableNames.RetentionHolds, ["RetentionEntityId", "RecordId"]),
-        new(CohortTableNames.SweepRun, ["SweepId"], true, true),
-        new(CohortTableNames.SweepRunEntitySummary,
-            ["SweepId", "RetentionEntityId", "Category", "TenantId", "Strategy"], true, true),
-        new(CohortTableNames.SweepRunEntitySummary, ["SweepId"]),
-        new(CohortTableNames.SweepRunRowDetail, ["Id"], true, true),
-        new(CohortTableNames.SweepRunRowDetail, ["SweepId"]),
-        new(CohortTableNames.SweepRunRowDetail,
-            ["SweepId", "RetentionEntityId", "EntityId", "Category", "Strategy", "TenantId"],
-            true),
-        new(CohortTableNames.SweepRowHandlerStatus, ["Id"], true, true),
-        new(CohortTableNames.SweepRowHandlerStatus, ["SweepRunRowDetailId", "HandlerType"], true),
-        new(CohortTableNames.SweepRowHandlerStatus, ["State", "NextAttemptAt", "Id"]),
-    ];
-
-    private static readonly CheckConstraintRequirement[] RequiredCheckConstraints =
-    [
-        new(CohortTableNames.SweepRun, "CK_sweep_run_Status_Range", "Status>=0ANDStatus<=4"),
-        new(CohortTableNames.SweepRun, "CK_sweep_run_Started_Unsettled", "Status<>0ORSettledAtISNULL"),
-        new(CohortTableNames.SweepRun, "CK_sweep_run_Terminal_Settled", "Status=0ORSettledAtISNOTNULL"),
-        new(CohortTableNames.SweepRun, "CK_sweep_run_TotalAffected_Nonnegative", "TotalAffectedISNULLORTotalAffected>=0"),
-        new(CohortTableNames.SweepRun, "CK_sweep_run_Duration_Nonnegative", "DurationISNULLORDuration>=000000INTERVAL"),
-        new(CohortTableNames.SweepRowHandlerStatus, "CK_sweep_row_handler_status_Claim", "(State=1ANDClaimedAtISNOTNULLANDClaimTokenISNOTNULL)OR(State<>1ANDClaimedAtISNULLANDClaimTokenISNULL)"),
-        new(CohortTableNames.SweepRowHandlerStatus, "CK_sweep_row_handler_status_Completion", "(State=ANYARRAY[2,3]ANDCompletedAtISNOTNULL)OR(State=ANYARRAY[0,1]ANDCompletedAtISNULL)"),
-    ];
-
-    private static readonly ForeignKeyRequirement[] RequiredForeignKeys =
-    [
-        new(
-            CohortTableNames.SweepRunEntitySummary,
-            ["SweepId"],
-            CohortTableNames.SweepRun,
-            ["SweepId"],
-            'r'
-        ),
-        new(
-            CohortTableNames.SweepRunRowDetail,
-            ["SweepId"],
-            CohortTableNames.SweepRun,
-            ["SweepId"],
-            'r'
-        ),
-        new(
-            CohortTableNames.SweepRowHandlerStatus,
-            ["SweepRunRowDetailId"],
-            CohortTableNames.SweepRunRowDetail,
-            ["Id"],
-            'c'
-        ),
-    ];
-
     public async Task ValidateAsync(CancellationToken ct)
     {
         var connection = db.Database.GetDbConnection();
         var shouldCloseConnection = connection.State != ConnectionState.Open;
-        if (shouldCloseConnection)
-        {
-            await db.Database.OpenConnectionAsync(ct);
-        }
+        Exception? primaryException = null;
 
         try
         {
-            await using var transaction = await connection.BeginTransactionAsync(
-                IsolationLevel.RepeatableRead,
-                ct
-            );
-            var tables = await ResolveTablesAsync(connection, transaction, ct);
+            if (shouldCloseConnection)
+            {
+                await db.Database.OpenConnectionAsync(ct);
+            }
+
+            var storeTables = CohortStoreTables.FromModel(db.Model);
+            var existingTransaction = db.Database.CurrentTransaction;
+            await using var ownedTransaction = existingTransaction is null
+                ? await connection.BeginTransactionAsync(IsolationLevel.RepeatableRead, ct)
+                : null;
+            var transaction = existingTransaction?.GetDbTransaction() ?? ownedTransaction!;
+            var tables = await ResolveTablesAsync(connection, transaction, storeTables, ct);
             var columns = await ReadColumnsAsync(connection, transaction, tables.Values, ct);
             var indexes = await ReadIndexesAsync(connection, transaction, tables.Values, ct);
             var checkConstraints = await ReadCheckConstraintsAsync(
@@ -182,91 +43,104 @@ internal sealed class CohortSchemaValidator(
                 ct
             );
             var foreignKeys = await ReadForeignKeysAsync(connection, transaction, tables.Values, ct);
-            await transaction.CommitAsync(ct);
+            if (ownedTransaction is not null)
+            {
+                await ownedTransaction.CommitAsync(ct);
+            }
             var missing = new List<string>();
 
-            foreach (var (table, requiredColumns) in RequiredColumns)
+            foreach (var table in CohortSchemaContract.Tables)
             {
-                if (!tables.TryGetValue(table, out var tableId))
+                var mappedTable = table.ResolveStoreTable(storeTables);
+                if (!tables.TryGetValue(table.Role, out var tableId))
                 {
-                    missing.Add($"table '{table}'");
+                    missing.Add($"table '{PostgreSqlIdentifier.Format(mappedTable)}'");
                     continue;
                 }
 
-                missing.AddRange(requiredColumns
-                    .Where(column => !columns.ContainsKey((tableId, column)))
-                    .Select(column => $"column '{table}.\"{column}\"'"));
-            }
-
-            foreach (var requirement in RequiredColumnStructures)
-            {
-                if (!tables.TryGetValue(requirement.Table, out var tableId)
-                    || !columns.TryGetValue((tableId, requirement.Column), out var actual))
+                foreach (var column in table.Columns)
                 {
-                    continue;
-                }
+                    if (!columns.TryGetValue((tableId, column.Name), out var actual))
+                    {
+                        missing.Add(
+                            $"column '{PostgreSqlIdentifier.Format(mappedTable)}.{PostgreSqlIdentifier.Quote(column.Name)}'"
+                        );
+                        continue;
+                    }
 
-                if (!IsCompatibleType(requirement.Type, actual.Type)
-                    || actual.Nullable != requirement.Nullable
-                    || requirement.Generated && !actual.Generated)
-                {
-                    missing.Add(
-                        $"column capability '{requirement.Table}.\"{requirement.Column}\" {requirement.Type} {(requirement.Nullable ? "NULL" : "NOT NULL")}{(requirement.Generated ? " GENERATED" : "")}'"
-                    );
-                }
-            }
-
-            foreach (var requirement in RequiredIndexes)
-            {
-                if (!tables.TryGetValue(requirement.Table, out var tableId))
-                {
-                    continue;
+                    if (!IsCompatibleType(column.CatalogType, actual)
+                        || actual.Nullable != column.Nullable
+                        || column.Generated && !actual.Generated)
+                    {
+                        missing.Add(
+                            $"column capability '{table.Role}.{PostgreSqlIdentifier.Quote(column.Name)} {column.CatalogType} {(column.Nullable ? "NULL" : "NOT NULL")}{(column.Generated ? " GENERATED" : "")}' on table '{PostgreSqlIdentifier.Format(mappedTable)}'"
+                        );
+                    }
                 }
 
                 if (!indexes.Any(index => index.TableId == tableId
-                    && index.Unique == requirement.Unique
-                    && index.Primary == requirement.Primary
-                    && index.Columns.SequenceEqual(requirement.Columns)
-                    && index.Predicate == NormalizePredicate(requirement.Predicate)))
-                {
-                    missing.Add($"index capability '{requirement.Table}({string.Join(", ", requirement.Columns)})'");
-                }
-            }
-
-            foreach (var requirement in RequiredCheckConstraints)
-            {
-                if (!tables.TryGetValue(requirement.Table, out var tableId))
-                {
-                    continue;
-                }
-
-                if (!checkConstraints.Any(constraint => constraint.TableId == tableId
-                    && constraint.Name == requirement.Name
-                    && constraint.Validated
-                    && constraint.Expression == NormalizeSql(requirement.Expression)))
-                {
-                    missing.Add($"check constraint capability '{requirement.Table}.{requirement.Name}'");
-                }
-            }
-
-            foreach (var requirement in RequiredForeignKeys)
-            {
-                if (!tables.TryGetValue(requirement.Table, out var tableId)
-                    || !tables.TryGetValue(requirement.ReferencedTable, out var referencedTableId))
-                {
-                    continue;
-                }
-
-                if (!foreignKeys.Any(foreignKey => foreignKey.TableId == tableId
-                    && foreignKey.Columns.SequenceEqual(requirement.Columns)
-                    && foreignKey.ReferencedTableId == referencedTableId
-                    && foreignKey.ReferencedColumns.SequenceEqual(requirement.ReferencedColumns)
-                    && foreignKey.DeleteAction == requirement.DeleteAction
-                    && foreignKey.Validated))
+                    && index.Unique
+                    && index.Primary
+                    && index.Columns.SequenceEqual(table.PrimaryKey)))
                 {
                     missing.Add(
-                        $"foreign key capability '{requirement.Table}({string.Join(", ", requirement.Columns)}) -> {requirement.ReferencedTable}({string.Join(", ", requirement.ReferencedColumns)}) ON DELETE {DescribeDeleteAction(requirement.DeleteAction)}'"
+                        $"primary key capability '{table.Role}({string.Join(", ", table.PrimaryKey)})' on table '{PostgreSqlIdentifier.Format(mappedTable)}'"
                     );
+                }
+
+                foreach (var indexRequirement in table.RequiredIndexes)
+                {
+                    if (!indexes.Any(index => index.TableId == tableId
+                        && index.Unique == indexRequirement.Unique
+                        && !index.Primary
+                        && index.Columns.SequenceEqual(indexRequirement.Columns)
+                        && index.Predicate == NormalizePredicate(indexRequirement.Predicate)))
+                    {
+                        missing.Add(
+                            $"index capability '{table.Role}({string.Join(", ", indexRequirement.Columns)})' on table '{PostgreSqlIdentifier.Format(mappedTable)}'"
+                        );
+                    }
+                }
+
+                foreach (var checkRequirement in table.RequiredChecks)
+                {
+                    if (!checkConstraints.Any(constraint => constraint.TableId == tableId
+                        && constraint.Name == checkRequirement.Name
+                        && constraint.Validated
+                        && constraint.Expression == NormalizeSql(checkRequirement.NormalizedSql)))
+                    {
+                        missing.Add(
+                            $"check constraint capability '{table.Role}.{checkRequirement.Name}' on table '{PostgreSqlIdentifier.Format(mappedTable)}'"
+                        );
+                    }
+                }
+
+                foreach (var foreignKeyRequirement in table.RequiredForeignKeys)
+                {
+                    if (!tables.TryGetValue(
+                            foreignKeyRequirement.PrincipalTable,
+                            out var principalTableId
+                        ))
+                    {
+                        continue;
+                    }
+
+                    if (!foreignKeys.Any(foreignKey => foreignKey.TableId == tableId
+                        && foreignKey.Columns.SequenceEqual(foreignKeyRequirement.Columns)
+                        && foreignKey.ReferencedTableId == principalTableId
+                        && foreignKey.ReferencedColumns.SequenceEqual(
+                            foreignKeyRequirement.PrincipalColumns
+                        )
+                        && foreignKey.DeleteAction == foreignKeyRequirement.CatalogDeleteAction
+                        && foreignKey.Validated))
+                    {
+                        var principalTable = CohortSchemaContract
+                            .GetTable(foreignKeyRequirement.PrincipalTable)
+                            .ResolveStoreTable(storeTables);
+                        missing.Add(
+                            $"foreign key capability '{table.Role}({string.Join(", ", foreignKeyRequirement.Columns)}) -> {foreignKeyRequirement.PrincipalTable}({string.Join(", ", foreignKeyRequirement.PrincipalColumns)}) ON DELETE {DescribeDeleteAction(foreignKeyRequirement.CatalogDeleteAction)}' on tables '{PostgreSqlIdentifier.Format(mappedTable)}' -> '{PostgreSqlIdentifier.Format(principalTable)}'"
+                        );
+                    }
                 }
             }
 
@@ -277,12 +151,21 @@ internal sealed class CohortSchemaValidator(
                 ]);
             }
         }
+        catch (Exception ex)
+        {
+            primaryException = ex;
+            throw;
+        }
         finally
         {
-            if (shouldCloseConnection)
-            {
-                await db.Database.CloseConnectionAsync();
-            }
+            await OperationalConnectionCleanup.RunAsync(
+                null,
+                shouldCloseConnection
+                    ? cleanupToken => db.Database.CloseConnectionAsync().WaitAsync(cleanupToken)
+                    : null,
+                primaryException,
+                null
+            );
         }
     }
 
@@ -302,13 +185,27 @@ internal sealed class CohortSchemaValidator(
     private static async Task<Dictionary<string, uint>> ResolveTablesAsync(
         DbConnection connection,
         DbTransaction transaction,
+        CohortStoreTables tables,
         CancellationToken ct
     )
     {
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = "SELECT name, to_regclass(name)::oid FROM unnest(@tables) AS name";
-        AddTablesParameter(command);
+        command.CommandText = """
+            SELECT requested.role, relation.oid
+            FROM ROWS FROM (
+                pg_catalog.unnest(@roles),
+                pg_catalog.unnest(@schemas),
+                pg_catalog.unnest(@tables)
+            ) AS requested(role, schema_name, table_name)
+            JOIN pg_catalog.pg_namespace namespace
+              ON namespace.nspname = requested.schema_name
+            JOIN pg_catalog.pg_class relation
+              ON relation.relnamespace = namespace.oid
+             AND relation.relname = requested.table_name
+             AND relation.relkind IN ('r', 'p')
+            """;
+        AddTablesParameters(command, tables);
 
         var result = new Dictionary<string, uint>(StringComparer.Ordinal);
         await using var reader = await command.ExecuteReaderAsync(ct);
@@ -333,16 +230,19 @@ internal sealed class CohortSchemaValidator(
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
-            SELECT attrelid, attname, typname, NOT attnotnull,
+            SELECT attrelid, attname, typname, atttypmod, NOT attnotnull,
                    attidentity <> '' OR COALESCE(
-                       pg_get_expr(attrdef.adbin, attrdef.adrelid) LIKE 'nextval(%',
+                        pg_catalog.pg_get_expr(attrdef.adbin, attrdef.adrelid) LIKE 'nextval(%',
                        FALSE
                    )
-            FROM pg_attribute attribute
-            JOIN pg_type ON pg_type.oid = atttypid
-            LEFT JOIN pg_attrdef attrdef
+            FROM pg_catalog.pg_attribute attribute
+            JOIN pg_catalog.pg_type ON pg_type.oid = atttypid
+            LEFT JOIN pg_catalog.pg_attrdef attrdef
               ON attrdef.adrelid = attrelid AND attrdef.adnum = attnum
-            WHERE attrelid = ANY (ARRAY(SELECT value::oid FROM unnest(@tableIds) AS value))
+            WHERE attrelid = ANY (ARRAY(
+                SELECT value::pg_catalog.oid
+                FROM pg_catalog.unnest(@tableIds) AS value
+            ))
               AND attnum > 0 AND NOT attisdropped
             """;
         AddTableIdsParameter(command, tableIds);
@@ -353,7 +253,12 @@ internal sealed class CohortSchemaValidator(
         {
             result.Add(
                 (reader.GetFieldValue<uint>(0), reader.GetString(1)),
-                new ColumnStructure(reader.GetString(2), reader.GetBoolean(3), reader.GetBoolean(4))
+                new ColumnStructure(
+                    reader.GetString(2),
+                    reader.GetInt32(3),
+                    reader.GetBoolean(4),
+                    reader.GetBoolean(5)
+                )
             );
         }
 
@@ -372,13 +277,16 @@ internal sealed class CohortSchemaValidator(
         command.CommandText = """
             SELECT i.indrelid, i.indisunique, i.indisprimary,
                    ARRAY(SELECT a.attname
-                         FROM unnest(i.indkey) WITH ORDINALITY AS key(attnum, position)
-                          JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = key.attnum
+                          FROM pg_catalog.unnest(i.indkey) WITH ORDINALITY AS key(attnum, position)
+                           JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = key.attnum
                           WHERE key.position <= i.indnkeyatts
                           ORDER BY key.position),
-                   pg_get_expr(i.indpred, i.indrelid)
-            FROM pg_index i
-            WHERE i.indrelid = ANY (ARRAY(SELECT value::oid FROM unnest(@tableIds) AS value))
+                    pg_catalog.pg_get_expr(i.indpred, i.indrelid)
+            FROM pg_catalog.pg_index i
+            WHERE i.indrelid = ANY (ARRAY(
+                SELECT value::pg_catalog.oid
+                FROM pg_catalog.unnest(@tableIds) AS value
+            ))
               AND i.indisvalid AND i.indisready
             """;
         AddTableIdsParameter(command, tableIds);
@@ -409,10 +317,13 @@ internal sealed class CohortSchemaValidator(
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
-            SELECT conrelid, conname, convalidated, pg_get_expr(conbin, conrelid)
-            FROM pg_constraint
+            SELECT conrelid, conname, convalidated, pg_catalog.pg_get_expr(conbin, conrelid)
+            FROM pg_catalog.pg_constraint
             WHERE contype = 'c'
-              AND conrelid = ANY (ARRAY(SELECT value::oid FROM unnest(@tableIds) AS value))
+              AND conrelid = ANY (ARRAY(
+                  SELECT value::pg_catalog.oid
+                  FROM pg_catalog.unnest(@tableIds) AS value
+              ))
             """;
         AddTableIdsParameter(command, tableIds);
 
@@ -442,17 +353,20 @@ internal sealed class CohortSchemaValidator(
         command.Transaction = transaction;
         command.CommandText = """
             SELECT c.conrelid,
-                   ARRAY(SELECT a.attname FROM unnest(c.conkey) WITH ORDINALITY AS key(attnum, position)
-                         JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = key.attnum
+                   ARRAY(SELECT a.attname FROM pg_catalog.unnest(c.conkey) WITH ORDINALITY AS key(attnum, position)
+                         JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = key.attnum
                          ORDER BY key.position),
                    c.confrelid,
-                   ARRAY(SELECT a.attname FROM unnest(c.confkey) WITH ORDINALITY AS key(attnum, position)
-                         JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = key.attnum
+                   ARRAY(SELECT a.attname FROM pg_catalog.unnest(c.confkey) WITH ORDINALITY AS key(attnum, position)
+                         JOIN pg_catalog.pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = key.attnum
                          ORDER BY key.position),
                    c.confdeltype, c.convalidated
-            FROM pg_constraint c
+            FROM pg_catalog.pg_constraint c
             WHERE c.contype = 'f'
-              AND c.conrelid = ANY (ARRAY(SELECT value::oid FROM unnest(@tableIds) AS value))
+              AND c.conrelid = ANY (ARRAY(
+                  SELECT value::pg_catalog.oid
+                  FROM pg_catalog.unnest(@tableIds) AS value
+              ))
             """;
         AddTableIdsParameter(command, tableIds);
 
@@ -473,11 +387,21 @@ internal sealed class CohortSchemaValidator(
         return result;
     }
 
-    private static void AddTablesParameter(DbCommand command)
+    private static void AddTablesParameters(DbCommand command, CohortStoreTables tables)
+    {
+        var mapped = CohortSchemaContract.Tables
+            .Select(table => (table.Role, Table: table.ResolveStoreTable(tables)))
+            .ToArray();
+        AddArrayParameter(command, "roles", mapped.Select(table => table.Role).ToArray());
+        AddArrayParameter(command, "schemas", mapped.Select(table => table.Table.Schema).ToArray());
+        AddArrayParameter(command, "tables", mapped.Select(table => table.Table.Name).ToArray());
+    }
+
+    private static void AddArrayParameter(DbCommand command, string name, string[] values)
     {
         var parameter = command.CreateParameter();
-        parameter.ParameterName = "tables";
-        parameter.Value = RequiredColumns.Keys.ToArray();
+        parameter.ParameterName = name;
+        parameter.Value = values;
         command.Parameters.Add(parameter);
     }
 
@@ -496,7 +420,7 @@ internal sealed class CohortSchemaValidator(
             : new string(predicate.Where(char.IsLetterOrDigit).ToArray()).ToUpperInvariant();
     }
 
-    private static string NormalizeSql(string sql)
+    internal static string NormalizeSql(string sql)
     {
         var compact = new string(sql
             .Where(character => !char.IsWhiteSpace(character)
@@ -553,25 +477,17 @@ internal sealed class CohortSchemaValidator(
         return result.ToString();
     }
 
-    private static bool IsCompatibleType(string required, string actual)
+    private static bool IsCompatibleType(string required, ColumnStructure actual)
     {
-        return actual == required || required == "text" && actual == "varchar";
+        return actual.Type == required
+            || required == "text" && actual.Type == "varchar" && actual.TypeModifier == -1;
     }
 
-    private sealed record ColumnRequirement(
-        string Table,
-        string Column,
+    private sealed record ColumnStructure(
         string Type,
+        int TypeModifier,
         bool Nullable,
-        bool Generated = false
-    );
-    private sealed record ColumnStructure(string Type, bool Nullable, bool Generated);
-    private sealed record IndexRequirement(
-        string Table,
-        string[] Columns,
-        bool Unique = false,
-        bool Primary = false,
-        string? Predicate = null
+        bool Generated
     );
     private sealed record IndexStructure(
         uint TableId,
@@ -580,15 +496,7 @@ internal sealed class CohortSchemaValidator(
         string[] Columns,
         string? Predicate
     );
-    private sealed record CheckConstraintRequirement(string Table, string Name, string Expression);
     private sealed record CheckConstraintStructure(uint TableId, string Name, bool Validated, string Expression);
-    private sealed record ForeignKeyRequirement(
-        string Table,
-        string[] Columns,
-        string ReferencedTable,
-        string[] ReferencedColumns,
-        char DeleteAction
-    );
     private sealed record ForeignKeyStructure(
         uint TableId,
         string[] Columns,

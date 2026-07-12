@@ -1,3 +1,5 @@
+using Cohort.Domain;
+using Cohort.Infrastructure;
 using Cohort.Infrastructure.Migrations;
 using Microsoft.EntityFrameworkCore;
 
@@ -6,6 +8,128 @@ namespace Cohort.Sample.Tests;
 // Narrow integration test: table adoption uses Npgsql model metadata but executes no SQL.
 public sealed class CohortTableAdoptionTests
 {
+    private static readonly IReadOnlyList<string> CohortTableNames =
+        CohortSchemaContract.TableNames;
+
+    [Fact]
+    public void ConfigureCohortTables_Maps_All_Tables_Explicitly_To_Public()
+    {
+        var options = new DbContextOptionsBuilder<PublicSchemaDbContext>()
+            .UseNpgsqlMetadataModel($"public-cohort-schema-{Guid.NewGuid()}")
+            .Options;
+        using var db = new PublicSchemaDbContext(options);
+
+        db.Model
+            .GetEntityTypes()
+            .Where(entityType => CohortTableNames.Contains(entityType.GetTableName()))
+            .Should()
+            .HaveCount(5)
+            .And.OnlyContain(entityType => entityType.GetSchema() == "public");
+    }
+
+    [Fact]
+    public void ConfigureCohortTables_Uses_Contract_Roles_And_Keys_For_Every_Table()
+    {
+        var options = new DbContextOptionsBuilder<PublicSchemaDbContext>()
+            .UseNpgsqlMetadataModel($"contract-cohort-schema-{Guid.NewGuid()}")
+            .Options;
+        using var db = new PublicSchemaDbContext(options);
+
+        var mapped = db.Model.GetEntityTypes()
+            .Where(entityType => entityType[CohortStoreTables.TableRoleAnnotation] is string)
+            .ToDictionary(
+                entityType => (string)entityType[CohortStoreTables.TableRoleAnnotation]!,
+                StringComparer.Ordinal
+            );
+
+        mapped.Keys.Should().BeEquivalentTo(CohortSchemaContract.TableNames);
+        foreach (var table in CohortSchemaContract.Tables)
+        {
+            mapped[table.Role].FindPrimaryKey()!.Properties.Select(property => property.Name)
+                .Should().Equal(table.PrimaryKey);
+        }
+    }
+
+    [Fact]
+    public void CohortStoreTables_Rejects_A_Model_Without_Cohort_Table_Mappings()
+    {
+        var options = new DbContextOptionsBuilder<UnconfiguredDbContext>()
+            .UseNpgsqlMetadataModel($"unconfigured-cohort-schema-{Guid.NewGuid()}")
+            .Options;
+        using var db = new UnconfiguredDbContext(options);
+
+        var act = () => CohortStoreTables.FromModel(db.Model);
+
+        act.Should()
+            .Throw<InvalidOperationException>()
+            .WithMessage("*ConfigureCohortTables*");
+    }
+
+    [Fact]
+    public void ConfigureCohortTables_Maps_All_Tables_To_The_Supplied_Schema()
+    {
+        const string schema = "Cohort schema \"quoted\"";
+        var options = new DbContextOptionsBuilder<CustomSchemaDbContext>()
+            .UseNpgsqlMetadataModel($"custom-cohort-schema-{Guid.NewGuid()}")
+            .Options;
+        using var db = new CustomSchemaDbContext(options);
+
+        db.Model
+            .GetEntityTypes()
+            .Where(entityType => CohortTableNames.Contains(entityType.GetTableName()))
+            .Should()
+            .HaveCount(5)
+            .And.OnlyContain(entityType => entityType.GetSchema() == schema);
+    }
+
+    [Fact]
+    public void ConfigureCohortTables_Does_Not_Adopt_A_Same_Named_Table_In_Another_Schema()
+    {
+        var options = new DbContextOptionsBuilder<OtherSchemaCollisionDbContext>()
+            .UseNpgsqlMetadataModel($"other-schema-collision-{Guid.NewGuid()}")
+            .Options;
+        using var db = new OtherSchemaCollisionDbContext(options);
+
+        var mappedSweepRuns = db.Model
+            .GetEntityTypes()
+            .Where(entityType => entityType.GetTableName() == "sweep_run")
+            .ToArray();
+
+        mappedSweepRuns.Should().HaveCount(2);
+        mappedSweepRuns.Should().ContainSingle(entityType => entityType.GetSchema() == "host");
+        mappedSweepRuns.Should().ContainSingle(entityType => entityType.GetSchema() == "cohort");
+    }
+
+    [Fact]
+    public void Retained_Table_Identity_Falls_Back_To_Public()
+    {
+        var options = new DbContextOptionsBuilder<PublicRetainedSchemaDbContext>()
+            .UseNpgsqlMetadataModel($"public-retained-schema-{Guid.NewGuid()}")
+            .Options;
+        using var db = new PublicRetainedSchemaDbContext(options);
+        var entityType = db.Model.FindEntityType(typeof(SchemaRecord))!;
+
+        var entry = new RetentionEntryBuilder(new RetentionModelConventions()).TryBuild(entityType);
+
+        entry!.Table.Schema.Should().Be("public");
+        entry.Table.Name.Should().Be("schema_records");
+    }
+
+    [Fact]
+    public void Retained_Table_Identity_Uses_The_Model_Default_Schema()
+    {
+        var options = new DbContextOptionsBuilder<DefaultRetainedSchemaDbContext>()
+            .UseNpgsqlMetadataModel($"default-retained-schema-{Guid.NewGuid()}")
+            .Options;
+        using var db = new DefaultRetainedSchemaDbContext(options);
+        var entityType = db.Model.FindEntityType(typeof(SchemaRecord))!;
+
+        var entry = new RetentionEntryBuilder(new RetentionModelConventions()).TryBuild(entityType);
+
+        entry!.Table.Schema.Should().Be("Host Default \"Schema\"");
+        entry.Table.Name.Should().Be("schema_records");
+    }
+
     [Fact]
     public void ConfigureCohortTables_Rejects_Host_Entities_Coincidentally_Mapped_To_Cohort_Table_Names()
     {
@@ -85,6 +209,21 @@ public sealed class CohortTableAdoptionTests
 
         handlerStatus.GetForeignKeys().Single().PrincipalEntityType.ClrType
             .Should().Be(typeof(HostSweepRunRowDetail));
+    }
+
+    [Fact]
+    public void ConfigureCohortTables_Rejects_A_Host_Handler_Status_Table_Collision()
+    {
+        var options = new DbContextOptionsBuilder<HandlerStatusCollisionDbContext>()
+            .UseNpgsqlMetadataModel($"handler-status-collision-{Guid.NewGuid()}")
+            .Options;
+        using var db = new HandlerStatusCollisionDbContext(options);
+
+        var act = () => db.Model;
+
+        act.Should()
+            .Throw<InvalidOperationException>()
+            .WithMessage("*sweep_row_handler_status*table-name collision*");
     }
 
     private sealed class RogueSweepRunDbContext(DbContextOptions<RogueSweepRunDbContext> options)
@@ -230,10 +369,108 @@ public sealed class CohortTableAdoptionTests
         public DateTimeOffset At { get; set; }
         public string EntityType { get; set; } = "";
         public Guid RetentionEntityId { get; set; }
-        public string EntityId { get; set; } = "";
+        public string RecordId { get; set; } = "";
         public string Category { get; set; } = "";
         public int Strategy { get; set; }
         public Guid TenantId { get; set; }
         public string? CapturedPayload { get; set; }
+    }
+
+    private sealed class HandlerStatusCollisionDbContext(
+        DbContextOptions<HandlerStatusCollisionDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<HostSweepRowHandlerStatus>(builder =>
+            {
+                builder.ToTable("sweep_row_handler_status");
+                builder.HasKey(status => status.Id);
+            });
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    private sealed class HostSweepRowHandlerStatus
+    {
+        public long Id { get; set; }
+        public long SweepRunRowDetailId { get; set; }
+        public string HandlerType { get; set; } = "";
+    }
+
+    private sealed class PublicSchemaDbContext(DbContextOptions<PublicSchemaDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    private sealed class UnconfiguredDbContext(DbContextOptions<UnconfiguredDbContext> options)
+        : DbContext(options);
+
+    private sealed class CustomSchemaDbContext(DbContextOptions<CustomSchemaDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.ConfigureCohortTables("Cohort schema \"quoted\"");
+        }
+    }
+
+    private sealed class OtherSchemaCollisionDbContext(
+        DbContextOptions<OtherSchemaCollisionDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<RogueSweepRun>(builder =>
+            {
+                builder.ToTable("sweep_run", "host");
+                builder.HasKey(run => run.Id);
+            });
+            modelBuilder.ConfigureCohortTables("cohort");
+        }
+    }
+
+    private sealed class PublicRetainedSchemaDbContext(
+        DbContextOptions<PublicRetainedSchemaDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<SchemaRecord>(builder =>
+            {
+                builder.ToTable("schema_records");
+                builder.HasKey(record => record.Id);
+            });
+            modelBuilder.ConfigureCohortTables("cohort");
+        }
+    }
+
+    private sealed class DefaultRetainedSchemaDbContext(
+        DbContextOptions<DefaultRetainedSchemaDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.HasDefaultSchema("Host Default \"Schema\"");
+            modelBuilder.Entity<SchemaRecord>(builder =>
+            {
+                builder.ToTable("schema_records");
+                builder.HasKey(record => record.Id);
+            });
+            modelBuilder.ConfigureCohortTables("cohort");
+        }
+    }
+
+    [Retain("schema", nameof(CreatedAt))]
+    [RetentionEntityId("3a80b886-d4c4-405d-a5ef-f6d604edfe75")]
+    private sealed class SchemaRecord
+    {
+        public Guid Id { get; set; }
+        public Guid TenantId { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
     }
 }

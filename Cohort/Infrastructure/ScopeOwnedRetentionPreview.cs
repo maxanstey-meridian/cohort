@@ -15,6 +15,9 @@ internal sealed class ScopeOwnedRetentionPreview(IServiceScopeFactory scopeFacto
         ArgumentNullException.ThrowIfNull(request);
 
         await using var scope = scopeFactory.CreateAsyncScope();
+        await scope.ServiceProvider
+            .GetRequiredService<RetentionRuntimeReadinessValidator>()
+            .ValidateAsync(ct);
         var preview = scope.ServiceProvider.GetRequiredService<RetentionPreviewService>();
         return await preview.ExecuteAsync(request, ct);
     }

@@ -1,5 +1,4 @@
 using System.Reflection;
-using Cohort.Application;
 using Cohort.Domain;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata;
@@ -73,7 +72,11 @@ internal sealed class RetentionEntryBuilder(RetentionModelConventions convention
                 ?? throw new InvalidOperationException(
                     $"[Retain] on {clrType.FullName}: retained entities must declare [RetentionEntityId(\"uuid\")] with a stable non-empty UUID."
                 ),
-            tableName,
+            new RelationalObjectName(
+                entityType.GetSchema() ?? entityType.Model.GetDefaultSchema() ?? "public",
+                tableName
+            ),
+            CohortStoreTables.FromModel(entityType.Model),
             retain.Category,
             retain.AnchorMember,
             anchorColumn,

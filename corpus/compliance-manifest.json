@@ -1,0 +1,368 @@
+{
+  "manifestVersion": "2.1.0",
+  "product": "Cohort",
+  "claim": "This manifest inventories Cohort's retention controls. It does not certify complete GDPR compliance or adjudicate whether a legal minimum, hold, or erasure request is legally justified. Evidence identities are structurally linked here; execution is established only by successful test runs.",
+  "requirements": [
+    { "id": "CORPUS-001", "source": "Cohort product invariant: executable compliance inventory", "requirement": "Every supported manifest entry names structurally linked xUnit evidence, every dedicated corpus test is linked by the manifest, and statuses and evidence kinds use closed vocabularies; successful test execution is a separate gate.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.ComplianceCorpusManifestTests", "method": "Manifest_is_complete_and_bidirectional", "kind": "architecture", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.ComplianceCorpusManifestTests", "method": "Manifest_declares_scope_and_non_goals", "kind": "architecture", "primary": false },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.ComplianceCorpusManifestTests", "method": "Manifest_primary_evidence_rules_reject_malformed_requirements", "kind": "architecture", "primary": true },
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.ComplianceManifestContractTests", "method": "Manifest_contract_is_well_formed_and_unit_evidence_is_structurally_linked", "kind": "architecture", "primary": true },
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.ComplianceManifestContractTests", "method": "Manifest_primary_evidence_rules_reject_malformed_requirements", "kind": "architecture", "primary": true }
+    ], "status": "supported" },
+
+    { "id": "SCOPE-001", "source": "Cohort product invariant: annotation-driven retention scope", "requirement": "Entities marked Retain participate, while unannotated and ExemptFromRetention entities remain outside mutation scope.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionSweepEndToEndTests", "method": "Sweep_Path_Deletes_Only_Rows_Older_Than_The_Resolved_Cutoff_For_The_Target_Tenant_And_Leaves_Exempt_Documents_Untouched", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionStartupValidatorTests", "method": "ValidateAsync_Passes_For_Unannotated_Entities_As_Implicitly_Exempt", "kind": "hosted-postgresql", "primary": false },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.RetentionScopeCorpusTests", "method": "Annotations_define_the_retention_scope", "kind": "architecture", "primary": false }
+    ], "status": "supported" },
+    { "id": "SCOPE-002", "source": "Cohort product invariant: fail-closed model validation", "requirement": "Conflicting Retain and ExemptFromRetention annotations fail validation before mutation.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.RetentionScopeCorpusTests", "method": "Conflicting_annotations_fail_validation_before_mutation", "kind": "hosted-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "SCOPE-003", "source": "Cohort product invariant: unsupported relational model shapes", "requirement": "Owned, shared-table, and table-split retained mappings fail hosted startup and direct public execution before seeded rows can be mutated.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.RetentionScopeCorpusTests", "method": "Unsupported_relational_mappings_fail_validation_before_mutation", "kind": "hosted-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "SCOPE-004", "source": "Cohort product invariant: inheritance mappings are unsupported", "requirement": "A retained entity participating in an EF inheritance hierarchy fails hosted startup and direct public execution before seeded rows can be mutated.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.RetentionScopeCorpusTests", "method": "Unsupported_relational_mappings_fail_validation_before_mutation", "kind": "hosted-postgresql", "primary": true }
+    ], "status": "supported" },
+
+    { "id": "STORAGE-001", "source": "UK GDPR Article 5(1)(e), storage limitation", "requirement": "Ordinary sweeps process rows strictly older than the resolved cutoff and preserve unexpired rows and rows exactly on the cutoff.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.StorageLimitationCorpusTests", "method": "Scheduled_sweep_applies_strict_resolved_cutoff_and_reports_null_anchors", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "STORAGE-002", "source": "Cohort product invariant: explicit null-anchor accountability", "requirement": "Zero retention permits immediate scheduled eligibility, while null anchors survive scheduled sweeps and are reported.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.StorageLimitationCorpusTests", "method": "Scheduled_sweep_applies_strict_resolved_cutoff_and_reports_null_anchors", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "STORAGE-003", "source": "Cohort product invariant: contextual policy resolution", "requirement": "Rule resolution receives the target tenant and logical time, and ordinary sweeps use the greater of Period and LegalMin.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.LegalMinimumCorpusTests", "method": "Tenant_and_logical_time_change_the_resolved_rule_outcome_and_audited_period", "kind": "public-postgresql", "primary": true }
+      ,{ "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.LegalMinimumCorpusTests", "method": "Ordinary_sweep_uses_the_greater_of_period_and_legal_minimum", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "STORAGE-004", "source": "Cohort product invariant: explicit exemption strategy", "requirement": "Strategy.Exempt produces a visible zero-mutation result while preserving matching rows.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.StrategySemanticsCorpusTests", "method": "Public_sweep_applies_each_strategy_only_to_eligible_rows", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+
+    { "id": "STRATEGY-001", "source": "Cohort product invariant: purge semantics", "requirement": "Purge physically removes only eligible rows.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.StrategySemanticsCorpusTests", "method": "Public_sweep_applies_each_strategy_only_to_eligible_rows", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "STRATEGY-002", "source": "Cohort product invariant: soft-delete semantics", "requirement": "Soft delete changes only configured deletion markers and does not repeat completed deletion.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.StrategySemanticsCorpusTests", "method": "Public_sweep_applies_each_strategy_only_to_eligible_rows", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "STRATEGY-003", "source": "Cohort product invariant: anonymisation semantics", "requirement": "Anonymise changes only declared fields, preserves non-personal fields, and does not repeatedly anonymise marked rows.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.AnonymisationCorpusTests", "method": "Anonymisation_changes_only_declared_fields_once_with_factory_semantics", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "STRATEGY-004", "source": "Cohort product invariant: provider-aware anonymisation values", "requirement": "Factory-backed anonymisation reads original values in their CLR representation and converts generated output to the configured provider representation.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AnonymiseSweepEndToEndTests", "method": "Sweep_Path_Converts_Provider_Values_Back_To_Clr_Values_Before_Building_OriginalValue_Context", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AnonymiseSweepEndToEndTests", "method": "Sweep_Path_Converts_SetBased_Factory_Output_To_Provider_Values_Before_Writing", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "STRATEGY-005", "source": "Cohort product invariant: strategy-specific startup validation", "requirement": "Invalid soft-delete and anonymise model metadata fails validation before execution.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.SoftDeleteSweepEndToEndTests", "method": "Validation_Fails_When_A_SoftDelete_Category_Lacks_The_Required_Convention", "kind": "hosted-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.StartupValidationEndToEndTests", "method": "Validation_Checks_Every_Strategy_Declared_For_A_Dynamic_Category", "kind": "hosted-postgresql", "primary": true }
+    ], "status": "supported" },
+
+    { "id": "LEGALMIN-001", "source": "Cohort product invariant informed by UK GDPR Article 17(3)", "requirement": "Ordinary sweeps apply max(Period, LegalMin), keep the exact boundary protected, and invoke rule resolution with the target tenant and logical time.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.LegalMinimumCorpusTests", "method": "Ordinary_sweep_uses_the_greater_of_period_and_legal_minimum", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "LEGALMIN-002", "source": "Cohort product invariant: minimum-age evidence", "requirement": "A null anchor cannot establish elapsed positive LegalMin and audit evidence records the policy actually applied.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.LegalMinimumCorpusTests", "method": "Ordinary_sweep_uses_the_greater_of_period_and_legal_minimum", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+
+    { "id": "HOLD-001", "source": "Cohort product invariant informed by UK GDPR Article 17(3)", "requirement": "Active holds prevent mutation; holds at their expiry boundary and holds at their removal boundary do not.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.HoldsCorpusTests", "method": "Active_holds_block_mutation_while_expired_holds_do_not", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionHoldsEndToEndTests", "method": "Hold_Is_Inactive_When_ExpiresAt_Equals_AsOf", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionHoldsEndToEndTests", "method": "Hold_Is_Inactive_When_RemovedAt_Equals_AsOf", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "HOLD-002", "source": "Cohort product invariant: hold identity scope", "requirement": "Holds are scoped by stable retention-entity identity, canonical record identity, and tenant, including equal canonical record and tenant identities in different retained entity types.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionHoldsEndToEndTests", "method": "Hold_Does_Not_Cross_Entity_Boundaries_For_The_Same_Record_And_Tenant", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "HOLD-003", "source": "Cohort product invariant: strategy-consistent holds", "requirement": "Active holds block purge, soft delete, anonymise, and erasure execution.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.HoldsCorpusTests", "method": "Active_holds_block_mutation_while_expired_holds_do_not", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionErasureEndToEndTests", "method": "Erase_Still_Respects_Active_Holds_When_Period_Is_Ignored", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "HOLD-004", "source": "Cohort product boundary: hosts own legal decisions", "requirement": "Cohort enforces configured case-specific holds but does not adjudicate their legal validity.", "evidence": [], "status": "non-goal" },
+    { "id": "HOLD-005", "source": "Cohort product invariant: race-safe hold enforcement", "requirement": "Mutation rechecks a concurrently created hold before purge or anonymisation.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionHoldsEndToEndTests", "method": "Hold_Creation_Racing_Purge_Preserves_The_Row", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionHoldsEndToEndTests", "method": "Hold_Creation_Racing_Anonymise_Preserves_The_Row_Unchanged", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "HOLD-006", "source": "Cohort product invariant: hold target validation", "requirement": "Hold creation rejects a canonical record identity when the target row does not exist.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.HoldsCorpusTests", "method": "Hold_creation_rejects_a_nonexistent_canonical_record_id", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "HOLD-007", "source": "Cohort product invariant: complete public hold race matrix", "requirement": "Public hold creation racing purge, soft delete, anonymise, and erasure preserves protected rows and reports committed public counts.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionHoldsEndToEndTests", "method": "Hold_Creation_Racing_Purge_Preserves_The_Row", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionHoldsEndToEndTests", "method": "Hold_Creation_Racing_SoftDelete_Preserves_All_Deletion_Markers", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionHoldsEndToEndTests", "method": "Hold_Creation_Racing_Anonymise_Preserves_The_Row_Unchanged", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionHoldsEndToEndTests", "method": "Hold_Creation_Racing_Erasure_Preserves_The_Row", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "HOLD-008", "source": "Cohort product invariant: hold tenant ownership", "requirement": "Hold creation rejects a tenant identity that does not own the existing target row.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionHoldsEndToEndTests", "method": "CreateAsync_Rejects_Holds_Whose_Tenant_Does_Not_Match_The_Existing_Rows_Tenant", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+
+    { "id": "ERASURE-001", "source": "Cohort contract informed by UK GDPR Article 17", "requirement": "Accepted erasure ignores ordinary Period and acts immediately when no positive LegalMin or active hold blocks it.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.ErasureCorpusTests", "method": "Erasure_is_subject_and_tenant_scoped_and_requires_soft_delete_opt_in", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ERASURE-002", "source": "Cohort product invariant informed by UK GDPR Article 17(3)", "requirement": "Positive LegalMin and active holds remain configured erasure blockers.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionErasureEndToEndTests", "method": "Erase_Does_Not_Touch_Row_Within_LegalMin", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionErasureEndToEndTests", "method": "Erase_Still_Respects_Active_Holds_When_Period_Is_Ignored", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ERASURE-003", "source": "Cohort product invariant: exact erasure scope", "requirement": "Tenant, primary subject, and alternate subject matching are exact.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.IsolationCorpusTests", "method": "Tenant_and_subject_boundaries_prevent_cross_scope_mutation", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionErasureEndToEndTests", "method": "Erasure_Service_Executes_Primary_And_Alternate_Subject_Matches", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ERASURE-004", "source": "Cohort contract informed by UK GDPR Article 17", "requirement": "Null and future anchors are eligible without positive LegalMin and blocked and reported with positive LegalMin.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionErasureEndToEndTests", "method": "Erasure_Anchor_Eligibility_Depends_Only_On_Positive_LegalMin", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ERASURE-005", "source": "Cohort product invariant: strategy-consistent erasure", "requirement": "Purge, anonymise, and explicitly approved soft delete share erasure eligibility; unapproved soft delete is refused without source mutation or audit evidence.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.ErasureCorpusTests", "method": "Erasure_is_subject_and_tenant_scoped_and_requires_soft_delete_opt_in", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionErasureEndToEndTests", "method": "Erase_Refuses_SoftDelete_Categories_Without_Explicit_OptIn", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ERASURE-006", "source": "Cohort product invariant: consistent erasure measurement", "requirement": "Audited dry-run erasure and live erasure report the same eligibility for purge, soft delete, and anonymise, including when LegalMin exceeds Period.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionErasureEndToEndTests", "method": "PreviewErase_Matches_Mutation_Eligibility", "kind": "public-postgresql", "primary": true }
+      ,{ "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionErasureEndToEndTests", "method": "PreviewErase_Matches_Mutation_Eligibility_When_LegalMin_Exceeds_Period", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ERASURE-007", "source": "Cohort product invariant: handler-aware erasure", "requirement": "Audited dry-run and live handler-aware erasure apply cutoff eligibility before queueing work; dry-run invokes no handlers and persists no handler work.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionHandlerEndToEndTests", "method": "DryRun_Erasure_With_Handlers_Does_Not_Invoke_Handlers_Or_Persist_Handler_Work", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionHandlerEndToEndTests", "method": "Preview_And_Live_Erasure_With_Handlers_Apply_Cutoff_Gating_Before_Queueing_Handler_Work", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ERASURE-008", "source": "Cohort product invariant: lock-wait revalidation", "requirement": "Handler-aware erasure rechecks the subject after waiting for a row lock and does not mutate a row whose subject changed.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AnonymiseSweepEndToEndTests", "method": "Handler_Aware_Erasure_Rechecks_Subject_After_Waiting_For_The_Row", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ERASURE-009", "source": "Cohort product invariant: final immediate-erasure revalidation", "requirement": "Final mutation rechecks the post-refactor legal-minimum, hold, subject, tenant, and anchor eligibility after lock waits.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionErasureEndToEndTests", "method": "Erasure_Final_Mutation_Revalidates_Hold_Subject_Tenant_And_LegalMin_After_Lock_Wait", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ERASURE-010", "source": "Cohort product invariant: erasure-subject metadata", "requirement": "Erasure-subject markers are property-targeted, permit multiple markers, are not inherited, and startup rejects incompatible effective subject types.", "evidence": [
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.RetentionAttributeTests", "method": "ErasureSubject_Attribute_Is_Property_Targeted_Multi_Instance_And_Not_Inherited", "kind": "pure-contract", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionErasureEndToEndTests", "method": "Startup_Validation_Fails_When_Multi_Subject_Metadata_Uses_Incompatible_Effective_Types", "kind": "hosted-postgresql", "primary": true }
+    ], "status": "supported" },
+
+    { "id": "ANON-001", "source": "UK GDPR Article 5(1)(c), data minimisation; Cohort product invariant", "requirement": "Only declared anonymisation properties change; null, empty-string, fixed-literal, and factory-backed methods obey their declarations.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.AnonymisationCorpusTests", "method": "Anonymisation_changes_only_declared_fields_once_with_factory_semantics", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AnonymiseWithEndToEndTests", "method": "Sweep_Path_Applies_Literal_And_FactoryBacked_Anonymisation_On_TombstoneRecord", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ANON-002", "source": "Cohort product invariant: atomic and scoped anonymisation", "requirement": "The anonymised marker is written with the mutation, original-value factories receive the original CLR value, and undeclared data remains unchanged.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.AnonymisationCorpusTests", "method": "Anonymisation_changes_only_declared_fields_once_with_factory_semantics", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AnonymiseSweepEndToEndTests", "method": "Sweep_Path_Converts_Provider_Values_Back_To_Clr_Values_Before_Building_OriginalValue_Context", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ANON-003", "source": "Cohort product invariant: provider-aware anonymisation", "requirement": "Anonymisation converts provider values to CLR originals before factory invocation and converts factory output back to the provider representation.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AnonymiseSweepEndToEndTests", "method": "Sweep_Path_Converts_Provider_Values_Back_To_Clr_Values_Before_Building_OriginalValue_Context", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AnonymiseSweepEndToEndTests", "method": "Sweep_Path_Converts_SetBased_Factory_Output_To_Provider_Values_Before_Writing", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+
+    { "id": "ACCOUNT-001", "source": "UK GDPR Article 5(2), accountability; Cohort product invariant", "requirement": "Mutating runs persist coherent started, entity-summary, row-detail when configured, and terminal evidence whose totals agree with committed mutations.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.AccountabilityCorpusTests", "method": "Mutating_run_persists_coherent_summary_and_row_evidence", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AuditWriterEndToEndTests", "method": "Sweep_Path_Persists_Run_Summary_And_OptIn_Row_Detail_Events_And_Returns_Result_From_The_Same_Aggregate", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ACCOUNT-002", "source": "Cohort product invariant: configurable row evidence", "requirement": "Per-row evidence exists when configured and resolved rule provenance is preserved in entity summaries.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.AccountabilityCorpusTests", "method": "Mutating_run_persists_coherent_summary_and_row_evidence", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AuditWriterEndToEndTests", "method": "Sweep_Path_Persists_Run_Summary_And_OptIn_Row_Detail_Events_And_Returns_Result_From_The_Same_Aggregate", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ACCOUNT-003", "source": "Cohort product invariant: transactionally honest evidence", "requirement": "A rolled-back mutation does not leave committed row-detail or entity-progress evidence.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AuditObserverEndToEndTests", "method": "Rolled_Back_Row_Detail_And_Progress_Are_Not_Observed", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ACCOUNT-004", "source": "Cohort product invariant: authoritative audit ownership", "requirement": "Consumers cannot replace or disable the internal authoritative audit writer, and consumer observer registration cannot suppress committed authoritative evidence.", "evidence": [
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.PackageReleaseContractTests", "method": "Assembly_Exports_Only_The_Explicit_Package_API", "kind": "architecture", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.AccountabilityCorpusTests", "method": "Consumer_observer_registration_cannot_suppress_authoritative_audit", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ACCOUNT-005", "source": "Cohort product invariant: privacy-safe diagnostics", "requirement": "New persisted diagnostics contain no subject data or raw exception text and carry a diagnostic identifier correlated with the original exception in structured logs; hosts remain responsible for sink access and retention.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.FailureSafetyCorpusTests", "method": "Erasure_failure_diagnostics_exclude_subject_data_and_correlate_to_logs", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.FailureSafetyCorpusTests", "method": "Handler_failure_diagnostics_exclude_personal_data_and_correlate_to_logs", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ACCOUNT-006", "source": "Cohort product invariant: held-work visibility", "requirement": "Held work is visible in public counts and persisted entity summaries.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionPreviewEndToEndTests", "method": "Preview_Reports_The_Same_Measured_Held_And_Null_Anchor_Counts_As_Dry_Run", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ACCOUNT-007", "source": "Cohort product invariant: skipped-work visibility", "requirement": "A row skipped by OnBefore is visible in public counts and persisted entity summaries.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionHandlerEndToEndTests", "method": "Live_Erasure_When_OnBefore_Fails_Counts_The_Skipped_Row_In_Entity_Summaries", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ACCOUNT-008", "source": "Cohort product invariant: null-anchor visibility", "requirement": "Null-anchor work is visible in public counts and audited dry-run summaries.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionPreviewEndToEndTests", "method": "Preview_Reports_The_Same_Measured_Held_And_Null_Anchor_Counts_As_Dry_Run", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ACCOUNT-009", "source": "Cohort product invariant: failed-work visibility", "requirement": "An entity failure is visible in the result and settles the run as partially failed without discarding successful summaries.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.FailureSafetyCorpusTests", "method": "An_entity_failure_preserves_committed_work_and_reports_only_committed_totals", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+
+    { "id": "ISOLATION-001", "source": "Cohort product invariant: tenant and subject isolation", "requirement": "Tenants, tenantless runs, and subject requests cannot mutate rows outside their exact scope.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.IsolationCorpusTests", "method": "Tenant_and_subject_boundaries_prevent_cross_scope_mutation", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionErasureEndToEndTests", "method": "Tenant_Erasure_Leaves_Tenantless_Subject_Data_Untouched_And_Unaudited", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ISOLATION-002", "source": "Cohort product invariant: canonical record identity", "requirement": "Record identifiers are canonical across culture boundaries, and integer record IDs remain correctly scoped for held and tenantless rows.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.CanonicalRecordIdSqlBoundaryEndToEndTests", "method": "Public_Sweep_Uses_Postgres_Canonical_Record_Ids_Under_A_NonInvariant_Culture", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionHoldsEndToEndTests", "method": "Repository_Uses_Selected_Integer_Record_Id_And_Tenantless_Hold_Matching", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ISOLATION-003", "source": "Cohort product invariant: explicit schema identity", "requirement": "Same-named tables in another schema cannot be read, validated, or mutated.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.SchemaQualificationEndToEndTests", "method": "Custom_schemas_are_isolated_from_search_path_and_public_decoys", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "ISOLATION-004", "source": "Cohort product invariant: isolated retention DbContext scope", "requirement": "Caller-tracked EF entities cannot overwrite Cohort mutations.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.PublicRetentionScopeIsolationEndToEndTests", "method": "RetentionSweep_Does_Not_Allow_Caller_Tracked_Entity_To_Overwrite_SoftDelete", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+
+    { "id": "FAILURE-001", "source": "Cohort product invariant: transactional batch accounting", "requirement": "An entity mutation failure does not over-report affected rows and does not undo work already committed for another entity.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.FailureSafetyCorpusTests", "method": "An_entity_failure_preserves_committed_work_and_reports_only_committed_totals", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "FAILURE-002", "source": "Cohort product invariant: failed-handler loop prevention", "requirement": "Committed row-detail progress excludes a persistently failing OnBefore row from later batches in the same run rather than causing an in-run processing loop.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionHandlerEndToEndTests", "method": "Multi_Batch_Sweep_Excludes_Persistently_Failing_OnBefore_Rows_From_Later_Batches", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "FAILURE-003", "source": "Cohort product invariant: cancellation evidence", "requirement": "Cancellation produces coherent terminal evidence and rolls back uncommitted mutation and audit progress.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AuditDurabilityEndToEndTests", "method": "Cancellation_During_Mutation_Rolls_Back_Entity_And_Audit_Progress", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "FAILURE-004", "source": "Cohort internal invariant: cleanup exception precedence", "requirement": "Internal operational cleanup preserves an existing primary exception; without one, unlock failure outranks connection-close failure.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AdvisoryLockCleanupEndToEndTests", "method": "Primary_Failure_Wins_Over_Unlock_And_Close_Failures", "kind": "internal-mechanism", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AdvisoryLockCleanupEndToEndTests", "method": "Unlock_Failure_Wins_Over_Close_Failure_Without_A_Primary_Failure", "kind": "internal-mechanism", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AdvisoryLockCleanupEndToEndTests", "method": "Close_Failure_Is_Surfaced_When_Unlock_Succeeds_And_No_Primary_Failure_Exists", "kind": "internal-mechanism", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AdvisoryLockCleanupEndToEndTests", "method": "Primary_Failure_Wins_When_Only_Close_Fails", "kind": "internal-mechanism", "primary": true }
+    ], "status": "supported" },
+    { "id": "FAILURE-005", "source": "Cohort product invariant: final eligibility revalidation", "requirement": "A row discovered for erasure is not mutated if its subject changes while execution waits for its row lock.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AnonymiseSweepEndToEndTests", "method": "Handler_Aware_Erasure_Rechecks_Subject_After_Waiting_For_The_Row", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "FAILURE-006", "source": "Cohort product invariant: entity failure isolation", "requirement": "One entity failure does not suppress successful work for unrelated entities in the same run.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.FailureSafetyCorpusTests", "method": "An_entity_failure_preserves_committed_work_and_reports_only_committed_totals", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "FAILURE-007", "source": "Cohort product invariant: tenant failure isolation", "requirement": "One tenant failure does not suppress later tenants or the tenantless pass in the same scheduled occurrence.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionWorkerEndToEndTests", "method": "Worker_Isolates_A_Tenant_Failure_And_Still_Runs_Later_And_Tenantless_Passes", "kind": "hosted-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "FAILURE-008", "source": "Cohort product invariant: rollback retryability", "requirement": "A cancelled in-flight batch leaves its source row and no committed progress evidence, so the row remains eligible for a later run.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AuditDurabilityEndToEndTests", "method": "Cancellation_During_Mutation_Rolls_Back_Entity_And_Audit_Progress", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "FAILURE-009", "source": "Cohort product invariant: bounded failed-handler resources", "requirement": "Failed-handler progress uses no run-sized record-ID collection and candidate SQL parameter counts remain bounded by batch-local work as failures grow.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionHandlerEndToEndTests", "method": "High_Volume_Persisted_OnBefore_Failures_Do_Not_Starve_Healthy_Later_Batches", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AnonymiseSweepEndToEndTests", "method": "Handler_Aware_Anonymisation_Keeps_Candidate_Resources_Batch_Bounded_As_Failure_History_Grows", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.ComplianceManifestContractTests", "method": "Sweep_Orchestrators_Do_Not_Accumulate_Run_History_Record_Ids", "kind": "architecture", "primary": true }
+    ], "status": "supported" },
+    { "id": "CONCURRENCY-001", "source": "Cohort product invariant: concurrent public mutation", "requirement": "Concurrent public sweep engines do not double-mutate or double-report rows across relational bulk, handler-aware relational, and anonymisation implementations.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.SweepConcurrencyAndVolumeEndToEndTests", "method": "Two_Concurrent_Engines_Sweep_Every_Row_Exactly_Once", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.SweepConcurrencyAndVolumeEndToEndTests", "method": "Two_Concurrent_Handler_Aware_Engines_Report_Each_Row_Exactly_Once", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.SweepConcurrencyAndVolumeEndToEndTests", "method": "Two_Concurrent_Anonymisation_Engines_Report_Each_Row_Exactly_Once", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+
+    { "id": "READY-001", "source": "Cohort product invariant: current-schema compatibility", "requirement": "A public sweep succeeds against the current migrated PostgreSQL schema.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.OperationalReadinessCorpusTests", "method": "Public_operation_validates_and_runs_against_the_installed_postgresql_schema", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "READY-002", "source": "Cohort product invariant: capability-driven hosted startup validation", "requirement": "Real hosted startup validates every possible dynamic strategy before execution.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.StartupValidationEndToEndTests", "method": "Validation_Checks_Every_Strategy_Declared_For_A_Dynamic_Category", "kind": "hosted-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "READY-003", "source": "Cohort product invariant: direct runtime readiness", "requirement": "Direct public invocation without generic-host startup enforces readiness, caches only success, and fails before Started evidence.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RuntimeReadinessEndToEndTests", "method": "Direct_public_database_operations_reject_an_unmigrated_schema", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RuntimeReadinessEndToEndTests", "method": "Direct_sweep_retries_after_schema_repair_and_caches_successful_readiness", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RuntimeReadinessEndToEndTests", "method": "Cancelled_first_readiness_call_is_retryable", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "READY-004", "source": "Cohort product invariant: migration history safety", "requirement": "The stable-entity-identity migration backfills retained audit and hold history, the row-detail RecordId rename preserves historical evidence, and the legacy Cohort schema upgrades to the current model shape.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.SampleMigrationsEndToEndTests", "method": "Stable_Entity_Identity_Migration_Backfills_All_Retained_Entity_History", "kind": "migration-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.SampleMigrationsEndToEndTests", "method": "Row_Detail_Record_Id_Migration_Preserves_Historical_Audit_Data", "kind": "migration-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.SampleMigrationsEndToEndTests", "method": "Legacy_Cohort_Schema_Upgrades_To_Current_ConfigureCohortTables_Shape", "kind": "migration-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "READY-005", "source": "Cohort product invariant: scheduled kill switch", "requirement": "The worker reloads the kill switch between passes and stops further scheduled mutation when it becomes active.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionWorkerEndToEndTests", "method": "Worker_Reloads_KillSwitch_Between_Passes", "kind": "hosted-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "READY-006", "source": "Cohort product invariant: scheduled advisory lock", "requirement": "A worker skips a scheduled occurrence while another instance holds the sweep advisory lock.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionWorkerEndToEndTests", "method": "Worker_Skips_Occurrences_While_Another_Instance_Holds_The_Sweep_Lock", "kind": "hosted-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "READY-007", "source": "Cohort product invariant: provider configuration", "requirement": "Hosted startup rejects a DbContext with no configured provider. Direct public execution rejects a configured non-Npgsql provider before mutation.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.ComplianceCorpus.OperationalReadinessCorpusTests", "method": "Missing_provider_fails_hosted_startup_before_mutation", "kind": "hosted-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RuntimeReadinessEndToEndTests", "method": "Direct_public_operation_rejects_a_non_npgsql_provider", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "READY-008", "source": "Cohort product invariant: hosted schema readiness", "requirement": "Hosted startup rejects a legacy or incomplete Cohort schema before retention execution.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.HostCompositionEndToEndTests", "method": "StartAsync_Rejects_Legacy_Cohort_Schema_When_Host_Migrations_Are_Not_Applied", "kind": "hosted-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "READY-009", "source": "Cohort product invariant: bounded hosted configuration", "requirement": "Options validation rejects audit observer timeouts and dispatcher numeric values above their safe ceilings, and real hosted binding rejects dispatcher values above those ceilings before execution.", "evidence": [
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.CohortOptionsValidatorTests", "method": "Validate_Rejects_Audit_Observer_Timeout_Above_Safe_Ceiling", "kind": "pure-contract", "primary": true },
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.CohortOptionsValidatorTests", "method": "Validate_Rejects_Row_Handler_Dispatch_Options_Above_Safe_Ceilings", "kind": "pure-contract", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.StartupValidationEndToEndTests", "method": "Hosted_Start_Rejects_Bound_Row_Handler_Dispatch_Values_Above_Their_Ceilings", "kind": "hosted-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AuditObserverEndToEndTests", "method": "Extreme_Observer_Timeout_Fails_Options_Validation_Before_The_Run_Starts", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+
+    { "id": "DOMAIN-001", "source": "Cohort product invariant: invariant-safe retention rules", "requirement": "RetentionRule rejects invalid period, legal-minimum, strategy, and audit states; exposes get-only properties; and has no public positional Deconstruct method.", "evidence": [
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.RetentionRuleContractTests", "method": "RetentionRule_Rejects_A_Negative_Period", "kind": "pure-contract", "primary": true },
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.RetentionRuleContractTests", "method": "RetentionRule_Rejects_A_Negative_Legal_Min", "kind": "pure-contract", "primary": true },
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.RetentionRuleContractTests", "method": "RetentionRule_Rejects_Undefined_Enum_Values", "kind": "pure-contract", "primary": true },
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.RetentionRuleContractTests", "method": "RetentionRule_Rejects_Inherited_Audit_Row_Detail", "kind": "pure-contract", "primary": true },
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.RetentionRuleContractTests", "method": "RetentionRule_Has_Get_Only_Properties_And_No_Public_Deconstruct", "kind": "architecture", "primary": true }
+    ], "status": "supported" },
+    { "id": "DOMAIN-002", "source": "Cohort product invariant: immutable category capabilities", "requirement": "RetentionCategoryCapabilities is non-empty, contains only defined strategies, defensively copies input, and cannot be mutated through its public contract.", "evidence": [
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.RetentionCategoryCapabilitiesTests", "method": "Constructor_Defensively_Copies_A_NonEmpty_Strategy_Set", "kind": "pure-contract", "primary": true },
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.RetentionCategoryCapabilitiesTests", "method": "Constructor_Rejects_An_Empty_Strategy_Set", "kind": "pure-contract", "primary": true },
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.RetentionCategoryCapabilitiesTests", "method": "Constructor_Rejects_An_Undefined_Strategy", "kind": "pure-contract", "primary": true },
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.RetentionCategoryCapabilitiesTests", "method": "Strategies_Cannot_Be_Mutated_Through_The_Public_Contract", "kind": "pure-contract", "primary": true }
+    ], "status": "supported" },
+    { "id": "RULE-001", "source": "Cohort product invariant: capability-bounded runtime resolution", "requirement": "Runtime rejects unresolved categories and rules whose strategy is outside startup-validated category capabilities.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionRuleProviderEndToEndTests", "method": "Preview_Path_Rejects_An_Unresolved_Runtime_Rule", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionRuleProviderEndToEndTests", "method": "Preview_Path_Rejects_A_Strategy_Not_Declared_By_The_Provider", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "RULE-002", "source": "Cohort product invariant: resolution context fidelity", "requirement": "Rule resolution preserves category, tenant, logical time, and alias path, and alias cycles report through RetentionAliasCycleException.", "evidence": [
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.RetentionRuleContractTests", "method": "Retention_Resolution_Context_Captures_Category_Tenant_Now_And_Alias_Path", "kind": "pure-contract", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionRuleProviderEndToEndTests", "method": "Preview_Path_Propagates_Retention_Alias_Cycle_Exception", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+
+    { "id": "SCHEMA-001", "source": "Cohort product invariant: explicit Cohort schema mapping", "requirement": "ConfigureCohortTables maps all five Cohort tables to public by default and to the exact supplied custom schema when configured.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.CohortTableAdoptionTests", "method": "ConfigureCohortTables_Maps_All_Tables_Explicitly_To_Public", "kind": "architecture", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.CohortTableAdoptionTests", "method": "ConfigureCohortTables_Maps_All_Tables_To_The_Supplied_Schema", "kind": "architecture", "primary": true }
+    ], "status": "supported" },
+    { "id": "SCHEMA-002", "source": "Cohort product invariant: retained-table schema identity", "requirement": "A retained table with no explicit or model-default schema resolves to public, while a model-default schema is adopted exactly.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.CohortTableAdoptionTests", "method": "Retained_Table_Identity_Falls_Back_To_Public", "kind": "architecture", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.CohortTableAdoptionTests", "method": "Retained_Table_Identity_Uses_The_Model_Default_Schema", "kind": "architecture", "primary": true }
+    ], "status": "supported" },
+    { "id": "SCHEMA-SEARCHPATH-001", "source": "Cohort product invariant: exact PostgreSQL catalog and function resolution", "requirement": "PostgreSQL catalog relations and built-in functions used by Cohort cannot be shadowed by an earlier writable search_path schema.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.SchemaQualificationEndToEndTests", "method": "Custom_schemas_are_isolated_from_search_path_and_public_decoys", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.SchemaQualificationEndToEndTests", "method": "Raw_PostgreSql_SQL_Does_Not_Contain_Unqualified_Shadowable_Builtins", "kind": "architecture", "primary": false }
+    ], "status": "supported" },
+    { "id": "SCHEMA-CONTRACT-001", "source": "Cohort product invariant: single schema authority", "requirement": "One infrastructure-local schema contract owns all five Cohort table capabilities and is consumed by model construction, adoption, and runtime validation.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.MigrationModelEndToEndTests", "method": "Schema_Shape_Inventory_Is_Owned_Only_By_CohortSchemaContract", "kind": "architecture", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.MigrationModelEndToEndTests", "method": "Finalized_Cohort_Model_Matches_The_Schema_Contract", "kind": "architecture", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.CohortTableAdoptionTests", "method": "ConfigureCohortTables_Maps_All_Tables_To_The_Supplied_Schema", "kind": "architecture", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.CohortSchemaValidatorEndToEndTests", "method": "Validation_Accepts_The_Current_Migrated_Schema", "kind": "internal-mechanism", "primary": false }
+    ], "status": "supported" },
+
+    { "id": "AUDIT-001", "source": "Cohort product invariant: post-commit observer isolation", "requirement": "Multiple observers receive committed lifecycle events in order; failure, timeout, and cancellation non-cooperation by one observer cannot block later observers or alter the run result.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AuditObserverEndToEndTests", "method": "Multiple_Observers_Receive_The_Same_Committed_Lifecycle_In_Order", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AuditObserverEndToEndTests", "method": "Observer_Failures_And_Timeouts_Do_Not_Fail_The_Run_Or_Block_Later_Observers", "kind": "public-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AuditObserverEndToEndTests", "method": "Non_Cooperative_Timed_Out_Observer_Is_Quarantined_For_The_Remainder_Of_The_Run", "kind": "public-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "AUDIT-002", "source": "Cohort product boundary: observer delivery durability", "requirement": "External audit observer delivery is best effort and non-durable; authoritative database audit tables remain the durable evidence source.", "evidence": [], "status": "non-goal" },
+    { "id": "AUDIT-003", "source": "Cohort product invariant: historical diagnostic preservation", "requirement": "Forward migrations preserve historical sweep_run.Error and sweep_row_handler_status.LastError values byte-for-byte.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.SampleMigrationsEndToEndTests", "method": "Current_Migration_Preserves_Historical_Error_And_LastError_Bytes", "kind": "migration-postgresql", "primary": true }
+    ], "status": "supported" },
+
+    { "id": "TENANT-001", "source": "Cohort product invariant: scheduled tenant orchestration", "requirement": "Duplicate tenants execute once in first-seen order using the first context; conflicting contexts warn; execution is sequential; null tenant entries fail before any pass; cancellation from tenant acquisition or iteration propagates without later passes; and tenant failure does not suppress later or tenantless work.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionWorkerEndToEndTests", "method": "Worker_Deduplicates_Tenants_In_First_Seen_Order_And_Uses_The_First_Context", "kind": "hosted-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionWorkerEndToEndTests", "method": "Worker_Executes_Tenant_Passes_Sequentially", "kind": "hosted-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionWorkerEndToEndTests", "method": "Worker_Isolates_A_Tenant_Failure_And_Still_Runs_Later_And_Tenantless_Passes", "kind": "hosted-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionWorkerEndToEndTests", "method": "Worker_Sweeps_Tenantless_Entities_Even_When_The_Tenant_Source_Is_Empty", "kind": "hosted-postgresql", "primary": true }
+      ,{ "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionWorkerEndToEndTests", "method": "Worker_Rejects_A_Null_Tenant_Before_Any_Tenant_Or_Tenantless_Pass", "kind": "hosted-postgresql", "primary": true }
+      ,{ "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionWorkerEndToEndTests", "method": "Worker_Cancellation_From_The_Tenant_Source_Propagates_Without_Later_Passes", "kind": "hosted-postgresql", "primary": true }
+      ,{ "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionWorkerEndToEndTests", "method": "Worker_Cancellation_During_Tenant_Iteration_Propagates_Without_Any_Pass", "kind": "hosted-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "DISPATCH-001", "source": "Cohort product invariant: dispatcher ceilings and time safety", "requirement": "Dispatcher numeric options enforce documented ceilings, timestamp and retry arithmetic saturate, poll and heartbeat waits use OperationalTime.DelayAsync chunking, and the audit observer timeout has its own validated ceiling.", "evidence": [
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.CohortOptionsValidatorTests", "method": "Validate_Accepts_Row_Handler_Dispatch_Options_At_Safe_Ceilings", "kind": "pure-contract", "primary": true },
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.OperationalTimeTests", "method": "SubtractSaturating_Preserves_Exact_Representable_Boundaries", "kind": "pure-contract", "primary": true },
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.OperationalTimeTests", "method": "GetDelayChunk_Clamps_At_The_Exact_One_Minute_Boundary", "kind": "pure-contract", "primary": true },
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.OperationalTimeTests", "method": "GetDelayChunk_Returns_A_TaskDelay_Safe_Duration", "kind": "pure-contract", "primary": true },
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.OperationalTimeTests", "method": "CalculateNextAttemptAt_Uses_Exact_Exponential_Boundaries_And_Saturates", "kind": "pure-contract", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.StartupValidationEndToEndTests", "method": "Hosted_Start_Rejects_Bound_Row_Handler_Dispatch_Values_Above_Their_Ceilings", "kind": "hosted-postgresql", "primary": true }
+      ,{ "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionHandlerEndToEndTests", "method": "Hosted_Dispatcher_Stop_During_Poll_Delay_Completes_Cleanly", "kind": "hosted-postgresql", "primary": true }
+      ,{ "assembly": "Cohort.Tests", "type": "Cohort.Tests.CohortOptionsValidatorTests", "method": "Validate_Rejects_Audit_Observer_Timeout_Above_Safe_Ceiling", "kind": "pure-contract", "primary": true }
+      ,{ "assembly": "Cohort.Tests", "type": "Cohort.Tests.ComplianceManifestContractTests", "method": "Dispatcher_Poll_And_Heartbeat_Waits_Use_OperationalTime_DelayAsync", "kind": "architecture", "primary": true }
+    ], "status": "supported" },
+    { "id": "DISPATCH-002", "source": "Cohort internal invariant: bounded cleanup cancellation", "requirement": "Operational cleanup uses an independent bounded cancellation token while preserving primary, unlock, and close exception precedence.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AdvisoryLockCleanupEndToEndTests", "method": "Cleanup_Uses_An_Independent_Bounded_Cancellation_Token", "kind": "internal-mechanism", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.AdvisoryLockCleanupEndToEndTests", "method": "Primary_Failure_Wins_Over_Unlock_And_Close_Failures", "kind": "internal-mechanism", "primary": true }
+    ], "status": "supported" },
+
+    { "id": "PACKAGE-001", "source": "Cohort product invariant: explicit consumer surface", "requirement": "The whole exported package API is allowlisted; authoritative audit infrastructure, engines, schema descriptors, SQL helpers, reflection helpers, and ordering helpers remain internal; a clean packed-package consumer can restore, compile, and run.", "evidence": [
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.PackageReleaseContractTests", "method": "Assembly_Exports_Only_The_Explicit_Package_API", "kind": "architecture", "primary": true },
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.PackageReleaseContractTests", "method": "Packed_Package_Can_Be_Restored_Into_A_Clean_Consumer_And_Expose_Release_Gate_Symbols", "kind": "package-consumer", "primary": true }
+    ], "status": "supported" },
+    { "id": "PACKAGE-003", "source": "Cohort product invariant: compilable package documentation", "requirement": "Every C# README example is explicitly marked as a package compilation contract and compiles in a clean consumer restored from the packed Cohort package.", "evidence": [
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.PackageReleaseContractTests", "method": "Packed_Package_Can_Be_Restored_Into_A_Clean_Consumer_And_Expose_Release_Gate_Symbols", "kind": "package-consumer", "primary": true }
+    ], "status": "supported" },
+    { "id": "MIGRATION-001", "source": "Cohort product invariant: complete historical migration chain", "requirement": "Empty and legacy databases migrate to the current schema while stable retention-entity identity and the row-detail RecordId rename preserve historical holds, summaries, and row details.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.SampleMigrationsEndToEndTests", "method": "Legacy_Cohort_Schema_Upgrades_To_Current_ConfigureCohortTables_Shape", "kind": "migration-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.SampleMigrationsEndToEndTests", "method": "Stable_Entity_Identity_Migration_Backfills_All_Retained_Entity_History", "kind": "migration-postgresql", "primary": true },
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.SampleMigrationsEndToEndTests", "method": "Row_Detail_Record_Id_Migration_Preserves_Historical_Audit_Data", "kind": "migration-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "MIGRATION-002", "source": "Cohort product invariant: host-owned custom-schema move", "requirement": "Hosts changing Cohort schema move all five tables together with a host-owned migration that preserves data, indexes, checks, foreign keys, readiness, and runtime behavior in the destination schema.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.SchemaQualificationEndToEndTests", "method": "Host_owned_move_preserves_populated_Cohort_tables_and_runtime_behavior", "kind": "migration-postgresql", "primary": true }
+    ], "status": "supported" },
+    { "id": "PACKAGE-002", "source": "Cohort product invariant: immutable shipped migration sources", "requirement": "Every checked-in historical migration source and designer file has an approved filename and SHA-256 hash; the mutable model snapshot is excluded, and additions or edits require explicit baseline review.", "evidence": [
+      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.PackageReleaseContractTests", "method": "Historical_Migration_Filenames_And_SHA256_Hashes_Match_The_Approved_Baseline", "kind": "architecture", "primary": true }
+    ], "status": "supported" },
+
+    { "id": "NONGOAL-001", "source": "Cohort product boundary", "requirement": "Cohort does not claim complete GDPR compliance, adjudicate legal requests, or determine whether host legal minima and holds are legally justified.", "evidence": [], "status": "non-goal" },
+    { "id": "NONGOAL-002", "source": "Cohort product boundary", "requirement": "Data-subject discovery, identity verification, consent, lawful-basis assessment, portability, rectification, and regulatory reporting remain host responsibilities.", "evidence": [], "status": "non-goal" },
+    { "id": "NONGOAL-003", "source": "Cohort product boundary", "requirement": "Guaranteed external audit delivery, historical error redaction, SQL Server, SQLite, and automatic source generation are outside the supported contract.", "evidence": [], "status": "non-goal" }
+  ]
+}

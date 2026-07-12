@@ -192,7 +192,7 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
         command.CommandText = """
-            SELECT summary."EntityType", summary."RetentionEntityId", detail."RetentionEntityId", detail."EntityId"
+            SELECT summary."EntityType", summary."RetentionEntityId", detail."RetentionEntityId", detail."EntityId" AS "RecordId"
             FROM "sweep_run_entity_summary" AS summary
             INNER JOIN "sweep_run_row_detail" AS detail
                 ON detail."SweepId" = summary."SweepId"
@@ -205,7 +205,7 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
             """;
         command.Parameters.AddWithValue("sweepId", sweepId);
         await using var reader = await command.ExecuteReaderAsync();
-        var rows = new List<(string EntityType, Guid SummaryId, Guid DetailId, string EntityId)>();
+        var rows = new List<(string EntityType, Guid SummaryId, Guid DetailId, string RecordId)>();
         while (await reader.ReadAsync())
         {
             rows.Add(
@@ -220,7 +220,7 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
                     row.EntityType == mapping.EntityType
                     && row.SummaryId == mapping.RetentionEntityId
                     && row.DetailId == mapping.RetentionEntityId
-                    && row.EntityId
+                    && row.RecordId
                         == (
                             mapping.EntityType == "Cohort.Sample.Entities.Note"
                                 ? "known-record"
@@ -240,6 +240,114 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
         holdReader.GetGuid(0).Should().Be(RetentionEntityIdentity.For<Note>());
         holdReader.GetString(1).Should().Be("held-record");
         holdReader.GetGuid(2).Should().Be(tenantId);
+    }
+
+    [Fact]
+    public async Task Row_Detail_Record_Id_Migration_Preserves_Historical_Audit_Data()
+    {
+        var options = CreateOptions(schemaQualifyHistoryTable: true);
+        var sweepId = Guid.NewGuid();
+        var tenantId = Guid.NewGuid();
+
+        await using (var db = new SampleDbContext(options))
+        {
+            var migrator = db.Database.GetService<IMigrator>();
+            await migrator.MigrateAsync("20260711150000_AddExplicitSweepRunStatus");
+            await SeedHistoricalAuditRowsAsync(sweepId, tenantId);
+            await migrator.MigrateAsync("20260711204005_AddAuditRunForeignKeys");
+
+            await db.Database.OpenConnectionAsync();
+            await db.Database.ExecuteSqlRawAsync(
+                "CREATE SCHEMA migration_search_path; SET search_path TO migration_search_path"
+            );
+
+            await migrator.MigrateAsync("20260712111414_RenameSweepRowDetailEntityIdToRecordId");
+            await migrator.MigrateAsync("20260712121023_ExplicitCohortSchemas");
+
+            await migrator.MigrateAsync("20260711204005_AddAuditRunForeignKeys");
+            (await GetColumnsAsync("sweep_run_row_detail")).Should().ContainKey("EntityId");
+
+            await migrator.MigrateAsync("20260712121023_ExplicitCohortSchemas");
+        }
+
+        var columns = await GetColumnsAsync("sweep_run_row_detail");
+        columns.Should().ContainKey("RecordId");
+        columns.Should().NotContainKey("EntityId");
+
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            "SELECT \"RecordId\", \"CapturedPayload\" FROM \"sweep_run_row_detail\" WHERE \"SweepId\" = @sweepId";
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        await using var reader = await command.ExecuteReaderAsync();
+        (await reader.ReadAsync()).Should().BeTrue();
+        reader.GetString(0).Should().Be("known-record");
+        reader.GetString(1).Should().Be("known payload");
+    }
+
+    [Fact]
+    public async Task Current_Migration_Preserves_Historical_Error_And_LastError_Bytes()
+    {
+        const string historicalError = "legacy Error: quote=' slash=\\ tab=\t line1\nline2 trailing  ";
+        const string historicalLastError =
+            "legacy LastError: code=host-owned; details=[A|B]\r\nsecond line  ";
+        var options = CreateOptions();
+        var sweepId = Guid.NewGuid();
+        var tenantId = Guid.NewGuid();
+
+        await using (var db = new SampleDbContext(options))
+        {
+            var migrator = db.Database.GetService<IMigrator>();
+            await migrator.MigrateAsync("20260711150000_AddExplicitSweepRunStatus");
+            await SeedHistoricalAuditRowsAsync(sweepId, tenantId);
+            await db.Database.ExecuteSqlRawAsync(
+                "UPDATE \"sweep_run\" SET \"Error\" = {0} WHERE \"SweepId\" = {1}",
+                historicalError,
+                sweepId
+            );
+            await db.Database.ExecuteSqlRawAsync(
+                """
+                INSERT INTO "sweep_row_handler_status"
+                    ("SweepRunRowDetailId", "HandlerType", "DispatchPhase", "State", "Attempt", "QueuedAt", "NextAttemptAt", "CompletedAt", "LastError")
+                SELECT "Id", {0}, 1, 3, 1, {1}, {1}, {1}, {2}
+                FROM "sweep_run_row_detail"
+                WHERE "SweepId" = {3}
+                """,
+                "Legacy.DiagnosticHandler",
+                new DateTimeOffset(2026, 7, 11, 12, 2, 0, TimeSpan.Zero),
+                historicalLastError,
+                sweepId
+            );
+
+            await migrator.MigrateAsync();
+        }
+
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT
+                run."Error",
+                status."LastError",
+                pg_catalog.convert_to(run."Error", 'UTF8'),
+                pg_catalog.convert_to(status."LastError", 'UTF8')
+            FROM "sweep_run" AS run
+            INNER JOIN "sweep_run_row_detail" AS detail ON detail."SweepId" = run."SweepId"
+            INNER JOIN "sweep_row_handler_status" AS status
+                ON status."SweepRunRowDetailId" = detail."Id"
+            WHERE run."SweepId" = @sweepId
+            """;
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        await using var reader = await command.ExecuteReaderAsync();
+        (await reader.ReadAsync()).Should().BeTrue();
+        reader.GetString(0).Should().Be(historicalError);
+        reader.GetString(1).Should().Be(historicalLastError);
+        reader.GetFieldValue<byte[]>(2).Should().Equal(System.Text.Encoding.UTF8.GetBytes(historicalError));
+        reader
+            .GetFieldValue<byte[]>(3)
+            .Should()
+            .Equal(System.Text.Encoding.UTF8.GetBytes(historicalLastError));
     }
 
     [Fact]
@@ -568,7 +676,7 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
     [InlineData("Cohort.Sample.Entities.Note", "known-record")]
     public async Task Stable_Entity_Identity_Migration_Rejects_Duplicate_Historical_Row_Details(
         string entityType,
-        string entityId
+        string recordId
     )
     {
         var options = CreateOptions();
@@ -593,11 +701,11 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
                     ("SweepId", "EntityType", "EntityId", "Category", "Strategy", "TenantId", "At", "RetentionEntityId")
                 SELECT "SweepId", "EntityType", "EntityId", "Category", "Strategy", "TenantId", "At", "RetentionEntityId"
                 FROM "sweep_run_row_detail"
-                WHERE "SweepId" = @sweepId AND "EntityType" = @entityType AND "EntityId" = @entityId
+                WHERE "SweepId" = @sweepId AND "EntityType" = @entityType AND "EntityId" = @recordId
                 """;
             command.Parameters.AddWithValue("sweepId", sweepId);
             command.Parameters.AddWithValue("entityType", entityType);
-            command.Parameters.AddWithValue("entityId", entityId);
+            command.Parameters.AddWithValue("recordId", recordId);
             await command.ExecuteNonQueryAsync();
         };
 
@@ -697,6 +805,9 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
         rowDetailColumns["CapturedPayload"].IsNullable.Should().BeTrue();
         rowDetailColumns["RetentionEntityId"].DataType.Should().Be("uuid");
         rowDetailColumns["RetentionEntityId"].IsNullable.Should().BeFalse();
+        rowDetailColumns["RecordId"].DataType.Should().Be("text");
+        rowDetailColumns["RecordId"].IsNullable.Should().BeFalse();
+        rowDetailColumns.Should().NotContainKey("EntityId");
         rowDetailColumns.Should().NotContainKey("RuleSource");
         rowDetailColumns.Should().NotContainKey("RuleReason");
         (await GetPrimaryKeyColumnsAsync("sweep_run_row_detail")).Should().Equal("Id");
@@ -762,7 +873,7 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
             .Contain(index =>
                 index.Contains("CREATE UNIQUE INDEX", StringComparison.Ordinal)
                 && index.Contains(
-                    "(\"SweepId\", \"RetentionEntityId\", \"EntityId\", \"Category\", \"Strategy\", \"TenantId\")",
+                    "(\"SweepId\", \"RetentionEntityId\", \"RecordId\", \"Category\", \"Strategy\", \"TenantId\")",
                     StringComparison.Ordinal
                 )
                 && !index.Contains(" WHERE ", StringComparison.Ordinal)
@@ -844,9 +955,22 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
         (await GetPrimaryKeyColumnsAsync("blob_backed_files")).Should().Equal("Id");
     }
 
-    private DbContextOptions<SampleDbContext> CreateOptions()
+    private DbContextOptions<SampleDbContext> CreateOptions(
+        bool schemaQualifyHistoryTable = false
+    )
     {
-        return new DbContextOptionsBuilder<SampleDbContext>().UseNpgsql(connectionString).Options;
+        return new DbContextOptionsBuilder<SampleDbContext>()
+            .UseNpgsql(
+                connectionString,
+                options =>
+                {
+                    if (schemaQualifyHistoryTable)
+                    {
+                        options.MigrationsHistoryTable("__EFMigrationsHistory", "public");
+                    }
+                }
+            )
+            .Options;
     }
 
     private async Task SeedHistoricalAuditRowsAsync(Guid sweepId, Guid tenantId)

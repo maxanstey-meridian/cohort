@@ -6,6 +6,8 @@ internal interface IRetentionExecutionSettings
 
     public int SweepBatchSize { get; }
 
+    public TimeSpan AuditObserverTimeout { get; }
+
     public RetentionRowHandlerSettings RowHandlerDispatch { get; }
 }
 

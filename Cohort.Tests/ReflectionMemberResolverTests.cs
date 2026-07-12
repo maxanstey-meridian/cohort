@@ -1,5 +1,5 @@
 using System.Reflection;
-using Cohort.Application;
+using Cohort.Infrastructure;
 
 namespace Cohort.Tests;
 

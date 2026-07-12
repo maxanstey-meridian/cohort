@@ -123,15 +123,15 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
         using var previewHost = new CohortTestHost(
             GetConnectionString(),
             new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
+                new Dictionary<string, ITestRetentionRule>
                 {
-                    ["short-lived"] = new StaticRetentionRuleResolver(
+                    ["short-lived"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
                     ),
-                    ["soft-delete"] = new StaticRetentionRuleResolver(
+                    ["soft-delete"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     ),
-                    ["anonymise"] = new StaticRetentionRuleResolver(
+                    ["anonymise"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
                 }
@@ -206,19 +206,19 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
         using var previewHost = new CohortTestHost(
             GetConnectionString(),
             new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
+                new Dictionary<string, ITestRetentionRule>
                 {
-                    ["short-lived"] = new StaticRetentionRuleResolver(
+                    ["short-lived"] = new StaticTestRetentionRule(
                         new RetentionRule(
                             TimeSpan.FromDays(30),
                             Strategy.Purge,
                             TimeSpan.FromDays(90)
                         )
                     ),
-                    ["soft-delete"] = new StaticRetentionRuleResolver(
+                    ["soft-delete"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     ),
-                    ["anonymise"] = new StaticRetentionRuleResolver(
+                    ["anonymise"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
                 }
@@ -734,19 +734,19 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
     }
 
     private sealed class StaticCategoryRepository(
-        IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
-    ) : IRetentionCategoryRepository
+        IReadOnlyDictionary<string, ITestRetentionRule> resolvers
+    ) : ITestRetentionRuleProvider
     {
-        private static readonly IRetentionRuleResolver ExemptFallback =
-            new StaticRetentionRuleResolver(
+        private static readonly ITestRetentionRule ExemptFallback =
+            new StaticTestRetentionRule(
                 new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
             );
 
-        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct)
         {
             return resolvers.TryGetValue(category, out var resolver)
-                ? Task.FromResult<IRetentionRuleResolver?>(resolver)
-                : Task.FromResult<IRetentionRuleResolver?>(ExemptFallback);
+                ? Task.FromResult<ITestRetentionRule?>(resolver)
+                : Task.FromResult<ITestRetentionRule?>(ExemptFallback);
         }
     }
 

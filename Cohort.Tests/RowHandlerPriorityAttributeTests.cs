@@ -1,5 +1,6 @@
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Infrastructure;
 
 namespace Cohort.Tests;
 
@@ -72,7 +73,7 @@ public sealed class RowHandlerPriorityAttributeTests
         snapshot["Checksum"] = "sha256:abc123";
 
         context.SweepId.Should().Be(Guid.Parse("fe482ec4-bb4d-4509-b8d6-8a516bd7a1f0"));
-        context.EntityId.Should().Be("row-42");
+        context.RecordId.Should().Be("row-42");
         context.Category.Should().Be("files");
         context.Strategy.Should().Be(Strategy.SoftDelete);
         context.TenantId.Should().Be(Guid.Parse("4c3640af-a9f1-4c01-b7dd-bfe4ee8435ea"));
@@ -85,7 +86,7 @@ public sealed class RowHandlerPriorityAttributeTests
     [Fact]
     public void Get_Priority_Returns_Declared_Priority()
     {
-        var priority = RowHandlerPriorityAttribute.GetPriority(typeof(HighPriorityHandler));
+        var priority = RowHandlerPriority.Get(typeof(HighPriorityHandler));
 
         priority.Should().Be(100);
     }
@@ -93,7 +94,7 @@ public sealed class RowHandlerPriorityAttributeTests
     [Fact]
     public void Get_Priority_Uses_Max_Value_When_Attribute_Is_Not_Present()
     {
-        var priority = RowHandlerPriorityAttribute.GetPriority(typeof(DefaultPriorityHandler));
+        var priority = RowHandlerPriority.Get(typeof(DefaultPriorityHandler));
 
         priority.Should().Be(int.MaxValue);
     }
@@ -107,7 +108,7 @@ public sealed class RowHandlerPriorityAttributeTests
             typeof(LowPriorityHandler),
             typeof(HighPriorityHandler),
         }
-            .OrderBy(RowHandlerPriorityAttribute.GetPriority)
+            .OrderBy(RowHandlerPriority.Get)
             .ToArray();
 
         ordered

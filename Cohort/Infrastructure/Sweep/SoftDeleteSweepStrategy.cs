@@ -1,5 +1,4 @@
 using System.Data.Common;
-using Cohort.Application;
 using Cohort.Domain;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -30,7 +29,7 @@ internal sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
                     : $", {RelationalSweepStrategyCore.QuoteIdentifier(softDelete.DeletedAtColumn)} = @deletedAt";
 
                 return $"""
-                    UPDATE {RelationalSweepStrategyCore.QuoteIdentifier(entry.TableName)} AS target
+                    UPDATE {PostgreSqlIdentifier.Format(entry.Table)} AS target
                     SET {RelationalSweepStrategyCore.QuoteIdentifier(
                         softDelete.IsDeletedColumn
                     )} = TRUE{deletedAtAssignment}
@@ -125,6 +124,18 @@ internal sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
     )
     {
         return core.CountHeldForEraseAsync(entry, rule, predicate, tenant, now, conn, ct);
+    }
+
+    public Task<long> CountNullAnchorsForEraseAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        ErasureSubjectPredicate predicate,
+        TenantContext tenant,
+        DbConnection conn,
+        CancellationToken ct
+    )
+    {
+        return core.CountNullAnchorsForEraseAsync(entry, rule, predicate, tenant, conn, ct);
     }
 
     public Task<SweepExecutionResult> EraseAsync(

@@ -1,22 +1,42 @@
 namespace Cohort.Domain;
 
-public sealed record RetentionRule(
-    TimeSpan Period,
-    Strategy Strategy,
-    TimeSpan? LegalMin = null,
-    AuditRowDetail AuditRowDetail = AuditRowDetail.SummaryOnly,
-    RetentionRuleProvenance? Provenance = null
-)
+public sealed record RetentionRule
 {
-    public TimeSpan Period { get; init; } = RequireNonNegative(Period, nameof(Period));
+    public RetentionRule(
+        TimeSpan Period,
+        Strategy Strategy,
+        TimeSpan? LegalMin = null,
+        AuditRowDetail AuditRowDetail = AuditRowDetail.SummaryOnly,
+        RetentionRuleProvenance? Provenance = null
+    )
+    {
+        this.Period = RequireNonNegative(Period, nameof(Period));
+        this.Strategy = RequireDefined(Strategy, nameof(Strategy));
+        this.LegalMin = LegalMin is { } legalMin
+            ? RequireNonNegative(legalMin, nameof(LegalMin))
+            : null;
+        this.AuditRowDetail = RequireDefined(AuditRowDetail, nameof(AuditRowDetail));
+        if (this.AuditRowDetail == global::Cohort.Domain.AuditRowDetail.Inherit)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(AuditRowDetail),
+                AuditRowDetail,
+                "AuditRowDetail.Inherit is only valid on entity metadata, not a resolved retention rule."
+            );
+        }
 
-    public Strategy Strategy { get; init; } = RequireDefined(Strategy, nameof(Strategy));
+        this.Provenance = Provenance;
+    }
 
-    public TimeSpan? LegalMin { get; init; } =
-        LegalMin is { } legalMin ? RequireNonNegative(legalMin, nameof(LegalMin)) : null;
+    public TimeSpan Period { get; }
 
-    public AuditRowDetail AuditRowDetail { get; init; } =
-        RequireDefined(AuditRowDetail, nameof(AuditRowDetail));
+    public Strategy Strategy { get; }
+
+    public TimeSpan? LegalMin { get; }
+
+    public AuditRowDetail AuditRowDetail { get; }
+
+    public RetentionRuleProvenance? Provenance { get; }
 
     private static TimeSpan RequireNonNegative(TimeSpan value, string paramName)
     {

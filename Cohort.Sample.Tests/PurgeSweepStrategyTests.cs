@@ -141,19 +141,19 @@ public sealed class PurgeSweepStrategyTests(PostgresFixture fixture)
         );
         services.AddLogging();
         services.AddDbContext<PurgeTestDbContext>(options => options.UseNpgsql(connectionString));
-        services.AddSingleton<IRetentionCategoryRepository>(new PurgeCategoryRepository());
+        services.AddSingleton<IRetentionRuleProvider>(new PurgeCategoryRepository());
         services.AddCohort<PurgeTestDbContext>();
         return services.BuildServiceProvider(validateScopes: true);
     }
 
-    private sealed class PurgeCategoryRepository : IRetentionCategoryRepository
+    private sealed class PurgeCategoryRepository : ITestRetentionRuleProvider
     {
-        private static readonly IRetentionRuleResolver Resolver = new StaticRetentionRuleResolver(
+        private static readonly ITestRetentionRule Resolver = new StaticTestRetentionRule(
             new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
         );
 
-        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct) =>
-            Task.FromResult<IRetentionRuleResolver?>(category == "short-lived" ? Resolver : null);
+        public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct) =>
+            Task.FromResult<ITestRetentionRule?>(category == "short-lived" ? Resolver : null);
     }
 
     private sealed class PurgeTestDbContext(DbContextOptions<PurgeTestDbContext> options)

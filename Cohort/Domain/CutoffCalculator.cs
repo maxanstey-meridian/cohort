@@ -19,6 +19,26 @@ internal static class CutoffCalculator
             );
         }
 
-        return now - effectivePeriod;
+        return SubtractSaturating(now, effectivePeriod);
+    }
+
+    public static TimeSpan ResolveErasureMinimumAge(TimeSpan? legalMin)
+    {
+        return legalMin is { } minimum && minimum > TimeSpan.Zero
+            ? minimum
+            : TimeSpan.Zero;
+    }
+
+    public static DateTimeOffset? ComputeErasureCutoff(DateTimeOffset now, TimeSpan? legalMin)
+    {
+        var minimumAge = ResolveErasureMinimumAge(legalMin);
+        return minimumAge > TimeSpan.Zero ? SubtractSaturating(now, minimumAge) : null;
+    }
+
+    private static DateTimeOffset SubtractSaturating(DateTimeOffset value, TimeSpan duration)
+    {
+        return duration.Ticks > value.UtcTicks - DateTimeOffset.MinValue.UtcTicks
+            ? DateTimeOffset.MinValue
+            : value - duration;
     }
 }

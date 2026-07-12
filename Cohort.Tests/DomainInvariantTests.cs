@@ -107,6 +107,12 @@ public sealed class DomainInvariantTests
     }
 
     [Fact]
+    public void Row_Identity_Contracts_Use_Record_Id_Vocabulary()
+    {
+        typeof(RetentionAfterContext<object>).GetProperty("RecordId").Should().NotBeNull();
+    }
+
+    [Fact]
     public void Tenant_Context_Copies_And_Protects_Tags()
     {
         var source = new Dictionary<string, string> { ["region"] = "south-east" };

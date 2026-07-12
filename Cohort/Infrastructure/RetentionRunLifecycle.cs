@@ -1,11 +1,13 @@
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Infrastructure.Audit;
 using Microsoft.Extensions.Logging;
 
 namespace Cohort.Infrastructure;
 
 internal sealed class RetentionRunLifecycle(
-    IRetentionAuditWriter auditWriter,
+    EfRetentionAuditWriter auditWriter,
+    RetentionAuditNotifier? auditNotifier = null,
     ILogger? logger = null
 )
 {
@@ -26,7 +28,14 @@ internal sealed class RetentionRunLifecycle(
             : new CancellationTokenSource(AuditSettlementTimeout);
         await auditWriter.WriteAsync(evt, timeout?.Token ?? ct);
         AuditEvents.Add(evt);
+        if (auditNotifier is not null)
+        {
+            await auditNotifier.NotifyCommittedAsync(evt);
+        }
     }
+
+    public Task NotifyCommittedAsync(SweepEvent evt) =>
+        auditNotifier?.NotifyCommittedAsync(evt) ?? Task.CompletedTask;
 
     public async Task TrySettleTerminalAsync(SweepEvent evt, string operation, Guid sweepId)
     {
@@ -34,6 +43,10 @@ internal sealed class RetentionRunLifecycle(
         {
             using var timeout = new CancellationTokenSource(AuditSettlementTimeout);
             await auditWriter.WriteAsync(evt, timeout.Token);
+            if (auditNotifier is not null)
+            {
+                await auditNotifier.NotifyCommittedAsync(evt);
+            }
         }
         catch (Exception settlementException)
         {
@@ -116,7 +129,15 @@ internal sealed class RetentionRunLifecycle(
     public static string TruncateError(string value)
     {
         const int maxLength = 4000;
-        return value.Length <= maxLength ? value : value[..maxLength];
+        if (value.Length <= maxLength)
+        {
+            return value;
+        }
+
+        var completeDiagnosticBoundary = value.LastIndexOf('\n', maxLength - 1, maxLength);
+        return completeDiagnosticBoundary > 0
+            ? value[..completeDiagnosticBoundary]
+            : value[..maxLength];
     }
 
     private void EnsureCountsFromAuditEvents()

@@ -62,9 +62,8 @@ internal interface IRetentionSweepStrategy
     );
 
     /// <summary>
-    /// Counts subject-matching rows that are past the effective cutoff (and otherwise
-    /// eligible for this strategy) but excluded by an active legal hold. The erasure
-    /// counterpart of <see cref="CountHeldAsync"/>.
+    /// Counts subject-matching rows that satisfy the erasure legal-minimum predicate,
+    /// when one exists, but are excluded by an active legal hold.
     /// </summary>
     public Task<long> CountHeldForEraseAsync(
         RetentionEntry entry,
@@ -72,6 +71,15 @@ internal interface IRetentionSweepStrategy
         ErasureSubjectPredicate predicate,
         TenantContext tenant,
         DateTimeOffset now,
+        DbConnection conn,
+        CancellationToken ct
+    );
+
+    public Task<long> CountNullAnchorsForEraseAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        ErasureSubjectPredicate predicate,
+        TenantContext tenant,
         DbConnection conn,
         CancellationToken ct
     );
@@ -110,16 +118,8 @@ internal sealed record SweepExecutionResult(
 internal sealed record SweepMutationContext(
     Guid SweepId,
     DateTimeOffset At,
-    int? BatchSize = null,
-    IReadOnlyList<string>? ExcludedRecordIds = null
-)
-{
-    /// <summary>
-    /// Record ids earlier batches of this run already skipped. Strategies must not
-    /// select them again; they are deferred to the next run.
-    /// </summary>
-    public IReadOnlyList<string> ExcludedRecordIds { get; init; } = ExcludedRecordIds ?? [];
-}
+    int? BatchSize = null
+);
 
 internal sealed record ErasureSubjectPredicate
 {

@@ -4,6 +4,7 @@ using Cohort.Application;
 using Cohort.Domain;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace Cohort.Infrastructure.Sweep;
 
@@ -31,7 +32,10 @@ internal sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         handlerAwareMutationExecutor = new AnonymiseHandlerAwareMutationExecutor(
             assignmentResolver,
             rowLoader,
-            mutationExecutor
+            mutationExecutor,
+            services
+                ?.GetService<ILoggerFactory>()
+                ?.CreateLogger(typeof(RetentionHandlerSupport).FullName!)
         );
         this.services = services;
     }
@@ -162,16 +166,13 @@ internal sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         ArgumentNullException.ThrowIfNull(tenant);
         ArgumentNullException.ThrowIfNull(conn);
 
-        var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
+        var cutoff = CutoffCalculator.ComputeErasureCutoff(now, rule.LegalMin);
         ValidateEntry(entry, rule, "erasure previews");
         await EnsureConnectionOpenAsync(conn, ct);
 
         return await previewExecutor.ExecuteAsync(
             entry,
-            AnonymiseFilterBuilder.Combine(
-                AnonymiseFilterBuilder.CreateSubjectFilter(predicate),
-                AnonymiseFilterBuilder.CreateCutoffFilter(entry, cutoff)
-            ),
+            AnonymiseFilterBuilder.CreateErasureFilter(entry, predicate, cutoff),
             tenant,
             conn,
             ct
@@ -194,15 +195,42 @@ internal sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         ArgumentNullException.ThrowIfNull(tenant);
         ArgumentNullException.ThrowIfNull(conn);
 
-        var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
+        var cutoff = CutoffCalculator.ComputeErasureCutoff(now, rule.LegalMin);
         ValidateEntry(entry, rule, "erasure held counts");
         await EnsureConnectionOpenAsync(conn, ct);
 
         return await previewExecutor.ExecuteHeldCountAsync(
             entry,
+            AnonymiseFilterBuilder.CreateErasureFilter(entry, predicate, cutoff),
+            tenant,
+            conn,
+            ct
+        );
+    }
+
+    public async Task<long> CountNullAnchorsForEraseAsync(
+        RetentionEntry entry,
+        RetentionRule rule,
+        ErasureSubjectPredicate predicate,
+        TenantContext tenant,
+        DbConnection conn,
+        CancellationToken ct
+    )
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+        ArgumentNullException.ThrowIfNull(rule);
+        ArgumentNullException.ThrowIfNull(predicate);
+        ArgumentNullException.ThrowIfNull(tenant);
+        ArgumentNullException.ThrowIfNull(conn);
+
+        ValidateEntry(entry, rule, "erasure null-anchor counts");
+        await EnsureConnectionOpenAsync(conn, ct);
+
+        return await previewExecutor.ExecuteNullAnchorCountAsync(
+            entry,
             AnonymiseFilterBuilder.Combine(
                 AnonymiseFilterBuilder.CreateSubjectFilter(predicate),
-                AnonymiseFilterBuilder.CreateCutoffFilter(entry, cutoff)
+                AnonymiseFilterBuilder.CreateNullAnchorFilter(entry)
             ),
             tenant,
             conn,
@@ -229,15 +257,12 @@ internal sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         ArgumentNullException.ThrowIfNull(conn);
         ArgumentNullException.ThrowIfNull(transaction);
 
-        var cutoff = CutoffCalculator.Compute(now, rule.Period, rule.LegalMin);
+        var cutoff = CutoffCalculator.ComputeErasureCutoff(now, rule.LegalMin);
         return await ExecuteMutationAsync(
             entry,
             rule,
             new RetentionResolutionContext(entry.Category, tenant, now, []),
-            AnonymiseFilterBuilder.Combine(
-                AnonymiseFilterBuilder.CreateSubjectFilter(predicate),
-                AnonymiseFilterBuilder.CreateCutoffFilter(entry, cutoff)
-            ),
+            AnonymiseFilterBuilder.CreateErasureFilter(entry, predicate, cutoff),
             conn,
             transaction,
             execution,
@@ -269,8 +294,7 @@ internal sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             conn,
             transaction,
             filter,
-            execution?.BatchSize,
-            execution?.ExcludedRecordIds,
+            execution,
             skipLocked,
             ct
         );

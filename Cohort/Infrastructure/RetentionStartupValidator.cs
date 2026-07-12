@@ -8,10 +8,11 @@ namespace Cohort.Infrastructure;
 
 internal sealed class RetentionStartupValidator(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
-    IRetentionCategoryRepository categoryRepository,
+    IRetentionRuleProvider ruleProvider,
     RetentionEntryBuilder entryBuilder,
     IEnumerable<IAnonymiseValueFactory>? anonymiseValueFactories = null,
-    RetentionValidationState? sharedState = null
+    RetentionValidationState? sharedState = null,
+    ErasureSubjectMetadataResolver? subjectMetadataResolver = null
 )
 {
     // Instance field, not static: NullabilityInfoContext is documented as not thread-safe,
@@ -30,6 +31,11 @@ internal sealed class RetentionStartupValidator(
         .GroupBy(factory => factory.GetType())
         .ToDictionary(group => group.Key, group => group.Count());
     private readonly RetentionValidationState validationState = sharedState ?? new();
+    private readonly ErasureSubjectMetadataResolver erasureSubjectMetadataResolver =
+        subjectMetadataResolver ?? new(db);
+
+    internal IReadOnlyDictionary<string, RetentionCategoryCapabilities> ValidatedCapabilities =>
+        validationState.Capabilities;
 
     public async Task ValidateAsync(CancellationToken ct = default)
     {
@@ -46,6 +52,10 @@ internal sealed class RetentionStartupValidator(
                 return;
             }
 
+        validationState.ErasureSubjects.Clear();
+        var validatedCapabilities = new Dictionary<string, RetentionCategoryCapabilities>(
+            StringComparer.Ordinal
+        );
         var errors = registeredAnonymiseFactoryTypeCounts
             .Where(pair => pair.Value > 1)
             .OrderBy(pair => pair.Key.FullName, StringComparer.Ordinal)
@@ -53,7 +63,7 @@ internal sealed class RetentionStartupValidator(
                 $"{nameof(IAnonymiseValueFactory)} concrete runtime type {pair.Key.FullName} is registered {pair.Value} times in DI; exactly one registration per concrete runtime type is allowed."
             )
             .ToList();
-        var entityIdOwners = new Dictionary<Guid, Type>();
+        var retentionEntityIdOwners = new Dictionary<Guid, Type>();
         var retainedEntries = new List<RetentionEntry>();
 
         foreach (var entityType in db.Model.GetEntityTypes())
@@ -88,12 +98,8 @@ internal sealed class RetentionStartupValidator(
                 continue;
             }
 
-            var schema = entityType.GetSchema() ?? db.Model.GetDefaultSchema();
-            if (schema is not null && !string.Equals(schema, "public", StringComparison.Ordinal))
+            if (!ValidateRelationalMappingShape(entityType, errors))
             {
-                errors.Add(
-                    $"[Retain] on {clrType.FullName}: entity is mapped to schema '{schema}'. Cohort SQL does not schema-qualify identifiers and resolves tables via the connection search_path, so entities outside the default 'public' schema are not supported."
-                );
                 continue;
             }
 
@@ -118,19 +124,34 @@ internal sealed class RetentionStartupValidator(
             retainedEntries.Add(entry);
             ValidateRecordIdConvention(entityType, entry, errors);
             ValidateTimestampStoreTypes(entityType, entry, errors);
-            if (entityIdOwners.TryGetValue(entry.EntityId, out var existingEntityType))
+            if (retentionEntityIdOwners.TryGetValue(entry.RetentionEntityId, out var existingEntityType))
             {
                 errors.Add(
-                    $"[RetentionEntityId] on {clrType.FullName}: identity '{entry.EntityId}' is already used by retained entity {existingEntityType.FullName}; identities must be unique in the DbContext model."
+                    $"[RetentionEntityId] on {clrType.FullName}: identity '{entry.RetentionEntityId}' is already used by retained entity {existingEntityType.FullName}; identities must be unique in the DbContext model."
                 );
             }
             else
             {
-                entityIdOwners.Add(entry.EntityId, clrType);
+                retentionEntityIdOwners.Add(entry.RetentionEntityId, clrType);
             }
 
-            var resolver = await categoryRepository.GetAsync(entry.Category, ct);
-            if (resolver is null)
+            RetentionCategoryCapabilities? capabilities = null;
+            if (!validatedCapabilities.TryGetValue(entry.Category, out capabilities))
+            {
+                try
+                {
+                    capabilities = ruleProvider.GetCapabilities(entry.Category);
+                }
+                catch (Exception ex)
+                {
+                    errors.Add(
+                        $"Retention category '{entry.Category}' for entity {clrType.FullName} failed capability resolution: {ex.Message}"
+                    );
+                    continue;
+                }
+            }
+
+            if (capabilities is null)
             {
                 errors.Add(
                     $"Retention category '{entry.Category}' for entity {clrType.FullName} could not be resolved."
@@ -138,24 +159,19 @@ internal sealed class RetentionStartupValidator(
                 continue;
             }
 
+            validatedCapabilities.TryAdd(entry.Category, capabilities);
+
             try
             {
-                var startupRule = resolver.TryResolveAtStartup();
-                if (startupRule is null || startupRule.Strategy == Strategy.Purge)
+                validationState.ErasureSubjects[entry.EntityType] =
+                    erasureSubjectMetadataResolver.Resolve(entry);
+
+                if (capabilities.Strategies.Contains(Strategy.Purge))
                 {
                     ValidateCascadeDeletePaths(entityType, errors);
                 }
 
-                if (entry.AnonymiseFields.Any(field => field is AnonymiseFactoryField))
-                {
-                    ValidateFactoryBackedAnonymiseSupport(
-                        entry,
-                        errors,
-                        $"Anonymise convention on {clrType.FullName}:"
-                    );
-                }
-
-                if (startupRule?.Strategy == Strategy.SoftDelete)
+                if (capabilities.Strategies.Contains(Strategy.SoftDelete))
                 {
                     ValidateSoftDeleteConvention(
                         entry,
@@ -164,8 +180,17 @@ internal sealed class RetentionStartupValidator(
                     );
                 }
 
-                if (startupRule?.Strategy == Strategy.Anonymise)
+                if (capabilities.Strategies.Contains(Strategy.Anonymise))
                 {
+                    if (entry.AnonymiseFields.Any(field => field is AnonymiseFactoryField))
+                    {
+                        ValidateFactoryBackedAnonymiseSupport(
+                            entry,
+                            errors,
+                            $"Anonymise convention on {clrType.FullName}:"
+                        );
+                    }
+
                     ValidateAnonymiseConvention(
                         entityType,
                         entry,
@@ -207,12 +232,68 @@ internal sealed class RetentionStartupValidator(
             throw new RetentionConfigurationException(errors);
         }
 
+        validationState.Capabilities.Clear();
+        foreach (var capability in validatedCapabilities)
+        {
+            validationState.Capabilities.Add(capability.Key, capability.Value);
+        }
         validationState.Validated = true;
         }
         finally
         {
             validationState.Gate.Release();
         }
+    }
+
+    private static bool ValidateRelationalMappingShape(
+        Microsoft.EntityFrameworkCore.Metadata.IEntityType entityType,
+        List<string> errors
+    )
+    {
+        var clrType = entityType.ClrType;
+        if (entityType.IsOwned())
+        {
+            errors.Add(
+                $"[Retain] on {clrType.FullName}: retained owned entity types are not supported because their rows are lifecycle-owned by another EF entity."
+            );
+            return false;
+        }
+
+        if (
+            entityType
+                .GetMappingFragments(
+                    Microsoft.EntityFrameworkCore.Metadata.StoreObjectType.Table
+                )
+                .Any()
+        )
+        {
+            errors.Add(
+                $"[Retain] on {clrType.FullName}: entity is mapped to multiple tables. Retention requires exactly one independently mutable relational table."
+            );
+            return false;
+        }
+
+        var tableName = entityType.GetTableName();
+        if (tableName is null)
+        {
+            return true;
+        }
+
+        var schema = entityType.GetSchema() ?? entityType.Model.GetDefaultSchema() ?? "public";
+        var sharingEntity = entityType.Model.GetEntityTypes().FirstOrDefault(other =>
+            other != entityType
+            && other.GetTableName() == tableName
+            && (other.GetSchema() ?? other.Model.GetDefaultSchema() ?? "public") == schema
+        );
+        if (sharingEntity is null)
+        {
+            return true;
+        }
+
+        errors.Add(
+            $"[Retain] on {clrType.FullName}: entity shares table '{schema}.{tableName}' with {sharingEntity.ClrType.FullName}. Retention requires exclusive ownership of its relational table."
+        );
+        return false;
     }
 
     private void ValidateTenantConvention(
@@ -665,6 +746,11 @@ internal sealed class RetentionStartupValidator(
 internal sealed class RetentionValidationState
 {
     internal SemaphoreSlim Gate { get; } = new(1, 1);
+
+    internal Dictionary<Type, ErasureSubjectMetadata?> ErasureSubjects { get; } = [];
+
+    internal Dictionary<string, RetentionCategoryCapabilities> Capabilities { get; } =
+        new(StringComparer.Ordinal);
 
     internal bool Validated { get; set; }
 }

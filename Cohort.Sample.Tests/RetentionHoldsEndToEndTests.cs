@@ -32,8 +32,15 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
             await db.SaveChangesAsync();
         }
 
-        await RaceHoldAgainstSweepAsync(
+        var result = await RaceHoldAgainstSweepAsync(
             RetentionEntityIdentity.For<Note>(), noteId, tenantId, holdId, asOf
+        );
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().ContainSingle(count =>
+            count.EntityType == typeof(Note)
+            && count.Affected == 0
+            && count.HeldCount == 1
         );
 
         await using var verify = Host.CreateDbContext();
@@ -66,8 +73,15 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
             await db.SaveChangesAsync();
         }
 
-        await RaceHoldAgainstSweepAsync(
+        var result = await RaceHoldAgainstSweepAsync(
             RetentionEntityIdentity.For<AnonymisedContact>(), contactId, tenantId, holdId, asOf
+        );
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().ContainSingle(count =>
+            count.EntityType == typeof(AnonymisedContact)
+            && count.Affected == 0
+            && count.HeldCount == 1
         );
 
         await using var verify = Host.CreateDbContext();
@@ -76,6 +90,148 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
         contact.GivenName.Should().Be("Race");
         contact.Surname.Should().Be("Target");
         contact.AnonymisedAt.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task Hold_Creation_Racing_SoftDelete_Preserves_All_Deletion_Markers()
+    {
+        var tenantId = Guid.NewGuid();
+        var recordId = Guid.NewGuid();
+        var holdId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.SoftDeleteRecords.Add(new SoftDeleteRecord
+            {
+                Id = recordId,
+                TenantId = tenantId,
+                CreatedAt = asOf.AddDays(-120),
+                Body = "hold-racing-soft-delete",
+                IsDeleted = false,
+            });
+            await db.SaveChangesAsync();
+        }
+
+        var result = await RaceHoldAgainstSweepAsync(
+            RetentionEntityIdentity.For<SoftDeleteRecord>(), recordId, tenantId, holdId, asOf
+        );
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().ContainSingle(count =>
+            count.EntityType == typeof(SoftDeleteRecord)
+            && count.Affected == 0
+            && count.HeldCount == 1
+        );
+
+        await using var verify = Host.CreateDbContext();
+        var record = await verify.SoftDeleteRecords.SingleAsync(row => row.Id == recordId);
+        record.IsDeleted.Should().BeFalse();
+        record.DeletedAt.Should().BeNull();
+        (await verify.HeldRecords.AnyAsync(hold => hold.HoldId == holdId)).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Hold_Creation_Racing_Erasure_Preserves_The_Row()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        var holdId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(new Note
+            {
+                Id = noteId,
+                TenantId = tenantId,
+                SubjectId = subjectId,
+                CreatedAt = asOf.AddDays(-120),
+                Body = "hold-racing-erasure",
+            });
+            await db.SaveChangesAsync();
+        }
+
+        var result = await RaceHoldAgainstMutationAsync(
+            RetentionEntityIdentity.For<Note>(),
+            noteId,
+            tenantId,
+            holdId,
+            () => Host.RunErasureAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+                asOf
+            )
+        );
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().ContainSingle(count =>
+            count.EntityType == typeof(Note)
+            && count.Affected == 0
+            && count.HeldCount == 1
+        );
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
+        (await verify.HeldRecords.AnyAsync(hold => hold.HoldId == holdId)).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Hold_Does_Not_Cross_Entity_Boundaries_For_The_Same_Record_And_Tenant()
+    {
+        var tenantId = Guid.NewGuid();
+        var recordId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(new Note
+            {
+                Id = recordId,
+                TenantId = tenantId,
+                CreatedAt = asOf.AddDays(-120),
+                Body = "cross-entity-held-note",
+            });
+            db.SoftDeleteRecords.Add(new SoftDeleteRecord
+            {
+                Id = recordId,
+                TenantId = tenantId,
+                CreatedAt = asOf.AddDays(-120),
+                Body = "cross-entity-unheld-soft-delete",
+                IsDeleted = false,
+            });
+            await db.SaveChangesAsync();
+        }
+
+        await CreateHoldAsync(new RetentionHoldRequest(
+            Guid.NewGuid(),
+            RetentionEntityIdentity.For<Note>(),
+            recordId.ToString(),
+            tenantId,
+            "entity-scoped hold",
+            asOf.AddDays(-1)
+        ));
+
+        var result = await Host.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        result.Counts.Should().ContainSingle(count =>
+            count.EntityType == typeof(Note) && count.Affected == 0 && count.HeldCount == 1
+        );
+        result.Counts.Should().ContainSingle(count =>
+            count.EntityType == typeof(SoftDeleteRecord)
+            && count.Affected == 1
+            && count.HeldCount == 0
+        );
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == recordId)).Should().BeTrue();
+        var softDeleted = await verify.SoftDeleteRecords.SingleAsync(row => row.Id == recordId);
+        softDeleted.IsDeleted.Should().BeTrue();
+        softDeleted.DeletedAt.Should().Be(asOf);
     }
 
     [Fact]
@@ -90,6 +246,12 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
         var tenantId = Guid.NewGuid();
         var createdAt = new DateTimeOffset(2026, 4, 10, 12, 0, 0, TimeSpan.Zero);
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        await SeedNotesAsync(
+            tenantId,
+            activeRecordId,
+            expiredRecordId,
+            removedRecordId
+        );
 
         await CreateHoldAsync(
             new RetentionHoldRequest(
@@ -221,6 +383,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
         var recordId = Guid.NewGuid();
         var tenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        await SeedNotesAsync(tenantId, recordId);
 
         await CreateHoldAsync(
             new RetentionHoldRequest(
@@ -244,6 +407,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
         var recordId = Guid.NewGuid();
         var tenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        await SeedNotesAsync(tenantId, recordId);
 
         await CreateHoldAsync(
             new RetentionHoldRequest(
@@ -269,6 +433,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
         var recordId = Guid.NewGuid();
         var tenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        await SeedNotesAsync(tenantId, recordId);
 
         await CreateHoldAsync(
             new RetentionHoldRequest(
@@ -292,8 +457,11 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
     {
         var rolledBackHoldId = Guid.NewGuid();
         var committedHoldId = Guid.NewGuid();
+        var rolledBackRecordId = Guid.NewGuid();
+        var committedRecordId = Guid.NewGuid();
         var tenantId = Guid.NewGuid();
         var createdAt = new DateTimeOffset(2026, 4, 10, 12, 0, 0, TimeSpan.Zero);
+        await SeedNotesAsync(tenantId, rolledBackRecordId, committedRecordId);
 
         await Host.RunWithServicesAsync(async services =>
         {
@@ -306,7 +474,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
                     new RetentionHoldRequest(
                         rolledBackHoldId,
                         RetentionEntityIdentity.For<Note>(),
-                        Guid.NewGuid().ToString(),
+                        rolledBackRecordId.ToString(),
                         tenantId,
                         "rolled back hold",
                         createdAt
@@ -322,7 +490,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
                     new RetentionHoldRequest(
                         committedHoldId,
                         RetentionEntityIdentity.For<Note>(),
-                        Guid.NewGuid().ToString(),
+                        committedRecordId.ToString(),
                         tenantId,
                         "committed hold",
                         createdAt
@@ -348,6 +516,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
         var recordId = Guid.NewGuid();
         var tenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        await SeedNotesAsync(tenantId, recordId);
 
         await Host.RunWithServicesAsync(async services =>
         {
@@ -385,8 +554,11 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
     {
         var rolledBackHoldId = Guid.NewGuid();
         var committedHoldId = Guid.NewGuid();
+        var rolledBackRecordId = Guid.NewGuid();
+        var committedRecordId = Guid.NewGuid();
         var tenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        await SeedNotesAsync(tenantId, rolledBackRecordId, committedRecordId);
 
         await Host.RunWithServicesAsync(async services =>
         {
@@ -399,7 +571,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
                     new RetentionHoldRequest(
                         rolledBackHoldId,
                         RetentionEntityIdentity.For<Note>(),
-                        Guid.NewGuid().ToString(),
+                        rolledBackRecordId.ToString(),
                         tenantId,
                         "rolled back list visibility",
                         asOf.AddDays(-1)
@@ -419,7 +591,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
                     new RetentionHoldRequest(
                         committedHoldId,
                         RetentionEntityIdentity.For<Note>(),
-                        Guid.NewGuid().ToString(),
+                        committedRecordId.ToString(),
                         tenantId,
                         "committed list visibility",
                         asOf.AddDays(-1)
@@ -446,6 +618,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
         var recordId = Guid.NewGuid();
         var tenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        await SeedNotesAsync(tenantId, recordId);
         await CreateHoldAsync(
             new RetentionHoldRequest(
                 holdId,
@@ -481,13 +654,16 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
     public async Task RemoveAsync_Composes_With_Caller_Owned_Ef_Transactions()
     {
         var holdId = Guid.NewGuid();
+        var recordId = Guid.NewGuid();
+        var tenantId = Guid.NewGuid();
         var removedAt = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        await SeedNotesAsync(tenantId, recordId);
         await CreateHoldAsync(
             new RetentionHoldRequest(
                 holdId,
                 RetentionEntityIdentity.For<Note>(),
-                Guid.NewGuid().ToString(),
-                Guid.NewGuid(),
+                recordId.ToString(),
+                tenantId,
                 "transactional removal",
                 removedAt.AddDays(-1)
             )
@@ -522,13 +698,16 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
     {
         var missingHoldId = Guid.NewGuid();
         var removedHoldId = Guid.NewGuid();
+        var recordId = Guid.NewGuid();
+        var tenantId = Guid.NewGuid();
         var removedAt = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        await SeedNotesAsync(tenantId, recordId);
         await CreateHoldAsync(
             new RetentionHoldRequest(
                 removedHoldId,
                 RetentionEntityIdentity.For<Note>(),
-                Guid.NewGuid().ToString(),
-                Guid.NewGuid(),
+                recordId.ToString(),
+                tenantId,
                 "already removed hold",
                 removedAt.AddDays(-1)
             )
@@ -755,6 +934,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
         var recordId = Guid.NewGuid();
         var tenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        await SeedNotesAsync(tenantId, recordId);
 
         await CreateHoldAsync(
             new RetentionHoldRequest(
@@ -787,6 +967,18 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
     {
         var holdId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.ExternalNumberedLogs.Add(new ExternalNumberedLog
+            {
+                Id = Guid.NewGuid(),
+                ExternalId = 42,
+                CreatedAt = asOf,
+                Payload = "typed hold target",
+            });
+            await db.SaveChangesAsync();
+        }
 
         await CreateHoldAsync(
             new RetentionHoldRequest(
@@ -1262,6 +1454,19 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
         });
     }
 
+    private async Task SeedNotesAsync(Guid tenantId, params Guid[] recordIds)
+    {
+        await using var db = Host.CreateDbContext();
+        db.Notes.AddRange(recordIds.Select(recordId => new Note
+        {
+            Id = recordId,
+            TenantId = tenantId,
+            CreatedAt = DateTimeOffset.UtcNow,
+            Body = "hold target",
+        }));
+        await db.SaveChangesAsync();
+    }
+
     private Task RemoveHoldAsync(Guid holdId, DateTimeOffset removedAt)
     {
         return Host.RunWithServicesAsync(async services =>
@@ -1356,12 +1561,32 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
         }
     }
 
-    private async Task RaceHoldAgainstSweepAsync(
+    private Task<RetentionSweepResult> RaceHoldAgainstSweepAsync(
         Guid retentionEntityId,
         Guid recordId,
         Guid tenantId,
         Guid holdId,
         DateTimeOffset asOf
+    )
+    {
+        return RaceHoldAgainstMutationAsync(
+            retentionEntityId,
+            recordId,
+            tenantId,
+            holdId,
+            () => Host.RunSweepAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                asOf
+            )
+        );
+    }
+
+    private async Task<TResult> RaceHoldAgainstMutationAsync<TResult>(
+        Guid retentionEntityId,
+        Guid recordId,
+        Guid tenantId,
+        Guid holdId,
+        Func<Task<TResult>> mutation
     )
     {
         const long testBarrierKey = 7_310_042_119;
@@ -1418,15 +1643,13 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
                 testBarrierKey,
                 blockerConnection.ProcessID
             );
-            var sweep = Host.RunSweepAsync(
-                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                asOf
-            );
+            var mutationTask = mutation();
             await WaitForSweepLockWaiterAsync();
 
             await blockerTransaction.CommitAsync();
             barrierReleased = true;
-            await Task.WhenAll(createHold, sweep);
+            await Task.WhenAll(createHold, mutationTask).WaitAsync(TimeSpan.FromSeconds(15));
+            return await mutationTask;
         }
         finally
         {

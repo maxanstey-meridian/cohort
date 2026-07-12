@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Threading.Channels;
 using Cohort.Application;
@@ -31,7 +32,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
     }
 
     [Fact]
-    public void AddCohort_Allows_Host_Overrides_For_Category_Audit_And_Holds_Repositories()
+    public void AddCohort_Allows_Host_Rule_Holds_And_Audit_Observer_Registrations()
     {
         var tenant = CreateTenant();
         var settings = CreateSettings(
@@ -45,8 +46,8 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             tenant,
             services =>
             {
-                services.AddSingleton<IRetentionCategoryRepository, CustomCategoryRepository>();
-                services.AddScoped<IRetentionAuditWriter, CustomAuditWriter>();
+                services.AddSingleton<IRetentionRuleProvider, CustomCategoryRepository>();
+                services.AddSingleton<IRetentionAuditObserver, CustomAuditObserver>();
                 services.AddScoped<IRetentionHoldsRepository, CustomHoldsRepository>();
             }
         );
@@ -54,13 +55,13 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         using var scope = host.Host.Services.CreateScope();
 
         scope
-            .ServiceProvider.GetRequiredService<IRetentionCategoryRepository>()
+            .ServiceProvider.GetRequiredService<IRetentionRuleProvider>()
             .Should()
             .BeOfType<CustomCategoryRepository>();
         scope
-            .ServiceProvider.GetRequiredService<IRetentionAuditWriter>()
+            .ServiceProvider.GetRequiredService<IRetentionAuditObserver>()
             .Should()
-            .BeOfType<CustomAuditWriter>();
+            .BeOfType<CustomAuditObserver>();
         scope
             .ServiceProvider.GetRequiredService<IRetentionHoldsRepository>()
             .Should()
@@ -82,7 +83,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             tenant,
             services =>
             {
-                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
             }
         );
 
@@ -103,13 +104,15 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             dryRun: false,
             killSwitch: false
         );
-        var categoryRepository = new CountingCategoryRepository(new SampleCategoryRepository());
+        var categoryRepository = new CountingCategoryRepository(
+            new SampleRetentionRuleProvider()
+        );
         using var host = BuildHost(
             settings,
             tenant,
             services =>
             {
-                services.AddSingleton<IRetentionCategoryRepository>(categoryRepository);
+                services.AddSingleton<IRetentionRuleProvider>(categoryRepository);
             }
         );
         await SeedOldNoteAsync(tenant.Id, "scheduled-delete");
@@ -141,7 +144,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             tenant,
             services =>
             {
-                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
             }
         );
         await SeedOldNoteAsync(tenant.Id, "scheduled-dry-run");
@@ -183,7 +186,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             tenant,
             services =>
             {
-                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
             }
         );
         await SeedOldNoteAsync(tenant.Id, "reloaded-dry-run");
@@ -227,7 +230,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             tenantA,
             services =>
             {
-                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
                 services.AddSingleton<IRetentionTenantSource>(
                     new StaticTenantSource(tenantA, tenantB)
                 );
@@ -251,6 +254,260 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
     }
 
     [Fact]
+    public async Task Worker_Rejects_A_Null_Tenant_Before_Any_Tenant_Or_Tenantless_Pass()
+    {
+        var tenant = CreateTenant();
+        var logs = new WorkerLogProvider();
+        var settings = CreateSettings(
+            fixture.ConnectionString,
+            schedule: "*/1 * * * * *",
+            dryRun: false,
+            killSwitch: false
+        );
+        using var host = BuildHost(
+            settings,
+            tenant,
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
+                services.AddSingleton<IRetentionTenantSource>(
+                    new StaticTenantSource(tenant, null!)
+                );
+                services.AddSingleton<ILoggerProvider>(logs);
+            }
+        );
+        await SeedOldNoteAsync(tenant.Id, "null-source-tenant");
+        await SeedOldTenantlessLogAsync("null-source-tenantless");
+
+        await host.Host.StartAsync();
+        await WaitUntilAsync(
+            () => Task.FromResult(logs.Entries.Any(entry =>
+                entry.Exception is InvalidOperationException
+                && entry.Exception.Message
+                    == "IRetentionTenantSource returned a null tenant context."
+            )),
+            TimeSpan.FromSeconds(8)
+        );
+        await host.Host.StopAsync();
+
+        (await NoteExistsAsync("null-source-tenant")).Should().BeTrue();
+        (await TenantlessLogExistsAsync("null-source-tenantless")).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Worker_Cancellation_From_The_Tenant_Source_Propagates_Without_Later_Passes()
+    {
+        var tenant = CreateTenant();
+        var source = new CancellationBlockingTenantSource();
+        var settings = CreateSettings(
+            fixture.ConnectionString,
+            schedule: "*/1 * * * * *",
+            dryRun: false,
+            killSwitch: false
+        );
+        using var host = BuildHost(
+            settings,
+            tenant,
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
+                services.AddSingleton<IRetentionTenantSource>(source);
+            }
+        );
+        await SeedOldNoteAsync(tenant.Id, "cancelled-source-tenant");
+        await SeedOldTenantlessLogAsync("cancelled-source-tenantless");
+
+        await host.Host.StartAsync();
+        await source.Entered.WaitAsync(TimeSpan.FromSeconds(8));
+        var stop = Stopwatch.StartNew();
+        await host.Host.StopAsync().WaitAsync(TimeSpan.FromSeconds(2));
+
+        stop.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(2));
+        source.CancellationObserved.Should().BeTrue();
+        (await NoteExistsAsync("cancelled-source-tenant")).Should().BeTrue();
+        (await TenantlessLogExistsAsync("cancelled-source-tenantless")).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Worker_Cancellation_During_Tenant_Iteration_Propagates_Without_Any_Pass()
+    {
+        var first = CreateTenant();
+        var later = CreateTenant();
+        var source = new CancellationBlockingIterationTenantSource(first, later);
+        var settings = CreateSettings(
+            fixture.ConnectionString,
+            schedule: "*/1 * * * * *",
+            dryRun: false,
+            killSwitch: false
+        );
+        using var host = BuildHost(
+            settings,
+            first,
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
+                services.AddSingleton<IRetentionTenantSource>(source);
+            }
+        );
+        await SeedOldNoteAsync(first.Id, "cancelled-iteration-first");
+        await SeedOldNoteAsync(later.Id, "cancelled-iteration-later");
+        await SeedOldTenantlessLogAsync("cancelled-iteration-tenantless");
+
+        await host.Host.StartAsync();
+        await source.IterationBlocked.WaitAsync(TimeSpan.FromSeconds(8));
+        var stop = Stopwatch.StartNew();
+        await host.Host.StopAsync().WaitAsync(TimeSpan.FromSeconds(2));
+
+        stop.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(2));
+        source.CancellationObserved.Should().BeTrue();
+        (await NoteExistsAsync("cancelled-iteration-first")).Should().BeTrue();
+        (await NoteExistsAsync("cancelled-iteration-later")).Should().BeTrue();
+        (await TenantlessLogExistsAsync("cancelled-iteration-tenantless")).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Worker_Isolates_A_Tenant_Failure_And_Still_Runs_Later_And_Tenantless_Passes()
+    {
+        var failingTenant = CreateTenant();
+        var healthyTenant = CreateTenant();
+        var settings = CreateSettings(
+            fixture.ConnectionString,
+            schedule: "*/1 * * * * *",
+            dryRun: false,
+            killSwitch: false
+        );
+        using var host = BuildHost(
+            settings,
+            failingTenant,
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider>(
+                    new TenantFailingRuleProvider(failingTenant.Id)
+                );
+                services.AddSingleton<IRetentionTenantSource>(
+                    new StaticTenantSource(failingTenant, healthyTenant)
+                );
+            }
+        );
+        await SeedOldNoteAsync(failingTenant.Id, "isolated-failing-tenant");
+        await SeedOldNoteAsync(healthyTenant.Id, "isolated-healthy-tenant");
+        await SeedOldTenantlessLogAsync("isolated-tenantless");
+
+        await host.Host.StartAsync();
+        await WaitUntilAsync(
+            async () =>
+                !await NoteExistsAsync("isolated-healthy-tenant")
+                && !await TenantlessLogExistsAsync("isolated-tenantless"),
+            TimeSpan.FromSeconds(8)
+        );
+        await host.Host.StopAsync();
+
+        (await NoteExistsAsync("isolated-failing-tenant")).Should().BeTrue();
+        (await NoteExistsAsync("isolated-healthy-tenant")).Should().BeFalse();
+        (await TenantlessLogExistsAsync("isolated-tenantless")).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task Worker_Deduplicates_Tenants_In_First_Seen_Order_And_Uses_The_First_Context()
+    {
+        var tenantId = Guid.NewGuid();
+        var first = new TenantContext(
+            tenantId,
+            "first",
+            new Dictionary<string, string> { ["source"] = "first" }
+        );
+        var conflictingDuplicate = new TenantContext(
+            tenantId,
+            "second",
+            new Dictionary<string, string> { ["source"] = "second" }
+        );
+        var provider = new CapturingRuleProvider(tenantId);
+        var logs = new WorkerLogProvider();
+        var settings = CreateSettings(
+            fixture.ConnectionString,
+            schedule: "*/1 * * * * *",
+            dryRun: false,
+            killSwitch: false
+        );
+        using var host = BuildHost(
+            settings,
+            first,
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider>(provider);
+                services.AddSingleton<IRetentionTenantSource>(
+                    new StaticTenantSource(first, conflictingDuplicate)
+                );
+                services.AddSingleton<ILoggerProvider>(logs);
+            }
+        );
+        await SeedOldNoteAsync(tenantId, "deduplicated-tenant");
+
+        await host.Host.StartAsync();
+        await provider.FirstResolution.WaitAsync(TimeSpan.FromSeconds(8));
+        await WaitUntilAsync(
+            async () => !await NoteExistsAsync("deduplicated-tenant"),
+            TimeSpan.FromSeconds(8)
+        );
+        await host.Host.StopAsync();
+
+        provider.FirstContext.Should().NotBeNull();
+        provider.FirstContext!.Jurisdiction.Should().Be("first");
+        provider.FirstContext.Tags.Should().Contain("source", "first");
+        provider.ResolutionCount.Should().Be(1);
+        logs.Entries.Should().Contain(entry =>
+            entry.Level == LogLevel.Warning
+            && entry.Message
+                == $"IRetentionTenantSource returned conflicting contexts for tenant {tenantId}; Cohort will use the first context."
+        );
+    }
+
+    [Fact]
+    public async Task Worker_Executes_Tenant_Passes_Sequentially()
+    {
+        var tenantA = CreateTenant();
+        var tenantB = CreateTenant();
+        var provider = new SequentialRuleProvider(tenantA.Id, tenantB.Id);
+        var settings = CreateSettings(
+            fixture.ConnectionString,
+            schedule: "*/1 * * * * *",
+            dryRun: false,
+            killSwitch: false
+        );
+        using var host = BuildHost(
+            settings,
+            tenantA,
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider>(provider);
+                services.AddSingleton<IRetentionTenantSource>(
+                    new StaticTenantSource(tenantA, tenantB)
+                );
+            }
+        );
+
+        await host.Host.StartAsync();
+        try
+        {
+            await provider.FirstTenantEntered.WaitAsync(TimeSpan.FromSeconds(8));
+            await Task.Delay(250);
+
+            provider.SecondTenantEntered.IsCompleted.Should().BeFalse();
+            provider.MaximumConcurrency.Should().Be(1);
+
+            provider.ReleaseFirstTenant();
+            await provider.SecondTenantEntered.WaitAsync(TimeSpan.FromSeconds(8));
+        }
+        finally
+        {
+            provider.ReleaseFirstTenant();
+            await host.Host.StopAsync();
+        }
+
+        provider.MaximumConcurrency.Should().Be(1);
+    }
+
+    [Fact]
     public async Task Worker_Sweeps_Tenantless_Entities_Once_Under_The_Tenantless_Context()
     {
         var tenantA = CreateTenant();
@@ -266,7 +523,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             tenantA,
             services =>
             {
-                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
                 services.AddSingleton<IRetentionTenantSource>(
                     new StaticTenantSource(tenantA, tenantB)
                 );
@@ -306,7 +563,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             CreateTenant(),
             services =>
             {
-                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
                 services.AddSingleton<IRetentionTenantSource>(new StaticTenantSource());
             }
         );
@@ -343,7 +600,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             tenant,
             services =>
             {
-                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
                 services.AddSingleton<ILoggerProvider>(skippedOccurrenceLog);
             }
         );
@@ -391,13 +648,15 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             dryRun: false,
             killSwitch: false
         );
-        var categoryRepository = new FailingOnceCategoryRepository(new SampleCategoryRepository());
+        var categoryRepository = new FailingOnceCategoryRepository(
+            new SampleRetentionRuleProvider()
+        );
         using var host = BuildHost(
             settings,
             tenant,
             services =>
             {
-                services.AddSingleton<IRetentionCategoryRepository>(categoryRepository);
+                services.AddSingleton<IRetentionRuleProvider>(categoryRepository);
             }
         );
         await SeedOldNoteAsync(tenant.Id, "resilient-delete");
@@ -425,13 +684,15 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             dryRun: true,
             killSwitch: false
         );
-        var categoryRepository = new CountingCategoryRepository(new SampleCategoryRepository());
+        var categoryRepository = new CountingCategoryRepository(
+            new SampleRetentionRuleProvider()
+        );
         using var host = BuildHost(
             settings,
             tenant,
             services =>
             {
-                services.AddSingleton<IRetentionCategoryRepository>(categoryRepository);
+                services.AddSingleton<IRetentionRuleProvider>(categoryRepository);
             }
         );
         await SeedOldNoteAsync(tenant.Id, "dry-run-note");
@@ -548,13 +809,14 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             tenantA,
             services =>
             {
-                services.AddSingleton<IRetentionCategoryRepository, SampleCategoryRepository>();
-                services.AddSingleton<IRetentionTenantSource>(
-                    new ReloadingTenantSource(
-                        tenantA,
-                        tenantB,
+                services.AddSingleton<IRetentionRuleProvider>(
+                    new ReloadingRuleProvider(
+                        tenantA.Id,
                         () => host!.Reload(killSwitch: true, dryRun: true)
                     )
+                );
+                services.AddSingleton<IRetentionTenantSource>(
+                    new StaticTenantSource(tenantA, tenantB)
                 );
             }
         );
@@ -767,18 +1029,23 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         throw new XunitException("Condition was not met within the allotted timeout.");
     }
 
-    private sealed class CountingCategoryRepository(IRetentionCategoryRepository inner)
-        : IRetentionCategoryRepository
+    private sealed class CountingCategoryRepository(IRetentionRuleProvider inner)
+        : IRetentionRuleProvider
     {
         public int GetAsyncCount => getAsyncCount;
 
         private int getAsyncCount;
 
-        public async Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        public RetentionCategoryCapabilities? GetCapabilities(string category)
         {
             Interlocked.Increment(ref getAsyncCount);
-            return await inner.GetAsync(category, ct);
+            return inner.GetCapabilities(category);
         }
+
+        public Task<RetentionRule?> ResolveAsync(
+            RetentionResolutionContext context,
+            CancellationToken ct
+        ) => inner.ResolveAsync(context, ct);
     }
 
     private sealed class StaticTenantSource(params TenantContext[] tenants) : IRetentionTenantSource
@@ -789,24 +1056,65 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         }
     }
 
-    private sealed class ReloadingTenantSource(
-        TenantContext first,
-        TenantContext second,
-        Action reload
-    ) : IRetentionTenantSource
+    private sealed class CancellationBlockingTenantSource : IRetentionTenantSource
     {
-        public Task<IReadOnlyList<TenantContext>> GetTenantsAsync(CancellationToken ct)
+        private readonly TaskCompletionSource entered = new(
+            TaskCreationOptions.RunContinuationsAsynchronously
+        );
+        private int cancellationObserved;
+
+        public Task Entered => entered.Task;
+
+        public bool CancellationObserved => Volatile.Read(ref cancellationObserved) == 1;
+
+        public async Task<IReadOnlyList<TenantContext>> GetTenantsAsync(CancellationToken ct)
         {
-            return Task.FromResult<IReadOnlyList<TenantContext>>(
-                new ReloadingTenantList(first, second, reload)
-            );
+            entered.TrySetResult();
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+                return [];
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                Interlocked.Exchange(ref cancellationObserved, 1);
+                throw;
+            }
         }
     }
 
-    private sealed class ReloadingTenantList(
+    private sealed class CancellationBlockingIterationTenantSource(
         TenantContext first,
-        TenantContext second,
-        Action reload
+        TenantContext later
+    ) : IRetentionTenantSource
+    {
+        private readonly TaskCompletionSource iterationBlocked = new(
+            TaskCreationOptions.RunContinuationsAsynchronously
+        );
+        private int cancellationObserved;
+
+        public Task IterationBlocked => iterationBlocked.Task;
+
+        public bool CancellationObserved => Volatile.Read(ref cancellationObserved) == 1;
+
+        public Task<IReadOnlyList<TenantContext>> GetTenantsAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<TenantContext>>(
+                new CancellationBlockingTenantList(
+                    first,
+                    later,
+                    ct,
+                    iterationBlocked,
+                    () => Interlocked.Exchange(ref cancellationObserved, 1)
+                )
+            );
+    }
+
+    private sealed class CancellationBlockingTenantList(
+        TenantContext first,
+        TenantContext later,
+        CancellationToken ct,
+        TaskCompletionSource iterationBlocked,
+        Action cancellationObserved
     ) : IReadOnlyList<TenantContext>
     {
         public int Count => 2;
@@ -814,23 +1122,52 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         public TenantContext this[int index] => index switch
         {
             0 => first,
-            1 => second,
+            1 => later,
             _ => throw new ArgumentOutOfRangeException(nameof(index)),
         };
 
         public IEnumerator<TenantContext> GetEnumerator()
         {
             yield return first;
-            reload();
-            yield return second;
+            iterationBlocked.TrySetResult();
+            ct.WaitHandle.WaitOne();
+            cancellationObserved();
+            ct.ThrowIfCancellationRequested();
+            yield return later;
         }
 
         System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() =>
             GetEnumerator();
     }
 
-    private sealed class FailingOnceCategoryRepository(IRetentionCategoryRepository inner)
-        : IRetentionCategoryRepository
+    private sealed class ReloadingRuleProvider(Guid firstTenantId, Action reload)
+        : IRetentionRuleProvider
+    {
+        private readonly SampleRetentionRuleProvider inner = new();
+        private int reloaded;
+
+        public RetentionCategoryCapabilities? GetCapabilities(string category) =>
+            inner.GetCapabilities(category);
+
+        public Task<RetentionRule?> ResolveAsync(
+            RetentionResolutionContext context,
+            CancellationToken ct
+        )
+        {
+            if (
+                context.Tenant.Id == firstTenantId
+                && Interlocked.CompareExchange(ref reloaded, 1, 0) == 0
+            )
+            {
+                reload();
+            }
+
+            return inner.ResolveAsync(context, ct);
+        }
+    }
+
+    private sealed class FailingOnceCategoryRepository(IRetentionRuleProvider inner)
+        : IRetentionRuleProvider
     {
         private readonly TaskCompletionSource failedIteration = new(
             TaskCreationOptions.RunContinuationsAsynchronously
@@ -844,61 +1181,171 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
 
         public Task LaterSuccessfulIteration => laterSuccessfulIteration.Task;
 
-        public async Task<IRetentionRuleResolver?> GetAsync(
-            string category,
+        public RetentionCategoryCapabilities? GetCapabilities(string category) =>
+            inner.GetCapabilities(category);
+
+        public async Task<RetentionRule?> ResolveAsync(
+            RetentionResolutionContext context,
             CancellationToken ct
         )
         {
-            var resolver = await inner.GetAsync(category, ct);
-            return resolver is null ? null : new FailingOnceResolver(resolver, this);
-        }
-
-        private sealed class FailingOnceResolver(
-            IRetentionRuleResolver inner,
-            FailingOnceCategoryRepository state
-        ) : IRetentionRuleResolver
-        {
-            public async Task<RetentionRule> ResolveAsync(
-                RetentionResolutionContext ctx,
-                CancellationToken ct
-            )
+            if (Interlocked.CompareExchange(ref failureInjected, 1, 0) == 0)
             {
-                if (Interlocked.CompareExchange(ref state.failureInjected, 1, 0) == 0)
-                {
-                    state.failedIteration.TrySetResult();
-                    throw new InvalidOperationException(
-                        "Simulated transient category resolver failure."
-                    );
-                }
-
-                var rule = await inner.ResolveAsync(ctx, ct);
-                state.laterSuccessfulIteration.TrySetResult();
-                return rule;
+                failedIteration.TrySetResult();
+                throw new InvalidOperationException(
+                    "Simulated transient category resolver failure."
+                );
             }
 
-            public RetentionRule? TryResolveAtStartup() => inner.TryResolveAtStartup();
+            var rule = await inner.ResolveAsync(context, ct);
+            laterSuccessfulIteration.TrySetResult();
+            return rule;
         }
     }
 
-    private sealed class CustomCategoryRepository : IRetentionCategoryRepository
+    private sealed class TenantFailingRuleProvider(Guid failingTenantId)
+        : IRetentionRuleProvider
     {
-        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        private readonly SampleRetentionRuleProvider inner = new();
+
+        public RetentionCategoryCapabilities? GetCapabilities(string category) =>
+            inner.GetCapabilities(category);
+
+        public Task<RetentionRule?> ResolveAsync(
+            RetentionResolutionContext context,
+            CancellationToken ct
+        )
         {
-            return Task.FromResult<IRetentionRuleResolver?>(null);
+            if (context.Tenant.Id == failingTenantId)
+            {
+                throw new InvalidOperationException("Simulated tenant-specific policy failure.");
+            }
+
+            return inner.ResolveAsync(context, ct);
         }
     }
 
-    private sealed class CustomAuditWriter : IRetentionAuditWriter
+    private sealed class CapturingRuleProvider(Guid tenantId) : IRetentionRuleProvider
     {
-        public Task WriteAsync(SweepEvent evt, CancellationToken ct)
+        private readonly SampleRetentionRuleProvider inner = new();
+        private readonly TaskCompletionSource firstResolution = new(
+            TaskCreationOptions.RunContinuationsAsynchronously
+        );
+        private int resolutionCount;
+
+        public Task FirstResolution => firstResolution.Task;
+
+        public TenantContext? FirstContext { get; private set; }
+
+        public int ResolutionCount => Volatile.Read(ref resolutionCount);
+
+        public RetentionCategoryCapabilities? GetCapabilities(string category) =>
+            inner.GetCapabilities(category);
+
+        public Task<RetentionRule?> ResolveAsync(
+            RetentionResolutionContext context,
+            CancellationToken ct
+        )
+        {
+            if (context.Category == "short-lived" && context.Tenant.Id == tenantId)
+            {
+                Interlocked.Increment(ref resolutionCount);
+                FirstContext ??= context.Tenant;
+                firstResolution.TrySetResult();
+            }
+
+            return inner.ResolveAsync(context, ct);
+        }
+    }
+
+    private sealed class SequentialRuleProvider(Guid firstTenantId, Guid secondTenantId)
+        : IRetentionRuleProvider
+    {
+        private readonly SampleRetentionRuleProvider inner = new();
+        private readonly TaskCompletionSource firstTenantEntered = new(
+            TaskCreationOptions.RunContinuationsAsynchronously
+        );
+        private readonly TaskCompletionSource secondTenantEntered = new(
+            TaskCreationOptions.RunContinuationsAsynchronously
+        );
+        private readonly TaskCompletionSource releaseFirstTenant = new(
+            TaskCreationOptions.RunContinuationsAsynchronously
+        );
+        private int concurrency;
+        private int maximumConcurrency;
+
+        public Task FirstTenantEntered => firstTenantEntered.Task;
+
+        public Task SecondTenantEntered => secondTenantEntered.Task;
+
+        public int MaximumConcurrency => Volatile.Read(ref maximumConcurrency);
+
+        public RetentionCategoryCapabilities? GetCapabilities(string category) =>
+            inner.GetCapabilities(category);
+
+        public async Task<RetentionRule?> ResolveAsync(
+            RetentionResolutionContext context,
+            CancellationToken ct
+        )
+        {
+            var current = Interlocked.Increment(ref concurrency);
+            var observedMaximum = Volatile.Read(ref maximumConcurrency);
+            while (
+                current > observedMaximum
+                && Interlocked.CompareExchange(
+                    ref maximumConcurrency,
+                    current,
+                    observedMaximum
+                ) != observedMaximum
+            )
+            {
+                observedMaximum = Volatile.Read(ref maximumConcurrency);
+            }
+            try
+            {
+                if (context.Tenant.Id == firstTenantId && context.Category == "short-lived")
+                {
+                    firstTenantEntered.TrySetResult();
+                    await releaseFirstTenant.Task.WaitAsync(ct);
+                }
+                else if (context.Tenant.Id == secondTenantId)
+                {
+                    secondTenantEntered.TrySetResult();
+                }
+
+                return await inner.ResolveAsync(context, ct);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref concurrency);
+            }
+        }
+
+        public void ReleaseFirstTenant() => releaseFirstTenant.TrySetResult();
+    }
+
+    private sealed class CustomCategoryRepository : IRetentionRuleProvider
+    {
+        public RetentionCategoryCapabilities? GetCapabilities(string category) => null;
+
+        public Task<RetentionRule?> ResolveAsync(
+            RetentionResolutionContext context,
+            CancellationToken ct
+        ) => Task.FromResult<RetentionRule?>(null);
+    }
+
+    private sealed class CustomAuditObserver : IRetentionAuditObserver
+    {
+        public Task OnCommittedAsync(SweepEvent evt, CancellationToken ct)
         {
             return Task.CompletedTask;
         }
     }
 
-    private sealed class BlockingAuditWriter(BlockingAuditWriterState state) : IRetentionAuditWriter
+    private sealed class BlockingAuditObserver(BlockingAuditWriterState state)
+        : IRetentionAuditObserver
     {
-        public async Task WriteAsync(SweepEvent evt, CancellationToken ct)
+        public async Task OnCommittedAsync(SweepEvent evt, CancellationToken ct)
         {
             if (evt is SweepEvent.Started)
             {
@@ -1035,6 +1482,44 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             }
         }
     }
+
+    private sealed class WorkerLogProvider : ILoggerProvider
+    {
+        private readonly ConcurrentQueue<WorkerLogEntry> entries = new();
+
+        public IReadOnlyList<WorkerLogEntry> Entries => entries.ToArray();
+
+        public ILogger CreateLogger(string categoryName) => new WorkerLogger(entries);
+
+        public void Dispose() { }
+
+        private sealed class WorkerLogger(ConcurrentQueue<WorkerLogEntry> entries) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state)
+                where TState : notnull => null;
+
+            public bool IsEnabled(LogLevel logLevel) => true;
+
+            public void Log<TState>(
+                LogLevel logLevel,
+                EventId eventId,
+                TState state,
+                Exception? exception,
+                Func<TState, Exception?, string> formatter
+            )
+            {
+                entries.Enqueue(
+                    new WorkerLogEntry(logLevel, formatter(state, exception), exception)
+                );
+            }
+        }
+    }
+
+    private sealed record WorkerLogEntry(
+        LogLevel Level,
+        string Message,
+        Exception? Exception
+    );
 
     private sealed class BlockingAuditWriterState
     {

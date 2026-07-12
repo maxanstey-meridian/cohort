@@ -9,6 +9,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
 
 using Npgsql;
 
@@ -116,11 +117,10 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
         exception
             .Which.Errors.Should()
             .ContainSingle(error =>
-                error.Contains("sweep_run.\"Status\"", StringComparison.Ordinal)
-                && error.Contains(
-                    "sweep_run_row_detail.\"RetentionEntityId\"",
-                    StringComparison.Ordinal
-                )
+                error.Contains("\"public\".\"sweep_run\"", StringComparison.Ordinal)
+                && error.Contains("Status", StringComparison.Ordinal)
+                && error.Contains("\"public\".\"sweep_run_row_detail\"", StringComparison.Ordinal)
+                && error.Contains("RetentionEntityId", StringComparison.Ordinal)
                 && error.Contains("sweep_row_handler_status", StringComparison.Ordinal)
                 && error.Contains("pending EF Core migrations", StringComparison.Ordinal)
             );
@@ -139,6 +139,55 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
 
         await host.StartAsync();
         await host.StopAsync();
+    }
+
+    [Fact]
+    public async Task Hosted_Configuration_Binding_Accepts_Dispatch_Numeric_Ceilings()
+    {
+        using var host = BuildHost<ValidRetentionDbContext>(
+            options => options.UseNpgsql(fixture.ConnectionString),
+            new SingleCategoryRepository(
+                "valid",
+                new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+            ),
+            new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:BatchSize"] = "10000",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxAttempts"] = "1000",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxParallelism"] = "256",
+            }
+        );
+
+        await host.StartAsync();
+        await host.StopAsync();
+    }
+
+    [Theory]
+    [InlineData("BatchSize", "10001")]
+    [InlineData("MaxAttempts", "1001")]
+    [InlineData("MaxParallelism", "257")]
+    public async Task Hosted_Configuration_Binding_Rejects_Dispatch_Numeric_Ceilings(
+        string option,
+        string value
+    )
+    {
+        using var host = BuildHost<ValidRetentionDbContext>(
+            options => options.UseNpgsql(fixture.ConnectionString),
+            new SingleCategoryRepository(
+                "valid",
+                new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+            ),
+            new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:{option}"] = value,
+            }
+        );
+
+        var act = async () => await host.StartAsync();
+
+        await act.Should()
+            .ThrowAsync<OptionsValidationException>()
+            .WithMessage($"*{option}*");
     }
 
     [Fact]
@@ -177,7 +226,7 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
                 ALTER COLUMN "Category" TYPE varchar;
             ALTER TABLE public.sweep_run_row_detail
                 ALTER COLUMN "EntityType" TYPE varchar,
-                ALTER COLUMN "EntityId" TYPE varchar,
+                ALTER COLUMN "RecordId" TYPE varchar,
                 ALTER COLUMN "Category" TYPE varchar;
             ALTER TABLE public.sweep_row_handler_status
                 ALTER COLUMN "HandlerType" TYPE varchar;
@@ -218,7 +267,7 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task StartAsync_Uses_SearchPath_Resolution_And_Accepts_Equivalent_Index_Names()
+    public async Task StartAsync_Rejects_Moved_Tables_Even_When_SearchPath_Can_Resolve_Them()
     {
         await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
         await BootstrapCurrentSchemaAsync(database.ConnectionString);
@@ -245,8 +294,14 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
             )
         );
 
-        await host.StartAsync();
-        await host.StopAsync();
+        var act = async () => await host.StartAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle(error =>
+            error.Contains("\"public\".\"retention_holds\"", StringComparison.Ordinal)
+            && error.Contains("\"public\".\"sweep_run\"", StringComparison.Ordinal)
+            && error.Contains("\"public\".\"sweep_row_handler_status\"", StringComparison.Ordinal)
+        );
     }
 
     [Fact]
@@ -272,7 +327,7 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle(error =>
-            error.Contains("sweep_run_row_detail(SweepId, RetentionEntityId, EntityId, Category, Strategy, TenantId)", StringComparison.Ordinal)
+            error.Contains("sweep_run_row_detail(SweepId, RetentionEntityId, RecordId, Category, Strategy, TenantId)", StringComparison.Ordinal)
         );
     }
 
@@ -495,6 +550,31 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public void AddCohort_Execution_Settings_Keep_The_Last_Valid_Snapshot_After_Invalid_Reload()
+    {
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(
+                new Dictionary<string, string?>
+                {
+                    [$"{CohortOptions.SectionName}:RowHandlerDispatch:BatchSize"] = "20",
+                }
+            )
+            .Build();
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IConfiguration>(configuration);
+        services.AddCohort<ValidRetentionDbContext>();
+        using var provider = services.BuildServiceProvider();
+        var settings = provider.GetRequiredService<IRetentionExecutionSettings>();
+
+        configuration[$"{CohortOptions.SectionName}:RowHandlerDispatch:BatchSize"] = "10001";
+        var reload = () => configuration.Reload();
+
+        reload.Should().Throw<OptionsValidationException>();
+        settings.RowHandlerDispatch.BatchSize.Should().Be(20);
+    }
+
+    [Fact]
     public void AddCohort_Rejects_A_Different_Context()
     {
         var services = new ServiceCollection();
@@ -602,7 +682,7 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
 
     private static IHost BuildHost<TContext>(
         Action<DbContextOptionsBuilder> configureDb,
-        IRetentionCategoryRepository categoryRepository,
+        ITestRetentionRuleProvider categoryRepository,
         IReadOnlyDictionary<string, string?>? settings = null,
         Action<IServiceCollection>? configureServices = null
     )
@@ -611,7 +691,7 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
         var builder = Host.CreateApplicationBuilder();
         builder.Configuration.AddInMemoryCollection(settings ?? new Dictionary<string, string?>());
         builder.Services.AddDbContext<TContext>(configureDb);
-        builder.Services.AddSingleton(categoryRepository);
+        builder.Services.AddSingleton<IRetentionRuleProvider>(categoryRepository);
         configureServices?.Invoke(builder.Services);
         builder.Services.AddCohort<TContext>();
         return builder.Build();
@@ -636,14 +716,14 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
     }
 
     private sealed class SingleCategoryRepository(string category, RetentionRule rule)
-        : IRetentionCategoryRepository
+        : ITestRetentionRuleProvider
     {
-        public Task<IRetentionRuleResolver?> GetAsync(
+        public Task<ITestRetentionRule?> GetAsync(
             string requestedCategory,
             CancellationToken ct
         ) =>
-            Task.FromResult<IRetentionRuleResolver?>(
-                requestedCategory == category ? new StaticRetentionRuleResolver(rule) : null
+            Task.FromResult<ITestRetentionRule?>(
+                requestedCategory == category ? new StaticTestRetentionRule(rule) : null
             );
     }
 
@@ -654,6 +734,7 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
             modelBuilder.Entity<InvalidRetentionRecord>().HasKey(record => record.Id);
+            modelBuilder.ConfigureCohortTables();
         }
     }
 
@@ -663,6 +744,7 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
             modelBuilder.Entity<ValidRetentionRecord>().HasKey(record => record.Id);
+            modelBuilder.ConfigureCohortTables();
         }
     }
 

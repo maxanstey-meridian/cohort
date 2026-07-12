@@ -2,7 +2,6 @@ using System.Collections.Concurrent;
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure;
-using Cohort.Infrastructure.Audit;
 using Cohort.Sample.Entities;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -13,6 +12,77 @@ namespace Cohort.Sample.Tests;
 public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
     : IntegrationTestBase(fixture)
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Rule_Resolution_Failure_Is_Sanitized_And_Does_Not_Block_Unrelated_Entities(
+        bool erasure
+    )
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 7, 12, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var contactId = Guid.NewGuid();
+        var provider = new FailingOnceRuleProvider("rule resolution contained private data");
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-60),
+                    Body = "failed category",
+                }
+            );
+            db.AnonymisedContacts.Add(
+                new AnonymisedContact
+                {
+                    Id = contactId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-60),
+                    EmailAddress = "unrelated@example.org",
+                    GivenName = "Unrelated",
+                    Surname = "Entity",
+                    Notes = "must still run",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var host = new CohortTestHost(ConnectionString, provider);
+
+        var result = erasure
+            ? ToAuditResult(
+                await host.RunErasureAsync(
+                    new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                    new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+                    asOf
+                )
+            )
+            : ToAuditResult(
+                await host.RunSweepAsync(
+                    new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                    asOf
+                )
+            );
+
+        result.EntityFailures.Should().ContainSingle().Which.Should().MatchRegex(
+            "^type=System\\.InvalidOperationException;code=hresult:0x80131509;diagnosticId=[0-9a-f]{32}$"
+        );
+        result.EntityFailures.Single().Should().NotContain("private data");
+        result.Counts.Should().Contain(count =>
+            count.EntityType == typeof(AnonymisedContact) && count.Affected == 1
+        );
+        (await LoadLatestRunRegardlessOfModeAsync(tenantId)).Status.Should().Be(
+            SweepRunStatus.PartiallyFailed
+        );
+    }
+
     [Fact]
     public async Task Dry_Run_Cancellation_Marks_Run_Cancelled_Without_Mutating_Source_Rows()
     {
@@ -83,6 +153,31 @@ public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
         }
     }
 
+    private sealed class FailingOnceRuleProvider(string message) : IRetentionRuleProvider
+    {
+        private readonly SampleRetentionRuleProvider inner = new();
+        private int failed;
+
+        public RetentionCategoryCapabilities? GetCapabilities(string category) =>
+            inner.GetCapabilities(category);
+
+        public Task<RetentionRule?> ResolveAsync(
+            RetentionResolutionContext context,
+            CancellationToken ct
+        )
+        {
+            if (
+                context.Category == "short-lived"
+                && Interlocked.CompareExchange(ref failed, 1, 0) == 0
+            )
+            {
+                throw new InvalidOperationException(message);
+            }
+
+            return inner.ResolveAsync(context, ct);
+        }
+    }
+
     [Fact]
     public async Task Dry_Run_Entity_Failure_Marks_Run_PartiallyFailed_And_Preserves_Successful_Summaries()
     {
@@ -143,9 +238,10 @@ public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
 
             result
                 .EntityFailures.Should()
-                .ContainSingle(failure =>
-                    failure.Contains(nameof(AnonymisedContact))
-                    && failure.Contains("dry run entity summary exploded")
+                .ContainSingle()
+                .Which.Should()
+                .MatchRegex(
+                    "^type=Npgsql\\.PostgresException;code=sqlstate:P0001;diagnosticId=[0-9a-f]{32}$"
                 );
             result
                 .Counts.Should()
@@ -155,7 +251,8 @@ public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
             var run = await LoadLatestRunAsync(tenantId);
             run.Status.Should().Be(SweepRunStatus.PartiallyFailed);
             run.SettledAt.Should().NotBeNull();
-            run.Error.Should().Contain("dry run entity summary exploded");
+            run.Error.Should().Be(result.EntityFailures.Single());
+            run.Error.Should().NotContain("dry run entity summary exploded");
             run.TotalAffected.Should().Be(1);
 
             var summaryEntityTypes = await LoadSummaryEntityTypesAsync(result.SweepId);
@@ -177,7 +274,7 @@ public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task Erasure_Dry_Run_Summary_Failure_Excludes_Unaudited_Entity_From_Result_And_Terminal_Total()
+    public async Task Erasure_Dry_Run_Observer_Failure_Does_Not_Alter_Result_Or_Authoritative_Audit()
     {
         var tenantId = Guid.NewGuid();
         var subjectId = Guid.NewGuid();
@@ -217,37 +314,29 @@ public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
                 ["Cohort:DryRun"] = "True",
             },
             configureServices: services =>
-                services.AddScoped<IRetentionAuditWriter>(sp =>
-                    new ThrowOnEntitySummaryAuditWriter(
-                        new EfRetentionAuditWriter(
-                            sp.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext)
-                        ),
-                        typeof(AnonymisedContact)
-                    )
+                services.AddSingleton<IRetentionAuditObserver>(
+                    new ThrowOnEntitySummaryAuditObserver(typeof(AnonymisedContact))
                 )
         );
 
         var result = await RunErasureAsync(host, tenantId, subjectId, asOf);
 
         result.DryRun.Should().BeTrue();
-        result
-            .EntityFailures.Should()
-            .ContainSingle(failure =>
-                failure.Contains(nameof(AnonymisedContact))
-                && failure.Contains("entity summary exploded")
-            );
+        result.EntityFailures.Should().BeEmpty();
         result
             .Counts.Should()
             .Contain(count => count.EntityType == typeof(Note) && count.Affected == 1);
-        result.Counts.Should().NotContain(count => count.EntityType == typeof(AnonymisedContact));
+        result
+            .Counts.Should()
+            .Contain(count => count.EntityType == typeof(AnonymisedContact) && count.Affected == 1);
 
         var run = await LoadLatestRunAsync(tenantId);
-        run.Status.Should().Be(SweepRunStatus.PartiallyFailed);
-        run.TotalAffected.Should().Be(1);
+        run.Status.Should().Be(SweepRunStatus.Succeeded);
+        run.TotalAffected.Should().Be(2);
 
         var summaryEntityTypes = await LoadSummaryEntityTypesAsync(result.SweepId);
         summaryEntityTypes.Should().Contain(typeof(Note).FullName!);
-        summaryEntityTypes.Should().NotContain(typeof(AnonymisedContact).FullName!);
+        summaryEntityTypes.Should().Contain(typeof(AnonymisedContact).FullName!);
     }
 
     [Theory]
@@ -279,23 +368,20 @@ public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
         }
 
         using var cancellation = new CancellationTokenSource();
-        CancelAfterEntitySummaryAuditWriter? cancellingWriter = null;
+        CancelAfterEntitySummaryAuditObserver? cancellingObserver = null;
         using var host = new CohortTestHost(
             ConnectionString,
             configurationOverrides: runKind == CancellationRunKind.DryRun
                 ? null
                 : new Dictionary<string, string?> { ["Cohort:DryRun"] = "False" },
             configureServices: services =>
-                services.AddScoped<IRetentionAuditWriter>(sp =>
+                services.AddSingleton<IRetentionAuditObserver>(sp =>
                 {
-                    cancellingWriter = new CancelAfterEntitySummaryAuditWriter(
-                        new EfRetentionAuditWriter(
-                            sp.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext)
-                        ),
+                    cancellingObserver = new CancelAfterEntitySummaryAuditObserver(
                         cancellation,
                         typeof(TombstoneRecord)
                     );
-                    return cancellingWriter;
+                    return cancellingObserver;
                 })
         );
 
@@ -320,8 +406,8 @@ public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
         };
 
         await act.Should().ThrowAsync<OperationCanceledException>();
-        cancellingWriter.Should().NotBeNull();
-        cancellingWriter!.Cancelled.Should().BeTrue();
+        cancellingObserver.Should().NotBeNull();
+        cancellingObserver!.Cancelled.Should().BeTrue();
 
         var run = await LoadLatestRunRegardlessOfModeAsync(tenantId);
         run.Status.Should().Be(SweepRunStatus.Cancelled);
@@ -381,7 +467,10 @@ public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
             var run = await LoadLatestRunAsync(tenantId);
             run.Status.Should().Be(SweepRunStatus.Failed);
             run.SettledAt.Should().NotBeNull();
-            run.Error.Should().Contain("dry run completion exploded");
+            run.Error.Should().MatchRegex(
+                "^type=Npgsql\\.PostgresException;code=sqlstate:P0001;diagnosticId=[0-9a-f]{32}$"
+            );
+            run.Error.Should().NotContain("dry run completion exploded");
             run.TotalAffected.Should().Be(1);
 
             var summaryEntityTypes = await LoadSummaryEntityTypesAsync(run.SweepId);
@@ -451,13 +540,8 @@ public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
                     ? new Dictionary<string, string?> { ["Cohort:DryRun"] = "False" }
                     : null,
                 configureServices: services =>
-                    services.AddScoped<IRetentionAuditWriter>(sp =>
-                        new RecordingAuditWriter(
-                            new EfRetentionAuditWriter(
-                                sp.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext)
-                            ),
-                            emittedEvents
-                        )
+                    services.AddSingleton<IRetentionAuditObserver>(
+                        new RecordingAuditObserver(emittedEvents)
                     )
             );
 
@@ -472,7 +556,13 @@ public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
 
             result
                 .EntityFailures.Should()
-                .Contain(failure => failure.Contains("entity settlement exploded"));
+                .AllSatisfy(failure =>
+                {
+                    failure.Should().MatchRegex(
+                        "^type=Npgsql\\.PostgresException;code=sqlstate:P0001;diagnosticId=[0-9a-f]{32}$"
+                    );
+                    failure.Should().NotContain("entity settlement exploded");
+                });
             result.Counts.Single(count => count.EntityType == typeof(Note)).Affected.Should().Be(1);
             emittedEvents
                 .OfType<SweepEvent.PartiallyFailed>()
@@ -550,7 +640,10 @@ public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
             (await reader.ReadAsync()).Should().BeTrue();
             reader.GetInt32(0).Should().Be((int)SweepRunStatus.Failed);
             reader.IsDBNull(1).Should().BeFalse();
-            reader.GetString(2).Should().Contain(exception.Which.MessageText);
+            reader.GetString(2).Should().MatchRegex(
+                "^type=Npgsql\\.PostgresException;code=sqlstate:P0001;diagnosticId=[0-9a-f]{32}$"
+            );
+            reader.GetString(2).Should().NotContain(exception.Which.MessageText);
         }
         finally
         {
@@ -658,13 +751,8 @@ public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
                     ? new Dictionary<string, string?> { ["Cohort:DryRun"] = "False" }
                     : null,
                 configureServices: services =>
-                    services.AddScoped<IRetentionAuditWriter>(sp =>
-                        new RecordingAuditWriter(
-                            new EfRetentionAuditWriter(
-                                sp.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext)
-                            ),
-                            emittedEvents
-                        )
+                    services.AddSingleton<IRetentionAuditObserver>(
+                        new RecordingAuditObserver(emittedEvents)
                     )
             );
             using var cancellation = new CancellationTokenSource();
@@ -974,50 +1062,46 @@ public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
         await command.ExecuteNonQueryAsync();
     }
 
-    private sealed class RecordingAuditWriter(
-        IRetentionAuditWriter inner,
-        ConcurrentQueue<SweepEvent> events
-    ) : IRetentionAuditWriter
+    private sealed class RecordingAuditObserver(ConcurrentQueue<SweepEvent> events)
+        : IRetentionAuditObserver
     {
-        public async Task WriteAsync(SweepEvent evt, CancellationToken ct)
+        public Task OnCommittedAsync(SweepEvent evt, CancellationToken ct)
         {
-            await inner.WriteAsync(evt, ct);
             events.Enqueue(evt);
+            return Task.CompletedTask;
         }
     }
 
-    private sealed class ThrowOnEntitySummaryAuditWriter(
-        IRetentionAuditWriter inner,
-        Type entityType
-    ) : IRetentionAuditWriter
+    private sealed class ThrowOnEntitySummaryAuditObserver(Type entityType)
+        : IRetentionAuditObserver
     {
-        public Task WriteAsync(SweepEvent evt, CancellationToken ct)
+        public Task OnCommittedAsync(SweepEvent evt, CancellationToken ct)
         {
             if (evt is SweepEvent.EntitySummary summary && summary.EntityType == entityType)
             {
                 throw new InvalidOperationException("entity summary exploded");
             }
 
-            return inner.WriteAsync(evt, ct);
+            return Task.CompletedTask;
         }
     }
 
-    private sealed class CancelAfterEntitySummaryAuditWriter(
-        IRetentionAuditWriter inner,
+    private sealed class CancelAfterEntitySummaryAuditObserver(
         CancellationTokenSource cancellation,
         Type entityType
-    ) : IRetentionAuditWriter
+    ) : IRetentionAuditObserver
     {
         public bool Cancelled { get; private set; }
 
-        public async Task WriteAsync(SweepEvent evt, CancellationToken ct)
+        public Task OnCommittedAsync(SweepEvent evt, CancellationToken ct)
         {
-            await inner.WriteAsync(evt, ct);
             if (evt is SweepEvent.EntitySummary summary && summary.EntityType == entityType)
             {
                 cancellation.Cancel();
                 Cancelled = true;
             }
+
+            return Task.CompletedTask;
         }
     }
 

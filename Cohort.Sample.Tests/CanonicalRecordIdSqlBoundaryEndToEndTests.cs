@@ -90,7 +90,7 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
             await using var verifyCommand = verify.CreateCommand();
             verifyCommand.CommandText = """
                 SELECT
-                    (SELECT "EntityId" FROM "sweep_run_row_detail" WHERE "SweepId" = @sweepId),
+                    (SELECT "RecordId" FROM "sweep_run_row_detail" WHERE "SweepId" = @sweepId),
                     (SELECT "RecordId" FROM "retention_holds" WHERE "RetentionEntityId" = '00000000-0000-0000-0004-000000000001'),
                     (SELECT "Id"::text FROM "canonical_record_id_regression" WHERE "Id" = 9876.50),
                     (SELECT "Payload" FROM "canonical_record_id_regression" WHERE "Id" = 1234.50)
@@ -145,7 +145,7 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
         await using var command = verify.CreateCommand();
         command.CommandText = """
             SELECT
-                (SELECT "EntityId" FROM "sweep_run_row_detail" WHERE "SweepId" = @sweepId),
+                (SELECT "RecordId" FROM "sweep_run_row_detail" WHERE "SweepId" = @sweepId),
                 EXISTS (SELECT 1 FROM "canonical_record_id_regression" WHERE "Id" = 1234.50)
             """;
         command.Parameters.AddWithValue("sweepId", result.SweepId);
@@ -236,7 +236,7 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
             await using var command = verify.CreateCommand();
             command.CommandText = """
                 SELECT
-                    (SELECT "EntityId" FROM "sweep_run_row_detail" WHERE "SweepId" = @sweepId),
+                    (SELECT "RecordId" FROM "sweep_run_row_detail" WHERE "SweepId" = @sweepId),
                     EXISTS (SELECT 1 FROM "canonical_record_id_regression" WHERE "Id" = 9876.50),
                     (SELECT "Payload" FROM "canonical_record_id_regression" WHERE "Id" = 9876.50),
                     EXISTS (SELECT 1 FROM "canonical_record_id_regression" WHERE "Id" = 1234.50),
@@ -281,7 +281,7 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
         services.AddDbContext<CanonicalRecordIdDbContext>(options =>
             options.UseNpgsql(connectionString)
         );
-        services.AddSingleton<IRetentionCategoryRepository>(new CategoryRepository(strategy));
+        services.AddSingleton<IRetentionRuleProvider>(new CategoryRepository(strategy));
         services.AddCohort<CanonicalRecordIdDbContext>();
         if (registerHandler)
         {
@@ -291,14 +291,14 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
         return services.BuildServiceProvider(validateScopes: true);
     }
 
-    private sealed class CategoryRepository(Strategy strategy) : IRetentionCategoryRepository
+    private sealed class CategoryRepository(Strategy strategy) : ITestRetentionRuleProvider
     {
-        private readonly IRetentionRuleResolver resolver = new StaticRetentionRuleResolver(
+        private readonly ITestRetentionRule resolver = new StaticTestRetentionRule(
             new RetentionRule(TimeSpan.FromDays(30), strategy)
         );
 
-        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct) =>
-            Task.FromResult<IRetentionRuleResolver?>(
+        public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct) =>
+            Task.FromResult<ITestRetentionRule?>(
                 category == "canonical-record-id" ? resolver : null
             );
     }

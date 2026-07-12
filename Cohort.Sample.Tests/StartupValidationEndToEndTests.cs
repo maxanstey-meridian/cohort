@@ -4,9 +4,11 @@ using Cohort.Hosting;
 using Cohort.Infrastructure;
 using Cohort.Infrastructure.Migrations;
 using Cohort.Sample.Entities;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 
@@ -102,13 +104,40 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     [Fact]
+    public async Task Validation_Checks_Every_Strategy_Declared_For_A_Dynamic_Category()
+    {
+        var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder();
+        builder.Configuration.AddInMemoryCollection(
+            new Dictionary<string, string?>
+            {
+                [$"{SampleOptions.SectionName}:{nameof(SampleOptions.ConnectionString)}"] =
+                    connectionString,
+            }
+        );
+        builder.Services.AddSampleRetentionServices();
+        builder.Services.RemoveAll<IRetentionRuleProvider>();
+        builder.Services.AddSingleton<IRetentionRuleProvider, MultiStrategyRuleProvider>();
+        using var host = builder.Build();
+
+        var act = () => host.StartAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception
+            .Which.Errors.Should()
+            .Contain(error =>
+                error.Contains(typeof(SoftDeleteRecord).FullName!, StringComparison.Ordinal)
+                && error.Contains("Anonymise", StringComparison.Ordinal)
+            );
+    }
+
+    [Fact]
     public async Task Validation_Fails_When_Retained_Entity_Cannot_Resolve_Tenant_In_TenantScoped_Config()
     {
         var act = async () =>
             await RunTenantScopeStartupAsync<MisconfiguredTenantScopedDbContext>(
                 new SingleCategoryRepository(
                     "misconfigured-tenant-scope",
-                    new StaticRetentionRuleResolver(
+                    new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                     )
                 )
@@ -133,7 +162,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         await RunTenantScopeHostAsync<MisconfiguredTenantScopedDbContext>(
             new SingleCategoryRepository(
                 "misconfigured-tenant-scope",
-                new StaticRetentionRuleResolver(
+                new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                 )
             ),
@@ -166,9 +195,8 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
                 var act = async () =>
                 {
                     await using var startupScope = serviceProvider.CreateAsyncScope();
-                    var startup =
-                        startupScope.ServiceProvider.GetRequiredService<SampleRetentionStartupService>();
-                    await startup.RunSweepAsync(
+                    var sweep = startupScope.ServiceProvider.GetRequiredService<IRetentionSweep>();
+                    await sweep.SweepAsync(
                         new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
                         asOf
                     );
@@ -285,6 +313,37 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     [Fact]
+    public async Task Hosted_Start_Rejects_Bound_Audit_Observer_Timeout_Above_The_Ceiling()
+    {
+        using var host = BuildSampleHostWithSetting("AuditObservers:Timeout", "01:00:00.001");
+
+        var start = () => host.StartAsync();
+
+        await start.Should()
+            .ThrowAsync<OptionsValidationException>()
+            .WithMessage("*AuditObservers Timeout must not exceed 1 hour*");
+    }
+
+    [Theory]
+    [InlineData("RowHandlerDispatch:BatchSize", "10001", "BatchSize")]
+    [InlineData("RowHandlerDispatch:MaxAttempts", "1001", "MaxAttempts")]
+    [InlineData("RowHandlerDispatch:MaxParallelism", "257", "MaxParallelism")]
+    public async Task Hosted_Start_Rejects_Bound_Row_Handler_Dispatch_Values_Above_Their_Ceilings(
+        string key,
+        string value,
+        string optionName
+    )
+    {
+        using var host = BuildSampleHostWithSetting(key, value);
+
+        var start = () => host.StartAsync();
+
+        await start.Should()
+            .ThrowAsync<OptionsValidationException>()
+            .WithMessage($"*RowHandlerDispatch {optionName} must not exceed*");
+    }
+
+    [Fact]
     public async Task AddRowHandler_Registers_Typed_Handlers_Without_Duplicates()
     {
         using var host = new CohortTestHost(
@@ -371,8 +430,8 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
             await RunFactoryValidationStartupAsync<InvalidFactoryTypeStartupDbContext>(
                 new SingleCategoryRepository(
                     "invalid-factory-type",
-                    new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    new StaticTestRetentionRule(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     )
                 )
             );
@@ -394,8 +453,8 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
             await RunFactoryValidationStartupAsync<UnregisteredFactoryStartupDbContext>(
                 new SingleCategoryRepository(
                     "unregistered-factory",
-                    new StaticRetentionRuleResolver(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    new StaticTestRetentionRule(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     )
                 )
             );
@@ -416,7 +475,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         var entries = await RunFactoryValidationStartupAsync<RegisteredFactoryStartupDbContext>(
             new SingleCategoryRepository(
                 "registered-factory",
-                new StaticRetentionRuleResolver(
+                new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                 )
             ),
@@ -437,7 +496,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
             await RunFactoryValidationStartupAsync<RegisteredFactoryStartupDbContext>(
                 new SingleCategoryRepository(
                     "registered-factory",
-                    new StaticRetentionRuleResolver(
+                    new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     )
                 ),
@@ -465,7 +524,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
             await RunFactoryValidationStartupAsync<RegisteredFactoryStartupDbContext>(
                 new SingleCategoryRepository(
                     "registered-factory",
-                    new StaticRetentionRuleResolver(
+                    new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     )
                 ),
@@ -496,7 +555,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         var entries = await RunFactoryValidationStartupAsync<RegisteredFactoryStartupDbContext>(
             new SingleCategoryRepository(
                 "registered-factory",
-                new StaticRetentionRuleResolver(
+                new StaticTestRetentionRule(
                     new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                 )
             ),
@@ -531,7 +590,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     private async Task<
         IReadOnlyDictionary<Type, RetentionEntry>
     > RunFactoryValidationStartupAsync<TContext>(
-        IRetentionCategoryRepository categoryRepository,
+        ITestRetentionRuleProvider categoryRepository,
         Action<IServiceCollection>? registerServices = null
     )
         where TContext : DbContext
@@ -544,7 +603,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         services.AddSingleton<IConfiguration>(configuration);
         services.AddLogging();
         services.AddDbContext<TContext>(options => options.UseNpgsql(connectionString));
-        services.AddSingleton(categoryRepository);
+        services.AddSingleton<IRetentionRuleProvider>(categoryRepository);
         registerServices?.Invoke(services);
         services.AddCohort<TContext>();
 
@@ -553,9 +612,24 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         return await ValidateAndScanAsync(scope.ServiceProvider);
     }
 
+    private IHost BuildSampleHostWithSetting(string key, string value)
+    {
+        var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder();
+        builder.Configuration.AddInMemoryCollection(
+            new Dictionary<string, string?>
+            {
+                [$"{SampleOptions.SectionName}:{nameof(SampleOptions.ConnectionString)}"] =
+                    connectionString,
+                [$"{CohortOptions.SectionName}:{key}"] = value,
+            }
+        );
+        builder.Services.AddSampleRetentionServices();
+        return builder.Build();
+    }
+
     private async Task<
         IReadOnlyDictionary<Type, RetentionEntry>
-    > RunTenantScopeStartupAsync<TContext>(IRetentionCategoryRepository categoryRepository)
+    > RunTenantScopeStartupAsync<TContext>(ITestRetentionRuleProvider categoryRepository)
         where TContext : DbContext
     {
         IReadOnlyDictionary<Type, RetentionEntry>? entries = null;
@@ -582,7 +656,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     private async Task RunTenantScopeHostAsync<TContext>(
-        IRetentionCategoryRepository categoryRepository,
+        ITestRetentionRuleProvider categoryRepository,
         Func<ServiceProvider, Task> action
     )
         where TContext : DbContext
@@ -595,29 +669,43 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         services.AddSingleton<IConfiguration>(configuration);
         services.AddLogging();
         services.AddDbContext<TContext>(options => options.UseNpgsql(connectionString));
-        services.AddSingleton(categoryRepository);
+        services.AddSingleton<IRetentionRuleProvider>(categoryRepository);
         services.AddCohort<TContext>();
-        services.AddScoped<SampleRetentionStartupService>();
 
         await using var serviceProvider = services.BuildServiceProvider(validateScopes: true);
         await action(serviceProvider);
     }
 
-    private sealed class EmptyCategoryRepository : IRetentionCategoryRepository
+    private sealed class EmptyCategoryRepository : ITestRetentionRuleProvider
     {
-        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct) =>
-            Task.FromResult<IRetentionRuleResolver?>(null);
+        public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct) =>
+            Task.FromResult<ITestRetentionRule?>(null);
     }
 
-    private sealed class SingleCategoryRepository(string category, IRetentionRuleResolver resolver)
-        : IRetentionCategoryRepository
+    private sealed class MultiStrategyRuleProvider : IRetentionRuleProvider
     {
-        public Task<IRetentionRuleResolver?> GetAsync(
+        private readonly SampleRetentionRuleProvider inner = new();
+
+        public RetentionCategoryCapabilities? GetCapabilities(string category) =>
+            category == "soft-delete"
+                ? new([Strategy.SoftDelete, Strategy.Anonymise])
+                : inner.GetCapabilities(category);
+
+        public Task<RetentionRule?> ResolveAsync(
+            RetentionResolutionContext context,
+            CancellationToken ct
+        ) => inner.ResolveAsync(context, ct);
+    }
+
+    private sealed class SingleCategoryRepository(string category, ITestRetentionRule resolver)
+        : ITestRetentionRuleProvider
+    {
+        public Task<ITestRetentionRule?> GetAsync(
             string requestedCategory,
             CancellationToken ct
         )
         {
-            return Task.FromResult<IRetentionRuleResolver?>(
+            return Task.FromResult<ITestRetentionRule?>(
                 requestedCategory == category
                     ? resolver
                     : throw new InvalidOperationException(
@@ -627,7 +715,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         }
     }
 
-    private sealed class DeferredRuleResolver(RetentionRule rule) : IRetentionRuleResolver
+    private sealed class DeferredRuleResolver(RetentionRule rule) : ITestRetentionRule
     {
         public Task<RetentionRule> ResolveAsync(
             RetentionResolutionContext ctx,
@@ -641,6 +729,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<InvalidFactoryTypeStartupRecord>(entity =>
             {
                 entity.ToTable("invalid_factory_type_startup_records");
@@ -658,6 +747,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<UnregisteredFactoryStartupRecord>(entity =>
             {
                 entity.ToTable("unregistered_factory_startup_records");
@@ -675,6 +765,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<RegisteredFactoryStartupRecord>(entity =>
             {
                 entity.ToTable("registered_factory_startup_records");
@@ -717,6 +808,8 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
 
         [AnonymiseWith(typeof(NotAFactory))]
         public Guid ExternalId { get; init; }
+
+        public DateTimeOffset? AnonymisedAt { get; init; }
     }
 
     [Retain("unregistered-factory", nameof(UnregisteredFactoryStartupRecord.CreatedAt))]
@@ -729,6 +822,8 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
 
         [AnonymiseWith(typeof(RegisteredFactory))]
         public Guid ExternalId { get; init; }
+
+        public DateTimeOffset? AnonymisedAt { get; init; }
     }
 
     [Retain("registered-factory", nameof(RegisteredFactoryStartupRecord.CreatedAt))]

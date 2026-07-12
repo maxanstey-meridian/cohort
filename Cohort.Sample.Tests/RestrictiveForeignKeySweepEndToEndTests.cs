@@ -143,19 +143,19 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
         services.AddDbContext<RestrictiveForeignKeyDbContext>(options =>
             options.UseNpgsql(connectionString)
         );
-        services.AddSingleton<IRetentionCategoryRepository>(new PurgeCategoryRepository());
+        services.AddSingleton<IRetentionRuleProvider>(new PurgeCategoryRepository());
         services.AddCohort<RestrictiveForeignKeyDbContext>();
         return services.BuildServiceProvider(validateScopes: true);
     }
 
-    private sealed class PurgeCategoryRepository : IRetentionCategoryRepository
+    private sealed class PurgeCategoryRepository : ITestRetentionRuleProvider
     {
-        private static readonly IRetentionRuleResolver Resolver = new StaticRetentionRuleResolver(
+        private static readonly ITestRetentionRule Resolver = new StaticTestRetentionRule(
             new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
         );
 
-        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct) =>
-            Task.FromResult<IRetentionRuleResolver?>(category == "restrictive-fk" ? Resolver : null);
+        public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct) =>
+            Task.FromResult<ITestRetentionRule?>(category == "restrictive-fk" ? Resolver : null);
     }
 
     private sealed class RestrictiveForeignKeyDbContext(

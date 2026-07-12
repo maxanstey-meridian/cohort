@@ -79,4 +79,66 @@ public sealed class CutoffCalculatorTests
 
         cutoff.Should().Be(now - TimeSpan.FromDays(90));
     }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Compute_Saturates_When_A_Valid_Retention_Duration_Precedes_The_Minimum_Date(
+        bool useLegalMinimum
+    )
+    {
+        var now = DateTimeOffset.Parse("2026-01-01T00:00:00+00:00");
+
+        var cutoff = CutoffCalculator.Compute(
+            now,
+            useLegalMinimum ? TimeSpan.Zero : TimeSpan.MaxValue,
+            useLegalMinimum ? TimeSpan.MaxValue : null
+        );
+
+        cutoff.Should().Be(DateTimeOffset.MinValue);
+    }
+
+    [Theory]
+    [InlineData(null, 0)]
+    [InlineData(0, 0)]
+    [InlineData(90, 90)]
+    public void ResolveErasureMinimumAge_Uses_Only_Positive_LegalMin(
+        int? legalMinDays,
+        int expectedDays
+    )
+    {
+        TimeSpan? legalMin = legalMinDays is { } days ? TimeSpan.FromDays(days) : null;
+
+        var minimumAge = CutoffCalculator.ResolveErasureMinimumAge(legalMin);
+
+        minimumAge.Should().Be(TimeSpan.FromDays(expectedDays));
+    }
+
+    [Theory]
+    [InlineData(null, null)]
+    [InlineData(0, null)]
+    [InlineData(90, "2025-10-03T00:00:00+00:00")]
+    public void ComputeErasureCutoff_Returns_A_Cutoff_Only_For_Positive_LegalMin(
+        int? legalMinDays,
+        string? expectedIso
+    )
+    {
+        var now = DateTimeOffset.Parse("2026-01-01T00:00:00+00:00");
+        TimeSpan? legalMin = legalMinDays is { } days ? TimeSpan.FromDays(days) : null;
+
+        var cutoff = CutoffCalculator.ComputeErasureCutoff(now, legalMin);
+
+        cutoff.Should().Be(expectedIso is null ? null : DateTimeOffset.Parse(expectedIso));
+    }
+
+    [Fact]
+    public void ComputeErasureCutoff_Saturates_When_LegalMin_Precedes_The_Minimum_Date()
+    {
+        var cutoff = CutoffCalculator.ComputeErasureCutoff(
+            DateTimeOffset.Parse("2026-01-01T00:00:00+00:00"),
+            TimeSpan.MaxValue
+        );
+
+        cutoff.Should().Be(DateTimeOffset.MinValue);
+    }
 }

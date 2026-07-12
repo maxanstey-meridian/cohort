@@ -16,6 +16,108 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
     : IntegrationTestBase(fixture)
 {
     [Fact]
+    public async Task Handler_Aware_Anonymisation_Keeps_Candidate_Resources_Batch_Bounded_As_Failure_History_Grows()
+    {
+        const int batchSize = 10;
+        const int failingRows = 80;
+        const int healthyRows = 6;
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 7, 11, 12, 0, 0, TimeSpan.Zero);
+        var failingIds = Enumerable.Range(0, failingRows).Select(_ => Guid.NewGuid()).ToArray();
+        var healthyIds = Enumerable.Range(0, healthyRows).Select(_ => Guid.NewGuid()).ToArray();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.AnonymisedContacts.AddRange(failingIds.Select((id, index) => new AnonymisedContact
+            {
+                Id = id,
+                TenantId = tenantId,
+                CreatedAt = asOf.AddDays(-400).AddSeconds(index),
+                EmailAddress = $"fail-{index}@example.com",
+                GivenName = "Failing",
+                Surname = "Contact",
+                Notes = "persistent-handler-failure",
+            }));
+            db.AnonymisedContacts.AddRange(healthyIds.Select((id, index) => new AnonymisedContact
+            {
+                Id = id,
+                TenantId = tenantId,
+                CreatedAt = asOf.AddDays(-200).AddSeconds(index),
+                EmailAddress = $"healthy-{index}@example.com",
+                GivenName = "Healthy",
+                Surname = "Contact",
+                Notes = "healthy-anonymisation",
+            }));
+            await db.SaveChangesAsync();
+        }
+
+        using var commands = new PostgreSqlCommandRecorder();
+        using var host = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:SweepBatchSize"] = batchSize.ToString(),
+            },
+            configureServices: services =>
+                services.AddRowHandler<AnonymisedContact, PersistentlyFailingContactHandler>(),
+            commandRecorder: commands
+        );
+        var tenant = new TenantContext(tenantId, "uk", new Dictionary<string, string>());
+
+        var first = await host.RunSweepAsync(tenant, asOf);
+
+        first.EntityFailures.Should().BeEmpty();
+        first.Counts.Should().ContainSingle(count =>
+            count.EntityType == typeof(AnonymisedContact)
+            && count.Affected == healthyRows
+            && count.SkippedCount == failingRows
+        );
+        await using (var verify = Host.CreateDbContext())
+        {
+            var contacts = await verify.AnonymisedContacts
+                .Where(contact => contact.TenantId == tenantId)
+                .ToListAsync();
+            contacts.Where(contact => healthyIds.Contains(contact.Id))
+                .Should().OnlyContain(contact => contact.AnonymisedAt == asOf);
+            contacts.Where(contact => failingIds.Contains(contact.Id))
+                .Should().OnlyContain(contact => contact.AnonymisedAt == null);
+        }
+
+        var retry = await host.RunSweepAsync(tenant, asOf);
+        retry.Counts.Should().ContainSingle(count =>
+            count.EntityType == typeof(AnonymisedContact)
+            && count.Affected == 0
+            && count.SkippedCount == failingRows
+        );
+
+        var candidateCommands = commands.Commands
+            .Where(command =>
+                command.CommandText.Contains(
+                    ".\"anonymised_contacts\" AS target",
+                    StringComparison.Ordinal
+                )
+                && command.CommandText.Contains("LIMIT $", StringComparison.Ordinal)
+            )
+            .ToArray();
+        candidateCommands.Should().NotBeEmpty();
+        candidateCommands.Max(command => command.ScalarParameterCount).Should().Be(9);
+        var idArrayLengths = commands.Commands
+            .Where(command => command.CommandText.Contains(
+                "\"anonymised_contacts\"",
+                StringComparison.Ordinal
+            ))
+            .SelectMany(command => command.ArrayLengths)
+            .ToArray();
+        idArrayLengths.Should().NotBeEmpty();
+        idArrayLengths.Should().OnlyContain(length => length <= batchSize);
+
+        var firstDetails = await LoadRunRecordIdsAsync(first.SweepId);
+        var retryDetails = await LoadRunRecordIdsAsync(retry.SweepId);
+        firstDetails.Should().HaveCount(failingRows + healthyRows).And.OnlyHaveUniqueItems();
+        retryDetails.Should().HaveCount(failingRows).And.OnlyHaveUniqueItems();
+    }
+
+    [Fact]
     public async Task Erasure_Waits_For_A_Matching_Row_Locked_By_Another_Transaction()
     {
         var tenantId = Guid.NewGuid();
@@ -354,15 +456,15 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         using var host = new CohortTestHost(
             connectionString,
             new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
+                new Dictionary<string, ITestRetentionRule>
                 {
-                    ["short-lived"] = new StaticRetentionRuleResolver(
+                    ["short-lived"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
-                    ["soft-delete"] = new StaticRetentionRuleResolver(
+                    ["soft-delete"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
                     ),
-                    ["anonymise"] = new StaticRetentionRuleResolver(
+                    ["anonymise"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
                 }
@@ -797,16 +899,10 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
             await db.SaveChangesAsync();
         }
 
-        await using (var scope = services.CreateAsyncScope())
-        {
-            var engine = scope.ServiceProvider.GetRequiredService<RetentionSweepEngine>();
-            await engine.SweepAsync(
-                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                asOf,
-                SweepTriggerKind.Manual,
-                SweepEntityScope.TenantedOnly
-            );
-        }
+        await services.GetRequiredService<IRetentionSweep>().SweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
 
         await using (var scope = services.CreateAsyncScope())
         {
@@ -860,16 +956,10 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
             await db.SaveChangesAsync();
         }
 
-        await using (var scope = services.CreateAsyncScope())
-        {
-            var engine = scope.ServiceProvider.GetRequiredService<RetentionSweepEngine>();
-            await engine.SweepAsync(
-                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                asOf,
-                SweepTriggerKind.Manual,
-                SweepEntityScope.TenantedOnly
-            );
-        }
+        await services.GetRequiredService<IRetentionSweep>().SweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
 
         await using (var scope = services.CreateAsyncScope())
         {
@@ -902,6 +992,23 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         return db.Database.GetConnectionString()!;
     }
 
+    private async Task<string[]> LoadRunRecordIdsAsync(Guid sweepId)
+    {
+        await using var connection = new NpgsqlConnection(GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            "SELECT \"RecordId\" FROM \"sweep_run_row_detail\" WHERE \"SweepId\" = @sweepId";
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        await using var reader = await command.ExecuteReaderAsync();
+        var recordIds = new List<string>();
+        while (await reader.ReadAsync())
+        {
+            recordIds.Add(reader.GetString(0));
+        }
+        return recordIds.ToArray();
+    }
+
     private static ServiceProvider BuildFactoryBackedSweepServiceProvider(string connectionString)
     {
         var services = new ServiceCollection();
@@ -912,14 +1019,14 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         services.AddDbContext<FactoryBackedSweepDbContext>(options =>
             options.UseNpgsql(connectionString)
         );
-        services.AddSingleton<IRetentionCategoryRepository>(
+        services.AddSingleton<IRetentionRuleProvider>(
             new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
+                new Dictionary<string, ITestRetentionRule>
                 {
-                    ["factory-backed-set-based"] = new StaticRetentionRuleResolver(
+                    ["factory-backed-set-based"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
-                    ["factory-backed-per-row"] = new StaticRetentionRuleResolver(
+                    ["factory-backed-per-row"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
                 }
@@ -954,14 +1061,14 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         services.AddDbContext<ConvertedOriginalValueDbContext>(options =>
             options.UseNpgsql(connectionString)
         );
-        services.AddSingleton<IRetentionCategoryRepository>(
+        services.AddSingleton<IRetentionRuleProvider>(
             new StaticCategoryRepository(
-                new Dictionary<string, IRetentionRuleResolver>
+                new Dictionary<string, ITestRetentionRule>
                 {
-                    ["converted-original-value"] = new StaticRetentionRuleResolver(
+                    ["converted-original-value"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
-                    ["converted-set-based-value"] = new StaticRetentionRuleResolver(
+                    ["converted-set-based-value"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
                     ),
                 }
@@ -1210,21 +1317,21 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
     }
 
     private sealed class StaticCategoryRepository(
-        IReadOnlyDictionary<string, IRetentionRuleResolver> resolvers
-    ) : IRetentionCategoryRepository
+        IReadOnlyDictionary<string, ITestRetentionRule> resolvers
+    ) : ITestRetentionRuleProvider
     {
         // Falls through to Exempt for categories the test does not care about
         // (e.g. categories owned by other sample entities sharing SampleDbContext).
-        private static readonly IRetentionRuleResolver ExemptFallback =
-            new StaticRetentionRuleResolver(
+        private static readonly ITestRetentionRule ExemptFallback =
+            new StaticTestRetentionRule(
                 new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
             );
 
-        public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+        public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct)
         {
             return resolvers.TryGetValue(category, out var resolver)
-                ? Task.FromResult<IRetentionRuleResolver?>(resolver)
-                : Task.FromResult<IRetentionRuleResolver?>(ExemptFallback);
+                ? Task.FromResult<ITestRetentionRule?>(resolver)
+                : Task.FromResult<ITestRetentionRule?>(ExemptFallback);
         }
     }
 }
@@ -1236,4 +1343,22 @@ file sealed class SubjectRaceContactHandler : IRetentionHandler<AnonymisedContac
         RetentionBeforeContext ctx,
         CancellationToken ct
     ) => Task.CompletedTask;
+}
+
+file sealed class PersistentlyFailingContactHandler : IRetentionHandler<AnonymisedContact>
+{
+    public Task OnBeforeAsync(
+        AnonymisedContact row,
+        RetentionBeforeContext ctx,
+        CancellationToken ct
+    )
+    {
+        if (row.EmailAddress?.StartsWith("fail-", StringComparison.Ordinal) == true)
+        {
+            throw new InvalidOperationException("Simulated persistent anonymisation failure.");
+        }
+
+        ctx.Snapshot["email"] = row.EmailAddress;
+        return Task.CompletedTask;
+    }
 }

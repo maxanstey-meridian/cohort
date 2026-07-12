@@ -11,8 +11,6 @@ namespace Cohort.Infrastructure;
 /// contract. The registry never touches `DbSet`, never issues SQL — it only reads
 /// metadata. SQL belongs in `Infrastructure/`.
 ///
-/// Crude error handling: throws `InvalidOperationException` on the first failure.
-/// Multi-error aggregation via `RetentionConfigurationException` is Milestone A.
 internal sealed class RetentionRegistry(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
     RetentionEntryBuilder entryBuilder

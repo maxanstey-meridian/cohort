@@ -1,14 +1,15 @@
 using System.Data.Common;
 using System.Reflection;
-using Cohort.Application;
 using Cohort.Domain;
+using Microsoft.Extensions.Logging;
 
 namespace Cohort.Infrastructure.Sweep;
 
 internal sealed class AnonymiseHandlerAwareMutationExecutor(
     AnonymiseAssignmentResolver assignmentResolver,
     AnonymiseRowLoader rowLoader,
-    AnonymiseMutationExecutor mutationExecutor
+    AnonymiseMutationExecutor mutationExecutor,
+    ILogger? logger = null
 )
 {
     private static readonly MethodInfo ExecuteCoreMethod =
@@ -75,6 +76,7 @@ internal sealed class AnonymiseHandlerAwareMutationExecutor(
             ctx.Tenant,
             conn,
             candidateRecordIds,
+            filter,
             ct
         );
         var recordIdProperty =
@@ -162,6 +164,7 @@ internal sealed class AnonymiseHandlerAwareMutationExecutor(
                     new Dictionary<string, object?>(beforeContext.Snapshot, StringComparer.Ordinal),
                     beforeResult.FailedHandler!,
                     beforeResult.Failure!,
+                    logger,
                     ct
                 );
                 continue;

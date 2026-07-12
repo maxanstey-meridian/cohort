@@ -30,6 +30,7 @@ internal sealed class AnonymiseMutationExecutor(
             conn,
             transaction,
             candidateRecordIds,
+            filter,
             ct
         );
         if (updatableRows.Count == 0)
@@ -96,7 +97,7 @@ internal sealed class AnonymiseMutationExecutor(
             tenant.Id
         );
         AnonymiseDbParameterFactory.AddCandidateIdsParameter(command, candidateRecordIds);
-        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.EntityId);
+        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.RetentionEntityId);
         AddAnonymisedAtParameter(command, entry, now);
 
         var affectedRecordIds = await ReadAffectedRecordIdsAsync(command, ct);
@@ -140,7 +141,7 @@ internal sealed class AnonymiseMutationExecutor(
             entry.Tenant?.TenantColumn,
             tenant.Id
         );
-        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.EntityId);
+        AnonymiseDbParameterFactory.AddHoldParameters(command, entry.RetentionEntityId);
         AddAnonymisedAtParameter(command, entry, now);
 
         await using var reader = await command.ExecuteReaderAsync(ct);

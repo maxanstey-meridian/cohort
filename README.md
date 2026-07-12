@@ -14,7 +14,7 @@ From there it handles the awkward bits for you:
 - applying tenant predicates automatically
 - respecting legal holds
 - running purge, soft-delete, or anonymise mutations
-- supporting right-to-erasure without bypassing retention windows
+- supporting immediate right-to-erasure with legal-minimum and active-hold blockers
 - writing an audit trail of what happened
 
 Postgres-only.
@@ -38,9 +38,12 @@ Two cases:
 1. purge short-lived operational data after 30 days
 2. keep a business record, but anonymise personal fields after 365 days
 
+<!-- package-contract:compile -->
 ```csharp
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Hosting;
+using Cohort.Infrastructure.Migrations;
 
 [Retain("session-notes", nameof(CreatedAt))]
 [RetentionEntityId("a3f467fe-c5d0-4f17-9897-83c373cc1dc8")]
@@ -68,32 +71,39 @@ public sealed class CaseContact
     public string FullName { get; set; } = "";
 }
 
-public sealed class RetentionCategories : IRetentionCategoryRepository
+public sealed class RetentionRules : IRetentionRuleProvider
 {
-    public Task<IRetentionRuleResolver?> GetAsync(string category, CancellationToken ct)
+    public RetentionCategoryCapabilities? GetCapabilities(string category) => category switch
     {
-        IRetentionRuleResolver? resolver = category switch
+        "session-notes" => new([Strategy.Purge]),
+        "case-contacts" => new([Strategy.Anonymise]),
+        _ => null,
+    };
+
+    public Task<RetentionRule?> ResolveAsync(
+        RetentionResolutionContext context,
+        CancellationToken ct)
+    {
+        RetentionRule? rule = context.Category switch
         {
-            "session-notes" => new StaticRetentionRuleResolver(
-                new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)),
-            "case-contacts" => new StaticRetentionRuleResolver(
-                new RetentionRule(TimeSpan.FromDays(365), Strategy.Anonymise)),
+            "session-notes" => new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge),
+            "case-contacts" => new RetentionRule(TimeSpan.FromDays(365), Strategy.Anonymise),
             _ => null,
         };
 
-        return Task.FromResult(resolver);
+        return Task.FromResult(rule);
     }
 }
 ```
 
 Register Cohort and add its infrastructure tables to your EF model:
 
-```csharp
-builder.Services.AddSingleton<IRetentionCategoryRepository, RetentionCategories>();
+```text
+builder.Services.AddSingleton<IRetentionRuleProvider, RetentionRules>();
 builder.Services.AddCohort<MyDbContext>();
 ```
 
-```csharp
+```text
 protected override void OnModelCreating(ModelBuilder modelBuilder)
 {
     base.OnModelCreating(modelBuilder);
@@ -117,7 +127,7 @@ Once registered, Cohort can preview, sweep, and right-to-erasure retained entiti
 
 Every retained entity also requires a stable UUID identity:
 
-```csharp
+```text
 [Retain("session-notes", nameof(CreatedAt))]
 [RetentionEntityId("a3f467fe-c5d0-4f17-9897-83c373cc1dc8")]
 public sealed class SessionNote { /* ... */ }
@@ -136,8 +146,8 @@ Audit rows retain the human-readable CLR `EntityType` separately; within a run,
 `sweep_run_entity_summary` rows are uniquely identified by the durable retention entity ID
 together with category, tenant, and strategy.
 
-At this point the entity annotation is wired. You must still map its category to a rule,
-register Cohort, and add Cohort's infrastructure tables to the EF model as shown below.
+Complete the configuration by mapping the category through `IRetentionRuleProvider`,
+registering Cohort, and adding Cohort's infrastructure tables to the EF model as shown below.
 
 Unannotated entities are implicitly exempt. Use `[ExemptFromRetention("reason")]` if you want that exemption to be explicit in code.
 
@@ -145,10 +155,11 @@ Guardrails enforced at startup validation:
 
 - `Period` and `LegalMin` must be non-negative (`RetentionRule` rejects negative values —
   a negative period would compute a future cutoff and sweep everything).
+- Owned retained types, entities sharing a table with another EF type, and entities split
+  across multiple tables are rejected. Cohort mutates one independently owned table per
+  retained entity and will not guess which columns or rows belong to it.
 - Retained entities must not participate in an EF inheritance hierarchy (TPH/TPT/TPC):
   sweep SQL targets the table without a discriminator.
-- Retained entities must live in the default `public` schema; Cohort SQL does not
-  schema-qualify identifiers.
 - No `ON DELETE CASCADE` foreign key may lead from a purgeable retained entity into
   another retained entity — a cascade would bypass the dependent's retention window,
   holds, and audit trail.
@@ -165,7 +176,7 @@ Retained entities are tenant-scoped by default. They must expose a `TenantId` pr
 
 ### 2. Map categories to rules
 
-Each category resolves to a `RetentionRule`:
+Each category resolves directly through `IRetentionRuleProvider` to a `RetentionRule`:
 
 - `Period`
 - `Strategy`
@@ -175,15 +186,61 @@ Each category resolves to a `RetentionRule`:
 
 The entity annotation does not decide whether a row is purged or anonymised. The resolved `RetentionRule` does.
 
+`GetCapabilities(category)` synchronously declares every strategy that `ResolveAsync` can
+return for that category. Capabilities are not a cache of the current rule: startup validates
+the union of every declared strategy against each retained entity. A runtime rule whose
+strategy was not declared is rejected. `ResolveAsync` receives category, tenant, logical time,
+and alias path, so a host provider can apply tenant- and time-specific policy without hiding
+its possible model requirements.
+
 ### 3. Register Cohort
 
-Register your `IRetentionCategoryRepository` before `AddCohort<TDbContext>()`, and call `ConfigureCohortTables()` in `OnModelCreating`.
+Register your `IRetentionRuleProvider` before `AddCohort<TDbContext>()`, declare every strategy each category can return, and call `ConfigureCohortTables()` in `OnModelCreating`. Startup validates the union of declared strategy requirements.
+
+`[ErasureSubject]` metadata is also validated at startup: marked properties must be mapped
+to physical columns and have compatible effective/provider types. Invalid erasure metadata
+therefore prevents startup instead of failing the first subject request.
+
+Map all Cohort-owned tables explicitly. The parameterless overload maps them to `public`;
+the schema overload maps all five tables together:
+
+```text
+modelBuilder.ConfigureCohortTables("retention");
+```
+
+All retained and Cohort-owned SQL identifiers are schema-qualified. Missing retained-table
+schema resolves to the EF model default and then `public`; runtime behavior does not depend on
+PostgreSQL `search_path`.
 
 ### 4. Choose how to run it
 
 - `IRetentionPreview` gives you a count-only preview
 - `IRetentionSweep` performs the real sweep
 - `IRetentionErasureService` runs subject erasure inside the same retention rules
+
+The package test compiles this invocation example verbatim against the packed artifact:
+
+<!-- package-contract:compile -->
+```csharp
+public static class ReadmeRetentionOperations
+{
+    public static async Task RunAsync(
+        IServiceProvider provider,
+        TenantContext tenant,
+        Guid subjectId,
+        CancellationToken ct)
+    {
+        var now = DateTimeOffset.UtcNow;
+        await provider.GetRequiredService<IRetentionPreview>().PreviewAsync(tenant, now, ct);
+        await provider.GetRequiredService<IRetentionSweep>().SweepAsync(tenant, now, ct);
+        await provider.GetRequiredService<IRetentionErasureService>().EraseAsync(
+            tenant,
+            new ErasureScope(subjectId),
+            now,
+            ct);
+    }
+}
+```
 
 ## Strategies
 
@@ -203,7 +260,7 @@ exactly once instead of on every sweep. Startup validation enforces the marker.
 
 For straightforward cases, mark columns with `[Anonymise]`:
 
-```csharp
+```text
 [Anonymise(AnonymiseMethod.Null)]
 public string? Email { get; set; }
 
@@ -216,7 +273,7 @@ public string Phone { get; set; } = "";
 
 For custom logic, use `AnonymiseWithAttribute`:
 
-```csharp
+```text
 [AnonymiseWith(typeof(MyCustomFactory))]
 public string ExternalReference { get; set; } = "";
 ```
@@ -225,6 +282,7 @@ public string ExternalReference { get; set; } = "";
 
 Mark one or more subject identifiers with `[ErasureSubject]`:
 
+<!-- package-contract:compile -->
 ```csharp
 [Retain("user-data", nameof(CreatedAt))]
 [RetentionEntityId("6b619c19-6e3c-44e8-a87f-975c68fd3988")]
@@ -246,12 +304,17 @@ You can mark multiple `[ErasureSubject]` properties on the same entity.
 
 Any marked subject column equals the requested subject is treated as an erasure match.
 
-Cohort only erases rows that satisfy both conditions:
+Cohort erases rows that satisfy these conditions:
 
 1. any marked subject column equals the requested subject
-2. the row is already past the effective retention cutoff for its category
+2. the row belongs to the requested tenant
+3. the resolved strategy is eligible for erasure
+4. no active hold covers the row
 
-Active holds still block erasure, and tenant-scoped entities still keep the tenant predicate in the SQL.
+Ordinary `Period` never delays subject erasure. With no positive `LegalMin`, Cohort emits no
+anchor predicate, so null and future anchors are eligible. A positive `LegalMin` adds the
+strict predicate `anchor < now - LegalMin`; an exact-boundary or null anchor remains blocked,
+and blocked null anchors are reported in `NullAnchorCount`. Active holds always block erasure.
 
 Erasure refuses categories that resolve to the SoftDelete strategy: setting a flag leaves
 personal data in the row, which rarely satisfies an erasure request. If it genuinely does,
@@ -337,8 +400,9 @@ The execution contract:
   backstop scrub after `RowHandlerDispatch:PayloadRetention` (default 30 days). Queued
   handler work whose snapshot the backstop scrubbed can never complete, so it dead-letters
   immediately with the scrub named as the reason instead of burning its retry budget.
-  Dead-letter `LastError` stores the root-cause exception type and message only — no
-  stack traces.
+  Dead-letter `LastError` stores a sanitized diagnostic containing the exception type, safe
+  machine code when available, and a diagnostic ID. It never stores arbitrary exception text
+  or stack traces.
 - Persisted payloads name CLR types, so deserialisation is allow-listed: snapshot values
   round-trip only as well-known scalars, property types of the swept entity, or types
   declared in the entity's or its registered handlers' assemblies. A tampered payload
@@ -352,7 +416,10 @@ The execution contract:
   "Cohort": {
     "Schedule": "0 2 * * *",
     "DryRun": false,
-    "KillSwitch": false
+    "KillSwitch": false,
+    "AuditObservers": {
+      "Timeout": "00:00:05"
+    }
   }
 }
 ```
@@ -363,6 +430,10 @@ The execution contract:
 | `DryRun` | `false` | Run scheduled sweeps as count-only audited runs instead of mutating data. The worker calls the sweep engine's dry-run path, which writes the same run and entity audit trail with `sweep_run.DryRun` set. Direct `IRetentionPreview` calls remain unaudited previews, `IRetentionSweep.SweepAsync` refuses to run, and `EraseAsync` returns counts without mutating (`ErasureResult.DryRun` is `true`). |
 | `KillSwitch` | `false` | Finish the current iteration, then skip future ticks. |
 | `SweepBatchSize` | `5000` | Maximum rows selected, locked, and mutated per transaction. Each batch commits independently. |
+| `AuditObservers:Timeout` | `00:00:05` | Maximum time Cohort waits for each observer to handle one committed event. Each observer has an independent timeout. |
+| `RowHandlerDispatch:BatchSize` | `100` | Maximum queued handler statuses claimed in one dispatcher batch. Valid range: 1 to 10000. |
+| `RowHandlerDispatch:MaxParallelism` | `4` | Maximum rows dispatched concurrently. Handlers for one row remain ordered. Valid range: 1 to 256. |
+| `RowHandlerDispatch:MaxAttempts` | `5` | Maximum delivery attempts before dead-lettering. Valid range: 1 to 1000. |
 
 Worker semantics worth knowing:
 
@@ -373,6 +444,9 @@ Worker semantics worth knowing:
 - The worker sweeps every tenant returned by `IRetentionTenantSource`. The default source
   adapts a singleton `TenantContext` registration; multi-tenant hosts register their own
   source enumerating all tenants.
+- Tenant passes execute sequentially in first-seen order. Duplicate tenant IDs execute once;
+  if duplicate entries disagree on jurisdiction or tags, Cohort logs a warning and uses the
+  first context.
 - Replicas coordinate through a Postgres advisory lock: only one instance sweeps a given
   occurrence; the others skip and log.
 - Missed occurrences are skipped, not caught up: the next occurrence is always computed
@@ -380,11 +454,25 @@ Worker semantics worth knowing:
 - Sweeps triggered by the worker are audited as `Scheduled`; direct calls to
   `IRetentionSweep.SweepAsync` are audited as `Manual`.
 
-### 0.6 package surface
+### Breaking pre-1.0 contract
 
-Version 0.6 intentionally narrows the public package surface. Relational strategy and
-mapping implementation types are internal; consumers configure and invoke retention through
-the annotations, hosting extensions, and application ports documented here.
+This release intentionally changes the pre-1.0 API and database contract. Relational strategy,
+reflection, ordering, and authoritative audit-writer implementation types are internal;
+consumers configure and invoke retention through annotations, hosting extensions, and the
+application ports documented here. Replace category repository/resolver registrations with one
+`IRetentionRuleProvider`, and replace custom audit writers with best-effort
+`IRetentionAuditObserver` registrations or database/CDC export.
+
+`RetentionRule` is now an invariant-preserving getter-only record. Construct a replacement rule
+through its public constructor when policy changes; object initializers and `with` mutation are no
+longer supported. This prevents copied rules from bypassing period, strategy, and audit-detail
+validation.
+
+Row-level public terminology now consistently uses `RecordId`. Rename consumers of
+`SweepEvent.RowDetail.EntityId` and `RetentionAfterContext<TEntity>.EntityId` to `RecordId` at the
+same time as applying the database rename below. `RowHandlerPriorityAttribute.GetPriority` and
+`DefaultPriority` were removed; set `[RowHandlerPriority(value)]` on handlers and treat an absent
+attribute as unspecified rather than calling library helper methods.
 
 ### Identity migration
 
@@ -398,6 +486,35 @@ diagnostic metadata but is not part of summary uniqueness.
 
 Legal holds use the durable retention entity ID rather than a physical table name, so table
 renames do not detach a hold from its retained entity.
+
+`RetentionEntityId` and `RecordId` are deliberately different identities:
+
+- `RetentionEntityId` is the stable UUID assigned to a retained entity type. It survives CLR
+  and table renames and correlates rules, holds, summaries, row details, and handler work.
+- `RecordId` is the canonical PostgreSQL text identity of one row. Cohort derives it using the
+  mapped provider/store type, so UUID, integer, string, and converted keys remain scoped
+  consistently.
+
+The sample `RenameSweepRowDetailEntityIdToRecordId` migration renames the row-identity
+column in place, preserving audit history and dependent indexes. Hosts must add the
+equivalent forward migration to rename `sweep_run_row_detail."EntityId"` to `"RecordId"`;
+schema-qualify that operation, and do not drop and recreate the column or rewrite an
+already-applied migration. The sample's following `ExplicitCohortSchemas` migration changes only
+EF model metadata and intentionally emits no SQL because the existing Cohort tables are already
+in `public`.
+
+When adopting this release, host-owned forward migrations must:
+
+1. Rename `sweep_run_row_detail."EntityId"` to `"RecordId"` in place.
+2. Call `ConfigureCohortTables()` or `ConfigureCohortTables(schema)` in the finalized model.
+3. Move all five Cohort tables together when changing schema, preferably with PostgreSQL
+   `ALTER TABLE ... SET SCHEMA` so table identity and dependent objects are preserved.
+4. Preserve the summary and row-detail foreign keys to `sweep_run`, and the handler-status
+   foreign key to row detail.
+5. Preserve existing hold and audit rows; do not rewrite historical migrations.
+
+Deploy only after correcting any newly surfaced provider-capability, relational-shape,
+strategy-specific, or erasure-subject startup failures.
 
 ## Execution model
 
@@ -428,7 +545,7 @@ Sweeps and erasure are batched and incremental:
 
 ## Legal holds
 
-```csharp
+```text
 await holdsRepo.CreateAsync(new RetentionHoldRequest(
     holdId: Guid.NewGuid(),
     retentionEntityId: Guid.Parse("a3f467fe-c5d0-4f17-9897-83c373cc1dc8"),
@@ -450,12 +567,16 @@ Held records survive all strategies. Holds are checked in SQL via a `NOT EXISTS`
   hyphenated form the sweep compares against; non-Guid values are rejected.
 - For retained tenant-scoped tables, if the target row already exists its tenant must
   match `TenantId` — sweeps only honour holds whose tenant matches the row's, so a
-  mis-scoped hold would persist while protecting nothing. A row that does not exist yet
-  is allowed (holds may be created ahead of their row).
+  mis-scoped hold would persist while protecting nothing.
+- The canonical `RecordId` must identify an existing row. Cohort acquires the same
+  entity/tenant/record advisory lock used by mutation before checking existence and inserting
+  the hold, so a concurrent Cohort sweep cannot pass the hold between validation and creation.
+- Tenantless entities require a null `TenantId`; typed and provider-converted record IDs are
+  canonicalized before existence and hold matching.
 
 ## Audit trail
 
-Every sweep writes to Cohort-managed tables:
+Every sweep unconditionally writes its authoritative ledger to Cohort-managed tables:
 
 - `sweep_run`
 - `sweep_run_entity_summary`
@@ -472,3 +593,38 @@ Summary rows carry:
 - optional provenance via `RuleSource` and `RuleReason`
 
 Per-row detail is opt-in through `AuditRowDetail.PerRow`.
+
+The EF audit writer is internal and cannot be replaced through dependency injection. Mutation,
+row detail, and entity progress commit in the same transaction. Consumers can register any
+number of `IRetentionAuditObserver` implementations for post-commit export:
+
+```text
+services.AddSingleton<IRetentionAuditObserver, AuditExporter>();
+services.AddCohort<MyDbContext>();
+```
+
+Observers receive `Started`, `EntityProgress`, `RowDetail`, `EntitySummary`, and the terminal
+`Completed`, `PartiallyFailed`, `Failed`, or `Cancelled` event in committed lifecycle order.
+Batch `RowDetail` and `EntityProgress` events are not delivered until their mutation transaction
+has committed, and rolled-back events are never delivered. Each observer is isolated and bounded
+by `AuditObservers:Timeout`; exceptions and timeouts are logged but never alter committed data,
+the retention result, or run status.
+
+`RowDetail` events contain the canonical `RecordId` and `TenantId`. Treat observer implementations
+and their downstream transport as sensitive-data processors: protect access, logs, queues, and
+exports accordingly.
+
+Observer delivery is best effort and has no durable outbox. A process crash can lose a
+notification after the database commit. Guaranteed integrations must poll the authoritative
+tables, use CDC, or implement a durable host-owned outbox.
+
+## Failure diagnostics
+
+Failures derived from external exceptions persist and return a sanitized envelope containing the
+exception type, safe machine code when available (for example PostgreSQL SQLSTATE), and a random
+diagnostic ID. Cohort-defined machine-safe reasons may be stored as plain `Error` or `LastError`
+values instead. Only diagnostic `Error` and `LastError` text is privacy-sanitized: exception
+messages, stack traces, SQL values, and subject identifiers are excluded there, but the deliberately
+identifying `RecordId` and `TenantId` fields remain in row-detail events. Structured logs retain the
+original exception with the same diagnostic ID for protected operational diagnosis. Existing
+historical `Error` and `LastError` values are not rewritten during upgrade.

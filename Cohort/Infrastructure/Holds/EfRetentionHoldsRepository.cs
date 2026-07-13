@@ -11,7 +11,7 @@ namespace Cohort.Infrastructure.Holds;
 
 internal sealed class EfRetentionHoldsRepository(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
-    RetentionRegistry registry,
+    RetentionTargetResolver targetResolver,
     RetentionRuntimeReadinessValidator readinessValidator
 )
     : IRetentionHoldsRepository
@@ -24,8 +24,8 @@ internal sealed class EfRetentionHoldsRepository(
 
         // A hold with an unknown stable identity or record-id format the sweep-side NOT EXISTS match
         // never hits would look persisted while protecting nothing. Fail loudly instead.
-        var entry = ResolveTarget(request.RetentionEntityId);
-        ValidateTenantOwnership(entry, request.TenantId);
+        var entry = targetResolver.ResolveTarget(request.RetentionEntityId);
+        RetentionTargetResolver.ValidateTenantOwnership(entry, request.TenantId, "Retention hold");
         await readinessValidator.ValidateAsync(ct);
 
         var connection = db.Database.GetDbConnection();
@@ -44,10 +44,11 @@ internal sealed class EfRetentionHoldsRepository(
                 ? await db.Database.BeginTransactionAsync(ct)
                 : null;
             var transaction = (existingTransaction ?? ownedTransaction)!.GetDbTransaction();
-            var recordId = await CanonicaliseRecordIdAsync(
+            var recordId = await targetResolver.CanonicaliseRecordIdAsync(
                 entry,
                 request.RecordId,
                 transaction,
+                "Retention hold",
                 ct
             );
             await RetentionEntityLockSql.AcquireAsync(
@@ -177,71 +178,6 @@ internal sealed class EfRetentionHoldsRepository(
         );
     }
 
-    private RetentionEntry ResolveTarget(Guid retentionEntityId)
-    {
-        return registry.Scan().Values.SingleOrDefault(entry => entry.RetentionEntityId == retentionEntityId)
-            ?? throw new InvalidOperationException(
-                $"Retention entity ID '{retentionEntityId}' does not match a retained entity in the EF model."
-            );
-    }
-
-    private static void ValidateTenantOwnership(RetentionEntry entry, Guid? tenantId)
-    {
-        if (entry.Tenant is not null && (tenantId is null || tenantId == Guid.Empty))
-        {
-            throw new InvalidOperationException(
-                $"Retention hold for tenanted entity '{entry.RetentionEntityId}' requires a non-empty tenant ID."
-            );
-        }
-
-        if (entry.Tenant is null && tenantId is not null)
-        {
-            throw new InvalidOperationException(
-                $"Retention hold for tenantless entity '{entry.RetentionEntityId}' requires a null tenant ID."
-            );
-        }
-    }
-
-    private async Task<string> CanonicaliseRecordIdAsync(
-        RetentionEntry entry,
-        string recordId,
-        DbTransaction? transaction,
-        CancellationToken ct
-    )
-    {
-        var keyClrType =
-            Nullable.GetUnderlyingType(entry.RecordId.RecordIdType)
-            ?? entry.RecordId.RecordIdType;
-        if (keyClrType == typeof(Guid) && !Guid.TryParse(recordId, out _))
-        {
-            throw new InvalidOperationException(
-                $"Retention hold record id '{recordId}' for entity '{entry.RetentionEntityId}' is not a valid Guid. The hold would never match its row."
-            );
-        }
-
-        if (PostgresStoreTypeSql.Validate(entry.RecordId.RecordIdStoreType) is not { } storeType)
-        {
-            return keyClrType == typeof(Guid) ? Guid.Parse(recordId).ToString("D") : recordId;
-        }
-
-        await using var command = db.Database.GetDbConnection().CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = $"SELECT CAST(CAST(@recordId AS {storeType}) AS text)";
-        command.Parameters.Add(RetentionHoldSql.CreateParameter(command, "recordId", recordId));
-
-        try
-        {
-            return (string)(await command.ExecuteScalarAsync(ct))!;
-        }
-        catch (DbException exception) when (exception.SqlState?.StartsWith("22", StringComparison.Ordinal) == true)
-        {
-            throw new InvalidOperationException(
-                $"Retention hold record id '{recordId}' for entity '{entry.RetentionEntityId}' is not valid for provider type '{storeType}'. The hold would never match its row.",
-                exception
-            );
-        }
-    }
-
     public async Task RemoveAsync(Guid holdId, DateTimeOffset removedAt, CancellationToken ct)
     {
         await readinessValidator.ValidateAsync(ct);
@@ -357,8 +293,8 @@ internal sealed class EfRetentionHoldsRepository(
     )
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(recordId);
-        var entry = ResolveTarget(retentionEntityId);
-        ValidateTenantOwnership(entry, tenantId);
+        var entry = targetResolver.ResolveTarget(retentionEntityId);
+        RetentionTargetResolver.ValidateTenantOwnership(entry, tenantId, "Retention hold");
         await readinessValidator.ValidateAsync(ct);
         var connection = db.Database.GetDbConnection();
         var shouldCloseConnection = connection.State != ConnectionState.Open;
@@ -372,10 +308,11 @@ internal sealed class EfRetentionHoldsRepository(
             }
 
             var transaction = db.Database.CurrentTransaction?.GetDbTransaction();
-            var canonicalRecordId = await CanonicaliseRecordIdAsync(
+            var canonicalRecordId = await targetResolver.CanonicaliseRecordIdAsync(
                 entry,
                 recordId,
                 transaction,
+                "Retention hold",
                 ct
             );
             await using var command = connection.CreateCommand();

@@ -73,7 +73,9 @@ public static class ServiceCollectionExtensions
         services.TryAddSingleton<IRetentionRuleProvider, MissingRetentionRuleProvider>();
         services.AddScoped<EfRetentionAuditWriter>();
         services.AddScoped<RetentionAuditNotifier>();
+        services.TryAddScoped<RetentionTargetResolver>();
         services.TryAddScoped<IRetentionHoldsRepository, EfRetentionHoldsRepository>();
+        services.TryAddScoped<IRetentionDeletion, EfRetentionDeletion>();
         services.TryAddEnumerable(
             ServiceDescriptor.Scoped<IRetentionSweepStrategy, PurgeSweepStrategy>()
         );

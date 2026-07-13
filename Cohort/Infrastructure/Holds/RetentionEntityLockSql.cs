@@ -6,6 +6,12 @@ internal static class RetentionEntityLockSql
 {
     private const long HashSeed = 4_341_726_887;
 
+    internal readonly record struct Target(
+        Guid RetentionEntityId,
+        Guid? TenantId,
+        string CanonicalRecordId
+    );
+
     internal static Task AcquireAsync(
         DbConnection connection,
         DbTransaction transaction,
@@ -32,8 +38,34 @@ internal static class RetentionEntityLockSql
             return;
         }
 
-        var lockKeys = canonicalRecordIds
-            .Select(recordId => BuildKey(retentionEntityId, tenantId, recordId))
+        await AcquireAsync(
+            connection,
+            transaction,
+            canonicalRecordIds
+                .Select(recordId => new Target(retentionEntityId, tenantId, recordId))
+                .ToArray(),
+            ct
+        );
+    }
+
+    internal static async Task AcquireAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        IReadOnlyCollection<Target> targets,
+        CancellationToken ct
+    )
+    {
+        if (targets.Count == 0)
+        {
+            return;
+        }
+
+        var lockKeys = targets
+            .Select(target => BuildKey(
+                target.RetentionEntityId,
+                target.TenantId,
+                target.CanonicalRecordId
+            ))
             .Distinct(StringComparer.Ordinal)
             .Order(StringComparer.Ordinal)
             .ToArray();

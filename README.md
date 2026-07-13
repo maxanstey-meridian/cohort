@@ -221,6 +221,15 @@ PostgreSQL `search_path`.
 - `IRetentionPreview` gives you a count-only preview
 - `IRetentionSweep` performs the real sweep
 - `IRetentionErasureService` runs subject erasure inside the same retention rules
+- `IRetentionDeletion` lets host deletion participate atomically in Cohort hold protection
+
+`IRetentionDeletion` is scoped. Resolve it and your registered `TDbContext` from the same DI
+scope, identify every row that the host callback will delete, and persist the callback's changes
+through that context. Cohort canonicalises the record IDs, takes the same transaction-scoped
+advisory locks used by hold creation and retention mutation, checks all targets for active holds,
+then invokes the callback inside the same EF/Postgres transaction. It returns `Protected` without
+invoking the callback when any target is held; callback failures propagate and roll back. The
+operation owns the transaction, so call it when the scoped context has no current transaction.
 
 The package test compiles this invocation example verbatim against the packed artifact:
 

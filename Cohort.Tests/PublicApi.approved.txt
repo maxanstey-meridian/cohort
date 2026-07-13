@@ -16,6 +16,7 @@ ctor Cohort.Application.RetentionAliasCycleException()
 ctor Cohort.Application.RetentionAliasCycleException(System.String? message)
 ctor Cohort.Application.RetentionAliasCycleException(System.String? message, System.Exception? innerException)
 ctor Cohort.Application.RetentionConfigurationException(System.Collections.Generic.IEnumerable<System.String> errors)
+ctor Cohort.Application.RetentionTarget(System.Guid retentionEntityId, System.String recordId, System.Nullable<System.Guid> tenantId)
 ctor Cohort.Application.RowDispatcherFlushResult(System.Int64 InFlightRemaining, System.Int64 PendingRemaining)
 ctor Cohort.Application.SweepEvent+Cancelled(System.Guid SweepId, System.DateTimeOffset At, System.String Error, System.TimeSpan Duration, System.Int64 TotalAffected)
 ctor Cohort.Application.SweepEvent+Completed(System.Guid SweepId, System.DateTimeOffset At, System.TimeSpan Duration, System.Int64 TotalAffected)
@@ -59,6 +60,8 @@ ctor Cohort.Hosting.RowHandlerDispatchOptions()
 enum Cohort.Application.AnonymiseFactoryExecutionMode.PerRow = 1
 enum Cohort.Application.AnonymiseFactoryExecutionMode.PerRowWithOriginalValue = 2
 enum Cohort.Application.AnonymiseFactoryExecutionMode.Static = 0
+enum Cohort.Application.RetentionDeletionOutcome.Executed = 0
+enum Cohort.Application.RetentionDeletionOutcome.Protected = 1
 enum Cohort.Application.RowHandlerDispatchPhase.AfterSweepSettled = 1
 enum Cohort.Application.RowHandlerDispatchPhase.Immediate = 0
 enum Cohort.Application.SweepRunStatus.Cancelled = 4
@@ -241,6 +244,7 @@ method Cohort.Domain.TenantContext.GetHashCode() -> System.Int32
 method Cohort.Domain.TenantContext.ToString() -> System.String
 method abstract Cohort.Application.IAnonymiseValueFactory.Create(Cohort.Domain.AnonymiseValueContext context) -> System.Object?
 method abstract Cohort.Application.IRetentionAuditObserver.OnCommittedAsync(Cohort.Application.SweepEvent evt, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task
+method abstract Cohort.Application.IRetentionDeletion.ExecuteAsync(System.Collections.Generic.IReadOnlyCollection<Cohort.Application.RetentionTarget> targets, System.Func<System.Threading.CancellationToken, System.Threading.Tasks.Task> deletion, System.Threading.CancellationToken ct = null) -> System.Threading.Tasks.Task<Cohort.Application.RetentionDeletionOutcome>
 method abstract Cohort.Application.IRetentionErasureService.EraseAsync(Cohort.Domain.TenantContext tenant, Cohort.Domain.ErasureScope scope, System.DateTimeOffset now, System.Threading.CancellationToken ct = null) -> System.Threading.Tasks.Task<Cohort.Domain.ErasureResult>
 method abstract Cohort.Application.IRetentionHoldsRepository.CreateAsync(Cohort.Domain.RetentionHoldRequest request, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task
 method abstract Cohort.Application.IRetentionHoldsRepository.HasActiveHoldAsync(System.Guid retentionEntityId, System.String recordId, System.Nullable<System.Guid> tenantId, System.DateTimeOffset asOf, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task<System.Boolean>
@@ -329,6 +333,9 @@ property Cohort.Application.RetentionSweepRequest+TenantedRequest.Tenant : Cohor
 property Cohort.Application.RetentionSweepRequest.At : System.DateTimeOffset { get; }
 property Cohort.Application.RetentionSweepRequest.DryRun : System.Boolean { get; }
 property Cohort.Application.RetentionSweepRequest.Trigger : Cohort.Application.SweepTriggerKind { get; }
+property Cohort.Application.RetentionTarget.RecordId : System.String { get; }
+property Cohort.Application.RetentionTarget.RetentionEntityId : System.Guid { get; }
+property Cohort.Application.RetentionTarget.TenantId : System.Nullable<System.Guid> { get; }
 property Cohort.Application.RowDispatcherFlushResult.InFlightRemaining : System.Int64 { get; init; }
 property Cohort.Application.RowDispatcherFlushResult.PendingRemaining : System.Int64 { get; init; }
 property Cohort.Application.RowDispatcherFlushResult.Settled : System.Boolean { get; }
@@ -498,6 +505,7 @@ type class Cohort.Application.RetentionPreviewRequest+TenantlessRequest : Cohort
 type class Cohort.Application.RetentionSweepRequest : System.IEquatable<Cohort.Application.RetentionSweepRequest>
 type class Cohort.Application.RetentionSweepRequest+TenantedRequest : Cohort.Application.RetentionSweepRequest, System.IEquatable<Cohort.Application.RetentionSweepRequest+TenantedRequest>, System.IEquatable<Cohort.Application.RetentionSweepRequest>
 type class Cohort.Application.RetentionSweepRequest+TenantlessRequest : Cohort.Application.RetentionSweepRequest, System.IEquatable<Cohort.Application.RetentionSweepRequest+TenantlessRequest>, System.IEquatable<Cohort.Application.RetentionSweepRequest>
+type class Cohort.Application.RetentionTarget
 type class Cohort.Application.RowDispatcherFlushResult : System.IEquatable<Cohort.Application.RowDispatcherFlushResult>
 type class Cohort.Application.SweepEvent : System.IEquatable<Cohort.Application.SweepEvent>
 type class Cohort.Application.SweepEvent+Cancelled : Cohort.Application.SweepEvent, System.IEquatable<Cohort.Application.SweepEvent+Cancelled>, System.IEquatable<Cohort.Application.SweepEvent>
@@ -542,6 +550,7 @@ type class Cohort.Hosting.RowHandlerDispatchOptions
 type class Cohort.Hosting.ServiceCollectionExtensions
 type class Cohort.Infrastructure.Migrations.CohortModelBuilder
 type enum Cohort.Application.AnonymiseFactoryExecutionMode : System.IComparable, System.IConvertible, System.IFormattable, System.ISpanFormattable
+type enum Cohort.Application.RetentionDeletionOutcome : System.IComparable, System.IConvertible, System.IFormattable, System.ISpanFormattable
 type enum Cohort.Application.RowHandlerDispatchPhase : System.IComparable, System.IConvertible, System.IFormattable, System.ISpanFormattable
 type enum Cohort.Application.SweepRunStatus : System.IComparable, System.IConvertible, System.IFormattable, System.ISpanFormattable
 type enum Cohort.Application.SweepTriggerKind : System.IComparable, System.IConvertible, System.IFormattable, System.ISpanFormattable
@@ -550,6 +559,7 @@ type enum Cohort.Domain.AuditRowDetail : System.IComparable, System.IConvertible
 type enum Cohort.Domain.Strategy : System.IComparable, System.IConvertible, System.IFormattable, System.ISpanFormattable
 type interface Cohort.Application.IAnonymiseValueFactory
 type interface Cohort.Application.IRetentionAuditObserver
+type interface Cohort.Application.IRetentionDeletion
 type interface Cohort.Application.IRetentionErasureService
 type interface Cohort.Application.IRetentionHandler<TEntity>
 type interface Cohort.Application.IRetentionHoldsRepository

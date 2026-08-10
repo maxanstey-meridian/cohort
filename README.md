@@ -663,3 +663,7 @@ messages, stack traces, SQL values, and subject identifiers are excluded there, 
 identifying `RecordId` and `TenantId` fields remain in row-detail events. Structured logs retain the
 original exception with the same diagnostic ID for protected operational diagnosis. Existing
 historical `Error` and `LastError` values are not rewritten during upgrade.
+
+## License
+
+[MIT](LICENSE)

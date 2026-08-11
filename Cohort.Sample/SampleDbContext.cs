@@ -64,6 +64,11 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
             b.Property(contact => contact.Surname).IsRequired();
             b.Property(contact => contact.Notes).IsRequired();
             b.Property(contact => contact.AnonymisedAt);
+            b.Property(contact => contact.RowVersion)
+                .HasColumnName("xmin")
+                .HasColumnType("xid")
+                .ValueGeneratedOnAddOrUpdate()
+                .IsConcurrencyToken();
         });
 
         modelBuilder.Entity<ErasureSubjectRecord>(b =>

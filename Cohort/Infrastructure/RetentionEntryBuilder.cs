@@ -82,6 +82,7 @@ internal sealed class RetentionEntryBuilder(RetentionModelConventions convention
             anchorColumn,
             BuildRecordIdConvention(entityType, storeObject),
             BuildAnonymiseFields(clrType, entityType, storeObject),
+            BuildMaterializationColumns(entityType, storeObject),
             BuildTenantConvention(entityType, storeObject),
             BuildSoftDeleteConvention(entityType, storeObject),
             clrType.GetCustomAttribute<RetentionTenantlessAttribute>(inherit: false) is not null,
@@ -89,6 +90,19 @@ internal sealed class RetentionEntryBuilder(RetentionModelConventions convention
             BuildAnonymisedAtConvention(entityType, storeObject)
         );
     }
+
+    private static IReadOnlyList<string> BuildMaterializationColumns(
+        IEntityType entityType,
+        StoreObjectIdentifier storeObject
+    ) =>
+        entityType
+            .GetProperties()
+            .Select(property => property.GetColumnName(storeObject))
+            .Where(columnName => columnName is not null)
+            .Select(columnName => columnName!)
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
 
     private RecordIdConvention BuildRecordIdConvention(
         IEntityType entityType,

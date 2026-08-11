@@ -224,9 +224,13 @@ internal static class AnonymiseSqlBuilder
     internal static string BuildLoadHandlerRowsCommandText(RetentionEntry entry, SqlFilter filter)
     {
         var tenantClause = BuildTenantClause(entry.Tenant?.TenantColumn);
+        var selectList = string.Join(
+            ", ",
+            entry.MaterializationColumns.Select(column => $"target.{QuoteIdentifier(column)}")
+        );
 
         return $"""
-            SELECT *
+            SELECT {selectList}
             FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
             WHERE {RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "candidateIds")}
               AND {filter.PredicateSql}

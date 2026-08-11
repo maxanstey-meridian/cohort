@@ -103,6 +103,7 @@ public sealed class RetentionExecutionPlanOrdererTests
             "CreatedAt",
             new RecordIdConvention("Id", "Id", typeof(Guid)),
             [],
+            [],
             new TenantConvention("TenantId", "TenantId"),
             null
         );

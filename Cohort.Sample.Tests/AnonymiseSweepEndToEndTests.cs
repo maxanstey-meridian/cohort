@@ -110,6 +110,10 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
             .ToArray();
         idArrayLengths.Should().NotBeEmpty();
         idArrayLengths.Should().OnlyContain(length => length <= batchSize);
+        commands.Commands.Should().Contain(command =>
+            command.CommandText.Contains("target.\"xmin\"", StringComparison.Ordinal)
+            && !command.CommandText.Contains("SELECT *", StringComparison.Ordinal)
+        );
 
         var firstDetails = await LoadRunRecordIdsAsync(first.SweepId);
         var retryDetails = await LoadRunRecordIdsAsync(retry.SweepId);

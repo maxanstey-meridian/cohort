@@ -25,4 +25,6 @@ public sealed class AnonymisedContact
     public string Notes { get; set; } = "";
 
     public DateTimeOffset? AnonymisedAt { get; set; }
+
+    public uint RowVersion { get; set; }
 }

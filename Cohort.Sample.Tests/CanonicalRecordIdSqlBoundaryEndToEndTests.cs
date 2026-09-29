@@ -267,6 +267,55 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
         }
     }
 
+    [Fact]
+    public async Task Hold_Stores_The_Rows_Canonical_Id_When_The_Request_Spells_It_Differently()
+    {
+        // numeric without a typmod keeps the stored scale ('1.00'), and citext compares
+        // case-insensitively ('ABC' = 'abc'). A hold must protect the row the request resolved to.
+        await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
+        var asOf = new DateTimeOffset(2026, 7, 11, 12, 0, 0, TimeSpan.Zero);
+        var services = new ServiceCollection();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().AddInMemoryCollection().Build());
+        services.AddLogging();
+        services.AddDbContext<SpelledRecordIdDbContext>(options => options.UseNpgsql(database.ConnectionString));
+        services.AddSingleton<IRetentionRuleProvider>(new CategoryRepository(Strategy.Purge));
+        services.AddCohort<SpelledRecordIdDbContext>();
+        await using var provider = services.BuildServiceProvider(validateScopes: true);
+
+        await using (var scope = provider.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<SpelledRecordIdDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.Add(new NumericKeyedRecord { Id = 1.00m, CreatedAt = asOf.AddDays(-60) });
+            db.Add(new CitextKeyedRecord { Id = "ABC", CreatedAt = asOf.AddDays(-60) });
+            await db.SaveChangesAsync();
+
+            var holds = scope.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>();
+            await holds.CreateAsync(
+                new RetentionHoldRequest(Guid.NewGuid(), RetentionEntityIdentity.For<NumericKeyedRecord>(), "1", null, "numeric", asOf),
+                CancellationToken.None
+            );
+            await holds.CreateAsync(
+                new RetentionHoldRequest(Guid.NewGuid(), RetentionEntityIdentity.For<CitextKeyedRecord>(), "abc", null, "citext", asOf),
+                CancellationToken.None
+            );
+        }
+
+        var result = await provider.GetRequiredService<IRetentionSweep>().ExecuteAsync(
+            RetentionSweepRequest.Tenantless(asOf)
+        );
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().HaveCount(2).And.OnlyContain(count => count.Affected == 0 && count.HeldCount == 1);
+        await using var verify = new NpgsqlConnection(database.ConnectionString);
+        await verify.OpenAsync();
+        await using var command = verify.CreateCommand();
+        command.CommandText = """
+            SELECT string_agg("RecordId", ',' ORDER BY "RecordId") FROM "retention_holds"
+            """;
+        (await command.ExecuteScalarAsync()).Should().Be("1.00,ABC");
+    }
+
     private static ServiceProvider BuildServiceProvider(
         string connectionString,
         Strategy strategy = Strategy.Anonymise,
@@ -340,4 +389,42 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
     }
 
     private readonly record struct ConvertedRecordId(decimal Value);
+
+    private sealed class SpelledRecordIdDbContext(DbContextOptions<SpelledRecordIdDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.HasPostgresExtension("citext");
+            modelBuilder.Entity<NumericKeyedRecord>(entity =>
+            {
+                entity.ToTable("numeric_keyed_record");
+                entity.Property(record => record.Id).HasColumnType("numeric");
+            });
+            modelBuilder.Entity<CitextKeyedRecord>(entity =>
+            {
+                entity.ToTable("citext_keyed_record");
+                entity.Property(record => record.Id).HasColumnType("citext");
+            });
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    [Retain("canonical-record-id", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0004-000000000002")]
+    [RetentionTenantless]
+    private sealed class NumericKeyedRecord
+    {
+        public decimal Id { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    [Retain("canonical-record-id", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0004-000000000003")]
+    [RetentionTenantless]
+    private sealed class CitextKeyedRecord
+    {
+        public string Id { get; init; } = "";
+        public DateTimeOffset CreatedAt { get; init; }
+    }
 }

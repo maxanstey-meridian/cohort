@@ -62,9 +62,21 @@ internal sealed class RetentionTargetResolver(
             return keyClrType == typeof(Guid) ? Guid.Parse(recordId).ToString("D") : recordId;
         }
 
+        // Prefer the stored row's own text: equality under the column type (citext, unscaled
+        // numeric) can admit spellings whose cast-to-text differs from what sweeps compare.
         await using var command = db.Database.GetDbConnection().CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = $"SELECT CAST(CAST(@recordId AS {storeType}) AS text)";
+        command.CommandText = $"""
+            SELECT COALESCE(
+                (
+                    SELECT {RecordIdSql.TextExpression("target", entry.RecordId)}
+                    FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
+                    WHERE {RecordIdSql.EqualsParameter("target", entry.RecordId, "recordId")}
+                    LIMIT 1
+                ),
+                CAST(CAST(@recordId AS {storeType}) AS text)
+            )
+            """;
         command.Parameters.Add(RetentionHoldSql.CreateParameter(command, "recordId", recordId));
 
         try

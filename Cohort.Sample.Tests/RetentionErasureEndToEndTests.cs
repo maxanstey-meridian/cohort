@@ -1842,6 +1842,119 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Erasure_Matches_Subjects_Using_The_Subject_Columns_Store_Type()
+    {
+        // citext columns compare case-insensitively everywhere else in the host; erasure must
+        // not silently fall back to case-sensitive text equality and leave the subject's data.
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        await using var services = BuildPredicateResolutionServiceProvider<CitextSubjectDbContext>(
+            database.ConnectionString,
+            new StaticCategoryRepository(
+                new Dictionary<string, ITestRetentionRule>
+                {
+                    ["citext-subject-purge"] = new StaticTestRetentionRule(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    ),
+                    ["citext-subject-anonymise"] = new StaticTestRetentionRule(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
+                }
+            )
+        );
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<CitextSubjectDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.Add(new CitextSubjectPurgeRecord { Id = Guid.NewGuid(), TenantId = tenantId, Email = "Bob@X.com", CreatedAt = asOf });
+            db.Add(new CitextSubjectAnonymiseRecord { Id = Guid.NewGuid(), TenantId = tenantId, Email = "Bob@X.com", CreatedAt = asOf });
+            await db.SaveChangesAsync();
+        }
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().EraseAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                new ErasureScope("bob@x.com"),
+                asOf
+            );
+        }
+
+        await using var verifyScope = services.CreateAsyncScope();
+        var verify = verifyScope.ServiceProvider.GetRequiredService<CitextSubjectDbContext>();
+        (await verify.Set<CitextSubjectPurgeRecord>().CountAsync()).Should().Be(0);
+        (await verify.Set<CitextSubjectAnonymiseRecord>().SingleAsync()).Email.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task Erasure_Validates_Each_Ef_Model_A_Host_Switches_Between()
+    {
+        // Hosts using IModelCacheKeyFactory get different IModel instances per scope. Metadata
+        // validated for one model must not be reused for another.
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        var services = new ServiceCollection();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().AddInMemoryCollection().Build());
+        services.AddLogging();
+        var variant = new ModelVariant();
+        services.AddSingleton(variant);
+        services.AddDbContext<ModelVariantDbContext>(options =>
+            options
+                .UseNpgsql(database.ConnectionString)
+                .ReplaceService<Microsoft.EntityFrameworkCore.Infrastructure.IModelCacheKeyFactory, ModelVariantCacheKeyFactory>()
+        );
+        services.AddSingleton<IRetentionRuleProvider>(
+            new StaticCategoryRepository(
+                new Dictionary<string, ITestRetentionRule>
+                {
+                    ["model-variant"] = new StaticTestRetentionRule(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    ),
+                }
+            )
+        );
+        services.AddCohort<ModelVariantDbContext>();
+        await using var provider = services.BuildServiceProvider(validateScopes: true);
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var tenant = new TenantContext(tenantId, "uk", new Dictionary<string, string>());
+
+        variant.IncludeExtended = true;
+        await using (var scope = provider.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<ModelVariantDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.Add(new ModelVariantBaseRecord { Id = Guid.NewGuid(), TenantId = tenantId, SubjectId = subjectId, CreatedAt = asOf });
+            db.Add(new ModelVariantExtendedRecord { Id = Guid.NewGuid(), TenantId = tenantId, SubjectId = subjectId, CreatedAt = asOf });
+            await db.SaveChangesAsync();
+        }
+
+        variant.IncludeExtended = false;
+        await using (var scope = provider.CreateAsyncScope())
+        {
+            await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>()
+                .EraseAsync(tenant, new ErasureScope(subjectId), asOf);
+        }
+
+        ErasureResult extended;
+        variant.IncludeExtended = true;
+        await using (var scope = provider.CreateAsyncScope())
+        {
+            extended = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>()
+                .EraseAsync(tenant, new ErasureScope(subjectId), asOf);
+        }
+
+        extended.EntityFailures.Should().BeEmpty();
+        extended.Counts.Select(count => count.EntityType).Should().Contain(typeof(ModelVariantExtendedRecord));
+        await using var verifyScope = provider.CreateAsyncScope();
+        var verify = verifyScope.ServiceProvider.GetRequiredService<ModelVariantDbContext>();
+        (await verify.Set<ModelVariantBaseRecord>().CountAsync()).Should().Be(0);
+        (await verify.Set<ModelVariantExtendedRecord>().CountAsync()).Should().Be(0);
+    }
+
+    [Fact]
     public async Task Erasure_Anchor_Eligibility_Depends_Only_On_Positive_LegalMin()
     {
         var tenantId = Guid.NewGuid();
@@ -4179,6 +4292,110 @@ internal sealed class ConvertedErasureSubjectFixtureRecord
 
     public DateTimeOffset CreatedAt { get; set; }
     public string Body { get; set; } = "";
+}
+
+internal sealed class ModelVariant
+{
+    public bool IncludeExtended { get; set; }
+}
+
+internal sealed class ModelVariantDbContext(
+    DbContextOptions<ModelVariantDbContext> options,
+    ModelVariant variant
+) : DbContext(options)
+{
+    public bool IncludeExtended => variant.IncludeExtended;
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<ModelVariantBaseRecord>().ToTable("model_variant_base_records");
+        if (variant.IncludeExtended)
+        {
+            modelBuilder.Entity<ModelVariantExtendedRecord>().ToTable("model_variant_extended_records");
+        }
+
+        modelBuilder.ConfigureCohortTables();
+    }
+}
+
+internal sealed class ModelVariantCacheKeyFactory : Microsoft.EntityFrameworkCore.Infrastructure.IModelCacheKeyFactory
+{
+    public object Create(DbContext context, bool designTime) =>
+        (context.GetType(), ((ModelVariantDbContext)context).IncludeExtended, designTime);
+}
+
+[Retain("model-variant", nameof(CreatedAt))]
+[RetentionEntityId("00000000-0000-0000-0001-0000000000a6")]
+internal sealed class ModelVariantBaseRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+
+    [ErasureSubject]
+    public Guid SubjectId { get; set; }
+
+    public DateTimeOffset CreatedAt { get; set; }
+}
+
+[Retain("model-variant", nameof(CreatedAt))]
+[RetentionEntityId("00000000-0000-0000-0001-0000000000a7")]
+internal sealed class ModelVariantExtendedRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+
+    [ErasureSubject]
+    public Guid SubjectId { get; set; }
+
+    public DateTimeOffset CreatedAt { get; set; }
+}
+
+internal sealed class CitextSubjectDbContext(DbContextOptions<CitextSubjectDbContext> options)
+    : DbContext(options)
+{
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.HasPostgresExtension("citext");
+        modelBuilder.Entity<CitextSubjectPurgeRecord>(builder =>
+        {
+            builder.ToTable("citext_subject_purge_records");
+            builder.Property(record => record.Email).HasColumnType("citext");
+        });
+        modelBuilder.Entity<CitextSubjectAnonymiseRecord>(builder =>
+        {
+            builder.ToTable("citext_subject_anonymise_records");
+            builder.Property(record => record.Email).HasColumnType("citext");
+        });
+        modelBuilder.ConfigureCohortTables();
+    }
+}
+
+[Retain("citext-subject-purge", nameof(CreatedAt))]
+[RetentionEntityId("00000000-0000-0000-0001-0000000000a1")]
+internal sealed class CitextSubjectPurgeRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+
+    [ErasureSubject]
+    public string? Email { get; set; }
+
+    public DateTimeOffset CreatedAt { get; set; }
+}
+
+[Retain("citext-subject-anonymise", nameof(CreatedAt))]
+[RetentionEntityId("00000000-0000-0000-0001-0000000000a2")]
+internal sealed class CitextSubjectAnonymiseRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+
+    [ErasureSubject]
+    [Anonymise(AnonymiseMethod.Null)]
+    public string? Email { get; set; }
+
+    public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset? AnonymisedAt { get; set; }
 }
 
 internal sealed class SinglePredicateResolutionDbContext(

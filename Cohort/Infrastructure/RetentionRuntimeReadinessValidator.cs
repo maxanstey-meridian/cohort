@@ -54,7 +54,8 @@ internal sealed class RetentionRuntimeReadinessValidator(
             connection.DataSource,
             connection.Database,
             GetPort(connection),
-            CohortStoreTables.FromModel(db.Model)
+            CohortStoreTables.FromModel(db.Model),
+            db.Model
         );
     }
 
@@ -107,7 +108,8 @@ internal sealed record RetentionRuntimeReadinessKey(
     string DataSource,
     string Database,
     string Port,
-    CohortStoreTables Tables
+    CohortStoreTables Tables,
+    Microsoft.EntityFrameworkCore.Metadata.IModel Model
 );
 
 internal sealed class RetentionRuntimeReadinessEntry

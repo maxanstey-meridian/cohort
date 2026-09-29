@@ -37,8 +37,7 @@ internal static class AnonymiseFilterBuilder
                 + string.Join(
                     " OR ",
                     predicate.Matches.Select(
-                        (match, index) =>
-                            $"target.{AnonymiseSqlBuilder.QuoteIdentifier(match.SubjectColumn)} = @subjectValue{index}"
+                        (match, index) => match.EqualsParameterSql("target", $"subjectValue{index}")
                     )
                 )
                 + ")",

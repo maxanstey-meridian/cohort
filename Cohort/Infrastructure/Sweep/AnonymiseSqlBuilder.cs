@@ -63,7 +63,7 @@ internal static class AnonymiseSqlBuilder
     internal static string BuildSetBasedCommandText(RetentionEntry entry, SqlFilter filter)
     {
         var assignments = entry.AnonymiseFields.Select(
-            (field, index) => $"{QuoteIdentifier(field.ColumnName)} = @value{index}"
+            (field, index) => field.AssignmentSql($"value{index}")
         );
         var tenantClause = BuildTenantClause(entry.Tenant?.TenantColumn);
 
@@ -85,12 +85,9 @@ internal static class AnonymiseSqlBuilder
 
     internal static string BuildPerRowCommandText(RetentionEntry entry, SqlFilter filter)
     {
-        var assignments = new List<string>(entry.AnonymiseFields.Count);
-        for (var index = 0; index < entry.AnonymiseFields.Count; index++)
-        {
-            var field = entry.AnonymiseFields[index];
-            assignments.Add($"{QuoteIdentifier(field.ColumnName)} = @value{index}");
-        }
+        var assignments = entry.AnonymiseFields.Select(
+            (field, index) => field.AssignmentSql($"value{index}")
+        );
 
         var tenantClause = BuildTenantClause(entry.Tenant?.TenantColumn);
 

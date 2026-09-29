@@ -1155,8 +1155,7 @@ internal sealed class RelationalSweepStrategyCore(
             + string.Join(
                 " OR ",
                 predicate.Matches.Select(
-                    (match, index) =>
-                        $"target.{QuoteIdentifier(match.SubjectColumn)} = @subjectValue{index}"
+                    (match, index) => match.EqualsParameterSql("target", $"subjectValue{index}")
                 )
             )
             + ")";

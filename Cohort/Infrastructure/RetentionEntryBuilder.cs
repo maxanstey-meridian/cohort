@@ -240,12 +240,14 @@ internal sealed class RetentionEntryBuilder(RetentionModelConventions convention
                     $"[Anonymise] on {clrType.FullName}.{property.Name}: property has no mapped table column."
                 );
 
+            var storeType = efProperty.GetColumnType(storeObject);
             if (anonymise is not null)
             {
                 fields.Add(
                     new AnonymiseLiteralField(
                         property.Name,
                         columnName,
+                        storeType,
                         anonymise.Method,
                         anonymise.Literal
                     )
@@ -254,7 +256,7 @@ internal sealed class RetentionEntryBuilder(RetentionModelConventions convention
             }
 
             fields.Add(
-                new AnonymiseFactoryField(property.Name, columnName, anonymiseWith!.FactoryType)
+                new AnonymiseFactoryField(property.Name, columnName, storeType, anonymiseWith!.FactoryType)
             );
         }
 

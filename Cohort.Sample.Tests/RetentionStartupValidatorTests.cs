@@ -370,6 +370,26 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
+    public async Task ValidateAsync_Rejects_Record_Ids_Whose_Only_Unique_Index_Is_Filtered()
+    {
+        // A partial unique index allows duplicates outside its filter, so it proves nothing.
+        var options = new DbContextOptionsBuilder<FilteredUniqueRecordIdDbContext>()
+            .UseNpgsqlMetadataModel($"startup-validator-filtered-unique-record-id-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new FilteredUniqueRecordIdDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, ITestRetentionRule> { ["record-id"] = ExemptResolver }
+        );
+
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle().Which.Should().StartWith(
+            $"Record-id convention on {typeof(NonUniqueRecordIdRecord).FullName}: record-id property 'ExternalId' must uniquely identify rows"
+        );
+    }
+
+    [Fact]
     public async Task ValidateAsync_Rejects_Record_Id_Properties_That_Do_Not_Uniquely_Identify_Rows()
     {
         var options = new DbContextOptionsBuilder<NonUniqueRecordIdDbContext>()
@@ -990,6 +1010,58 @@ public sealed class RetentionStartupValidatorTests
     }
 
     [Fact]
+    public async Task ValidateAsync_Rejects_Value_Converters_On_Columns_Cohort_Writes_Or_Filters_In_Sql()
+    {
+        // Cohort's raw SQL binds tenant ids and writes TRUE/now() directly, so a converter
+        // (e.g. an is_active column exposed inverted as IsDeleted) would silently flip meaning.
+        var options = new DbContextOptionsBuilder<ConvertedStructuralColumnsDbContext>()
+            .UseNpgsqlMetadataModel($"startup-validator-structural-converters-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new ConvertedStructuralColumnsDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, ITestRetentionRule>
+            {
+                ["structural-converters"] = new StaticTestRetentionRule(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                ),
+            }
+        );
+
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Where(error => error.Contains("value converter", StringComparison.Ordinal))
+            .Should().HaveCount(2)
+            .And.Contain(error => error.Contains("'TenantId'", StringComparison.Ordinal))
+            .And.Contain(error => error.Contains("'IsDeleted'", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Rejects_Self_Referencing_Cascades_On_Retained_Entities()
+    {
+        // Purging an expired parent would cascade into children still inside their window.
+        var options = new DbContextOptionsBuilder<SelfCascadeDbContext>()
+            .UseNpgsqlMetadataModel($"startup-validator-self-cascade-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new SelfCascadeDbContext(options);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, ITestRetentionRule>
+            {
+                ["self-cascade"] = new StaticTestRetentionRule(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                ),
+            }
+        );
+
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle().Which.Should().StartWith(
+            $"[Retain] on {typeof(SelfCascadeRecord).FullName}: purging this entity cascades (ON DELETE CASCADE) into retained entity {typeof(SelfCascadeRecord).FullName},"
+        );
+    }
+
+    [Fact]
     public async Task ValidateAsync_Allows_Restrict_Delete_Paths_Between_Retained_Entities()
     {
         var options = new DbContextOptionsBuilder<RestrictDeleteDbContext>()
@@ -1504,6 +1576,22 @@ public sealed class RetentionStartupValidatorTests
             {
                 entity.ToTable("non_unique_record_id_records");
                 entity.HasKey(record => record.InternalKey);
+            });
+        }
+    }
+
+    private sealed class FilteredUniqueRecordIdDbContext(
+        DbContextOptions<FilteredUniqueRecordIdDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.ConfigureCohortTables();
+            modelBuilder.Entity<NonUniqueRecordIdRecord>(entity =>
+            {
+                entity.ToTable("filtered_unique_record_id_records");
+                entity.HasKey(record => record.InternalKey);
+                entity.HasIndex(record => record.ExternalId).IsUnique().HasFilter("\"TenantId\" IS NOT NULL");
             });
         }
     }
@@ -2156,6 +2244,61 @@ public sealed class RetentionStartupValidatorTests
                     .OnDelete(DeleteBehavior.Cascade);
             });
         }
+    }
+
+    private sealed class ConvertedStructuralColumnsDbContext(
+        DbContextOptions<ConvertedStructuralColumnsDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.ConfigureCohortTables();
+            modelBuilder.Entity<ConvertedStructuralColumnsRecord>(entity =>
+            {
+                entity.ToTable("converted_structural_columns_records");
+                entity.Property(record => record.TenantId).HasConversion(value => value.ToString(), value => Guid.Parse(value));
+                entity.Property(record => record.IsDeleted).HasColumnName("is_active").HasConversion(value => !value, value => !value);
+            });
+        }
+    }
+
+    [Retain("structural-converters", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-0000000000a5")]
+    private sealed class ConvertedStructuralColumnsRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+        public bool IsDeleted { get; init; }
+        public DateTimeOffset? DeletedAt { get; init; }
+    }
+
+    private sealed class SelfCascadeDbContext(DbContextOptions<SelfCascadeDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.ConfigureCohortTables();
+            modelBuilder.Entity<SelfCascadeRecord>(entity =>
+            {
+                entity.ToTable("self_cascade_records");
+                entity
+                    .HasOne<SelfCascadeRecord>()
+                    .WithMany()
+                    .HasForeignKey(record => record.ParentId)
+                    .OnDelete(DeleteBehavior.Cascade);
+            });
+        }
+    }
+
+    [Retain("self-cascade", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-0000000000a4")]
+    private sealed class SelfCascadeRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public Guid? ParentId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
     }
 
     private sealed class RestrictDeleteDbContext(DbContextOptions<RestrictDeleteDbContext> options)

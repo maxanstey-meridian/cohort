@@ -30,29 +30,32 @@ internal sealed class RetentionStartupValidator(
     )
         .GroupBy(factory => factory.GetType())
         .ToDictionary(group => group.Key, group => group.Count());
-    private readonly RetentionValidationState validationState = sharedState ?? new();
+    private readonly RetentionValidationState sharedValidationState = sharedState ?? new();
+
+    // Resolved lazily: touching db.Model before the provider check would mask a wrong provider.
+    private RetentionModelValidation ModelValidation => sharedValidationState.For(db.Model);
     private readonly ErasureSubjectMetadataResolver erasureSubjectMetadataResolver =
         subjectMetadataResolver ?? new(db);
 
     internal IReadOnlyDictionary<string, RetentionCategoryCapabilities> ValidatedCapabilities =>
-        validationState.Capabilities;
+        ModelValidation.Capabilities;
 
     public async Task ValidateAsync(CancellationToken ct = default)
     {
-        if (validationState.Validated)
+        if (ModelValidation.Validated)
         {
             return;
         }
 
-        await validationState.Gate.WaitAsync(ct);
+        await ModelValidation.Gate.WaitAsync(ct);
         try
         {
-            if (validationState.Validated)
+            if (ModelValidation.Validated)
             {
                 return;
             }
 
-        validationState.ErasureSubjects.Clear();
+        ModelValidation.ErasureSubjects.Clear();
         var validatedCapabilities = new Dictionary<string, RetentionCategoryCapabilities>(
             StringComparer.Ordinal
         );
@@ -124,6 +127,7 @@ internal sealed class RetentionStartupValidator(
             retainedEntries.Add(entry);
             ValidateRecordIdConvention(entityType, entry, errors);
             ValidateTimestampStoreTypes(entityType, entry, errors);
+            ValidateNoStructuralValueConverters(entityType, entry, errors);
             if (retentionEntityIdOwners.TryGetValue(entry.RetentionEntityId, out var existingEntityType))
             {
                 errors.Add(
@@ -163,7 +167,7 @@ internal sealed class RetentionStartupValidator(
 
             try
             {
-                validationState.ErasureSubjects[entry.EntityType] =
+                ModelValidation.ErasureSubjects[entry.EntityType] =
                     erasureSubjectMetadataResolver.Resolve(entry);
 
                 if (capabilities.Strategies.Contains(Strategy.Purge))
@@ -232,16 +236,16 @@ internal sealed class RetentionStartupValidator(
             throw new RetentionConfigurationException(errors);
         }
 
-        validationState.Capabilities.Clear();
+        ModelValidation.Capabilities.Clear();
         foreach (var capability in validatedCapabilities)
         {
-            validationState.Capabilities.Add(capability.Key, capability.Value);
+            ModelValidation.Capabilities.Add(capability.Key, capability.Value);
         }
-        validationState.Validated = true;
+        ModelValidation.Validated = true;
         }
         finally
         {
-            validationState.Gate.Release();
+            ModelValidation.Gate.Release();
         }
     }
 
@@ -374,6 +378,7 @@ internal sealed class RetentionStartupValidator(
             .GetIndexes()
             .Any(index =>
                 index.IsUnique
+                && index.GetFilter() is null
                 && index.Properties.Count == 1
                 && index.Properties[0] == recordIdProperty
             );
@@ -583,6 +588,34 @@ internal sealed class RetentionStartupValidator(
         return null;
     }
 
+    private static void ValidateNoStructuralValueConverters(
+        Microsoft.EntityFrameworkCore.Metadata.IEntityType entityType,
+        RetentionEntry entry,
+        List<string> errors
+    )
+    {
+        // These columns are bound or written directly in Cohort's SQL (tenant ids, anchor
+        // cutoffs, TRUE / now() markers). A converter would be bypassed, silently changing
+        // what the column means, so refuse it rather than honour it half-way.
+        string?[] members =
+        [
+            entry.Tenant?.TenantMember,
+            entry.AnchorMember,
+            entry.SoftDelete?.IsDeletedMember,
+            entry.SoftDelete?.DeletedAtMember,
+            entry.AnonymisedAt?.AnonymisedAtMember,
+        ];
+        foreach (var member in members.OfType<string>().Distinct(StringComparer.Ordinal))
+        {
+            if (entityType.FindProperty(member)?.GetTypeMapping().Converter is not null)
+            {
+                errors.Add(
+                    $"Value converter on {entry.EntityType.FullName}: property '{member}' is filtered or written directly in Cohort's SQL, so a value converter would be bypassed. Remove the converter or map the column to the property's own type."
+                );
+            }
+        }
+    }
+
     private static void ValidateTimestampStoreTypes(
         Microsoft.EntityFrameworkCore.Metadata.IEntityType entityType,
         RetentionEntry entry,
@@ -665,6 +698,7 @@ internal sealed class RetentionStartupValidator(
         {
             entityType,
         };
+        var reported = new HashSet<Microsoft.EntityFrameworkCore.Metadata.IEntityType>();
         var queue = new Queue<Microsoft.EntityFrameworkCore.Metadata.IEntityType>();
         queue.Enqueue(entityType);
 
@@ -678,15 +712,13 @@ internal sealed class RetentionStartupValidator(
                     continue;
                 }
 
+                // Check before the visited-skip: a cascade that loops back to the root type
+                // (self-references included) still bypasses those rows' own retention.
                 var dependent = foreignKey.DeclaringEntityType;
-                if (!visited.Add(dependent))
-                {
-                    continue;
-                }
-
                 if (
                     dependent.ClrType.GetCustomAttribute<RetainAttribute>(inherit: false)
                     is not null
+                    && reported.Add(dependent)
                 )
                 {
                     errors.Add(
@@ -694,7 +726,10 @@ internal sealed class RetentionStartupValidator(
                     );
                 }
 
-                queue.Enqueue(dependent);
+                if (visited.Add(dependent))
+                {
+                    queue.Enqueue(dependent);
+                }
             }
         }
     }
@@ -744,6 +779,19 @@ internal sealed class RetentionStartupValidator(
 }
 
 internal sealed class RetentionValidationState
+{
+    // Keyed by IModel instance: hosts using IModelCacheKeyFactory run different models in
+    // different scopes, and metadata validated for one must never be applied to another.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<
+        Microsoft.EntityFrameworkCore.Metadata.IModel,
+        RetentionModelValidation
+    > models = new();
+
+    internal RetentionModelValidation For(Microsoft.EntityFrameworkCore.Metadata.IModel model) =>
+        models.GetOrAdd(model, static _ => new RetentionModelValidation());
+}
+
+internal sealed class RetentionModelValidation
 {
     internal SemaphoreSlim Gate { get; } = new(1, 1);
 

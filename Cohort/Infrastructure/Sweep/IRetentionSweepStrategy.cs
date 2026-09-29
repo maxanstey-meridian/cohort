@@ -143,5 +143,16 @@ internal sealed record ErasureSubjectPredicate
 internal sealed record ErasureSubjectMatch(
     string SubjectMember,
     string SubjectColumn,
+    string? SubjectStoreType,
     object SubjectValue
-);
+)
+{
+    // Compare under the column's own type so citext and similar types keep their semantics.
+    internal string EqualsParameterSql(string targetAlias, string parameterName)
+    {
+        var column = $"{targetAlias}.{PostgreSqlIdentifier.Quote(SubjectColumn)}";
+        return PostgresStoreTypeSql.Validate(SubjectStoreType) is { } storeType
+            ? $"{column} = CAST(@{parameterName} AS {storeType})"
+            : $"{column} = @{parameterName}";
+    }
+}

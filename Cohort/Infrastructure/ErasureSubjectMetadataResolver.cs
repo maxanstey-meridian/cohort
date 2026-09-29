@@ -73,7 +73,7 @@ internal sealed class ErasureSubjectMetadataResolver(
             );
 
         _ = efProperty.GetTypeMapping();
-        return new ErasureSubjectMember(property.Name, column, efProperty);
+        return new ErasureSubjectMember(property.Name, column, efProperty.GetColumnType(storeObject), efProperty);
     }
 }
 
@@ -102,6 +102,7 @@ internal sealed record ErasureSubjectMetadata(
                     new ErasureSubjectMatch(
                         member.Name,
                         member.Column,
+                        member.StoreType,
                         member.Property.GetTypeMapping().Converter?.ConvertToProvider(subject) ?? subject
                     )
                 )
@@ -110,4 +111,9 @@ internal sealed record ErasureSubjectMetadata(
     }
 }
 
-internal sealed record ErasureSubjectMember(string Name, string Column, IProperty Property);
+internal sealed record ErasureSubjectMember(
+    string Name,
+    string Column,
+    string? StoreType,
+    IProperty Property
+);

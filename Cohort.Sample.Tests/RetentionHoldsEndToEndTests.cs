@@ -783,6 +783,46 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Hold_With_A_CreatedAt_Ahead_Of_The_Database_Clock_Protects_Immediately()
+    {
+        // An application clock running ahead of Postgres must not open a window where a
+        // successfully created hold is not yet active.
+        var tenantId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(new Note
+            {
+                Id = noteId,
+                TenantId = tenantId,
+                CreatedAt = DateTimeOffset.UtcNow.AddDays(-120),
+                Body = "clock-skew-hold",
+            });
+            await db.SaveChangesAsync();
+        }
+
+        await CreateHoldAsync(
+            new RetentionHoldRequest(
+                Guid.NewGuid(),
+                RetentionEntityIdentity.For<Note>(),
+                noteId.ToString(),
+                tenantId,
+                "app clock ahead of database",
+                DateTimeOffset.UtcNow.AddHours(1)
+            )
+        );
+
+        var result = await Host.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            DateTimeOffset.UtcNow
+        );
+
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note) && count.HeldCount == 1);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
+    }
+
+    [Fact]
     public async Task CreateAsync_Rejects_Retention_Entity_Ids_That_Do_Not_Match_The_Registry()
     {
         var act = async () =>

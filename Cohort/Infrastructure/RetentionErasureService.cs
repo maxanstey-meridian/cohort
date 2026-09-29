@@ -66,7 +66,7 @@ internal sealed class RetentionErasureService(
                     continue;
                 }
 
-                var subjectMetadata = validationState.ErasureSubjects[entry.EntityType];
+                var subjectMetadata = validationState.For(db.Model).ErasureSubjects[entry.EntityType];
                 if (subjectMetadata is null)
                 {
                     continue;

@@ -86,7 +86,9 @@ internal sealed class EfRetentionHoldsRepository(
                     @recordId,
                     @tenantId,
                     @reason,
-                    @createdAt,
+                    -- A hold is active from the moment it commits; never let an application clock
+                    -- ahead of Postgres defer that.
+                    LEAST(@createdAt, pg_catalog.statement_timestamp()),
                     @expiresAt,
                     NULL
                 )

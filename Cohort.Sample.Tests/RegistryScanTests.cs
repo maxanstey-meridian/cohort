@@ -158,6 +158,7 @@ public sealed class RegistryScanTests
                 new AnonymiseLiteralField(
                     nameof(RetentionReadyRecord.EmailAddress),
                     "email_address",
+                    "text",
                     AnonymiseMethod.FixedLiteral,
                     "[redacted]"
                 )
@@ -185,6 +186,7 @@ public sealed class RegistryScanTests
                 new AnonymiseFactoryField(
                     nameof(FactoryBackedRetentionReadyRecord.ExternalId),
                     "external_identifier",
+                    "uuid",
                     typeof(TestAnonymiseValueFactory)
                 )
             );

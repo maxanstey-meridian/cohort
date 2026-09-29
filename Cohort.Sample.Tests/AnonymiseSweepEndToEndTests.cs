@@ -990,6 +990,48 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         }
     }
 
+    [Fact]
+    public async Task Sweep_Path_Writes_Anonymised_Values_Using_The_Columns_Store_Type()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        var services = new ServiceCollection();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().AddInMemoryCollection().Build());
+        services.AddLogging();
+        services.AddDbContext<JsonbAnonymiseDbContext>(options => options.UseNpgsql(database.ConnectionString));
+        services.AddSingleton<IRetentionRuleProvider>(
+            new StaticCategoryRepository(
+                new Dictionary<string, ITestRetentionRule>
+                {
+                    ["jsonb-anonymise"] = new StaticTestRetentionRule(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
+                }
+            )
+        );
+        services.AddCohort<JsonbAnonymiseDbContext>();
+        await using var provider = services.BuildServiceProvider(validateScopes: true);
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var scope = provider.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<JsonbAnonymiseDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.Add(new JsonbAnonymiseRecord { Id = Guid.NewGuid(), TenantId = tenantId, CreatedAt = asOf.AddDays(-60), Profile = """{"name":"Bob"}""" });
+            await db.SaveChangesAsync();
+        }
+
+        var result = await provider.GetRequiredService<IRetentionSweep>().SweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        result.EntityFailures.Should().BeEmpty();
+        await using var verifyScope = provider.CreateAsyncScope();
+        var verify = verifyScope.ServiceProvider.GetRequiredService<JsonbAnonymiseDbContext>();
+        (await verify.Set<JsonbAnonymiseRecord>().SingleAsync()).Profile.Should().Be("{}");
+    }
+
     private string GetConnectionString()
     {
         using var db = Host.CreateDbContext();
@@ -1089,6 +1131,34 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         services.AddCohort<ConvertedOriginalValueDbContext>();
 
         return services.BuildServiceProvider(validateScopes: true);
+    }
+
+    private sealed class JsonbAnonymiseDbContext(DbContextOptions<JsonbAnonymiseDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<JsonbAnonymiseRecord>(builder =>
+            {
+                builder.ToTable("jsonb_anonymise_records");
+                builder.Property(record => record.Profile).HasColumnType("jsonb");
+            });
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    [Retain("jsonb-anonymise", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-0000000000a3")]
+    private sealed class JsonbAnonymiseRecord
+    {
+        public Guid Id { get; set; }
+        public Guid TenantId { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
+
+        [Anonymise(AnonymiseMethod.FixedLiteral, "{}")]
+        public string Profile { get; set; } = "";
+
+        public DateTimeOffset? AnonymisedAt { get; set; }
     }
 
     private sealed class FactoryBackedSweepDbContext(

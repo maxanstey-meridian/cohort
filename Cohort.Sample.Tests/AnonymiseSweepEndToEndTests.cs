@@ -574,6 +574,93 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         (await verify.Set<JsonbAnonymiseRecord>().SingleAsync()).Profile.Should().Be("{}");
     }
 
+    [Fact]
+    public async Task Original_Value_Factories_Receive_The_Models_Clr_Type()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        var factory = new BirthYearFactory();
+        await using var provider = BuildSingleEntityProvider<BirthDateAnonymiseDbContext>(
+            database.ConnectionString,
+            "birth-date-anonymise",
+            Strategy.Anonymise,
+            services => services.AddSingleton<IAnonymiseValueFactory>(factory)
+        );
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        await using (var scope = provider.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<BirthDateAnonymiseDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.Add(new BirthDateRecord { Id = Guid.NewGuid(), TenantId = tenantId, CreatedAt = asOf.AddDays(-60), BirthDate = new DateOnly(1990, 7, 14) });
+            await db.SaveChangesAsync();
+        }
+
+        var result = await provider.GetRequiredService<IRetentionSweep>().SweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        result.EntityFailures.Should().BeEmpty();
+        factory.OriginalValueTypes.Should().Equal(typeof(DateOnly));
+        await using var verifyScope = provider.CreateAsyncScope();
+        var verify = verifyScope.ServiceProvider.GetRequiredService<BirthDateAnonymiseDbContext>();
+        (await verify.Set<BirthDateRecord>().SingleAsync()).BirthDate.Should().Be(new DateOnly(1990, 1, 1));
+    }
+
+    [Fact]
+    public async Task Handler_Path_Anonymises_Entities_With_Complex_Properties()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        await using var provider = BuildSingleEntityProvider<ComplexAddressDbContext>(
+            database.ConnectionString,
+            "complex-address",
+            Strategy.Anonymise,
+            services => services.AddRowHandler<ComplexAddressRecord, CountingComplexAddressHandler>()
+        );
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        await using (var scope = provider.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<ComplexAddressDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.Add(new ComplexAddressRecord { Id = Guid.NewGuid(), TenantId = tenantId, CreatedAt = asOf.AddDays(-60), Email = "a@example.test", Address = new PostalAddress { Street = "1 High St", Town = "Leeds" } });
+            await db.SaveChangesAsync();
+        }
+
+        var result = await provider.GetRequiredService<IRetentionSweep>().SweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Single(count => count.EntityType == typeof(ComplexAddressRecord)).Affected.Should().Be(1);
+    }
+
+    private static ServiceProvider BuildSingleEntityProvider<TContext>(
+        string connectionString,
+        string category,
+        Strategy strategy,
+        Action<IServiceCollection> configure
+    )
+        where TContext : DbContext
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().AddInMemoryCollection().Build());
+        services.AddLogging();
+        services.AddDbContext<TContext>(options => options.UseNpgsql(connectionString));
+        services.AddSingleton<IRetentionRuleProvider>(
+            new StaticCategoryRepository(
+                new Dictionary<string, ITestRetentionRule>
+                {
+                    [category] = new StaticTestRetentionRule(new RetentionRule(TimeSpan.FromDays(30), strategy)),
+                }
+            )
+        );
+        configure(services);
+        services.AddCohort<TContext>();
+        return services.BuildServiceProvider(validateScopes: true);
+    }
+
     private string GetConnectionString()
     {
         using var db = Host.CreateDbContext();
@@ -657,6 +744,81 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
 
         return services.BuildServiceProvider(validateScopes: true);
     }
+
+    private sealed class BirthDateAnonymiseDbContext(DbContextOptions<BirthDateAnonymiseDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<BirthDateRecord>().ToTable("birth_date_records");
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    [Retain("birth-date-anonymise", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-0000000000a8")]
+    private sealed class BirthDateRecord
+    {
+        public Guid Id { get; set; }
+        public Guid TenantId { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
+
+        [AnonymiseWith(typeof(BirthYearFactory))]
+        public DateOnly BirthDate { get; set; }
+
+        public DateTimeOffset? AnonymisedAt { get; set; }
+    }
+
+    // Keeps only the year: a factory written against the model's DateOnly.
+    private sealed class BirthYearFactory : IAnonymiseValueFactory
+    {
+        public AnonymiseFactoryExecutionMode ExecutionMode =>
+            AnonymiseFactoryExecutionMode.PerRowWithOriginalValue;
+        public List<Type?> OriginalValueTypes { get; } = [];
+
+        public object? Create(AnonymiseValueContext context)
+        {
+            OriginalValueTypes.Add(context.OriginalValue?.GetType());
+            return new DateOnly(((DateOnly)context.OriginalValue!).Year, 1, 1);
+        }
+    }
+
+    private sealed class ComplexAddressDbContext(DbContextOptions<ComplexAddressDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<ComplexAddressRecord>(builder =>
+            {
+                builder.ToTable("complex_address_records");
+                builder.ComplexProperty(record => record.Address);
+            });
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    [Retain("complex-address", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-0000000000a9")]
+    private sealed class ComplexAddressRecord
+    {
+        public Guid Id { get; set; }
+        public Guid TenantId { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
+        public PostalAddress Address { get; set; } = new();
+
+        [Anonymise(AnonymiseMethod.Null)]
+        public string? Email { get; set; }
+
+        public DateTimeOffset? AnonymisedAt { get; set; }
+    }
+
+    private sealed class PostalAddress
+    {
+        public string Street { get; set; } = "";
+        public string Town { get; set; } = "";
+    }
+
+    private sealed class CountingComplexAddressHandler : IRetentionHandler<ComplexAddressRecord>;
 
     private sealed class JsonbAnonymiseDbContext(DbContextOptions<JsonbAnonymiseDbContext> options)
         : DbContext(options)

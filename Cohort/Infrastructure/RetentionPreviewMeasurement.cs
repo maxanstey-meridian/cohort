@@ -7,7 +7,7 @@ namespace Cohort.Infrastructure;
 internal static class RetentionPreviewMeasurement
 {
     internal static async Task<(long Affected, long HeldCount, long NullAnchorCount)> MeasureAsync(
-        IRetentionSweepStrategy strategy,
+        SweepStrategy strategy,
         RetentionEntry entry,
         RetentionRule rule,
         RetentionResolutionContext context,
@@ -15,15 +15,11 @@ internal static class RetentionPreviewMeasurement
         CancellationToken ct
     )
     {
-        var affected = await strategy.PreviewAsync(entry, rule, context, connection, ct);
-        var heldCount = await strategy.CountHeldAsync(entry, rule, context, connection, ct);
-        var nullAnchorCount = await strategy.CountNullAnchorsAsync(
-            entry,
-            rule,
-            context,
-            connection,
-            ct
+        var scope = SweepScope.ForSweep(entry, rule, context);
+        return (
+            await strategy.CountAsync(scope, SweepCount.Eligible, connection, ct),
+            await strategy.CountAsync(scope, SweepCount.Held, connection, ct),
+            await strategy.CountAsync(scope, SweepCount.NullAnchor, connection, ct)
         );
-        return (affected, heldCount, nullAnchorCount);
     }
 }

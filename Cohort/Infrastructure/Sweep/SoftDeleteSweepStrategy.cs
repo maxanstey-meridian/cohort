@@ -1,4 +1,3 @@
-using System.Data.Common;
 using Cohort.Domain;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -6,205 +5,61 @@ using Microsoft.Extensions.Logging;
 
 namespace Cohort.Infrastructure.Sweep;
 
-internal sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
+internal sealed class SoftDeleteSweepStrategy(
+    [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
+    IServiceProvider services,
+    ILogger<SoftDeleteSweepStrategy> logger
+) : SweepStrategy(db, services, logger)
 {
-    private readonly RelationalSweepStrategyCore core;
+    public override Strategy HandlesStrategy => Strategy.SoftDelete;
 
-    public SoftDeleteSweepStrategy(
-        [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
-        IServiceProvider services,
-        ILogger<SoftDeleteSweepStrategy> logger
-    )
+    protected override void Validate(RetentionEntry entry)
     {
-        core = new RelationalSweepStrategyCore(
-            Strategy.SoftDelete,
-            nameof(SoftDeleteSweepStrategy),
-            db,
-            services,
-            logger,
-            eligibilityClause: static entry =>
-                $"AND target.{RelationalSweepStrategyCore.QuoteIdentifier(RequireSoftDelete(entry).IsDeletedColumn)} = FALSE",
-            mutationHead: static entry =>
-            {
-                var softDelete = RequireSoftDelete(entry);
-                var deletedAtAssignment = softDelete.DeletedAtColumn is null
-                    ? ""
-                    : $", {RelationalSweepStrategyCore.QuoteIdentifier(softDelete.DeletedAtColumn)} = @deletedAt";
-
-                return $"""
-                    UPDATE {PostgreSqlIdentifier.Format(entry.Table)} AS target
-                    SET {RelationalSweepStrategyCore.QuoteIdentifier(
-                        softDelete.IsDeletedColumn
-                    )} = TRUE{deletedAtAssignment}
-                    """;
-            },
-            addMutationParameters: static (command, entry, now) =>
-            {
-                var softDelete = RequireSoftDelete(entry);
-                if (softDelete.DeletedAtColumn is not null)
-                {
-                    command.Parameters.Add(
-                        RelationalSweepStrategyCore.CreateParameter(
-                            command,
-                            "deletedAt",
-                            CreateDeletedAtValue(entry, softDelete, now)
-                        )
-                    );
-                }
-            }
-        );
-    }
-
-    public Strategy HandlesStrategy => Strategy.SoftDelete;
-
-    public Task<long> PreviewAsync(
-        RetentionEntry entry,
-        RetentionRule rule,
-        RetentionResolutionContext ctx,
-        DbConnection conn,
-        CancellationToken ct
-    )
-    {
-        return core.PreviewAsync(entry, rule, ctx, conn, ct);
-    }
-
-    public Task<long> CountHeldAsync(
-        RetentionEntry entry,
-        RetentionRule rule,
-        RetentionResolutionContext ctx,
-        DbConnection conn,
-        CancellationToken ct
-    )
-    {
-        return core.CountHeldAsync(entry, rule, ctx, conn, ct);
-    }
-
-    public Task<long> CountNullAnchorsAsync(
-        RetentionEntry entry,
-        RetentionRule rule,
-        RetentionResolutionContext ctx,
-        DbConnection conn,
-        CancellationToken ct
-    )
-    {
-        return core.CountNullAnchorsAsync(entry, rule, ctx, conn, ct);
-    }
-
-    public Task<SweepExecutionResult> SweepAsync(
-        RetentionEntry entry,
-        RetentionRule rule,
-        RetentionResolutionContext ctx,
-        DbConnection conn,
-        DbTransaction transaction,
-        CancellationToken ct,
-        SweepMutationContext? execution = null
-    )
-    {
-        return core.SweepAsync(entry, rule, ctx, conn, transaction, ct, execution);
-    }
-
-    public Task<long> PreviewEraseAsync(
-        RetentionEntry entry,
-        RetentionRule rule,
-        ErasureSubjectPredicate predicate,
-        TenantContext tenant,
-        DateTimeOffset now,
-        DbConnection conn,
-        CancellationToken ct
-    )
-    {
-        return core.PreviewEraseAsync(entry, rule, predicate, tenant, now, conn, ct);
-    }
-
-    public Task<long> CountHeldForEraseAsync(
-        RetentionEntry entry,
-        RetentionRule rule,
-        ErasureSubjectPredicate predicate,
-        TenantContext tenant,
-        DateTimeOffset now,
-        DbConnection conn,
-        CancellationToken ct
-    )
-    {
-        return core.CountHeldForEraseAsync(entry, rule, predicate, tenant, now, conn, ct);
-    }
-
-    public Task<long> CountNullAnchorsForEraseAsync(
-        RetentionEntry entry,
-        RetentionRule rule,
-        ErasureSubjectPredicate predicate,
-        TenantContext tenant,
-        DbConnection conn,
-        CancellationToken ct
-    )
-    {
-        return core.CountNullAnchorsForEraseAsync(entry, rule, predicate, tenant, conn, ct);
-    }
-
-    public Task<SweepExecutionResult> EraseAsync(
-        RetentionEntry entry,
-        RetentionRule rule,
-        ErasureSubjectPredicate predicate,
-        TenantContext tenant,
-        DateTimeOffset now,
-        DbConnection conn,
-        DbTransaction transaction,
-        CancellationToken ct,
-        SweepMutationContext? execution = null
-    )
-    {
-        return core.EraseAsync(
-            entry,
-            rule,
-            predicate,
-            tenant,
-            now,
-            conn,
-            transaction,
-            ct,
-            execution
-        );
-    }
-
-    private static SoftDeleteConvention RequireSoftDelete(RetentionEntry entry)
-    {
-        return entry.SoftDelete
-            ?? throw new InvalidOperationException(
+        if (entry.SoftDelete is null)
+        {
+            throw new InvalidOperationException(
                 $"Retention entry for {entry.EntityType.FullName} must expose soft-delete metadata for soft-delete operations."
             );
+        }
     }
 
-    private static object CreateDeletedAtValue(
+    protected override string EligibilitySql(RetentionEntry entry) =>
+        $"target.{PostgreSqlIdentifier.Quote(entry.SoftDelete!.IsDeletedColumn)} = FALSE";
+
+    protected override SweepMutation CreateMutation(SweepScope scope)
+    {
+        var entry = scope.Entry;
+        var softDelete = entry.SoftDelete!;
+        if (softDelete.DeletedAtColumn is null)
+        {
+            return new(
+                $"UPDATE {PostgreSqlIdentifier.Format(entry.Table)} AS target SET {PostgreSqlIdentifier.Quote(softDelete.IsDeletedColumn)} = TRUE",
+                static (_, _) => { }
+            );
+        }
+
+        var deletedAt = DeletedAtValue(entry, softDelete, scope.Now);
+        return new(
+            $"UPDATE {PostgreSqlIdentifier.Format(entry.Table)} AS target SET {PostgreSqlIdentifier.Quote(softDelete.IsDeletedColumn)} = TRUE, {PostgreSqlIdentifier.Quote(softDelete.DeletedAtColumn)} = @deletedAt",
+            (parameters, _) => parameters["deletedAt"] = deletedAt
+        );
+    }
+
+    private static object DeletedAtValue(
         RetentionEntry entry,
         SoftDeleteConvention softDelete,
         DateTimeOffset now
     )
     {
-        if (softDelete.DeletedAtMember is null)
-        {
-            throw new InvalidOperationException(
-                $"Retention entry for {entry.EntityType.FullName} does not define DeletedAt metadata."
-            );
-        }
-
-        var deletedAtProperty = ReflectionMemberResolver.FindPropertyByName(
-            entry.EntityType,
-            softDelete.DeletedAtMember
-        );
-        if (deletedAtProperty is null)
-        {
-            throw new InvalidOperationException(
-                $"Retention entry for {entry.EntityType.FullName} could not find DeletedAt member '{softDelete.DeletedAtMember}'."
-            );
-        }
-
-        return deletedAtProperty.PropertyType switch
-        {
-            var type when type == typeof(DateTime) || type == typeof(DateTime?) => now.UtcDateTime,
-            var type when type == typeof(DateTimeOffset) || type == typeof(DateTimeOffset?) => now,
-            _ => throw new InvalidOperationException(
-                $"Soft-delete DeletedAt member '{deletedAtProperty.Name}' on {entry.EntityType.FullName} must be DateTime or DateTimeOffset (nullable allowed), got {deletedAtProperty.PropertyType.Name}."
-            ),
-        };
+        var type = ReflectionMemberResolver
+            .FindPropertyByName(entry.EntityType, softDelete.DeletedAtMember!)
+            ?.PropertyType;
+        return type == typeof(DateTime) || type == typeof(DateTime?)
+            ? now.UtcDateTime
+            : type == typeof(DateTimeOffset) || type == typeof(DateTimeOffset?)
+                ? now
+                : throw new InvalidOperationException(
+                    $"Soft-delete DeletedAt member '{softDelete.DeletedAtMember}' on {entry.EntityType.FullName} must be DateTime or DateTimeOffset (nullable allowed), got {type?.Name ?? "no property"}."
+                );
     }
 }

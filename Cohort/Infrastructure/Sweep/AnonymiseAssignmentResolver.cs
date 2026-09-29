@@ -23,7 +23,7 @@ internal sealed class AnonymiseAssignmentResolver(
             .Any(field => ResolveFactory(field).ExecutionMode is not AnonymiseFactoryExecutionMode.Static);
     }
 
-    internal IReadOnlyList<AnonymiseFactoryField> GetOriginalValueFields(RetentionEntry entry)
+    private IReadOnlyList<AnonymiseFactoryField> GetOriginalValueFields(RetentionEntry entry)
     {
         return entry
             .AnonymiseFields.OfType<AnonymiseFactoryField>()
@@ -70,13 +70,11 @@ internal sealed class AnonymiseAssignmentResolver(
         return values;
     }
 
-    internal IReadOnlyList<object?> CreateSetBasedAssignmentValues(
+    internal IReadOnlyList<object?> ToProviderValues(
         RetentionEntry entry,
-        Guid tenantId,
-        DateTimeOffset now
+        IReadOnlyDictionary<string, object?> staticAssignments
     )
     {
-        var staticAssignments = CreateStaticAssignments(entry, tenantId, now);
         return entry
             .AnonymiseFields.Select(field =>
                 ConvertAssignmentValueToProvider(entry, field, staticAssignments[field.MemberName])
@@ -84,14 +82,29 @@ internal sealed class AnonymiseAssignmentResolver(
             .ToArray();
     }
 
+    /// <summary>
+    /// Values for one loaded row. Original values come from the materialized entity, so
+    /// factories see the model's CLR types, not provider types.
+    /// </summary>
     internal IReadOnlyList<object?> CreatePerRowAssignmentValues(
         RetentionEntry entry,
         TenantContext tenant,
         DateTimeOffset now,
-        IReadOnlyDictionary<string, object?> originalValues,
+        object row,
         IReadOnlyDictionary<string, object?> staticAssignments
     )
     {
+        var originalValues = new Dictionary<string, object?>(StringComparer.Ordinal);
+        foreach (var field in GetOriginalValueFields(entry))
+        {
+            originalValues[field.MemberName] = (
+                ReflectionMemberResolver.FindPropertyByName(entry.EntityType, field.MemberName)
+                ?? throw new InvalidOperationException(
+                    $"Property '{field.MemberName}' on {entry.EntityType.FullName} is not mapped by the current EF model."
+                )
+            ).GetValue(row);
+        }
+
         return entry
             .AnonymiseFields.Select(field =>
                 ConvertAssignmentValueToProvider(
@@ -108,42 +121,6 @@ internal sealed class AnonymiseAssignmentResolver(
                 )
             )
             .ToArray();
-    }
-
-    internal IReadOnlyDictionary<string, object?> CreateOriginalValuesFromEntity<TEntity>(
-        RetentionEntry entry,
-        TEntity row
-    )
-        where TEntity : class
-    {
-        var originalValues = new Dictionary<string, object?>(StringComparer.Ordinal);
-        foreach (var field in GetOriginalValueFields(entry))
-        {
-            var property =
-                ReflectionMemberResolver.FindPropertyByName(entry.EntityType, field.MemberName)
-                ?? throw new InvalidOperationException(
-                    $"Property '{field.MemberName}' on {entry.EntityType.FullName} is not mapped by the current EF model."
-                );
-            originalValues[field.MemberName] = property.GetValue(row);
-        }
-
-        return originalValues;
-    }
-
-    internal object? ConvertOriginalValueFromProvider(
-        RetentionEntry entry,
-        AnonymiseFactoryField field,
-        object? providerValue
-    )
-    {
-        if (providerValue is null)
-        {
-            return providerValue;
-        }
-
-        var property = ResolveEfProperty(entry, field.MemberName);
-        var converter = property.GetTypeMapping().Converter;
-        return converter?.ConvertFromProvider(providerValue) ?? providerValue;
     }
 
     private object? ResolvePerRowAssignmentValue(

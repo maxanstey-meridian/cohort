@@ -68,13 +68,13 @@ public static class ServiceCollectionExtensions
         services.TryAddScoped<IRetentionHoldsRepository, EfRetentionHoldsRepository>();
         services.TryAddScoped<IRetentionDeletion, EfRetentionDeletion>();
         services.TryAddEnumerable(
-            ServiceDescriptor.Scoped<IRetentionSweepStrategy, PurgeSweepStrategy>()
+            ServiceDescriptor.Scoped<SweepStrategy, PurgeSweepStrategy>()
         );
         services.TryAddEnumerable(
-            ServiceDescriptor.Scoped<IRetentionSweepStrategy, SoftDeleteSweepStrategy>()
+            ServiceDescriptor.Scoped<SweepStrategy, SoftDeleteSweepStrategy>()
         );
         services.TryAddEnumerable(
-            ServiceDescriptor.Scoped<IRetentionSweepStrategy, AnonymiseSweepStrategy>()
+            ServiceDescriptor.Scoped<SweepStrategy, AnonymiseSweepStrategy>()
         );
         services.TryAddScoped<RetentionPreviewService>();
         services.TryAddSingleton<IRetentionPreview, ScopeOwnedRetentionPreview>();

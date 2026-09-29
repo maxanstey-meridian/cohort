@@ -37,8 +37,7 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
             "Cohort/Infrastructure/Holds/RetentionHoldSql.cs",
             "Cohort/Infrastructure/Holds/RetentionEntityLockSql.cs",
             "Cohort/Infrastructure/RetentionRunAdvisoryLock.cs",
-            "Cohort/Infrastructure/Sweep/RelationalSweepStrategyCore.cs",
-            "Cohort/Infrastructure/Sweep/AnonymiseSqlBuilder.cs",
+            "Cohort/Infrastructure/Sweep/SweepStrategy.cs",
             "Cohort/Hosting/RetentionRowDispatcher.cs",
         ];
         var unqualified = new Regex(

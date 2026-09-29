@@ -12,10 +12,10 @@ internal sealed class RetentionPreviewService(
     RetentionRegistry registry,
     IRetentionRuleProvider ruleProvider,
     RetentionRuntimeReadinessValidator readinessValidator,
-    IEnumerable<IRetentionSweepStrategy> sweepStrategies
+    IEnumerable<SweepStrategy> sweepStrategies
 )
 {
-    private readonly IReadOnlyDictionary<Strategy, IRetentionSweepStrategy> strategies =
+    private readonly IReadOnlyDictionary<Strategy, SweepStrategy> strategies =
         sweepStrategies.ToDictionary(strategy => strategy.HandlesStrategy);
 
     public async Task<RetentionSweepResult> ExecuteAsync(

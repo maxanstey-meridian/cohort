@@ -19,12 +19,12 @@ internal sealed class RetentionErasureService(
     RetentionValidationState validationState,
     EfRetentionAuditWriter auditWriter,
     RetentionAuditNotifier auditNotifier,
-    IEnumerable<IRetentionSweepStrategy> sweepStrategies,
+    IEnumerable<SweepStrategy> sweepStrategies,
     IRetentionExecutionSettings options,
     ILogger<RetentionErasureService> logger
 )
 {
-    private readonly IReadOnlyDictionary<Strategy, IRetentionSweepStrategy> strategies =
+    private readonly IReadOnlyDictionary<Strategy, SweepStrategy> strategies =
         sweepStrategies.ToDictionary(strategy => strategy.HandlesStrategy);
 
     public async Task<ErasureResult> EraseAsync(
@@ -346,18 +346,11 @@ internal sealed class RetentionErasureService(
         if (rule.Strategy != Strategy.Exempt)
         {
             var strategy = strategies[rule.Strategy];
+            var scope = SweepScope.ForErasure(entry, rule, predicate, tenant, now);
 
             if (dryRun)
             {
-                affectedCount = await strategy.PreviewEraseAsync(
-                    entry,
-                    rule,
-                    predicate,
-                    tenant,
-                    now,
-                    connection,
-                    ct
-                );
+                affectedCount = await strategy.CountAsync(scope, SweepCount.Eligible, connection, ct);
             }
             else
             {
@@ -372,20 +365,12 @@ internal sealed class RetentionErasureService(
                     List<SweepEvent> committedEvents = [];
                     await using (var transaction = await db.Database.BeginTransactionAsync(ct))
                     {
-                        execution = await strategy.EraseAsync(
-                            entry,
-                            rule,
-                            predicate,
-                            tenant,
-                            now,
+                        execution = await strategy.ExecuteAsync(
+                            scope,
                             connection,
                             transaction.GetDbTransaction(),
-                            ct,
-                            new SweepMutationContext(
-                                sweepId,
-                                DateTimeOffset.UtcNow,
-                                batchSize
-                            )
+                            new SweepMutationContext(sweepId, DateTimeOffset.UtcNow, batchSize),
+                            ct
                         );
 
                         if (execution.HeldCount < 0)
@@ -495,25 +480,10 @@ internal sealed class RetentionErasureService(
 
             // Held rows are measured directly using the same subject, tenant,
             // strategy, and optional legal-minimum predicates as mutation.
-            heldCount = await strategy.CountHeldForEraseAsync(
-                entry,
-                rule,
-                predicate,
-                tenant,
-                now,
-                connection,
-                ct
-            );
-            if (CutoffCalculator.ComputeErasureCutoff(now, rule.LegalMin) is not null)
+            heldCount = await strategy.CountAsync(scope, SweepCount.Held, connection, ct);
+            if (scope.Cutoff is not null)
             {
-                nullAnchorCount = await strategy.CountNullAnchorsForEraseAsync(
-                    entry,
-                    rule,
-                    predicate,
-                    tenant,
-                    connection,
-                    ct
-                );
+                nullAnchorCount = await strategy.CountAsync(scope, SweepCount.NullAnchor, connection, ct);
             }
         }
 

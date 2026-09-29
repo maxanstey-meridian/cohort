@@ -22,7 +22,7 @@ internal static class RecordIdSql
     {
         return PostgresStoreTypeSql.Validate(recordId.RecordIdStoreType) is { } storeType
             ? $"{targetAlias}.{Quote(recordId.RecordIdColumn)} = CAST(@{parameterName} AS {storeType})"
-            : $"CAST({targetAlias}.{Quote(recordId.RecordIdColumn)} AS text) = @{parameterName}";
+            : $"CAST({targetAlias}.{Quote(recordId.RecordIdColumn)} AS text) = CAST(@{parameterName} AS text)";
     }
 
     internal static string EqualsAnyParameter(
@@ -45,14 +45,12 @@ internal static class RecordIdSql
     )
     {
         var storeType = PostgresStoreTypeSql.Validate(recordId.RecordIdStoreType);
-        await using var command = connection.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText =
+        await using var command = new SqlParams { ["recordId"] = value }.CreateCommand(
+            connection,
+            transaction,
             storeType is null
                 ? "SELECT CAST(@recordId AS text)"
-                : $"SELECT CAST(CAST(@recordId AS {storeType}) AS text)";
-        command.Parameters.Add(
-            RelationalSweepStrategyCore.CreateParameter(command, "recordId", value)
+                : $"SELECT CAST(CAST(@recordId AS {storeType}) AS text)"
         );
         return (string)(await command.ExecuteScalarAsync(ct))!;
     }

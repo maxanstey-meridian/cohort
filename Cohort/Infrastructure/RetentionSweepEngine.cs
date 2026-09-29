@@ -16,13 +16,13 @@ internal sealed class RetentionSweepEngine(
     IRetentionRuleProvider ruleProvider,
     RetentionRuntimeReadinessValidator readinessValidator,
     EfRetentionAuditWriter auditWriter,
-    IEnumerable<IRetentionSweepStrategy> sweepStrategies,
+    IEnumerable<SweepStrategy> sweepStrategies,
     IRetentionExecutionSettings options,
     RetentionAuditNotifier auditNotifier,
     ILogger<RetentionSweepEngine> logger
 )
 {
-    private readonly IReadOnlyDictionary<Strategy, IRetentionSweepStrategy> strategies =
+    private readonly IReadOnlyDictionary<Strategy, SweepStrategy> strategies =
         sweepStrategies.ToDictionary(strategy => strategy.HandlesStrategy);
 
     public async Task<RetentionSweepResult> SweepAsync(
@@ -555,18 +555,12 @@ internal sealed class RetentionSweepEngine(
                 List<SweepEvent> committedEvents = [];
                 await using (var transaction = await db.Database.BeginTransactionAsync(ct))
                 {
-                    execution = await strategy.SweepAsync(
-                        entry,
-                        rule,
-                        context,
+                    execution = await strategy.ExecuteAsync(
+                        SweepScope.ForSweep(entry, rule, context),
                         connection,
                         transaction.GetDbTransaction(),
-                        ct,
-                        new SweepMutationContext(
-                            sweepId,
-                            DateTimeOffset.UtcNow,
-                            batchSize
-                        )
+                        new SweepMutationContext(sweepId, DateTimeOffset.UtcNow, batchSize),
+                        ct
                     );
 
                     if (execution.HeldCount < 0)
@@ -674,14 +668,9 @@ internal sealed class RetentionSweepEngine(
 
             // Held rows are measured directly (eligible AND actively held) instead of
             // being inferred from candidate arithmetic.
-            heldCount = await strategy.CountHeldAsync(entry, rule, context, connection, ct);
-            nullAnchorCount = await strategy.CountNullAnchorsAsync(
-                entry,
-                rule,
-                context,
-                connection,
-                ct
-            );
+            var scope = SweepScope.ForSweep(entry, rule, context);
+            heldCount = await strategy.CountAsync(scope, SweepCount.Held, connection, ct);
+            nullAnchorCount = await strategy.CountAsync(scope, SweepCount.NullAnchor, connection, ct);
         }
 
         lifecycle.ReplaceEntityCount(

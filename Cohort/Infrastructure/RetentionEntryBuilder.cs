@@ -91,12 +91,14 @@ internal sealed class RetentionEntryBuilder(CohortConventions conventions)
         );
     }
 
+    // Every mapped column, complex-property columns and system columns such as xmin included:
+    // FromSql materialization fails if any is missing, and SELECT * omits system columns.
     private static IReadOnlyList<string> BuildMaterializationColumns(
         IEntityType entityType,
         StoreObjectIdentifier storeObject
     ) =>
         entityType
-            .GetProperties()
+            .GetFlattenedProperties()
             .Select(property => property.GetColumnName(storeObject))
             .Where(columnName => columnName is not null)
             .Select(columnName => columnName!)

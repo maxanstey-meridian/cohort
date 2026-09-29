@@ -1,4 +1,6 @@
+using System.Collections.Frozen;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using Cohort.Domain;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata;
@@ -16,7 +18,19 @@ internal sealed class RetentionEntryBuilder(CohortConventions conventions)
     ];
     private static readonly Type[] AllowedTenantTypes = [typeof(Guid)];
 
+    private readonly ConditionalWeakTable<IModel, FrozenDictionary<Type, RetentionEntry>> entriesByModel = new();
+
     public string ExpectedTenantPropertyName => conventions.TenantPropertyName;
+
+    /// <summary>Every retained entity in <paramref name="model"/>, built once per model.</summary>
+    public FrozenDictionary<Type, RetentionEntry> BuildAll(IModel model) =>
+        entriesByModel.GetValue(
+            model,
+            m => m.GetEntityTypes()
+                .Select(TryBuild)
+                .OfType<RetentionEntry>()
+                .ToFrozenDictionary(entry => entry.EntityType)
+        );
 
     public RetentionEntry? TryBuild(IEntityType entityType)
     {

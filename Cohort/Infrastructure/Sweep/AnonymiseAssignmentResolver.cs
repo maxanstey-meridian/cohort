@@ -97,12 +97,9 @@ internal sealed class AnonymiseAssignmentResolver(
         var originalValues = new Dictionary<string, object?>(StringComparer.Ordinal);
         foreach (var field in GetOriginalValueFields(entry))
         {
-            originalValues[field.MemberName] = (
-                ReflectionMemberResolver.FindPropertyByName(entry.EntityType, field.MemberName)
-                ?? throw new InvalidOperationException(
-                    $"Property '{field.MemberName}' on {entry.EntityType.FullName} is not mapped by the current EF model."
-                )
-            ).GetValue(row);
+            originalValues[field.MemberName] = ResolveEfProperty(entry, field.MemberName)
+                .GetGetter()
+                .GetClrValueUsingContainingEntity(row);
         }
 
         return entry

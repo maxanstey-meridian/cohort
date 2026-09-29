@@ -151,15 +151,9 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
             .AsNoTracking()
             .ToListAsync(ct);
 
-        var recordIdProperty =
-            ReflectionMemberResolver.FindPropertyByName(typeof(TEntity), entry.RecordId.RecordIdMember)
-            ?? throw new InvalidOperationException(
-                $"Retention entry for {entry.EntityType.FullName} references missing record-id member '{entry.RecordId.RecordIdMember}'."
-            );
-        var recordIdConverter = db.Model.FindEntityType(typeof(TEntity))
-            ?.FindProperty(entry.RecordId.RecordIdMember)
-            ?.GetTypeMapping()
-            .Converter;
+        var recordIdProperty = db.Model.FindEntityType(typeof(TEntity))!.FindProperty(entry.RecordId.RecordIdMember)!;
+        var recordIdGetter = recordIdProperty.GetGetter();
+        var recordIdConverter = recordIdProperty.GetTypeMapping().Converter;
 
         var affected = new List<string>();
         var skipped = new List<string>();
@@ -167,7 +161,7 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
         foreach (var row in rows)
         {
             var recordIdValue =
-                recordIdProperty.GetValue(row)
+                recordIdGetter.GetClrValueUsingContainingEntity(row)
                 ?? throw new InvalidOperationException(
                     $"Retention row for {entry.EntityType.FullName} produced an empty record id for member '{entry.RecordId.RecordIdMember}'."
                 );

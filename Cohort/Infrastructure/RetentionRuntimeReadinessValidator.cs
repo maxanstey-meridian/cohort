@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using System.Data.Common;
 using Cohort.Application;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -46,23 +45,12 @@ internal sealed class RetentionRuntimeReadinessValidator(
         }
     }
 
+    // Readiness depends on the model (and so Cohort's table mapping) and on the database it
+    // runs against; Npgsql's DataSource already carries host and port.
     private RetentionRuntimeReadinessKey CreateKey()
     {
         var connection = db.Database.GetDbConnection();
-        return new RetentionRuntimeReadinessKey(
-            connection.GetType().FullName ?? connection.GetType().Name,
-            connection.DataSource,
-            connection.Database,
-            GetPort(connection),
-            CohortStoreTables.FromModel(db.Model),
-            db.Model
-        );
-    }
-
-    private static string GetPort(DbConnection connection)
-    {
-        var values = new DbConnectionStringBuilder { ConnectionString = connection.ConnectionString };
-        return values.TryGetValue("Port", out var port) ? port?.ToString() ?? "" : "";
+        return new RetentionRuntimeReadinessKey(db.Model, connection.DataSource, connection.Database);
     }
 
     private void ValidateProvider()
@@ -104,12 +92,9 @@ internal sealed class RetentionRuntimeReadinessState
 }
 
 internal sealed record RetentionRuntimeReadinessKey(
-    string Provider,
+    Microsoft.EntityFrameworkCore.Metadata.IModel Model,
     string DataSource,
-    string Database,
-    string Port,
-    CohortStoreTables Tables,
-    Microsoft.EntityFrameworkCore.Metadata.IModel Model
+    string Database
 );
 
 internal sealed class RetentionRuntimeReadinessEntry

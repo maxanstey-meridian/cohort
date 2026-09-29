@@ -39,15 +39,9 @@ internal sealed class RetentionPreviewService(
         var startedAt = DateTimeOffset.UtcNow;
         var counts = new List<EntitySweepCount>();
         var connection = db.Database.GetDbConnection();
-        var shouldCloseConnection = connection.State != ConnectionState.Open;
-        Exception? primaryException = null;
-
+        await db.Database.OpenConnectionAsync(ct);
         try
         {
-            if (shouldCloseConnection)
-            {
-                await db.Database.OpenConnectionAsync(ct);
-            }
 
             foreach (
                 var entry in registry
@@ -86,21 +80,9 @@ internal sealed class RetentionPreviewService(
                 );
             }
         }
-        catch (Exception ex)
-        {
-            primaryException = ex;
-            throw;
-        }
         finally
         {
-            await OperationalConnectionCleanup.RunAsync(
-                null,
-                shouldCloseConnection
-                    ? cleanupToken => db.Database.CloseConnectionAsync().WaitAsync(cleanupToken)
-                    : null,
-                primaryException,
-                null
-            );
+            await db.Database.CloseConnectionAsync();
         }
 
         return new RetentionSweepResult(Guid.NewGuid(), startedAt, DateTimeOffset.UtcNow, counts);

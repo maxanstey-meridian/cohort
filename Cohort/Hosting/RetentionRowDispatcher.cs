@@ -44,6 +44,7 @@ internal sealed class RetentionRowDispatcher(
 
     public async Task<RowDispatcherFlushResult> FlushAsync(CancellationToken ct = default)
     {
+        await ValidateReadinessAsync(ct);
         await RecoverAbandonedRunsAsync(DateTimeOffset.UtcNow, ct);
         await ScrubExpiredPayloadsAsync(ct);
         await DrainQueueAsync(RetryScheduleUpperBound, ct);
@@ -78,6 +79,7 @@ internal sealed class RetentionRowDispatcher(
         {
             try
             {
+                await ValidateReadinessAsync(stoppingToken);
                 var now = DateTimeOffset.UtcNow;
                 await RecoverAbandonedRunsAsync(now, stoppingToken);
                 if (now - lastPayloadScrubAt >= PayloadScrubInterval)
@@ -738,13 +740,20 @@ internal sealed class RetentionRowDispatcher(
                 && s.ClaimToken == claimed.ClaimToken
             );
 
+    // Once per poll or flush, not per statement: the result is cached after the first pass.
+    private async Task ValidateReadinessAsync(CancellationToken ct)
+    {
+        await using var scope = scopeFactory.CreateAsyncScope();
+        await scope.ServiceProvider.GetRequiredService<RetentionRuntimeReadinessValidator>().ValidateAsync(ct);
+    }
+
     private async Task<TResult> WithDbAsync<TResult>(
         Func<DbContext, Task<TResult>> action,
         CancellationToken ct
     )
     {
+        ct.ThrowIfCancellationRequested();
         await using var scope = scopeFactory.CreateAsyncScope();
-        await scope.ServiceProvider.GetRequiredService<RetentionRuntimeReadinessValidator>().ValidateAsync(ct);
         return await action(scope.ServiceProvider.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext));
     }
 

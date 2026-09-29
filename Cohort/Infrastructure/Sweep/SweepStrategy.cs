@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using System.Data;
 using System.Data.Common;
 using System.Reflection;
 using Cohort.Domain;
@@ -49,7 +48,6 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
     )
     {
         EnsureHandles(scope);
-        await EnsureOpenAsync(conn, ct);
 
         var parameters = new SqlParams();
         var where = count switch
@@ -77,7 +75,6 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
     )
     {
         EnsureHandles(scope);
-        await EnsureOpenAsync(conn, ct);
 
         var candidates = await LockCandidatesAsync(scope, conn, transaction, execution, ct);
         if (candidates.Count == 0)
@@ -453,14 +450,6 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
         }
 
         Validate(scope.Entry);
-    }
-
-    private static async Task EnsureOpenAsync(DbConnection conn, CancellationToken ct)
-    {
-        if (conn.State != ConnectionState.Open)
-        {
-            await conn.OpenAsync(ct);
-        }
     }
 
     private static async Task<List<string>> ReadRecordIdsAsync(DbCommand command, CancellationToken ct)

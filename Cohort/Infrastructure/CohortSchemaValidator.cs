@@ -17,15 +17,9 @@ internal sealed class CohortSchemaValidator(
     public async Task ValidateAsync(CancellationToken ct)
     {
         var connection = db.Database.GetDbConnection();
-        var shouldCloseConnection = connection.State != ConnectionState.Open;
-        Exception? primaryException = null;
-
+        await db.Database.OpenConnectionAsync(ct);
         try
         {
-            if (shouldCloseConnection)
-            {
-                await db.Database.OpenConnectionAsync(ct);
-            }
 
             var storeTables = CohortStoreTables.FromModel(db.Model);
             var existingTransaction = db.Database.CurrentTransaction;
@@ -151,21 +145,9 @@ internal sealed class CohortSchemaValidator(
                 ]);
             }
         }
-        catch (Exception ex)
-        {
-            primaryException = ex;
-            throw;
-        }
         finally
         {
-            await OperationalConnectionCleanup.RunAsync(
-                null,
-                shouldCloseConnection
-                    ? cleanupToken => db.Database.CloseConnectionAsync().WaitAsync(cleanupToken)
-                    : null,
-                primaryException,
-                null
-            );
+            await db.Database.CloseConnectionAsync();
         }
     }
 

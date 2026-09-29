@@ -423,6 +423,12 @@ The execution contract:
   declared in the entity's or its registered handlers' assemblies. A tampered payload
   naming anything else dead-letters instead of materialising an arbitrary type, and the
   persisted entity type resolves only against registered retained entities.
+- Snapshot values must round-trip exactly: `OnAfterAsync` receives an equal value of the
+  same type. Supported values are `null`, well-known scalars, enums and value-equal types
+  from the allow-list above, one-dimensional arrays and `List<T>` of those (element type
+  preserved), `object?[]`, `List<object?>`, and nested `IDictionary<string, object?>`.
+  Anything else fails the handler that stashed it at capture time, before the row is
+  mutated, through the same path as a throwing `OnBeforeAsync`.
 
 ## Configuration
 

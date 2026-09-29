@@ -48,19 +48,32 @@ internal static class RetentionHandlerSupport
             .ToArray();
     }
 
+    /// <summary>
+    /// Runs every handler's OnBefore and captures the snapshot after each one, so a value
+    /// that cannot round-trip to OnAfter fails the handler that left it, before the row
+    /// is mutated.
+    /// </summary>
     public static async Task<OnBeforeInvocationResult> InvokeOnBeforeAsync(
         IReadOnlyList<ResolvedRetentionHandler> handlers,
+        Type entityType,
         object row,
         RetentionBeforeContext ctx,
         CancellationToken ct
     )
     {
+        var handlerAssemblies = handlers.Select(handler => handler.HandlerType.Assembly).ToArray();
+        string? capturedPayload = null;
         foreach (var handler in handlers)
         {
             try
             {
                 var invocation = handler.OnBeforeMethod.Invoke(handler.Instance, [row, ctx, ct]);
                 await (Task)invocation!;
+                capturedPayload = RetentionSnapshotSerializer.Capture(
+                    ctx.Snapshot,
+                    entityType,
+                    handlerAssemblies
+                );
             }
             catch (System.Reflection.TargetInvocationException ex)
                 when (ex.InnerException is OperationCanceledException cancellation)
@@ -82,11 +95,14 @@ internal static class RetentionHandlerSupport
             }
         }
 
-        return OnBeforeInvocationResult.Success;
+        return OnBeforeInvocationResult.Captured(
+            capturedPayload
+                ?? RetentionSnapshotSerializer.Capture(ctx.Snapshot, entityType, handlerAssemblies)
+        );
     }
 
     /// <summary>
-    /// Records a mutated row with its captured snapshot and queues one pending status per
+    /// Records a mutated row with its captured snapshot payload and queues one pending status per
     /// handler, in the mutation's transaction.
     /// </summary>
     public static async Task PersistCapturedRowAsync(
@@ -97,7 +113,7 @@ internal static class RetentionHandlerSupport
         Strategy strategy,
         Guid tenantId,
         string recordId,
-        IReadOnlyDictionary<string, object?> snapshot,
+        string capturedPayload,
         IReadOnlyList<ResolvedRetentionHandler> handlers,
         CancellationToken ct
     )
@@ -110,7 +126,7 @@ internal static class RetentionHandlerSupport
             strategy,
             tenantId,
             recordId,
-            RetentionSnapshotSerializer.Serialize(snapshot),
+            capturedPayload,
             ct
         );
         foreach (var handler in handlers)
@@ -276,10 +292,12 @@ internal sealed class ResolvedRetentionHandler(
 
 internal sealed record OnBeforeInvocationResult(
     ResolvedRetentionHandler? FailedHandler,
-    Exception? Failure
+    Exception? Failure,
+    string? CapturedPayload = null
 )
 {
-    public static OnBeforeInvocationResult Success { get; } = new(null, null);
+    public static OnBeforeInvocationResult Captured(string capturedPayload) =>
+        new(null, null, capturedPayload);
 
     public bool Succeeded => FailedHandler is null;
 }

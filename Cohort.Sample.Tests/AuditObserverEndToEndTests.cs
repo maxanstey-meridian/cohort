@@ -205,6 +205,48 @@ public sealed class AuditObserverEndToEndTests(PostgresFixture fixture)
         reader.GetInt64(1).Should().Be(1);
     }
 
+    [Fact]
+    public async Task Observer_That_Blocks_Synchronously_Is_Bounded_By_Timeout_And_Quarantined()
+    {
+        var tenantId = Guid.NewGuid();
+        var now = new DateTimeOffset(2026, 7, 12, 12, 0, 0, TimeSpan.Zero);
+        var observer = new SynchronouslyBlockingObserver(TimeSpan.FromSeconds(3));
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = now.AddDays(-60),
+                    Body = "synchronous-observer",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:AuditObservers:Timeout"] = "00:00:00.100",
+            },
+            configureServices: services => services.AddSingleton<IRetentionAuditObserver>(observer)
+        );
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var result = await host.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            now
+        );
+        stopwatch.Stop();
+
+        result.EntityFailures.Should().BeEmpty();
+        stopwatch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(2));
+        observer.Calls.Should().Be(1);
+    }
+
     private sealed class CommitVisibilityObserver(string connectionString, Guid recordId)
         : IRetentionAuditObserver
     {
@@ -246,6 +288,23 @@ public sealed class AuditObserverEndToEndTests(PostgresFixture fixture)
         public Task OnCommittedAsync(SweepEvent evt, CancellationToken ct)
         {
             events.Enqueue(evt);
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class SynchronouslyBlockingObserver(TimeSpan block) : IRetentionAuditObserver
+    {
+        private int calls;
+
+        public int Calls => Volatile.Read(ref calls);
+
+        public Task OnCommittedAsync(SweepEvent evt, CancellationToken ct)
+        {
+            if (Interlocked.Increment(ref calls) == 1)
+            {
+                Thread.Sleep(block);
+            }
+
             return Task.CompletedTask;
         }
     }

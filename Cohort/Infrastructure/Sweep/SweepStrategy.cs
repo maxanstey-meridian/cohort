@@ -167,17 +167,23 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
                 );
             var recordKey = recordIdConverter?.ConvertToProvider(recordIdValue) ?? recordIdValue;
 
-            RetentionBeforeContext? before = null;
+            string? capturedPayload = null;
             if (handlers.Count > 0)
             {
-                before = new RetentionBeforeContext(
+                var before = new RetentionBeforeContext(
                     execution!.SweepId,
                     entry.Category,
                     scope.Rule.Strategy,
                     scope.Tenant.Id,
                     execution.At
                 );
-                var result = await RetentionHandlerSupport.InvokeOnBeforeAsync(handlers, row, before, ct);
+                var result = await RetentionHandlerSupport.InvokeOnBeforeAsync(
+                    handlers,
+                    entry.EntityType,
+                    row,
+                    before,
+                    ct
+                );
                 if (!result.Succeeded)
                 {
                     var skippedId = await RecordIdSql.CanonicalizeAsync(
@@ -203,6 +209,8 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
                     );
                     continue;
                 }
+
+                capturedPayload = result.CapturedPayload;
             }
 
             var update = new SqlParams { ["recordKey"] = recordKey };
@@ -225,7 +233,7 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
                 continue;
             }
 
-            if (before is not null)
+            if (capturedPayload is not null)
             {
                 await RetentionHandlerSupport.PersistCapturedRowAsync(
                     conn,
@@ -235,7 +243,7 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
                     scope.Rule.Strategy,
                     scope.Tenant.Id,
                     recordId,
-                    new Dictionary<string, object?>(before.Snapshot, StringComparer.Ordinal),
+                    capturedPayload,
                     handlers,
                     ct
                 );

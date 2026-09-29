@@ -99,7 +99,7 @@ internal sealed class RetentionWorker(
             return;
         }
 
-        await RunIterationAsync(executionOptions.DryRun, stoppingToken);
+        await RunIterationAsync(nextOccurrence.Value, executionOptions.DryRun, stoppingToken);
     }
 
     private async Task<bool> TrySleepUntilAsync(
@@ -146,7 +146,11 @@ internal sealed class RetentionWorker(
         return false;
     }
 
-    private async Task RunIterationAsync(bool dryRun, CancellationToken ct)
+    internal async Task RunIterationAsync(
+        DateTimeOffset occurrence,
+        bool dryRun,
+        CancellationToken ct
+    )
     {
         await using var scope = scopeFactory.CreateAsyncScope();
         var services = scope.ServiceProvider;
@@ -175,6 +179,17 @@ internal sealed class RetentionWorker(
                 return;
             }
 
+            // The lock only serialises replicas; one that fires for this occurrence after
+            // another finished and released it must not sweep the occurrence again.
+            if (await OccurrenceAlreadySweptAsync(db, occurrence, ct))
+            {
+                logger.LogInformation(
+                    "Cohort worker skipped occurrence {Occurrence}: another instance already swept it.",
+                    occurrence
+                );
+                return;
+            }
+
             await RunLockedIterationAsync(services, dryRun, ct);
         }
         catch (Exception ex)
@@ -198,6 +213,30 @@ internal sealed class RetentionWorker(
                 logger
             );
         }
+    }
+
+    private static async Task<bool> OccurrenceAlreadySweptAsync(
+        DbContext db,
+        DateTimeOffset occurrence,
+        CancellationToken ct
+    )
+    {
+        var sweepRun = PostgreSqlIdentifier.Format(CohortStoreTables.FromModel(db.Model).SweepRun);
+        await using var command = new SqlParams
+        {
+            ["scheduled"] = (int)SweepTriggerKind.Scheduled,
+            ["occurrence"] = occurrence,
+        }.CreateCommand(
+            db.Database.GetDbConnection(),
+            null,
+            $"""
+            SELECT EXISTS (
+                SELECT 1 FROM {sweepRun}
+                WHERE "TriggerKind" = @scheduled AND "StartedAt" >= @occurrence
+            )
+            """
+        );
+        return (bool)(await command.ExecuteScalarAsync(ct))!;
     }
 
     private async Task RunLockedIterationAsync(

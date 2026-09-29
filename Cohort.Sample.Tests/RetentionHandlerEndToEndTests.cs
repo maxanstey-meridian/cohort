@@ -1551,6 +1551,115 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         AssertInvalidOperationDiagnostic(statuses[0].LastError);
     }
 
+    [Fact]
+    public async Task FlushAsync_Delivers_Typed_Array_And_List_Snapshot_Values_With_Their_Element_Types()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var recorder = new CollectionSnapshotRecorder();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "typed-collections",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
+            {
+                services.AddSingleton(recorder);
+                services.AddRowHandler<Note, CollectionSnapshotNoteHandler>();
+            }
+        );
+
+        await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            await serviceProvider.GetRequiredService<IRetentionRowDispatcher>().FlushAsync();
+        });
+
+        var snapshot = recorder.Snapshot.Should().NotBeNull().And.Subject!;
+        snapshot["paths"].Should().BeOfType<string[]>().Which.Should().Equal("a/1", "b/2");
+        snapshot["tags"].Should().BeOfType<List<string>>().Which.Should().Equal("x", "y");
+        snapshot["sizes"].Should().BeOfType<int[]>().Which.Should().Equal(1, 2, 3);
+    }
+
+    [Fact]
+    public async Task Sweep_Refuses_Snapshot_Values_That_Cannot_Round_Trip_Before_Mutating_The_Row()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var recorder = new CollectionSnapshotRecorder();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "unsupported-snapshot",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
+            {
+                services.AddSingleton(recorder);
+                services.AddRowHandler<Note, UnsupportedSnapshotNoteHandler>();
+            }
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            await serviceProvider.GetRequiredService<IRetentionRowDispatcher>().FlushAsync();
+        });
+
+        result.EntityFailures.Should().BeEmpty();
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(Note),
+                    "short-lived",
+                    tenantId,
+                    Strategy.Purge,
+                    0,
+                    SkippedCount: 1
+                )
+            );
+        recorder.Snapshot.Should().BeNull();
+
+        await using (var verify = Host.CreateDbContext())
+        {
+            (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
+        }
+
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().ContainSingle().Which.State.Should().Be(DeadLetteredState);
+    }
+
     private static DateTimeOffset EligibleErasureCreatedAt(DateTimeOffset asOf)
     {
         return asOf.AddDays(-45);
@@ -2159,6 +2268,50 @@ file sealed record TypedSnapshotAfterCall(
     DateTimeOffset At,
     TypedSnapshotPayload Payload
 );
+
+file sealed class CollectionSnapshotRecorder
+{
+    public IDictionary<string, object?>? Snapshot { get; set; }
+}
+
+file sealed class CollectionSnapshotNoteHandler(CollectionSnapshotRecorder recorder)
+    : IRetentionHandler<Note>
+{
+    public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        ctx.Snapshot["paths"] = new[] { "a/1", "b/2" };
+        ctx.Snapshot["tags"] = new List<string> { "x", "y" };
+        ctx.Snapshot["sizes"] = new[] { 1, 2, 3 };
+        return Task.CompletedTask;
+    }
+
+    public Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
+    {
+        recorder.Snapshot = new Dictionary<string, object?>(ctx.Snapshot);
+        return Task.CompletedTask;
+    }
+}
+
+file sealed class UnsupportedSnapshotValue
+{
+    public string Body { get; set; } = "";
+}
+
+file sealed class UnsupportedSnapshotNoteHandler(CollectionSnapshotRecorder recorder)
+    : IRetentionHandler<Note>
+{
+    public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        ctx.Snapshot["value"] = new UnsupportedSnapshotValue { Body = row.Body };
+        return Task.CompletedTask;
+    }
+
+    public Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
+    {
+        recorder.Snapshot = new Dictionary<string, object?>(ctx.Snapshot);
+        return Task.CompletedTask;
+    }
+}
 
 file sealed class ScopedDispatchProbe
 {

@@ -468,25 +468,16 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
         actualIndexes.Should().Equal(expectedIndexes);
 
         var expectedChecks = CohortSchemaContract.Tables.SelectMany(table =>
-                table.RequiredChecks.Select(check =>
-                    $"{table.Role}|{check.Name}|{CohortSchemaValidator.NormalizeSql(check.NormalizedSql)}"
-                )
+                table.RequiredChecks.Select(check => $"{table.Role}|{check.Name}")
             ).Order(StringComparer.Ordinal).ToArray();
-        var actualChecks = (await ReadCatalogSignaturesAsync(connection, """
-            SELECT relation.relname || '|' || con.conname || '|' ||
-                   pg_catalog.pg_get_expr(con.conbin, con.conrelid)
+        var actualChecks = await ReadCatalogSignaturesAsync(connection, """
+            SELECT relation.relname || '|' || con.conname
             FROM pg_catalog.pg_constraint con
             JOIN pg_catalog.pg_class relation ON relation.oid = con.conrelid
             JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
             WHERE namespace.nspname = @schema AND con.contype = 'c' AND con.convalidated
             ORDER BY 1
-            """))
-            .Select(value =>
-            {
-                var parts = value.Split('|', 3);
-                return $"{parts[0]}|{parts[1]}|{CohortSchemaValidator.NormalizeSql(parts[2])}";
-            })
-            .ToArray();
+            """);
         actualChecks.Should().Equal(expectedChecks);
 
         var expectedForeignKeys = CohortSchemaContract.Tables.SelectMany(table =>

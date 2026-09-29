@@ -1,7 +1,9 @@
+using System.Collections.Concurrent;
 using Cohort.Application;
 using Cohort.Infrastructure;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Npgsql;
 
 namespace Cohort.Sample.Tests;
@@ -49,10 +51,10 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
         "primary key capability 'retention_holds(HoldId)' on table '\"public\".\"retention_holds\"'"
     )]
     [InlineData(
-        "DROP INDEX \"IX_retention_holds_RetentionEntityId_RecordId\"",
-        "index capability 'retention_holds(RetentionEntityId, RecordId)' on table '\"public\".\"retention_holds\"'"
+        "DROP INDEX \"IX_sweep_run_row_detail_StableIdentity\"",
+        "index capability 'sweep_run_row_detail(SweepId, RetentionEntityId, RecordId, Category, Strategy, TenantId)' on table '\"public\".\"sweep_run_row_detail\"'"
     )]
-    public async Task Validation_Rejects_Missing_Key_And_Index_Capabilities(
+    public async Task Validation_Rejects_Missing_Key_And_Unique_Index_Capabilities(
         string mutation,
         string expectedCapability
     )
@@ -68,16 +70,39 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
         exception.Which.Errors.Should().ContainSingle(error => error.Contains(expectedCapability));
     }
 
+    [Fact]
+    public async Task Validation_Warns_But_Passes_When_A_Recommended_Index_Is_Missing()
+    {
+        await ExecuteAsync("DROP INDEX \"IX_retention_holds_RetentionEntityId_RecordId\"");
+        var logs = new RecordingLogProvider();
+        using var host = new CohortTestHost(
+            connectionString,
+            configureServices: services => services.AddSingleton<ILoggerProvider>(logs)
+        );
+
+        var act = () => host.RunWithServicesAsync(serviceProvider =>
+            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+        );
+
+        await act.Should().NotThrowAsync();
+        logs.Entries.Should().ContainSingle(entry =>
+            entry.Level == LogLevel.Warning
+            && entry.Message.Contains(
+                "index 'retention_holds(RetentionEntityId, RecordId)' on table '\"public\".\"retention_holds\"'"
+            )
+        );
+    }
+
     [Theory]
     [InlineData(
-        "ALTER TABLE \"sweep_run\" DROP CONSTRAINT \"CK_sweep_run_Status_Range\"; ALTER TABLE \"sweep_run\" ADD CONSTRAINT \"CK_sweep_run_Status_Range\" CHECK (\"Status\" BETWEEN 0 AND 5)",
+        "ALTER TABLE \"sweep_run\" DROP CONSTRAINT \"CK_sweep_run_Status_Range\"; ALTER TABLE \"sweep_run\" ADD CONSTRAINT \"CK_sweep_run_Status_Range\" CHECK (\"Status\" BETWEEN 0 AND 4) NOT VALID",
         "sweep_run.CK_sweep_run_Status_Range"
     )]
     [InlineData(
-        "ALTER TABLE \"sweep_row_handler_status\" DROP CONSTRAINT \"CK_sweep_row_handler_status_Completion\"; ALTER TABLE \"sweep_row_handler_status\" ADD CONSTRAINT \"CK_sweep_row_handler_status_Completion\" CHECK (\"CompletedAt\" IS NULL)",
+        "ALTER TABLE \"sweep_row_handler_status\" DROP CONSTRAINT \"CK_sweep_row_handler_status_Completion\"",
         "sweep_row_handler_status.CK_sweep_row_handler_status_Completion"
     )]
-    public async Task Validation_Rejects_Adopted_Schemas_With_Malformed_Checks(
+    public async Task Validation_Rejects_Missing_Or_Unvalidated_Checks(
         string mutation,
         string expectedCapability
     )
@@ -148,6 +173,52 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
             .ContainSingle(error => error.Contains("sweep_row_handler_status(SweepRunRowDetailId) -> sweep_run_row_detail(Id) ON DELETE CASCADE"));
     }
 
+    [Fact]
+    public async Task Validation_Rejects_A_Deferrable_Summary_Key_Because_On_Conflict_Cannot_Use_It()
+    {
+        await ExecuteAsync("""
+            ALTER TABLE "sweep_run_entity_summary" DROP CONSTRAINT "PK_sweep_run_entity_summary";
+            ALTER TABLE "sweep_run_entity_summary" ADD CONSTRAINT "PK_sweep_run_entity_summary"
+                PRIMARY KEY ("SweepId", "RetentionEntityId", "Category", "TenantId", "Strategy")
+                DEFERRABLE INITIALLY IMMEDIATE
+            """);
+        using var host = new CohortTestHost(connectionString);
+
+        var act = () => host.RunWithServicesAsync(serviceProvider =>
+            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+        );
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception
+            .Which.Errors.Should()
+            .ContainSingle(error => error.Contains(
+                "primary key capability 'sweep_run_entity_summary(SweepId, RetentionEntityId, Category, TenantId, Strategy)'"
+            ));
+    }
+
+    [Fact]
+    public async Task Validation_Accepts_A_Migrated_Schema_Under_A_NonDefault_IntervalStyle()
+    {
+        // pg_get_expr deparses the Duration check's INTERVAL '0' literal through the session
+        // IntervalStyle: '00:00:00'::interval under the default, 'PT0S'::interval under iso_8601.
+        await ExecuteAsync($"ALTER DATABASE \"{databaseName}\" SET intervalstyle = 'iso_8601'");
+        // Database-level settings only apply to new backends, so drop pooled sessions.
+        NpgsqlConnection.ClearAllPools();
+        var deparsed = (string)(await ExecuteScalarAsync("""
+            SELECT pg_get_expr(conbin, conrelid)
+            FROM pg_constraint
+            WHERE conname = 'CK_sweep_run_Duration_Nonnegative'
+            """))!;
+        deparsed.Should().Contain("PT0S");
+        using var host = new CohortTestHost(connectionString);
+
+        var act = () => host.RunWithServicesAsync(serviceProvider =>
+            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+        );
+
+        await act.Should().NotThrowAsync();
+    }
+
     private async Task ExecuteAsync(string sql)
     {
         await using var connection = new NpgsqlConnection(connectionString);
@@ -165,6 +236,38 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
         command.CommandText = sql;
         return await command.ExecuteScalarAsync();
     }
+
+    private sealed class RecordingLogProvider : ILoggerProvider
+    {
+        private readonly ConcurrentQueue<LogEntry> entries = new();
+
+        public IReadOnlyList<LogEntry> Entries => entries.ToArray();
+
+        public ILogger CreateLogger(string categoryName) => new RecordingLogger(entries);
+
+        public void Dispose() { }
+
+        private sealed class RecordingLogger(ConcurrentQueue<LogEntry> entries) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state)
+                where TState : notnull => null;
+
+            public bool IsEnabled(LogLevel logLevel) => true;
+
+            public void Log<TState>(
+                LogLevel logLevel,
+                EventId eventId,
+                TState state,
+                Exception? exception,
+                Func<TState, Exception?, string> formatter
+            )
+            {
+                entries.Enqueue(new LogEntry(logLevel, formatter(state, exception)));
+            }
+        }
+    }
+
+    private sealed record LogEntry(LogLevel Level, string Message);
 
     private static string CreateAdminConnectionString(string originalConnectionString)
     {

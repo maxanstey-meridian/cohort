@@ -7,11 +7,13 @@ using Cohort.Infrastructure.Migrations;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace Cohort.Infrastructure;
 
 internal sealed class CohortSchemaValidator(
-    [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db
+    [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
+    ILogger<CohortSchemaValidator> logger
 )
 {
     public async Task ValidateAsync(CancellationToken ct)
@@ -42,6 +44,7 @@ internal sealed class CohortSchemaValidator(
                 await ownedTransaction.CommitAsync(ct);
             }
             var missing = new List<string>();
+            var missingRecommended = new List<string>();
 
             foreach (var table in CohortSchemaContract.Tables)
             {
@@ -75,33 +78,49 @@ internal sealed class CohortSchemaValidator(
                 if (!indexes.Any(index => index.TableId == tableId
                     && index.Unique
                     && index.Primary
+                    && index.Immediate
                     && index.Columns.SequenceEqual(table.PrimaryKey)))
                 {
                     missing.Add(
-                        $"primary key capability '{table.Role}({string.Join(", ", table.PrimaryKey)})' on table '{PostgreSqlIdentifier.Format(mappedTable)}'"
+                        $"primary key capability '{table.Role}({string.Join(", ", table.PrimaryKey)})' on table '{PostgreSqlIdentifier.Format(mappedTable)}' (NOT DEFERRABLE)"
                     );
                 }
 
                 foreach (var indexRequirement in table.RequiredIndexes)
                 {
-                    if (!indexes.Any(index => index.TableId == tableId
+                    if (indexes.Any(index => index.TableId == tableId
                         && index.Unique == indexRequirement.Unique
+                        && (!index.Unique || index.Immediate)
                         && !index.Primary
                         && index.Columns.SequenceEqual(indexRequirement.Columns)
                         && index.Predicate == NormalizePredicate(indexRequirement.Predicate)))
                     {
+                        continue;
+                    }
+
+                    // Only unique indexes carry semantics Cohort's SQL relies on; the rest are
+                    // tuning, so their absence degrades performance rather than correctness.
+                    if (indexRequirement.Unique)
+                    {
                         missing.Add(
-                            $"index capability '{table.Role}({string.Join(", ", indexRequirement.Columns)})' on table '{PostgreSqlIdentifier.Format(mappedTable)}'"
+                            $"index capability '{table.Role}({string.Join(", ", indexRequirement.Columns)})' on table '{PostgreSqlIdentifier.Format(mappedTable)}' (UNIQUE, NOT DEFERRABLE)"
+                        );
+                    }
+                    else
+                    {
+                        missingRecommended.Add(
+                            $"index '{table.Role}({string.Join(", ", indexRequirement.Columns)})' on table '{PostgreSqlIdentifier.Format(mappedTable)}'"
                         );
                     }
                 }
 
+                // Matched by name, not by deparsed text: pg_get_expr output depends on session
+                // settings such as IntervalStyle, so text comparison rejects correct schemas.
                 foreach (var checkRequirement in table.RequiredChecks)
                 {
                     if (!checkConstraints.Any(constraint => constraint.TableId == tableId
                         && constraint.Name == checkRequirement.Name
-                        && constraint.Validated
-                        && constraint.Expression == NormalizeSql(checkRequirement.NormalizedSql)))
+                        && constraint.Validated))
                     {
                         missing.Add(
                             $"check constraint capability '{table.Role}.{checkRequirement.Name}' on table '{PostgreSqlIdentifier.Format(mappedTable)}'"
@@ -136,6 +155,14 @@ internal sealed class CohortSchemaValidator(
                         );
                     }
                 }
+            }
+
+            if (missingRecommended.Count != 0)
+            {
+                logger.LogWarning(
+                    "The configured PostgreSQL schema is missing Cohort's recommended indexes: {MissingIndexes}. Retention runs remain correct but may be slow; apply the host application's pending EF Core migrations.",
+                    string.Join(", ", missingRecommended)
+                );
             }
 
             if (missing.Count != 0)
@@ -257,7 +284,7 @@ internal sealed class CohortSchemaValidator(
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
-            SELECT i.indrelid, i.indisunique, i.indisprimary,
+            SELECT i.indrelid, i.indisunique, i.indisprimary, i.indimmediate,
                    ARRAY(SELECT a.attname
                           FROM pg_catalog.unnest(i.indkey) WITH ORDINALITY AS key(attnum, position)
                            JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = key.attnum
@@ -281,8 +308,9 @@ internal sealed class CohortSchemaValidator(
                 reader.GetFieldValue<uint>(0),
                 reader.GetBoolean(1),
                 reader.GetBoolean(2),
-                reader.GetFieldValue<string[]>(3),
-                NormalizePredicate(reader.IsDBNull(4) ? null : reader.GetString(4))
+                reader.GetBoolean(3),
+                reader.GetFieldValue<string[]>(4),
+                NormalizePredicate(reader.IsDBNull(5) ? null : reader.GetString(5))
             ));
         }
 
@@ -299,7 +327,7 @@ internal sealed class CohortSchemaValidator(
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
-            SELECT conrelid, conname, convalidated, pg_catalog.pg_get_expr(conbin, conrelid)
+            SELECT conrelid, conname, convalidated
             FROM pg_catalog.pg_constraint
             WHERE contype = 'c'
               AND conrelid = ANY (ARRAY(
@@ -316,8 +344,7 @@ internal sealed class CohortSchemaValidator(
             result.Add(new CheckConstraintStructure(
                 reader.GetFieldValue<uint>(0),
                 reader.GetString(1),
-                reader.GetBoolean(2),
-                NormalizeSql(reader.GetString(3))
+                reader.GetBoolean(2)
             ));
         }
 
@@ -402,63 +429,6 @@ internal sealed class CohortSchemaValidator(
             : new string(predicate.Where(char.IsLetterOrDigit).ToArray()).ToUpperInvariant();
     }
 
-    internal static string NormalizeSql(string sql)
-    {
-        var compact = new string(sql
-            .Where(character => !char.IsWhiteSpace(character)
-                && character is not '"' and not '\'' and not ':')
-            .Select(char.ToUpperInvariant)
-            .ToArray());
-        return NormalizeParentheses(compact);
-    }
-
-    private static string NormalizeParentheses(string sql)
-    {
-        var result = new System.Text.StringBuilder(sql.Length);
-        for (var index = 0; index < sql.Length; index++)
-        {
-            if (sql[index] != '(')
-            {
-                result.Append(sql[index]);
-                continue;
-            }
-
-            var depth = 1;
-            var end = index + 1;
-            for (; end < sql.Length && depth != 0; end++)
-            {
-                depth += sql[end] switch
-                {
-                    '(' => 1,
-                    ')' => -1,
-                    _ => 0,
-                };
-            }
-
-            if (depth != 0)
-            {
-                return sql;
-            }
-
-            var inner = NormalizeParentheses(sql[(index + 1)..(end - 1)]);
-            var isWholeExpression = index == 0 && end == sql.Length;
-            var groupsBooleanExpression = inner.Contains("AND", StringComparison.Ordinal)
-                || inner.Contains("OR", StringComparison.Ordinal);
-            if (groupsBooleanExpression && !isWholeExpression)
-            {
-                result.Append('(').Append(inner).Append(')');
-            }
-            else
-            {
-                result.Append(inner);
-            }
-
-            index = end - 1;
-        }
-
-        return result.ToString();
-    }
-
     private static bool IsCompatibleType(string required, ColumnStructure actual)
     {
         return actual.Type == required
@@ -475,10 +445,11 @@ internal sealed class CohortSchemaValidator(
         uint TableId,
         bool Unique,
         bool Primary,
+        bool Immediate,
         string[] Columns,
         string? Predicate
     );
-    private sealed record CheckConstraintStructure(uint TableId, string Name, bool Validated, string Expression);
+    private sealed record CheckConstraintStructure(uint TableId, string Name, bool Validated);
     private sealed record ForeignKeyStructure(
         uint TableId,
         string[] Columns,

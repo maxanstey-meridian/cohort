@@ -576,6 +576,64 @@ public sealed class RetentionStartupValidatorTests
         exception.Which.Errors[0].Should().Contain("timestamp with time zone");
     }
 
+    [Theory]
+    [InlineData("timestamptz")]
+    [InlineData("timestamp(3) with time zone")]
+    [InlineData("TIMESTAMPTZ(6)")]
+    public async Task ValidateAsync_Accepts_Timestamptz_Aliases_For_Anchor_And_DeletedAt_Columns(
+        string storeType
+    )
+    {
+        // Service-provider caching is off so each row builds its own model for the same context type.
+        var options = new DbContextOptionsBuilder<TimestamptzAliasDbContext>()
+            .UseNpgsql("Host=localhost;Database=cohort-model-only")
+            .EnableServiceProviderCaching(false)
+            .Options;
+        await using var db = new TimestamptzAliasDbContext(options, storeType);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, ITestRetentionRule>
+            {
+                ["timestamptz-alias"] = new StaticTestRetentionRule(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                ),
+            }
+        );
+
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
+
+        await act.Should().NotThrowAsync();
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Rejects_Record_Ids_Whose_Text_Form_Depends_On_Session_Settings()
+    {
+        // Cohort persists record ids as CAST(key AS text); for these store types that text
+        // follows TimeZone/DateStyle/extra_float_digits, so holds and row details drift apart.
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, ITestRetentionRule> { ["session-key"] = ExemptResolver }
+        );
+        var timestampOptions = new DbContextOptionsBuilder<SessionDependentKeyDbContext<DateTimeOffset>>()
+            .UseNpgsqlMetadataModel($"startup-validator-timestamptz-record-id-{Guid.NewGuid()}")
+            .Options;
+        await using var timestampDb = new SessionDependentKeyDbContext<DateTimeOffset>(timestampOptions);
+        var floatOptions = new DbContextOptionsBuilder<SessionDependentKeyDbContext<double>>()
+            .UseNpgsqlMetadataModel($"startup-validator-float-record-id-{Guid.NewGuid()}")
+            .Options;
+        await using var floatDb = new SessionDependentKeyDbContext<double>(floatOptions);
+
+        var timestampAct = async () => await CreateValidator(timestampDb, repository).ValidateAsync();
+        var floatAct = async () => await CreateValidator(floatDb, repository).ValidateAsync();
+
+        var timestampException = await timestampAct.Should().ThrowAsync<RetentionConfigurationException>();
+        timestampException.Which.Errors.Should().ContainSingle().Which.Should().StartWith(
+            $"Record-id convention on {typeof(SessionDependentKeyRecord<DateTimeOffset>).FullName}: record-id property 'Id' is mapped to 'timestamp with time zone'"
+        );
+        var floatException = await floatAct.Should().ThrowAsync<RetentionConfigurationException>();
+        floatException.Which.Errors.Should().ContainSingle().Which.Should().StartWith(
+            $"Record-id convention on {typeof(SessionDependentKeyRecord<double>).FullName}: record-id property 'Id' is mapped to 'double precision'"
+        );
+    }
+
     private sealed class InMemoryCategoryRepository(
         IReadOnlyDictionary<string, ITestRetentionRule> resolvers
     ) : ITestRetentionRuleProvider
@@ -1100,6 +1158,61 @@ public sealed class RetentionStartupValidatorTests
                 entity
                     .Property(record => record.CreatedAt)
                     .HasColumnType("timestamp without time zone");
+            });
+        }
+    }
+
+    [Retain("timestamptz-alias", nameof(CreatedAt))]
+    [RetentionEntityId("6d0e4b8c-2f7a-4c55-9b1e-3a8f0c2d7e41")]
+    private sealed class TimestamptzAliasRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+        public bool IsDeleted { get; set; }
+        public DateTimeOffset? DeletedAt { get; set; }
+    }
+
+    private sealed class TimestamptzAliasDbContext(
+        DbContextOptions<TimestamptzAliasDbContext> options,
+        string storeType
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.ConfigureCohortTables();
+            modelBuilder.Entity<TimestamptzAliasRecord>(entity =>
+            {
+                entity.ToTable("timestamptz_alias_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.CreatedAt).HasColumnType(storeType);
+                entity.Property(record => record.DeletedAt).HasColumnType(storeType);
+            });
+        }
+    }
+
+    [Retain("session-key", nameof(CreatedAt))]
+    [RetentionEntityId("b3f19a6e-7c02-4d8b-a5e4-1f6c9d2b8a73")]
+    private sealed class SessionDependentKeyRecord<TKey>
+        where TKey : struct
+    {
+        public TKey Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    private sealed class SessionDependentKeyDbContext<TKey>(
+        DbContextOptions<SessionDependentKeyDbContext<TKey>> options
+    ) : DbContext(options)
+        where TKey : struct
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.ConfigureCohortTables();
+            modelBuilder.Entity<SessionDependentKeyRecord<TKey>>(entity =>
+            {
+                entity.ToTable("session_dependent_key_records");
+                entity.HasKey(record => record.Id);
             });
         }
     }

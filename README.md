@@ -38,7 +38,6 @@ Two cases:
 1. purge short-lived operational data after 30 days
 2. keep a business record, but anonymise personal fields after 365 days
 
-<!-- package-contract:compile -->
 ```csharp
 using Cohort.Application;
 using Cohort.Domain;
@@ -233,7 +232,6 @@ operation owns the transaction, so call it when the scoped context has no curren
 
 The package test compiles this invocation example verbatim against the packed artifact:
 
-<!-- package-contract:compile -->
 ```csharp
 public static class ReadmeRetentionOperations
 {
@@ -295,7 +293,6 @@ public string ExternalReference { get; set; } = "";
 
 Mark one or more subject identifiers with `[ErasureSubject]`:
 
-<!-- package-contract:compile -->
 ```csharp
 [Retain("user-data", nameof(CreatedAt))]
 [RetentionEntityId("6b619c19-6e3c-44e8-a87f-975c68fd3988")]
@@ -568,7 +565,6 @@ Sweeps and erasure are batched and incremental:
 
 ## Legal holds
 
-<!-- package-contract:compile -->
 ```csharp
 public static class ReadmeLegalHolds
 {

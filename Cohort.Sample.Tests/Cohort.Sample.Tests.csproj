@@ -19,10 +19,6 @@
         <ProjectReference Include="..\Cohort.Sample\Cohort.Sample.csproj" />
     </ItemGroup>
 
-    <ItemGroup>
-        <None Include="..\corpus\compliance-manifest.json" Link="compliance-manifest.json" CopyToOutputDirectory="PreserveNewest" />
-    </ItemGroup>
-
     <!--
     Deliberately absent: NSubstitute, Moq, FakeItEasy.
     The mock ban is structural, not policy. See CLAUDE.md.

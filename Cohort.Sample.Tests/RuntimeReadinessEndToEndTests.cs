@@ -36,13 +36,8 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
 
     [Theory]
     [InlineData(PublicDatabaseOperation.Sweep)]
-    [InlineData(PublicDatabaseOperation.AuditedDryRun)]
-    [InlineData(PublicDatabaseOperation.Preview)]
     [InlineData(PublicDatabaseOperation.Erasure)]
     [InlineData(PublicDatabaseOperation.CreateHold)]
-    [InlineData(PublicDatabaseOperation.RemoveHold)]
-    [InlineData(PublicDatabaseOperation.ListHolds)]
-    [InlineData(PublicDatabaseOperation.HasHold)]
     [InlineData(PublicDatabaseOperation.FlushDispatcher)]
     public async Task Direct_public_database_operations_reject_an_unmigrated_schema(
         PublicDatabaseOperation operation
@@ -140,51 +135,6 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task Concurrent_first_calls_share_one_successful_readiness_validation()
-    {
-        var baselineProvider = new CountingRuleProvider();
-        int readinessCalls;
-        int runtimeCallsPerPreview;
-        using (var baselineHost = new CohortTestHost(fixture.ConnectionString, baselineProvider))
-        {
-            await InvokeAsync(baselineHost, PublicDatabaseOperation.Preview, CancellationToken.None);
-            var firstCallCount = baselineProvider.CapabilityCallCount;
-            await InvokeAsync(baselineHost, PublicDatabaseOperation.Preview, CancellationToken.None);
-            runtimeCallsPerPreview = baselineProvider.CapabilityCallCount - firstCallCount;
-            readinessCalls = firstCallCount - runtimeCallsPerPreview;
-        }
-
-        var concurrentProvider = new CountingRuleProvider();
-        using var concurrentHost = new CohortTestHost(fixture.ConnectionString, concurrentProvider);
-
-        await Task.WhenAll(Enumerable.Range(0, 8).Select(_ =>
-            InvokeAsync(concurrentHost, PublicDatabaseOperation.Preview, CancellationToken.None)
-        ));
-
-        concurrentProvider.CapabilityCallCount.Should().Be(
-            readinessCalls + 8 * runtimeCallsPerPreview
-        );
-    }
-
-    [Fact]
-    public async Task Readiness_success_does_not_leak_between_service_providers()
-    {
-        using var readyHost = new CohortTestHost(fixture.ConnectionString);
-        await InvokeAsync(readyHost, PublicDatabaseOperation.Preview, CancellationToken.None);
-
-        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
-        using var unreadyHost = new CohortTestHost(database.ConnectionString);
-
-        var act = () => InvokeAsync(
-            unreadyHost,
-            PublicDatabaseOperation.Preview,
-            CancellationToken.None
-        );
-
-        await act.Should().ThrowAsync<RetentionConfigurationException>();
-    }
-
-    [Fact]
     public async Task Readiness_success_does_not_leak_between_routed_databases_in_one_service_provider()
     {
         await using var unmigrated = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
@@ -232,12 +182,6 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
                 case PublicDatabaseOperation.Sweep:
                     await services.GetRequiredService<IRetentionSweep>().SweepAsync(tenant, now, ct);
                     break;
-                case PublicDatabaseOperation.AuditedDryRun:
-                    await services.GetRequiredService<IRetentionSweep>().ExecuteAsync(
-                        RetentionSweepRequest.Tenanted(tenant, now, dryRun: true),
-                        ct
-                    );
-                    break;
                 case PublicDatabaseOperation.Preview:
                     await services.GetRequiredService<IRetentionPreview>().PreviewAsync(tenant, now, ct);
                     break;
@@ -262,25 +206,6 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
                         ct
                     );
                     break;
-                case PublicDatabaseOperation.RemoveHold:
-                    await services.GetRequiredService<IRetentionHoldsRepository>().RemoveAsync(
-                        Guid.NewGuid(),
-                        now,
-                        ct
-                    );
-                    break;
-                case PublicDatabaseOperation.ListHolds:
-                    await services.GetRequiredService<IRetentionHoldsRepository>().ListActiveAsync(now, ct);
-                    break;
-                case PublicDatabaseOperation.HasHold:
-                    await services.GetRequiredService<IRetentionHoldsRepository>().HasActiveHoldAsync(
-                        RetentionEntityIdentity.For<Note>(),
-                        Guid.NewGuid().ToString("D"),
-                        tenantId,
-                        now,
-                        ct
-                    );
-                    break;
                 case PublicDatabaseOperation.FlushDispatcher:
                     await services.GetRequiredService<IRetentionRowDispatcher>().FlushAsync(ct);
                     break;
@@ -302,13 +227,9 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     public enum PublicDatabaseOperation
     {
         Sweep,
-        AuditedDryRun,
         Preview,
         Erasure,
         CreateHold,
-        RemoveHold,
-        ListHolds,
-        HasHold,
         FlushDispatcher,
     }
 

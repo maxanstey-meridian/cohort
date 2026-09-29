@@ -5,7 +5,6 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
-using Npgsql;
 
 namespace Cohort.Sample.Tests;
 
@@ -19,23 +18,16 @@ public sealed class CohortTestHost(
     string connectionString,
     IRetentionRuleProvider? ruleProvider = null,
     IReadOnlyDictionary<string, string?>? configurationOverrides = null,
-    Action<IServiceCollection>? configureServices = null,
-    PostgreSqlCommandRecorder? commandRecorder = null
+    Action<IServiceCollection>? configureServices = null
 ) : IDisposable
 {
-    private readonly NpgsqlDataSource? _dataSource = commandRecorder?.CreateDataSource(connectionString);
     private readonly DbContextOptions<SampleDbContext> _options =
-        commandRecorder is null
-            ? new DbContextOptionsBuilder<SampleDbContext>().UseNpgsql(connectionString).Options
-            : new DbContextOptionsBuilder<SampleDbContext>()
-                .UseNpgsql(commandRecorder.DataSource!)
-                .Options;
+        new DbContextOptionsBuilder<SampleDbContext>().UseNpgsql(connectionString).Options;
     private readonly ServiceProvider _services = BuildServices(
         connectionString,
         ruleProvider,
         configurationOverrides,
-        configureServices,
-        commandRecorder
+        configureServices
     );
 
     public SampleDbContext CreateDbContext() => new(_options);
@@ -100,15 +92,13 @@ public sealed class CohortTestHost(
     public void Dispose()
     {
         _services.Dispose();
-        _dataSource?.Dispose();
     }
 
     private static ServiceProvider BuildServices(
         string connectionString,
         IRetentionRuleProvider? ruleProvider,
         IReadOnlyDictionary<string, string?>? configurationOverrides,
-        Action<IServiceCollection>? configureServices,
-        PostgreSqlCommandRecorder? commandRecorder
+        Action<IServiceCollection>? configureServices
     )
     {
         var services = new ServiceCollection();
@@ -133,12 +123,6 @@ public sealed class CohortTestHost(
         services.AddSingleton<IConfiguration>(configuration);
         services.AddLogging();
         services.AddSampleRetentionServices();
-        if (commandRecorder is not null)
-        {
-            services.AddDbContext<SampleDbContext>(options =>
-                options.UseNpgsql(commandRecorder.DataSource!)
-            );
-        }
         services.RemoveAll<IRetentionRuleProvider>();
         services.AddSingleton<IRetentionRuleProvider>(
             ruleProvider ?? new SampleRetentionRuleProvider()

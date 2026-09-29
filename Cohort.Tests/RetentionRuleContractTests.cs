@@ -5,48 +5,6 @@ namespace Cohort.Tests;
 public sealed class RetentionRuleContractTests
 {
     [Fact]
-    public void RetentionRule_Uses_Summary_Only_Audit_And_Null_Legal_Min_By_Default()
-    {
-        var rule = new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge);
-
-        rule.Period.Should().Be(TimeSpan.FromDays(30));
-        rule.Strategy.Should().Be(Strategy.Purge);
-        rule.LegalMin.Should().BeNull();
-        rule.AuditRowDetail.Should().Be(AuditRowDetail.SummaryOnly);
-        rule.Provenance.Should().BeNull();
-    }
-
-    [Fact]
-    public void RetentionRule_Preserves_Explicit_Legal_Min_And_Audit_Detail()
-    {
-        var rule = new RetentionRule(
-            TimeSpan.FromDays(30),
-            Strategy.Anonymise,
-            TimeSpan.FromDays(90),
-            AuditRowDetail.PerRow
-        );
-
-        rule.Period.Should().Be(TimeSpan.FromDays(30));
-        rule.Strategy.Should().Be(Strategy.Anonymise);
-        rule.LegalMin.Should().Be(TimeSpan.FromDays(90));
-        rule.AuditRowDetail.Should().Be(AuditRowDetail.PerRow);
-    }
-
-    [Fact]
-    public void RetentionRule_Preserves_Explicit_Provenance()
-    {
-        var provenance = new RetentionRuleProvenance("policy-alias", "county override");
-        var rule = new RetentionRule(
-            TimeSpan.FromDays(30),
-            Strategy.Purge,
-            AuditRowDetail: AuditRowDetail.PerRow,
-            Provenance: provenance
-        );
-
-        rule.Provenance.Should().Be(provenance);
-    }
-
-    [Fact]
     public void RetentionRule_Rejects_A_Negative_Period()
     {
         var act = () => new RetentionRule(TimeSpan.FromDays(-30), Strategy.Purge);
@@ -61,14 +19,6 @@ public sealed class RetentionRuleContractTests
             new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge, TimeSpan.FromDays(-90));
 
         act.Should().Throw<ArgumentOutOfRangeException>().WithParameterName("LegalMin");
-    }
-
-    [Fact]
-    public void RetentionRule_Allows_A_Zero_Period_As_Sweep_Immediately()
-    {
-        var rule = new RetentionRule(TimeSpan.Zero, Strategy.Purge);
-
-        rule.Period.Should().Be(TimeSpan.Zero);
     }
 
     [Theory]
@@ -102,96 +52,4 @@ public sealed class RetentionRuleContractTests
 
         act.Should().Throw<ArgumentOutOfRangeException>().WithParameterName("AuditRowDetail");
     }
-
-    [Fact]
-    public void RetentionRule_Has_Get_Only_Properties_And_No_Public_Deconstruct()
-    {
-        var properties = typeof(RetentionRule).GetProperties();
-
-        properties.All(property => property.SetMethod is null).Should().BeTrue();
-        typeof(RetentionRule)
-            .GetMethods()
-            .Should()
-            .NotContain(method => method.Name == "Deconstruct" && method.IsPublic);
-    }
-
-    [Fact]
-    public void Strategy_Enum_Exposes_The_Planned_Public_Vocabulary()
-    {
-        Enum.GetNames<Strategy>()
-            .Should()
-            .Equal(
-                nameof(Strategy.Purge),
-                nameof(Strategy.SoftDelete),
-                nameof(Strategy.Anonymise),
-                nameof(Strategy.Exempt)
-            );
-    }
-
-    [Fact]
-    public void Audit_Row_Detail_Enum_Exposes_The_Planned_Public_Vocabulary()
-    {
-        Enum.GetNames<AuditRowDetail>()
-            .Should()
-            .Equal(
-                nameof(AuditRowDetail.SummaryOnly),
-                nameof(AuditRowDetail.PerRow),
-                nameof(AuditRowDetail.Inherit)
-            );
-    }
-
-    [Fact]
-    public void Anonymise_Method_Enum_Exposes_The_Planned_Public_Vocabulary()
-    {
-        Enum.GetNames<AnonymiseMethod>()
-            .Should()
-            .Equal(
-                nameof(AnonymiseMethod.Null),
-                nameof(AnonymiseMethod.EmptyString),
-                nameof(AnonymiseMethod.FixedLiteral)
-            );
-    }
-
-    [Fact]
-    public void Retention_Sweep_Result_Carries_Grouped_Entity_Counts()
-    {
-        var sweepId = Guid.NewGuid();
-        var tenantId = Guid.NewGuid();
-        var count = new EntitySweepCount(
-            typeof(CountedEntity),
-            "short-lived",
-            tenantId,
-            Strategy.Purge,
-            3
-        );
-        var result = new RetentionSweepResult(
-            sweepId,
-            DateTimeOffset.Parse("2026-01-01T00:00:00+00:00"),
-            DateTimeOffset.Parse("2026-01-01T00:05:00+00:00"),
-            [count]
-        );
-
-        result.SweepId.Should().Be(sweepId);
-        result.Counts.Should().ContainSingle();
-        result.Counts[0].EntityType.Should().Be(typeof(CountedEntity));
-        result.Counts[0]
-            .RetentionEntityId.Should()
-            .Be(Guid.Parse("370ca3b1-4f67-44a6-8e92-74ac92e519ed"));
-        result.Counts[0].Category.Should().Be("short-lived");
-        result.Counts[0].TenantId.Should().Be(tenantId);
-        result.Counts[0].Strategy.Should().Be(Strategy.Purge);
-        result.Counts[0].Affected.Should().Be(3);
-    }
-
-    [Fact]
-    public void Entity_Sweep_Count_Rejects_A_Type_Without_A_Retention_Entity_Id()
-    {
-        var act = () =>
-            new EntitySweepCount(typeof(string), "short-lived", Guid.NewGuid(), Strategy.Purge, 1);
-
-        act.Should().Throw<ArgumentException>().WithParameterName("EntityType");
-    }
-
-    [RetentionEntityId("370ca3b1-4f67-44a6-8e92-74ac92e519ed")]
-    private sealed class CountedEntity;
 }

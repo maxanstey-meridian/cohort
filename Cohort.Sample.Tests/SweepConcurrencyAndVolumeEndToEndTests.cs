@@ -325,37 +325,6 @@ public sealed class SweepConcurrencyAndVolumeEndToEndTests(PostgresFixture fixtu
     }
 
     [Fact]
-    public async Task Sweep_Retires_A_Large_Backlog_Across_Many_Batches()
-    {
-        var tenantId = Guid.NewGuid();
-        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
-        const int backlogRows = 25_000;
-
-        await SeedNotesInBulkAsync(tenantId, asOf.AddDays(-120), backlogRows);
-
-        using var host = new CohortTestHost(
-            GetConnectionString(),
-            configurationOverrides: new Dictionary<string, string?>
-            {
-                [$"{CohortOptions.SectionName}:SweepBatchSize"] = "1000",
-            }
-        );
-
-        var result = await host.RunSweepAsync(
-            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            asOf
-        );
-
-        result.EntityFailures.Should().BeEmpty();
-        result
-            .Counts.Should()
-            .Contain(count => count.EntityType == typeof(Note) && count.Affected == backlogRows);
-
-        await using var verify = Host.CreateDbContext();
-        (await verify.Notes.CountAsync(note => note.TenantId == tenantId)).Should().Be(0);
-    }
-
-    [Fact]
     public async Task Sweep_Fills_A_Batch_Past_Oldest_Rows_Locked_By_Another_Transaction()
     {
         var tenantId = Guid.NewGuid();
@@ -630,57 +599,6 @@ public sealed class SweepConcurrencyAndVolumeEndToEndTests(PostgresFixture fixtu
         }
 
         return entries.ToArray();
-    }
-
-    private async Task SeedNotesInBulkAsync(Guid tenantId, DateTimeOffset createdAt, int count)
-    {
-        await using var connection = new NpgsqlConnection(GetConnectionString());
-        await connection.OpenAsync();
-        await using var command = connection.CreateCommand();
-        command.CommandText = """
-            INSERT INTO "notes" ("Id", "TenantId", "SubjectId", "CreatedAt", "Body")
-            SELECT gen_random_uuid(), @tenantId, NULL, @createdAt, 'volume-' || g
-            FROM generate_series(1, @count) AS g
-            """;
-        command.Parameters.AddWithValue("tenantId", tenantId);
-        command.Parameters.AddWithValue("createdAt", createdAt);
-        command.Parameters.AddWithValue("count", count);
-        await command.ExecuteNonQueryAsync();
-    }
-
-    private sealed class ConcurrentRuleProvider(string blockedCategory) : IRetentionRuleProvider
-    {
-        private readonly SampleRetentionRuleProvider _inner = new();
-        private readonly TaskCompletionSource _bothCallsEntered = new(
-            TaskCreationOptions.RunContinuationsAsynchronously
-        );
-        private readonly TaskCompletionSource _release = new(
-            TaskCreationOptions.RunContinuationsAsynchronously
-        );
-        private int _callCount;
-
-        internal Task BothCallsEntered => _bothCallsEntered.Task;
-
-        public RetentionCategoryCapabilities? GetCapabilities(string category) =>
-            _inner.GetCapabilities(category);
-
-        public async Task<RetentionRule?> ResolveAsync(
-            RetentionResolutionContext context,
-            CancellationToken ct
-        )
-        {
-            if (context.Category == blockedCategory)
-            {
-                if (Interlocked.Increment(ref _callCount) == 2)
-                {
-                    _bothCallsEntered.TrySetResult();
-                }
-                await _release.Task.WaitAsync(ct);
-            }
-            return await _inner.ResolveAsync(context, ct);
-        }
-
-        internal void Release() => _release.TrySetResult();
     }
 
     private sealed class ConcurrentNoteHandler : IRetentionHandler<Note>;

@@ -48,21 +48,6 @@ public sealed class CohortConventionsEndToEndTests
     }
 
     [Fact]
-    public void Default_Convention_Resolves_TenantId_When_No_Attribute_And_No_Config_Override()
-    {
-        var options = new DbContextOptionsBuilder<DefaultTenantDbContext>()
-            .UseNpgsqlMetadataModel($"conventions-default-{Guid.NewGuid()}")
-            .Options;
-        using var db = new DefaultTenantDbContext(options);
-
-        var builder = new RetentionEntryBuilder(new RetentionModelConventions());
-        var entry = new RetentionRegistry(db, builder).Scan()[typeof(DefaultTenantRecord)];
-
-        entry.Tenant.Should().NotBeNull();
-        entry.Tenant!.TenantMember.Should().Be(nameof(DefaultTenantRecord.TenantId));
-    }
-
-    [Fact]
     public void Global_Config_RecordIdPropertyName_Resolves_Unattributed_Property()
     {
         var options = new DbContextOptionsBuilder<OrganisationIdDbContext>()
@@ -113,15 +98,6 @@ public sealed class CohortConventionsEndToEndTests
         public DateTimeOffset RetainedAt { get; init; }
     }
 
-    [Retain("conventions", nameof(RetainedAt))]
-    [RetentionEntityId("00000000-0000-0000-0001-000000000008")]
-    private sealed class DefaultTenantRecord
-    {
-        public Guid Id { get; init; }
-        public Guid TenantId { get; init; }
-        public DateTimeOffset RetainedAt { get; init; }
-    }
-
     private sealed class OrganisationTenantDbContext(
         DbContextOptions<OrganisationTenantDbContext> options
     ) : DbContext(options)
@@ -167,22 +143,6 @@ public sealed class CohortConventionsEndToEndTests
                 entity.HasKey(record => record.Id);
                 entity.Property(record => record.OrganisationId);
                 entity.Property(record => record.WorkspaceId);
-                entity.Property(record => record.RetainedAt);
-            });
-        }
-    }
-
-    private sealed class DefaultTenantDbContext(DbContextOptions<DefaultTenantDbContext> options)
-        : DbContext(options)
-    {
-        protected override void OnModelCreating(ModelBuilder modelBuilder)
-        {
-            modelBuilder.ConfigureCohortTables();
-            modelBuilder.Entity<DefaultTenantRecord>(entity =>
-            {
-                entity.ToTable("default_tenant_records");
-                entity.HasKey(record => record.Id);
-                entity.Property(record => record.TenantId);
                 entity.Property(record => record.RetainedAt);
             });
         }

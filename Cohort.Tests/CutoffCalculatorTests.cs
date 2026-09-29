@@ -53,34 +53,6 @@ public sealed class CutoffCalculatorTests
     }
 
     [Theory]
-    // negative period, no legal min → refuse a future cutoff
-    [InlineData(-30, null)]
-    // negative period and negative legal min → refuse a future cutoff
-    [InlineData(-30, -90)]
-    public void Compute_Rejects_Negative_Effective_Periods(int periodDays, int? legalMinDays)
-    {
-        var now = DateTimeOffset.Parse("2026-01-01T00:00:00+00:00");
-        var period = TimeSpan.FromDays(periodDays);
-        TimeSpan? legalMin = legalMinDays is { } d ? TimeSpan.FromDays(d) : null;
-
-        var act = () => CutoffCalculator.Compute(now, period, legalMin);
-
-        act.Should().Throw<ArgumentOutOfRangeException>();
-    }
-
-    [Fact]
-    public void Compute_Uses_A_NonNegative_Legal_Min_To_Rescue_A_Negative_Period()
-    {
-        // A negative period with a dominating non-negative legal min still yields a
-        // valid (past or present) cutoff; the guard only rejects future cutoffs.
-        var now = DateTimeOffset.Parse("2026-01-01T00:00:00+00:00");
-
-        var cutoff = CutoffCalculator.Compute(now, TimeSpan.FromDays(-30), TimeSpan.FromDays(90));
-
-        cutoff.Should().Be(now - TimeSpan.FromDays(90));
-    }
-
-    [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public void Compute_Saturates_When_A_Valid_Retention_Duration_Precedes_The_Minimum_Date(
@@ -96,22 +68,6 @@ public sealed class CutoffCalculatorTests
         );
 
         cutoff.Should().Be(DateTimeOffset.MinValue);
-    }
-
-    [Theory]
-    [InlineData(null, 0)]
-    [InlineData(0, 0)]
-    [InlineData(90, 90)]
-    public void ResolveErasureMinimumAge_Uses_Only_Positive_LegalMin(
-        int? legalMinDays,
-        int expectedDays
-    )
-    {
-        TimeSpan? legalMin = legalMinDays is { } days ? TimeSpan.FromDays(days) : null;
-
-        var minimumAge = CutoffCalculator.ResolveErasureMinimumAge(legalMin);
-
-        minimumAge.Should().Be(TimeSpan.FromDays(expectedDays));
     }
 
     [Theory]

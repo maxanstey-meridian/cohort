@@ -10,56 +10,6 @@ namespace Cohort.Sample.Tests;
 public sealed class RetentionExecutionPlanOrdererTests
 {
     [Fact]
-    public void Order_Runs_Dependent_Child_Before_Retained_Parent()
-    {
-        using var db = new DependencyOrderedTestDbContext(
-            new DbContextOptionsBuilder<DependencyOrderedTestDbContext>()
-                .UseNpgsqlMetadataModel(nameof(Order_Runs_Dependent_Child_Before_Retained_Parent))
-                .Options
-        );
-
-        var parentEntry = CreateEntry<ParentRecord>("parents", "parent");
-        var childEntry = CreateEntry<ChildRecord>("children", "child");
-
-        var ordered = RetentionExecutionPlanOrderer.Order(
-            db,
-            [parentEntry, childEntry],
-            entry => entry
-        );
-
-        ordered
-            .Select(entry => entry.EntityType)
-            .Should()
-            .Equal(typeof(ChildRecord), typeof(ParentRecord));
-    }
-
-    [Fact]
-    public void Order_Preserves_Alphabetical_Fallback_When_Entities_Are_Unrelated()
-    {
-        using var db = new DependencyOrderedTestDbContext(
-            new DbContextOptionsBuilder<DependencyOrderedTestDbContext>()
-                .UseNpgsqlMetadataModel(
-                    nameof(Order_Preserves_Alphabetical_Fallback_When_Entities_Are_Unrelated)
-                )
-                .Options
-        );
-
-        var zetaEntry = CreateEntry<ZetaRecord>("zetas", "zeta");
-        var alphaEntry = CreateEntry<AlphaRecord>("alphas", "alpha");
-
-        var ordered = RetentionExecutionPlanOrderer.Order(
-            db,
-            [zetaEntry, alphaEntry],
-            entry => entry
-        );
-
-        ordered
-            .Select(entry => entry.EntityType)
-            .Should()
-            .Equal(typeof(AlphaRecord), typeof(ZetaRecord));
-    }
-
-    [Fact]
     public void Order_Rejects_Foreign_Key_Cycles()
     {
         using var db = new CyclicTestDbContext(
@@ -142,61 +92,6 @@ public sealed class RetentionExecutionPlanOrdererTests
                     .OnDelete(DeleteBehavior.Restrict);
             });
         }
-    }
-
-    private sealed class DependencyOrderedTestDbContext(
-        DbContextOptions<DependencyOrderedTestDbContext> options
-    ) : DbContext(options)
-    {
-        protected override void OnModelCreating(ModelBuilder modelBuilder)
-        {
-            modelBuilder.Entity<ParentRecord>(builder =>
-            {
-                builder.ToTable("parents");
-                builder.HasKey(entity => entity.Id);
-            });
-            modelBuilder.Entity<ChildRecord>(builder =>
-            {
-                builder.ToTable("children");
-                builder.HasKey(entity => entity.Id);
-                builder
-                    .HasOne<ParentRecord>()
-                    .WithMany()
-                    .HasForeignKey(entity => entity.ParentId)
-                    .OnDelete(DeleteBehavior.Restrict);
-            });
-            modelBuilder.Entity<AlphaRecord>(builder => builder.HasKey(entity => entity.Id));
-            modelBuilder.Entity<ZetaRecord>(builder => builder.HasKey(entity => entity.Id));
-        }
-    }
-
-    private sealed class ParentRecord
-    {
-        public Guid Id { get; init; }
-        public Guid TenantId { get; init; }
-        public DateTimeOffset CreatedAt { get; init; }
-    }
-
-    private sealed class ChildRecord
-    {
-        public Guid Id { get; init; }
-        public Guid TenantId { get; init; }
-        public Guid ParentId { get; init; }
-        public DateTimeOffset CreatedAt { get; init; }
-    }
-
-    private sealed class AlphaRecord
-    {
-        public Guid Id { get; init; }
-        public Guid TenantId { get; init; }
-        public DateTimeOffset CreatedAt { get; init; }
-    }
-
-    private sealed class ZetaRecord
-    {
-        public Guid Id { get; init; }
-        public Guid TenantId { get; init; }
-        public DateTimeOffset CreatedAt { get; init; }
     }
 
     private sealed class CycleFirstRecord

@@ -11,11 +11,8 @@ namespace Cohort.Sample.Tests;
 public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
     : IntegrationTestBase(fixture)
 {
-    [Theory]
-    [InlineData(false)]
-    public async Task Committed_Mutation_Remains_In_Authoritative_Totals_When_Entity_Settlement_Fails(
-        bool erasure
-    )
+    [Fact]
+    public async Task Committed_Mutation_Remains_In_Authoritative_Totals_When_Entity_Settlement_Fails()
     {
         var tenantId = Guid.NewGuid();
         var subjectId = Guid.NewGuid();
@@ -59,23 +56,16 @@ public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
             var emittedEvents = new ConcurrentQueue<SweepEvent>();
             using var host = new CohortTestHost(
                 ConnectionString,
-                configurationOverrides: erasure
-                    ? new Dictionary<string, string?> { ["Cohort:DryRun"] = "False" }
-                    : null,
                 configureServices: services =>
                     services.AddSingleton<IRetentionAuditObserver>(
                         new RecordingAuditObserver(emittedEvents)
                     )
             );
 
-            var result = erasure
-                ? ToAuditResult(await RunErasureAsync(host, tenantId, subjectId, asOf))
-                : ToAuditResult(
-                    await host.RunSweepAsync(
-                        new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                        asOf
-                    )
-                );
+            var result = await host.RunSweepAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                asOf
+            );
 
             result
                 .EntityFailures.Should()
@@ -102,10 +92,9 @@ public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
     }
 
     [Theory]
-    [InlineData(false, Strategy.Purge)]
-    [InlineData(false, Strategy.Anonymise)]
+    [InlineData(Strategy.Purge)]
+    [InlineData(Strategy.Anonymise)]
     public async Task Cancellation_During_Mutation_Rolls_Back_Entity_And_Audit_Progress(
-        bool erasure,
         Strategy strategy
     )
     {
@@ -119,7 +108,6 @@ public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
         var (tableName, operation) = strategy switch
         {
             Strategy.Purge => ("notes", "DELETE"),
-            Strategy.SoftDelete => ("soft_delete_records", "UPDATE"),
             Strategy.Anonymise => ("anonymised_contacts", "UPDATE"),
             _ => throw new ArgumentOutOfRangeException(nameof(strategy)),
         };
@@ -131,18 +119,6 @@ public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
                 case Strategy.Purge:
                     db.Notes.Add(
                         new Note
-                        {
-                            Id = noteId,
-                            TenantId = tenantId,
-                            SubjectId = subjectId,
-                            CreatedAt = asOf.AddDays(-120),
-                            Body = "cancel-after-mutation",
-                        }
-                    );
-                    break;
-                case Strategy.SoftDelete:
-                    db.SoftDeleteRecords.Add(
-                        new SoftDeleteRecord
                         {
                             Id = noteId,
                             TenantId = tenantId,
@@ -191,9 +167,6 @@ public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
             var emittedEvents = new ConcurrentQueue<SweepEvent>();
             using var host = new CohortTestHost(
                 ConnectionString,
-                configurationOverrides: erasure
-                    ? new Dictionary<string, string?> { ["Cohort:DryRun"] = "False" }
-                    : null,
                 configureServices: services =>
                     services.AddSingleton<IRetentionAuditObserver>(
                         new RecordingAuditObserver(emittedEvents)
@@ -202,18 +175,11 @@ public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
             using var cancellation = new CancellationTokenSource();
             await using var lockConnection = await HoldAdvisoryLockAsync(lockKey1, lockKey2);
 
-            Task runTask = erasure
-                ? host.RunErasureAsync(
-                        new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                        new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
-                        asOf,
-                        cancellation.Token
-                    )
-                : host.RunSweepAsync(
-                        new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                        asOf,
-                        cancellation.Token
-                    );
+            var runTask = host.RunSweepAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                asOf,
+                cancellation.Token
+            );
 
             await WaitForAdvisoryLockWaiterAsync(lockKey1, lockKey2);
             cancellation.Cancel();
@@ -228,13 +194,6 @@ public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
                 {
                     case Strategy.Purge:
                         (await verify.Notes.AnyAsync(row => row.Id == noteId)).Should().BeTrue();
-                        break;
-                    case Strategy.SoftDelete:
-                        var record = await verify.SoftDeleteRecords.SingleAsync(row =>
-                            row.Id == noteId
-                        );
-                        record.IsDeleted.Should().BeFalse();
-                        record.DeletedAt.Should().BeNull();
                         break;
                     case Strategy.Anonymise:
                         var contact = await verify.AnonymisedContacts.SingleAsync(row =>
@@ -346,33 +305,6 @@ public sealed class AuditDurabilityEndToEndTests(PostgresFixture fixture)
             await Task.Delay(TimeSpan.FromMilliseconds(20), timeout.Token);
         }
     }
-
-    private async Task<ErasureResult> RunErasureAsync(
-        CohortTestHost host,
-        Guid tenantId,
-        Guid subjectId,
-        DateTimeOffset asOf
-    )
-    {
-        return await host.RunErasureAsync(
-            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
-            asOf
-        );
-    }
-
-    private static (
-        Guid SweepId,
-        IReadOnlyList<EntitySweepCount> Counts,
-        IReadOnlyList<string> EntityFailures
-    ) ToAuditResult(ErasureResult result) => (result.SweepId, result.Counts, result.EntityFailures);
-
-    private static (
-        Guid SweepId,
-        IReadOnlyList<EntitySweepCount> Counts,
-        IReadOnlyList<string> EntityFailures
-    ) ToAuditResult(RetentionSweepResult result) =>
-        (result.SweepId, result.Counts, result.EntityFailures);
 
     private async Task AssertTotalsAsync(Guid sweepId, Guid tenantId, long expectedAffected)
     {

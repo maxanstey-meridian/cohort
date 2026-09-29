@@ -1,3 +1,5 @@
+using System.Reflection.Metadata;
+using System.Reflection.PortableExecutable;
 using System.Xml.Linq;
 
 using ArchUnitNET.Domain;
@@ -46,6 +48,26 @@ public sealed class ArchitectureBoundaryTests
             .Should()
             .ResideInNamespaceMatching(@"^Cohort\.(Domain|Application|Infrastructure|Hosting)(\..+)?$")
             .Check(Architecture);
+    }
+
+    // Cohort compiles against EF Core 9 but hosts may run EF Core 10, which replaced these
+    // types. Referencing one compiles and passes here, then throws TypeLoadException there.
+    [Theory]
+    [InlineData("Microsoft.EntityFrameworkCore.Query", "SetPropertyCalls`1")]
+    public void Cohort_Does_Not_Reference_Ef_Types_Removed_In_Later_Majors(string ns, string name)
+    {
+        using var stream = File.OpenRead(typeof(Cohort.Domain.RetentionRule).Assembly.Location);
+        using var pe = new PEReader(stream);
+        var metadata = pe.GetMetadataReader();
+
+        var referenced = metadata.TypeReferences
+            .Select(handle => metadata.GetTypeReference(handle))
+            .Any(reference =>
+                metadata.GetString(reference.Namespace) == ns
+                && metadata.GetString(reference.Name) == name
+            );
+
+        referenced.Should().BeFalse();
     }
 
     [Fact]

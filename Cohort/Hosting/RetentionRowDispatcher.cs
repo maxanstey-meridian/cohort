@@ -38,6 +38,7 @@ internal sealed class RetentionRowDispatcher(
 
     private const int Pending = (int)SweepRowHandlerDispatchState.Pending;
     private const int InFlight = (int)SweepRowHandlerDispatchState.InFlight;
+    private const int Succeeded = (int)SweepRowHandlerDispatchState.Succeeded;
     private const int DeadLettered = (int)SweepRowHandlerDispatchState.DeadLettered;
 
     private DateTimeOffset lastPayloadScrubAt = DateTimeOffset.MinValue;
@@ -296,18 +297,15 @@ internal sealed class RetentionRowDispatcher(
                     using var cleanup = new CancellationTokenSource(CleanupTimeout);
                     await WithDbAsync(
                         db =>
-                            db.Set<SweepRowHandlerStatusEntity>()
-                                .Where(s =>
-                                    s.ClaimToken == claimToken
-                                    && s.State == SweepRowHandlerDispatchState.InFlight
-                                )
-                                .ExecuteUpdateAsync(
-                                    s => s
-                                        .SetProperty(x => x.State, SweepRowHandlerDispatchState.Pending)
-                                        .SetProperty(x => x.ClaimedAt, (DateTimeOffset?)null)
-                                        .SetProperty(x => x.ClaimToken, (Guid?)null),
-                                    cleanup.Token
-                                ),
+                            db.Database.ExecuteSqlRawAsync(
+                                $$"""
+                                UPDATE {{Table(db).SweepRowHandlerStatus}}
+                                SET "State" = {0}, "ClaimedAt" = NULL, "ClaimToken" = NULL
+                                WHERE "ClaimToken" = {1} AND "State" = {2}
+                                """,
+                                [Pending, claimToken, InFlight],
+                                cleanup.Token
+                            ),
                         cleanup.Token
                     );
                 }
@@ -537,17 +535,12 @@ internal sealed class RetentionRowDispatcher(
             await InvokeOnAfterAsync(entityType, handler.Instance, claimed, snapshot, handlerCts.Token);
             handlerCompleted = true;
             await StopHeartbeatAsync(heartbeat, heartbeatCts);
-            // Captured outside the lambda: EF would otherwise emit an unqualified now(),
-            // resolvable through the search_path and on the database clock.
-            var completedAt = DateTimeOffset.UtcNow;
             await SettleAsync(
                 claimed,
-                s => s
-                    .SetProperty(x => x.State, SweepRowHandlerDispatchState.Succeeded)
-                    .SetProperty(x => x.CompletedAt, completedAt)
-                    .SetProperty(x => x.ClaimedAt, (DateTimeOffset?)null)
-                    .SetProperty(x => x.ClaimToken, (Guid?)null)
-                    .SetProperty(x => x.LastError, (string?)null),
+                """
+                "State" = {0}, "CompletedAt" = {1}, "ClaimedAt" = NULL, "ClaimToken" = NULL, "LastError" = NULL
+                """,
+                [Succeeded, DateTimeOffset.UtcNow],
                 CancellationToken.None
             );
             await ClearSettledPayloadAsync(claimed.RowDetailId);
@@ -620,13 +613,9 @@ internal sealed class RetentionRowDispatcher(
 
     private Task<bool> RenewClaimAsync(ClaimedHandlerRow claimed, CancellationToken ct)
     {
-        // Leases are judged on the app clock, so renew on it too (and never via a bare now()).
-        var claimedAt = DateTimeOffset.UtcNow;
+        // Leases are judged on the app clock, so renew on it too.
         return WithDbAsync(
-            async db =>
-                await Owned(db, claimed)
-                    .ExecuteUpdateAsync(s => s.SetProperty(x => x.ClaimedAt, claimedAt), ct)
-                == 1,
+            async db => await UpdateOwnedAsync(db, claimed, "\"ClaimedAt\" = {0}", [DateTimeOffset.UtcNow], ct) == 1,
             ct
         );
     }
@@ -659,12 +648,10 @@ internal sealed class RetentionRowDispatcher(
         );
         await SettleAsync(
             claimed,
-            s => s
-                .SetProperty(x => x.State, SweepRowHandlerDispatchState.Pending)
-                .SetProperty(x => x.NextAttemptAt, nextAttemptAt)
-                .SetProperty(x => x.ClaimedAt, (DateTimeOffset?)null)
-                .SetProperty(x => x.ClaimToken, (Guid?)null)
-                .SetProperty(x => x.LastError, diagnostic.ToString()),
+            """
+            "State" = {0}, "NextAttemptAt" = {1}, "ClaimedAt" = NULL, "ClaimToken" = NULL, "LastError" = {2}
+            """,
+            [Pending, nextAttemptAt, diagnostic.ToString()],
             ct
         );
     }
@@ -680,55 +667,47 @@ internal sealed class RetentionRowDispatcher(
             async db =>
             {
                 await using var transaction = await db.Database.BeginTransactionAsync(ct);
-                var settled = await Owned(db, claimed).ExecuteUpdateAsync(DeadLetter(now, lastError), ct);
+                var settled = await UpdateOwnedAsync(db, claimed, DeadLetterAssignments, [DeadLettered, now, lastError], ct);
                 if (settled != 1)
                 {
                     throw new RetentionRowDispatchClaimLostException(claimed.StatusId);
                 }
 
-                await db.Set<SweepRowHandlerStatusEntity>()
-                    .Where(s =>
-                        s.SweepRunRowDetailId == claimed.RowDetailId
-                        && s.Id > claimed.StatusId
-                        && (
-                            s.State == SweepRowHandlerDispatchState.Pending
-                            || s.State == SweepRowHandlerDispatchState.InFlight
-                        )
-                    )
-                    .ExecuteUpdateAsync(
-                        DeadLetter(now, "Skipped because an earlier handler for the same row dead-lettered."),
-                        ct
-                    );
+                await db.Database.ExecuteSqlRawAsync(
+                    $$"""
+                    UPDATE {{Table(db).SweepRowHandlerStatus}}
+                    SET {{DeadLetterAssignments}}
+                    WHERE "SweepRunRowDetailId" = {3} AND "Id" > {4} AND "State" IN ({5}, {6})
+                    """,
+                    [
+                        DeadLettered,
+                        now,
+                        "Skipped because an earlier handler for the same row dead-lettered.",
+                        claimed.RowDetailId,
+                        claimed.StatusId,
+                        Pending,
+                        InFlight,
+                    ],
+                    ct
+                );
                 await transaction.CommitAsync(ct);
             },
             ct
         );
     }
 
-    private static System.Linq.Expressions.Expression<
-        Func<Microsoft.EntityFrameworkCore.Query.SetPropertyCalls<SweepRowHandlerStatusEntity>,
-            Microsoft.EntityFrameworkCore.Query.SetPropertyCalls<SweepRowHandlerStatusEntity>>
-    > DeadLetter(DateTimeOffset now, string lastError) =>
-        s => s
-            .SetProperty(x => x.State, SweepRowHandlerDispatchState.DeadLettered)
-            .SetProperty(x => x.CompletedAt, now)
-            .SetProperty(x => x.ClaimedAt, (DateTimeOffset?)null)
-            .SetProperty(x => x.ClaimToken, (Guid?)null)
-            .SetProperty(x => x.LastError, lastError);
+    // Values: {0} state, {1} completed-at, {2} last error.
+    private const string DeadLetterAssignments =
+        """
+        "State" = {0}, "CompletedAt" = {1}, "ClaimedAt" = NULL, "ClaimToken" = NULL, "LastError" = {2}
+        """;
 
-    private Task SettleAsync(
-        ClaimedHandlerRow claimed,
-        System.Linq.Expressions.Expression<
-            Func<Microsoft.EntityFrameworkCore.Query.SetPropertyCalls<SweepRowHandlerStatusEntity>,
-                Microsoft.EntityFrameworkCore.Query.SetPropertyCalls<SweepRowHandlerStatusEntity>>
-        > update,
-        CancellationToken ct
-    )
+    private Task SettleAsync(ClaimedHandlerRow claimed, string assignments, object[] values, CancellationToken ct)
     {
         return WithDbAsync(
             async db =>
             {
-                if (await Owned(db, claimed).ExecuteUpdateAsync(update, ct) != 1)
+                if (await UpdateOwnedAsync(db, claimed, assignments, values, ct) != 1)
                 {
                     throw new RetentionRowDispatchClaimLostException(claimed.StatusId);
                 }
@@ -737,13 +716,30 @@ internal sealed class RetentionRowDispatcher(
         );
     }
 
-    private static IQueryable<SweepRowHandlerStatusEntity> Owned(DbContext db, ClaimedHandlerRow claimed) =>
-        db.Set<SweepRowHandlerStatusEntity>()
-            .Where(s =>
-                s.Id == claimed.StatusId
-                && s.State == SweepRowHandlerDispatchState.InFlight
-                && s.ClaimToken == claimed.ClaimToken
-            );
+    /// <summary>
+    /// Updates this handler row only while this dispatcher still owns its claim. Raw SQL rather
+    /// than ExecuteUpdateAsync: Cohort builds against EF Core 9, and EF Core 10 replaced the
+    /// setter types, so a compiled ExecuteUpdateAsync call fails to load on EF Core 10 hosts.
+    /// </summary>
+    private static Task<int> UpdateOwnedAsync(
+        DbContext db,
+        ClaimedHandlerRow claimed,
+        string assignments,
+        object[] values,
+        CancellationToken ct
+    )
+    {
+        var n = values.Length;
+        return db.Database.ExecuteSqlRawAsync(
+            $$"""
+            UPDATE {{Table(db).SweepRowHandlerStatus}}
+            SET {{assignments}}
+            WHERE "Id" = {{{n}}} AND "State" = {{{n + 1}}} AND "ClaimToken" = {{{n + 2}}}
+            """,
+            [.. values, claimed.StatusId, InFlight, claimed.ClaimToken],
+            ct
+        );
+    }
 
     // Once per poll or flush, not per statement: the result is cached after the first pass.
     private async Task ValidateReadinessAsync(CancellationToken ct)

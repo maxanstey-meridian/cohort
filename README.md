@@ -193,9 +193,9 @@ The entity annotation does not decide whether a row is purged or anonymised. The
 `GetCapabilities(category)` synchronously declares every strategy that `ResolveAsync` can
 return for that category. Capabilities are not a cache of the current rule: startup validates
 the union of every declared strategy against each retained entity. A runtime rule whose
-strategy was not declared is rejected. `ResolveAsync` receives category, tenant, logical time,
-and alias path, so a host provider can apply tenant- and time-specific policy without hiding
-its possible model requirements.
+strategy was not declared is rejected. `ResolveAsync` receives category, tenant, and logical
+time, so a host provider can apply tenant- and time-specific policy without hiding its possible
+model requirements. Category aliasing, if a host wants it, stays inside its provider.
 
 ### 3. Register Cohort
 

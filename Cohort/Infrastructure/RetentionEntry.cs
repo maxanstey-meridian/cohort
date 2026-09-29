@@ -20,39 +20,6 @@ internal sealed record RetentionEntry(
     AnonymisedAtConvention? AnonymisedAt = null
 )
 {
-    internal RetentionEntry(
-        Type entityType,
-        Guid retentionEntityId,
-        string tableName,
-        string category,
-        string anchorMember,
-        string anchorColumn,
-        RecordIdConvention recordId,
-        IReadOnlyList<AnonymiseField> anonymiseFields,
-        IReadOnlyList<string> materializationColumns,
-        TenantConvention? tenant,
-        SoftDeleteConvention? softDelete,
-        bool isExplicitlyTenantless = false,
-        AuditRowDetail auditRowDetail = AuditRowDetail.Inherit,
-        AnonymisedAtConvention? anonymisedAt = null
-    ) : this(
-        entityType,
-        retentionEntityId,
-        new RelationalObjectName("public", tableName),
-        CohortStoreTables.Public,
-        category,
-        anchorMember,
-        anchorColumn,
-        recordId,
-        anonymiseFields,
-        materializationColumns,
-        tenant,
-        softDelete,
-        isExplicitlyTenantless,
-        auditRowDetail,
-        anonymisedAt
-    ) { }
-
     internal string TableName => Table.Name;
 }
 

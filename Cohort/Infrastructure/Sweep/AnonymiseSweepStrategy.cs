@@ -261,7 +261,7 @@ internal sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
         return await ExecuteMutationAsync(
             entry,
             rule,
-            new RetentionResolutionContext(entry.Category, tenant, now, []),
+            new RetentionResolutionContext(entry.Category, tenant, now),
             AnonymiseFilterBuilder.CreateErasureFilter(entry, predicate, cutoff),
             conn,
             transaction,

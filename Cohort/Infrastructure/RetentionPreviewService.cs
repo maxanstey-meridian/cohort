@@ -56,7 +56,7 @@ internal sealed class RetentionPreviewService(
                     .OrderBy(entry => entry.EntityType.FullName, StringComparer.Ordinal)
             )
             {
-                var context = new RetentionResolutionContext(entry.Category, tenant, request.At, []);
+                var context = new RetentionResolutionContext(entry.Category, tenant, request.At);
                 var rule = await RetentionRuleProviderResolution.ResolveAsync(
                     ruleProvider,
                     readinessValidator.ValidatedCapabilities,

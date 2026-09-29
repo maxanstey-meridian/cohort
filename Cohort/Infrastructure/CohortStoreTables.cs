@@ -14,14 +14,6 @@ internal sealed record CohortStoreTables(
 {
     internal const string TableRoleAnnotation = "Cohort:TableRole";
 
-    internal static CohortStoreTables Public { get; } = new(
-        new("public", CohortTableNames.RetentionHolds),
-        new("public", CohortTableNames.SweepRun),
-        new("public", CohortTableNames.SweepRunEntitySummary),
-        new("public", CohortTableNames.SweepRunRowDetail),
-        new("public", CohortTableNames.SweepRowHandlerStatus)
-    );
-
     internal static CohortStoreTables FromModel(IModel model)
     {
         ArgumentNullException.ThrowIfNull(model);

@@ -153,28 +153,6 @@ public sealed class RetentionRuleContractTests
     }
 
     [Fact]
-    public void Retention_Resolution_Context_Captures_Category_Tenant_Now_And_Alias_Path()
-    {
-        var tenantId = Guid.NewGuid();
-        var tenant = new TenantContext(
-            tenantId,
-            "uk-england",
-            new Dictionary<string, string> { ["service"] = "cohort" }
-        );
-        var now = DateTimeOffset.Parse("2026-01-01T00:00:00+00:00");
-        IReadOnlyList<string> aliasPath = ["base-policy", "county-override"];
-
-        var context = new RetentionResolutionContext("short-lived", tenant, now, aliasPath);
-
-        context.Category.Should().Be("short-lived");
-        context.Tenant.Id.Should().Be(tenantId);
-        context.Tenant.Jurisdiction.Should().Be("uk-england");
-        context.Tenant.Tags.Should().Contain(new KeyValuePair<string, string>("service", "cohort"));
-        context.Now.Should().Be(now);
-        context.AliasPath.Should().Equal("base-policy", "county-override");
-    }
-
-    [Fact]
     public void Retention_Sweep_Result_Carries_Grouped_Entity_Counts()
     {
         var sweepId = Guid.NewGuid();

@@ -72,7 +72,7 @@ internal sealed class RetentionErasureService(
                     continue;
                 }
 
-                var context = new RetentionResolutionContext(entry.Category, tenant, now, []);
+                var context = new RetentionResolutionContext(entry.Category, tenant, now);
                 RetentionRule rule;
                 try
                 {

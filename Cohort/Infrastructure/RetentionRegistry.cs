@@ -9,7 +9,7 @@ namespace Cohort.Infrastructure;
 ///
 /// Takes `DbContext` as a port-shaped dependency: it's the host's "here is my model"
 /// contract. The registry never touches `DbSet`, never issues SQL — it only reads
-/// metadata. SQL belongs in `Infrastructure/`.
+/// metadata.
 ///
 internal sealed class RetentionRegistry(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,

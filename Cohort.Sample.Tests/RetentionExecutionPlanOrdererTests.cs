@@ -1,5 +1,6 @@
 using Cohort.Application;
 using Cohort.Infrastructure;
+using Cohort.Infrastructure.Migrations;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 
@@ -97,7 +98,14 @@ public sealed class RetentionExecutionPlanOrdererTests
         new(
             typeof(TEntity),
             Guid.NewGuid(),
-            table,
+            new RelationalObjectName("public", table),
+            new CohortStoreTables(
+                new("public", CohortTableNames.RetentionHolds),
+                new("public", CohortTableNames.SweepRun),
+                new("public", CohortTableNames.SweepRunEntitySummary),
+                new("public", CohortTableNames.SweepRunRowDetail),
+                new("public", CohortTableNames.SweepRowHandlerStatus)
+            ),
             category,
             "CreatedAt",
             "CreatedAt",

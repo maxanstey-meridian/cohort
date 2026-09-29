@@ -36,7 +36,20 @@ public sealed class RetentionCategoryCapabilitiesTests
     {
         var capabilities = new RetentionCategoryCapabilities([Strategy.Purge]);
 
-        capabilities.Strategies.Should().NotBeAssignableTo<ISet<Strategy>>();
+        var act = () => ((ISet<Strategy>)capabilities.Strategies).Add(Strategy.Anonymise);
+
+        act.Should().Throw<NotSupportedException>();
         capabilities.Strategies.Should().Equal(Strategy.Purge);
+    }
+
+    [Fact]
+    public void Capabilities_With_The_Same_Strategies_Are_Equal_Regardless_Of_Order()
+    {
+        var first = new RetentionCategoryCapabilities([Strategy.Purge, Strategy.Anonymise]);
+        var second = new RetentionCategoryCapabilities([Strategy.Anonymise, Strategy.Purge, Strategy.Purge]);
+
+        first.Should().Be(second);
+        first.GetHashCode().Should().Be(second.GetHashCode());
+        first.Should().NotBe(new RetentionCategoryCapabilities([Strategy.Purge]));
     }
 }

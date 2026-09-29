@@ -391,7 +391,7 @@ internal sealed class RelationalSweepStrategyCore(
             return await ExecuteHandlerAwareSweepAsync(
                 entry,
                 rule,
-                new RetentionResolutionContext(entry.Category, tenant, now, []),
+                new RetentionResolutionContext(entry.Category, tenant, now),
                 conn,
                 transaction,
                 candidateRecordIds,

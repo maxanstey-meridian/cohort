@@ -1,3 +1,5 @@
+using System.Collections.ObjectModel;
+
 namespace Cohort.Domain;
 
 public sealed record RetentionCategoryCapabilities
@@ -27,34 +29,22 @@ public sealed record RetentionCategoryCapabilities
             }
         }
 
-        Strategies = new ReadOnlyStrategySet(copy);
+        Strategies = new ReadOnlySet<Strategy>(copy);
     }
 
     public IReadOnlySet<Strategy> Strategies { get; }
 
-    private sealed class ReadOnlyStrategySet(HashSet<Strategy> values) : IReadOnlySet<Strategy>
+    public bool Equals(RetentionCategoryCapabilities? other) =>
+        other is not null && Strategies.SetEquals(other.Strategies);
+
+    public override int GetHashCode()
     {
-        public int Count => values.Count;
+        var hash = 0;
+        foreach (var strategy in Strategies)
+        {
+            hash |= 1 << (int)strategy;
+        }
 
-        public bool Contains(Strategy item) => values.Contains(item);
-
-        public IEnumerator<Strategy> GetEnumerator() => values.GetEnumerator();
-
-        public bool IsProperSubsetOf(IEnumerable<Strategy> other) =>
-            values.IsProperSubsetOf(other);
-
-        public bool IsProperSupersetOf(IEnumerable<Strategy> other) =>
-            values.IsProperSupersetOf(other);
-
-        public bool IsSubsetOf(IEnumerable<Strategy> other) => values.IsSubsetOf(other);
-
-        public bool IsSupersetOf(IEnumerable<Strategy> other) => values.IsSupersetOf(other);
-
-        public bool Overlaps(IEnumerable<Strategy> other) => values.Overlaps(other);
-
-        public bool SetEquals(IEnumerable<Strategy> other) => values.SetEquals(other);
-
-        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() =>
-            GetEnumerator();
+        return hash;
     }
 }

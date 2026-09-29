@@ -162,63 +162,6 @@ internal static class RetentionSnapshotSerializer
             null => null,
             string => value,
             bool => value,
-            byte byteValue => EncodeTypedValue(
-                typeof(byte),
-                JsonSerializer.SerializeToElement(byteValue)
-            ),
-            sbyte sbyteValue => EncodeTypedValue(
-                typeof(sbyte),
-                JsonSerializer.SerializeToElement(sbyteValue)
-            ),
-            short shortValue => EncodeTypedValue(
-                typeof(short),
-                JsonSerializer.SerializeToElement(shortValue)
-            ),
-            ushort ushortValue => EncodeTypedValue(
-                typeof(ushort),
-                JsonSerializer.SerializeToElement(ushortValue)
-            ),
-            int intValue => EncodeTypedValue(
-                typeof(int),
-                JsonSerializer.SerializeToElement(intValue)
-            ),
-            uint uintValue => EncodeTypedValue(
-                typeof(uint),
-                JsonSerializer.SerializeToElement(uintValue)
-            ),
-            long longValue => EncodeTypedValue(
-                typeof(long),
-                JsonSerializer.SerializeToElement(longValue)
-            ),
-            ulong ulongValue => EncodeTypedValue(
-                typeof(ulong),
-                JsonSerializer.SerializeToElement(ulongValue)
-            ),
-            float floatValue => EncodeTypedValue(
-                typeof(float),
-                JsonSerializer.SerializeToElement(floatValue)
-            ),
-            double doubleValue => EncodeTypedValue(
-                typeof(double),
-                JsonSerializer.SerializeToElement(doubleValue)
-            ),
-            decimal decimalValue => EncodeTypedValue(
-                typeof(decimal),
-                JsonSerializer.SerializeToElement(decimalValue)
-            ),
-            Guid guid => EncodeTypedValue(typeof(Guid), JsonSerializer.SerializeToElement(guid)),
-            DateTime dateTime => EncodeTypedValue(
-                typeof(DateTime),
-                JsonSerializer.SerializeToElement(dateTime)
-            ),
-            DateTimeOffset dateTimeOffset => EncodeTypedValue(
-                typeof(DateTimeOffset),
-                JsonSerializer.SerializeToElement(dateTimeOffset)
-            ),
-            Enum enumeration => EncodeTypedValue(
-                enumeration.GetType(),
-                JsonSerializer.SerializeToElement(enumeration, enumeration.GetType())
-            ),
             IDictionary<string, object?> dictionary => dictionary.ToDictionary(
                 pair => pair.Key,
                 pair => EncodeValue(pair.Value),

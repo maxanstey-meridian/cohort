@@ -76,7 +76,7 @@ public sealed class RetentionRuleProviderEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task Preview_Path_Propagates_Retention_Alias_Cycle_Exception()
+    public async Task Preview_Path_Propagates_Rule_Provider_Exceptions()
     {
         using var previewHost = new CohortTestHost(
             GetConnectionString(),
@@ -89,7 +89,7 @@ public sealed class RetentionRuleProviderEndToEndTests(PostgresFixture fixture)
                 new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero)
             );
 
-        var exception = await act.Should().ThrowAsync<RetentionAliasCycleException>();
+        var exception = await act.Should().ThrowAsync<InvalidOperationException>();
         exception.Which.Message.Should().Contain("policy-a");
         exception.Which.Message.Should().Contain("policy-b");
     }
@@ -220,12 +220,15 @@ public sealed class RetentionRuleProviderEndToEndTests(PostgresFixture fixture)
                 _ => new([Strategy.Exempt]),
             };
 
-        public async Task<RetentionRule?> ResolveAsync(
+        public Task<RetentionRule?> ResolveAsync(
             RetentionResolutionContext context,
             CancellationToken ct
-        )
+        ) => Task.FromResult(Resolve(context.Category, []));
+
+        // Alias traversal is the host provider's business; Cohort only sees the outcome.
+        private RetentionRule? Resolve(string category, IReadOnlyList<string> path)
         {
-            var nextCategory = context.Category switch
+            var nextCategory = category switch
             {
                 "short-lived" => "policy-a",
                 "policy-a" => "policy-b",
@@ -234,26 +237,18 @@ public sealed class RetentionRuleProviderEndToEndTests(PostgresFixture fixture)
             };
             if (nextCategory is null)
             {
-                var strategy = GetCapabilities(context.Category)!.Strategies.Single();
+                var strategy = GetCapabilities(category)!.Strategies.Single();
                 return new RetentionRule(TimeSpan.FromDays(30), strategy);
             }
 
-            if (context.AliasPath.Contains(nextCategory, StringComparer.Ordinal))
+            if (path.Contains(nextCategory, StringComparer.Ordinal))
             {
-                throw new RetentionAliasCycleException(
-                    $"Retention alias cycle detected: {string.Join(" -> ", [.. context.AliasPath, context.Category, nextCategory])}"
+                throw new InvalidOperationException(
+                    $"Retention alias cycle detected: {string.Join(" -> ", [.. path, category, nextCategory])}"
                 );
             }
 
-            return await ResolveAsync(
-                new RetentionResolutionContext(
-                    nextCategory,
-                    context.Tenant,
-                    context.Now,
-                    [.. context.AliasPath, context.Category]
-                ),
-                ct
-            );
+            return Resolve(nextCategory, [.. path, category]);
         }
     }
 

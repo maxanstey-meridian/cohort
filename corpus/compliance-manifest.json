@@ -283,9 +283,8 @@
       { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionRuleProviderEndToEndTests", "method": "Preview_Path_Rejects_An_Unresolved_Runtime_Rule", "kind": "public-postgresql", "primary": true },
       { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionRuleProviderEndToEndTests", "method": "Preview_Path_Rejects_A_Strategy_Not_Declared_By_The_Provider", "kind": "public-postgresql", "primary": true }
     ], "status": "supported" },
-    { "id": "RULE-002", "source": "Cohort product invariant: resolution context fidelity", "requirement": "Rule resolution preserves category, tenant, logical time, and alias path, and alias cycles report through RetentionAliasCycleException.", "evidence": [
-      { "assembly": "Cohort.Tests", "type": "Cohort.Tests.RetentionRuleContractTests", "method": "Retention_Resolution_Context_Captures_Category_Tenant_Now_And_Alias_Path", "kind": "pure-contract", "primary": true },
-      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionRuleProviderEndToEndTests", "method": "Preview_Path_Propagates_Retention_Alias_Cycle_Exception", "kind": "public-postgresql", "primary": true }
+    { "id": "RULE-002", "source": "Cohort product invariant: resolution context fidelity", "requirement": "Rule resolution receives category, tenant, and logical time, and rule provider failures propagate to the caller.", "evidence": [
+      { "assembly": "Cohort.Sample.Tests", "type": "Cohort.Sample.Tests.RetentionRuleProviderEndToEndTests", "method": "Preview_Path_Propagates_Rule_Provider_Exceptions", "kind": "public-postgresql", "primary": true }
     ], "status": "supported" },
 
     { "id": "SCHEMA-001", "source": "Cohort product invariant: explicit Cohort schema mapping", "requirement": "ConfigureCohortTables maps all five Cohort tables to public by default and to the exact supplied custom schema when configured.", "evidence": [

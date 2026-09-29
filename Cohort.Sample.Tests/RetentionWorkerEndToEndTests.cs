@@ -169,6 +169,47 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
     }
 
     [Fact]
+    public async Task Two_Replicas_Firing_For_The_Same_Occurrence_Record_One_Scheduled_Run()
+    {
+        var tenant = CreateTenant();
+        var settings = CreateSettings(
+            fixture.ConnectionString,
+            schedule: "0 0 0 1 1 *",
+            dryRun: false,
+            killSwitch: false
+        );
+        using var first = BuildHost(
+            settings,
+            tenant,
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
+            }
+        );
+        using var second = BuildHost(
+            settings,
+            tenant,
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
+            }
+        );
+        await SeedOldNoteAsync(tenant.Id, "once-per-occurrence");
+        var occurrence = DateTimeOffset.UtcNow.AddSeconds(-1);
+
+        await GetWorker(first).RunIterationAsync(occurrence, dryRun: false, CancellationToken.None);
+        await GetWorker(second).RunIterationAsync(occurrence, dryRun: false, CancellationToken.None);
+
+        (await CountScheduledRunsAsync(tenant.Id)).Should().Be(1);
+        (await NoteExistsAsync("once-per-occurrence")).Should().BeFalse();
+
+        var nextOccurrence = DateTimeOffset.UtcNow;
+        await GetWorker(second).RunIterationAsync(nextOccurrence, dryRun: false, CancellationToken.None);
+
+        (await CountScheduledRunsAsync(tenant.Id)).Should().Be(2);
+    }
+
+    [Fact]
     public async Task Worker_Survives_A_Failing_Iteration_And_Sweeps_On_A_Later_Tick()
     {
         var tenant = CreateTenant();
@@ -228,6 +269,23 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         configureServices(builder.Services);
 
         return new WorkerTestHost(builder.Build(), builder.Configuration);
+    }
+
+    private static RetentionWorker GetWorker(WorkerTestHost host) =>
+        host.Host.Services.GetServices<IHostedService>().OfType<RetentionWorker>().Single();
+
+    private async Task<long> CountScheduledRunsAsync(Guid tenantId)
+    {
+        await using var connection = new NpgsqlConnection(fixture.ConnectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT COUNT(*) FROM "sweep_run"
+            WHERE "TenantId" = @tenantId AND "TriggerKind" = @scheduled
+            """;
+        command.Parameters.AddWithValue("tenantId", tenantId);
+        command.Parameters.AddWithValue("scheduled", (int)SweepTriggerKind.Scheduled);
+        return (long)(await command.ExecuteScalarAsync())!;
     }
 
     private static IReadOnlyDictionary<string, string?> CreateSettings(

@@ -50,28 +50,23 @@ internal static class CohortSchemaContract
             [
                 new(
                     "CK_sweep_run_Status_Range",
-                    "\"Status\" BETWEEN 0 AND 4",
-                    "Status>=0ANDStatus<=4"
+                    "\"Status\" BETWEEN 0 AND 4"
                 ),
                 new(
                     "CK_sweep_run_Started_Unsettled",
-                    "\"Status\" <> 0 OR \"SettledAt\" IS NULL",
-                    "Status<>0ORSettledAtISNULL"
+                    "\"Status\" <> 0 OR \"SettledAt\" IS NULL"
                 ),
                 new(
                     "CK_sweep_run_Terminal_Settled",
-                    "\"Status\" = 0 OR \"SettledAt\" IS NOT NULL",
-                    "Status=0ORSettledAtISNOTNULL"
+                    "\"Status\" = 0 OR \"SettledAt\" IS NOT NULL"
                 ),
                 new(
                     "CK_sweep_run_TotalAffected_Nonnegative",
-                    "\"TotalAffected\" IS NULL OR \"TotalAffected\" >= 0",
-                    "TotalAffectedISNULLORTotalAffected>=0"
+                    "\"TotalAffected\" IS NULL OR \"TotalAffected\" >= 0"
                 ),
                 new(
                     "CK_sweep_run_Duration_Nonnegative",
-                    "\"Duration\" IS NULL OR \"Duration\" >= INTERVAL '0'",
-                    "DurationISNULLORDuration>=000000INTERVAL"
+                    "\"Duration\" IS NULL OR \"Duration\" >= INTERVAL '0'"
                 )
             ]
         ),
@@ -158,13 +153,11 @@ internal static class CohortSchemaContract
             [
                 new(
                     "CK_sweep_row_handler_status_Claim",
-                    "(\"State\" = 1 AND \"ClaimedAt\" IS NOT NULL AND \"ClaimToken\" IS NOT NULL) OR (\"State\" <> 1 AND \"ClaimedAt\" IS NULL AND \"ClaimToken\" IS NULL)",
-                    "(State=1ANDClaimedAtISNOTNULLANDClaimTokenISNOTNULL)OR(State<>1ANDClaimedAtISNULLANDClaimTokenISNULL)"
+                    "(\"State\" = 1 AND \"ClaimedAt\" IS NOT NULL AND \"ClaimToken\" IS NOT NULL) OR (\"State\" <> 1 AND \"ClaimedAt\" IS NULL AND \"ClaimToken\" IS NULL)"
                 ),
                 new(
                     "CK_sweep_row_handler_status_Completion",
-                    "(\"State\" IN (2, 3) AND \"CompletedAt\" IS NOT NULL) OR (\"State\" IN (0, 1) AND \"CompletedAt\" IS NULL)",
-                    "(State=ANYARRAY[2,3]ANDCompletedAtISNOTNULL)OR(State=ANYARRAY[0,1]ANDCompletedAtISNULL)"
+                    "(\"State\" IN (2, 3) AND \"CompletedAt\" IS NOT NULL) OR (\"State\" IN (0, 1) AND \"CompletedAt\" IS NULL)"
                 ),
             ],
             [
@@ -225,7 +218,7 @@ internal static class CohortSchemaContract
         string? Name = null
     );
 
-    internal sealed record CheckConstraintRequirement(string Name, string Sql, string NormalizedSql);
+    internal sealed record CheckConstraintRequirement(string Name, string Sql);
 
     internal sealed record ForeignKeyRequirement(
         IReadOnlyList<string> Columns,

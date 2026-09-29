@@ -1,8 +1,12 @@
-using System.Runtime.ExceptionServices;
 using Microsoft.Extensions.Logging;
 
 namespace Cohort.Infrastructure;
 
+/// <summary>
+/// Releases a session advisory lock and closes an owned connection. Failures are logged, never
+/// thrown: the run's outcome is already recorded, and a dropped session releases its locks
+/// anyway, so a cleanup error must not replace the real result or exception.
+/// </summary>
 internal static class OperationalConnectionCleanup
 {
     private static readonly TimeSpan CleanupTimeout = TimeSpan.FromSeconds(30);
@@ -14,8 +18,6 @@ internal static class OperationalConnectionCleanup
         ILogger? logger
     )
     {
-        Exception? unlockException = null;
-        Exception? closeException = null;
         using var cleanup = new CancellationTokenSource(CleanupTimeout);
 
         if (unlock is not null)
@@ -26,7 +28,6 @@ internal static class OperationalConnectionCleanup
             }
             catch (Exception ex)
             {
-                unlockException = ex;
                 logger?.LogWarning(
                     ex,
                     "Cohort advisory-lock cleanup failed{PrimaryFailureContext}.",
@@ -43,23 +44,12 @@ internal static class OperationalConnectionCleanup
             }
             catch (Exception ex)
             {
-                closeException = ex;
                 logger?.LogWarning(
                     ex,
                     "Cohort owned-connection cleanup failed{PrimaryFailureContext}.",
                     primaryException is null ? "" : " after the primary operation failed"
                 );
             }
-        }
-
-        if (primaryException is not null)
-        {
-            return;
-        }
-
-        if ((unlockException ?? closeException) is { } cleanupException)
-        {
-            ExceptionDispatchInfo.Capture(cleanupException).Throw();
         }
     }
 }

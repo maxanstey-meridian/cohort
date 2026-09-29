@@ -148,6 +148,29 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
             .ContainSingle(error => error.Contains("sweep_row_handler_status(SweepRunRowDetailId) -> sweep_run_row_detail(Id) ON DELETE CASCADE"));
     }
 
+    [Fact]
+    public async Task Validation_Rejects_A_Deferrable_Summary_Key_Because_On_Conflict_Cannot_Use_It()
+    {
+        await ExecuteAsync("""
+            ALTER TABLE "sweep_run_entity_summary" DROP CONSTRAINT "PK_sweep_run_entity_summary";
+            ALTER TABLE "sweep_run_entity_summary" ADD CONSTRAINT "PK_sweep_run_entity_summary"
+                PRIMARY KEY ("SweepId", "RetentionEntityId", "Category", "TenantId", "Strategy")
+                DEFERRABLE INITIALLY IMMEDIATE
+            """);
+        using var host = new CohortTestHost(connectionString);
+
+        var act = () => host.RunWithServicesAsync(serviceProvider =>
+            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+        );
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception
+            .Which.Errors.Should()
+            .ContainSingle(error => error.Contains(
+                "primary key capability 'sweep_run_entity_summary(SweepId, RetentionEntityId, Category, TenantId, Strategy)'"
+            ));
+    }
+
     private async Task ExecuteAsync(string sql)
     {
         await using var connection = new NpgsqlConnection(connectionString);

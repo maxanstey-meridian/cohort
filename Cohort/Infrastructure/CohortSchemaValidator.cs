@@ -75,10 +75,11 @@ internal sealed class CohortSchemaValidator(
                 if (!indexes.Any(index => index.TableId == tableId
                     && index.Unique
                     && index.Primary
+                    && index.Immediate
                     && index.Columns.SequenceEqual(table.PrimaryKey)))
                 {
                     missing.Add(
-                        $"primary key capability '{table.Role}({string.Join(", ", table.PrimaryKey)})' on table '{PostgreSqlIdentifier.Format(mappedTable)}'"
+                        $"primary key capability '{table.Role}({string.Join(", ", table.PrimaryKey)})' on table '{PostgreSqlIdentifier.Format(mappedTable)}' (NOT DEFERRABLE)"
                     );
                 }
 
@@ -86,6 +87,7 @@ internal sealed class CohortSchemaValidator(
                 {
                     if (!indexes.Any(index => index.TableId == tableId
                         && index.Unique == indexRequirement.Unique
+                        && (!index.Unique || index.Immediate)
                         && !index.Primary
                         && index.Columns.SequenceEqual(indexRequirement.Columns)
                         && index.Predicate == NormalizePredicate(indexRequirement.Predicate)))
@@ -257,7 +259,7 @@ internal sealed class CohortSchemaValidator(
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
-            SELECT i.indrelid, i.indisunique, i.indisprimary,
+            SELECT i.indrelid, i.indisunique, i.indisprimary, i.indimmediate,
                    ARRAY(SELECT a.attname
                           FROM pg_catalog.unnest(i.indkey) WITH ORDINALITY AS key(attnum, position)
                            JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = key.attnum
@@ -281,8 +283,9 @@ internal sealed class CohortSchemaValidator(
                 reader.GetFieldValue<uint>(0),
                 reader.GetBoolean(1),
                 reader.GetBoolean(2),
-                reader.GetFieldValue<string[]>(3),
-                NormalizePredicate(reader.IsDBNull(4) ? null : reader.GetString(4))
+                reader.GetBoolean(3),
+                reader.GetFieldValue<string[]>(4),
+                NormalizePredicate(reader.IsDBNull(5) ? null : reader.GetString(5))
             ));
         }
 
@@ -475,6 +478,7 @@ internal sealed class CohortSchemaValidator(
         uint TableId,
         bool Unique,
         bool Primary,
+        bool Immediate,
         string[] Columns,
         string? Predicate
     );

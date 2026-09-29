@@ -28,7 +28,13 @@ internal sealed class RetentionAuditNotifier(
             try
             {
                 using var timeoutSource = new CancellationTokenSource(timeout);
-                var delivery = observer.OnCommittedAsync(evt, timeoutSource.Token);
+                // Task.Run so the timeout also bounds work an observer does synchronously
+                // before returning its Task.
+                var token = timeoutSource.Token;
+                var delivery = Task.Run(
+                    () => observer.OnCommittedAsync(evt, token),
+                    CancellationToken.None
+                );
                 try
                 {
                     await delivery.WaitAsync(timeoutSource.Token);

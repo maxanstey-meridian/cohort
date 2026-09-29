@@ -70,9 +70,10 @@ internal static class RetentionEntityLockSql
             .Order(StringComparer.Ordinal)
             .ToArray();
 
-        await using var command = connection.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = """
+        await using var command = new SqlParams { ["hashSeed"] = HashSeed, ["lockKeys"] = lockKeys }.CreateCommand(
+            connection,
+            transaction,
+            """
             SELECT pg_catalog.pg_advisory_xact_lock(
                 pg_catalog.hashtextextended(ordered.lock_key, @hashSeed)
             )
@@ -81,9 +82,8 @@ internal static class RetentionEntityLockSql
                 FROM pg_catalog.unnest(@lockKeys) AS keys(lock_key)
                 ORDER BY lock_key
             ) AS ordered
-            """;
-        command.Parameters.Add(RetentionHoldSql.CreateParameter(command, "hashSeed", HashSeed));
-        command.Parameters.Add(RetentionHoldSql.CreateParameter(command, "lockKeys", lockKeys));
+            """
+        );
         await command.ExecuteNonQueryAsync(ct);
     }
 

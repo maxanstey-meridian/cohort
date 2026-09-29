@@ -1,5 +1,3 @@
-using System.Data.Common;
-
 namespace Cohort.Infrastructure.Holds;
 
 internal static class RetentionHoldSql
@@ -35,15 +33,7 @@ internal static class RetentionHoldSql
             """;
     }
 
-    internal static DbParameter CreateParameter(DbCommand command, string name, object value)
-    {
-        var parameter = command.CreateParameter();
-        parameter.ParameterName = name;
-        parameter.Value = value;
-        return parameter;
-    }
-
-    internal static string QuoteIdentifier(string identifier)
+    private static string QuoteIdentifier(string identifier)
     {
         return PostgreSqlIdentifier.Quote(identifier);
     }

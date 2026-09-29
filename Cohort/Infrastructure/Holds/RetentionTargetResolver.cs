@@ -64,9 +64,10 @@ internal sealed class RetentionTargetResolver(
 
         // Prefer the stored row's own text: equality under the column type (citext, unscaled
         // numeric) can admit spellings whose cast-to-text differs from what sweeps compare.
-        await using var command = db.Database.GetDbConnection().CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = $"""
+        await using var command = new SqlParams { ["recordId"] = recordId }.CreateCommand(
+            db.Database.GetDbConnection(),
+            transaction,
+            $"""
             SELECT COALESCE(
                 (
                     SELECT {RecordIdSql.TextExpression("target", entry.RecordId)}
@@ -76,8 +77,8 @@ internal sealed class RetentionTargetResolver(
                 ),
                 CAST(CAST(@recordId AS {storeType}) AS text)
             )
-            """;
-        command.Parameters.Add(RetentionHoldSql.CreateParameter(command, "recordId", recordId));
+            """
+        );
 
         try
         {

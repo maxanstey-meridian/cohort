@@ -89,6 +89,10 @@ internal static class RetentionHandlerSupport
         return OnBeforeInvocationResult.Success;
     }
 
+    /// <summary>
+    /// Records a mutated row with its captured snapshot and queues one pending status per
+    /// handler, in the mutation's transaction.
+    /// </summary>
     public static async Task PersistCapturedRowAsync(
         DbConnection conn,
         DbTransaction transaction,
@@ -102,14 +106,6 @@ internal static class RetentionHandlerSupport
         CancellationToken ct
     )
     {
-        ArgumentNullException.ThrowIfNull(conn);
-        ArgumentNullException.ThrowIfNull(transaction);
-        ArgumentNullException.ThrowIfNull(execution);
-        ArgumentNullException.ThrowIfNull(entry);
-        ArgumentException.ThrowIfNullOrWhiteSpace(recordId);
-        ArgumentNullException.ThrowIfNull(snapshot);
-        ArgumentNullException.ThrowIfNull(handlers);
-
         var rowDetailId = await InsertRowDetailAsync(
             conn,
             transaction,
@@ -118,24 +114,19 @@ internal static class RetentionHandlerSupport
             strategy,
             tenantId,
             recordId,
-            snapshot,
+            RetentionSnapshotSerializer.Serialize(snapshot),
             ct
         );
-
         foreach (var handler in handlers)
         {
-            await InsertPendingHandlerStatusAsync(
-                conn,
-                transaction,
-                entry.CohortTables,
-                rowDetailId,
-                handler,
-                execution.At,
-                ct
-            );
+            await InsertHandlerStatusAsync(conn, transaction, entry.CohortTables, rowDetailId, handler, execution.At, failure: null, ct);
         }
     }
 
+    /// <summary>
+    /// Records a row left unmutated because an OnBefore handler failed, with that handler's
+    /// status dead-lettered. No snapshot is kept: nothing will run after it.
+    /// </summary>
     public static async Task PersistBeforeFailureAsync(
         DbConnection conn,
         DbTransaction transaction,
@@ -144,22 +135,12 @@ internal static class RetentionHandlerSupport
         Strategy strategy,
         Guid tenantId,
         string recordId,
-        IReadOnlyDictionary<string, object?> snapshot,
         ResolvedRetentionHandler failedHandler,
         Exception failure,
         ILogger logger,
         CancellationToken ct
     )
     {
-        ArgumentNullException.ThrowIfNull(conn);
-        ArgumentNullException.ThrowIfNull(transaction);
-        ArgumentNullException.ThrowIfNull(execution);
-        ArgumentNullException.ThrowIfNull(entry);
-        ArgumentException.ThrowIfNullOrWhiteSpace(recordId);
-        ArgumentNullException.ThrowIfNull(snapshot);
-        ArgumentNullException.ThrowIfNull(failedHandler);
-        ArgumentNullException.ThrowIfNull(failure);
-
         var rowDetailId = await InsertRowDetailAsync(
             conn,
             transaction,
@@ -168,7 +149,7 @@ internal static class RetentionHandlerSupport
             strategy,
             tenantId,
             recordId,
-            snapshot: null,
+            capturedPayload: null,
             ct
         );
 
@@ -180,7 +161,7 @@ internal static class RetentionHandlerSupport
             entry.EntityType.FullName,
             diagnostic.DiagnosticIdText
         );
-        await InsertDeadLetteredHandlerStatusAsync(
+        await InsertHandlerStatusAsync(
             conn,
             transaction,
             entry.CohortTables,
@@ -200,180 +181,70 @@ internal static class RetentionHandlerSupport
         Strategy strategy,
         Guid tenantId,
         string recordId,
-        IReadOnlyDictionary<string, object?>? snapshot,
+        string? capturedPayload,
         CancellationToken ct
     )
     {
-        await using var command = conn.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = $"""
-            INSERT INTO {PostgreSqlIdentifier.Format(entry.CohortTables.SweepRunRowDetail)} (
-                "SweepId",
-                "At",
-                "EntityType",
-                "RetentionEntityId",
-                "RecordId",
-                "Category",
-                "Strategy",
-                "TenantId",
-                "CapturedPayload"
-            )
-            VALUES (
-                @sweepId,
-                @at,
-                @entityType,
-                @retentionEntityId,
-                @recordId,
-                @category,
-                @strategy,
-                @tenantId,
-                @capturedPayload
-            )
+        await using var command = new SqlParams
+        {
+            ["sweepId"] = execution.SweepId,
+            ["at"] = execution.At,
+            ["entityType"] = entry.EntityType.FullName ?? entry.EntityType.Name,
+            ["retentionEntityId"] = entry.RetentionEntityId,
+            ["recordId"] = recordId,
+            ["category"] = entry.Category,
+            ["strategy"] = (int)strategy,
+            ["tenantId"] = tenantId,
+            ["capturedPayload"] = capturedPayload,
+        }.CreateCommand(
+            conn,
+            transaction,
+            $"""
+            INSERT INTO {PostgreSqlIdentifier.Format(entry.CohortTables.SweepRunRowDetail)}
+                ("SweepId", "At", "EntityType", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId", "CapturedPayload")
+            VALUES (@sweepId, @at, @entityType, @retentionEntityId, @recordId, @category, @strategy, @tenantId, @capturedPayload)
             RETURNING "Id"
-            """;
-        command.Parameters.Add(CreateParameter(command, "sweepId", execution.SweepId));
-        command.Parameters.Add(CreateParameter(command, "at", execution.At));
-        command.Parameters.Add(
-            CreateParameter(
-                command,
-                "entityType",
-                entry.EntityType.FullName ?? entry.EntityType.Name
-            )
+            """
         );
-        command.Parameters.Add(CreateParameter(command, "retentionEntityId", entry.RetentionEntityId));
-        command.Parameters.Add(CreateParameter(command, "recordId", recordId));
-        command.Parameters.Add(CreateParameter(command, "category", entry.Category));
-        command.Parameters.Add(CreateParameter(command, "strategy", (int)strategy));
-        command.Parameters.Add(CreateParameter(command, "tenantId", tenantId));
-        command.Parameters.Add(
-            CreateParameter(
-                command,
-                "capturedPayload",
-                snapshot is null ? null : RetentionSnapshotSerializer.Serialize(snapshot)
-            )
-        );
-
-        var insertedId = await command.ExecuteScalarAsync(ct);
-        return Convert.ToInt64(insertedId, System.Globalization.CultureInfo.InvariantCulture);
+        return (long)(await command.ExecuteScalarAsync(ct))!;
     }
 
-    private static async Task InsertPendingHandlerStatusAsync(
+    /// <summary>
+    /// Queues a pending status, or with <paramref name="failure"/> records one already
+    /// dead-lettered on its first attempt.
+    /// </summary>
+    private static async Task InsertHandlerStatusAsync(
         DbConnection conn,
         DbTransaction transaction,
         CohortStoreTables tables,
         long rowDetailId,
         ResolvedRetentionHandler handler,
-        DateTimeOffset queuedAt,
+        DateTimeOffset at,
+        string? failure,
         CancellationToken ct
     )
     {
-        await using var command = conn.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = $"""
-            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)} (
-                "SweepRunRowDetailId",
-                "HandlerType",
-                "DispatchPhase",
-                "State",
-                "Attempt",
-                "QueuedAt",
-                "NextAttemptAt",
-                "ClaimedAt",
-                "CompletedAt",
-                "LastError"
-            )
-            VALUES (
-                @rowDetailId,
-                @handlerType,
-                @dispatchPhase,
-                @state,
-                @attempt,
-                @queuedAt,
-                @nextAttemptAt,
-                NULL,
-                NULL,
-                NULL
-            )
-            """;
-        command.Parameters.Add(CreateParameter(command, "rowDetailId", rowDetailId));
-        command.Parameters.Add(CreateParameter(command, "handlerType", handler.HandlerIdentity));
-        command.Parameters.Add(
-            CreateParameter(command, "dispatchPhase", (int)handler.DispatchPhase)
+        await using var command = new SqlParams
+        {
+            ["rowDetailId"] = rowDetailId,
+            ["handlerType"] = handler.HandlerIdentity,
+            ["dispatchPhase"] = (int)handler.DispatchPhase,
+            ["state"] = (int)(failure is null ? SweepRowHandlerDispatchState.Pending : SweepRowHandlerDispatchState.DeadLettered),
+            ["attempt"] = failure is null ? 0 : 1,
+            ["at"] = at,
+            ["completedAt"] = failure is null ? null : at,
+            ["lastError"] = failure,
+        }.CreateCommand(
+            conn,
+            transaction,
+            $"""
+            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)}
+                ("SweepRunRowDetailId", "HandlerType", "DispatchPhase", "State", "Attempt", "QueuedAt", "NextAttemptAt", "ClaimedAt", "CompletedAt", "LastError")
+            VALUES (@rowDetailId, @handlerType, @dispatchPhase, @state, @attempt, @at, @at, NULL, @completedAt, @lastError)
+            """
         );
-        command.Parameters.Add(
-            CreateParameter(command, "state", (int)SweepRowHandlerDispatchState.Pending)
-        );
-        command.Parameters.Add(CreateParameter(command, "attempt", 0));
-        command.Parameters.Add(CreateParameter(command, "queuedAt", queuedAt));
-        command.Parameters.Add(CreateParameter(command, "nextAttemptAt", queuedAt));
-
         await command.ExecuteNonQueryAsync(ct);
     }
-
-    private static async Task InsertDeadLetteredHandlerStatusAsync(
-        DbConnection conn,
-        DbTransaction transaction,
-        CohortStoreTables tables,
-        long rowDetailId,
-        ResolvedRetentionHandler handler,
-        DateTimeOffset failedAt,
-        string failureDiagnostic,
-        CancellationToken ct
-    )
-    {
-        await using var command = conn.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = $"""
-            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)} (
-                "SweepRunRowDetailId",
-                "HandlerType",
-                "DispatchPhase",
-                "State",
-                "Attempt",
-                "QueuedAt",
-                "NextAttemptAt",
-                "ClaimedAt",
-                "CompletedAt",
-                "LastError"
-            )
-            VALUES (
-                @rowDetailId,
-                @handlerType,
-                @dispatchPhase,
-                @state,
-                @attempt,
-                @queuedAt,
-                @nextAttemptAt,
-                NULL,
-                @completedAt,
-                @lastError
-            )
-            """;
-        command.Parameters.Add(CreateParameter(command, "rowDetailId", rowDetailId));
-        command.Parameters.Add(CreateParameter(command, "handlerType", handler.HandlerIdentity));
-        command.Parameters.Add(
-            CreateParameter(command, "dispatchPhase", (int)handler.DispatchPhase)
-        );
-        command.Parameters.Add(
-            CreateParameter(command, "state", (int)SweepRowHandlerDispatchState.DeadLettered)
-        );
-        command.Parameters.Add(CreateParameter(command, "attempt", 1));
-        command.Parameters.Add(CreateParameter(command, "queuedAt", failedAt));
-        command.Parameters.Add(CreateParameter(command, "nextAttemptAt", failedAt));
-        command.Parameters.Add(CreateParameter(command, "completedAt", failedAt));
-        command.Parameters.Add(CreateParameter(command, "lastError", failureDiagnostic));
-
-        await command.ExecuteNonQueryAsync(ct);
-    }
-
-    private static DbParameter CreateParameter(DbCommand command, string name, object? value)
-    {
-        var parameter = command.CreateParameter();
-        parameter.ParameterName = name;
-        parameter.Value = value ?? DBNull.Value;
-        return parameter;
-    }
-
 }
 
 internal sealed class ResolvedRetentionHandler(

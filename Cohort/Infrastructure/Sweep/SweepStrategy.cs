@@ -205,7 +205,6 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
                         scope.Rule.Strategy,
                         scope.Tenant.Id,
                         skippedId,
-                        new Dictionary<string, object?>(before.Snapshot, StringComparer.Ordinal),
                         result.FailedHandler!,
                         result.Failure!,
                         logger,

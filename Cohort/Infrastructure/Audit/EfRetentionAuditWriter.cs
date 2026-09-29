@@ -1,20 +1,22 @@
-using System.Data;
-using System.Data.Common;
 using Cohort.Application;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Infrastructure.Audit;
 
+// Cohort's run tables may be adopted by host entity types, so they are written with raw SQL
+// rather than typed LINQ. Interpolations are table names quoted from the EF model only.
+#pragma warning disable EF1002
+
+/// <summary>
+/// Writes the audit ledger. Statements run on the scoped DbContext, so they join the
+/// caller's transaction when there is one.
+/// </summary>
 internal sealed class EfRetentionAuditWriter(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db
 )
 {
     private readonly CohortStoreTables tables = CohortStoreTables.FromModel(db.Model);
-
-    private const string TerminalTransitionError =
-        "Sweep run does not exist or is no longer in the Started state.";
 
     public Task WriteAsync(SweepEvent evt, CancellationToken ct)
     {
@@ -26,13 +28,10 @@ internal sealed class EfRetentionAuditWriter(
             SweepEvent.EntityProgress progress => WriteEntityProgressAsync(progress, ct),
             SweepEvent.EntitySummary summary => WriteEntitySummaryAsync(summary, ct),
             SweepEvent.RowDetail rowDetail => WriteRowDetailAsync(rowDetail, ct),
-            SweepEvent.Completed completed => WriteCompletedAsync(completed, ct),
-            SweepEvent.PartiallyFailed partiallyFailed => WritePartiallyFailedAsync(
-                partiallyFailed,
-                ct
-            ),
-            SweepEvent.Failed failed => WriteFailedAsync(failed, ct),
-            SweepEvent.Cancelled cancelled => WriteCancelledAsync(cancelled, ct),
+            SweepEvent.Completed e => WriteTerminalAsync(e.SweepId, SweepRunStatus.Succeeded, e.At, e.Duration, e.TotalAffected, null, ct),
+            SweepEvent.PartiallyFailed e => WriteTerminalAsync(e.SweepId, SweepRunStatus.PartiallyFailed, e.At, e.Duration, e.TotalAffected, e.Error, ct),
+            SweepEvent.Failed e => WriteTerminalAsync(e.SweepId, SweepRunStatus.Failed, e.At, e.Duration, e.TotalAffected, e.Error, ct),
+            SweepEvent.Cancelled e => WriteTerminalAsync(e.SweepId, SweepRunStatus.Cancelled, e.At, e.Duration, e.TotalAffected, e.Error, ct),
             _ => throw new InvalidOperationException(
                 $"Unsupported sweep event type '{evt.GetType().FullName}'."
             ),
@@ -43,41 +42,18 @@ internal sealed class EfRetentionAuditWriter(
     {
         return ExecuteAsync(
             $"""
-            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRun)} (
-                "SweepId",
-                "StartedAt",
-                "Status",
-                "SettledAt",
-                "Duration",
-                "TriggerKind",
-                "DryRun",
-                "TenantId",
-                "TotalAffected"
-            )
-            VALUES (
-                @sweepId,
-                @startedAt,
-                @status,
-                NULL,
-                NULL,
-                @triggerKind,
-                @dryRun,
-                @tenantId,
-                0
-            )
+            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRun)}
+                ("SweepId", "StartedAt", "Status", "SettledAt", "Duration", "TriggerKind", "DryRun", "TenantId", "TotalAffected")
+            VALUES (@sweepId, @startedAt, @status, NULL, NULL, @triggerKind, @dryRun, @tenantId, 0)
             """,
-            command =>
+            new SqlParams
             {
-                command.Parameters.Add(CreateParameter(command, "sweepId", started.SweepId));
-                command.Parameters.Add(CreateParameter(command, "startedAt", started.At));
-                command.Parameters.Add(
-                    CreateParameter(command, "status", (int)SweepRunStatus.Started)
-                );
-                command.Parameters.Add(
-                    CreateParameter(command, "triggerKind", (int)started.Trigger)
-                );
-                command.Parameters.Add(CreateParameter(command, "dryRun", started.DryRun));
-                command.Parameters.Add(CreateParameter(command, "tenantId", started.TenantId));
+                ["sweepId"] = started.SweepId,
+                ["startedAt"] = started.At,
+                ["status"] = (int)SweepRunStatus.Started,
+                ["triggerKind"] = (int)started.Trigger,
+                ["dryRun"] = started.DryRun,
+                ["tenantId"] = started.TenantId,
             },
             ct
         );
@@ -87,38 +63,11 @@ internal sealed class EfRetentionAuditWriter(
     {
         return ExecuteAsync(
             $"""
-            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRunEntitySummary)} AS current_summary (
-                "SweepId",
-                "At",
-                "EntityType",
-                "RetentionEntityId",
-                "Category",
-                "TenantId",
-                "Strategy",
-                "ResolvedPeriod",
-                "Affected",
-                "HeldCount",
-                "SkippedCount",
-                "NullAnchorCount",
-                "RuleSource",
-                "RuleReason"
-            )
-            VALUES (
-                @sweepId,
-                @at,
-                @entityType,
-                @retentionEntityId,
-                @category,
-                @tenantId,
-                @strategy,
-                @resolvedPeriod,
-                @affected,
-                @heldCount,
-                @skippedCount,
-                @nullAnchorCount,
-                @ruleSource,
-                @ruleReason
-            )
+            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRunEntitySummary)} AS current_summary
+                ("SweepId", "At", "EntityType", "RetentionEntityId", "Category", "TenantId", "Strategy",
+                 "ResolvedPeriod", "Affected", "HeldCount", "SkippedCount", "NullAnchorCount", "RuleSource", "RuleReason")
+            VALUES (@sweepId, @at, @entityType, @retentionEntityId, @category, @tenantId, @strategy,
+                    @resolvedPeriod, @affected, @heldCount, @skippedCount, @nullAnchorCount, @ruleSource, @ruleReason)
             ON CONFLICT ("SweepId", "RetentionEntityId", "Category", "TenantId", "Strategy")
             DO UPDATE SET
                 "EntityType" = EXCLUDED."EntityType",
@@ -129,36 +78,22 @@ internal sealed class EfRetentionAuditWriter(
                 "RuleSource" = EXCLUDED."RuleSource",
                 "RuleReason" = EXCLUDED."RuleReason"
             """,
-            command =>
+            new SqlParams
             {
-                command.Parameters.Add(CreateParameter(command, "sweepId", summary.SweepId));
-                command.Parameters.Add(CreateParameter(command, "at", summary.At));
-                command.Parameters.Add(
-                    CreateParameter(command, "entityType", GetEntityTypeName(summary.EntityType))
-                );
-                command.Parameters.Add(
-                    CreateParameter(command, "retentionEntityId", summary.RetentionEntityId)
-                );
-                command.Parameters.Add(CreateParameter(command, "category", summary.Category));
-                command.Parameters.Add(CreateParameter(command, "tenantId", summary.TenantId));
-                command.Parameters.Add(CreateParameter(command, "strategy", (int)summary.Strategy));
-                command.Parameters.Add(
-                    CreateParameter(command, "resolvedPeriod", summary.ResolvedPeriod)
-                );
-                command.Parameters.Add(CreateParameter(command, "affected", summary.Affected));
-                command.Parameters.Add(CreateParameter(command, "heldCount", summary.HeldCount));
-                command.Parameters.Add(
-                    CreateParameter(command, "skippedCount", summary.SkippedCount)
-                );
-                command.Parameters.Add(
-                    CreateParameter(command, "nullAnchorCount", summary.NullAnchorCount)
-                );
-                command.Parameters.Add(
-                    CreateParameter(command, "ruleSource", summary.Provenance?.Source)
-                );
-                command.Parameters.Add(
-                    CreateParameter(command, "ruleReason", summary.Provenance?.Reason)
-                );
+                ["sweepId"] = summary.SweepId,
+                ["at"] = summary.At,
+                ["entityType"] = EntityTypeName(summary.EntityType),
+                ["retentionEntityId"] = summary.RetentionEntityId,
+                ["category"] = summary.Category,
+                ["tenantId"] = summary.TenantId,
+                ["strategy"] = (int)summary.Strategy,
+                ["resolvedPeriod"] = summary.ResolvedPeriod,
+                ["affected"] = summary.Affected,
+                ["heldCount"] = summary.HeldCount,
+                ["skippedCount"] = summary.SkippedCount,
+                ["nullAnchorCount"] = summary.NullAnchorCount,
+                ["ruleSource"] = summary.Provenance?.Source,
+                ["ruleReason"] = summary.Provenance?.Reason,
             },
             ct
         );
@@ -169,54 +104,37 @@ internal sealed class EfRetentionAuditWriter(
         return ExecuteAsync(
             $"""
             WITH upserted_summary AS (
-            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRunEntitySummary)} AS current_summary (
-                "SweepId", "At", "EntityType", "RetentionEntityId", "Category", "TenantId", "Strategy",
-                "ResolvedPeriod", "Affected", "HeldCount", "SkippedCount", "NullAnchorCount",
-                "RuleSource", "RuleReason"
-            ) VALUES (
-                @sweepId, @at, @entityType, @retentionEntityId, @category, @tenantId, @strategy,
-                @resolvedPeriod, @affected, 0, @skippedCount, 0, @ruleSource, @ruleReason
-            )
-            ON CONFLICT ("SweepId", "RetentionEntityId", "Category", "TenantId", "Strategy")
-            DO UPDATE SET
-                "EntityType" = EXCLUDED."EntityType",
-                "Affected" = current_summary."Affected" + EXCLUDED."Affected",
-                "SkippedCount" = current_summary."SkippedCount" + EXCLUDED."SkippedCount"
-            RETURNING 1
+                INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRunEntitySummary)} AS current_summary
+                    ("SweepId", "At", "EntityType", "RetentionEntityId", "Category", "TenantId", "Strategy",
+                     "ResolvedPeriod", "Affected", "HeldCount", "SkippedCount", "NullAnchorCount", "RuleSource", "RuleReason")
+                VALUES (@sweepId, @at, @entityType, @retentionEntityId, @category, @tenantId, @strategy,
+                        @resolvedPeriod, @affected, 0, @skippedCount, 0, @ruleSource, @ruleReason)
+                ON CONFLICT ("SweepId", "RetentionEntityId", "Category", "TenantId", "Strategy")
+                DO UPDATE SET
+                    "EntityType" = EXCLUDED."EntityType",
+                    "Affected" = current_summary."Affected" + EXCLUDED."Affected",
+                    "SkippedCount" = current_summary."SkippedCount" + EXCLUDED."SkippedCount"
+                RETURNING 1
             )
             UPDATE {PostgreSqlIdentifier.Format(tables.SweepRun)}
             SET "TotalAffected" = "TotalAffected" + @affected
             WHERE "SweepId" = @sweepId
               AND EXISTS (SELECT 1 FROM upserted_summary)
             """,
-            command =>
+            new SqlParams
             {
-                command.Parameters.Add(CreateParameter(command, "sweepId", progress.SweepId));
-                command.Parameters.Add(CreateParameter(command, "at", progress.At));
-                command.Parameters.Add(
-                    CreateParameter(command, "entityType", GetEntityTypeName(progress.EntityType))
-                );
-                command.Parameters.Add(
-                    CreateParameter(command, "retentionEntityId", progress.RetentionEntityId)
-                );
-                command.Parameters.Add(CreateParameter(command, "category", progress.Category));
-                command.Parameters.Add(CreateParameter(command, "tenantId", progress.TenantId));
-                command.Parameters.Add(
-                    CreateParameter(command, "strategy", (int)progress.Strategy)
-                );
-                command.Parameters.Add(
-                    CreateParameter(command, "resolvedPeriod", progress.ResolvedPeriod)
-                );
-                command.Parameters.Add(CreateParameter(command, "affected", progress.Affected));
-                command.Parameters.Add(
-                    CreateParameter(command, "skippedCount", progress.SkippedCount)
-                );
-                command.Parameters.Add(
-                    CreateParameter(command, "ruleSource", progress.Provenance?.Source)
-                );
-                command.Parameters.Add(
-                    CreateParameter(command, "ruleReason", progress.Provenance?.Reason)
-                );
+                ["sweepId"] = progress.SweepId,
+                ["at"] = progress.At,
+                ["entityType"] = EntityTypeName(progress.EntityType),
+                ["retentionEntityId"] = progress.RetentionEntityId,
+                ["category"] = progress.Category,
+                ["tenantId"] = progress.TenantId,
+                ["strategy"] = (int)progress.Strategy,
+                ["resolvedPeriod"] = progress.ResolvedPeriod,
+                ["affected"] = progress.Affected,
+                ["skippedCount"] = progress.SkippedCount,
+                ["ruleSource"] = progress.Provenance?.Source,
+                ["ruleReason"] = progress.Provenance?.Reason,
             },
             ct
         );
@@ -226,238 +144,72 @@ internal sealed class EfRetentionAuditWriter(
     {
         return ExecuteAsync(
             $"""
-            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRunRowDetail)} (
-                "SweepId",
-                "At",
-                "EntityType",
-                "RetentionEntityId",
-                "RecordId",
-                "Category",
-                "Strategy",
-                "TenantId"
-            )
-            VALUES (
-                @sweepId,
-                @at,
-                @entityType,
-                @retentionEntityId,
-                @recordId,
-                @category,
-                @strategy,
-                @tenantId
-            )
+            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRunRowDetail)}
+                ("SweepId", "At", "EntityType", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId")
+            VALUES (@sweepId, @at, @entityType, @retentionEntityId, @recordId, @category, @strategy, @tenantId)
             """,
-            command =>
+            new SqlParams
             {
-                command.Parameters.Add(CreateParameter(command, "sweepId", rowDetail.SweepId));
-                command.Parameters.Add(CreateParameter(command, "at", rowDetail.At));
-                command.Parameters.Add(
-                    CreateParameter(command, "entityType", GetEntityTypeName(rowDetail.EntityType))
-                );
-                command.Parameters.Add(
-                    CreateParameter(command, "retentionEntityId", rowDetail.RetentionEntityId)
-                );
-                command.Parameters.Add(CreateParameter(command, "recordId", rowDetail.RecordId));
-                command.Parameters.Add(CreateParameter(command, "category", rowDetail.Category));
-                command.Parameters.Add(
-                    CreateParameter(command, "strategy", (int)rowDetail.Strategy)
-                );
-                command.Parameters.Add(CreateParameter(command, "tenantId", rowDetail.TenantId));
+                ["sweepId"] = rowDetail.SweepId,
+                ["at"] = rowDetail.At,
+                ["entityType"] = EntityTypeName(rowDetail.EntityType),
+                ["retentionEntityId"] = rowDetail.RetentionEntityId,
+                ["recordId"] = rowDetail.RecordId,
+                ["category"] = rowDetail.Category,
+                ["strategy"] = (int)rowDetail.Strategy,
+                ["tenantId"] = rowDetail.TenantId,
             },
             ct
         );
     }
 
-    private Task WriteCompletedAsync(SweepEvent.Completed completed, CancellationToken ct)
-    {
-        return ExecuteAsync(
-            $"""
-            UPDATE {PostgreSqlIdentifier.Format(tables.SweepRun)}
-            SET "Status" = @status,
-                "SettledAt" = @completedAt,
-                "Duration" = @duration,
-                "TotalAffected" = CASE WHEN "DryRun" THEN @totalAffected ELSE "TotalAffected" END
-            WHERE "SweepId" = @sweepId
-              AND "Status" = @startedStatus
-            """,
-            command =>
-            {
-                command.Parameters.Add(CreateParameter(command, "sweepId", completed.SweepId));
-                command.Parameters.Add(
-                    CreateParameter(command, "status", (int)SweepRunStatus.Succeeded)
-                );
-                command.Parameters.Add(
-                    CreateParameter(command, "startedStatus", (int)SweepRunStatus.Started)
-                );
-                command.Parameters.Add(CreateParameter(command, "completedAt", completed.At));
-                command.Parameters.Add(CreateParameter(command, "duration", completed.Duration));
-                command.Parameters.Add(
-                    CreateParameter(command, "totalAffected", completed.TotalAffected)
-                );
-            },
-            ct,
-            TerminalTransitionError
-        );
-    }
-
-    private Task WritePartiallyFailedAsync(SweepEvent.PartiallyFailed failed, CancellationToken ct)
-    {
-        return WriteTerminalAsync(
-            failed.SweepId,
-            SweepRunStatus.PartiallyFailed,
-            failed.At,
-            failed.Duration,
-            failed.TotalAffected,
-            failed.Error,
-            ct
-        );
-    }
-
-    private Task WriteFailedAsync(SweepEvent.Failed failed, CancellationToken ct)
-    {
-        return ExecuteAsync(
-            $"""
-            UPDATE {PostgreSqlIdentifier.Format(tables.SweepRun)}
-            SET "Status" = @status,
-                "SettledAt" = @failedAt,
-                "Duration" = @duration,
-                "TotalAffected" = CASE
-                    WHEN "DryRun" THEN COALESCE(@totalAffected, "TotalAffected")
-                    ELSE "TotalAffected"
-                END,
-                "Error" = @error
-            WHERE "SweepId" = @sweepId
-              AND "Status" = @startedStatus
-            """,
-            command =>
-            {
-                command.Parameters.Add(CreateParameter(command, "sweepId", failed.SweepId));
-                command.Parameters.Add(
-                    CreateParameter(command, "status", (int)SweepRunStatus.Failed)
-                );
-                command.Parameters.Add(
-                    CreateParameter(command, "startedStatus", (int)SweepRunStatus.Started)
-                );
-                command.Parameters.Add(CreateParameter(command, "failedAt", failed.At));
-                command.Parameters.Add(CreateParameter(command, "duration", failed.Duration));
-                command.Parameters.Add(
-                    CreateParameter(command, "totalAffected", failed.TotalAffected)
-                );
-                command.Parameters.Add(CreateParameter(command, "error", failed.Error));
-            },
-            ct,
-            TerminalTransitionError
-        );
-    }
-
-    private Task WriteCancelledAsync(SweepEvent.Cancelled cancelled, CancellationToken ct)
-    {
-        return WriteTerminalAsync(
-            cancelled.SweepId,
-            SweepRunStatus.Cancelled,
-            cancelled.At,
-            cancelled.Duration,
-            cancelled.TotalAffected,
-            cancelled.Error,
-            ct
-        );
-    }
-
-    private Task WriteTerminalAsync(
+    /// <summary>
+    /// Settles a Started run. A real run's total is the sum of its committed progress, so
+    /// only a dry run takes the event's total.
+    /// </summary>
+    private async Task WriteTerminalAsync(
         Guid sweepId,
         SweepRunStatus status,
         DateTimeOffset settledAt,
-        TimeSpan duration,
-        long totalAffected,
-        string error,
+        TimeSpan? duration,
+        long? totalAffected,
+        string? error,
         CancellationToken ct
     )
     {
-        return ExecuteAsync(
+        var settled = await ExecuteAsync(
             $"""
             UPDATE {PostgreSqlIdentifier.Format(tables.SweepRun)}
             SET "Status" = @status,
                 "SettledAt" = @settledAt,
                 "Duration" = @duration,
-                "TotalAffected" = CASE WHEN "DryRun" THEN @totalAffected ELSE "TotalAffected" END,
+                "TotalAffected" = CASE WHEN "DryRun" THEN COALESCE(@totalAffected, "TotalAffected") ELSE "TotalAffected" END,
                 "Error" = @error
             WHERE "SweepId" = @sweepId
               AND "Status" = @startedStatus
             """,
-            command =>
+            new SqlParams
             {
-                command.Parameters.Add(CreateParameter(command, "sweepId", sweepId));
-                command.Parameters.Add(CreateParameter(command, "status", (int)status));
-                command.Parameters.Add(
-                    CreateParameter(command, "startedStatus", (int)SweepRunStatus.Started)
-                );
-                command.Parameters.Add(CreateParameter(command, "settledAt", settledAt));
-                command.Parameters.Add(CreateParameter(command, "duration", duration));
-                command.Parameters.Add(CreateParameter(command, "totalAffected", totalAffected));
-                command.Parameters.Add(CreateParameter(command, "error", error));
+                ["sweepId"] = sweepId,
+                ["status"] = (int)status,
+                ["startedStatus"] = (int)SweepRunStatus.Started,
+                ["settledAt"] = settledAt,
+                ["duration"] = duration,
+                ["totalAffected"] = totalAffected,
+                ["error"] = error,
             },
-            ct,
-            TerminalTransitionError
+            ct
         );
-    }
-
-    private async Task ExecuteAsync(
-        string commandText,
-        Action<DbCommand> configure,
-        CancellationToken ct,
-        string? zeroRowsError = null
-    )
-    {
-        var connection = db.Database.GetDbConnection();
-        var shouldCloseConnection = connection.State != ConnectionState.Open;
-        Exception? primaryException = null;
-
-        try
+        if (settled != 1)
         {
-            if (shouldCloseConnection)
-            {
-                await db.Database.OpenConnectionAsync(ct);
-            }
-
-            await using var command = connection.CreateCommand();
-            command.CommandText = commandText;
-            command.Transaction = db.Database.CurrentTransaction?.GetDbTransaction();
-            configure(command);
-            var affected = await command.ExecuteNonQueryAsync(ct);
-            if (affected != 1 && zeroRowsError is not null)
-            {
-                throw new InvalidOperationException(zeroRowsError);
-            }
-        }
-        catch (Exception ex)
-        {
-            primaryException = ex;
-            throw;
-        }
-        finally
-        {
-            await OperationalConnectionCleanup.RunAsync(
-                null,
-                shouldCloseConnection
-                    ? cleanupToken => db.Database.CloseConnectionAsync().WaitAsync(cleanupToken)
-                    : null,
-                primaryException,
-                null
+            throw new InvalidOperationException(
+                "Sweep run does not exist or is no longer in the Started state."
             );
         }
     }
 
-    private static DbParameter CreateParameter(DbCommand command, string name, object? value)
-    {
-        var parameter = command.CreateParameter();
-        parameter.ParameterName = name;
-        parameter.Value = value ?? DBNull.Value;
-        return parameter;
-    }
+    private Task<int> ExecuteAsync(string sql, SqlParams parameters, CancellationToken ct) =>
+        db.Database.ExecuteSqlRawAsync(sql, parameters.ToDbParameters(db.Database.GetDbConnection()), ct);
 
-    private static string GetEntityTypeName(Type entityType)
-    {
-        return entityType.FullName ?? entityType.Name;
-    }
-
+    private static string EntityTypeName(Type entityType) => entityType.FullName ?? entityType.Name;
 }

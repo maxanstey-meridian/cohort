@@ -101,39 +101,31 @@ internal sealed class EfRetentionDeletion(
         CancellationToken ct
     )
     {
-        await using var command = db.Database.GetDbConnection().CreateCommand();
-        command.Transaction = transaction;
-        var tenantPredicate = target.Entry.Tenant is not null
-            ? "AND \"TenantId\" = @tenantId"
-            : "AND \"TenantId\" IS NULL";
-        command.CommandText = $"""
+        var parameters = new SqlParams
+        {
+            ["retentionEntityId"] = target.Entry.RetentionEntityId,
+            ["recordId"] = target.RecordId,
+        };
+        if (target.Entry.Tenant is not null)
+        {
+            parameters["tenantId"] = target.TenantId;
+        }
+
+        await using var command = parameters.CreateCommand(
+            db.Database.GetDbConnection(),
+            transaction,
+            $"""
             SELECT 1
             FROM {PostgreSqlIdentifier.Format(tables.RetentionHolds)}
             WHERE "RetentionEntityId" = @retentionEntityId
               AND "RecordId" = @recordId
-              {tenantPredicate}
+              {(target.Entry.Tenant is not null ? "AND \"TenantId\" = @tenantId" : "AND \"TenantId\" IS NULL")}
               AND "CreatedAt" <= pg_catalog.statement_timestamp()
               AND ("ExpiresAt" IS NULL OR "ExpiresAt" > pg_catalog.statement_timestamp())
               AND ("RemovedAt" IS NULL OR "RemovedAt" > pg_catalog.statement_timestamp())
             LIMIT 1
-            """;
-        command.Parameters.Add(
-            RetentionHoldSql.CreateParameter(
-                command,
-                "retentionEntityId",
-                target.Entry.RetentionEntityId
-            )
+            """
         );
-        command.Parameters.Add(
-            RetentionHoldSql.CreateParameter(command, "recordId", target.RecordId)
-        );
-        if (target.Entry.Tenant is not null)
-        {
-            command.Parameters.Add(
-                RetentionHoldSql.CreateParameter(command, "tenantId", target.TenantId!.Value)
-            );
-        }
-
         return await command.ExecuteScalarAsync(ct) is not null;
     }
 

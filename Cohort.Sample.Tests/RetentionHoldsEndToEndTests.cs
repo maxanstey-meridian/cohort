@@ -459,6 +459,45 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task CreateAsync_In_A_Repeatable_Read_Transaction_Rejects_A_Row_Deleted_After_The_Snapshot()
+    {
+        // The caller's snapshot can still show a row another transaction has since deleted;
+        // a hold created on it would persist while protecting nothing.
+        var tenantId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        var holdId = Guid.NewGuid();
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(new Note { Id = noteId, TenantId = tenantId, CreatedAt = DateTimeOffset.UtcNow.AddDays(-1), Body = "stale-snapshot-hold" });
+            await db.SaveChangesAsync();
+        }
+
+        var create = () => Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            await using var transaction = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.RepeatableRead);
+            await db.Notes.CountAsync(); // takes the snapshot
+
+            await using (var other = Host.CreateDbContext())
+            {
+                await other.Notes.Where(note => note.Id == noteId).ExecuteDeleteAsync();
+            }
+
+            await services.GetRequiredService<IRetentionHoldsRepository>().CreateAsync(
+                new RetentionHoldRequest(holdId, RetentionEntityIdentity.For<Note>(), noteId.ToString(), tenantId, "stale snapshot", DateTimeOffset.UtcNow),
+                CancellationToken.None
+            );
+            await transaction.CommitAsync();
+        });
+
+        await create.Should().ThrowAsync<Exception>();
+        var holds = await Host.RunWithServicesAsync(services =>
+            services.GetRequiredService<IRetentionHoldsRepository>().ListActiveAsync(DateTimeOffset.UtcNow, CancellationToken.None)
+        );
+        holds.Should().NotContain(hold => hold.HoldId == holdId);
+    }
+
+    [Fact]
     public async Task CreateAsync_Rejects_Holds_Whose_Tenant_Does_Not_Match_The_Existing_Rows_Tenant()
     {
         // The sweep-side exclusion on tenanted tables only honours holds whose TenantId

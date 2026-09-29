@@ -87,9 +87,9 @@ These follow the same pattern as `[Anonymise]` — property-level, discovered by
 
 ## Record ID types
 
-Cohort is PK-type-agnostic. Entity record IDs can be `Guid`, `int`, `long`, `string`, or any other type. Cohort stores canonical record IDs as `text` in its own infrastructure tables (`retention_holds.RecordId`, `sweep_run_row_detail.RecordId`). Hold-table joins cast the column to text (`hold."RecordId" = CAST(target."pk_col" AS text)`); candidate-id matching casts the **parameter** to the column's store type when EF metadata exposes one (`RecordIdSql`, index-friendly), falling back to the column-to-text cast otherwise.
+Entity record IDs can be `Guid`, integers, `numeric`, `string`/`citext`, or converted keys. Types whose text form depends on session settings (timestamps, dates, times, intervals, floats, `money`, `bytea`) are rejected at startup. Cohort stores canonical record IDs as `text` in its own infrastructure tables (`retention_holds.RecordId`, `sweep_run_row_detail.RecordId`). Hold-table joins cast the column to text (`hold."RecordId" = CAST(target."pk_col" AS text)`); candidate-id matching casts the **parameter** to the column's store type when EF metadata exposes one (`RecordIdSql`, index-friendly), falling back to the column-to-text cast otherwise.
 
-`RetentionEntityId` always means the stable UUID assigned to a retained entity type. `RecordId` always means one row's canonical text identity. Hold creation canonicalizes the mapped ID, requires the target row to exist, validates tenant ownership, and uses the same advisory-lock key as mutation. Tenantless targets require a null tenant ID.
+`RetentionEntityId` always means the stable UUID assigned to a retained entity type. `RecordId` always means one row's canonical text identity. Hold creation stores the row's own canonical text, requires the target row to exist (read `FOR SHARE`), validates tenant ownership, and uses the same advisory-lock key as mutation. Tenantless targets require a null tenant ID.
 
 ## Entity annotation
 

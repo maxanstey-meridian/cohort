@@ -17,9 +17,9 @@ internal sealed class RetentionSweepEngine(
     RetentionRuntimeReadinessValidator readinessValidator,
     EfRetentionAuditWriter auditWriter,
     IEnumerable<IRetentionSweepStrategy> sweepStrategies,
-    IRetentionExecutionSettings? options = null,
-    RetentionAuditNotifier? auditNotifier = null,
-    ILogger<RetentionSweepEngine>? logger = null
+    IRetentionExecutionSettings options,
+    RetentionAuditNotifier auditNotifier,
+    ILogger<RetentionSweepEngine> logger
 )
 {
     private readonly IReadOnlyDictionary<Strategy, IRetentionSweepStrategy> strategies =
@@ -38,7 +38,7 @@ internal sealed class RetentionSweepEngine(
 
         var sweepId = Guid.NewGuid();
         var startedAt = DateTimeOffset.UtcNow;
-        var batchSize = Math.Max(1, options?.SweepBatchSize ?? 5000);
+        var batchSize = options.SweepBatchSize;
         var lifecycle = new RetentionRunLifecycle(auditWriter, auditNotifier, logger);
         var entityFailures = new List<string>();
         var startedPersisted = false;
@@ -65,7 +65,7 @@ internal sealed class RetentionSweepEngine(
             await RetentionRunAdvisoryLock.AcquireAsync(connection, sweepId, ct);
             runLockAcquired = true;
 
-            if (options?.DryRun == true)
+            if (options.DryRun)
             {
                 throw new InvalidOperationException(
                     "Cohort is configured with DryRun enabled. RetentionSweepEngine.SweepAsync mutates data and refuses to run as a safety net; use IRetentionPreview for a count-only pass, or clear Cohort:DryRun."
@@ -114,7 +114,7 @@ internal sealed class RetentionSweepEngine(
                     // the result.
                     var diagnostic = RetentionFailureDiagnostic.Create(ex);
                     entityFailures.Add(diagnostic.ToString());
-                    logger?.LogError(
+                    logger.LogError(
                         ex,
                         "Cohort sweep {SweepId} failed for entity {EntityType}; continuing with remaining entities. Diagnostic {DiagnosticId}.",
                         sweepId,
@@ -158,7 +158,7 @@ internal sealed class RetentionSweepEngine(
             primaryException = ex;
             var cancelledAt = DateTimeOffset.UtcNow;
             var diagnostic = RetentionFailureDiagnostic.Create(ex);
-            logger?.LogWarning(
+            logger.LogWarning(
                 ex,
                 "Cohort sweep {SweepId} was cancelled. Diagnostic {DiagnosticId}.",
                 sweepId,
@@ -182,7 +182,7 @@ internal sealed class RetentionSweepEngine(
             primaryException = ex;
             var failedAt = DateTimeOffset.UtcNow;
             var diagnostic = RetentionFailureDiagnostic.Create(ex);
-            logger?.LogError(
+            logger.LogError(
                 ex,
                 "Cohort sweep {SweepId} failed. Diagnostic {DiagnosticId}.",
                 sweepId,
@@ -338,7 +338,7 @@ internal sealed class RetentionSweepEngine(
                 {
                     var diagnostic = RetentionFailureDiagnostic.Create(ex);
                     entityFailures.Add(diagnostic.ToString());
-                    logger?.LogError(
+                    logger.LogError(
                         ex,
                         "Cohort dry run {SweepId} failed for entity {EntityType}; continuing with remaining entities. Diagnostic {DiagnosticId}.",
                         sweepId,
@@ -382,7 +382,7 @@ internal sealed class RetentionSweepEngine(
             primaryException = ex;
             var cancelledAt = DateTimeOffset.UtcNow;
             var diagnostic = RetentionFailureDiagnostic.Create(ex);
-            logger?.LogWarning(
+            logger.LogWarning(
                 ex,
                 "Cohort dry run {SweepId} was cancelled. Diagnostic {DiagnosticId}.",
                 sweepId,
@@ -406,7 +406,7 @@ internal sealed class RetentionSweepEngine(
             primaryException = ex;
             var failedAt = DateTimeOffset.UtcNow;
             var diagnostic = RetentionFailureDiagnostic.Create(ex);
-            logger?.LogError(
+            logger.LogError(
                 ex,
                 "Cohort dry run {SweepId} failed. Diagnostic {DiagnosticId}.",
                 sweepId,
@@ -495,7 +495,7 @@ internal sealed class RetentionSweepEngine(
             {
                 var diagnostic = RetentionFailureDiagnostic.Create(ex);
                 entityFailures.Add(diagnostic.ToString());
-                logger?.LogError(
+                logger.LogError(
                     ex,
                     "Cohort sweep {SweepId} failed to prepare entity {EntityType}; continuing with remaining entities. Diagnostic {DiagnosticId}.",
                     sweepId,

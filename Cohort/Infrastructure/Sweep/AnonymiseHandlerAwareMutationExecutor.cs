@@ -9,7 +9,7 @@ internal sealed class AnonymiseHandlerAwareMutationExecutor(
     AnonymiseAssignmentResolver assignmentResolver,
     AnonymiseRowLoader rowLoader,
     AnonymiseMutationExecutor mutationExecutor,
-    ILogger? logger = null
+    ILogger logger
 )
 {
     private static readonly MethodInfo ExecuteCoreMethod =

@@ -2,6 +2,7 @@ using System.Data.Common;
 using Cohort.Domain;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace Cohort.Infrastructure.Sweep;
 
@@ -10,8 +11,9 @@ internal sealed class PurgeSweepStrategy : IRetentionSweepStrategy
     private readonly RelationalSweepStrategyCore core;
 
     public PurgeSweepStrategy(
-        [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext? db = null,
-        IServiceProvider? services = null
+        [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
+        IServiceProvider services,
+        ILogger<PurgeSweepStrategy> logger
     )
     {
         core = new RelationalSweepStrategyCore(
@@ -19,6 +21,7 @@ internal sealed class PurgeSweepStrategy : IRetentionSweepStrategy
             nameof(PurgeSweepStrategy),
             db,
             services,
+            logger,
             eligibilityClause: static _ => "",
             mutationHead: static entry =>
                 $"DELETE FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target",

@@ -1,5 +1,6 @@
 using Cohort.Domain;
 using Cohort.Application;
+using Cohort.Hosting;
 using Cohort.Sample;
 using Cohort.Sample.Entities;
 using Microsoft.EntityFrameworkCore;
@@ -9,6 +10,10 @@ using Microsoft.Extensions.Logging;
 
 var builder = Host.CreateApplicationBuilder(args);
 builder.Services.AddSampleRetentionServices();
+// Dogfoods durable after-commit delivery: the sweep queues one OnAfterAsync per deleted note.
+builder.Services.AddRowHandler<Note, NoteSweptLogger>(
+    identity: new Guid("6a1f4a8e-2f0d-4c55-9a51-0d6f0f7c2b11")
+);
 
 var host = builder.Build();
 
@@ -76,6 +81,9 @@ try
 
     var demoNoteRemoved = !await db.Notes.AnyAsync(note => note.Id == demoNoteId);
     logger.LogInformation("Sweep removed the expired demo note: {Removed}", demoNoteRemoved);
+
+    var flush = await scope.ServiceProvider.GetRequiredService<IRetentionRowDispatcher>().FlushAsync();
+    logger.LogInformation("Row handlers settled: {Settled}", flush.Settled);
 }
 finally
 {

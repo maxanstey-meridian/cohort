@@ -21,7 +21,7 @@ internal sealed class RetentionErasureService(
     RetentionAuditNotifier auditNotifier,
     IEnumerable<IRetentionSweepStrategy> sweepStrategies,
     IRetentionExecutionSettings options,
-    ILogger<RetentionErasureService>? logger = null
+    ILogger<RetentionErasureService> logger
 )
 {
     private readonly IReadOnlyDictionary<Strategy, IRetentionSweepStrategy> strategies =
@@ -54,7 +54,7 @@ internal sealed class RetentionErasureService(
         var connection = db.Database.GetDbConnection();
         var shouldCloseConnection = connection.State != ConnectionState.Open;
         var runLockAcquired = false;
-        var batchSize = Math.Max(1, options.SweepBatchSize);
+        var batchSize = options.SweepBatchSize;
         Exception? primaryException = null;
 
         async Task BuildExecutionPlanAsync()
@@ -190,7 +190,7 @@ internal sealed class RetentionErasureService(
                     // surfaced in the result.
                     var diagnostic = RetentionFailureDiagnostic.Create(ex);
                     entityFailures.Add(diagnostic.ToString());
-                    logger?.LogError(
+                    logger.LogError(
                         ex,
                         "Cohort erasure {SweepId} failed for entity {EntityType}; continuing with remaining entities. Diagnostic {DiagnosticId}.",
                         sweepId,
@@ -234,7 +234,7 @@ internal sealed class RetentionErasureService(
             primaryException = ex;
             var cancelledAt = DateTimeOffset.UtcNow;
             var diagnostic = RetentionFailureDiagnostic.Create(ex);
-            logger?.LogWarning(
+            logger.LogWarning(
                 ex,
                 "Cohort erasure {SweepId} was cancelled. Diagnostic {DiagnosticId}.",
                 sweepId,
@@ -258,7 +258,7 @@ internal sealed class RetentionErasureService(
             primaryException = ex;
             var failedAt = DateTimeOffset.UtcNow;
             var diagnostic = RetentionFailureDiagnostic.Create(ex);
-            logger?.LogError(
+            logger.LogError(
                 ex,
                 "Cohort erasure {SweepId} failed. Diagnostic {DiagnosticId}.",
                 sweepId,
@@ -309,7 +309,7 @@ internal sealed class RetentionErasureService(
     {
         var diagnostic = RetentionFailureDiagnostic.Create(exception);
         entityFailures.Add(diagnostic.ToString());
-        logger?.LogError(
+        logger.LogError(
             exception,
             "Cohort erasure {SweepId} failed to prepare entity {EntityType}; continuing with remaining entities. Diagnostic {DiagnosticId}.",
             sweepId,

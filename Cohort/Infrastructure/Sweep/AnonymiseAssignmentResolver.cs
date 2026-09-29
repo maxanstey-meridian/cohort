@@ -8,11 +8,11 @@ namespace Cohort.Infrastructure.Sweep;
 
 internal sealed class AnonymiseAssignmentResolver(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
-    IEnumerable<IAnonymiseValueFactory>? anonymiseValueFactories = null
+    IEnumerable<IAnonymiseValueFactory> anonymiseValueFactories
 )
 {
     private readonly IReadOnlyList<IAnonymiseValueFactory> factories = (
-        anonymiseValueFactories ?? Array.Empty<IAnonymiseValueFactory>()
+        anonymiseValueFactories
     ).ToArray();
     private readonly DbContext modelDb = db ?? throw new ArgumentNullException(nameof(db));
 

@@ -2,6 +2,7 @@ using System.Data.Common;
 using Cohort.Domain;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace Cohort.Infrastructure.Sweep;
 
@@ -10,8 +11,9 @@ internal sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
     private readonly RelationalSweepStrategyCore core;
 
     public SoftDeleteSweepStrategy(
-        [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext? db = null,
-        IServiceProvider? services = null
+        [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
+        IServiceProvider services,
+        ILogger<SoftDeleteSweepStrategy> logger
     )
     {
         core = new RelationalSweepStrategyCore(
@@ -19,6 +21,7 @@ internal sealed class SoftDeleteSweepStrategy : IRetentionSweepStrategy
             nameof(SoftDeleteSweepStrategy),
             db,
             services,
+            logger,
             eligibilityClause: static entry =>
                 $"AND target.{RelationalSweepStrategyCore.QuoteIdentifier(RequireSoftDelete(entry).IsDeletedColumn)} = FALSE",
             mutationHead: static entry =>

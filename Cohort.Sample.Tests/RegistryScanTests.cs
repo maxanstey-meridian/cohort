@@ -37,7 +37,7 @@ public sealed class RegistryScanTests
 
         var entries = new RetentionRegistry(
             db,
-            new RetentionEntryBuilder(new RetentionModelConventions())
+            new RetentionEntryBuilder(new CohortConventions())
         ).Scan();
 
         // Positive — the one annotated entity is found, with the right shape
@@ -131,7 +131,7 @@ public sealed class RegistryScanTests
 
         var entry = new RetentionRegistry(
             db,
-            new RetentionEntryBuilder(new RetentionModelConventions())
+            new RetentionEntryBuilder(new CohortConventions())
         ).Scan()[typeof(RetentionReadyRecord)];
 
         entry.TableName.Should().Be("retention_ready_records");
@@ -175,7 +175,7 @@ public sealed class RegistryScanTests
 
         var entry = new RetentionRegistry(
             db,
-            new RetentionEntryBuilder(new RetentionModelConventions())
+            new RetentionEntryBuilder(new CohortConventions())
         ).Scan()[typeof(FactoryBackedRetentionReadyRecord)];
 
         entry.AnonymiseFields.Should().ContainSingle();
@@ -201,7 +201,7 @@ public sealed class RegistryScanTests
         using var db = new ConflictingAnonymiseMetadataDbContext(options);
         var registry = new RetentionRegistry(
             db,
-            new RetentionEntryBuilder(new RetentionModelConventions())
+            new RetentionEntryBuilder(new CohortConventions())
         );
 
         var act = () => registry.Scan();
@@ -223,7 +223,7 @@ public sealed class RegistryScanTests
 
         var entry = new RetentionRegistry(
             db,
-            new RetentionEntryBuilder(new RetentionModelConventions())
+            new RetentionEntryBuilder(new CohortConventions())
         ).Scan()[typeof(RetentionReadyRecord)];
 
         entry.SoftDelete.Should().NotBeNull();
@@ -242,7 +242,7 @@ public sealed class RegistryScanTests
         using var db = new UnmappedDeletedAtDbContext(options);
 
         var act = () =>
-            new RetentionRegistry(db, new RetentionEntryBuilder(new RetentionModelConventions())).Scan();
+            new RetentionRegistry(db, new RetentionEntryBuilder(new CohortConventions())).Scan();
 
         act.Should()
             .Throw<InvalidOperationException>()
@@ -260,7 +260,7 @@ public sealed class RegistryScanTests
         using var db = new RegistryMetadataDbContext(options);
         var registry = new RetentionRegistry(
             db,
-            new RetentionEntryBuilder(new RetentionModelConventions())
+            new RetentionEntryBuilder(new CohortConventions())
         );
 
         var firstScan = registry.Scan();
@@ -285,7 +285,7 @@ public sealed class RegistryScanTests
 
         var registry = new RetentionRegistry(
             db,
-            new RetentionEntryBuilder(new RetentionModelConventions())
+            new RetentionEntryBuilder(new CohortConventions())
         );
 
         var act = () => registry.Scan();

@@ -1,7 +1,6 @@
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
-using Cohort.Infrastructure;
 using Cohort.Infrastructure.Migrations;
 
 using Microsoft.EntityFrameworkCore;
@@ -86,13 +85,13 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
         services.AddSingleton<IConfiguration>(configuration);
         services.AddCohort<ValidRetentionDbContext>();
         using var provider = services.BuildServiceProvider();
-        var settings = provider.GetRequiredService<IRetentionExecutionSettings>();
+        var settings = provider.GetRequiredService<CohortOptionsSnapshot>();
 
         configuration[$"{CohortOptions.SectionName}:RowHandlerDispatch:BatchSize"] = "10001";
         var reload = () => configuration.Reload();
 
         reload.Should().Throw<OptionsValidationException>();
-        settings.RowHandlerDispatch.BatchSize.Should().Be(20);
+        settings.Current.RowHandlerDispatch.BatchSize.Should().Be(20);
     }
 
     private static IHost BuildHost<TContext>(

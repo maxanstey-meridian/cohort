@@ -20,7 +20,7 @@ public sealed class CohortConventionsEndToEndTests
         using var db = new OrganisationTenantDbContext(options);
 
         var builder = new RetentionEntryBuilder(
-            new RetentionModelConventions { TenantPropertyName = "OrganisationId" }
+            new CohortConventions { TenantPropertyName = "OrganisationId" }
         );
         var entry = new RetentionRegistry(db, builder).Scan()[typeof(OrganisationTenantRecord)];
 
@@ -39,7 +39,7 @@ public sealed class CohortConventionsEndToEndTests
 
         // Global config says "look for OrganisationId", but the attribute points at WorkspaceId.
         var builder = new RetentionEntryBuilder(
-            new RetentionModelConventions { TenantPropertyName = "OrganisationId" }
+            new CohortConventions { TenantPropertyName = "OrganisationId" }
         );
         var entry = new RetentionRegistry(db, builder).Scan()[typeof(AttributeOverrideRecord)];
 
@@ -56,7 +56,7 @@ public sealed class CohortConventionsEndToEndTests
         using var db = new OrganisationIdDbContext(options);
 
         var builder = new RetentionEntryBuilder(
-            new RetentionModelConventions
+            new CohortConventions
             {
                 RecordIdPropertyName = "RecordKey",
                 TenantPropertyName = "OrganisationId",

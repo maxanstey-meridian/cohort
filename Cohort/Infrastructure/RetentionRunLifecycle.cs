@@ -7,8 +7,8 @@ namespace Cohort.Infrastructure;
 
 internal sealed class RetentionRunLifecycle(
     EfRetentionAuditWriter auditWriter,
-    RetentionAuditNotifier? auditNotifier = null,
-    ILogger? logger = null
+    RetentionAuditNotifier auditNotifier,
+    ILogger logger
 )
 {
     private static readonly TimeSpan AuditSettlementTimeout = TimeSpan.FromSeconds(30);
@@ -28,14 +28,11 @@ internal sealed class RetentionRunLifecycle(
             : new CancellationTokenSource(AuditSettlementTimeout);
         await auditWriter.WriteAsync(evt, timeout?.Token ?? ct);
         AuditEvents.Add(evt);
-        if (auditNotifier is not null)
-        {
-            await auditNotifier.NotifyCommittedAsync(evt);
-        }
+        await auditNotifier.NotifyCommittedAsync(evt);
     }
 
     public Task NotifyCommittedAsync(SweepEvent evt) =>
-        auditNotifier?.NotifyCommittedAsync(evt) ?? Task.CompletedTask;
+        auditNotifier.NotifyCommittedAsync(evt);
 
     public async Task TrySettleTerminalAsync(SweepEvent evt, string operation, Guid sweepId)
     {
@@ -43,14 +40,11 @@ internal sealed class RetentionRunLifecycle(
         {
             using var timeout = new CancellationTokenSource(AuditSettlementTimeout);
             await auditWriter.WriteAsync(evt, timeout.Token);
-            if (auditNotifier is not null)
-            {
-                await auditNotifier.NotifyCommittedAsync(evt);
-            }
+            await auditNotifier.NotifyCommittedAsync(evt);
         }
         catch (Exception settlementException)
         {
-            logger?.LogError(
+            logger.LogError(
                 settlementException,
                 "Cohort could not mark {Operation} {SweepId} as terminal.",
                 operation,

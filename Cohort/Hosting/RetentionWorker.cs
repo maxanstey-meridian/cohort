@@ -9,7 +9,12 @@ using Microsoft.Extensions.Options;
 
 namespace Cohort.Hosting;
 
-internal sealed class RetentionWorker : BackgroundService
+internal sealed class RetentionWorker(
+    IServiceScopeFactory scopeFactory,
+    CohortOptionsSnapshot options,
+    IOptionsMonitor<CohortOptions> optionsMonitor,
+    ILogger<RetentionWorker> logger
+) : BackgroundService
 {
     private static readonly TimeSpan IdlePollInterval = TimeSpan.FromMilliseconds(200);
 
@@ -21,26 +26,6 @@ internal sealed class RetentionWorker : BackgroundService
     // at the same cron instant must not both sweep: double mutations are mostly benign,
     // but doubled audit runs and doubled handler side effects are not.
     private const long SweepAdvisoryLockKey = 0x636F_686F_7274_3031;
-    private readonly IServiceScopeFactory scopeFactory;
-    private readonly IOptionsMonitor<CohortOptions> optionsMonitor;
-    private readonly ILogger<RetentionWorker> logger;
-    private readonly IDisposable? optionsReloadSubscription;
-    private CohortOptions currentOptions;
-
-    public RetentionWorker(
-        IServiceScopeFactory scopeFactory,
-        IOptionsMonitor<CohortOptions> optionsMonitor,
-        ILogger<RetentionWorker> logger
-    )
-    {
-        this.scopeFactory = scopeFactory;
-        this.optionsMonitor = optionsMonitor;
-        this.logger = logger;
-        currentOptions = optionsMonitor.CurrentValue;
-        optionsReloadSubscription = optionsMonitor.OnChange(updated =>
-            Volatile.Write(ref currentOptions, updated)
-        );
-    }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -70,7 +55,7 @@ internal sealed class RetentionWorker : BackgroundService
 
     private async Task RunScheduleLoopOnceAsync(CancellationToken stoppingToken)
     {
-        var currentOptions = Volatile.Read(ref this.currentOptions);
+        var currentOptions = options.Current;
         if (
             currentOptions.KillSwitch
             || string.IsNullOrWhiteSpace(currentOptions.Schedule)
@@ -107,7 +92,7 @@ internal sealed class RetentionWorker : BackgroundService
             return;
         }
 
-        var executionOptions = Volatile.Read(ref this.currentOptions);
+        var executionOptions = options.Current;
         if (
             stoppingToken.IsCancellationRequested
             || executionOptions.KillSwitch
@@ -126,7 +111,7 @@ internal sealed class RetentionWorker : BackgroundService
         CancellationToken ct
     )
     {
-        var currentKillSwitch = Volatile.Read(ref currentOptions).KillSwitch;
+        var currentKillSwitch = options.Current.KillSwitch;
         var scheduleChanged = new TaskCompletionSource(
             TaskCreationOptions.RunContinuationsAsynchronously
         );
@@ -400,7 +385,7 @@ internal sealed class RetentionWorker : BackgroundService
     {
         // The kill switch is an emergency brake: an in-flight sweep finishes, but no
         // further sweep starts — not even the remaining passes of the current iteration.
-        if (!Volatile.Read(ref currentOptions).KillSwitch)
+        if (!options.Current.KillSwitch)
         {
             return false;
         }
@@ -421,11 +406,5 @@ internal sealed class RetentionWorker : BackgroundService
         {
             // Shutdown during an idle wait is not an error.
         }
-    }
-
-    public override void Dispose()
-    {
-        optionsReloadSubscription?.Dispose();
-        base.Dispose();
     }
 }

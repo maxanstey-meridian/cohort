@@ -15,12 +15,13 @@ internal sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
     private readonly AnonymiseMutationExecutor mutationExecutor;
     private readonly AnonymisePreviewExecutor previewExecutor;
     private readonly AnonymiseRowLoader rowLoader;
-    private readonly IServiceProvider? services;
+    private readonly IServiceProvider services;
 
     public AnonymiseSweepStrategy(
         [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
-        IEnumerable<IAnonymiseValueFactory>? anonymiseValueFactories = null,
-        IServiceProvider? services = null
+        IEnumerable<IAnonymiseValueFactory> anonymiseValueFactories,
+        IServiceProvider services,
+        ILogger<AnonymiseSweepStrategy> logger
     )
     {
         ArgumentNullException.ThrowIfNull(db);
@@ -33,9 +34,7 @@ internal sealed class AnonymiseSweepStrategy : IRetentionSweepStrategy
             assignmentResolver,
             rowLoader,
             mutationExecutor,
-            services
-                ?.GetService<ILoggerFactory>()
-                ?.CreateLogger(typeof(RetentionHandlerSupport).FullName!)
+            logger
         );
         this.services = services;
     }

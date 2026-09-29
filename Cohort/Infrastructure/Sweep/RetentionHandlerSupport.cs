@@ -11,17 +11,10 @@ namespace Cohort.Infrastructure.Sweep;
 internal static class RetentionHandlerSupport
 {
     public static IReadOnlyList<ResolvedRetentionHandler> ResolveHandlers(
-        IServiceProvider? services,
+        IServiceProvider services,
         Type entityType
     )
     {
-        ArgumentNullException.ThrowIfNull(entityType);
-
-        if (services is null)
-        {
-            return [];
-        }
-
         var handlerInterface = typeof(IRetentionHandler<>).MakeGenericType(entityType);
         var enumerableType = typeof(IEnumerable<>).MakeGenericType(handlerInterface);
         var registeredHandlers = services.GetService(enumerableType) as IEnumerable;
@@ -154,7 +147,7 @@ internal static class RetentionHandlerSupport
         IReadOnlyDictionary<string, object?> snapshot,
         ResolvedRetentionHandler failedHandler,
         Exception failure,
-        ILogger? logger,
+        ILogger logger,
         CancellationToken ct
     )
     {
@@ -180,7 +173,7 @@ internal static class RetentionHandlerSupport
         );
 
         var diagnostic = RetentionFailureDiagnostic.Create(failure);
-        logger?.LogError(
+        logger.LogError(
             failure,
             "Cohort row handler failed before mutation for sweep {SweepId} and entity {EntityType}. Diagnostic {DiagnosticId}.",
             execution.SweepId,

@@ -87,7 +87,7 @@ public sealed class ArchitectureBoundaryTests
             .Check(Architecture);
     }
 
-    [Fact(Skip = "Phase 3: RetentionRowDispatcher moves to Hosting (D1)")]
+    [Fact]
     public void Background_Services_Live_In_Hosting()
     {
         Classes()

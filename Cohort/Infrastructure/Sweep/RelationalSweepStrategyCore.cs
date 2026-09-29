@@ -5,7 +5,6 @@ using System.Reflection;
 using Cohort.Domain;
 using Cohort.Infrastructure.Holds;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
 namespace Cohort.Infrastructure.Sweep;
@@ -19,16 +18,14 @@ namespace Cohort.Infrastructure.Sweep;
 internal sealed class RelationalSweepStrategyCore(
     Strategy strategy,
     string strategyName,
-    DbContext? db,
-    IServiceProvider? services,
+    DbContext db,
+    IServiceProvider services,
+    ILogger logger,
     Func<RetentionEntry, string> eligibilityClause,
     Func<RetentionEntry, string> mutationHead,
     Action<DbCommand, RetentionEntry, DateTimeOffset> addMutationParameters
 )
 {
-    private readonly ILogger? logger = services
-        ?.GetService<ILoggerFactory>()
-        ?.CreateLogger(typeof(RetentionHandlerSupport).FullName!);
     private static readonly MethodInfo ExecuteHandlerAwareSweepCoreMethod =
         typeof(RelationalSweepStrategyCore).GetMethod(
             nameof(ExecuteHandlerAwareSweepCoreAsync),
@@ -486,11 +483,7 @@ internal sealed class RelationalSweepStrategyCore(
     )
         where TEntity : class
     {
-        var runtimeDb =
-            db
-            ?? throw new InvalidOperationException(
-                $"Handler-aware {strategyName} execution for {entry.EntityType.FullName} requires a DbContext-backed strategy instance."
-            );
+        var runtimeDb = db;
         var rows = await LoadHandlerRowsAsync<TEntity>(
             runtimeDb,
             entry,

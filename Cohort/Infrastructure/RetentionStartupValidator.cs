@@ -10,9 +10,9 @@ internal sealed class RetentionStartupValidator(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
     IRetentionRuleProvider ruleProvider,
     RetentionEntryBuilder entryBuilder,
-    IEnumerable<IAnonymiseValueFactory>? anonymiseValueFactories = null,
-    RetentionValidationState? sharedState = null,
-    ErasureSubjectMetadataResolver? subjectMetadataResolver = null
+    IEnumerable<IAnonymiseValueFactory> anonymiseValueFactories,
+    RetentionValidationState validationState,
+    ErasureSubjectMetadataResolver erasureSubjectMetadataResolver
 )
 {
     // Instance field, not static: NullabilityInfoContext is documented as not thread-safe,
@@ -25,17 +25,12 @@ internal sealed class RetentionStartupValidator(
         typeof(DateTimeOffset),
         typeof(DateTimeOffset?),
     ];
-    private readonly IReadOnlyDictionary<Type, int> registeredAnonymiseFactoryTypeCounts = (
-        anonymiseValueFactories ?? Array.Empty<IAnonymiseValueFactory>()
-    )
+    private readonly IReadOnlyDictionary<Type, int> registeredAnonymiseFactoryTypeCounts = anonymiseValueFactories
         .GroupBy(factory => factory.GetType())
         .ToDictionary(group => group.Key, group => group.Count());
-    private readonly RetentionValidationState sharedValidationState = sharedState ?? new();
 
     // Resolved lazily: touching db.Model before the provider check would mask a wrong provider.
-    private RetentionModelValidation ModelValidation => sharedValidationState.For(db.Model);
-    private readonly ErasureSubjectMetadataResolver erasureSubjectMetadataResolver =
-        subjectMetadataResolver ?? new(db);
+    private RetentionModelValidation ModelValidation => validationState.For(db.Model);
 
     internal IReadOnlyDictionary<string, RetentionCategoryCapabilities> ValidatedCapabilities =>
         ModelValidation.Capabilities;

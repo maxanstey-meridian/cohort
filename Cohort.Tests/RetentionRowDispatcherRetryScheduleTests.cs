@@ -1,4 +1,4 @@
-using Cohort.Infrastructure.Handlers;
+using Cohort.Hosting;
 
 namespace Cohort.Tests;
 

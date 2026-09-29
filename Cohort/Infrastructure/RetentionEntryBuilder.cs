@@ -5,7 +5,7 @@ using Microsoft.EntityFrameworkCore.Metadata;
 
 namespace Cohort.Infrastructure;
 
-internal sealed class RetentionEntryBuilder(RetentionModelConventions conventions)
+internal sealed class RetentionEntryBuilder(CohortConventions conventions)
 {
     private static readonly Type[] AllowedAnchorTypes =
     [

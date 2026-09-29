@@ -39,7 +39,7 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
             "Cohort/Infrastructure/RetentionRunAdvisoryLock.cs",
             "Cohort/Infrastructure/Sweep/RelationalSweepStrategyCore.cs",
             "Cohort/Infrastructure/Sweep/AnonymiseSqlBuilder.cs",
-            "Cohort/Infrastructure/Handlers/RetentionRowDispatcher.cs",
+            "Cohort/Hosting/RetentionRowDispatcher.cs",
         ];
         var unqualified = new Regex(
             @"(?<![\w.])(count|statement_timestamp|hashtextextended|unnest|pg_(?:advisory|try_advisory|get_expr)[a-z_]*)\s*\(",
@@ -178,8 +178,8 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
                 now
             );
 
-            (await services.GetRequiredService<IRetentionRowDispatcher>().FlushAsync()).Settled
-                .Should().BeTrue();
+            (await services.GetRequiredService<IRetentionRowDispatcher>().FlushAsync())
+                .Should().Be(new RowDispatcherFlushResult(0, 0));
 
             await using var connection = new NpgsqlConnection(connectionString);
             await connection.OpenAsync();

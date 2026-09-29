@@ -2,7 +2,6 @@ using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure;
 using Cohort.Infrastructure.Audit;
-using Cohort.Infrastructure.Handlers;
 using Cohort.Infrastructure.Holds;
 using Cohort.Infrastructure.Sweep;
 
@@ -52,20 +51,12 @@ public static class ServiceCollectionExtensions
         );
 
         services.TryAddSingleton(sp =>
-        {
-            var conventions = sp.GetRequiredService<IOptions<CohortOptions>>().Value.Conventions;
-            return new RetentionEntryBuilder(
-                new RetentionModelConventions
-                {
-                    RecordIdPropertyName = conventions.RecordIdPropertyName,
-                    TenantPropertyName = conventions.TenantPropertyName,
-                    SoftDeletePropertyName = conventions.SoftDeletePropertyName,
-                    DeletedAtPropertyName = conventions.DeletedAtPropertyName,
-                    AnonymisedAtPropertyName = conventions.AnonymisedAtPropertyName,
-                }
-            );
-        });
-        services.TryAddSingleton<IRetentionExecutionSettings, HostingRetentionExecutionSettings>();
+            new RetentionEntryBuilder(sp.GetRequiredService<IOptions<CohortOptions>>().Value.Conventions)
+        );
+        services.TryAddSingleton<CohortOptionsSnapshot>();
+        services.TryAddSingleton<IRetentionExecutionSettings>(sp =>
+            sp.GetRequiredService<CohortOptionsSnapshot>()
+        );
 
         services.AddKeyedScoped<DbContext>(CohortServiceKeys.DbContext, (sp, _) =>
             sp.GetRequiredService<TContext>()
@@ -189,47 +180,6 @@ public static class ServiceCollectionExtensions
     }
 
     private sealed record CohortRegistrationMarker(Type ContextType);
-
-    private sealed class HostingRetentionExecutionSettings : IRetentionExecutionSettings, IDisposable
-    {
-        private CohortOptions current;
-        private readonly IDisposable? reloadSubscription;
-
-        public HostingRetentionExecutionSettings(IOptionsMonitor<CohortOptions> options)
-        {
-            current = options.CurrentValue;
-            reloadSubscription = options.OnChange(updated => Volatile.Write(ref current, updated));
-        }
-
-        public bool DryRun => Volatile.Read(ref current).DryRun;
-
-        public int SweepBatchSize => Volatile.Read(ref current).SweepBatchSize;
-
-        public TimeSpan AuditObserverTimeout => Volatile.Read(ref current).AuditObservers.Timeout;
-
-        public RetentionRowHandlerSettings RowHandlerDispatch
-        {
-            get
-            {
-                var value = Volatile.Read(ref current).RowHandlerDispatch;
-                return new RetentionRowHandlerSettings(
-                    value.PollInterval,
-                    value.PayloadRetention,
-                    value.MaxParallelism,
-                    value.BatchSize,
-                    value.MaxAttempts,
-                    value.BaseBackoff,
-                    value.ClaimTimeout,
-                    value.SweepSettleTimeout
-                );
-            }
-        }
-
-        public void Dispose()
-        {
-            reloadSubscription?.Dispose();
-        }
-    }
 
     private sealed class SingleTenantContextSource(IServiceProvider services)
         : IRetentionTenantSource

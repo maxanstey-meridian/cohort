@@ -10,7 +10,7 @@ internal sealed class RetentionAuditNotifier(
 )
 {
     private readonly IRetentionAuditObserver[] observerList = observers.ToArray();
-    private readonly TimeSpan timeout = NormalizeTimeout(settings.AuditObserverTimeout);
+    private readonly TimeSpan timeout = settings.AuditObserverTimeout;
     private readonly HashSet<IRetentionAuditObserver> quarantined =
         new(ReferenceEqualityComparer.Instance);
 
@@ -63,11 +63,6 @@ internal sealed class RetentionAuditNotifier(
             }
         }
     }
-
-    private static TimeSpan NormalizeTimeout(TimeSpan configuredTimeout) =>
-        configuredTimeout > TimeSpan.Zero && configuredTimeout <= TimeSpan.FromHours(1)
-            ? configuredTimeout
-            : TimeSpan.FromSeconds(5);
 
     private static Guid GetSweepId(SweepEvent evt) =>
         evt switch

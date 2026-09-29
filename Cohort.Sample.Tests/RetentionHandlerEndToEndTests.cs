@@ -665,7 +665,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             command.CommandText = """
                 SELECT COUNT(*)
                 FROM pg_stat_activity waiter
-                WHERE waiter.query LIKE '%UPDATE %"sweep_row_handler_status"%'
+                WHERE waiter.query LIKE '%UPDATE %sweep_row_handler_status%'
                   AND (
                       @blockerBackendId = ANY(pg_blocking_pids(waiter.pid))
                       OR EXISTS (
@@ -1250,7 +1250,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task FlushAsync_Cancellation_Requeues_All_Claimed_Rows_So_A_Later_Flush_Can_Drain_Them()
+    public async Task FlushAsync_Claims_Only_What_It_Can_Run_And_Cancellation_Requeues_That_Claim()
     {
         var tenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
@@ -1320,13 +1320,17 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             await dispatcher.FlushAsync();
         });
 
-        sink.AfterCalls.Should()
-            .BeEquivalentTo(["after:cancelled-batch-first:2", "after:cancelled-batch-second:2"]);
+        // MaxParallelism 1 claims one row at a time despite BatchSize 10: only the row that
+        // was running when the flush was cancelled spent an attempt; the other was never
+        // claimed, so it could not sit unheartbeated behind it and expire.
+        sink.AfterCalls.Select(call => call[call.LastIndexOf(':')..])
+            .Should()
+            .BeEquivalentTo([":2", ":1"]);
 
         var statuses = await LoadHandlerStatusesAsync(result.SweepId);
         statuses.Should().HaveCount(2);
         statuses.All(status => status.State == SucceededState).Should().BeTrue();
-        statuses.All(status => status.Attempt == 2).Should().BeTrue();
+        statuses.Select(status => status.Attempt).Should().BeEquivalentTo([2, 1]);
         statuses.All(status => status.CompletedAt is not null).Should().BeTrue();
     }
 

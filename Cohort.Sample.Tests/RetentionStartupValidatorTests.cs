@@ -66,7 +66,10 @@ public sealed class RetentionStartupValidatorTests
             await new RetentionStartupValidator(
                 db,
                 InMemoryCategoryRepository.Empty,
-                new RetentionEntryBuilder(new RetentionModelConventions())
+                new RetentionEntryBuilder(new CohortConventions()),
+                [],
+                new RetentionValidationState(),
+                new ErasureSubjectMetadataResolver(db)
             ).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
@@ -100,7 +103,10 @@ public sealed class RetentionStartupValidatorTests
             await new RetentionStartupValidator(
                 db,
                 repository,
-                new RetentionEntryBuilder(new RetentionModelConventions())
+                new RetentionEntryBuilder(new CohortConventions()),
+                [],
+                new RetentionValidationState(),
+                new ErasureSubjectMetadataResolver(db)
             ).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
@@ -126,7 +132,10 @@ public sealed class RetentionStartupValidatorTests
             await new RetentionStartupValidator(
                 db,
                 InMemoryCategoryRepository.Empty,
-                new RetentionEntryBuilder(new RetentionModelConventions())
+                new RetentionEntryBuilder(new CohortConventions()),
+                [],
+                new RetentionValidationState(),
+                new ErasureSubjectMetadataResolver(db)
             ).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
@@ -378,8 +387,10 @@ public sealed class RetentionStartupValidatorTests
             await new RetentionStartupValidator(
                 db,
                 repository,
-                new RetentionEntryBuilder(new RetentionModelConventions()),
-                [new TestAnonymiseValueFactory()]
+                new RetentionEntryBuilder(new CohortConventions()),
+                [new TestAnonymiseValueFactory()],
+                new RetentionValidationState(),
+                new ErasureSubjectMetadataResolver(db)
             ).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
@@ -595,8 +606,10 @@ public sealed class RetentionStartupValidatorTests
         return new RetentionStartupValidator(
             db,
             repository,
-            new RetentionEntryBuilder(new RetentionModelConventions()),
-            [new GuidTombstoneFactory(), new OriginalValueTombstoneFactory()]
+            new RetentionEntryBuilder(new CohortConventions()),
+            [new GuidTombstoneFactory(), new OriginalValueTombstoneFactory()],
+            new RetentionValidationState(),
+            new ErasureSubjectMetadataResolver(db)
         );
     }
 

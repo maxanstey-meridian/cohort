@@ -198,6 +198,18 @@ Cohort.Domain.AuditRowDetail
 Cohort.Domain.AuditRowDetail.Inherit = 2 -> Cohort.Domain.AuditRowDetail
 Cohort.Domain.AuditRowDetail.PerRow = 1 -> Cohort.Domain.AuditRowDetail
 Cohort.Domain.AuditRowDetail.SummaryOnly = 0 -> Cohort.Domain.AuditRowDetail
+Cohort.Domain.CohortConventions
+Cohort.Domain.CohortConventions.AnonymisedAtPropertyName.get -> string!
+Cohort.Domain.CohortConventions.AnonymisedAtPropertyName.init -> void
+Cohort.Domain.CohortConventions.CohortConventions() -> void
+Cohort.Domain.CohortConventions.DeletedAtPropertyName.get -> string!
+Cohort.Domain.CohortConventions.DeletedAtPropertyName.init -> void
+Cohort.Domain.CohortConventions.RecordIdPropertyName.get -> string!
+Cohort.Domain.CohortConventions.RecordIdPropertyName.init -> void
+Cohort.Domain.CohortConventions.SoftDeletePropertyName.get -> string!
+Cohort.Domain.CohortConventions.SoftDeletePropertyName.init -> void
+Cohort.Domain.CohortConventions.TenantPropertyName.get -> string!
+Cohort.Domain.CohortConventions.TenantPropertyName.init -> void
 Cohort.Domain.EntitySweepCount
 Cohort.Domain.EntitySweepCount.<Clone>$() -> Cohort.Domain.EntitySweepCount!
 Cohort.Domain.EntitySweepCount.Affected.get -> long
@@ -390,23 +402,11 @@ Cohort.Hosting.AuditObserverOptions
 Cohort.Hosting.AuditObserverOptions.AuditObserverOptions() -> void
 Cohort.Hosting.AuditObserverOptions.Timeout.get -> System.TimeSpan
 Cohort.Hosting.AuditObserverOptions.Timeout.init -> void
-Cohort.Hosting.CohortConventions
-Cohort.Hosting.CohortConventions.AnonymisedAtPropertyName.get -> string!
-Cohort.Hosting.CohortConventions.AnonymisedAtPropertyName.init -> void
-Cohort.Hosting.CohortConventions.CohortConventions() -> void
-Cohort.Hosting.CohortConventions.DeletedAtPropertyName.get -> string!
-Cohort.Hosting.CohortConventions.DeletedAtPropertyName.init -> void
-Cohort.Hosting.CohortConventions.RecordIdPropertyName.get -> string!
-Cohort.Hosting.CohortConventions.RecordIdPropertyName.init -> void
-Cohort.Hosting.CohortConventions.SoftDeletePropertyName.get -> string!
-Cohort.Hosting.CohortConventions.SoftDeletePropertyName.init -> void
-Cohort.Hosting.CohortConventions.TenantPropertyName.get -> string!
-Cohort.Hosting.CohortConventions.TenantPropertyName.init -> void
 Cohort.Hosting.CohortOptions
 Cohort.Hosting.CohortOptions.AuditObservers.get -> Cohort.Hosting.AuditObserverOptions!
 Cohort.Hosting.CohortOptions.AuditObservers.init -> void
 Cohort.Hosting.CohortOptions.CohortOptions() -> void
-Cohort.Hosting.CohortOptions.Conventions.get -> Cohort.Hosting.CohortConventions!
+Cohort.Hosting.CohortOptions.Conventions.get -> Cohort.Domain.CohortConventions!
 Cohort.Hosting.CohortOptions.Conventions.init -> void
 Cohort.Hosting.CohortOptions.DryRun.get -> bool
 Cohort.Hosting.CohortOptions.DryRun.init -> void

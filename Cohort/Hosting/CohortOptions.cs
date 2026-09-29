@@ -1,3 +1,5 @@
+using Cohort.Domain;
+
 namespace Cohort.Hosting;
 
 public sealed class CohortOptions

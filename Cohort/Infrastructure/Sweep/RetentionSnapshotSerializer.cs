@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Collections.Concurrent;
 using System.Reflection;
 using System.Text.Json;
@@ -8,6 +9,12 @@ internal static class RetentionSnapshotSerializer
 {
     private const string EncodedTypeProperty = "$cohortType";
     private const string EncodedValueProperty = "$cohortValue";
+    private const string EncodedCollectionProperty = "$cohortCollection";
+    private const string ArrayCollectionKind = "array";
+    private const string ListCollectionKind = "list";
+    private static readonly string ObjectTypeName = RetentionTypeIdentity.GetPersistedName(
+        typeof(object)
+    );
 
     // Persisted payloads name CLR types; resolving arbitrary names AppDomain-wide turns a
     // tampered payload into a deserialization gadget. Only well-known scalars and the
@@ -42,16 +49,58 @@ internal static class RetentionSnapshotSerializer
         IReadOnlyDictionary<string, Type>
     > AllowedSnapshotTypes = new();
 
-    public static string Serialize(IReadOnlyDictionary<string, object?> snapshot)
+    /// <summary>
+    /// Encodes the OnBefore snapshot for post-commit dispatch, refusing (before the row is
+    /// mutated) any value that would not decode back to an equal value of the same type.
+    /// </summary>
+    public static string Capture(
+        IEnumerable<KeyValuePair<string, object?>> snapshot,
+        Type entityType,
+        IEnumerable<Assembly> handlerAssemblies
+    )
     {
-        var encoded = new Dictionary<string, object?>(snapshot.Count, StringComparer.Ordinal);
+        var resolver = CreateResolver(entityType, handlerAssemblies);
+        var encoded = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
         foreach (var (key, value) in snapshot)
         {
-            encoded[key] = EncodeValue(value);
+            JsonElement element;
+            object? decoded;
+            try
+            {
+                element = JsonSerializer.SerializeToElement(EncodeValue(value));
+                decoded = DecodeValue(element, resolver);
+            }
+            catch (Exception ex)
+                when (ex
+                        is JsonException
+                            or NotSupportedException
+                            or InvalidOperationException
+                            or ArgumentException
+                )
+            {
+                throw UnsupportedValue(key, value, ex);
+            }
+
+            if (!RoundTrips(value, decoded))
+            {
+                throw UnsupportedValue(key, value, inner: null);
+            }
+
+            encoded[key] = element;
         }
 
         return JsonSerializer.Serialize(encoded);
     }
+
+    private static NotSupportedException UnsupportedValue(
+        string key,
+        object? value,
+        Exception? inner
+    ) =>
+        new(
+            $"Retention snapshot value '{key}' of type {value?.GetType().FullName} cannot round-trip exactly to OnAfterAsync. Snapshot values must be null, well-known scalars, enums or value-equal types from the entity's or its handlers' assemblies, one-dimensional arrays or List<T> of those, object?[], List<object?>, or nested IDictionary<string, object?>.",
+            inner
+        );
 
     public static IReadOnlyDictionary<string, object?> Deserialize(
         string? capturedPayload,
@@ -74,11 +123,7 @@ internal static class RetentionSnapshotSerializer
             );
         }
 
-        var resolver = new SnapshotTypeResolver(
-            entityType,
-            AllowedSnapshotTypes.GetOrAdd(entityType, BuildAllowedSnapshotTypes),
-            handlerAssemblies.Append(entityType.Assembly).Distinct().ToArray()
-        );
+        var resolver = CreateResolver(entityType, handlerAssemblies);
 
         return document
             .RootElement.EnumerateObject()
@@ -88,6 +133,16 @@ internal static class RetentionSnapshotSerializer
                 StringComparer.Ordinal
             );
     }
+
+    private static SnapshotTypeResolver CreateResolver(
+        Type entityType,
+        IEnumerable<Assembly> handlerAssemblies
+    ) =>
+        new(
+            entityType,
+            AllowedSnapshotTypes.GetOrAdd(entityType, BuildAllowedSnapshotTypes),
+            handlerAssemblies.Append(entityType.Assembly).Distinct().ToArray()
+        );
 
     private static IReadOnlyDictionary<string, Type> BuildAllowedSnapshotTypes(Type entityType)
     {
@@ -167,12 +222,74 @@ internal static class RetentionSnapshotSerializer
                 pair => EncodeValue(pair.Value),
                 StringComparer.Ordinal
             ),
-            object?[] array => array.Select(EncodeValue).ToArray(),
-            IEnumerable<object?> enumerable => enumerable.Select(EncodeValue).ToArray(),
+            // Exactly object?[]: array covariance would otherwise route string[] here and
+            // decode it as object?[].
+            object?[] array when value.GetType() == typeof(object[]) => array
+                .Select(EncodeValue)
+                .ToArray(),
+            byte[] => EncodeTypedValue(
+                value.GetType(),
+                JsonSerializer.SerializeToElement(value, value.GetType())
+            ),
+            Array array when array.Rank == 1 => EncodeCollection(
+                value.GetType().GetElementType()!,
+                ArrayCollectionKind,
+                array
+            ),
+            IList list
+                when value.GetType().IsGenericType
+                    && value.GetType().GetGenericTypeDefinition() == typeof(List<>) =>
+                EncodeCollection(value.GetType().GetGenericArguments()[0], ListCollectionKind, list),
             _ => EncodeTypedValue(
                 value.GetType(),
                 JsonSerializer.SerializeToElement(value, value.GetType())
             ),
+        };
+    }
+
+    private static object EncodeCollection(Type elementType, string kind, IList items)
+    {
+        return new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            [EncodedTypeProperty] = RetentionTypeIdentity.GetPersistedName(elementType),
+            [EncodedCollectionProperty] = kind,
+            [EncodedValueProperty] =
+                elementType == typeof(object)
+                    ? items.Cast<object?>().Select(EncodeValue).ToArray()
+                    : JsonSerializer.SerializeToElement(items, items.GetType()),
+        };
+    }
+
+    private static bool RoundTrips(object? original, object? decoded)
+    {
+        if (original is null || decoded is null)
+        {
+            return original is null && decoded is null;
+        }
+
+        if (original.GetType() != decoded.GetType())
+        {
+            return false;
+        }
+
+        return original switch
+        {
+            IDictionary<string, object?> dictionary => decoded
+                is IDictionary<string, object?> other
+                && dictionary.Count == other.Count
+                && dictionary.All(pair =>
+                    other.TryGetValue(pair.Key, out var value) && RoundTrips(pair.Value, value)
+                ),
+            IReadOnlyDictionary<string, object?> dictionary => decoded
+                is IReadOnlyDictionary<string, object?> other
+                && dictionary.Count == other.Count
+                && dictionary.All(pair =>
+                    other.TryGetValue(pair.Key, out var value) && RoundTrips(pair.Value, value)
+                ),
+            IList list => decoded is IList other
+                && list.Count == other.Count
+                && Enumerable.Range(0, list.Count).All(index => RoundTrips(list[index], other[index])),
+            _ => original.Equals(decoded),
         };
     }
 
@@ -256,8 +373,57 @@ internal static class RetentionSnapshotSerializer
             );
         }
 
+        if (element.TryGetProperty(EncodedCollectionProperty, out var collectionProperty))
+        {
+            decoded = DecodeCollection(typeName, collectionProperty, valueProperty, resolver);
+            return true;
+        }
+
         var resolvedType = resolver.Resolve(typeName);
         decoded = JsonSerializer.Deserialize(valueProperty.GetRawText(), resolvedType);
         return true;
+    }
+
+    private static object DecodeCollection(
+        string elementTypeName,
+        JsonElement collectionProperty,
+        JsonElement valueProperty,
+        SnapshotTypeResolver resolver
+    )
+    {
+        if (valueProperty.ValueKind != JsonValueKind.Array)
+        {
+            throw new InvalidOperationException(
+                "Retention snapshot encoded collection value must be a JSON array."
+            );
+        }
+
+        var elementType =
+            RetentionTypeIdentity.Normalize(elementTypeName) == ObjectTypeName
+                ? typeof(object)
+                : resolver.Resolve(elementTypeName);
+        var items = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(elementType))!;
+        foreach (var item in valueProperty.EnumerateArray())
+        {
+            items.Add(
+                elementType == typeof(object)
+                    ? DecodeValue(item, resolver)
+                    : JsonSerializer.Deserialize(item.GetRawText(), elementType)
+            );
+        }
+
+        switch (collectionProperty.ValueKind == JsonValueKind.String ? collectionProperty.GetString() : null)
+        {
+            case ListCollectionKind:
+                return items;
+            case ArrayCollectionKind:
+                var array = Array.CreateInstance(elementType, items.Count);
+                items.CopyTo(array, 0);
+                return array;
+            default:
+                throw new InvalidOperationException(
+                    "Retention snapshot encoded collection kind must be 'array' or 'list'."
+                );
+        }
     }
 }

@@ -181,7 +181,7 @@ internal sealed class RetentionWorker(
 
             // The lock only serialises replicas; one that fires for this occurrence after
             // another finished and released it must not sweep the occurrence again.
-            if (await OccurrenceAlreadySweptAsync(db, occurrence, ct))
+            if (await OccurrenceAlreadySweptAsync(db, occurrence, dryRun, ct))
             {
                 logger.LogInformation(
                     "Cohort worker skipped occurrence {Occurrence}: a scheduled run for it already exists.",
@@ -218,21 +218,25 @@ internal sealed class RetentionWorker(
     private static async Task<bool> OccurrenceAlreadySweptAsync(
         DbContext db,
         DateTimeOffset occurrence,
+        bool dryRun,
         CancellationToken ct
     )
     {
+        // Only a run of the same kind claims the occurrence: a replica still configured to
+        // dry run must not stand in for the real sweep.
         var sweepRun = PostgreSqlIdentifier.Format(CohortStoreTables.FromModel(db.Model).SweepRun);
         await using var command = new SqlParams
         {
             ["scheduled"] = (int)SweepTriggerKind.Scheduled,
             ["occurrence"] = occurrence,
+            ["dryRun"] = dryRun,
         }.CreateCommand(
             db.Database.GetDbConnection(),
             null,
             $"""
             SELECT EXISTS (
                 SELECT 1 FROM {sweepRun}
-                WHERE "TriggerKind" = @scheduled AND "StartedAt" >= @occurrence
+                WHERE "TriggerKind" = @scheduled AND "DryRun" = @dryRun AND "StartedAt" >= @occurrence
             )
             """
         );

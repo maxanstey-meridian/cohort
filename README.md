@@ -482,7 +482,8 @@ Worker semantics worth knowing:
   if duplicate entries disagree on jurisdiction or tags, Cohort logs a warning and uses the
   first context.
 - Each occurrence runs once. Replicas coordinate through a Postgres advisory lock, and under it
-  a worker skips an occurrence that already has a `Scheduled` run started at or after it. (This
+  a worker skips an occurrence that already has a `Scheduled` run of the same kind (dry or real)
+  started at or after it, so a dry-run replica never stands in for the real sweep. (This
   compares with other replicas' clocks, so keep replica clocks in sync.)
 - Missed occurrences are skipped, not caught up: the next occurrence is always computed
   from the current time.

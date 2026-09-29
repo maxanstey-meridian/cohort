@@ -210,6 +210,37 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
     }
 
     [Fact]
+    public async Task A_Dry_Run_Replica_Does_Not_Take_The_Occurrence_From_A_Real_Sweep()
+    {
+        // Mid rolling deploy one replica may still be configured to dry run.
+        var tenant = CreateTenant();
+        var settings = CreateSettings(
+            fixture.ConnectionString,
+            schedule: "0 0 0 1 1 *",
+            dryRun: false,
+            killSwitch: false
+        );
+        using var host = BuildHost(
+            settings,
+            tenant,
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
+            }
+        );
+        await SeedOldNoteAsync(tenant.Id, "dry-run-replica");
+        var occurrence = DateTimeOffset.UtcNow.AddSeconds(-1);
+
+        await GetWorker(host).RunIterationAsync(occurrence, dryRun: true, CancellationToken.None);
+        (await NoteExistsAsync("dry-run-replica")).Should().BeTrue();
+
+        await GetWorker(host).RunIterationAsync(occurrence, dryRun: false, CancellationToken.None);
+
+        (await NoteExistsAsync("dry-run-replica")).Should().BeFalse();
+        (await CountScheduledRunsAsync(tenant.Id)).Should().Be(2);
+    }
+
+    [Fact]
     public async Task Worker_Survives_A_Failing_Iteration_And_Sweeps_On_A_Later_Tick()
     {
         var tenant = CreateTenant();

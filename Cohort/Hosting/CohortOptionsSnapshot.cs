@@ -21,8 +21,6 @@ internal sealed class CohortOptionsSnapshot : IRetentionExecutionSettings, IDisp
 
     public CohortOptions Current => Volatile.Read(ref current);
 
-    public bool DryRun => Current.DryRun;
-
     public int SweepBatchSize => Current.SweepBatchSize;
 
     public TimeSpan AuditObserverTimeout => Current.AuditObservers.Timeout;

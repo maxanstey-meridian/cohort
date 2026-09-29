@@ -356,11 +356,12 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         await using (var scope = services.CreateAsyncScope())
         {
             var engine = scope.ServiceProvider.GetRequiredService<RetentionSweepEngine>();
-            result = await engine.SweepAsync(
+            result = await engine.RunAsync(
                 new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
                 asOf,
                 SweepTriggerKind.Manual,
-                SweepEntityScope.TenantedOnly
+                SweepEntityScope.TenantedOnly,
+                dryRun: false
             );
         }
 

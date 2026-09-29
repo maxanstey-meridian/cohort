@@ -8,6 +8,10 @@ public sealed class CohortOptions
 
     public string? Schedule { get; init; }
 
+    /// <summary>
+    /// Makes the scheduled worker dry-run instead of sweep. Explicit sweep and erasure
+    /// requests carry their own dry-run flag and are not affected.
+    /// </summary>
     public bool DryRun { get; init; }
 
     public bool KillSwitch { get; init; }

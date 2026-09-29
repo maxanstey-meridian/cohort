@@ -1,6 +1,7 @@
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Npgsql;
 
@@ -44,6 +45,93 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
         (await LoadRunStatusAsync(sweepId)).Should().Be(SweepRunStatus.Succeeded);
     }
 
+    [Fact]
+    public async Task Run_Is_Locked_Before_Started_Reaches_Observers()
+    {
+        // A slow observer delays the run between Started and its first entity. Recovery must
+        // still see a live owner, or it would fail a run that is about to proceed.
+        var tenantId = Guid.NewGuid();
+        var observer = new StartedBlockingObserver();
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                ["Cohort:AuditObservers:Timeout"] = "00:01:00",
+            },
+            configureServices: services => services.AddSingleton<IRetentionAuditObserver>(observer)
+        );
+        var runTask = host.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new DateTimeOffset(2026, 7, 11, 12, 0, 0, TimeSpan.Zero)
+        );
+
+        await observer.StartedDelivered.WaitAsync(TimeSpan.FromSeconds(10));
+        var sweepId = await LoadStartedSweepIdAsync(tenantId);
+        try
+        {
+            await BackdateRunAsync(sweepId);
+            await host.RunWithServicesAsync(services =>
+                services.GetRequiredService<IRetentionRowDispatcher>().FlushAsync()
+            );
+
+            (await LoadRunStatusAsync(sweepId)).Should().Be(SweepRunStatus.Started);
+        }
+        finally
+        {
+            observer.Release();
+        }
+
+        (await runTask).SweepId.Should().Be(sweepId);
+        (await LoadRunStatusAsync(sweepId)).Should().Be(SweepRunStatus.Succeeded);
+    }
+
+    [Fact]
+    public async Task Manual_Sweep_Runs_As_Requested_When_The_Worker_Is_Configured_To_Dry_Run()
+    {
+        // Cohort:DryRun only sets what the scheduled worker does; an explicit request is
+        // honoured as written.
+        var tenantId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 7, 11, 12, 0, 0, TimeSpan.Zero);
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configurationOverrides: new Dictionary<string, string?> { ["Cohort:DryRun"] = "true" }
+        );
+        await using (var db = host.CreateDbContext())
+        {
+            db.Notes.Add(new Cohort.Sample.Entities.Note { Id = noteId, TenantId = tenantId, CreatedAt = asOf.AddDays(-120), Body = "configured-dry-run" });
+            await db.SaveChangesAsync();
+        }
+
+        var result = await host.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        (await LoadRunStatusAsync(result.SweepId)).Should().Be(SweepRunStatus.Succeeded);
+        await using var verify = host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeFalse();
+    }
+
+    private sealed class StartedBlockingObserver : IRetentionAuditObserver
+    {
+        private readonly TaskCompletionSource delivered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource released = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task StartedDelivered => delivered.Task;
+
+        public void Release() => released.TrySetResult();
+
+        public async Task OnCommittedAsync(SweepEvent evt, CancellationToken ct)
+        {
+            if (evt is SweepEvent.Started)
+            {
+                delivered.TrySetResult();
+                await released.Task.WaitAsync(ct);
+            }
+        }
+    }
+
     private static Task<Guid> StartRunAsync(
         CohortTestHost host,
         RunPath path,
@@ -70,11 +158,12 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
             var result = await host.RunWithServicesAsync(services =>
                 services
                     .GetRequiredService<RetentionSweepEngine>()
-                    .DryRunAsync(
+                    .RunAsync(
                         tenant,
                         asOf,
                         SweepTriggerKind.Manual,
-                        SweepEntityScope.TenantedOnly
+                        SweepEntityScope.TenantedOnly,
+                        dryRun: true
                     )
             );
             return result.SweepId;

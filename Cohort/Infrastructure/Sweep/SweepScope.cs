@@ -46,6 +46,15 @@ internal sealed record SweepScope(
         );
 
     /// <summary>
+    /// The age recorded on audit summaries: the effective retention period for a sweep, the
+    /// legal minimum alone for an erasure (which ignores the period).
+    /// </summary>
+    public TimeSpan ResolvedPeriod =>
+        Subject is null
+            ? CutoffCalculator.ResolveEffectivePeriod(Rule.Period, Rule.LegalMin)
+            : CutoffCalculator.ResolveErasureMinimumAge(Rule.LegalMin);
+
+    /// <summary>
     /// A sweep skips rows another run has locked and retires them next time; an erasure
     /// must wait for them, because it has to cover every one of the subject's rows.
     /// </summary>

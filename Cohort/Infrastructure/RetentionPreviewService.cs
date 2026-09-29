@@ -63,24 +63,15 @@ internal sealed class RetentionPreviewService(
                     context,
                     ct
                 );
-                if (rule.Strategy != Strategy.Exempt && !strategies.ContainsKey(rule.Strategy))
+                long affected = 0, held = 0, nullAnchors = 0;
+                if (rule.Strategy != Strategy.Exempt)
                 {
-                    throw new InvalidOperationException(
-                        $"Retention strategy '{rule.Strategy}' is not supported by the preview path."
-                    );
+                    var strategy = strategies[rule.Strategy];
+                    var scope = SweepScope.ForSweep(entry, rule, context);
+                    affected = await strategy.CountAsync(scope, SweepCount.Eligible, connection, ct);
+                    held = await strategy.CountAsync(scope, SweepCount.Held, connection, ct);
+                    nullAnchors = await strategy.CountAsync(scope, SweepCount.NullAnchor, connection, ct);
                 }
-
-                var measurement =
-                    rule.Strategy == Strategy.Exempt
-                        ? (Affected: 0L, HeldCount: 0L, NullAnchorCount: 0L)
-                        : await RetentionPreviewMeasurement.MeasureAsync(
-                            strategies[rule.Strategy],
-                            entry,
-                            rule,
-                            context,
-                            connection,
-                            ct
-                        );
 
                 counts.Add(
                     new EntitySweepCount(
@@ -88,9 +79,9 @@ internal sealed class RetentionPreviewService(
                         entry.Category,
                         tenant.Id,
                         rule.Strategy,
-                        measurement.Affected,
-                        measurement.HeldCount,
-                        NullAnchorCount: measurement.NullAnchorCount
+                        affected,
+                        held,
+                        NullAnchorCount: nullAnchors
                     )
                 );
             }

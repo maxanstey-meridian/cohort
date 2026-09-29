@@ -6,8 +6,6 @@ namespace Cohort.Infrastructure;
 /// </summary>
 internal interface IRetentionExecutionSettings
 {
-    public bool DryRun { get; }
-
     public int SweepBatchSize { get; }
 
     public TimeSpan AuditObserverTimeout { get; }

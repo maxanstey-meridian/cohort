@@ -254,8 +254,9 @@ Cohort.Domain.ErasureResult.SweepId.init -> void
 Cohort.Domain.ErasureScope
 Cohort.Domain.ErasureScope.<Clone>$() -> Cohort.Domain.ErasureScope!
 Cohort.Domain.ErasureScope.AllowSoftDeleteAsErasure.get -> bool
+Cohort.Domain.ErasureScope.DryRun.get -> bool
 Cohort.Domain.ErasureScope.Equals(Cohort.Domain.ErasureScope? other) -> bool
-Cohort.Domain.ErasureScope.ErasureScope(object! subject, bool allowSoftDeleteAsErasure = false) -> void
+Cohort.Domain.ErasureScope.ErasureScope(object! subject, bool allowSoftDeleteAsErasure = false, bool dryRun = false) -> void
 Cohort.Domain.ErasureScope.Subject.get -> object!
 Cohort.Domain.ErasureSubjectAttribute
 Cohort.Domain.ErasureSubjectAttribute.ErasureSubjectAttribute() -> void

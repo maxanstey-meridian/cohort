@@ -364,21 +364,14 @@ internal sealed class RetentionWorker(
         CancellationToken ct
     )
     {
-        return dryRun
-            ? engine.DryRunAsync(
-                tenant,
-                DateTimeOffset.UtcNow,
-                SweepTriggerKind.Scheduled,
-                scope,
-                ct
-            )
-            : engine.SweepAsync(
-                tenant,
-                DateTimeOffset.UtcNow,
-                SweepTriggerKind.Scheduled,
-                scope,
-                ct
-            );
+        return engine.RunAsync(
+            tenant,
+            DateTimeOffset.UtcNow,
+            SweepTriggerKind.Scheduled,
+            scope,
+            dryRun,
+            ct
+        );
     }
 
     private bool KillSwitchEngagedMidIteration()

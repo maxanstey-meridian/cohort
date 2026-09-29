@@ -179,11 +179,12 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
         {
             dryRun = await services
                 .GetRequiredService<RetentionSweepEngine>()
-                .DryRunAsync(
+                .RunAsync(
                     tenant,
                     asOf,
                     SweepTriggerKind.Manual,
-                    SweepEntityScope.TenantedOnly
+                    SweepEntityScope.TenantedOnly,
+                    dryRun: true
                 );
         });
 

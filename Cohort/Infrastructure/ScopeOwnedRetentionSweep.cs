@@ -23,22 +23,7 @@ internal sealed class ScopeOwnedRetentionSweep(IServiceScopeFactory scopeFactory
         };
 
         return ExecuteAsync(
-            engine =>
-                request.DryRun
-                    ? engine.DryRunAsync(
-                        tenant,
-                        request.At,
-                        request.Trigger,
-                        scope,
-                        ct
-                    )
-                    : engine.SweepAsync(
-                        tenant,
-                        request.At,
-                        request.Trigger,
-                        scope,
-                        ct
-                    ),
+            engine => engine.RunAsync(tenant, request.At, request.Trigger, scope, request.DryRun, ct),
             ct
         );
     }

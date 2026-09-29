@@ -226,13 +226,12 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
         using var erasureHost = new CohortTestHost(
             GetConnectionString(),
-            CreateErasureCategoryRepository(),
-            CreateCohortSettings(dryRun: true)
+            CreateErasureCategoryRepository()
         );
 
         var result = await erasureHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true, dryRun: true),
             asOf
         );
 
@@ -360,8 +359,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
         using var erasureHost = new CohortTestHost(
             GetConnectionString(),
-            CreateErasureCategoryRepository(),
-            CreateCohortSettings(dryRun: true)
+            CreateErasureCategoryRepository()
         );
         await erasureHost.RunPreviewAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
@@ -382,7 +380,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
         var erasureTask = erasureHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true, dryRun: true),
             asOf
         );
 
@@ -914,14 +912,8 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     public async Task Erasure_Path_DryRun_And_Live_MultiSubject_Matches_Ignore_Period_While_Holds_Block_Mutation()
     {
         await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
-        await using var previewServices = BuildMultiSubjectServiceProvider(
-            database.ConnectionString,
-            dryRun: true
-        );
-        await using var liveServices = BuildMultiSubjectServiceProvider(
-            database.ConnectionString,
-            dryRun: false
-        );
+        await using var previewServices = BuildMultiSubjectServiceProvider(database.ConnectionString);
+        await using var liveServices = BuildMultiSubjectServiceProvider(database.ConnectionString);
 
         var tenantId = Guid.NewGuid();
         var otherTenantId = Guid.NewGuid();
@@ -1010,7 +1002,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                 scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
             previewResult = await erasureService.EraseAsync(
                 new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+                new ErasureScope(subjectId, allowSoftDeleteAsErasure: true, dryRun: true),
                 asOf
             );
         }
@@ -1862,14 +1854,6 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         );
     }
 
-    private static IReadOnlyDictionary<string, string?> CreateCohortSettings(bool dryRun)
-    {
-        return new Dictionary<string, string?>
-        {
-            [$"{CohortOptions.SectionName}:DryRun"] = dryRun.ToString(),
-        };
-    }
-
     private static ServiceProvider BuildFactoryBackedErasureServiceProvider(string connectionString)
     {
         var services = new ServiceCollection();
@@ -1924,14 +1908,11 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         return services.BuildServiceProvider(validateScopes: true);
     }
 
-    private static ServiceProvider BuildMultiSubjectServiceProvider(
-        string connectionString,
-        bool dryRun = false
-    )
+    private static ServiceProvider BuildMultiSubjectServiceProvider(string connectionString)
     {
         var services = new ServiceCollection();
         var configuration = new ConfigurationBuilder()
-            .AddInMemoryCollection(CreateCohortSettings(dryRun))
+            .AddInMemoryCollection()
             .Build();
 
         services.AddSingleton<IConfiguration>(configuration);

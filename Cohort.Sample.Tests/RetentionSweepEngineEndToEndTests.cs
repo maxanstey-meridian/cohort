@@ -106,20 +106,22 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
 
             if (dryRun)
             {
-                await engine.DryRunAsync(
+                await engine.RunAsync(
                     tenant,
                     asOf,
                     SweepTriggerKind.Manual,
-                    SweepEntityScope.TenantedOnly
+                    SweepEntityScope.TenantedOnly,
+                    dryRun: true
                 );
             }
             else
             {
-                await engine.SweepAsync(
+                await engine.RunAsync(
                     tenant,
                     asOf,
                     SweepTriggerKind.Manual,
-                    SweepEntityScope.TenantedOnly
+                    SweepEntityScope.TenantedOnly,
+                    dryRun: false
                 );
             }
 

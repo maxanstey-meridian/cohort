@@ -1105,7 +1105,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         using var handlerHost = new CohortTestHost(
             GetConnectionString(),
             CreateHandlerErasureCategoryRepository(),
-            CreateCohortSettings(dryRun: true),
+            configurationOverrides: null,
             services =>
             {
                 services.AddSingleton(sink);
@@ -1121,7 +1121,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         var result = await handlerHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true, dryRun: true),
             asOf
         );
 
@@ -1888,14 +1888,6 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                 ),
             }
         );
-    }
-
-    private static IReadOnlyDictionary<string, string?> CreateCohortSettings(bool dryRun)
-    {
-        return new Dictionary<string, string?>
-        {
-            [$"{CohortOptions.SectionName}:DryRun"] = dryRun.ToString(),
-        };
     }
 
     private sealed record CapturedRow(

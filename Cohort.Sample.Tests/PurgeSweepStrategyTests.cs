@@ -8,6 +8,29 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Sample.Tests;
 
+// ─── EXEMPLAR — end-to-end test ─────────────────────────────────────────────
+//
+// Pattern: end-to-end test. THIS IS THE PATTERN.
+//
+// Feed real data in the front. Run the real code path. Assert what comes out
+// the back. Use this whenever the code under test touches a port (DbContext,
+// IOptions with real config binding, IHostedService, file/HTTP I/O).
+//
+// Here: seed rows into a real PostgreSQL database, resolve the public
+// IRetentionSweep from a real AddCohort<TContext>() container, sweep, then read
+// the table back and compare what survived.
+//
+// Copy this file. Rename it. Edit the seed and assertions.
+//
+// Do NOT abstract.
+// Do NOT share a base class beyond IntegrationTestBase.
+// Do NOT add mocks — NSubstitute is intentionally absent from this project.
+//
+// When you add a new port `IFoo`, the same PR adds an end-to-end test here that
+// exercises the REAL implementation against PostgresFixture. Non-negotiable.
+// See CLAUDE.md.
+// ────────────────────────────────────────────────────────────────────────────
+
 [Collection("Integration")]
 public sealed class PurgeSweepStrategyTests(PostgresFixture fixture)
 {

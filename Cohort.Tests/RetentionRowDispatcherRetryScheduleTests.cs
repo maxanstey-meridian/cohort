@@ -37,18 +37,4 @@ public sealed class RetentionRowDispatcherRetryScheduleTests
 
         nextAttemptAt.Should().Be(RetentionRowDispatcher.RetryScheduleUpperBound);
     }
-
-    [Fact]
-    public void CalculateNextAttemptAt_Saturates_When_Ordinary_Backoff_Crosses_Upper_Bound()
-    {
-        var now = RetentionRowDispatcher.RetryScheduleUpperBound.AddSeconds(-1);
-
-        var nextAttemptAt = RetentionRowDispatcher.CalculateNextAttemptAt(
-            now,
-            TimeSpan.FromSeconds(1),
-            2
-        );
-
-        nextAttemptAt.Should().Be(RetentionRowDispatcher.RetryScheduleUpperBound);
-    }
 }

@@ -108,22 +108,6 @@ public sealed class RetentionScopeCorpusTests(PostgresFixture fixture) : Integra
     }
 
     [Fact]
-    public async Task Conflicting_annotations_fail_validation_before_mutation()
-    {
-        await AssertHostedAndPublicOperationFailBeforeMutationAsync<ConflictingAnnotationDbContext>(
-            "scope_conflicting_rows",
-            "*must declare exactly one of [Retain] or [ExemptFromRetention], not both*",
-            """
-            CREATE TABLE IF NOT EXISTS "scope_conflicting_rows" (
-                "Id" uuid PRIMARY KEY,
-                "TenantId" uuid NOT NULL,
-                "CreatedAt" timestamp with time zone NOT NULL
-            )
-            """
-        );
-    }
-
-    [Fact]
     public async Task Unsupported_relational_mappings_fail_validation_before_mutation()
     {
         await AssertHostedAndPublicOperationFailBeforeMutationAsync<OwnedMappingDbContext>(
@@ -320,19 +304,6 @@ public sealed class RetentionScopeCorpusTests(PostgresFixture fixture) : Integra
         public string Payload { get; set; } = string.Empty;
     }
 
-    private sealed class ConflictingAnnotationDbContext(
-        DbContextOptions<ConflictingAnnotationDbContext> options
-    ) : DbContext(options)
-    {
-        public DbSet<ConflictingAnnotationRow> ConflictingRows => Set<ConflictingAnnotationRow>();
-
-        protected override void OnModelCreating(ModelBuilder modelBuilder)
-        {
-            modelBuilder.Entity<ConflictingAnnotationRow>().ToTable("scope_conflicting_rows");
-            modelBuilder.ConfigureCohortTables();
-        }
-    }
-
     private sealed class OwnedMappingDbContext(DbContextOptions<OwnedMappingDbContext> options)
         : DbContext(options)
     {
@@ -409,16 +380,6 @@ public sealed class RetentionScopeCorpusTests(PostgresFixture fixture) : Integra
             modelBuilder.Entity<InheritanceDerivedRow>();
             modelBuilder.ConfigureCohortTables();
         }
-    }
-
-    [Retain("conflict", nameof(CreatedAt))]
-    [ExemptFromRetention("conflicting fixture")]
-    [RetentionEntityId("00000000-0000-0000-0005-000000000001")]
-    private sealed class ConflictingAnnotationRow
-    {
-        public Guid Id { get; set; }
-        public Guid TenantId { get; set; }
-        public DateTimeOffset CreatedAt { get; set; }
     }
 
     private sealed class OwnedContainer

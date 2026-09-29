@@ -10,7 +10,7 @@ Standalone .NET 9 class library. Annotation-driven retention for EF Core consume
 
 Three patterns. Each has a header comment in its exemplar file. Pick one, copy the exemplar, edit the seed and assertions.
 
-1. **End-to-end test in `Cohort.Sample.Tests/`** — the default. Use whenever the code under test touches a port: `DbContext`, `IOptions<T>` with real config binding, `IHostedService`, file/HTTP I/O, anything that crosses an I/O boundary. Feed real data in the front, run the real code path, assert what comes out. **Copy `RegistryEndToEndTests.cs`.** Do not abstract. Do not share a base class beyond `IntegrationTestBase`. Do not add mocks.
+1. **End-to-end test in `Cohort.Sample.Tests/`** — the default. Use whenever the code under test touches a port: `DbContext`, `IOptions<T>` with real config binding, `IHostedService`, file/HTTP I/O, anything that crosses an I/O boundary. Feed real data in the front, run the real code path, assert what comes out. **Copy `PurgeSweepStrategyTests.cs`.** Do not abstract. Do not share a base class beyond `IntegrationTestBase`. Do not add mocks.
 
 2. **Pure unit test in `Cohort.Tests/`** — only when the code under test is a static function with no I/O, no DbContext, no time source beyond parameters, no randomness. `[Theory]` + `[InlineData]` rows. **Copy `CutoffCalculatorTests.cs`.** No async. No fixtures. No DI. No `IClock` abstraction — never invent an abstraction to test a pure function.
 

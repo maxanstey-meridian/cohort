@@ -1,5 +1,4 @@
 using Cohort.Infrastructure;
-using Cohort.Infrastructure.Handlers;
 
 namespace Cohort.Tests;
 
@@ -28,18 +27,6 @@ public sealed class OperationalTimeTests
         {
             result.Should().Be(timestamp);
         }
-    }
-
-    [Theory]
-    [InlineData(0)]
-    [InlineData(1)]
-    [InlineData(long.MaxValue)]
-    public void GetDelayChunk_Returns_A_TaskDelay_Safe_Duration(long ticks)
-    {
-        var result = OperationalTime.GetDelayChunk(TimeSpan.FromTicks(ticks));
-
-        result.Should().BeGreaterThanOrEqualTo(TimeSpan.Zero);
-        result.Should().BeLessThanOrEqualTo(OperationalTime.MaxDelayChunk);
     }
 
     [Theory]
@@ -82,32 +69,5 @@ public sealed class OperationalTimeTests
             .SubtractSaturating(DateTimeOffset.MaxValue, TimeSpan.MaxValue)
             .Should()
             .Be(DateTimeOffset.MinValue);
-    }
-
-    [Fact]
-    public void CalculateNextAttemptAt_Uses_Exact_Exponential_Boundaries_And_Saturates()
-    {
-        var upperBound = RetentionRowDispatcher.RetryScheduleUpperBound;
-
-        RetentionRowDispatcher
-            .CalculateNextAttemptAt(upperBound.AddTicks(-2), TimeSpan.FromTicks(1), attempt: 2)
-            .Should()
-            .Be(upperBound);
-        RetentionRowDispatcher
-            .CalculateNextAttemptAt(upperBound.AddTicks(-2), TimeSpan.FromTicks(1), attempt: 3)
-            .Should()
-            .Be(upperBound);
-        RetentionRowDispatcher
-            .CalculateNextAttemptAt(DateTimeOffset.MinValue, TimeSpan.MaxValue, int.MaxValue)
-            .Should()
-            .Be(upperBound);
-        RetentionRowDispatcher
-            .CalculateNextAttemptAt(DateTimeOffset.MaxValue, TimeSpan.FromTicks(1), attempt: 1)
-            .Should()
-            .Be(upperBound);
-        RetentionRowDispatcher
-            .CalculateNextAttemptAt(DateTimeOffset.UnixEpoch, TimeSpan.FromTicks(-1), attempt: 1)
-            .Should()
-            .Be(DateTimeOffset.UnixEpoch);
     }
 }

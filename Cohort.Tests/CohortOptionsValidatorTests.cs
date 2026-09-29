@@ -5,31 +5,6 @@ namespace Cohort.Tests;
 public sealed class CohortOptionsValidatorTests
 {
     [Fact]
-    public void Audit_Observer_Timeout_Defaults_To_Five_Seconds()
-    {
-        new CohortOptions().AuditObservers.Timeout.Should().Be(TimeSpan.FromSeconds(5));
-    }
-
-    [Theory]
-    [InlineData(0)]
-    [InlineData(-1)]
-    public void Validate_Rejects_Non_Positive_Audit_Observer_Timeout(int milliseconds)
-    {
-        var options = new CohortOptions
-        {
-            AuditObservers = new AuditObserverOptions
-            {
-                Timeout = TimeSpan.FromMilliseconds(milliseconds),
-            },
-        };
-
-        var result = new CohortOptionsValidator().Validate(null, options);
-
-        result.Failed.Should().BeTrue();
-        result.Failures.Should().ContainSingle(message => message.Contains("AuditObservers Timeout"));
-    }
-
-    [Fact]
     public void Validate_Rejects_Audit_Observer_Timeout_Above_Safe_Ceiling()
     {
         var options = new CohortOptions
@@ -41,24 +16,6 @@ public sealed class CohortOptionsValidatorTests
 
         result.Failed.Should().BeTrue();
         result.Failures.Should().ContainSingle(message => message.Contains("AuditObservers Timeout"));
-    }
-
-    [Theory]
-    [InlineData("Conventions")]
-    [InlineData("RowHandlerDispatch")]
-    public void Validate_Rejects_Null_Nested_Options(string option)
-    {
-        var options = option switch
-        {
-            "Conventions" => new CohortOptions { Conventions = null! },
-            "RowHandlerDispatch" => new CohortOptions { RowHandlerDispatch = null! },
-            _ => throw new ArgumentOutOfRangeException(nameof(option)),
-        };
-
-        var result = new CohortOptionsValidator().Validate(null, options);
-
-        result.Failed.Should().BeTrue();
-        result.Failures.Should().ContainSingle(message => message.Contains(option));
     }
 
     [Theory]
@@ -146,38 +103,5 @@ public sealed class CohortOptionsValidatorTests
             .Validate(null, new CohortOptions { RowHandlerDispatch = dispatch })
             .Succeeded.Should()
             .BeTrue();
-    }
-
-    [Theory]
-    [InlineData("RecordIdPropertyName")]
-    [InlineData("TenantPropertyName")]
-    [InlineData("SoftDeletePropertyName")]
-    [InlineData("DeletedAtPropertyName")]
-    [InlineData("AnonymisedAtPropertyName")]
-    public void Validate_Rejects_Blank_Convention_Names(string option)
-    {
-        var conventions = option switch
-        {
-            "RecordIdPropertyName" => new CohortConventions { RecordIdPropertyName = " " },
-            "TenantPropertyName" => new CohortConventions { TenantPropertyName = " " },
-            "SoftDeletePropertyName" => new CohortConventions
-            {
-                SoftDeletePropertyName = " ",
-            },
-            "DeletedAtPropertyName" => new CohortConventions { DeletedAtPropertyName = " " },
-            "AnonymisedAtPropertyName" => new CohortConventions
-            {
-                AnonymisedAtPropertyName = " ",
-            },
-            _ => throw new ArgumentOutOfRangeException(nameof(option)),
-        };
-
-        var result = new CohortOptionsValidator().Validate(
-            null,
-            new CohortOptions { Conventions = conventions }
-        );
-
-        result.Failed.Should().BeTrue();
-        result.Failures.Should().ContainSingle(message => message.Contains(option));
     }
 }

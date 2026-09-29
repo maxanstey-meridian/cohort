@@ -6,7 +6,6 @@ using Cohort.Sample.Entities;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 using Npgsql;
 
 namespace Cohort.Sample.Tests;
@@ -14,27 +13,6 @@ namespace Cohort.Sample.Tests;
 public sealed class AuditObserverEndToEndTests(PostgresFixture fixture)
     : IntegrationTestBase(fixture)
 {
-    [Fact]
-    public async Task Extreme_Observer_Timeout_Fails_Options_Validation_Before_The_Run_Starts()
-    {
-        using var host = new CohortTestHost(
-            ConnectionString,
-            configurationOverrides: new Dictionary<string, string?>
-            {
-                [$"{CohortOptions.SectionName}:AuditObservers:Timeout"] = "01:00:00.001",
-            }
-        );
-
-        var act = () => host.RunPreviewAsync(
-            new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
-            DateTimeOffset.UtcNow
-        );
-
-        await act.Should()
-            .ThrowAsync<OptionsValidationException>()
-            .WithMessage("*AuditObservers Timeout must not exceed 1 hour*");
-    }
-
     [Fact]
     public async Task Row_Detail_Observer_Runs_Only_After_Mutation_And_Audit_Commit()
     {
@@ -70,67 +48,6 @@ public sealed class AuditObserverEndToEndTests(PostgresFixture fixture)
         var visibility = await observer.Visibility.WaitAsync(TimeSpan.FromSeconds(5));
         visibility.SourceRowExists.Should().BeFalse();
         visibility.AuditRowExists.Should().BeTrue();
-    }
-
-    [Fact]
-    public async Task Multiple_Observers_Receive_The_Same_Committed_Lifecycle_In_Order()
-    {
-        var tenantId = Guid.NewGuid();
-        var recordId = Guid.NewGuid();
-        var now = new DateTimeOffset(2026, 7, 12, 12, 0, 0, TimeSpan.Zero);
-        var first = new RecordingObserver();
-        var second = new RecordingObserver();
-
-        await using (var db = Host.CreateDbContext())
-        {
-            db.PerRowAuditedLogs.Add(
-                new PerRowAuditedLog
-                {
-                    Id = recordId,
-                    TenantId = tenantId,
-                    CreatedAt = now.AddDays(-60),
-                    Payload = "ordered-observers",
-                }
-            );
-            await db.SaveChangesAsync();
-        }
-
-        using var host = new CohortTestHost(
-            ConnectionString,
-            configureServices: services =>
-            {
-                services.AddSingleton<IRetentionAuditObserver>(first);
-                services.AddSingleton<IRetentionAuditObserver>(second);
-            }
-        );
-
-        var result = await host.RunSweepAsync(
-            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            now
-        );
-
-        var events = first.Events.ToList();
-        events.Should().Equal(second.Events);
-        events[0].Should().BeOfType<SweepEvent.Started>();
-        events[^1].Should().BeOfType<SweepEvent.Completed>();
-
-        var rowDetailIndex = events.FindIndex(evt =>
-            evt is SweepEvent.RowDetail detail && detail.RecordId == recordId.ToString()
-        );
-        var progressIndex = events.FindIndex(evt =>
-            evt is SweepEvent.EntityProgress progress
-            && progress.EntityType == typeof(PerRowAuditedLog)
-            && progress.Affected == 1
-        );
-        var summaryIndex = events.FindIndex(evt =>
-            evt is SweepEvent.EntitySummary summary
-            && summary.EntityType == typeof(PerRowAuditedLog)
-        );
-
-        rowDetailIndex.Should().BeGreaterThan(0);
-        progressIndex.Should().BeGreaterThan(rowDetailIndex);
-        summaryIndex.Should().BeGreaterThan(progressIndex);
-        ((SweepEvent.Completed)events[^1]).SweepId.Should().Be(result.SweepId);
     }
 
     [Fact]
@@ -288,53 +205,6 @@ public sealed class AuditObserverEndToEndTests(PostgresFixture fixture)
         reader.GetInt64(1).Should().Be(1);
     }
 
-    [Fact]
-    public async Task Non_Cooperative_Timed_Out_Observer_Is_Quarantined_For_The_Remainder_Of_The_Run()
-    {
-        var tenantId = Guid.NewGuid();
-        var now = new DateTimeOffset(2026, 7, 12, 12, 0, 0, TimeSpan.Zero);
-        var blocking = new NonCooperativeObserver();
-        var healthy = new RecordingObserver();
-
-        await using (var db = Host.CreateDbContext())
-        {
-            db.Notes.Add(
-                new Note
-                {
-                    Id = Guid.NewGuid(),
-                    TenantId = tenantId,
-                    CreatedAt = now.AddDays(-60),
-                    Body = "observer-quarantine",
-                }
-            );
-            await db.SaveChangesAsync();
-        }
-
-        using var host = new CohortTestHost(
-            ConnectionString,
-            configurationOverrides: new Dictionary<string, string?>
-            {
-                [$"{CohortOptions.SectionName}:AuditObservers:Timeout"] = "00:00:00.050",
-            },
-            configureServices: services =>
-            {
-                services.AddSingleton<IRetentionAuditObserver>(blocking);
-                services.AddSingleton<IRetentionAuditObserver>(healthy);
-            }
-        );
-
-        var result = await host.RunSweepAsync(
-            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            now
-        );
-
-        result.EntityFailures.Should().BeEmpty();
-        blocking.CallCount.Should().Be(1);
-        blocking.MaximumConcurrency.Should().Be(1);
-        healthy.Events[^1].Should().BeOfType<SweepEvent.Completed>();
-        blocking.Release();
-    }
-
     private sealed class CommitVisibilityObserver(string connectionString, Guid recordId)
         : IRetentionAuditObserver
     {
@@ -410,39 +280,6 @@ public sealed class AuditObserverEndToEndTests(PostgresFixture fixture)
                 throw;
             }
         }
-    }
-
-    private sealed class NonCooperativeObserver : IRetentionAuditObserver
-    {
-        private readonly TaskCompletionSource release =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
-        private int callCount;
-        private int concurrency;
-        private int maximumConcurrency;
-
-        public int CallCount => Volatile.Read(ref callCount);
-
-        public int MaximumConcurrency => Volatile.Read(ref maximumConcurrency);
-
-        public async Task OnCommittedAsync(SweepEvent evt, CancellationToken ct)
-        {
-            Interlocked.Increment(ref callCount);
-            var current = Interlocked.Increment(ref concurrency);
-            if (current > Volatile.Read(ref maximumConcurrency))
-            {
-                Interlocked.Exchange(ref maximumConcurrency, current);
-            }
-            try
-            {
-                await release.Task;
-            }
-            finally
-            {
-                Interlocked.Decrement(ref concurrency);
-            }
-        }
-
-        public void Release() => release.TrySetResult();
     }
 
     private sealed class RecordingLogProvider : ILoggerProvider

@@ -26,6 +26,21 @@ internal sealed partial class RetentionStartupValidator(
         typeof(DateTimeOffset),
         typeof(DateTimeOffset?),
     ];
+    // CAST(value AS text) for these types follows session settings (TimeZone, DateStyle,
+    // IntervalStyle, extra_float_digits, lc_monetary, bytea_output).
+    private static readonly HashSet<string> SessionDependentTextStoreTypes =
+    [
+        "timestamp with time zone",
+        "timestamp without time zone",
+        "date",
+        "time with time zone",
+        "time without time zone",
+        "interval",
+        "real",
+        "double precision",
+        "money",
+        "bytea",
+    ];
     private readonly IReadOnlyDictionary<Type, int> registeredAnonymiseFactoryTypeCounts = anonymiseValueFactories
         .GroupBy(factory => factory.GetType())
         .ToDictionary(group => group.Key, group => group.Count());
@@ -382,6 +397,15 @@ internal sealed partial class RetentionStartupValidator(
         {
             errors.Add(
                 $"Record-id convention on {entry.EntityType.FullName}: record-id property '{entry.RecordId.RecordIdMember}' must uniquely identify rows via a single-column primary key, alternate key, or unique index."
+            );
+            return;
+        }
+
+        var storeType = TryGetStoreType(recordIdProperty);
+        if (storeType is not null && SessionDependentTextStoreTypes.Contains(NormalizeStoreType(storeType)))
+        {
+            errors.Add(
+                $"Record-id convention on {entry.EntityType.FullName}: record-id property '{entry.RecordId.RecordIdMember}' is mapped to '{storeType}'. Cohort stores record ids as the column's PostgreSQL text form, which for this type depends on session settings (TimeZone, DateStyle, IntervalStyle, extra_float_digits), so holds and audit rows could silently stop matching. Use a uuid, integer, numeric, or text record id, or mark a stable unique column with [RetentionRecordId]."
             );
         }
     }

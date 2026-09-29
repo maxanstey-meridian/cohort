@@ -183,7 +183,9 @@ internal static class RetentionSnapshotSerializer
 
             // Handler-stashed payload types resolve only inside the entity's and the
             // registered handlers' own assemblies; framework and third-party assemblies
-            // (where deserialization gadget types live) stay out of reach.
+            // (where deserialization gadget types live) stay out of reach. A name without an
+            // assembly (including a generic argument) would otherwise be looked up in CoreLib
+            // without consulting the assembly resolver, so it resolves to nothing.
             var resolved = Type.GetType(
                 normalized,
                 assemblyName =>
@@ -194,7 +196,7 @@ internal static class RetentionSnapshotSerializer
                             StringComparison.Ordinal
                         )
                     ),
-                typeResolver: null,
+                (assembly, name, ignoreCase) => assembly?.GetType(name, throwOnError: false, ignoreCase),
                 throwOnError: false
             );
 

@@ -54,7 +54,7 @@ internal sealed record ErasureSubjectMatch(
     internal string EqualsParameterSql(string targetAlias, string parameterName)
     {
         var column = $"{targetAlias}.{PostgreSqlIdentifier.Quote(SubjectColumn)}";
-        return PostgresStoreTypeSql.Validate(SubjectStoreType) is { } storeType
+        return PostgresStoreTypeSql.CastType(SubjectStoreType) is { } storeType
             ? $"{column} = CAST(@{parameterName} AS {storeType})"
             : $"{column} = @{parameterName}";
     }

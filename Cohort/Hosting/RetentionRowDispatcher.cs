@@ -537,11 +537,14 @@ internal sealed class RetentionRowDispatcher(
             await InvokeOnAfterAsync(entityType, handler.Instance, claimed, snapshot, handlerCts.Token);
             handlerCompleted = true;
             await StopHeartbeatAsync(heartbeat, heartbeatCts);
+            // Captured outside the lambda: EF would otherwise emit an unqualified now(),
+            // resolvable through the search_path and on the database clock.
+            var completedAt = DateTimeOffset.UtcNow;
             await SettleAsync(
                 claimed,
                 s => s
                     .SetProperty(x => x.State, SweepRowHandlerDispatchState.Succeeded)
-                    .SetProperty(x => x.CompletedAt, DateTimeOffset.UtcNow)
+                    .SetProperty(x => x.CompletedAt, completedAt)
                     .SetProperty(x => x.ClaimedAt, (DateTimeOffset?)null)
                     .SetProperty(x => x.ClaimToken, (Guid?)null)
                     .SetProperty(x => x.LastError, (string?)null),
@@ -617,10 +620,12 @@ internal sealed class RetentionRowDispatcher(
 
     private Task<bool> RenewClaimAsync(ClaimedHandlerRow claimed, CancellationToken ct)
     {
+        // Leases are judged on the app clock, so renew on it too (and never via a bare now()).
+        var claimedAt = DateTimeOffset.UtcNow;
         return WithDbAsync(
             async db =>
                 await Owned(db, claimed)
-                    .ExecuteUpdateAsync(s => s.SetProperty(x => x.ClaimedAt, DateTimeOffset.UtcNow), ct)
+                    .ExecuteUpdateAsync(s => s.SetProperty(x => x.ClaimedAt, claimedAt), ct)
                 == 1,
             ct
         );

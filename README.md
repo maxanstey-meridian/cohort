@@ -457,7 +457,7 @@ The execution contract:
 |---|---|---|
 | `Schedule` | `null` | Cron expression, evaluated in **UTC**. `null` means the worker is disabled. |
 | `DryRun` | `false` | Run **scheduled** sweeps as count-only audited runs instead of mutating data, with the same run and entity audit trail and `sweep_run.DryRun` set. Only the worker reads it: explicit requests carry their own flag (`RetentionSweepRequest.Tenanted(..., dryRun: true)`, `new ErasureScope(..., dryRun: true)`) and are honoured as written. |
-| `KillSwitch` | `false` | Finish the current iteration, then skip future ticks. |
+| `KillSwitch` | `false` | Stop between tenant passes: the tenant in progress finishes, the remaining tenants and future ticks are skipped. |
 | `SweepBatchSize` | `5000` | Maximum rows selected, locked, and mutated per transaction. Each batch commits independently. |
 | `AuditObservers:Timeout` | `00:00:05` | Maximum time Cohort waits for each observer to handle one committed event. Each observer has an independent timeout. |
 | `RowHandlerDispatch:PollInterval` | `00:00:10` | Delay between dispatcher polling passes. |

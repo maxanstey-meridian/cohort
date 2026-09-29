@@ -234,6 +234,8 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
                 AS $body$ SELECT '-infinity'::pg_catalog.timestamptz $body$;
                 CREATE FUNCTION "{{Escape(HostileSchema)}}".pg_advisory_xact_lock(bigint)
                 RETURNS void LANGUAGE plpgsql AS $body$ BEGIN RAISE EXCEPTION 'hostile lock shadow'; END $body$;
+                CREATE FUNCTION "{{Escape(HostileSchema)}}".now()
+                RETURNS timestamp with time zone LANGUAGE plpgsql AS $body$ BEGIN RAISE EXCEPTION 'hostile now shadow'; END $body$;
                 CREATE FUNCTION "{{Escape(HostileSchema)}}".hashtextextended(text, bigint)
                 RETURNS bigint LANGUAGE plpgsql AS $body$ BEGIN RAISE EXCEPTION 'hostile hash shadow'; END $body$;
                 CREATE FUNCTION "{{Escape(HostileSchema)}}".unnest(text[])

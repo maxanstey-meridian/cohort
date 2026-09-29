@@ -20,7 +20,7 @@ internal static class RecordIdSql
         string parameterName
     )
     {
-        return PostgresStoreTypeSql.Validate(recordId.RecordIdStoreType) is { } storeType
+        return PostgresStoreTypeSql.CastType(recordId.RecordIdStoreType) is { } storeType
             ? $"{targetAlias}.{PostgreSqlIdentifier.Quote(recordId.RecordIdColumn)} = CAST(@{parameterName} AS {storeType})"
             : $"CAST({targetAlias}.{PostgreSqlIdentifier.Quote(recordId.RecordIdColumn)} AS text) = CAST(@{parameterName} AS text)";
     }
@@ -31,7 +31,7 @@ internal static class RecordIdSql
         string parameterName
     )
     {
-        return PostgresStoreTypeSql.Validate(recordId.RecordIdStoreType) is { } storeType
+        return PostgresStoreTypeSql.CastType(recordId.RecordIdStoreType) is { } storeType
             ? $"{targetAlias}.{PostgreSqlIdentifier.Quote(recordId.RecordIdColumn)} = ANY(CAST(@{parameterName} AS {storeType}[]))"
             : $"CAST({targetAlias}.{PostgreSqlIdentifier.Quote(recordId.RecordIdColumn)} AS text) = ANY(@{parameterName})";
     }
@@ -44,7 +44,7 @@ internal static class RecordIdSql
         CancellationToken ct
     )
     {
-        var storeType = PostgresStoreTypeSql.Validate(recordId.RecordIdStoreType);
+        var storeType = PostgresStoreTypeSql.CastType(recordId.RecordIdStoreType);
         await using var command = new SqlParams { ["recordId"] = value }.CreateCommand(
             connection,
             transaction,

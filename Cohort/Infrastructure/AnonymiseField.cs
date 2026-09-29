@@ -9,7 +9,7 @@ internal abstract record AnonymiseField(string MemberName, string ColumnName, st
     internal string AssignmentSql(string parameterName)
     {
         var column = PostgreSqlIdentifier.Quote(ColumnName);
-        return PostgresStoreTypeSql.Validate(StoreType) is { } storeType
+        return PostgresStoreTypeSql.CastType(StoreType) is { } storeType
             ? $"{column} = CAST(@{parameterName} AS {storeType})"
             : $"{column} = @{parameterName}";
     }

@@ -1477,8 +1477,11 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             .Be(0);
     }
 
-    [Fact]
-    public async Task FlushAsync_Refuses_Snapshot_Payloads_Naming_Types_Outside_The_AllowList()
+    [Theory]
+    [InlineData("System.Diagnostics.ProcessStartInfo, System.Diagnostics.Process")]
+    // Without an assembly name Type.GetType searches CoreLib and never asks the resolver.
+    [InlineData("System.Version")]
+    public async Task FlushAsync_Refuses_Snapshot_Payloads_Naming_Types_Outside_The_AllowList(string typeName)
     {
         var tenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
@@ -1531,7 +1534,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                 """;
             command.Parameters.AddWithValue(
                 "payload",
-                """{"payload":{"$cohortType":"System.Diagnostics.ProcessStartInfo, System.Diagnostics.Process","$cohortValue":{}}}"""
+                $$$"""{"payload":{"$cohortType":"{{{typeName}}}","$cohortValue":"1.2"}}"""
             );
             command.Parameters.AddWithValue("sweepId", result.SweepId);
             (await command.ExecuteNonQueryAsync()).Should().Be(1);

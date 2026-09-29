@@ -59,7 +59,7 @@ internal sealed class RetentionTargetResolver(
             );
         }
 
-        if (PostgresStoreTypeSql.Validate(entry.RecordId.RecordIdStoreType) is not { } storeType)
+        if (PostgresStoreTypeSql.CastType(entry.RecordId.RecordIdStoreType) is not { } storeType)
         {
             return keyClrType == typeof(Guid) ? Guid.Parse(recordId).ToString("D") : recordId;
         }

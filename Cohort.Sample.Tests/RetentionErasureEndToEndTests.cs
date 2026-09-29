@@ -633,6 +633,64 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Length_Limited_Subject_And_Record_Ids_Match_Exactly_Instead_Of_Being_Truncated()
+    {
+        // An explicit cast to varchar(8) silently truncates; "ABCDEFGH-2" must not reach "ABCDEFGH".
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        await using var services = BuildPredicateResolutionServiceProvider<BoundedSubjectDbContext>(
+            database.ConnectionString,
+            new StaticCategoryRepository(
+                new Dictionary<string, ITestRetentionRule>
+                {
+                    ["bounded-subject-purge"] = new StaticTestRetentionRule(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    ),
+                }
+            )
+        );
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<BoundedSubjectDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.Add(new BoundedSubjectRecord { Id = "ABCDEFGH", TenantId = tenantId, Email = "ABCDEFGH", CreatedAt = asOf });
+            await db.SaveChangesAsync();
+        }
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var create = () => scope.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>().CreateAsync(
+                new RetentionHoldRequest(
+                    Guid.NewGuid(),
+                    BoundedSubjectRecord.RetentionId,
+                    "ABCDEFGH-2",
+                    tenantId,
+                    "litigation",
+                    asOf
+                ),
+                CancellationToken.None
+            );
+            await create.Should().ThrowAsync<InvalidOperationException>();
+        }
+
+                await using (var scope = services.CreateAsyncScope())
+        {
+            var result = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().EraseAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                new ErasureScope("ABCDEFGH-2"),
+                asOf
+            );
+            result.EntityFailures.Should().BeEmpty();
+        }
+
+await using var verifyScope = services.CreateAsyncScope();
+        var verify = verifyScope.ServiceProvider.GetRequiredService<BoundedSubjectDbContext>();
+        (await verify.Set<BoundedSubjectRecord>().CountAsync()).Should().Be(1);
+    }
+
+    [Fact]
     public async Task Erasure_Validates_Each_Ef_Model_A_Host_Switches_Between()
     {
         // Hosts using IModelCacheKeyFactory get different IModel instances per scope. Metadata
@@ -2374,6 +2432,36 @@ internal sealed class CitextSubjectAnonymiseRecord
 
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset? AnonymisedAt { get; set; }
+}
+
+internal sealed class BoundedSubjectDbContext(DbContextOptions<BoundedSubjectDbContext> options)
+    : DbContext(options)
+{
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<BoundedSubjectRecord>(builder =>
+        {
+            builder.ToTable("bounded_subject_records");
+            builder.Property(record => record.Id).HasMaxLength(8);
+            builder.Property(record => record.Email).HasMaxLength(8);
+        });
+        modelBuilder.ConfigureCohortTables();
+    }
+}
+
+[Retain("bounded-subject-purge", nameof(CreatedAt))]
+[RetentionEntityId("00000000-0000-0000-0001-0000000000b1")]
+internal sealed class BoundedSubjectRecord
+{
+    internal static readonly Guid RetentionId = Guid.Parse("00000000-0000-0000-0001-0000000000b1");
+
+    public string Id { get; set; } = "";
+    public Guid TenantId { get; set; }
+
+    [ErasureSubject]
+    public string? Email { get; set; }
+
+    public DateTimeOffset CreatedAt { get; set; }
 }
 
 internal sealed class SinglePredicateResolutionDbContext(

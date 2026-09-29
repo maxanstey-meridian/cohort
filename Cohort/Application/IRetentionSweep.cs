@@ -36,7 +36,8 @@ public abstract record RetentionSweepRequest
         bool dryRun
     )
     {
-        At = at;
+        // Npgsql only writes UTC DateTimeOffsets to timestamptz.
+        At = at.ToUniversalTime();
         Trigger = trigger;
         DryRun = dryRun;
     }

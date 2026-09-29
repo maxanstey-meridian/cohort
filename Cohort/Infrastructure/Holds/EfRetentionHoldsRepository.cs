@@ -146,7 +146,7 @@ internal sealed class EfRetentionHoldsRepository(
             WHERE "HoldId" = @holdId
               AND "RemovedAt" IS NULL
             """,
-            new SqlParams { ["holdId"] = holdId, ["removedAt"] = removedAt }.ToDbParameters(db.Database.GetDbConnection()),
+            new SqlParams { ["holdId"] = holdId, ["removedAt"] = removedAt.ToUniversalTime() }.ToDbParameters(db.Database.GetDbConnection()),
             ct
         );
         if (removed == 0)
@@ -166,7 +166,7 @@ internal sealed class EfRetentionHoldsRepository(
         await db.Database.OpenConnectionAsync(ct);
         try
         {
-            await using var command = new SqlParams { ["asOf"] = asOf }.CreateCommand(
+            await using var command = new SqlParams { ["asOf"] = asOf.ToUniversalTime() }.CreateCommand(
                 db.Database.GetDbConnection(),
                 db.Database.CurrentTransaction?.GetDbTransaction(),
                 $"""
@@ -232,7 +232,7 @@ internal sealed class EfRetentionHoldsRepository(
                     "Retention hold",
                     ct
                 ),
-                ["asOf"] = asOf,
+                ["asOf"] = asOf.ToUniversalTime(),
             };
             if (entry.Tenant is not null)
             {

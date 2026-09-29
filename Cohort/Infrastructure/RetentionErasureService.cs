@@ -31,6 +31,8 @@ internal sealed class RetentionErasureService(
         CancellationToken ct = default
     )
     {
+        // Npgsql only writes UTC DateTimeOffsets to timestamptz.
+        now = now.ToUniversalTime();
         await readinessValidator.ValidateAsync(ct);
 
         var run = new RetentionRun(

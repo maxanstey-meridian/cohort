@@ -21,7 +21,8 @@ public abstract record RetentionPreviewRequest
 {
     private RetentionPreviewRequest(DateTimeOffset at)
     {
-        At = at;
+        // Npgsql only writes UTC DateTimeOffsets to timestamptz.
+        At = at.ToUniversalTime();
     }
 
     public DateTimeOffset At { get; }

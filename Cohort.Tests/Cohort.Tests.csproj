@@ -9,6 +9,7 @@
         <PackageReference Include="xunit" />
         <PackageReference Include="xunit.runner.visualstudio" />
         <PackageReference Include="FluentAssertions" />
+        <PackageReference Include="TngTech.ArchUnitNET.xUnit" />
     </ItemGroup>
 
     <ItemGroup>
@@ -16,9 +17,7 @@
     </ItemGroup>
 
     <ItemGroup>
-        <None Update="PublicApi.approved.txt" CopyToOutputDirectory="PreserveNewest" />
         <None Update="HistoricalMigrations.approved.txt" CopyToOutputDirectory="PreserveNewest" />
-        <None Include="..\corpus\compliance-manifest.json" Link="compliance-manifest.json" CopyToOutputDirectory="PreserveNewest" />
     </ItemGroup>
 
     <!--

@@ -11,6 +11,8 @@
         <RepositoryUrl>https://github.com/maxanstey-meridian/cohort</RepositoryUrl>
         <PackageTags>dotnet;efcore;gdpr;data-retention;postgresql</PackageTags>
         <IsPackable>true</IsPackable>
+        <!-- Public API drift (RS0016 undeclared, RS0017 removed) fails the build. -->
+        <WarningsAsErrors>$(WarningsAsErrors);RS0016;RS0017</WarningsAsErrors>
     </PropertyGroup>
 
     <ItemGroup>
@@ -19,6 +21,12 @@
         <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" />
         <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
         <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" />
+        <PackageReference Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" PrivateAssets="all" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <AdditionalFiles Include="PublicAPI.Shipped.txt" />
+        <AdditionalFiles Include="PublicAPI.Unshipped.txt" />
     </ItemGroup>
 
     <ItemGroup>

@@ -16,6 +16,9 @@
         />
         <PackageVersion Include="Microsoft.Extensions.Options.DataAnnotations" Version="9.0.0" />
 
+        <!-- Build-time analyzers (PrivateAssets=all; not shipped in the package) -->
+        <PackageVersion Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" Version="4.14.0" />
+
         <!-- Test -->
         <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
         <PackageVersion Include="xunit" Version="2.9.2" />
@@ -24,5 +27,6 @@
         <PackageVersion Include="Testcontainers.PostgreSql" Version="4.1.0" />
         <PackageVersion Include="Respawn" Version="6.2.1" />
         <PackageVersion Include="Npgsql" Version="9.0.2" />
+        <PackageVersion Include="TngTech.ArchUnitNET.xUnit" Version="0.13.4" />
     </ItemGroup>
 </Project>

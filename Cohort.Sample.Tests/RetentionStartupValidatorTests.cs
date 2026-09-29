@@ -576,6 +576,34 @@ public sealed class RetentionStartupValidatorTests
         exception.Which.Errors[0].Should().Contain("timestamp with time zone");
     }
 
+    [Theory]
+    [InlineData("timestamptz")]
+    [InlineData("timestamp(3) with time zone")]
+    [InlineData("TIMESTAMPTZ(6)")]
+    public async Task ValidateAsync_Accepts_Timestamptz_Aliases_For_Anchor_And_DeletedAt_Columns(
+        string storeType
+    )
+    {
+        // Service-provider caching is off so each row builds its own model for the same context type.
+        var options = new DbContextOptionsBuilder<TimestamptzAliasDbContext>()
+            .UseNpgsql("Host=localhost;Database=cohort-model-only")
+            .EnableServiceProviderCaching(false)
+            .Options;
+        await using var db = new TimestamptzAliasDbContext(options, storeType);
+        var repository = new InMemoryCategoryRepository(
+            new Dictionary<string, ITestRetentionRule>
+            {
+                ["timestamptz-alias"] = new StaticTestRetentionRule(
+                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                ),
+            }
+        );
+
+        var act = async () => await CreateValidator(db, repository).ValidateAsync();
+
+        await act.Should().NotThrowAsync();
+    }
+
     private sealed class InMemoryCategoryRepository(
         IReadOnlyDictionary<string, ITestRetentionRule> resolvers
     ) : ITestRetentionRuleProvider
@@ -1100,6 +1128,35 @@ public sealed class RetentionStartupValidatorTests
                 entity
                     .Property(record => record.CreatedAt)
                     .HasColumnType("timestamp without time zone");
+            });
+        }
+    }
+
+    [Retain("timestamptz-alias", nameof(CreatedAt))]
+    [RetentionEntityId("6d0e4b8c-2f7a-4c55-9b1e-3a8f0c2d7e41")]
+    private sealed class TimestamptzAliasRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+        public bool IsDeleted { get; set; }
+        public DateTimeOffset? DeletedAt { get; set; }
+    }
+
+    private sealed class TimestamptzAliasDbContext(
+        DbContextOptions<TimestamptzAliasDbContext> options,
+        string storeType
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.ConfigureCohortTables();
+            modelBuilder.Entity<TimestamptzAliasRecord>(entity =>
+            {
+                entity.ToTable("timestamptz_alias_records");
+                entity.HasKey(record => record.Id);
+                entity.Property(record => record.CreatedAt).HasColumnType(storeType);
+                entity.Property(record => record.DeletedAt).HasColumnType(storeType);
             });
         }
     }

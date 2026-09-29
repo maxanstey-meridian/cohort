@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Text.RegularExpressions;
 using Cohort.Application;
 using Cohort.Domain;
 using Microsoft.EntityFrameworkCore;
@@ -6,7 +7,7 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Infrastructure;
 
-internal sealed class RetentionStartupValidator(
+internal sealed partial class RetentionStartupValidator(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
     IRetentionRuleProvider ruleProvider,
     RetentionEntryBuilder entryBuilder,
@@ -659,30 +660,51 @@ internal sealed class RetentionStartupValidator(
             return;
         }
 
-        string storeType;
-        try
-        {
-            storeType = property.GetColumnType();
-        }
-        catch (Exception ex) when (ex is InvalidOperationException or InvalidCastException)
-        {
-            // Non-relational providers expose no store type.
-            return;
-        }
-
-        if (
-            !string.Equals(
-                storeType,
-                "timestamp with time zone",
-                StringComparison.OrdinalIgnoreCase
-            )
-        )
+        var storeType = TryGetStoreType(property);
+        if (storeType is not null && NormalizeStoreType(storeType) != "timestamp with time zone")
         {
             errors.Add(
                 $"Timestamp convention on {entry.EntityType.FullName}: {role} property '{memberName}' is mapped to '{storeType}'. Cohort compares and writes retention timestamps as UTC instants, which requires 'timestamp with time zone'; 'timestamp without time zone' silently drifts with the session TimeZone and rejects UTC-kinded parameters. Map the property with HasColumnType(\"timestamptz\") or use DateTimeOffset."
             );
         }
     }
+
+    private static string? TryGetStoreType(Microsoft.EntityFrameworkCore.Metadata.IProperty property)
+    {
+        try
+        {
+            return property.GetColumnType();
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or InvalidCastException)
+        {
+            // Non-relational providers expose no store type.
+            return null;
+        }
+    }
+
+    // Folds PostgreSQL aliases and precision modifiers onto one spelling, so that
+    // "timestamptz" and "timestamp(3) with time zone" both read as "timestamp with time zone".
+    private static string NormalizeStoreType(string storeType)
+    {
+        var words = StoreTypeModifier()
+            .Replace(storeType, " ")
+            .ToLowerInvariant()
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var canonical = string.Join(' ', words);
+        return canonical switch
+        {
+            "timestamptz" => "timestamp with time zone",
+            "timestamp" => "timestamp without time zone",
+            "timetz" => "time with time zone",
+            "time" => "time without time zone",
+            "float4" => "real",
+            "float8" or "float" => "double precision",
+            _ => canonical,
+        };
+    }
+
+    [GeneratedRegex(@"\(\s*\d+\s*(,\s*\d+\s*)?\)", RegexOptions.CultureInvariant)]
+    private static partial Regex StoreTypeModifier();
 
     private static void ValidateCascadeDeletePaths(
         Microsoft.EntityFrameworkCore.Metadata.IEntityType entityType,

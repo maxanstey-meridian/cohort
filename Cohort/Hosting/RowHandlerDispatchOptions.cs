@@ -13,10 +13,10 @@ public sealed class RowHandlerDispatchOptions
     public TimeSpan BaseBackoff { get; init; } = TimeSpan.FromSeconds(1);
 
     /// <summary>
-    /// Visibility timeout for claimed handler work. A row left InFlight longer than this
-    /// (e.g. the process crashed between claiming and completing) is reclaimed by the next
-    /// dispatch pass, and the reclaim counts as an attempt. Must be at least 30 seconds
-    /// to avoid reclaiming work that is genuinely still running.
+    /// How long one delivery may hold its claim. The handler is cancelled when it elapses
+    /// and the delivery counts as a failed attempt; a row left InFlight longer than this
+    /// (e.g. the process crashed mid-delivery) is reclaimed by the next dispatch pass, and
+    /// the reclaim counts as an attempt. Must be at least 30 seconds.
     /// </summary>
     public TimeSpan ClaimTimeout { get; init; } = TimeSpan.FromMinutes(5);
 

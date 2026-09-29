@@ -121,6 +121,10 @@ internal sealed class CohortOptionsValidator : IValidateOptions<CohortOptions>
         {
             errors.Add("Cohort RowHandlerDispatch ClaimTimeout must be at least 30 seconds.");
         }
+        else if (dispatch.ClaimTimeout > TimeSpan.FromDays(1))
+        {
+            errors.Add("Cohort RowHandlerDispatch ClaimTimeout must not exceed 1 day.");
+        }
 
         if (dispatch.SweepSettleTimeout < TimeSpan.FromMinutes(1))
         {

@@ -64,6 +64,7 @@ public sealed class CohortOptionsValidatorTests
     [InlineData("BatchSize")]
     [InlineData("MaxAttempts")]
     [InlineData("MaxParallelism")]
+    [InlineData("ClaimTimeout")]
     public void Validate_Rejects_Row_Handler_Dispatch_Options_Above_Safe_Ceilings(
         string option
     )
@@ -73,6 +74,10 @@ public sealed class CohortOptionsValidatorTests
             "BatchSize" => new RowHandlerDispatchOptions { BatchSize = 10_001 },
             "MaxAttempts" => new RowHandlerDispatchOptions { MaxAttempts = 1_001 },
             "MaxParallelism" => new RowHandlerDispatchOptions { MaxParallelism = 257 },
+            "ClaimTimeout" => new RowHandlerDispatchOptions
+            {
+                ClaimTimeout = TimeSpan.FromDays(1).Add(TimeSpan.FromTicks(1)),
+            },
             _ => throw new ArgumentOutOfRangeException(nameof(option)),
         };
 
@@ -89,6 +94,7 @@ public sealed class CohortOptionsValidatorTests
     [InlineData("BatchSize")]
     [InlineData("MaxAttempts")]
     [InlineData("MaxParallelism")]
+    [InlineData("ClaimTimeout")]
     public void Validate_Accepts_Row_Handler_Dispatch_Options_At_Safe_Ceilings(string option)
     {
         var dispatch = option switch
@@ -96,6 +102,7 @@ public sealed class CohortOptionsValidatorTests
             "BatchSize" => new RowHandlerDispatchOptions { BatchSize = 10_000 },
             "MaxAttempts" => new RowHandlerDispatchOptions { MaxAttempts = 1_000 },
             "MaxParallelism" => new RowHandlerDispatchOptions { MaxParallelism = 256 },
+            "ClaimTimeout" => new RowHandlerDispatchOptions { ClaimTimeout = TimeSpan.FromDays(1) },
             _ => throw new ArgumentOutOfRangeException(nameof(option)),
         };
 

@@ -413,8 +413,14 @@ The execution contract:
   it can run for a row that is subsequently withheld (for example by a hold created mid-sweep).
 - `OnAfterAsync` is dispatched after commit with at-least-once delivery. Handlers must be
   idempotent; `ctx.Attempt` greater than 1 means a possible retry of completed work.
-- Work stuck `InFlight` after a crash is reclaimed once `RowHandlerDispatch:ClaimTimeout`
-  (default 5 minutes) elapses; the reclaim counts as an attempt.
+- Each delivery holds its claim for `RowHandlerDispatch:ClaimTimeout` (default 5 minutes).
+  A handler must finish within nine tenths of it (the rest covers claim latency and clock
+  skew between hosts): then its cancellation token fires and the delivery is recorded as a
+  failed attempt. A handler that ignores the token may overlap its own retry, and the
+  row's next handler may start before it finishes. Work left `InFlight` by a crash is
+  reclaimed once the timeout elapses, and the reclaim counts as an attempt. A delivery whose
+  claim was reclaimed cannot settle the row; its outcome is discarded and the newer delivery
+  settles it.
 - `AfterSweepSettled` work runs only once its run records completion or failure. A run
   left `Started` by a process crash is marked failed after
   `RowHandlerDispatch:SweepSettleTimeout`, allowing that work to dispatch.
@@ -461,11 +467,11 @@ The execution contract:
 | `SweepBatchSize` | `5000` | Maximum rows selected, locked, and mutated per transaction. Each batch commits independently. |
 | `AuditObservers:Timeout` | `00:00:05` | Maximum time Cohort waits for each observer to handle one committed event. Each observer has an independent timeout. |
 | `RowHandlerDispatch:PollInterval` | `00:00:10` | Delay between dispatcher polling passes. |
-| `RowHandlerDispatch:BatchSize` | `50` | Upper bound on queued handler statuses claimed per poll; the dispatcher claims at most `min(MaxParallelism, BatchSize)` so every claim is worked and heartbeated at once. Valid range: 1 to 10000. |
+| `RowHandlerDispatch:BatchSize` | `50` | Upper bound on queued handler statuses claimed per poll; the dispatcher claims at most `min(MaxParallelism, BatchSize)` so every claim starts running at once. Valid range: 1 to 10000. |
 | `RowHandlerDispatch:MaxParallelism` | `4` | Maximum rows dispatched concurrently. Handlers for one row remain ordered. Valid range: 1 to 256. |
 | `RowHandlerDispatch:MaxAttempts` | `10` | Maximum delivery attempts before dead-lettering. Valid range: 1 to 1000. |
 | `RowHandlerDispatch:BaseBackoff` | `00:00:01` | Base delay for exponential retry backoff. |
-| `RowHandlerDispatch:ClaimTimeout` | `00:05:00` | Visibility timeout before abandoned in-flight work is reclaimed. |
+| `RowHandlerDispatch:ClaimTimeout` | `00:05:00` | Lease on one delivery. The handler is cancelled at nine tenths of it, and in-flight work abandoned by a crash is reclaimed after it. Valid range: 30 seconds to 1 day. |
 | `RowHandlerDispatch:SweepSettleTimeout` | `01:00:00` | Age after which an unowned `Started` run is recovered as failed. |
 | `RowHandlerDispatch:PayloadRetention` | `30.00:00:00` | Backstop retention for potentially sensitive captured row snapshots. |
 

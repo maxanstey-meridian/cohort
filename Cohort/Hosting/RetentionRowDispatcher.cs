@@ -18,9 +18,10 @@ namespace Cohort.Hosting;
 
 /// <summary>
 /// Durable after-commit delivery of <see cref="IRetentionHandler{TEntity}.OnAfterAsync"/>.
-/// Each poll claims at most <c>MaxParallelism</c> rows (capped by <c>BatchSize</c>) so no
-/// claim waits unheartbeated behind another row, renews each claim before invoking its
-/// handler, and heartbeats it while the handler runs.
+/// Each poll claims at most <c>MaxParallelism</c> rows (capped by <c>BatchSize</c>), so every
+/// claim starts running at once. A claim is a lease of <c>ClaimTimeout</c>: the handler is
+/// cancelled when it runs out, and another dispatcher may reclaim the row after it. The
+/// claim token fences settlement, so a delivery can only settle the claim it took.
 /// </summary>
 internal sealed class RetentionRowDispatcher(
     IServiceScopeFactory scopeFactory,
@@ -51,7 +52,7 @@ internal sealed class RetentionRowDispatcher(
         await DrainQueueAsync(RetryScheduleUpperBound, ct);
 
         // Pending rows left here were not dispatchable (deferred phase with an unsettled
-        // sweep, or queued behind a sibling); in-flight rows are held under a live lease.
+        // sweep, or queued behind a sibling); in-flight rows are held under a lease.
         // Raw SQL, not LINQ: EF emits an unqualified COUNT that a search_path decoy can shadow.
         return await WithDbAsync(
             async db =>
@@ -268,8 +269,8 @@ internal sealed class RetentionRowDispatcher(
     {
         while (!ct.IsCancellationRequested)
         {
-            // One snapshot per claim: the lease cutoff, claim size, heartbeat and retry
-            // policy for these rows all come from the same options.
+            // One snapshot per claim: the lease cutoff, claim size, handler timeout and
+            // retry policy for these rows all come from the same options.
             var dispatch = options.Current.RowHandlerDispatch;
             var claimToken = Guid.NewGuid();
             var claimed = await ClaimAsync(dispatch, claimToken, dueCutoff, ct);
@@ -419,13 +420,14 @@ internal sealed class RetentionRowDispatcher(
                             SET "State" = {1}, "ClaimedAt" = {8}, "ClaimToken" = {9}, "Attempt" = status."Attempt" + 1
                             FROM due
                             WHERE status."Id" = due."Id"
-                            RETURNING status."Id", status."SweepRunRowDetailId", status."HandlerType", status."Attempt", status."ClaimToken"
+                            RETURNING status."Id", status."SweepRunRowDetailId", status."HandlerType", status."Attempt", status."ClaimedAt", status."ClaimToken"
                         )
                         SELECT
                             claimed."Id" AS "StatusId",
                             detail."Id" AS "RowDetailId",
                             claimed."HandlerType",
                             claimed."Attempt",
+                            claimed."ClaimedAt",
                             claimed."ClaimToken",
                             detail."SweepId",
                             detail."At",
@@ -480,21 +482,12 @@ internal sealed class RetentionRowDispatcher(
             return;
         }
 
-        // Ownership check: the claim may have been reclaimed or dead-lettered since it was
-        // taken. Renewing it also restarts the lease for the handler.
-        if (!await RenewClaimAsync(claimed, ct))
-        {
-            logger.LogInformation(
-                "Cohort skipped row handler status {StatusId}: its claim is no longer owned by this dispatcher.",
-                claimed.StatusId
-            );
-            return;
-        }
-
-        var handlerCompleted = false;
+        // The handler must end before its lease does: past it, another dispatcher may reclaim
+        // the row and run it again. A tenth of the lease covers claim latency and clock skew.
+        var deadline = claimed.ClaimedAt + dispatch.ClaimTimeout - dispatch.ClaimTimeout / 10;
         using var handlerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        using var heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var heartbeat = HeartbeatAsync(claimed, dispatch.ClaimTimeout / 3, handlerCts, heartbeatCts.Token);
+        var remaining = deadline - DateTimeOffset.UtcNow;
+        handlerCts.CancelAfter(remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero);
 
         try
         {
@@ -533,8 +526,46 @@ internal sealed class RetentionRowDispatcher(
                 handlers.Select(resolved => resolved.Instance.GetType().Assembly)
             );
             await InvokeOnAfterAsync(entityType, handler.Instance, claimed, snapshot, handlerCts.Token);
-            handlerCompleted = true;
-            await StopHeartbeatAsync(heartbeat, heartbeatCts);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (OperationCanceledException) when (handlerCts.IsCancellationRequested)
+        {
+            logger.LogError(
+                "Cohort row handler for sweep {SweepId} exceeded RowHandlerDispatch:ClaimTimeout and was cancelled.",
+                claimed.SweepId
+            );
+            await MarkFailureAsync(
+                claimed,
+                dispatch,
+                "Handler exceeded RowHandlerDispatch:ClaimTimeout and was cancelled.",
+                ct
+            );
+            await ClearSettledPayloadAsync(claimed.RowDetailId);
+            return;
+        }
+        catch (Exception ex)
+        {
+            var diagnostic = RetentionFailureDiagnostic.Create(ex);
+            logger.LogError(
+                ex.GetBaseException(),
+                "Cohort row handler failed for sweep {SweepId}. Diagnostic {DiagnosticId}.",
+                claimed.SweepId,
+                diagnostic.DiagnosticIdText
+            );
+            await MarkFailureAsync(claimed, dispatch, diagnostic.ToString(), ct);
+            // No-op while a sibling handler (or this one's retry) is still unsettled.
+            await ClearSettledPayloadAsync(claimed.RowDetailId);
+            return;
+        }
+
+        // Outside the handler's try: failing to record a success must not be mistaken for the
+        // handler failing, nor abort the rest of the batch. The row stays in flight and its
+        // lease recovers it.
+        try
+        {
             await SettleAsync(
                 claimed,
                 """
@@ -545,99 +576,26 @@ internal sealed class RetentionRowDispatcher(
             );
             await ClearSettledPayloadAsync(claimed.RowDetailId);
         }
-        catch (OperationCanceledException) when (!handlerCompleted && ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (OperationCanceledException) when (!handlerCompleted && handlerCts.IsCancellationRequested)
-        {
-            // The heartbeat lost the claim and cancelled the handler; surface why.
-            await heartbeat;
-            throw;
-        }
-        catch (RetentionRowDispatchClaimLostException)
-        {
-            throw;
-        }
         catch (Exception ex)
         {
-            await MarkFailureAsync(claimed, dispatch, ex, ct);
-            // No-op while a sibling handler (or this one's retry) is still unsettled.
-            await ClearSettledPayloadAsync(claimed.RowDetailId);
+            logger.LogWarning(
+                ex,
+                "Cohort could not record the success of row handler status {StatusId}; its lease will recover it.",
+                claimed.StatusId
+            );
         }
-        finally
-        {
-            await StopHeartbeatAsync(heartbeat, heartbeatCts);
-        }
-    }
-
-    private static async Task StopHeartbeatAsync(Task heartbeat, CancellationTokenSource heartbeatCts)
-    {
-        heartbeatCts.Cancel();
-        try
-        {
-            await heartbeat;
-        }
-        catch (OperationCanceledException) when (heartbeatCts.IsCancellationRequested) { }
-    }
-
-    private async Task HeartbeatAsync(
-        ClaimedHandlerRow claimed,
-        TimeSpan interval,
-        CancellationTokenSource handlerCts,
-        CancellationToken ct
-    )
-    {
-        try
-        {
-            while (true)
-            {
-                await OperationalTime.DelayAsync(interval, ct);
-                if (!await RenewClaimAsync(claimed, ct))
-                {
-                    throw new RetentionRowDispatchClaimLostException(claimed.StatusId);
-                }
-            }
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            handlerCts.Cancel();
-            throw ex as RetentionRowDispatchClaimLostException
-                ?? new RetentionRowDispatchClaimLostException(claimed.StatusId, ex);
-        }
-    }
-
-    private Task<bool> RenewClaimAsync(ClaimedHandlerRow claimed, CancellationToken ct)
-    {
-        // Leases are judged on the app clock, so renew on it too.
-        return WithDbAsync(
-            async db => await UpdateOwnedAsync(db, claimed, "\"ClaimedAt\" = {0}", [DateTimeOffset.UtcNow], ct) == 1,
-            ct
-        );
     }
 
     private async Task MarkFailureAsync(
         ClaimedHandlerRow claimed,
         RowHandlerDispatchOptions dispatch,
-        Exception ex,
+        string lastError,
         CancellationToken ct
     )
     {
-        var diagnostic = RetentionFailureDiagnostic.Create(ex);
-        logger.LogError(
-            ex.GetBaseException(),
-            "Cohort row handler failed for sweep {SweepId}. Diagnostic {DiagnosticId}.",
-            claimed.SweepId,
-            diagnostic.DiagnosticIdText
-        );
-
         if (claimed.Attempt >= dispatch.MaxAttempts)
         {
-            await MarkDeadLetteredAsync(claimed, diagnostic.ToString(), ct);
+            await MarkDeadLetteredAsync(claimed, lastError, ct);
             return;
         }
 
@@ -651,7 +609,7 @@ internal sealed class RetentionRowDispatcher(
             """
             "State" = {0}, "NextAttemptAt" = {1}, "ClaimedAt" = NULL, "ClaimToken" = NULL, "LastError" = {2}
             """,
-            [Pending, nextAttemptAt, diagnostic.ToString()],
+            [Pending, nextAttemptAt, lastError],
             ct
         );
     }
@@ -670,7 +628,8 @@ internal sealed class RetentionRowDispatcher(
                 var settled = await UpdateOwnedAsync(db, claimed, DeadLetterAssignments, [DeadLettered, now, lastError], ct);
                 if (settled != 1)
                 {
-                    throw new RetentionRowDispatchClaimLostException(claimed.StatusId);
+                    LogSuperseded(claimed);
+                    return;
                 }
 
                 await db.Database.ExecuteSqlRawAsync(
@@ -709,15 +668,24 @@ internal sealed class RetentionRowDispatcher(
             {
                 if (await UpdateOwnedAsync(db, claimed, assignments, values, ct) != 1)
                 {
-                    throw new RetentionRowDispatchClaimLostException(claimed.StatusId);
+                    LogSuperseded(claimed);
                 }
             },
             ct
         );
     }
 
+    // At-least-once: whichever pass took the expired claim over owns the row's outcome now.
+    private void LogSuperseded(ClaimedHandlerRow claimed) =>
+        logger.LogWarning(
+            "Cohort discarded the outcome of row handler status {StatusId} attempt {Attempt}: its claim expired and was taken over or dead-lettered.",
+            claimed.StatusId,
+            claimed.Attempt
+        );
+
     /// <summary>
-    /// Updates this handler row only while this dispatcher still owns its claim. Raw SQL rather
+    /// Updates this handler row only while this delivery still owns its claim: a reclaim
+    /// replaces the token, so a stale delivery matches nothing. Raw SQL rather
     /// than ExecuteUpdateAsync: Cohort builds against EF Core 9, and EF Core 10 replaced the
     /// setter types, so a compiled ExecuteUpdateAsync call fails to load on EF Core 10 hosts.
     /// </summary>
@@ -859,6 +827,7 @@ internal sealed class RetentionRowDispatcher(
         public long RowDetailId { get; init; }
         public string HandlerType { get; init; } = "";
         public int Attempt { get; init; }
+        public DateTimeOffset ClaimedAt { get; init; }
         public Guid ClaimToken { get; init; }
         public Guid SweepId { get; init; }
         public DateTimeOffset At { get; init; }

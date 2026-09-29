@@ -506,7 +506,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             {
                 services.AddSingleton(gate);
                 services.AddSingleton(sink);
-                services.AddRowHandler<Note, BlockingHighPriorityAfterNoteHandler>();
+                services.AddRowHandler<Note, BlockingDispatchNoteHandler>();
             }
         );
         var result = await handlerHost.RunSweepAsync(
@@ -515,29 +515,29 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         );
 
         var flushTask = handlerHost.RunWithServicesAsync(async serviceProvider =>
-        {
-            await serviceProvider.GetRequiredService<IRetentionRowDispatcher>().FlushAsync();
-        });
+            await serviceProvider.GetRequiredService<IRetentionRowDispatcher>().FlushAsync()
+        );
         await gate.WaitUntilBlockedAsync().WaitAsync(TimeSpan.FromSeconds(5));
 
-        var newerClaimToken = await ReplaceClaimOwnerAsync(result.SweepId);
+        // Another dispatcher reclaims the row (as it would once the lease looked expired)
+        // while the first delivery is still running.
+        await ReclaimInFlightAsync(result.SweepId);
         gate.Release();
-        var exception = await Assert.ThrowsAsync<RetentionRowDispatchClaimLostException>(() =>
-            flushTask.WaitAsync(TimeSpan.FromSeconds(5))
-        );
-        exception.StatusId.Should().BeGreaterThan(0);
+        var flush = await flushTask.WaitAsync(TimeSpan.FromSeconds(5));
 
+        // The stale delivery ran, but its success must not settle the newer claim.
+        sink.AfterCalls.Should().Equal("after:fenced-claim:1");
+        flush.InFlightRemaining.Should().Be(1);
         var status = (await LoadHandlerStatusesAsync(result.SweepId)).Single();
         status.State.Should().Be(InFlightState);
         status.Attempt.Should().Be(2);
-        status.ClaimToken.Should().Be(newerClaimToken);
         status.CompletedAt.Should().BeNull();
         status.LastError.Should().BeNull();
         (await CountRemainingCapturedPayloadsAsync(result.SweepId)).Should().Be(1);
     }
 
     [Fact]
-    public async Task FlushAsync_Heartbeat_Claim_Loss_Cancels_The_Running_Handler()
+    public async Task FlushAsync_Stale_Owner_Failing_Its_Last_Attempt_Cannot_Dead_Letter_The_Newer_Claim_Or_Its_Siblings()
     {
         var tenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
@@ -552,7 +552,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     CreatedAt = asOf.AddDays(-120),
-                    Body = "heartbeat-fenced-claim",
+                    Body = "fenced-failure",
                 }
             );
             await db.SaveChangesAsync();
@@ -562,13 +562,14 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             GetConnectionString(),
             configurationOverrides: new Dictionary<string, string?>
             {
-                [$"{CohortOptions.SectionName}:RowHandlerDispatch:ClaimTimeout"] = "00:00:30",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxAttempts"] = "1",
             },
             configureServices: services =>
             {
                 services.AddSingleton(gate);
                 services.AddSingleton(sink);
-                services.AddRowHandler<Note, BlockingHighPriorityAfterNoteHandler>();
+                services.AddRowHandler<Note, BlockingThenFailingHighPriorityNoteHandler>();
+                services.AddRowHandler<Note, LowPriorityAfterNoteHandler>();
             }
         );
         var result = await handlerHost.RunSweepAsync(
@@ -581,26 +582,29 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         );
         await gate.WaitUntilBlockedAsync().WaitAsync(TimeSpan.FromSeconds(5));
 
-        var newerClaimToken = await ReplaceClaimOwnerAsync(result.SweepId);
-        var exception = await Assert.ThrowsAsync<RetentionRowDispatchClaimLostException>(() =>
-            flushTask.WaitAsync(TimeSpan.FromSeconds(15))
-        );
+        await ReclaimInFlightAsync(result.SweepId);
+        gate.Release();
+        await flushTask.WaitAsync(TimeSpan.FromSeconds(5));
 
-        exception.StatusId.Should().BeGreaterThan(0);
+        // The stale delivery failed on what was its last attempt, but the row belongs to the
+        // newer claim now: neither it nor the queued sibling may be dead-lettered for it.
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().HaveCount(2);
+        statuses[0].State.Should().Be(InFlightState);
+        statuses[0].Attempt.Should().Be(2);
+        statuses[0].LastError.Should().BeNull();
+        statuses[1].State.Should().Be(PendingState);
+        statuses[1].CompletedAt.Should().BeNull();
         sink.AfterCalls.Should().BeEmpty();
-        var status = (await LoadHandlerStatusesAsync(result.SweepId)).Single();
-        status.State.Should().Be(InFlightState);
-        status.ClaimToken.Should().Be(newerClaimToken);
-        status.CompletedAt.Should().BeNull();
     }
 
     [Fact]
-    public async Task FlushAsync_Success_Waits_For_A_Blocked_Heartbeat_Without_Reporting_Claim_Loss()
+    public async Task FlushAsync_Cancels_A_Handler_That_Outlives_ClaimTimeout_And_Counts_It_As_A_Failed_Attempt()
     {
         var tenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var gate = new DispatchBlockGate();
         var sink = new HandlerExecutionSink();
-        var blocker = new StatusUpdateBlocker(GetConnectionString(), holdHandler: true);
 
         await using (var db = Host.CreateDbContext())
         {
@@ -610,7 +614,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     CreatedAt = asOf.AddDays(-120),
-                    Body = "success-heartbeat-race",
+                    Body = "outlives-claim",
                 }
             );
             await db.SaveChangesAsync();
@@ -621,12 +625,13 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             configurationOverrides: new Dictionary<string, string?>
             {
                 [$"{CohortOptions.SectionName}:RowHandlerDispatch:ClaimTimeout"] = "00:00:30",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxAttempts"] = "1",
             },
             configureServices: services =>
             {
+                services.AddSingleton(gate);
                 services.AddSingleton(sink);
-                services.AddSingleton(blocker);
-                services.AddRowHandler<Note, LocksStatusThenReturnsNoteHandler>();
+                services.AddRowHandler<Note, BlockingDispatchNoteHandler>();
             }
         );
         var result = await handlerHost.RunSweepAsync(
@@ -634,55 +639,79 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
+        // The gate is never released: only the claim timeout can end the handler.
         var flushTask = handlerHost.RunWithServicesAsync(async serviceProvider =>
             await serviceProvider.GetRequiredService<IRetentionRowDispatcher>().FlushAsync()
         );
-        await blocker.WaitUntilLockedAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        await gate.WaitUntilBlockedAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        var claimedAt = (await LoadHandlerStatusesAsync(result.SweepId)).Single().ClaimedAt!.Value;
+        var flush = await flushTask.WaitAsync(TimeSpan.FromSeconds(60));
 
-        await WaitForBlockedStatusUpdatesAsync(blocker.BackendId, expectedCount: 1);
-        blocker.AllowHandlerToReturn();
-        await blocker.ReleaseAsync();
-        await flushTask.WaitAsync(TimeSpan.FromSeconds(5));
+        // The delivery gives up before its lease lapses, so no other dispatcher can reclaim
+        // the row while this handler may still be running.
+        DateTimeOffset.UtcNow.Should().BeBefore(claimedAt.AddSeconds(30));
 
-        sink.AfterCalls.Should().Equal("after:success-heartbeat-race:1");
+        sink.AfterCalls.Should().BeEmpty();
+        flush.InFlightRemaining.Should().Be(0);
         var status = (await LoadHandlerStatusesAsync(result.SweepId)).Single();
-        status.State.Should().Be(SucceededState);
+        status.State.Should().Be(DeadLetteredState);
         status.Attempt.Should().Be(1);
-        status.ClaimToken.Should().BeNull();
-        status.CompletedAt.Should().NotBeNull();
-        status.LastError.Should().BeNull();
+        status.ClaimedAt.Should().BeNull();
+        status.LastError.Should().Contain("ClaimTimeout");
     }
 
-    private async Task WaitForBlockedStatusUpdatesAsync(int blockerBackendId, int expectedCount)
+    [Theory]
+    [InlineData(1, SucceededState, 2)]
+    [InlineData(10, DeadLetteredState, 10)]
+    public async Task FlushAsync_Reclaims_A_Claim_Its_Crashed_Owner_Left_Behind_Until_Attempts_Run_Out(
+        int attemptsSpent,
+        int expectedState,
+        int expectedAttempt
+    )
     {
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-        await using var connection = new NpgsqlConnection(GetConnectionString());
-        await connection.OpenAsync(timeout.Token);
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var sink = new HandlerExecutionSink();
 
-        while (true)
+        await using (var db = Host.CreateDbContext())
         {
-            await using var command = connection.CreateCommand();
-            command.CommandText = """
-                SELECT COUNT(*)
-                FROM pg_stat_activity waiter
-                WHERE waiter.query LIKE '%UPDATE %sweep_row_handler_status%'
-                  AND (
-                      @blockerBackendId = ANY(pg_blocking_pids(waiter.pid))
-                      OR EXISTS (
-                          SELECT 1
-                          FROM unnest(pg_blocking_pids(waiter.pid)) AS immediate_blocker(pid)
-                          WHERE @blockerBackendId = ANY(pg_blocking_pids(immediate_blocker.pid))
-                      )
-                  )
-                """;
-            command.Parameters.AddWithValue("blockerBackendId", blockerBackendId);
-            if ((long)(await command.ExecuteScalarAsync(timeout.Token))! >= expectedCount)
-            {
-                return;
-            }
-
-            await Task.Delay(TimeSpan.FromMilliseconds(20), timeout.Token);
+            db.Notes.Add(
+                new Note
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "crashed-owner",
+                }
+            );
+            await db.SaveChangesAsync();
         }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
+            {
+                services.AddSingleton(sink);
+                services.AddRowHandler<Note, DispatchRecordingNoteHandler>();
+            }
+        );
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        // A dispatcher claimed the row and died: nothing will ever settle it.
+        await AbandonClaimAsync(result.SweepId, attemptsSpent, DateTimeOffset.UtcNow.AddMinutes(-6));
+
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+            await serviceProvider.GetRequiredService<IRetentionRowDispatcher>().FlushAsync()
+        );
+
+        var status = (await LoadHandlerStatusesAsync(result.SweepId)).Single();
+        status.State.Should().Be(expectedState);
+        status.Attempt.Should().Be(expectedAttempt);
+        status.ClaimedAt.Should().BeNull();
+        sink.AfterCalls.Should().HaveCount(expectedState == SucceededState ? 1 : 0);
     }
 
     [Fact]
@@ -1225,7 +1254,6 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             claimedStatus.State.Should().Be(InFlightState);
             claimedStatus.Attempt.Should().Be(1);
             claimedStatus.ClaimedAt.Should().NotBeNull();
-            claimedStatus.ClaimToken.Should().NotBeNull();
 
             var competingResult = await dispatcher.FlushAsync().WaitAsync(TimeSpan.FromSeconds(5));
             competingResult.Settled.Should().BeFalse();
@@ -1244,7 +1272,6 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         statuses[0].State.Should().Be(SucceededState);
         statuses[0].Attempt.Should().Be(1);
         statuses[0].ClaimedAt.Should().BeNull();
-        statuses[0].ClaimToken.Should().BeNull();
         statuses[0].CompletedAt.Should().NotBeNull();
         statuses[0].LastError.Should().BeNull();
     }
@@ -1322,7 +1349,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         // MaxParallelism 1 claims one row at a time despite BatchSize 10: only the row that
         // was running when the flush was cancelled spent an attempt; the other was never
-        // claimed, so it could not sit unheartbeated behind it and expire.
+        // claimed, so it could not sit behind it while its lease ran out.
         sink.AfterCalls.Select(call => call[call.LastIndexOf(':')..])
             .Should()
             .BeEquivalentTo([":2", ":1"]);
@@ -1798,7 +1825,6 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                 status."Attempt",
                 status."NextAttemptAt",
                 status."ClaimedAt",
-                status."ClaimToken",
                 status."CompletedAt",
                 status."LastError"
             FROM "sweep_row_handler_status" AS status
@@ -1820,9 +1846,8 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     reader.GetInt32(3),
                     reader.GetFieldValue<DateTimeOffset>(4),
                     reader.IsDBNull(5) ? null : reader.GetFieldValue<DateTimeOffset>(5),
-                    reader.IsDBNull(6) ? null : reader.GetGuid(6),
-                    reader.IsDBNull(7) ? null : reader.GetFieldValue<DateTimeOffset>(7),
-                    reader.IsDBNull(8) ? null : reader.GetString(8)
+                    reader.IsDBNull(6) ? null : reader.GetFieldValue<DateTimeOffset>(6),
+                    reader.IsDBNull(7) ? null : reader.GetString(7)
                 )
             );
         }
@@ -1941,38 +1966,44 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         (await command.ExecuteNonQueryAsync()).Should().Be(1);
     }
 
-    private async Task<Guid> ReplaceClaimOwnerAsync(Guid sweepId)
+    private async Task ReclaimInFlightAsync(Guid sweepId)
     {
-        var claimToken = Guid.NewGuid();
         await using var connection = new NpgsqlConnection(GetConnectionString());
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
         command.CommandText = """
             UPDATE "sweep_row_handler_status" AS status
-            SET "ClaimToken" = @claimToken,
-                "ClaimedAt" = @claimedAt,
-                "Attempt" = "Attempt" + 1
+            SET "ClaimedAt" = @claimedAt, "ClaimToken" = gen_random_uuid(), "Attempt" = "Attempt" + 1
             FROM "sweep_run_row_detail" AS detail
             WHERE detail."Id" = status."SweepRunRowDetailId"
               AND detail."SweepId" = @sweepId
               AND status."State" = @inFlight
-              AND status."Id" = (
-                  SELECT candidate."Id"
-                  FROM "sweep_row_handler_status" AS candidate
-                  INNER JOIN "sweep_run_row_detail" AS candidate_detail
-                      ON candidate_detail."Id" = candidate."SweepRunRowDetailId"
-                  WHERE candidate_detail."SweepId" = @sweepId
-                    AND candidate."State" = @inFlight
-                  ORDER BY candidate."Id"
-                  LIMIT 1
-              )
             """;
-        command.Parameters.AddWithValue("claimToken", claimToken);
         command.Parameters.AddWithValue("claimedAt", DateTimeOffset.UtcNow);
         command.Parameters.AddWithValue("sweepId", sweepId);
         command.Parameters.AddWithValue("inFlight", InFlightState);
         (await command.ExecuteNonQueryAsync()).Should().Be(1);
-        return claimToken;
+    }
+
+    private async Task AbandonClaimAsync(Guid sweepId, int attempt, DateTimeOffset claimedAt)
+    {
+        await using var connection = new NpgsqlConnection(GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE "sweep_row_handler_status" AS status
+            SET "State" = @inFlight, "ClaimedAt" = @claimedAt, "ClaimToken" = gen_random_uuid(), "Attempt" = @attempt
+            FROM "sweep_run_row_detail" AS detail
+            WHERE detail."Id" = status."SweepRunRowDetailId"
+              AND detail."SweepId" = @sweepId
+              AND status."State" = @pending
+            """;
+        command.Parameters.AddWithValue("inFlight", InFlightState);
+        command.Parameters.AddWithValue("pending", PendingState);
+        command.Parameters.AddWithValue("claimedAt", claimedAt);
+        command.Parameters.AddWithValue("attempt", attempt);
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        (await command.ExecuteNonQueryAsync()).Should().Be(1);
     }
 
     private static ITestRetentionRuleProvider CreateHandlerErasureCategoryRepository(
@@ -2025,7 +2056,6 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         int Attempt,
         DateTimeOffset NextAttemptAt,
         DateTimeOffset? ClaimedAt,
-        Guid? ClaimToken,
         DateTimeOffset? CompletedAt,
         string? LastError
     );
@@ -2140,71 +2170,6 @@ file sealed class DispatchBlockGate
     public void Release()
     {
         released = true;
-    }
-}
-
-file sealed class StatusUpdateBlocker(string connectionString, bool holdHandler = false)
-    : IAsyncDisposable
-{
-    private readonly TaskCompletionSource locked = new(
-        TaskCreationOptions.RunContinuationsAsynchronously
-    );
-    private readonly TaskCompletionSource handlerMayReturn = new(
-        TaskCreationOptions.RunContinuationsAsynchronously
-    );
-    private NpgsqlConnection? connection;
-    private NpgsqlTransaction? transaction;
-
-    public int BackendId =>
-        connection?.ProcessID
-        ?? throw new InvalidOperationException("The status update lock has not been acquired.");
-
-    public Task WaitUntilLockedAsync()
-    {
-        return locked.Task;
-    }
-
-    public async Task AcquireAsync(CancellationToken ct)
-    {
-        connection = new NpgsqlConnection(connectionString);
-        await connection.OpenAsync(ct);
-        transaction = await connection.BeginTransactionAsync(ct);
-
-        await using var command = connection.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = """LOCK TABLE "sweep_row_handler_status" IN ACCESS EXCLUSIVE MODE""";
-        await command.ExecuteNonQueryAsync(ct);
-        locked.TrySetResult();
-        if (holdHandler)
-        {
-            await handlerMayReturn.Task.WaitAsync(ct);
-        }
-    }
-
-    public void AllowHandlerToReturn()
-    {
-        handlerMayReturn.TrySetResult();
-    }
-
-    public async Task ReleaseAsync()
-    {
-        if (transaction is not null)
-        {
-            await transaction.CommitAsync();
-            await transaction.DisposeAsync();
-            transaction = null;
-        }
-
-        if (connection is not null)
-        {
-            await connection.DisposeAsync();
-            connection = null;
-        }
-    }
-
-    public async ValueTask DisposeAsync()
-    {
-        await ReleaseAsync();
     }
 }
 
@@ -2380,6 +2345,23 @@ file sealed class BlockingHighPriorityAfterNoteHandler(
     {
         await gate.WaitForReleaseAsync(ct);
         sink.AfterCalls.Add("after-high-blocking");
+    }
+}
+
+[RowHandlerPriority(10)]
+file sealed class BlockingThenFailingHighPriorityNoteHandler(DispatchBlockGate gate)
+    : IRetentionHandler<Note>
+{
+    public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        ctx.Snapshot["body"] = row.Body;
+        return Task.CompletedTask;
+    }
+
+    public async Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
+    {
+        await gate.WaitForReleaseAsync(ct);
+        throw new InvalidOperationException("stale delivery failed");
     }
 }
 
@@ -2590,20 +2572,3 @@ file sealed class BlockingDispatchNoteHandler(HandlerExecutionSink sink, Dispatc
     }
 }
 
-file sealed class LocksStatusThenReturnsNoteHandler(
-    HandlerExecutionSink sink,
-    StatusUpdateBlocker blocker
-) : IRetentionHandler<Note>
-{
-    public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
-    {
-        ctx.Snapshot["body"] = row.Body;
-        return Task.CompletedTask;
-    }
-
-    public async Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
-    {
-        sink.AfterCalls.Add($"after:{ctx.Snapshot["body"]}:{ctx.Attempt}");
-        await blocker.AcquireAsync(ct);
-    }
-}

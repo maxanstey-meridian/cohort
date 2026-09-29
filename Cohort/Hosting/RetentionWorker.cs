@@ -184,7 +184,7 @@ internal sealed class RetentionWorker(
             if (await OccurrenceAlreadySweptAsync(db, occurrence, ct))
             {
                 logger.LogInformation(
-                    "Cohort worker skipped occurrence {Occurrence}: another instance already swept it.",
+                    "Cohort worker skipped occurrence {Occurrence}: a scheduled run for it already exists.",
                     occurrence
                 );
                 return;

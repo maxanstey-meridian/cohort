@@ -10,6 +10,8 @@ internal sealed class RetentionTargetResolver(
     RetentionRegistry registry
 )
 {
+    private const string CastSavepoint = "cohort_record_id_cast";
+
     internal RetentionEntry ResolveTarget(Guid retentionEntityId)
     {
         return registry.Scan().Values.SingleOrDefault(entry => entry.RetentionEntityId == retentionEntityId)
@@ -80,12 +82,29 @@ internal sealed class RetentionTargetResolver(
             """
         );
 
+        // A failed cast aborts the enclosing transaction, which may be the host's own.
+        if (transaction is not null)
+        {
+            await transaction.SaveAsync(CastSavepoint, ct);
+        }
+
         try
         {
-            return (string)(await command.ExecuteScalarAsync(ct))!;
+            var canonical = (string)(await command.ExecuteScalarAsync(ct))!;
+            if (transaction is not null)
+            {
+                await transaction.ReleaseAsync(CastSavepoint, ct);
+            }
+
+            return canonical;
         }
         catch (DbException exception) when (exception.SqlState?.StartsWith("22", StringComparison.Ordinal) == true)
         {
+            if (transaction is not null)
+            {
+                await transaction.RollbackAsync(CastSavepoint, CancellationToken.None);
+            }
+
             throw new InvalidOperationException(
                 $"{operation} record id '{recordId}' for entity '{entry.RetentionEntityId}' is not valid for provider type '{storeType}'. The target would never match its row.",
                 exception

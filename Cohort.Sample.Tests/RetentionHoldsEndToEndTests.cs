@@ -650,6 +650,70 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
         result.Item2.RecordId.Should().Be("42");
     }
 
+    [Fact]
+    public async Task Invalid_Record_Id_Is_Rejected_Without_Aborting_The_Callers_Transaction()
+    {
+        var holdId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.ExternalNumberedLogs.Add(new ExternalNumberedLog
+            {
+                Id = Guid.NewGuid(),
+                ExternalId = 42,
+                CreatedAt = asOf,
+                Payload = "caller transaction target",
+            });
+            await db.SaveChangesAsync();
+        }
+
+        await Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            var repository = services.GetRequiredService<IRetentionHoldsRepository>();
+            await using var transaction = await db.Database.BeginTransactionAsync();
+
+            var create = () => repository.CreateAsync(
+                new RetentionHoldRequest(
+                    Guid.NewGuid(),
+                    RetentionEntityIdentity.For<ExternalNumberedLog>(),
+                    "abc",
+                    null,
+                    "unparsable integer id",
+                    asOf
+                ),
+                CancellationToken.None
+            );
+            var check = () => repository.HasActiveHoldAsync(
+                RetentionEntityIdentity.For<ExternalNumberedLog>(),
+                "abc",
+                null,
+                asOf,
+                CancellationToken.None
+            );
+            await create.Should().ThrowAsync<InvalidOperationException>();
+            await check.Should().ThrowAsync<InvalidOperationException>();
+
+            (await db.ExternalNumberedLogs.CountAsync()).Should().Be(1);
+            await repository.CreateAsync(
+                new RetentionHoldRequest(
+                    holdId,
+                    RetentionEntityIdentity.For<ExternalNumberedLog>(),
+                    "42",
+                    null,
+                    "valid hold in the same transaction",
+                    asOf
+                ),
+                CancellationToken.None
+            );
+            await transaction.CommitAsync();
+        });
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.HeldRecords.SingleAsync()).HoldId.Should().Be(holdId);
+    }
+
     private Task CreateHoldAsync(RetentionHoldRequest request)
     {
         return Host.RunWithServicesAsync(async services =>

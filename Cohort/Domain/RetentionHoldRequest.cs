@@ -17,8 +17,9 @@ public sealed record RetentionHoldRequest
         RecordId = ValidateRequired(recordId, nameof(RecordId), "Record ID");
         TenantId = ValidateTenantId(tenantId);
         Reason = ValidateRequired(reason, nameof(Reason), "Reason");
-        CreatedAt = createdAt;
-        ExpiresAt = ValidateExpiry(expiresAt, createdAt);
+        // Npgsql only writes UTC DateTimeOffsets to timestamptz.
+        CreatedAt = createdAt.ToUniversalTime();
+        ExpiresAt = ValidateExpiry(expiresAt?.ToUniversalTime(), CreatedAt);
     }
 
     public Guid HoldId { get; }

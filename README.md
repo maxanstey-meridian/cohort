@@ -329,8 +329,8 @@ and blocked null anchors are reported in `NullAnchorCount`. Active holds always 
 Erasure refuses categories that resolve to the SoftDelete strategy: setting a flag leaves
 personal data in the row, which rarely satisfies an erasure request. If it genuinely does,
 opt in explicitly with `new ErasureScope(subject, allowSoftDeleteAsErasure: true)`.
-`ErasureResult.DryRun` tells you whether the call previewed (under `Cohort:DryRun`) or
-actually mutated.
+Pass `new ErasureScope(subject, dryRun: true)` to count what an erasure would change and write
+its audit trail without changing any row; `ErasureResult.DryRun` reports which it was.
 
 Erasure runs on the same execution model as sweeps (see [Execution model](#execution-model)):
 the `Started` audit row commits before any mutation, rows are erased in independently
@@ -442,12 +442,12 @@ The execution contract:
 | Key | Default | Description |
 |---|---|---|
 | `Schedule` | `null` | Cron expression, evaluated in **UTC**. `null` means the worker is disabled. |
-| `DryRun` | `false` | Run scheduled sweeps as count-only audited runs instead of mutating data. The worker calls the sweep engine's dry-run path, which writes the same run and entity audit trail with `sweep_run.DryRun` set. Direct `IRetentionPreview` calls remain unaudited previews, `IRetentionSweep.SweepAsync` refuses to run, and `EraseAsync` returns counts without mutating (`ErasureResult.DryRun` is `true`). |
+| `DryRun` | `false` | Run **scheduled** sweeps as count-only audited runs instead of mutating data, with the same run and entity audit trail and `sweep_run.DryRun` set. Only the worker reads it: explicit requests carry their own flag (`RetentionSweepRequest.Tenanted(..., dryRun: true)`, `new ErasureScope(..., dryRun: true)`) and are honoured as written. |
 | `KillSwitch` | `false` | Finish the current iteration, then skip future ticks. |
 | `SweepBatchSize` | `5000` | Maximum rows selected, locked, and mutated per transaction. Each batch commits independently. |
 | `AuditObservers:Timeout` | `00:00:05` | Maximum time Cohort waits for each observer to handle one committed event. Each observer has an independent timeout. |
 | `RowHandlerDispatch:PollInterval` | `00:00:10` | Delay between dispatcher polling passes. |
-| `RowHandlerDispatch:BatchSize` | `50` | Maximum queued handler statuses claimed in one dispatcher batch. Valid range: 1 to 10000. |
+| `RowHandlerDispatch:BatchSize` | `50` | Upper bound on queued handler statuses claimed per poll; the dispatcher claims at most `min(MaxParallelism, BatchSize)` so every claim is worked and heartbeated at once. Valid range: 1 to 10000. |
 | `RowHandlerDispatch:MaxParallelism` | `4` | Maximum rows dispatched concurrently. Handlers for one row remain ordered. Valid range: 1 to 256. |
 | `RowHandlerDispatch:MaxAttempts` | `10` | Maximum delivery attempts before dead-lettering. Valid range: 1 to 1000. |
 | `RowHandlerDispatch:BaseBackoff` | `00:00:01` | Base delay for exponential retry backoff. |
@@ -476,7 +476,28 @@ Worker semantics worth knowing:
 
 ### Breaking pre-1.0 contract
 
-This release intentionally changes the pre-1.0 API and database contract. Relational strategy,
+**0.7.0**
+
+- `RetentionAliasCycleException` and `RetentionResolutionContext.AliasPath` are removed; the
+  context constructor and `Deconstruct` lose that parameter. Aliasing, if a host wants it, stays
+  inside its rule provider.
+- `RetentionCategoryCapabilities` compares by strategy set, and `Strategies` is a
+  `ReadOnlySet<Strategy>`.
+- `CohortConventions` moved from `Cohort.Hosting` to `Cohort.Domain`.
+- `SweepEvent.SweepId` and `SweepEvent.At` are declared on the base record (source compatible).
+- `ErasureScope` gains `dryRun`. `Cohort:DryRun` now only sets the scheduled worker's mode: a
+  manual `IRetentionSweep` call no longer throws after writing `Started`, and erasure no longer
+  silently becomes a dry run.
+- Startup now also rejects: cascade cycles back into retained types, a filtered unique index as
+  record-id uniqueness, and value converters on tenant, anchor, soft-delete, deleted-at and
+  anonymised-at columns.
+- A hold's stored `CreatedAt` is clamped to the database clock, and its `RecordId` is the stored
+  row's canonical text.
+- The row-handler dispatcher claims at most `min(MaxParallelism, BatchSize)` rows per poll.
+
+**Earlier pre-1.0 releases**
+
+Earlier releases intentionally changed the pre-1.0 API and database contract. Relational strategy,
 reflection, ordering, and authoritative audit-writer implementation types are internal;
 consumers configure and invoke retention through annotations, hosting extensions, and the
 application ports documented here. Replace category repository/resolver registrations with one
@@ -587,7 +608,7 @@ public static class ReadmeLegalHolds
 }
 ```
 
-Held records survive all strategies. Holds are checked in SQL via a `NOT EXISTS` subquery, not via an in-memory row pass. Hold activity is evaluated against the **database wall clock**, not the sweep's logical `now`: a hold created yesterday protects its row even from a backdated sweep.
+Held records survive all strategies. Holds are checked in SQL via a `NOT EXISTS` subquery, not via an in-memory row pass. Hold activity is evaluated against the **database wall clock**, not the sweep's logical `now`: a hold created yesterday protects its row even from a backdated sweep. A hold is active from the moment it commits: its stored `CreatedAt` is the earlier of the requested value and the database clock, so an application clock running ahead cannot open a window where a created hold does not yet protect.
 
 `CreateAsync` validates its input so a hold cannot silently protect nothing:
 
@@ -599,7 +620,11 @@ Held records survive all strategies. Holds are checked in SQL via a `NOT EXISTS`
 - For retained tenant-scoped tables, if the target row already exists its tenant must
   match `TenantId` — sweeps only honour holds whose tenant matches the row's, so a
   mis-scoped hold would persist while protecting nothing.
-- The canonical `RecordId` must identify an existing row. Cohort acquires the same
+- The stored `RecordId` is the row's own canonical text, so `citext`, `numeric` and similar
+  keys match what sweeps compare even when the request spells the ID differently.
+- The canonical `RecordId` must identify an existing row, read under `FOR SHARE`: in a
+  caller's `REPEATABLE READ` transaction a row deleted since the snapshot raises a
+  serialization failure rather than taking a hold that protects nothing. Cohort acquires the same
   entity/tenant/record advisory lock used by mutation before checking existence and inserting
   the hold, so a concurrent Cohort sweep cannot pass the hold between validation and creation.
 - Tenantless entities require a null `TenantId`; typed and provider-converted record IDs are

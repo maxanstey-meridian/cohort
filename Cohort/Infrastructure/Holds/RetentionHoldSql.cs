@@ -23,7 +23,7 @@ internal static class RetentionHoldSql
                 SELECT 1
                 FROM {PostgreSqlIdentifier.Format(holdsTable)} AS hold
                 WHERE hold."RetentionEntityId" = @retentionEntityId
-                  AND hold."RecordId" = CAST({targetAlias}.{QuoteIdentifier(
+                  AND hold."RecordId" = CAST({targetAlias}.{PostgreSqlIdentifier.Quote(
                 recordIdColumn
             )} AS text){tenantLine}
                   AND hold."CreatedAt" <= pg_catalog.statement_timestamp()
@@ -31,10 +31,5 @@ internal static class RetentionHoldSql
                   AND (hold."RemovedAt" IS NULL OR hold."RemovedAt" > pg_catalog.statement_timestamp())
             )
             """;
-    }
-
-    private static string QuoteIdentifier(string identifier)
-    {
-        return PostgreSqlIdentifier.Quote(identifier);
     }
 }

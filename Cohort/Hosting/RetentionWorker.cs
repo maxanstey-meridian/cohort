@@ -18,9 +18,6 @@ internal sealed class RetentionWorker(
 {
     private static readonly TimeSpan IdlePollInterval = TimeSpan.FromMilliseconds(200);
 
-    // Long schedule gaps are slept in bounded chunks so a gap beyond Task.Delay's
-    // ~49.7-day ceiling cannot throw.
-    private static readonly TimeSpan MaxScheduleSleepChunk = TimeSpan.FromMinutes(1);
 
     // Session-level Postgres advisory lock key ("cohort01" in hex). Two replicas firing
     // at the same cron instant must not both sweep: double mutations are mostly benign,
@@ -135,7 +132,8 @@ internal sealed class RetentionWorker(
             }
 
             var delay = Task.Delay(
-                remaining < MaxScheduleSleepChunk ? remaining : MaxScheduleSleepChunk,
+                // Bounded chunks: a gap beyond Task.Delay's ~49.7-day ceiling would throw.
+                OperationalTime.GetDelayChunk(remaining),
                 ct
             );
             if (await Task.WhenAny(delay, scheduleChanged.Task) == scheduleChanged.Task)

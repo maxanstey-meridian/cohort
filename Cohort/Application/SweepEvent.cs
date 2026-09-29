@@ -6,6 +6,11 @@ public abstract record SweepEvent
 {
     private SweepEvent() { }
 
+    /// <summary>The run this event belongs to.</summary>
+    public Guid SweepId { get; private init; }
+
+    public DateTimeOffset At { get; private init; }
+
     public sealed record Started : SweepEvent
     {
         public Started(
@@ -23,8 +28,6 @@ public abstract record SweepEvent
             this.TenantId = TenantId;
         }
 
-        public Guid SweepId { get; }
-        public DateTimeOffset At { get; }
         public SweepTriggerKind Trigger { get; }
         public bool DryRun { get; }
         public Guid TenantId { get; }
@@ -63,8 +66,6 @@ public abstract record SweepEvent
             this.Provenance = Provenance;
         }
 
-        public Guid SweepId { get; }
-        public DateTimeOffset At { get; }
         public Type EntityType { get; }
         public Guid RetentionEntityId { get; }
         public string Category { get; }
@@ -107,8 +108,6 @@ public abstract record SweepEvent
             this.Provenance = Provenance;
         }
 
-        public Guid SweepId { get; }
-        public DateTimeOffset At { get; }
         public Type EntityType { get; }
         public Guid RetentionEntityId { get; }
         public string Category { get; }
@@ -143,8 +142,6 @@ public abstract record SweepEvent
             this.TenantId = TenantId;
         }
 
-        public Guid SweepId { get; }
-        public DateTimeOffset At { get; }
         public Type EntityType { get; }
         public Guid RetentionEntityId { get; }
         public string RecordId { get; }
@@ -163,8 +160,6 @@ public abstract record SweepEvent
             this.TotalAffected = NonNegative(TotalAffected, nameof(TotalAffected));
         }
 
-        public Guid SweepId { get; }
-        public DateTimeOffset At { get; }
         public TimeSpan Duration { get; }
         public long TotalAffected { get; }
     }
@@ -186,8 +181,6 @@ public abstract record SweepEvent
             this.TotalAffected = OptionalNonNegative(TotalAffected, nameof(TotalAffected));
         }
 
-        public Guid SweepId { get; }
-        public DateTimeOffset At { get; }
         public string Error { get; }
         public TimeSpan? Duration { get; }
         public long? TotalAffected { get; }
@@ -210,8 +203,6 @@ public abstract record SweepEvent
             this.Error = RequiredText(Error, nameof(Error));
         }
 
-        public Guid SweepId { get; }
-        public DateTimeOffset At { get; }
         public TimeSpan Duration { get; }
         public long TotalAffected { get; }
         public string Error { get; }
@@ -234,8 +225,6 @@ public abstract record SweepEvent
             this.TotalAffected = NonNegative(TotalAffected, nameof(TotalAffected));
         }
 
-        public Guid SweepId { get; }
-        public DateTimeOffset At { get; }
         public string Error { get; }
         public TimeSpan Duration { get; }
         public long TotalAffected { get; }

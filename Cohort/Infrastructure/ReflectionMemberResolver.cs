@@ -8,9 +8,6 @@ internal static class ReflectionMemberResolver
 
     internal static PropertyInfo? FindPropertyByName(Type clrType, string name)
     {
-        ArgumentNullException.ThrowIfNull(clrType);
-        ArgumentException.ThrowIfNullOrWhiteSpace(name);
-
         var declared = clrType
             .GetProperties(PublicInstance | BindingFlags.DeclaredOnly)
             .FirstOrDefault(property =>

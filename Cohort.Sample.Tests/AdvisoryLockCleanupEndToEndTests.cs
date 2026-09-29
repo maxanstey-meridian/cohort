@@ -24,7 +24,7 @@ public sealed class AdvisoryLockCleanupEndToEndTests(PostgresFixture fixture)
             {
                 await OperationalConnectionCleanup.RunAsync(
                     ct =>
-                        RetentionRunAdvisoryLock.ReleaseAsync(connection, Guid.NewGuid(), ct),
+                        RetentionRunAdvisoryLock.ReleaseAsync(connection, RetentionRunAdvisoryLock.KeyFor(Guid.NewGuid()), ct),
                     _ => throw new CloseFailureException(),
                     ex,
                     NullLogger.Instance

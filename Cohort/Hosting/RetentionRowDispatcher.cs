@@ -205,7 +205,7 @@ internal sealed class RetentionRowDispatcher(
                     var connection = db.Database.GetDbConnection();
                     foreach (var sweepId in staleSweepIds)
                     {
-                        if (!await RetentionRunAdvisoryLock.TryAcquireAsync(connection, sweepId, ct))
+                        if (!await RetentionRunAdvisoryLock.TryAcquireAsync(connection, RetentionRunAdvisoryLock.KeyFor(sweepId), ct))
                         {
                             continue;
                         }
@@ -255,7 +255,7 @@ internal sealed class RetentionRowDispatcher(
         try
         {
             using var cleanup = new CancellationTokenSource(CleanupTimeout);
-            await RetentionRunAdvisoryLock.ReleaseAsync(connection, sweepId, cleanup.Token);
+            await RetentionRunAdvisoryLock.ReleaseAsync(connection, RetentionRunAdvisoryLock.KeyFor(sweepId), cleanup.Token);
         }
         catch (Exception ex)
         {

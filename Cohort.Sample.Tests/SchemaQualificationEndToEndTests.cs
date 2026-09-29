@@ -666,7 +666,7 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
             prepare.Parameters.AddWithValue("started", (int)SweepRunStatus.Started);
             prepare.Parameters.AddWithValue("startedAt", now.AddDays(-1));
             prepare.Parameters.AddWithValue("sweepId", sweepId);
-            prepare.Parameters.AddWithValue("lockKey", RetentionRunAdvisoryLock.GetKey(sweepId));
+            prepare.Parameters.AddWithValue("lockKey", RetentionRunAdvisoryLock.KeyFor(sweepId));
             await prepare.ExecuteNonQueryAsync();
         }
 
@@ -677,7 +677,7 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
         await using (var release = owner.CreateCommand())
         {
             release.CommandText = "SELECT pg_catalog.pg_advisory_unlock(@lockKey)";
-            release.Parameters.AddWithValue("lockKey", RetentionRunAdvisoryLock.GetKey(sweepId));
+            release.Parameters.AddWithValue("lockKey", RetentionRunAdvisoryLock.KeyFor(sweepId));
             (await release.ExecuteScalarAsync()).Should().Be(true);
         }
 

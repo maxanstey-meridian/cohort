@@ -47,7 +47,7 @@ internal sealed class RetentionAuditNotifier(
                         "Cohort audit observer {ObserverType} timed out processing committed event {EventType} for sweep {SweepId} and was quarantined for the remainder of the run.",
                         observer.GetType().FullName,
                         evt.GetType().Name,
-                        GetSweepId(evt)
+                        evt.SweepId
                     );
                 }
             }
@@ -58,23 +58,9 @@ internal sealed class RetentionAuditNotifier(
                     "Cohort audit observer {ObserverType} failed processing committed event {EventType} for sweep {SweepId}.",
                     observer.GetType().FullName,
                     evt.GetType().Name,
-                    GetSweepId(evt)
+                    evt.SweepId
                 );
             }
         }
     }
-
-    private static Guid GetSweepId(SweepEvent evt) =>
-        evt switch
-        {
-            SweepEvent.Started value => value.SweepId,
-            SweepEvent.EntityProgress value => value.SweepId,
-            SweepEvent.EntitySummary value => value.SweepId,
-            SweepEvent.RowDetail value => value.SweepId,
-            SweepEvent.Completed value => value.SweepId,
-            SweepEvent.PartiallyFailed value => value.SweepId,
-            SweepEvent.Failed value => value.SweepId,
-            SweepEvent.Cancelled value => value.SweepId,
-            _ => Guid.Empty,
-        };
 }

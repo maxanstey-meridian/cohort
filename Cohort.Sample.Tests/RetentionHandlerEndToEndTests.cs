@@ -257,7 +257,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         await SetSweepStartedAtAsync(result.SweepId, DateTimeOffset.UtcNow.AddDays(-1));
         await using var ownerConnection = new NpgsqlConnection(GetConnectionString());
         await ownerConnection.OpenAsync();
-        await RetentionRunAdvisoryLock.AcquireAsync(ownerConnection, result.SweepId, default);
+        await RetentionRunAdvisoryLock.AcquireAsync(ownerConnection, RetentionRunAdvisoryLock.KeyFor(result.SweepId), default);
         await handlerHost.RunWithServicesAsync(async serviceProvider =>
         {
             var activeFlush = await serviceProvider
@@ -266,7 +266,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             activeFlush.PendingRemaining.Should().Be(1);
         });
         recorder.AfterCalls.Should().BeEmpty();
-        await RetentionRunAdvisoryLock.ReleaseAsync(ownerConnection, result.SweepId, default);
+        await RetentionRunAdvisoryLock.ReleaseAsync(ownerConnection, RetentionRunAdvisoryLock.KeyFor(result.SweepId), default);
 
         RowDispatcherFlushResult? flushResult = null;
         await handlerHost.RunWithServicesAsync(async serviceProvider =>

@@ -6,8 +6,6 @@ internal static partial class RetentionTypeIdentity
 {
     public static string GetPersistedName(Type type)
     {
-        ArgumentNullException.ThrowIfNull(type);
-
         var assemblyQualifiedName =
             type.AssemblyQualifiedName
             ?? throw new InvalidOperationException(
@@ -19,8 +17,6 @@ internal static partial class RetentionTypeIdentity
 
     public static string Normalize(string persistedName)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(persistedName);
-
         return PublicKeyTokenPattern()
             .Replace(
                 CulturePattern()

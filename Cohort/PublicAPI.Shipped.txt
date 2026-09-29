@@ -77,24 +77,20 @@ Cohort.Application.RowHandlerDispatchPhase
 Cohort.Application.RowHandlerDispatchPhase.AfterSweepSettled = 1 -> Cohort.Application.RowHandlerDispatchPhase
 Cohort.Application.RowHandlerDispatchPhase.Immediate = 0 -> Cohort.Application.RowHandlerDispatchPhase
 Cohort.Application.SweepEvent
+Cohort.Application.SweepEvent.At.get -> System.DateTimeOffset
 Cohort.Application.SweepEvent.Cancelled
-Cohort.Application.SweepEvent.Cancelled.At.get -> System.DateTimeOffset
 Cohort.Application.SweepEvent.Cancelled.Cancelled(System.Guid SweepId, System.DateTimeOffset At, string! Error, System.TimeSpan Duration, long TotalAffected) -> void
 Cohort.Application.SweepEvent.Cancelled.Duration.get -> System.TimeSpan
 Cohort.Application.SweepEvent.Cancelled.Equals(Cohort.Application.SweepEvent.Cancelled? other) -> bool
 Cohort.Application.SweepEvent.Cancelled.Error.get -> string!
-Cohort.Application.SweepEvent.Cancelled.SweepId.get -> System.Guid
 Cohort.Application.SweepEvent.Cancelled.TotalAffected.get -> long
 Cohort.Application.SweepEvent.Completed
-Cohort.Application.SweepEvent.Completed.At.get -> System.DateTimeOffset
 Cohort.Application.SweepEvent.Completed.Completed(System.Guid SweepId, System.DateTimeOffset At, System.TimeSpan Duration, long TotalAffected) -> void
 Cohort.Application.SweepEvent.Completed.Duration.get -> System.TimeSpan
 Cohort.Application.SweepEvent.Completed.Equals(Cohort.Application.SweepEvent.Completed? other) -> bool
-Cohort.Application.SweepEvent.Completed.SweepId.get -> System.Guid
 Cohort.Application.SweepEvent.Completed.TotalAffected.get -> long
 Cohort.Application.SweepEvent.EntityProgress
 Cohort.Application.SweepEvent.EntityProgress.Affected.get -> long
-Cohort.Application.SweepEvent.EntityProgress.At.get -> System.DateTimeOffset
 Cohort.Application.SweepEvent.EntityProgress.Category.get -> string!
 Cohort.Application.SweepEvent.EntityProgress.EntityProgress(System.Guid SweepId, System.DateTimeOffset At, System.Type! EntityType, System.Guid RetentionEntityId, string! Category, System.Guid TenantId, Cohort.Domain.Strategy Strategy, System.TimeSpan ResolvedPeriod, long Affected, long SkippedCount, Cohort.Domain.RetentionRuleProvenance? Provenance = null) -> void
 Cohort.Application.SweepEvent.EntityProgress.EntityType.get -> System.Type!
@@ -104,11 +100,9 @@ Cohort.Application.SweepEvent.EntityProgress.ResolvedPeriod.get -> System.TimeSp
 Cohort.Application.SweepEvent.EntityProgress.RetentionEntityId.get -> System.Guid
 Cohort.Application.SweepEvent.EntityProgress.SkippedCount.get -> long
 Cohort.Application.SweepEvent.EntityProgress.Strategy.get -> Cohort.Domain.Strategy
-Cohort.Application.SweepEvent.EntityProgress.SweepId.get -> System.Guid
 Cohort.Application.SweepEvent.EntityProgress.TenantId.get -> System.Guid
 Cohort.Application.SweepEvent.EntitySummary
 Cohort.Application.SweepEvent.EntitySummary.Affected.get -> long
-Cohort.Application.SweepEvent.EntitySummary.At.get -> System.DateTimeOffset
 Cohort.Application.SweepEvent.EntitySummary.Category.get -> string!
 Cohort.Application.SweepEvent.EntitySummary.EntitySummary(System.Guid SweepId, System.DateTimeOffset At, System.Type! EntityType, System.Guid RetentionEntityId, string! Category, System.Guid TenantId, Cohort.Domain.Strategy Strategy, System.TimeSpan ResolvedPeriod, long Affected, long HeldCount, long SkippedCount = 0, long NullAnchorCount = 0, Cohort.Domain.RetentionRuleProvenance? Provenance = null) -> void
 Cohort.Application.SweepEvent.EntitySummary.EntityType.get -> System.Type!
@@ -120,26 +114,20 @@ Cohort.Application.SweepEvent.EntitySummary.ResolvedPeriod.get -> System.TimeSpa
 Cohort.Application.SweepEvent.EntitySummary.RetentionEntityId.get -> System.Guid
 Cohort.Application.SweepEvent.EntitySummary.SkippedCount.get -> long
 Cohort.Application.SweepEvent.EntitySummary.Strategy.get -> Cohort.Domain.Strategy
-Cohort.Application.SweepEvent.EntitySummary.SweepId.get -> System.Guid
 Cohort.Application.SweepEvent.EntitySummary.TenantId.get -> System.Guid
 Cohort.Application.SweepEvent.Failed
-Cohort.Application.SweepEvent.Failed.At.get -> System.DateTimeOffset
 Cohort.Application.SweepEvent.Failed.Duration.get -> System.TimeSpan?
 Cohort.Application.SweepEvent.Failed.Equals(Cohort.Application.SweepEvent.Failed? other) -> bool
 Cohort.Application.SweepEvent.Failed.Error.get -> string!
 Cohort.Application.SweepEvent.Failed.Failed(System.Guid SweepId, System.DateTimeOffset At, string! Error, System.TimeSpan? Duration = null, long? TotalAffected = null) -> void
-Cohort.Application.SweepEvent.Failed.SweepId.get -> System.Guid
 Cohort.Application.SweepEvent.Failed.TotalAffected.get -> long?
 Cohort.Application.SweepEvent.PartiallyFailed
-Cohort.Application.SweepEvent.PartiallyFailed.At.get -> System.DateTimeOffset
 Cohort.Application.SweepEvent.PartiallyFailed.Duration.get -> System.TimeSpan
 Cohort.Application.SweepEvent.PartiallyFailed.Equals(Cohort.Application.SweepEvent.PartiallyFailed? other) -> bool
 Cohort.Application.SweepEvent.PartiallyFailed.Error.get -> string!
 Cohort.Application.SweepEvent.PartiallyFailed.PartiallyFailed(System.Guid SweepId, System.DateTimeOffset At, System.TimeSpan Duration, long TotalAffected, string! Error) -> void
-Cohort.Application.SweepEvent.PartiallyFailed.SweepId.get -> System.Guid
 Cohort.Application.SweepEvent.PartiallyFailed.TotalAffected.get -> long
 Cohort.Application.SweepEvent.RowDetail
-Cohort.Application.SweepEvent.RowDetail.At.get -> System.DateTimeOffset
 Cohort.Application.SweepEvent.RowDetail.Category.get -> string!
 Cohort.Application.SweepEvent.RowDetail.EntityType.get -> System.Type!
 Cohort.Application.SweepEvent.RowDetail.Equals(Cohort.Application.SweepEvent.RowDetail? other) -> bool
@@ -147,17 +135,15 @@ Cohort.Application.SweepEvent.RowDetail.RecordId.get -> string!
 Cohort.Application.SweepEvent.RowDetail.RetentionEntityId.get -> System.Guid
 Cohort.Application.SweepEvent.RowDetail.RowDetail(System.Guid SweepId, System.DateTimeOffset At, System.Type! EntityType, System.Guid RetentionEntityId, string! RecordId, string! Category, Cohort.Domain.Strategy Strategy, System.Guid TenantId) -> void
 Cohort.Application.SweepEvent.RowDetail.Strategy.get -> Cohort.Domain.Strategy
-Cohort.Application.SweepEvent.RowDetail.SweepId.get -> System.Guid
 Cohort.Application.SweepEvent.RowDetail.TenantId.get -> System.Guid
 Cohort.Application.SweepEvent.Started
-Cohort.Application.SweepEvent.Started.At.get -> System.DateTimeOffset
 Cohort.Application.SweepEvent.Started.DryRun.get -> bool
 Cohort.Application.SweepEvent.Started.Equals(Cohort.Application.SweepEvent.Started? other) -> bool
 Cohort.Application.SweepEvent.Started.Started(System.Guid SweepId, System.DateTimeOffset At, Cohort.Application.SweepTriggerKind Trigger, bool DryRun, System.Guid TenantId) -> void
-Cohort.Application.SweepEvent.Started.SweepId.get -> System.Guid
 Cohort.Application.SweepEvent.Started.TenantId.get -> System.Guid
 Cohort.Application.SweepEvent.Started.Trigger.get -> Cohort.Application.SweepTriggerKind
 Cohort.Application.SweepEvent.SweepEvent(Cohort.Application.SweepEvent! original) -> void
+Cohort.Application.SweepEvent.SweepId.get -> System.Guid
 Cohort.Application.SweepRunStatus
 Cohort.Application.SweepRunStatus.Cancelled = 4 -> Cohort.Application.SweepRunStatus
 Cohort.Application.SweepRunStatus.Failed = 3 -> Cohort.Application.SweepRunStatus

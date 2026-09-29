@@ -11,7 +11,7 @@ internal static class RecordIdSql
 {
     internal static string TextExpression(string targetAlias, RecordIdConvention recordId)
     {
-        return $"CAST({targetAlias}.{Quote(recordId.RecordIdColumn)} AS text)";
+        return $"CAST({targetAlias}.{PostgreSqlIdentifier.Quote(recordId.RecordIdColumn)} AS text)";
     }
 
     internal static string EqualsParameter(
@@ -21,8 +21,8 @@ internal static class RecordIdSql
     )
     {
         return PostgresStoreTypeSql.Validate(recordId.RecordIdStoreType) is { } storeType
-            ? $"{targetAlias}.{Quote(recordId.RecordIdColumn)} = CAST(@{parameterName} AS {storeType})"
-            : $"CAST({targetAlias}.{Quote(recordId.RecordIdColumn)} AS text) = CAST(@{parameterName} AS text)";
+            ? $"{targetAlias}.{PostgreSqlIdentifier.Quote(recordId.RecordIdColumn)} = CAST(@{parameterName} AS {storeType})"
+            : $"CAST({targetAlias}.{PostgreSqlIdentifier.Quote(recordId.RecordIdColumn)} AS text) = CAST(@{parameterName} AS text)";
     }
 
     internal static string EqualsAnyParameter(
@@ -32,8 +32,8 @@ internal static class RecordIdSql
     )
     {
         return PostgresStoreTypeSql.Validate(recordId.RecordIdStoreType) is { } storeType
-            ? $"{targetAlias}.{Quote(recordId.RecordIdColumn)} = ANY(CAST(@{parameterName} AS {storeType}[]))"
-            : $"CAST({targetAlias}.{Quote(recordId.RecordIdColumn)} AS text) = ANY(@{parameterName})";
+            ? $"{targetAlias}.{PostgreSqlIdentifier.Quote(recordId.RecordIdColumn)} = ANY(CAST(@{parameterName} AS {storeType}[]))"
+            : $"CAST({targetAlias}.{PostgreSqlIdentifier.Quote(recordId.RecordIdColumn)} AS text) = ANY(@{parameterName})";
     }
 
     internal static async Task<string> CanonicalizeAsync(
@@ -53,10 +53,5 @@ internal static class RecordIdSql
                 : $"SELECT CAST(CAST(@recordId AS {storeType}) AS text)"
         );
         return (string)(await command.ExecuteScalarAsync(ct))!;
-    }
-
-    private static string Quote(string identifier)
-    {
-        return PostgreSqlIdentifier.Quote(identifier);
     }
 }

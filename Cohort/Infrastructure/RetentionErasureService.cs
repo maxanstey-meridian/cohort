@@ -31,8 +31,6 @@ internal sealed class RetentionErasureService(
         CancellationToken ct = default
     )
     {
-        ArgumentNullException.ThrowIfNull(tenant);
-        ArgumentNullException.ThrowIfNull(scope);
         await readinessValidator.ValidateAsync(ct);
 
         var run = new RetentionRun(

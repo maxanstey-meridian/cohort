@@ -37,7 +37,6 @@ internal sealed class RetentionSweepEngine(
         CancellationToken ct = default
     )
     {
-        ArgumentNullException.ThrowIfNull(tenant);
         await readinessValidator.ValidateAsync(ct);
 
         var run = new RetentionRun(

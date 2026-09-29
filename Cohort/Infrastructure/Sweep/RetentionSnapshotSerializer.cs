@@ -44,8 +44,6 @@ internal static class RetentionSnapshotSerializer
 
     public static string Serialize(IReadOnlyDictionary<string, object?> snapshot)
     {
-        ArgumentNullException.ThrowIfNull(snapshot);
-
         var encoded = new Dictionary<string, object?>(snapshot.Count, StringComparer.Ordinal);
         foreach (var (key, value) in snapshot)
         {
@@ -61,9 +59,6 @@ internal static class RetentionSnapshotSerializer
         IEnumerable<Assembly> handlerAssemblies
     )
     {
-        ArgumentNullException.ThrowIfNull(entityType);
-        ArgumentNullException.ThrowIfNull(handlerAssemblies);
-
         if (string.IsNullOrWhiteSpace(capturedPayload))
         {
             throw new InvalidOperationException(

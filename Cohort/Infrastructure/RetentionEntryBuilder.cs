@@ -111,32 +111,10 @@ internal sealed class RetentionEntryBuilder(CohortConventions conventions)
         StoreObjectIdentifier storeObject
     )
     {
-        var clrType = entityType.ClrType;
-        var recordIdMember =
-            clrType
-                .GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                .FirstOrDefault(p => p.GetCustomAttribute<RetentionRecordIdAttribute>() is not null)
-            ?? ReflectionMemberResolver.FindPropertyByName(
-                clrType,
-                conventions.RecordIdPropertyName
-            );
-        if (recordIdMember is null)
-        {
-            throw new InvalidOperationException(
-                $"Record-id convention on {clrType.FullName}: no public Id property found and no property marked with [RetentionRecordId]."
-            );
-        }
-
-        var recordIdProperty =
-            entityType.FindProperty(recordIdMember.Name)
+        var (recordIdProperty, recordIdColumn, recordIdMember) =
+            ResolveMarked<RetentionRecordIdAttribute>(entityType, storeObject, conventions.RecordIdPropertyName, "Record-id", "'{0}'")
             ?? throw new InvalidOperationException(
-                $"Record-id convention on {clrType.FullName}: '{recordIdMember.Name}' is not mapped by EF."
-            );
-
-        var recordIdColumn =
-            recordIdProperty.GetColumnName(storeObject)
-            ?? throw new InvalidOperationException(
-                $"Record-id convention on {clrType.FullName}: '{recordIdMember.Name}' has no mapped table column."
+                $"Record-id convention on {entityType.ClrType.FullName}: no public Id property found and no property marked with [RetentionRecordId]."
             );
 
         return new RecordIdConvention(
@@ -145,6 +123,41 @@ internal sealed class RetentionEntryBuilder(CohortConventions conventions)
             recordIdMember.PropertyType,
             TryGetStoreType(recordIdProperty)
         );
+    }
+
+    /// <summary>
+    /// The property marked with <typeparamref name="TMarker"/>, else the one named by
+    /// convention, with its mapped column; null when neither exists. <paramref name="label"/>
+    /// names it in errors ("{0}" is replaced by the member name).
+    /// </summary>
+    private static (IProperty Property, string Column, PropertyInfo Member)? ResolveMarked<TMarker>(
+        IEntityType entityType,
+        StoreObjectIdentifier storeObject,
+        string conventionName,
+        string role,
+        string label
+    )
+        where TMarker : Attribute
+    {
+        var clrType = entityType.ClrType;
+        var member =
+            clrType
+                .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(property => property.GetCustomAttribute<TMarker>() is not null)
+            ?? ReflectionMemberResolver.FindPropertyByName(clrType, conventionName);
+        if (member is null)
+        {
+            return null;
+        }
+
+        var name = string.Format(System.Globalization.CultureInfo.InvariantCulture, label, member.Name);
+        var property =
+            entityType.FindProperty(member.Name)
+            ?? throw new InvalidOperationException($"{role} convention on {clrType.FullName}: {name} is not mapped by EF.");
+        var column =
+            property.GetColumnName(storeObject)
+            ?? throw new InvalidOperationException($"{role} convention on {clrType.FullName}: {name} has no mapped table column.");
+        return (property, column, member);
     }
 
     private static string? TryGetStoreType(IProperty property)
@@ -167,18 +180,10 @@ internal sealed class RetentionEntryBuilder(CohortConventions conventions)
         StoreObjectIdentifier storeObject
     )
     {
-        var clrType = entityType.ClrType;
-        var anonymisedAtMember =
-            clrType
-                .GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                .FirstOrDefault(p =>
-                    p.GetCustomAttribute<RetentionAnonymisedAtAttribute>() is not null
-                )
-            ?? ReflectionMemberResolver.FindPropertyByName(
-                clrType,
-                conventions.AnonymisedAtPropertyName
-            );
-        if (anonymisedAtMember is null)
+        if (
+            ResolveMarked<RetentionAnonymisedAtAttribute>(entityType, storeObject, conventions.AnonymisedAtPropertyName, "AnonymisedAt", "'{0}'")
+            is not var (anonymisedAtProperty, anonymisedAtColumn, anonymisedAtMember)
+        )
         {
             return null;
         }
@@ -186,21 +191,9 @@ internal sealed class RetentionEntryBuilder(CohortConventions conventions)
         if (anonymisedAtMember.PropertyType != typeof(DateTimeOffset?))
         {
             throw new InvalidOperationException(
-                $"AnonymisedAt convention on {clrType.FullName}: '{anonymisedAtMember.Name}' must be a nullable DateTimeOffset — NULL marks rows not yet anonymised, got {anonymisedAtMember.PropertyType.Name}."
+                $"AnonymisedAt convention on {entityType.ClrType.FullName}: '{anonymisedAtMember.Name}' must be a nullable DateTimeOffset — NULL marks rows not yet anonymised, got {anonymisedAtMember.PropertyType.Name}."
             );
         }
-
-        var anonymisedAtProperty =
-            entityType.FindProperty(anonymisedAtMember.Name)
-            ?? throw new InvalidOperationException(
-                $"AnonymisedAt convention on {clrType.FullName}: '{anonymisedAtMember.Name}' is not mapped by EF."
-            );
-
-        var anonymisedAtColumn =
-            anonymisedAtProperty.GetColumnName(storeObject)
-            ?? throw new InvalidOperationException(
-                $"AnonymisedAt convention on {clrType.FullName}: '{anonymisedAtMember.Name}' has no mapped table column."
-            );
 
         return new AnonymisedAtConvention(anonymisedAtProperty.Name, anonymisedAtColumn);
     }
@@ -270,13 +263,10 @@ internal sealed class RetentionEntryBuilder(CohortConventions conventions)
         StoreObjectIdentifier storeObject
     )
     {
-        var clrType = entityType.ClrType;
-        var tenantMember =
-            clrType
-                .GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                .FirstOrDefault(p => p.GetCustomAttribute<RetentionTenantAttribute>() is not null)
-            ?? ReflectionMemberResolver.FindPropertyByName(clrType, conventions.TenantPropertyName);
-        if (tenantMember is null)
+        if (
+            ResolveMarked<RetentionTenantAttribute>(entityType, storeObject, conventions.TenantPropertyName, "Tenant", "TenantId")
+            is not var (tenantProperty, tenantColumn, tenantMember)
+        )
         {
             return null;
         }
@@ -284,21 +274,9 @@ internal sealed class RetentionEntryBuilder(CohortConventions conventions)
         if (!AllowedTenantTypes.Contains(tenantMember.PropertyType))
         {
             throw new InvalidOperationException(
-                $"Tenant convention on {clrType.FullName}: TenantId must be a non-nullable Guid, got {tenantMember.PropertyType.Name}."
+                $"Tenant convention on {entityType.ClrType.FullName}: TenantId must be a non-nullable Guid, got {tenantMember.PropertyType.Name}."
             );
         }
-
-        var tenantProperty =
-            entityType.FindProperty(tenantMember.Name)
-            ?? throw new InvalidOperationException(
-                $"Tenant convention on {clrType.FullName}: TenantId is not mapped by EF."
-            );
-
-        var tenantColumn =
-            tenantProperty.GetColumnName(storeObject)
-            ?? throw new InvalidOperationException(
-                $"Tenant convention on {clrType.FullName}: TenantId has no mapped table column."
-            );
 
         return new TenantConvention(tenantProperty.Name, tenantColumn);
     }
@@ -308,65 +286,15 @@ internal sealed class RetentionEntryBuilder(CohortConventions conventions)
         StoreObjectIdentifier storeObject
     )
     {
-        var clrType = entityType.ClrType;
-        var isDeletedMember =
-            clrType
-                .GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                .FirstOrDefault(p =>
-                    p.GetCustomAttribute<RetentionSoftDeleteAttribute>() is not null
-                )
-            ?? ReflectionMemberResolver.FindPropertyByName(
-                clrType,
-                conventions.SoftDeletePropertyName
-            );
-        if (isDeletedMember is null)
+        if (
+            ResolveMarked<RetentionSoftDeleteAttribute>(entityType, storeObject, conventions.SoftDeletePropertyName, "Soft-delete", "IsDeleted")
+            is not var (isDeletedProperty, isDeletedColumn, _)
+        )
         {
             return null;
         }
 
-        var isDeletedProperty =
-            entityType.FindProperty(isDeletedMember.Name)
-            ?? throw new InvalidOperationException(
-                $"Soft-delete convention on {clrType.FullName}: IsDeleted is not mapped by EF."
-            );
-
-        var isDeletedColumn =
-            isDeletedProperty.GetColumnName(storeObject)
-            ?? throw new InvalidOperationException(
-                $"Soft-delete convention on {clrType.FullName}: IsDeleted has no mapped table column."
-            );
-
-        var deletedAtMember =
-            clrType
-                .GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                .FirstOrDefault(p =>
-                    p.GetCustomAttribute<RetentionDeletedAtAttribute>() is not null
-                )
-            ?? ReflectionMemberResolver.FindPropertyByName(
-                clrType,
-                conventions.DeletedAtPropertyName
-            );
-        var deletedAtProperty = deletedAtMember is null
-            ? null
-            : entityType.FindProperty(deletedAtMember.Name)
-                ?? throw new InvalidOperationException(
-                    $"Soft-delete convention on {clrType.FullName}: DeletedAt is not mapped by EF."
-                );
-        var deletedAtColumn =
-            deletedAtProperty?.GetColumnName(storeObject)
-            ?? (
-                deletedAtProperty is null
-                    ? null
-                    : throw new InvalidOperationException(
-                        $"Soft-delete convention on {clrType.FullName}: DeletedAt has no mapped table column."
-                    )
-            );
-
-        return new SoftDeleteConvention(
-            isDeletedProperty.Name,
-            isDeletedColumn,
-            deletedAtMember?.Name,
-            deletedAtColumn
-        );
+        var deletedAt = ResolveMarked<RetentionDeletedAtAttribute>(entityType, storeObject, conventions.DeletedAtPropertyName, "Soft-delete", "DeletedAt");
+        return new SoftDeleteConvention(isDeletedProperty.Name, isDeletedColumn, deletedAt?.Member.Name, deletedAt?.Column);
     }
 }

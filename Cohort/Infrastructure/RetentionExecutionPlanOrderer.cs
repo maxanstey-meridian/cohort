@@ -14,10 +14,6 @@ internal static class RetentionExecutionPlanOrderer
         ILogger? logger = null
     )
     {
-        ArgumentNullException.ThrowIfNull(db);
-        ArgumentNullException.ThrowIfNull(plan);
-        ArgumentNullException.ThrowIfNull(entrySelector);
-
         if (plan.Count <= 1)
         {
             return plan;

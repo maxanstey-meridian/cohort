@@ -47,7 +47,7 @@ internal sealed class RetentionRun(
         Exception? primaryException = null;
         try
         {
-            await RetentionRunAdvisoryLock.AcquireAsync(connection, SweepId, ct);
+            await RetentionRunAdvisoryLock.AcquireAsync(connection, RetentionRunAdvisoryLock.KeyFor(SweepId), ct);
             locked = true;
             // Started commits on its own, so a run that later fails still leaves evidence.
             await WriteDurableAsync(started, CancellationToken.None);
@@ -91,7 +91,7 @@ internal sealed class RetentionRun(
         finally
         {
             await OperationalConnectionCleanup.RunAsync(
-                locked ? cleanupToken => RetentionRunAdvisoryLock.ReleaseAsync(connection, SweepId, cleanupToken) : null,
+                locked ? cleanupToken => RetentionRunAdvisoryLock.ReleaseAsync(connection, RetentionRunAdvisoryLock.KeyFor(SweepId), cleanupToken) : null,
                 _ => db.Database.CloseConnectionAsync(),
                 primaryException,
                 logger

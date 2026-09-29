@@ -24,8 +24,6 @@ internal sealed record RetentionFailureDiagnostic
 
     public static RetentionFailureDiagnostic Create(Exception exception)
     {
-        ArgumentNullException.ThrowIfNull(exception);
-
         var root = exception.GetBaseException();
         return new RetentionFailureDiagnostic(
             Guid.NewGuid(),

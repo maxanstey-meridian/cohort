@@ -55,10 +55,6 @@ internal static class RetentionHandlerSupport
         CancellationToken ct
     )
     {
-        ArgumentNullException.ThrowIfNull(handlers);
-        ArgumentNullException.ThrowIfNull(row);
-        ArgumentNullException.ThrowIfNull(ctx);
-
         foreach (var handler in handlers)
         {
             try

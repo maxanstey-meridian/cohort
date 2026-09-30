@@ -262,6 +262,7 @@ internal sealed class RetentionRowDispatcher(
         catch (Exception ex)
         {
             logger.LogWarning(ex, "Cohort could not release the run lock for {SweepId}.", sweepId);
+            OperationalConnectionCleanup.DiscardWhenClosed(connection);
         }
     }
 
@@ -293,6 +294,9 @@ internal sealed class RetentionRowDispatcher(
             }
             catch (Exception)
             {
+                // Every delivery records its own outcome, so only cancellation (shutdown or a
+                // cancelled flush) ends a batch early. Its interrupted deliveries go back to
+                // the queue; the attempt they were cancelled in still counts.
                 try
                 {
                     using var cleanup = new CancellationTokenSource(CleanupTimeout);
@@ -474,10 +478,13 @@ internal sealed class RetentionRowDispatcher(
             // Without the snapshot (scrubbed by the PayloadRetention backstop) the handler
             // can never succeed, so dead-letter with the real reason instead of burning
             // the retry budget on a misleading deserialisation error.
-            await MarkDeadLetteredAsync(
+            await RecordOutcomeAsync(
                 claimed,
-                "Captured row snapshot was scrubbed by the payload-retention backstop (RowHandlerDispatch:PayloadRetention) before this handler ran; the work can no longer complete. Increase PayloadRetention or drain handler work sooner.",
-                ct
+                () => MarkDeadLetteredAsync(
+                    claimed,
+                    "Captured row snapshot was scrubbed by the payload-retention backstop (RowHandlerDispatch:PayloadRetention) before this handler ran; the work can no longer complete. Increase PayloadRetention or drain handler work sooner.",
+                    ct
+                )
             );
             return;
         }
@@ -489,6 +496,7 @@ internal sealed class RetentionRowDispatcher(
         var remaining = deadline - DateTimeOffset.UtcNow;
         handlerCts.CancelAfter(remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero);
 
+        Func<Task> recordOutcome;
         try
         {
             await using var scope = scopeFactory.CreateAsyncScope();
@@ -511,21 +519,37 @@ internal sealed class RetentionRowDispatcher(
             {
                 // Retrying cannot heal an unregistered identity: the handler was renamed
                 // without an explicit identity, or removed.
-                await MarkDeadLetteredAsync(
-                    claimed,
-                    "The queued retention row handler is not registered. If it was renamed, register it with an explicit identity so queued work survives renames.",
-                    ct
-                );
-                await ClearSettledPayloadAsync(claimed.RowDetailId);
-                return;
+                recordOutcome = async () =>
+                {
+                    await MarkDeadLetteredAsync(
+                        claimed,
+                        "The queued retention row handler is not registered. If it was renamed, register it with an explicit identity so queued work survives renames.",
+                        ct
+                    );
+                    await ClearSettledPayloadAsync(claimed.RowDetailId);
+                };
             }
-
-            var snapshot = RetentionSnapshotSerializer.Deserialize(
-                claimed.CapturedPayload,
-                entityType,
-                handlers.Select(resolved => resolved.Instance.GetType().Assembly)
-            );
-            await InvokeOnAfterAsync(entityType, handler.Instance, claimed, snapshot, handlerCts.Token);
+            else
+            {
+                var snapshot = RetentionSnapshotSerializer.Deserialize(
+                    claimed.CapturedPayload,
+                    entityType,
+                    handlers.Select(resolved => resolved.Instance.GetType().Assembly)
+                );
+                await InvokeOnAfterAsync(entityType, handler.Instance, claimed, snapshot, handlerCts.Token);
+                recordOutcome = async () =>
+                {
+                    await SettleAsync(
+                        claimed,
+                        """
+                        "State" = {0}, "CompletedAt" = {1}, "ClaimedAt" = NULL, "ClaimToken" = NULL, "LastError" = NULL
+                        """,
+                        [Succeeded, DateTimeOffset.UtcNow],
+                        CancellationToken.None
+                    );
+                    await ClearSettledPayloadAsync(claimed.RowDetailId);
+                };
+            }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -537,14 +561,12 @@ internal sealed class RetentionRowDispatcher(
                 "Cohort row handler for sweep {SweepId} exceeded RowHandlerDispatch:ClaimTimeout and was cancelled.",
                 claimed.SweepId
             );
-            await MarkFailureAsync(
+            recordOutcome = () => RecordFailureAsync(
                 claimed,
                 dispatch,
                 "Handler exceeded RowHandlerDispatch:ClaimTimeout and was cancelled.",
                 ct
             );
-            await ClearSettledPayloadAsync(claimed.RowDetailId);
-            return;
         }
         catch (Exception ex)
         {
@@ -555,35 +577,45 @@ internal sealed class RetentionRowDispatcher(
                 claimed.SweepId,
                 diagnostic.DiagnosticIdText
             );
-            await MarkFailureAsync(claimed, dispatch, diagnostic.ToString(), ct);
-            // No-op while a sibling handler (or this one's retry) is still unsettled.
-            await ClearSettledPayloadAsync(claimed.RowDetailId);
-            return;
+            recordOutcome = () => RecordFailureAsync(claimed, dispatch, diagnostic.ToString(), ct);
         }
 
-        // Outside the handler's try: failing to record a success must not be mistaken for the
-        // handler failing, nor abort the rest of the batch. The row stays in flight and its
-        // lease recovers it.
+        await RecordOutcomeAsync(claimed, recordOutcome);
+    }
+
+    /// <summary>
+    /// Writes a delivery's outcome. The delivery has already happened, so failing to record
+    /// it is neither the handler's failure nor a reason to abort the rest of the batch (and
+    /// cancel its siblings mid-delivery): the row stays in flight, attempt spent, and its
+    /// lease recovers it.
+    /// </summary>
+    private async Task RecordOutcomeAsync(ClaimedHandlerRow claimed, Func<Task> record)
+    {
         try
         {
-            await SettleAsync(
-                claimed,
-                """
-                "State" = {0}, "CompletedAt" = {1}, "ClaimedAt" = NULL, "ClaimToken" = NULL, "LastError" = NULL
-                """,
-                [Succeeded, DateTimeOffset.UtcNow],
-                CancellationToken.None
-            );
-            await ClearSettledPayloadAsync(claimed.RowDetailId);
+            await record();
         }
         catch (Exception ex)
         {
             logger.LogWarning(
                 ex,
-                "Cohort could not record the success of row handler status {StatusId}; its lease will recover it.",
-                claimed.StatusId
+                "Cohort could not record the outcome of row handler status {StatusId} attempt {Attempt}; its lease will recover it.",
+                claimed.StatusId,
+                claimed.Attempt
             );
         }
+    }
+
+    private async Task RecordFailureAsync(
+        ClaimedHandlerRow claimed,
+        RowHandlerDispatchOptions dispatch,
+        string lastError,
+        CancellationToken ct
+    )
+    {
+        await MarkFailureAsync(claimed, dispatch, lastError, ct);
+        // No-op while a sibling handler (or this one's retry) is still unsettled.
+        await ClearSettledPayloadAsync(claimed.RowDetailId);
     }
 
     private async Task MarkFailureAsync(

@@ -88,12 +88,12 @@ internal sealed class CohortSchemaValidator(
 
                 foreach (var indexRequirement in table.RequiredIndexes)
                 {
+                    // A required unique index must be exactly that constraint; a recommended one
+                    // only serves lookups, which any index on the same keys does.
                     if (indexes.Any(index => index.TableId == tableId
-                        && index.Unique == indexRequirement.Unique
-                        && (!index.Unique || index.Immediate)
-                        && !index.Primary
                         && index.Columns.SequenceEqual(indexRequirement.Columns)
-                        && index.Predicate == NormalizePredicate(indexRequirement.Predicate)))
+                        && index.Predicate == NormalizePredicate(indexRequirement.Predicate)
+                        && (!indexRequirement.Unique || index.Unique && index.Immediate && !index.Primary)))
                     {
                         continue;
                     }
@@ -285,9 +285,10 @@ internal sealed class CohortSchemaValidator(
         command.Transaction = transaction;
         command.CommandText = """
             SELECT i.indrelid, i.indisunique, i.indisprimary, i.indimmediate,
+                   -- An expression key (attnum 0) reads as NULL, so it still occupies its position.
                    ARRAY(SELECT a.attname
                           FROM pg_catalog.unnest(i.indkey) WITH ORDINALITY AS key(attnum, position)
-                           JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = key.attnum
+                           LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = key.attnum
                           WHERE key.position <= i.indnkeyatts
                           ORDER BY key.position),
                     pg_catalog.pg_get_expr(i.indpred, i.indrelid)
@@ -309,7 +310,7 @@ internal sealed class CohortSchemaValidator(
                 reader.GetBoolean(1),
                 reader.GetBoolean(2),
                 reader.GetBoolean(3),
-                reader.GetFieldValue<string[]>(4),
+                reader.GetFieldValue<string?[]>(4),
                 NormalizePredicate(reader.IsDBNull(5) ? null : reader.GetString(5))
             ));
         }
@@ -446,7 +447,7 @@ internal sealed class CohortSchemaValidator(
         bool Unique,
         bool Primary,
         bool Immediate,
-        string[] Columns,
+        string?[] Columns,
         string? Predicate
     );
     private sealed record CheckConstraintStructure(uint TableId, string Name, bool Validated);

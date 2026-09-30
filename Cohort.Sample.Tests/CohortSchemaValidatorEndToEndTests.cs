@@ -93,6 +93,48 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
         );
     }
 
+    [Fact]
+    public async Task Validation_Does_Not_Warn_When_A_Unique_Index_Serves_A_Recommended_One()
+    {
+        await ExecuteAsync("""
+            DROP INDEX "IX_retention_holds_RetentionEntityId_RecordId";
+            CREATE UNIQUE INDEX "IX_retention_holds_RetentionEntityId_RecordId" ON "retention_holds" ("RetentionEntityId", "RecordId");
+            """);
+        var logs = new RecordingLogProvider();
+        using var host = new CohortTestHost(
+            connectionString,
+            configureServices: services => services.AddSingleton<ILoggerProvider>(logs)
+        );
+
+        await host.RunWithServicesAsync(serviceProvider =>
+            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+        );
+
+        logs.Entries.Should().NotContain(entry => entry.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task Validation_Rejects_A_Unique_Index_Whose_Extra_Expression_Key_Weakens_It()
+    {
+        // The expression key has attnum 0; dropping it would read this index as exactly the
+        // stable-identity key, though it only enforces uniqueness together with lower("Category").
+        await ExecuteAsync("""
+            DROP INDEX "IX_sweep_run_row_detail_StableIdentity";
+            CREATE UNIQUE INDEX "IX_sweep_run_row_detail_StableIdentity" ON "sweep_run_row_detail"
+                ("SweepId", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId", lower("Category"));
+            """);
+        using var host = new CohortTestHost(connectionString);
+
+        var act = () => host.RunWithServicesAsync(serviceProvider =>
+            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+        );
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle(error => error.Contains(
+            "index capability 'sweep_run_row_detail(SweepId, RetentionEntityId, RecordId, Category, Strategy, TenantId)'"
+        ));
+    }
+
     [Theory]
     [InlineData(
         "ALTER TABLE \"sweep_run\" DROP CONSTRAINT \"CK_sweep_run_Status_Range\"; ALTER TABLE \"sweep_run\" ADD CONSTRAINT \"CK_sweep_run_Status_Range\" CHECK (\"Status\" BETWEEN 0 AND 4) NOT VALID",

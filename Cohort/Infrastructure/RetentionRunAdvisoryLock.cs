@@ -1,5 +1,7 @@
 using System.Buffers.Binary;
 using System.Data.Common;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace Cohort.Infrastructure;
 
@@ -11,6 +13,18 @@ internal static class RetentionRunAdvisoryLock
         Span<byte> bytes = stackalloc byte[16];
         sweepId.TryWriteBytes(bytes, bigEndian: true, out _);
         return BinaryPrimitives.ReadInt64BigEndian(bytes);
+    }
+
+    /// <summary>
+    /// The scheduled worker's key for one Cohort install. Advisory locks are per database, so
+    /// the key is derived from the install's schema-qualified <c>sweep_run</c> table: installs
+    /// in different schemas sweep independently, replicas of one install share the key.
+    /// </summary>
+    internal static long WorkerKeyFor(RelationalObjectName sweepRun)
+    {
+        Span<byte> hash = stackalloc byte[SHA256.HashSizeInBytes];
+        SHA256.HashData(Encoding.UTF8.GetBytes($"cohort-worker:{PostgreSqlIdentifier.Format(sweepRun)}"), hash);
+        return BinaryPrimitives.ReadInt64BigEndian(hash);
     }
 
     internal static Task AcquireAsync(DbConnection connection, long key, CancellationToken ct) =>

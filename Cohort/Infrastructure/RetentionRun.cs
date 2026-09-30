@@ -91,6 +91,7 @@ internal sealed class RetentionRun(
         finally
         {
             await OperationalConnectionCleanup.RunAsync(
+                connection,
                 locked ? cleanupToken => RetentionRunAdvisoryLock.ReleaseAsync(connection, RetentionRunAdvisoryLock.KeyFor(SweepId), cleanupToken) : null,
                 _ => db.Database.CloseConnectionAsync(),
                 primaryException,

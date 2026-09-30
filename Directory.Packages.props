@@ -5,6 +5,7 @@
         <PackageVersion Include="Microsoft.EntityFrameworkCore.Relational" Version="9.0.0" />
         <PackageVersion Include="Microsoft.EntityFrameworkCore.Design" Version="9.0.0" />
         <PackageVersion Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="9.0.2" />
+        <PackageVersion Include="Npgsql" Version="9.0.2" />
 
         <!-- Hosting -->
         <PackageVersion Include="Cronos" Version="0.11.1" />
@@ -26,7 +27,6 @@
         <PackageVersion Include="FluentAssertions" Version="7.0.0" />
         <PackageVersion Include="Testcontainers.PostgreSql" Version="4.1.0" />
         <PackageVersion Include="Respawn" Version="6.2.1" />
-        <PackageVersion Include="Npgsql" Version="9.0.2" />
         <PackageVersion Include="TngTech.ArchUnitNET.xUnit" Version="0.13.4" />
     </ItemGroup>
 </Project>

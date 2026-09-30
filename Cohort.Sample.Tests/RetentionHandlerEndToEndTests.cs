@@ -1362,6 +1362,89 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task FlushAsync_A_Failure_Recording_A_Handler_Outcome_Neither_Aborts_The_Batch_Nor_Spends_Sibling_Attempts()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var sink = new HandlerExecutionSink();
+        var gate = new DispatchBlockGate();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note { Id = Guid.NewGuid(), TenantId = tenantId, CreatedAt = asOf.AddDays(-120), Body = "fails" },
+                new Note { Id = Guid.NewGuid(), TenantId = tenantId, CreatedAt = asOf.AddDays(-120), Body = "blocks" }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxParallelism"] = "2",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(sink);
+                services.AddSingleton(gate);
+                services.AddRowHandler<Note, FailsWhileSiblingBlocksNoteHandler>();
+            }
+        );
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        // A transient database failure hits the write that records the handler's failure.
+        await ExecuteAsync("""
+            CREATE FUNCTION public.cohort_test_fail_recording() RETURNS trigger LANGUAGE plpgsql
+            AS $$ BEGIN RAISE EXCEPTION 'simulated transient failure'; END $$;
+            CREATE TRIGGER cohort_test_fail_recording
+            BEFORE UPDATE ON public.sweep_row_handler_status
+            FOR EACH ROW WHEN (NEW."State" = 0 AND NEW."LastError" IS NOT NULL)
+            EXECUTE FUNCTION public.cohort_test_fail_recording();
+            """);
+        try
+        {
+            var flushTask = handlerHost.RunWithServicesAsync(async serviceProvider =>
+                await serviceProvider.GetRequiredService<IRetentionRowDispatcher>().FlushAsync()
+            );
+            await gate.WaitUntilBlockedAsync().WaitAsync(TimeSpan.FromSeconds(5));
+            // Give the failing sibling time to finish and hit the recording failure.
+            await Task.WhenAny(flushTask, Task.Delay(TimeSpan.FromSeconds(1)));
+            gate.Release();
+            await flushTask.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        finally
+        {
+            await ExecuteAsync("""
+                DROP TRIGGER IF EXISTS cohort_test_fail_recording ON public.sweep_row_handler_status;
+                DROP FUNCTION IF EXISTS public.cohort_test_fail_recording();
+                """);
+        }
+
+        // The blocked sibling was not cancelled: it completed on its first attempt.
+        sink.AfterCalls.Should().Equal("after:blocks:1");
+        var statuses = await LoadHandlerStatusesAsync(result.SweepId);
+        statuses.Should().HaveCount(2);
+        statuses.Should().ContainSingle(status => status.State == SucceededState && status.Attempt == 1);
+        // The failed delivery stays claimed with its attempt spent; its lease recovers it.
+        statuses.Should().ContainSingle(status =>
+            status.State == InFlightState && status.Attempt == 1 && status.LastError == null
+        );
+    }
+
+    private async Task ExecuteAsync(string sql)
+    {
+        await using var connection = new NpgsqlConnection(GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        await command.ExecuteNonQueryAsync();
+    }
+
+    [Fact]
     public async Task FlushAsync_Rebuilds_Full_AfterContext_From_Persisted_Row_Detail_Using_A_Fresh_Scope_Per_Dispatch()
     {
         var tenantId = Guid.NewGuid();
@@ -2553,6 +2636,29 @@ file sealed class AlwaysFailingDispatchNoteHandler(DispatchAttemptTracker tracke
         tracker.Increment(ctx.RecordId);
         tracker.RecordFailure(ctx.RecordId, DateTimeOffset.UtcNow);
         throw new InvalidOperationException("Simulated permanent after-dispatch failure.");
+    }
+}
+
+file sealed class FailsWhileSiblingBlocksNoteHandler(HandlerExecutionSink sink, DispatchBlockGate gate)
+    : IRetentionHandler<Note>
+{
+    public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        ctx.Snapshot["body"] = row.Body;
+        return Task.CompletedTask;
+    }
+
+    public async Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
+    {
+        if ((string?)ctx.Snapshot["body"] == "blocks")
+        {
+            await gate.WaitForReleaseAsync(ct);
+            sink.AfterCalls.Add($"after:{ctx.Snapshot["body"]}:{ctx.Attempt}");
+            return;
+        }
+
+        await gate.WaitUntilBlockedAsync().WaitAsync(ct);
+        throw new InvalidOperationException("Simulated handler failure.");
     }
 }
 

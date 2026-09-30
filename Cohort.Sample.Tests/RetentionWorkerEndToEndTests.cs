@@ -3,6 +3,8 @@ using System.Threading.Channels;
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
+using Cohort.Infrastructure;
+using Cohort.Infrastructure.Migrations;
 using Cohort.Sample.Entities;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
@@ -116,7 +118,9 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
     [Fact]
     public async Task Worker_Skips_Occurrences_While_Another_Instance_Holds_The_Sweep_Lock()
     {
-        const long sweepAdvisoryLockKey = 0x636F_686F_7274_3031;
+        var sweepAdvisoryLockKey = RetentionRunAdvisoryLock.WorkerKeyFor(
+            new RelationalObjectName("public", "sweep_run")
+        );
         var skippedOccurrenceLog = new SkippedOccurrenceLogProvider();
         var tenant = CreateTenant();
         var settings = CreateSettings(
@@ -210,6 +214,95 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
     }
 
     [Fact]
+    public async Task A_Replica_That_Crashed_Mid_Occurrence_Does_Not_Keep_The_Occurrence_From_Other_Replicas()
+    {
+        var tenant = CreateTenant();
+        using var host = BuildHost(
+            CreateSettings(fixture.ConnectionString, schedule: "0 0 0 1 1 *", dryRun: false, killSwitch: false),
+            tenant,
+            services => services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>()
+        );
+        await SeedOldNoteAsync(tenant.Id, "crashed-replica");
+        var occurrence = DateTimeOffset.UtcNow.AddSeconds(-1);
+
+        // The replica that fired first died after committing Started: its worker lock went
+        // with its session, and nothing will ever settle the run.
+        await using (var connection = new NpgsqlConnection(fixture.ConnectionString))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                INSERT INTO "sweep_run" ("SweepId", "StartedAt", "Status", "TriggerKind", "DryRun", "TenantId")
+                VALUES (@sweepId, @startedAt, @started, @scheduled, FALSE, @tenantId)
+                """;
+            command.Parameters.AddWithValue("sweepId", Guid.NewGuid());
+            command.Parameters.AddWithValue("startedAt", occurrence.AddMilliseconds(10));
+            command.Parameters.AddWithValue("started", (int)SweepRunStatus.Started);
+            command.Parameters.AddWithValue("scheduled", (int)SweepTriggerKind.Scheduled);
+            command.Parameters.AddWithValue("tenantId", tenant.Id);
+            await command.ExecuteNonQueryAsync();
+        }
+
+        await GetWorker(host).RunIterationAsync(occurrence, dryRun: false, CancellationToken.None);
+
+        (await NoteExistsAsync("crashed-replica")).Should().BeFalse();
+        (await CountScheduledRunsAsync(tenant.Id)).Should().Be(2);
+    }
+
+    [Fact]
+    public async Task Installs_In_Different_Schemas_Of_One_Database_Sweep_Independently()
+    {
+        // Advisory locks are per database, not per schema: the public install's worker holding
+        // its lock must not stop a second install in another schema from sweeping.
+        var tenant = CreateTenant();
+        var blockingRules = new BlockingRuleProvider(new SampleRetentionRuleProvider());
+        using var publicInstall = BuildHost(
+            CreateSettings(fixture.ConnectionString, schedule: "0 0 0 1 1 *", dryRun: false, killSwitch: false),
+            tenant,
+            services => services.AddSingleton<IRetentionRuleProvider>(blockingRules)
+        );
+        await SeedOldNoteAsync(tenant.Id, "public-install");
+
+        await CreateSecondInstallAsync();
+        try
+        {
+            using var secondInstall = BuildSecondInstallHost();
+            await using (var scope = secondInstall.Host.Services.CreateAsyncScope())
+            {
+                var db = scope.ServiceProvider.GetRequiredService<SecondInstallDbContext>();
+                db.Add(new SecondInstallRecord { Id = Guid.NewGuid(), CreatedAt = DateTimeOffset.UtcNow.AddDays(-120) });
+                await db.SaveChangesAsync();
+            }
+
+            var occurrence = DateTimeOffset.UtcNow.AddSeconds(-1);
+            var publicIteration = GetWorker(publicInstall).RunIterationAsync(occurrence, dryRun: false, CancellationToken.None);
+            await blockingRules.Entered.WaitAsync(TimeSpan.FromSeconds(10));
+            try
+            {
+                await GetWorker(secondInstall).RunIterationAsync(occurrence, dryRun: false, CancellationToken.None);
+            }
+            finally
+            {
+                blockingRules.Release();
+                await publicIteration.WaitAsync(TimeSpan.FromSeconds(10));
+            }
+
+            await using var verifyScope = secondInstall.Host.Services.CreateAsyncScope();
+            var verify = verifyScope.ServiceProvider.GetRequiredService<SecondInstallDbContext>();
+            (await verify.Set<SecondInstallRecord>().CountAsync()).Should().Be(0);
+            (await NoteExistsAsync("public-install")).Should().BeFalse();
+        }
+        finally
+        {
+            await using var connection = new NpgsqlConnection(fixture.ConnectionString);
+            await connection.OpenAsync();
+            await using var drop = connection.CreateCommand();
+            drop.CommandText = $"DROP SCHEMA IF EXISTS \"{SecondInstallDbContext.Schema}\" CASCADE";
+            await drop.ExecuteNonQueryAsync();
+        }
+    }
+
+    [Fact]
     public async Task A_Dry_Run_Replica_Does_Not_Take_The_Occurrence_From_A_Real_Sweep()
     {
         // Mid rolling deploy one replica may still be configured to dry run.
@@ -299,6 +392,27 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         builder.Services.AddCohort<SampleDbContext>();
         configureServices(builder.Services);
 
+        return new WorkerTestHost(builder.Build(), builder.Configuration);
+    }
+
+    private async Task CreateSecondInstallAsync()
+    {
+        var options = new DbContextOptionsBuilder<SecondInstallDbContext>()
+            .UseNpgsql(fixture.ConnectionString)
+            .Options;
+        await using var db = new SecondInstallDbContext(options);
+        await db.Database.ExecuteSqlRawAsync(db.Database.GenerateCreateScript());
+    }
+
+    private WorkerTestHost BuildSecondInstallHost()
+    {
+        var builder = Host.CreateApplicationBuilder();
+        builder.Configuration.AddInMemoryCollection(
+            CreateSettings(fixture.ConnectionString, schedule: "0 0 0 1 1 *", dryRun: false, killSwitch: false)
+        );
+        builder.Services.AddDbContext<SecondInstallDbContext>(options => options.UseNpgsql(fixture.ConnectionString));
+        builder.Services.AddSingleton<IRetentionRuleProvider, SecondInstallRuleProvider>();
+        builder.Services.AddCohort<SecondInstallDbContext>();
         return new WorkerTestHost(builder.Build(), builder.Configuration);
     }
 
@@ -478,6 +592,55 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             RetentionResolutionContext context,
             CancellationToken ct
         ) => inner.ResolveAsync(context, ct);
+    }
+
+    private sealed class BlockingRuleProvider(IRetentionRuleProvider inner) : IRetentionRuleProvider
+    {
+        private readonly TaskCompletionSource entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource released = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task Entered => entered.Task;
+
+        public void Release() => released.TrySetResult();
+
+        public RetentionCategoryCapabilities? GetCapabilities(string category) => inner.GetCapabilities(category);
+
+        public async Task<RetentionRule?> ResolveAsync(RetentionResolutionContext context, CancellationToken ct)
+        {
+            entered.TrySetResult();
+            await released.Task.WaitAsync(ct);
+            return await inner.ResolveAsync(context, ct);
+        }
+    }
+
+    private sealed class SecondInstallDbContext(DbContextOptions<SecondInstallDbContext> options)
+        : DbContext(options)
+    {
+        public const string Schema = "second_install";
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<SecondInstallRecord>().ToTable("records", Schema);
+            modelBuilder.ConfigureCohortTables(Schema);
+        }
+    }
+
+    [Retain("second-install", nameof(CreatedAt))]
+    [RetentionEntityId("5d7f4b8e-2c61-4a0f-9e3b-7a1c8d2e6f40")]
+    [RetentionTenantless]
+    private sealed class SecondInstallRecord
+    {
+        public Guid Id { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
+    }
+
+    private sealed class SecondInstallRuleProvider : IRetentionRuleProvider
+    {
+        public RetentionCategoryCapabilities? GetCapabilities(string category) =>
+            category == "second-install" ? new RetentionCategoryCapabilities([Strategy.Purge]) : null;
+
+        public Task<RetentionRule?> ResolveAsync(RetentionResolutionContext context, CancellationToken ct) =>
+            Task.FromResult<RetentionRule?>(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge));
     }
 
     private sealed class StaticTenantSource(params TenantContext[] tenants) : IRetentionTenantSource

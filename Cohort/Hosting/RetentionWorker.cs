@@ -19,11 +19,6 @@ internal sealed class RetentionWorker(
     private static readonly TimeSpan IdlePollInterval = TimeSpan.FromMilliseconds(200);
 
 
-    // Session-level Postgres advisory lock key ("cohort01" in hex). Two replicas firing
-    // at the same cron instant must not both sweep: double mutations are mostly benign,
-    // but doubled audit runs and doubled handler side effects are not.
-    private const long SweepAdvisoryLockKey = 0x636F_686F_7274_3031;
-
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         // A retention worker must outlive individual failures: a transient database
@@ -162,13 +157,16 @@ internal sealed class RetentionWorker(
         // The advisory lock is session-scoped, so the connection must stay open for the
         // whole iteration; the sweep itself reuses the already-open scoped connection.
         await db.Database.OpenConnectionAsync(ct);
+        // Two replicas firing at the same cron instant must not both sweep: double mutations
+        // are mostly benign, but doubled audit runs and doubled handler side effects are not.
+        var workerLockKey = RetentionRunAdvisoryLock.WorkerKeyFor(CohortStoreTables.FromModel(db.Model).SweepRun);
         var lockAcquired = false;
         Exception? primaryException = null;
         try
         {
             lockAcquired = await RetentionRunAdvisoryLock.TryAcquireAsync(
                 db.Database.GetDbConnection(),
-                SweepAdvisoryLockKey,
+                workerLockKey,
                 ct
             );
             if (!lockAcquired)
@@ -200,11 +198,12 @@ internal sealed class RetentionWorker(
         finally
         {
             await OperationalConnectionCleanup.RunAsync(
+                db.Database.GetDbConnection(),
                 lockAcquired
                     ? cleanupToken =>
                         RetentionRunAdvisoryLock.ReleaseAsync(
                             db.Database.GetDbConnection(),
-                            SweepAdvisoryLockKey,
+                            workerLockKey,
                             cleanupToken
                         )
                     : null,
@@ -223,13 +222,18 @@ internal sealed class RetentionWorker(
     )
     {
         // Only a run of the same kind claims the occurrence: a replica still configured to
-        // dry run must not stand in for the real sweep.
+        // dry run must not stand in for the real sweep. And only a finished iteration claims
+        // it: the worker writes its runs under the worker lock, which this worker now holds,
+        // so a run still Started lost its owner mid-occurrence (the lock went with its
+        // session) and a Cancelled one was interrupted. Either way the occurrence runs again.
         var sweepRun = PostgreSqlIdentifier.Format(CohortStoreTables.FromModel(db.Model).SweepRun);
         await using var command = new SqlParams
         {
             ["scheduled"] = (int)SweepTriggerKind.Scheduled,
             ["occurrence"] = occurrence,
             ["dryRun"] = dryRun,
+            ["started"] = (int)SweepRunStatus.Started,
+            ["cancelled"] = (int)SweepRunStatus.Cancelled,
         }.CreateCommand(
             db.Database.GetDbConnection(),
             null,
@@ -237,6 +241,10 @@ internal sealed class RetentionWorker(
             SELECT EXISTS (
                 SELECT 1 FROM {sweepRun}
                 WHERE "TriggerKind" = @scheduled AND "DryRun" = @dryRun AND "StartedAt" >= @occurrence
+            ) AND NOT EXISTS (
+                SELECT 1 FROM {sweepRun}
+                WHERE "TriggerKind" = @scheduled AND "DryRun" = @dryRun AND "StartedAt" >= @occurrence
+                  AND "Status" IN (@started, @cancelled)
             )
             """
         );

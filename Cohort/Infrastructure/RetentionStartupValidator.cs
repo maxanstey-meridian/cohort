@@ -402,7 +402,7 @@ internal sealed partial class RetentionStartupValidator(
         }
 
         var storeType = TryGetStoreType(recordIdProperty);
-        if (storeType is not null && SessionDependentTextStoreTypes.Contains(NormalizeStoreType(storeType)))
+        if (storeType is not null && HasSessionDependentText(storeType))
         {
             errors.Add(
                 $"Record-id convention on {entry.EntityType.FullName}: record-id property '{entry.RecordId.RecordIdMember}' is mapped to '{storeType}'. Cohort stores record ids as the column's PostgreSQL text form, which for this type depends on session settings (TimeZone, DateStyle, IntervalStyle, extra_float_digits), so holds and audit rows could silently stop matching. Use a uuid, integer, numeric, or text record id, or mark a stable unique column with [RetentionRecordId]."
@@ -705,6 +705,13 @@ internal sealed partial class RetentionStartupValidator(
             return null;
         }
     }
+
+    /// <summary>
+    /// Whether CAST(value AS text) for this PostgreSQL type follows session settings. Knows type
+    /// names only; readiness resolves the column's catalog type through domains, arrays and ranges.
+    /// </summary>
+    internal static bool HasSessionDependentText(string storeType) =>
+        SessionDependentTextStoreTypes.Contains(NormalizeStoreType(storeType));
 
     // Folds PostgreSQL aliases and precision modifiers onto one spelling, so that
     // "timestamptz" and "timestamp(3) with time zone" both read as "timestamp with time zone".

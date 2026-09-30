@@ -114,7 +114,8 @@ After adding `ConfigureCohortTables()`, generate a host-owned EF Core migration 
 five Cohort tables and apply it before startup or any direct Cohort operation. Cohort validates
 the installed schema but never creates or upgrades it at runtime. Readiness requires the
 columns, keys, unique indexes (not deferrable) and named CHECK constraints Cohort relies on; a
-missing performance-only index is logged as a warning.
+missing performance-only index is logged as a warning (any index on the same key columns
+serves, unique or not).
 
 What happens:
 
@@ -420,7 +421,9 @@ The execution contract:
   row's next handler may start before it finishes. Work left `InFlight` by a crash is
   reclaimed once the timeout elapses, and the reclaim counts as an attempt. A delivery whose
   claim was reclaimed cannot settle the row; its outcome is discarded and the newer delivery
-  settles it.
+  settles it. If recording a delivery's outcome fails (a transient database error), the
+  delivery is not treated as a handler failure and the rest of the batch carries on; the
+  row stays `InFlight` with that attempt spent until its claim times out and is reclaimed.
 - `AfterSweepSettled` work runs only once its run records completion or failure. A run
   left `Started` by a process crash is marked failed after
   `RowHandlerDispatch:SweepSettleTimeout`, allowing that work to dispatch.
@@ -487,10 +490,16 @@ Worker semantics worth knowing:
 - Tenant passes execute sequentially in first-seen order. Duplicate tenant IDs execute once;
   if duplicate entries disagree on jurisdiction or tags, Cohort logs a warning and uses the
   first context.
-- Each occurrence runs once. Replicas coordinate through a Postgres advisory lock, and under it
-  a worker skips an occurrence that already has a `Scheduled` run of the same kind (dry or real)
-  started at or after it, so a dry-run replica never stands in for the real sweep. (This
-  compares with other replicas' clocks, so keep replica clocks in sync.)
+- Each occurrence runs once. Replicas of one install coordinate through a Postgres advisory
+  lock keyed on the install's schema-qualified `sweep_run` table, so installs in different
+  schemas of one database sweep independently. Under the lock a worker skips an occurrence
+  that already has a `Scheduled` run of the same kind (dry or real) started at or after it,
+  so a dry-run replica never stands in for the real sweep, unless one of those runs was
+  interrupted: a run still `Started` lost its owner (the lock went with its session) and a
+  `Cancelled` run was stopped, so the occurrence is swept again, including the passes that
+  had finished. A run that settled `Failed` or `PartiallyFailed` still claims it; its failures
+  are retried at the next occurrence. (Occurrence times are compared with other replicas'
+  clocks, so keep replica clocks in sync.)
 - Missed occurrences are skipped, not caught up: the next occurrence is always computed
   from the current time.
 - Sweeps triggered by the worker are audited as `Scheduled`; direct calls to
@@ -511,6 +520,8 @@ Worker semantics worth knowing:
 Record-id types whose text form depends on session settings (`timestamp`/`timestamptz`,
 `date`, `time`, `interval`, `real`/`double precision`, `money`, `bytea`) are rejected at
 startup: their canonical text could change between sessions and silently detach holds.
+Readiness checks the record-id column's actual catalog type, so domains, arrays and ranges
+built on those types are rejected too.
 
 ## Execution model
 
@@ -566,7 +577,7 @@ public static class ReadmeLegalHolds
 }
 ```
 
-Held records survive all strategies. Holds are checked in SQL via a `NOT EXISTS` subquery, not via an in-memory row pass. Hold activity is evaluated against the **database wall clock**, not the sweep's logical `now`: a hold created yesterday protects its row even from a backdated sweep. A hold is active from the moment it commits: its stored `CreatedAt` is the earlier of the requested value and the database clock, so an application clock running ahead cannot open a window where a created hold does not yet protect.
+Held records survive all strategies. Holds are checked in SQL via a `NOT EXISTS` subquery, not via an in-memory row pass. When Cohort's mutations (sweeps, erasure and `IRetentionDeletion`) decide whether a hold protects a row, they evaluate `CreatedAt`, `ExpiresAt` and `RemovedAt` against the **database wall clock** (`statement_timestamp()`), not the operation's logical `now`: a hold created yesterday protects its row even from a backdated sweep. A hold protects from the moment it commits: its stored `CreatedAt` is the earlier of the requested value and the database clock, so an application clock running ahead cannot open a window where a created hold does not yet protect. `ExpiresAt` and `RemovedAt` are stored as given, so a hold stops protecting once the database clock passes them. `ListActiveAsync` and `HasActiveHoldAsync` are reporting queries and evaluate the same columns against the `asOf` you pass.
 
 `CreateAsync` validates its input so a hold cannot silently protect nothing:
 

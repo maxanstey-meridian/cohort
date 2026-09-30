@@ -691,6 +691,53 @@ await using var verifyScope = services.CreateAsyncScope();
     }
 
     [Fact]
+    public async Task An_Anonymise_Literal_Longer_Than_Its_Column_Fails_The_Entity_Instead_Of_Being_Truncated()
+    {
+        // The literal is bound without the column's length modifier, so PostgreSQL rejects it
+        // rather than silently cutting it to fit varchar(8).
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        await using var services = BuildPredicateResolutionServiceProvider<BoundedAnonymiseDbContext>(
+            database.ConnectionString,
+            new StaticCategoryRepository(
+                new Dictionary<string, ITestRetentionRule>
+                {
+                    ["bounded-anonymise"] = new StaticTestRetentionRule(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    ),
+                }
+            )
+        );
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<BoundedAnonymiseDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.Add(new BoundedAnonymiseRecord { Id = Guid.NewGuid(), TenantId = tenantId, SubjectId = subjectId, Email = "a@b.c", CreatedAt = asOf });
+            await db.SaveChangesAsync();
+        }
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var result = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().EraseAsync(
+                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                new ErasureScope(subjectId),
+                asOf
+            );
+            // 22001: string_data_right_truncation, "value too long for type character varying(8)".
+            result.EntityFailures.Should().ContainSingle().Which.Should().Contain("code=sqlstate:22001");
+        }
+
+        await using var verifyScope = services.CreateAsyncScope();
+        var verify = verifyScope.ServiceProvider.GetRequiredService<BoundedAnonymiseDbContext>();
+        var record = await verify.Set<BoundedAnonymiseRecord>().SingleAsync();
+        record.Email.Should().Be("a@b.c");
+        record.AnonymisedAt.Should().BeNull();
+    }
+
+    [Fact]
     public async Task Erasure_Validates_Each_Ef_Model_A_Host_Switches_Between()
     {
         // Hosts using IModelCacheKeyFactory get different IModel instances per scope. Metadata
@@ -2462,6 +2509,37 @@ internal sealed class BoundedSubjectRecord
     public string? Email { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; }
+}
+
+internal sealed class BoundedAnonymiseDbContext(DbContextOptions<BoundedAnonymiseDbContext> options)
+    : DbContext(options)
+{
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<BoundedAnonymiseRecord>(builder =>
+        {
+            builder.ToTable("bounded_anonymise_records");
+            builder.Property(record => record.Email).HasMaxLength(8);
+        });
+        modelBuilder.ConfigureCohortTables();
+    }
+}
+
+[Retain("bounded-anonymise", nameof(CreatedAt))]
+[RetentionEntityId("00000000-0000-0000-0001-0000000000b2")]
+internal sealed class BoundedAnonymiseRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+
+    [ErasureSubject]
+    public Guid SubjectId { get; set; }
+
+    [Anonymise(AnonymiseMethod.FixedLiteral, "anonymised@example.invalid")]
+    public string Email { get; set; } = "";
+
+    public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset? AnonymisedAt { get; set; }
 }
 
 internal sealed class SinglePredicateResolutionDbContext(

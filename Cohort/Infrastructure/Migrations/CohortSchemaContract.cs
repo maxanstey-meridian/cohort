@@ -46,6 +46,8 @@ internal static class CohortSchemaContract
                 Column<string?>("Error", "text", nullable: true),
             ],
             ["SweepId"],
+            // The worker's once-per-occurrence lookup.
+            [new(["TriggerKind", "StartedAt"])],
             Checks:
             [
                 new(

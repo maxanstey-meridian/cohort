@@ -1,6 +1,7 @@
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
+using Cohort.Infrastructure.Migrations;
 using Cohort.Sample.Entities;
 using Microsoft.Extensions.Configuration;
 using Microsoft.EntityFrameworkCore;
@@ -115,6 +116,52 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         await using var count = connection.CreateCommand();
         count.CommandText = "SELECT COUNT(*) FROM public.sweep_run";
         ((long)(await count.ExecuteScalarAsync())!).Should().Be(2);
+    }
+
+    [Theory]
+    [InlineData("CREATE DOMAIN session_instant AS timestamptz", "session_instant")]
+    [InlineData("CREATE DOMAIN session_ids AS timestamptz[]", "session_ids")]
+    [InlineData("", "tstzrange")]
+    [InlineData("", "double precision[]")]
+    public async Task Readiness_rejects_a_record_id_column_whose_text_form_depends_on_session_settings(
+        string typeDefinition,
+        string columnType
+    )
+    {
+        // The EF model says text; only the catalog knows the column is a domain, array or range
+        // over a type whose text form follows TimeZone, DateStyle or extra_float_digits.
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        var options = new DbContextOptionsBuilder<SessionKeyDbContext>()
+            .UseNpgsql(database.ConnectionString)
+            .Options;
+        await using (var db = new SessionKeyDbContext(options))
+        {
+            await db.Database.ExecuteSqlRawAsync(db.Database.GenerateCreateScript());
+            if (typeDefinition != "")
+            {
+                await db.Database.ExecuteSqlRawAsync(typeDefinition);
+            }
+            var alter = $"ALTER TABLE public.session_key_records ALTER COLUMN \"Id\" TYPE {columnType} USING NULL";
+            await db.Database.ExecuteSqlRawAsync(alter);
+        }
+
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
+        services.AddDbContext<SessionKeyDbContext>(builder => builder.UseNpgsql(database.ConnectionString));
+        services.AddSingleton<IRetentionRuleProvider>(new SessionKeyRuleProvider());
+        services.AddCohort<SessionKeyDbContext>();
+        await using var provider = services.BuildServiceProvider(validateScopes: true);
+
+        var act = () => provider.GetRequiredService<IRetentionSweep>().ExecuteAsync(
+            RetentionSweepRequest.Tenantless(DateTimeOffset.UtcNow)
+        );
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle(error =>
+            error.Contains("record-id column", StringComparison.Ordinal)
+            && error.Contains("depends on session settings", StringComparison.Ordinal)
+        );
     }
 
     [Fact]
@@ -255,6 +302,34 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     private sealed class DatabaseRoute(string connectionString)
     {
         public string ConnectionString { get; set; } = connectionString;
+    }
+
+    private sealed class SessionKeyDbContext(DbContextOptions<SessionKeyDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<SessionKeyRecord>().ToTable("session_key_records");
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    [Retain("session-key", nameof(CreatedAt))]
+    [RetentionEntityId("0c8e5a4f-6b1d-4e27-9a3c-5f2d7e8b1a96")]
+    [RetentionTenantless]
+    private sealed class SessionKeyRecord
+    {
+        public string Id { get; set; } = "";
+        public DateTimeOffset CreatedAt { get; set; }
+    }
+
+    private sealed class SessionKeyRuleProvider : IRetentionRuleProvider
+    {
+        public RetentionCategoryCapabilities? GetCapabilities(string category) =>
+            category == "session-key" ? new RetentionCategoryCapabilities([Strategy.Purge]) : null;
+
+        public Task<RetentionRule?> ResolveAsync(RetentionResolutionContext context, CancellationToken ct) =>
+            Task.FromResult<RetentionRule?>(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge));
     }
 
     private sealed class UnsupportedProviderDbContext(

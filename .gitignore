@@ -49,3 +49,8 @@ secrets.json
 ## Other
 .orch/
 .plans/
+
+## Docs
+docs/node_modules/
+docs/.vitepress/dist/
+docs/.vitepress/cache/

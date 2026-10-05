@@ -20,9 +20,9 @@ public static class ServiceCollectionExtensions
     {
         ArgumentNullException.ThrowIfNull(services);
 
-        // Idempotency guard: most registrations below are TryAdd*, but the dispatcher's
-        // IHostedService registration cannot be (factory descriptors do not dedupe), and
-        // a second registration would start two polling loops on the same dispatcher.
+        // Idempotency guard: most registrations below are TryAdd*, but the dispatcher's and
+        // the history pruner's IHostedService registrations cannot be (factory descriptors
+        // do not dedupe), and a second registration would start two loops on one instance.
         var existingRegistration = services
             .Where(descriptor => descriptor.ServiceType == typeof(CohortRegistrationMarker))
             .Select(descriptor => descriptor.ImplementationInstance)
@@ -101,6 +101,10 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<RetentionRowDispatcher>()
         );
         services.TryAddEnumerable(ServiceDescriptor.Singleton<IHostedService, RetentionWorker>());
+        services.TryAddSingleton<RetentionHistoryPruner>();
+        services.AddSingleton<IHostedService>(sp =>
+            sp.GetRequiredService<RetentionHistoryPruner>()
+        );
 
         return services;
     }

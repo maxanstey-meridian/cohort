@@ -79,6 +79,8 @@ internal sealed class CohortOptionsValidator : IValidateOptions<CohortOptions>
             );
         }
 
+        ValidateHistoryPruning(options.HistoryPruning, errors);
+
         var dispatch = options.RowHandlerDispatch;
         if (dispatch is null)
         {
@@ -138,6 +140,30 @@ internal sealed class CohortOptionsValidator : IValidateOptions<CohortOptions>
         return errors.Count == 0
             ? ValidateOptionsResult.Success
             : ValidateOptionsResult.Fail(errors);
+    }
+
+    private static void ValidateHistoryPruning(
+        HistoryPruningOptions? pruning,
+        ICollection<string> errors
+    )
+    {
+        if (pruning is null)
+        {
+            errors.Add("Cohort HistoryPruning cannot be null.");
+            return;
+        }
+
+        ValidateRetention(pruning.SucceededRunRetention, nameof(pruning.SucceededRunRetention), errors);
+        ValidateRetention(pruning.FailedRunRetention, nameof(pruning.FailedRunRetention), errors);
+        ValidateRetention(pruning.InactiveHoldRetention, nameof(pruning.InactiveHoldRetention), errors);
+    }
+
+    private static void ValidateRetention(TimeSpan? retention, string name, ICollection<string> errors)
+    {
+        if (retention is not null && retention < HistoryPruningOptions.MinimumRetention)
+        {
+            errors.Add($"Cohort HistoryPruning {name} must be at least 1 day when set.");
+        }
     }
 
     private static void ValidateConventionName(

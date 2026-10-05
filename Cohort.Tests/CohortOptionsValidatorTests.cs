@@ -111,4 +111,51 @@ public sealed class CohortOptionsValidatorTests
             .Succeeded.Should()
             .BeTrue();
     }
+
+    [Theory]
+    [InlineData("SucceededRunRetention")]
+    [InlineData("FailedRunRetention")]
+    [InlineData("InactiveHoldRetention")]
+    public void Validate_Rejects_Nonsensical_History_Pruning_Options(string option)
+    {
+        var pruning = option switch
+        {
+            "SucceededRunRetention" => new HistoryPruningOptions { SucceededRunRetention = TimeSpan.FromHours(23) },
+            "FailedRunRetention" => new HistoryPruningOptions { FailedRunRetention = TimeSpan.Zero },
+            "InactiveHoldRetention" => new HistoryPruningOptions { InactiveHoldRetention = TimeSpan.FromDays(-90) },
+            _ => throw new ArgumentOutOfRangeException(nameof(option)),
+        };
+
+        var result = new CohortOptionsValidator().Validate(
+            null,
+            new CohortOptions { HistoryPruning = pruning }
+        );
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().ContainSingle(message => message.Contains($"HistoryPruning {option}"));
+    }
+
+    [Fact]
+    public void Validate_Accepts_Unset_And_Minimum_History_Pruning_Retentions()
+    {
+        new CohortOptionsValidator()
+            .Validate(null, new CohortOptions())
+            .Succeeded.Should()
+            .BeTrue();
+        new CohortOptionsValidator()
+            .Validate(
+                null,
+                new CohortOptions
+                {
+                    HistoryPruning = new HistoryPruningOptions
+                    {
+                        SucceededRunRetention = TimeSpan.FromDays(1),
+                        FailedRunRetention = TimeSpan.FromDays(1),
+                        InactiveHoldRetention = TimeSpan.FromDays(1),
+                    },
+                }
+            )
+            .Succeeded.Should()
+            .BeTrue();
+    }
 }

@@ -397,6 +397,8 @@ Cohort.Hosting.CohortOptions.Conventions.get -> Cohort.Domain.CohortConventions!
 Cohort.Hosting.CohortOptions.Conventions.init -> void
 Cohort.Hosting.CohortOptions.DryRun.get -> bool
 Cohort.Hosting.CohortOptions.DryRun.init -> void
+Cohort.Hosting.CohortOptions.HistoryPruning.get -> Cohort.Hosting.HistoryPruningOptions!
+Cohort.Hosting.CohortOptions.HistoryPruning.init -> void
 Cohort.Hosting.CohortOptions.KillSwitch.get -> bool
 Cohort.Hosting.CohortOptions.KillSwitch.init -> void
 Cohort.Hosting.CohortOptions.RowHandlerDispatch.get -> Cohort.Hosting.RowHandlerDispatchOptions!
@@ -405,6 +407,14 @@ Cohort.Hosting.CohortOptions.Schedule.get -> string?
 Cohort.Hosting.CohortOptions.Schedule.init -> void
 Cohort.Hosting.CohortOptions.SweepBatchSize.get -> int
 Cohort.Hosting.CohortOptions.SweepBatchSize.init -> void
+Cohort.Hosting.HistoryPruningOptions
+Cohort.Hosting.HistoryPruningOptions.FailedRunRetention.get -> System.TimeSpan?
+Cohort.Hosting.HistoryPruningOptions.FailedRunRetention.init -> void
+Cohort.Hosting.HistoryPruningOptions.HistoryPruningOptions() -> void
+Cohort.Hosting.HistoryPruningOptions.InactiveHoldRetention.get -> System.TimeSpan?
+Cohort.Hosting.HistoryPruningOptions.InactiveHoldRetention.init -> void
+Cohort.Hosting.HistoryPruningOptions.SucceededRunRetention.get -> System.TimeSpan?
+Cohort.Hosting.HistoryPruningOptions.SucceededRunRetention.init -> void
 Cohort.Hosting.RowHandlerDispatchOptions
 Cohort.Hosting.RowHandlerDispatchOptions.BaseBackoff.get -> System.TimeSpan
 Cohort.Hosting.RowHandlerDispatchOptions.BaseBackoff.init -> void

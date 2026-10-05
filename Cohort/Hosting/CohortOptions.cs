@@ -27,5 +27,11 @@ public sealed class CohortOptions
 
     public RowHandlerDispatchOptions RowHandlerDispatch { get; init; } = new();
 
+    /// <summary>
+    /// Opt-in pruning of settled run history and inactive holds. Nothing is pruned unless
+    /// a retention is configured.
+    /// </summary>
+    public HistoryPruningOptions HistoryPruning { get; init; } = new();
+
     public CohortConventions Conventions { get; init; } = new();
 }

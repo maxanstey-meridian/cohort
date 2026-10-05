@@ -466,7 +466,7 @@ The execution contract:
 |---|---|---|
 | `Schedule` | `null` | Cron expression, evaluated in **UTC**. `null` means the worker is disabled. |
 | `DryRun` | `false` | Run **scheduled** sweeps as count-only audited runs instead of mutating data, with the same run and entity audit trail and `sweep_run.DryRun` set. Only the worker reads it: explicit requests carry their own flag (`RetentionSweepRequest.Tenanted(..., dryRun: true)`, `new ErasureScope(..., dryRun: true)`) and are honoured as written. |
-| `KillSwitch` | `false` | Stop between tenant passes: the tenant in progress finishes, the remaining tenants and future ticks are skipped. |
+| `KillSwitch` | `false` | Stop between tenant passes: the tenant in progress finishes, the remaining tenants and future ticks are skipped. It also stops [history pruning](#history-pruning) after the batch in progress. |
 | `SweepBatchSize` | `5000` | Maximum rows selected, locked, and mutated per transaction. Each batch commits independently. |
 | `AuditObservers:Timeout` | `00:00:05` | Maximum time Cohort waits for each observer to handle one committed event. Each observer has an independent timeout. |
 | `RowHandlerDispatch:PollInterval` | `00:00:10` | Delay between dispatcher polling passes. |
@@ -477,6 +477,9 @@ The execution contract:
 | `RowHandlerDispatch:ClaimTimeout` | `00:05:00` | Lease on one delivery. The handler is cancelled at nine tenths of it, and in-flight work abandoned by a crash is reclaimed after it. Valid range: 30 seconds to 1 day. |
 | `RowHandlerDispatch:SweepSettleTimeout` | `01:00:00` | Age after which an unowned `Started` run is recovered as failed. |
 | `RowHandlerDispatch:PayloadRetention` | `30.00:00:00` | Backstop retention for potentially sensitive captured row snapshots. |
+| `HistoryPruning:SucceededRunRetention` | `null` | How long a succeeded run whose handler work all succeeded is kept after it settled. `null` keeps it forever. See [History pruning](#history-pruning). |
+| `HistoryPruning:FailedRunRetention` | `null` | How long a `Failed`, `PartiallyFailed` or `Cancelled` run, or a succeeded run with dead-lettered handler work, is kept after it settled. `null` keeps it forever. |
+| `HistoryPruning:InactiveHoldRetention` | `null` | How long a removed or expired hold is kept after it stopped protecting. `null` keeps it forever. |
 
 Worker semantics worth knowing:
 
@@ -648,6 +651,44 @@ exports accordingly.
 Observer delivery is best effort and has no durable outbox. A process crash can lose a
 notification after the database commit. Guaranteed integrations must poll the authoritative
 tables, use CDC, or implement a durable host-owned outbox.
+
+## History pruning
+
+Cohort's ledger and hold tables grow forever unless you opt in to pruning. Each retention is
+independent and `null` (keep forever) by default; set the ones you want, each at least one day:
+
+```json
+{
+  "Cohort": {
+    "HistoryPruning": {
+      "SucceededRunRetention": "90.00:00:00",
+      "FailedRunRetention": "90.00:00:00",
+      "InactiveHoldRetention": "90.00:00:00"
+    }
+  }
+}
+```
+
+A hosted pruner runs a pass when the host starts and then every hour:
+
+- A **settled run** is deleted together with its `sweep_run_entity_summary`,
+  `sweep_run_row_detail` and `sweep_row_handler_status` rows once `SettledAt` is older than its
+  retention. A run that settled `Succeeded` with every handler delivery succeeded uses
+  `SucceededRunRetention`. A run that settled `Failed`, `PartiallyFailed` or `Cancelled`, or a
+  succeeded run with dead-lettered handler work, uses `FailedRunRetention`, so failure evidence
+  can be kept longer (or shorter) than routine history.
+- A run is **never** deleted while any of its handler work is `Pending` or `InFlight`, however
+  old it is, and a run still `Started` is never deleted (the dispatcher recovers abandoned runs
+  as failed first).
+- A **hold** is deleted once the earlier of its `RemovedAt` and `ExpiresAt` is older than
+  `InactiveHoldRetention`. Active holds, including holds without an expiry, are never deleted.
+  `ListActiveAsync` and `HasActiveHoldAsync` with an `asOf` older than `InactiveHoldRetention`
+  can therefore answer "not held" for a hold that has since been pruned.
+
+Each batch of up to 100 runs (or holds) commits on its own, claimed with
+`FOR UPDATE SKIP LOCKED` so replicas prune disjoint batches. A failed pass is logged and
+retried an hour later. `KillSwitch` stops pruning after the batch in progress; pruning is
+otherwise independent of `Schedule` and `DryRun`, and needs no schema change.
 
 ## Failure diagnostics
 

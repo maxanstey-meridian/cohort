@@ -52,6 +52,22 @@ public sealed class DomainInvariantTests
         scope.Should().Throw<ArgumentException>().WithParameterName("kind");
     }
 
+    [Fact]
+    public void A_Sweep_Request_Cannot_Be_An_Erasure()
+    {
+        var tenanted = () =>
+            RetentionSweepRequest.Tenanted(
+                new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
+                DateTimeOffset.UnixEpoch,
+                SweepTriggerKind.Erasure
+            );
+        var tenantless = () =>
+            RetentionSweepRequest.Tenantless(DateTimeOffset.UnixEpoch, SweepTriggerKind.Erasure);
+
+        tenanted.Should().Throw<ArgumentException>().WithParameterName("trigger");
+        tenantless.Should().Throw<ArgumentException>().WithParameterName("trigger");
+    }
+
     [Theory]
     [InlineData(SweepTriggerKind.Erasure, null)]
     [InlineData(SweepTriggerKind.Erasure, " ")]

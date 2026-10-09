@@ -38,7 +38,14 @@ public abstract record RetentionSweepRequest
     {
         // Npgsql only writes UTC DateTimeOffsets to timestamptz.
         At = at.ToUniversalTime();
-        Trigger = trigger;
+        // An erasure run names the kind of subject it erased, which a sweep has none of.
+        Trigger =
+            trigger == SweepTriggerKind.Erasure
+                ? throw new ArgumentException(
+                    "A sweep can't be an erasure run; erase a subject through IRetentionErasureService.",
+                    nameof(trigger)
+                )
+                : trigger;
         DryRun = dryRun;
     }
 

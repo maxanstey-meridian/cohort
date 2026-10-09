@@ -67,6 +67,7 @@ internal sealed partial class RetentionStartupValidator(
             }
 
         ModelValidation.ErasureSubjects.Clear();
+        ModelValidation.ErasureSubjectKinds.Clear();
         var validatedCapabilities = new Dictionary<string, RetentionCategoryCapabilities>(
             StringComparer.Ordinal
         );
@@ -233,6 +234,8 @@ internal sealed partial class RetentionStartupValidator(
             }
         }
 
+        ValidateErasureSubjectKinds(errors);
+
         try
         {
             RetentionExecutionPlanOrderer.Order(db, retainedEntries, entry => entry);
@@ -257,6 +260,37 @@ internal sealed partial class RetentionStartupValidator(
         finally
         {
             ModelValidation.Gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// A kind names one sort of subject, so every column of that kind, across the model,
+    /// must hold the same CLR type; an erasure's subject is checked against it.
+    /// </summary>
+    private void ValidateErasureSubjectKinds(List<string> errors)
+    {
+        var membersByKind = ModelValidation
+            .ErasureSubjects.Values.SelectMany(metadata => metadata)
+            .GroupBy(metadata => metadata.Kind, StringComparer.Ordinal)
+            .OrderBy(group => group.Key, StringComparer.Ordinal);
+        foreach (var kind in membersByKind)
+        {
+            var members = kind
+                .SelectMany(metadata => metadata.Members.Select(member => (metadata.EntityType, Member: member)))
+                .ToArray();
+            var subjectTypes = members.Select(pair => pair.Member.SubjectType).Distinct().ToArray();
+            if (subjectTypes.Length == 1)
+            {
+                ModelValidation.ErasureSubjectKinds.Add(kind.Key, subjectTypes[0]);
+                continue;
+            }
+
+            var found = members
+                .Select(pair => $"{pair.EntityType.FullName}.{pair.Member.Name}:{pair.Member.SubjectType.Name}")
+                .Order(StringComparer.Ordinal);
+            errors.Add(
+                $"[ErasureSubject(\"{kind.Key}\")] columns must all hold one CLR type (after nullable unwrapping), but they hold {string.Join(", ", subjectTypes.Select(type => type.Name).Order(StringComparer.Ordinal))}: {string.Join(", ", found)}. Give each sort of subject its own kind."
+            );
         }
     }
 
@@ -843,7 +877,11 @@ internal sealed class RetentionModelValidation
 {
     internal SemaphoreSlim Gate { get; } = new(1, 1);
 
-    internal Dictionary<Type, ErasureSubjectMetadata?> ErasureSubjects { get; } = [];
+    /// <summary>Each retained entity's erasure subject columns, one entry per kind.</summary>
+    internal Dictionary<Type, IReadOnlyList<ErasureSubjectMetadata>> ErasureSubjects { get; } = [];
+
+    /// <summary>The CLR type every column of each declared erasure subject kind holds.</summary>
+    internal Dictionary<string, Type> ErasureSubjectKinds { get; } = new(StringComparer.Ordinal);
 
     internal Dictionary<string, RetentionCategoryCapabilities> Capabilities { get; } =
         new(StringComparer.Ordinal);

@@ -173,7 +173,7 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
         {
             var result = await host.RunErasureAsync(
                 tenant,
-                new ErasureScope(Guid.NewGuid(), allowSoftDeleteAsErasure: true),
+                new ErasureScope("user", Guid.NewGuid(), allowSoftDeleteAsErasure: true),
                 asOf
             );
             return result.SweepId;

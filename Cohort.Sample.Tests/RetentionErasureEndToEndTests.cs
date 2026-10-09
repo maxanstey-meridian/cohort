@@ -45,7 +45,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
         var result = await erasureHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subject, allowSoftDeleteAsErasure: true),
+            new ErasureScope("user", subject, allowSoftDeleteAsErasure: true),
             asOf
         );
 
@@ -231,7 +231,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
         var result = await erasureHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true, dryRun: true),
+            new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true, dryRun: true),
             asOf
         );
 
@@ -380,7 +380,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
         var erasureTask = erasureHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true, dryRun: true),
+            new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true, dryRun: true),
             asOf
         );
 
@@ -496,7 +496,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
         var erasure = erasureHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+            new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
             asOf
         );
         await WaitForBlockedRowMutationAsync(blocker.ProcessID);
@@ -549,40 +549,166 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task Predicate_Construction_Failures_Are_Sanitized_Entity_Failures()
+    public async Task Erasure_Refuses_A_Subject_Of_The_Wrong_Type_Before_Any_Run()
     {
         var tenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
 
-        await using (var db = Host.CreateDbContext())
-        {
-            db.Notes.Add(
-                new Note
-                {
-                    Id = Guid.NewGuid(),
-                    TenantId = tenantId,
-                    SubjectId = Guid.NewGuid(),
-                    CreatedAt = asOf,
-                    Body = "mismatch",
-                }
-            );
-            await db.SaveChangesAsync();
-        }
+        var act = () => Host.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope("user", "not-a-guid", allowSoftDeleteAsErasure: true),
+            asOf
+        );
 
-        var result = await Host.RunErasureAsync(
-                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope("not-a-guid", allowSoftDeleteAsErasure: true),
-                asOf
-            );
+        var exception = await act.Should().ThrowAsync<InvalidOperationException>();
+        exception.Which.Message.Should().Be(
+            "Erasure subject kind 'user' identifies subjects by Guid, but the scope's subject is a String."
+        );
+        (await CountRunsAsync(tenantId)).Should().Be(0);
+    }
 
-        result.EntityFailures.Should().NotBeEmpty();
-        result.EntityFailures.Should().AllSatisfy(failure =>
-        {
-            failure.Should().MatchRegex(
-                "^type=System\\.InvalidOperationException;code=hresult:0x80131509;diagnosticId=[0-9a-f]{32}$"
-            );
-            failure.Should().NotContain("SubjectId");
-        });
+    [Fact]
+    public async Task Erasure_Refuses_A_Kind_No_Retained_Entity_Declares_Before_Any_Run()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        var act = () => Host.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope("customer", Guid.NewGuid(), allowSoftDeleteAsErasure: true),
+            asOf
+        );
+
+        var exception = await act.Should().ThrowAsync<InvalidOperationException>();
+        exception.Which.Message.Should().Be(
+            "Erasure subject kind 'customer' isn't declared by any retained entity's [ErasureSubject], so the erasure would match nothing. Declared kinds: 'person', 'user'."
+        );
+        (await CountRunsAsync(tenantId)).Should().Be(0);
+    }
+
+    [Fact]
+    public async Task Erasing_A_Person_Matches_Only_Person_Columns_And_Records_The_Kind()
+    {
+        // Note has a "user" column and a "person" column; SoftDeleteRecord and
+        // AnonymisedContact have only "user" columns, so a person erasure skips them, and
+        // their SoftDelete category is never refused.
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var personNoteId = Guid.NewGuid();
+        var userNoteId = Guid.NewGuid();
+        var softDeleteId = Guid.NewGuid();
+        await SeedKindFixturesAsync(tenantId, subjectId, asOf, personNoteId, userNoteId, softDeleteId);
+
+        using var erasureHost = new CohortTestHost(GetConnectionString(), CreateErasureCategoryRepository());
+        var result = await erasureHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope("person", subjectId),
+            asOf
+        );
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().ContainSingle().Which.Should().Be(
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+        );
+        (await LoadRowDetailsAsync(result.SweepId)).Should().ContainSingle()
+            .Which.RecordId.Should().Be(personNoteId.ToString());
+        (await LoadErasureSubjectKindAsync(result.SweepId)).Should().Be("person");
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.Where(note => note.TenantId == tenantId).Select(note => note.Id).ToListAsync())
+            .Should().Equal(userNoteId);
+        (await verify.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteId))
+            .IsDeleted.Should().BeFalse();
+        (await verify.AnonymisedContacts.SingleAsync(contact => contact.TenantId == tenantId))
+            .EmailAddress.Should().Be("kind@example.com");
+    }
+
+    [Fact]
+    public async Task A_Dry_Run_Erasure_Counts_Only_Rows_Its_Kind_Matches()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        await SeedKindFixturesAsync(tenantId, subjectId, asOf, Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid());
+
+        using var erasureHost = new CohortTestHost(GetConnectionString(), CreateErasureCategoryRepository());
+        var person = await erasureHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope("person", subjectId, dryRun: true),
+            asOf
+        );
+        var user = await erasureHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true, dryRun: true),
+            asOf
+        );
+
+        person.Counts.Should().ContainSingle().Which.Should().Be(
+            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+        );
+        (await LoadRunAsync(person.SweepId)).TotalAffected.Should().Be(1);
+        (await LoadErasureSubjectKindAsync(person.SweepId)).Should().Be("person");
+        user.Counts.Select(count => (count.EntityType, count.Affected)).Should().BeEquivalentTo(
+            [
+                (typeof(Note), 1L),
+                (typeof(SoftDeleteRecord), 1L),
+                (typeof(AnonymisedContact), 1L),
+                // An exempt category: visited by a user erasure, counted as nothing.
+                (typeof(TombstoneRecord), 0L),
+            ]
+        );
+        (await LoadRunAsync(user.SweepId)).TotalAffected.Should().Be(3);
+        (await LoadErasureSubjectKindAsync(user.SweepId)).Should().Be("user");
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.CountAsync(note => note.TenantId == tenantId)).Should().Be(2);
+        (await verify.SoftDeleteRecords.SingleAsync(record => record.TenantId == tenantId))
+            .IsDeleted.Should().BeFalse();
+        (await verify.AnonymisedContacts.SingleAsync(contact => contact.TenantId == tenantId))
+            .AnonymisedAt.Should().BeNull();
+    }
+
+    private async Task SeedKindFixturesAsync(
+        Guid tenantId,
+        Guid subjectId,
+        DateTimeOffset asOf,
+        Guid personNoteId,
+        Guid userNoteId,
+        Guid softDeleteId
+    )
+    {
+        await using var db = Host.CreateDbContext();
+        db.Notes.AddRange(
+            new Note { Id = personNoteId, TenantId = tenantId, SubjectId = Guid.NewGuid(), PersonId = subjectId, CreatedAt = EligibleErasureCreatedAt(asOf), Body = "person-note" },
+            new Note { Id = userNoteId, TenantId = tenantId, SubjectId = subjectId, PersonId = Guid.NewGuid(), CreatedAt = EligibleErasureCreatedAt(asOf), Body = "user-note" }
+        );
+        db.SoftDeleteRecords.Add(
+            new SoftDeleteRecord { Id = softDeleteId, TenantId = tenantId, SubjectId = subjectId, CreatedAt = EligibleErasureCreatedAt(asOf), Body = "user-soft-delete" }
+        );
+        db.AnonymisedContacts.Add(
+            new AnonymisedContact { Id = Guid.NewGuid(), TenantId = tenantId, SubjectId = subjectId, CreatedAt = EligibleErasureCreatedAt(asOf), EmailAddress = "kind@example.com", GivenName = "Kind", Surname = "Fixture" }
+        );
+        await db.SaveChangesAsync();
+    }
+
+    private async Task<string?> LoadErasureSubjectKindAsync(Guid sweepId)
+    {
+        await using var db = Host.CreateDbContext();
+        await using var command = await CreateCommandAsync(db, sweepId);
+        command.CommandText = """
+            SELECT "ErasureSubjectKind" FROM "sweep_run" WHERE "SweepId" = @sweepId
+            """;
+        var value = await command.ExecuteScalarAsync();
+        return value is DBNull ? null : (string?)value;
+    }
+
+    private async Task<long> CountRunsAsync(Guid tenantId)
+    {
+        await using var db = Host.CreateDbContext();
+        return await db.Database
+            .SqlQuery<long>($"""SELECT COUNT(*) AS "Value" FROM "sweep_run" WHERE "TenantId" = {tenantId}""")
+            .SingleAsync();
     }
 
     [Fact]
@@ -621,7 +747,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         {
             await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().EraseAsync(
                 new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope("bob@x.com"),
+                new ErasureScope("email", "bob@x.com"),
                 asOf
             );
         }
@@ -679,7 +805,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         {
             var result = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().EraseAsync(
                 new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope("ABCDEFGH-2"),
+                new ErasureScope("email", "ABCDEFGH-2"),
                 asOf
             );
             result.EntityFailures.Should().BeEmpty();
@@ -723,7 +849,7 @@ await using var verifyScope = services.CreateAsyncScope();
         {
             var result = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().EraseAsync(
                 new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope(subjectId),
+                new ErasureScope("user", subjectId),
                 asOf
             );
             // 22001: string_data_right_truncation, "value too long for type character varying(8)".
@@ -784,7 +910,7 @@ await using var verifyScope = services.CreateAsyncScope();
         await using (var scope = provider.CreateAsyncScope())
         {
             await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>()
-                .EraseAsync(tenant, new ErasureScope(subjectId), asOf);
+                .EraseAsync(tenant, new ErasureScope("user", subjectId), asOf);
         }
 
         ErasureResult extended;
@@ -792,7 +918,7 @@ await using var verifyScope = services.CreateAsyncScope();
         await using (var scope = provider.CreateAsyncScope())
         {
             extended = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>()
-                .EraseAsync(tenant, new ErasureScope(subjectId), asOf);
+                .EraseAsync(tenant, new ErasureScope("user", subjectId), asOf);
         }
 
         extended.EntityFailures.Should().BeEmpty();
@@ -841,7 +967,7 @@ await using var verifyScope = services.CreateAsyncScope();
                     .GetRequiredService<IRetentionErasureService>()
                     .EraseAsync(
                         new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                        new ErasureScope(subjectId),
+                        new ErasureScope("user", subjectId),
                         asOf
                     );
             }
@@ -904,7 +1030,7 @@ await using var verifyScope = services.CreateAsyncScope();
                     .GetRequiredService<IRetentionErasureService>()
                     .EraseAsync(
                         new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                        new ErasureScope(subjectId),
+                        new ErasureScope("user", subjectId),
                         asOf
                     );
             }
@@ -971,7 +1097,7 @@ await using var verifyScope = services.CreateAsyncScope();
         {
             result = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().EraseAsync(
                 new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope(subjectId),
+                new ErasureScope("user", subjectId),
                 asOf
             );
         }
@@ -986,7 +1112,7 @@ await using var verifyScope = services.CreateAsyncScope();
     }
 
     [Fact]
-    public async Task Startup_Validation_Fails_When_Multi_Subject_Metadata_Uses_Incompatible_Effective_Types()
+    public async Task Startup_Validation_Fails_When_One_Kind_Holds_Two_Clr_Types_Across_The_Model()
     {
         await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
         await using var services = BuildPredicateResolutionServiceProvider<IncompatiblePredicateResolutionDbContext>(
@@ -995,6 +1121,9 @@ await using var verifyScope = services.CreateAsyncScope();
                 new Dictionary<string, ITestRetentionRule>
                 {
                     ["incompatible-multi-subject-erasure"] = new StaticTestRetentionRule(
+                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    ),
+                    ["incompatible-kind-erasure"] = new StaticTestRetentionRule(
                         new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
                     ),
                 }
@@ -1006,11 +1135,12 @@ await using var verifyScope = services.CreateAsyncScope();
         var validator = scope.ServiceProvider.GetRequiredService<RetentionStartupValidator>();
         var act = () => validator.ValidateAsync();
 
+        // One entity may mix kinds of different types ("user" Guid, "email" string); one
+        // kind may not hold two types, even on different entities.
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        var error = exception.Which.Errors.Should().ContainSingle().Which;
-        error.Should().Contain("incompatible [ErasureSubject] properties");
-        error.Should().Contain("AlternateSubjectId:String");
-        error.Should().Contain("PrimarySubjectId:Guid");
+        exception.Which.Errors.Should().ContainSingle().Which.Should().Be(
+            $"[ErasureSubject(\"user\")] columns must all hold one CLR type (after nullable unwrapping), but they hold Guid, String: {typeof(IncompatibleKindRecord).FullName}.UserEmail:String, {typeof(IncompatibleMultiSubjectPredicateRecord).FullName}.PrimarySubjectId:Guid. Give each sort of subject its own kind."
+        );
     }
 
     [Fact]
@@ -1107,7 +1237,7 @@ await using var verifyScope = services.CreateAsyncScope();
                 scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
             previewResult = await erasureService.EraseAsync(
                 new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope(subjectId, allowSoftDeleteAsErasure: true, dryRun: true),
+                new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true, dryRun: true),
                 asOf
             );
         }
@@ -1151,7 +1281,7 @@ await using var verifyScope = services.CreateAsyncScope();
                 scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
             liveResult = await erasureService.EraseAsync(
                 new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+                new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
                 asOf
             );
         }
@@ -1242,7 +1372,7 @@ await using var verifyScope = services.CreateAsyncScope();
                 scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
             result = await erasureService.EraseAsync(
                 new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+                new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
                 asOf
             );
         }
@@ -1408,7 +1538,7 @@ await using var verifyScope = services.CreateAsyncScope();
                 scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
             result = await erasureService.EraseAsync(
                 new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+                new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
                 asOf
             );
         }
@@ -1652,7 +1782,7 @@ await using var verifyScope = services.CreateAsyncScope();
         );
         var erasureTask = erasureHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+            new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
             asOf
         );
         await WaitForAdvisoryLockWaiterAsync(blocker.ProcessID);
@@ -2151,7 +2281,7 @@ internal sealed class SetBasedFactoryErasureRecord
     public Guid Id { get; set; }
     public Guid TenantId { get; set; }
 
-    [ErasureSubject]
+    [ErasureSubject("user")]
     public Guid? SubjectId { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; }
@@ -2171,7 +2301,7 @@ internal sealed class PerRowFactoryErasureRecord
     public Guid Id { get; set; }
     public Guid TenantId { get; set; }
 
-    [ErasureSubject]
+    [ErasureSubject("user")]
     public Guid? SubjectId { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; }
@@ -2194,7 +2324,7 @@ internal sealed class ConvertedSetBasedErasureRecord
     public Guid Id { get; set; }
     public Guid TenantId { get; set; }
 
-    [ErasureSubject]
+    [ErasureSubject("user")]
     public Guid? SubjectId { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; }
@@ -2214,7 +2344,7 @@ internal sealed class ConvertedOriginalValueErasureRecord
     public Guid Id { get; set; }
     public Guid TenantId { get; set; }
 
-    [ErasureSubject]
+    [ErasureSubject("user")]
     public Guid? SubjectId { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; }
@@ -2323,10 +2453,10 @@ internal sealed class MultiSubjectFixtureRecord
     public Guid Id { get; set; }
     public Guid TenantId { get; set; }
 
-    [ErasureSubject]
+    [ErasureSubject("user")]
     public Guid? PrimarySubjectId { get; set; }
 
-    [ErasureSubject]
+    [ErasureSubject("user")]
     public Guid? DelegateSubjectId { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; }
@@ -2370,7 +2500,7 @@ internal sealed class ConvertedErasureSubjectFixtureRecord
     public Guid Id { get; set; }
     public Guid TenantId { get; set; }
 
-    [ErasureSubject]
+    [ErasureSubject("user")]
     public Guid SubjectKey { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; }
@@ -2414,7 +2544,7 @@ internal sealed class ModelVariantBaseRecord
     public Guid Id { get; set; }
     public Guid TenantId { get; set; }
 
-    [ErasureSubject]
+    [ErasureSubject("user")]
     public Guid SubjectId { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; }
@@ -2427,7 +2557,7 @@ internal sealed class ModelVariantExtendedRecord
     public Guid Id { get; set; }
     public Guid TenantId { get; set; }
 
-    [ErasureSubject]
+    [ErasureSubject("user")]
     public Guid SubjectId { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; }
@@ -2460,7 +2590,7 @@ internal sealed class CitextSubjectPurgeRecord
     public Guid Id { get; set; }
     public Guid TenantId { get; set; }
 
-    [ErasureSubject]
+    [ErasureSubject("email")]
     public string? Email { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; }
@@ -2473,7 +2603,7 @@ internal sealed class CitextSubjectAnonymiseRecord
     public Guid Id { get; set; }
     public Guid TenantId { get; set; }
 
-    [ErasureSubject]
+    [ErasureSubject("email")]
     [Anonymise(AnonymiseMethod.Null)]
     public string? Email { get; set; }
 
@@ -2505,7 +2635,7 @@ internal sealed class BoundedSubjectRecord
     public string Id { get; set; } = "";
     public Guid TenantId { get; set; }
 
-    [ErasureSubject]
+    [ErasureSubject("email")]
     public string? Email { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; }
@@ -2532,7 +2662,7 @@ internal sealed class BoundedAnonymiseRecord
     public Guid Id { get; set; }
     public Guid TenantId { get; set; }
 
-    [ErasureSubject]
+    [ErasureSubject("user")]
     public Guid SubjectId { get; set; }
 
     [Anonymise(AnonymiseMethod.FixedLiteral, "anonymised@example.invalid")]
@@ -2581,7 +2711,7 @@ internal sealed class SingleSubjectPredicateRecord
     public Guid Id { get; set; }
     public Guid TenantId { get; set; }
 
-    [ErasureSubject]
+    [ErasureSubject("user")]
     public Guid? CustomerReference { get; set; }
 
     public DateTimeOffset? CreatedAt { get; set; }
@@ -2627,10 +2757,10 @@ internal sealed class MultiSubjectPredicateRecord
     public Guid Id { get; set; }
     public Guid TenantId { get; set; }
 
-    [ErasureSubject]
+    [ErasureSubject("user")]
     public Guid? PrimarySubjectId { get; set; }
 
-    [ErasureSubject]
+    [ErasureSubject("user")]
     public Guid? DelegateSubjectId { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; }
@@ -2653,6 +2783,9 @@ internal sealed class IncompatiblePredicateResolutionDbContext(
                 .HasColumnName("alternate_subject_id");
             builder.Property(record => record.CreatedAt).HasColumnName("created_at_utc");
         });
+        modelBuilder.Entity<IncompatibleKindRecord>(builder =>
+            builder.ToTable("incompatible_kind_records")
+        );
 
         modelBuilder.ConfigureCohortTables();
     }
@@ -2665,11 +2798,24 @@ internal sealed class IncompatibleMultiSubjectPredicateRecord
     public Guid Id { get; set; }
     public Guid TenantId { get; set; }
 
-    [ErasureSubject]
+    [ErasureSubject("user")]
     public Guid? PrimarySubjectId { get; set; }
 
-    [ErasureSubject]
+    [ErasureSubject("email")]
     public string AlternateSubjectId { get; set; } = "";
+
+    public DateTimeOffset CreatedAt { get; set; }
+}
+
+[Retain("incompatible-kind-erasure", nameof(CreatedAt))]
+[RetentionEntityId("00000000-0000-0000-0001-00000000001d")]
+internal sealed class IncompatibleKindRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+
+    [ErasureSubject("user")]
+    public string UserEmail { get; set; } = "";
 
     public DateTimeOffset CreatedAt { get; set; }
 }

@@ -44,6 +44,8 @@ internal static class CohortSchemaContract
                 Column<Guid>("TenantId", "uuid"),
                 Column<long?>("TotalAffected", "bigint", "int8", nullable: true),
                 Column<string?>("Error", "text", nullable: true),
+                // The kind of subject an erasure erased; never the subject itself.
+                Column<string?>("ErasureSubjectKind", "text", nullable: true),
             ],
             ["SweepId"],
             // The worker's once-per-occurrence lookup.
@@ -69,6 +71,11 @@ internal static class CohortSchemaContract
                 new(
                     "CK_sweep_run_Duration_Nonnegative",
                     "\"Duration\" IS NULL OR \"Duration\" >= INTERVAL '0'"
+                ),
+                // One-way: erasure runs recorded before 0.9.0 have no kind.
+                new(
+                    "CK_sweep_run_ErasureSubjectKind_Erasure_Only",
+                    "\"TriggerKind\" = 1 OR \"ErasureSubjectKind\" IS NULL"
                 )
             ]
         ),

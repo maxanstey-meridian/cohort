@@ -1,3 +1,4 @@
+using Cohort.Application;
 using Cohort.Domain;
 
 namespace Cohort.Tests;
@@ -37,6 +38,40 @@ public sealed class DomainInvariantTests
             new TenantContext(Guid.Empty, "uk", new Dictionary<string, string>());
 
         act.Should().Throw<ArgumentException>().WithParameterName("id");
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData(" ")]
+    public void Erasure_Subject_Kinds_Cannot_Be_Blank(string kind)
+    {
+        var attribute = () => new ErasureSubjectAttribute(kind);
+        var scope = () => new ErasureScope(kind, Guid.NewGuid());
+
+        attribute.Should().Throw<ArgumentException>().WithParameterName("kind");
+        scope.Should().Throw<ArgumentException>().WithParameterName("kind");
+    }
+
+    [Theory]
+    [InlineData(SweepTriggerKind.Erasure, null)]
+    [InlineData(SweepTriggerKind.Erasure, " ")]
+    [InlineData(SweepTriggerKind.Scheduled, "person")]
+    [InlineData(SweepTriggerKind.Manual, "person")]
+    public void Only_An_Erasure_Run_Starts_With_A_Subject_Kind(
+        SweepTriggerKind trigger,
+        string? erasureSubjectKind
+    )
+    {
+        var act = () => new SweepEvent.Started(
+            Guid.NewGuid(),
+            DateTimeOffset.UnixEpoch,
+            trigger,
+            DryRun: false,
+            Guid.NewGuid(),
+            erasureSubjectKind
+        );
+
+        act.Should().Throw<ArgumentException>().WithParameterName("ErasureSubjectKind");
     }
 
     private static RetentionHoldRequest CreateHold(

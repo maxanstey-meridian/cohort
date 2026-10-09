@@ -61,7 +61,7 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
 
         var erasure = handlerHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(originalSubjectId, allowSoftDeleteAsErasure: true),
+            new ErasureScope("user", originalSubjectId, allowSoftDeleteAsErasure: true),
             asOf
         );
         await WaitForBlockedRowMutationAsync(blocker.ProcessID);

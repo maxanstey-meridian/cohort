@@ -43,8 +43,8 @@ internal sealed class EfRetentionAuditWriter(
         return ExecuteAsync(
             $"""
             INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRun)}
-                ("SweepId", "StartedAt", "Status", "SettledAt", "Duration", "TriggerKind", "DryRun", "TenantId", "TotalAffected")
-            VALUES (@sweepId, @startedAt, @status, NULL, NULL, @triggerKind, @dryRun, @tenantId, 0)
+                ("SweepId", "StartedAt", "Status", "SettledAt", "Duration", "TriggerKind", "DryRun", "TenantId", "TotalAffected", "ErasureSubjectKind")
+            VALUES (@sweepId, @startedAt, @status, NULL, NULL, @triggerKind, @dryRun, @tenantId, 0, @erasureSubjectKind)
             """,
             new SqlParams
             {
@@ -54,6 +54,7 @@ internal sealed class EfRetentionAuditWriter(
                 ["triggerKind"] = (int)started.Trigger,
                 ["dryRun"] = started.DryRun,
                 ["tenantId"] = started.TenantId,
+                ["erasureSubjectKind"] = started.ErasureSubjectKind,
             },
             ct
         );

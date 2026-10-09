@@ -18,7 +18,8 @@ public abstract record SweepEvent
             DateTimeOffset At,
             SweepTriggerKind Trigger,
             bool DryRun,
-            Guid TenantId
+            Guid TenantId,
+            string? ErasureSubjectKind = null
         )
         {
             this.SweepId = RequiredId(SweepId, nameof(SweepId));
@@ -26,11 +27,25 @@ public abstract record SweepEvent
             this.Trigger = Defined(Trigger, nameof(Trigger));
             this.DryRun = DryRun;
             this.TenantId = TenantId;
+            this.ErasureSubjectKind = this.Trigger == SweepTriggerKind.Erasure
+                ? RequiredText(ErasureSubjectKind ?? "", nameof(ErasureSubjectKind))
+                : ErasureSubjectKind is null
+                    ? null
+                    : throw new ArgumentException(
+                        "Only an erasure run has an erasure subject kind.",
+                        nameof(ErasureSubjectKind)
+                    );
         }
 
         public SweepTriggerKind Trigger { get; }
         public bool DryRun { get; }
         public Guid TenantId { get; }
+
+        /// <summary>
+        /// The kind of subject an erasure run erased (never the subject itself); null for
+        /// every other run.
+        /// </summary>
+        public string? ErasureSubjectKind { get; }
     }
 
     public sealed record EntitySummary : SweepEvent

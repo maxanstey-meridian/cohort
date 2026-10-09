@@ -19,7 +19,7 @@ var now = DateTimeOffset.UtcNow;
 await services.GetRequiredService<IRetentionPreview>().PreviewAsync(tenant, now, ct);
 await services.GetRequiredService<IRetentionSweep>().SweepAsync(tenant, now, ct);
 await services.GetRequiredService<IRetentionErasureService>()
-    .EraseAsync(tenant, new ErasureScope(subjectId), now, ct);
+    .EraseAsync(tenant, new ErasureScope("user", userId), now, ct);
 ```
 
 `SweepAsync(tenant, ...)` sweeps that tenant's tenanted entities. Tenantless entities hold

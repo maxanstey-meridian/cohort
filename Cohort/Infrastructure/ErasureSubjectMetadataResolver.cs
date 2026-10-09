@@ -11,17 +11,24 @@ internal sealed class ErasureSubjectMetadataResolver(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db
 )
 {
-    internal ErasureSubjectMetadata? Resolve(RetentionEntry entry)
+    /// <summary>
+    /// Resolves the entity's <c>[ErasureSubject]</c> columns, one metadata per kind, ordered
+    /// by kind. Whether each kind keeps one CLR type is checked across the whole model by
+    /// the startup validator.
+    /// </summary>
+    internal IReadOnlyList<ErasureSubjectMetadata> Resolve(RetentionEntry entry)
     {
         var subjectProperties = entry
             .EntityType.GetProperties(BindingFlags.Public | BindingFlags.Instance)
-            .Where(property => property.IsDefined(typeof(ErasureSubjectAttribute), inherit: false))
-            .OrderBy(property => property.Name, StringComparer.Ordinal)
+            .Select(property =>
+                (Property: property, Attribute: property.GetCustomAttribute<ErasureSubjectAttribute>(inherit: false))
+            )
+            .Where(marked => marked.Attribute is not null)
             .ToArray();
 
         if (subjectProperties.Length == 0)
         {
-            return null;
+            return [];
         }
 
         var entityType =
@@ -35,23 +42,18 @@ internal sealed class ErasureSubjectMetadataResolver(
                 $"Entity {entry.EntityType.FullName} does not have a mapped table for erasure."
             );
 
-        var effectiveTypes = subjectProperties
-            .Select(property =>
-                Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType
-            )
-            .Distinct()
+        return subjectProperties
+            .GroupBy(marked => marked.Attribute!.Kind, StringComparer.Ordinal)
+            .OrderBy(group => group.Key, StringComparer.Ordinal)
+            .Select(group => new ErasureSubjectMetadata(
+                entry.EntityType,
+                group.Key,
+                group
+                    .OrderBy(marked => marked.Property.Name, StringComparer.Ordinal)
+                    .Select(marked => ResolveMember(entry.EntityType, entityType, storeObject, marked.Property))
+                    .ToArray()
+            ))
             .ToArray();
-        if (effectiveTypes.Length > 1)
-        {
-            throw new InvalidOperationException(
-                $"Entity {entry.EntityType.FullName} defines incompatible [ErasureSubject] properties. All marked properties must share the same effective CLR type after nullable unwrapping. Found: {string.Join(", ", subjectProperties.Select(property => $"{property.Name}:{(Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType).Name}"))}."
-            );
-        }
-
-        var members = subjectProperties
-            .Select(property => ResolveMember(entry.EntityType, entityType, storeObject, property))
-            .ToArray();
-        return new ErasureSubjectMetadata(entry.EntityType, effectiveTypes[0], members);
     }
 
     private static ErasureSubjectMember ResolveMember(
@@ -73,30 +75,27 @@ internal sealed class ErasureSubjectMetadataResolver(
             );
 
         _ = efProperty.GetTypeMapping();
-        return new ErasureSubjectMember(property.Name, column, efProperty.GetColumnType(storeObject), efProperty);
+        return new ErasureSubjectMember(
+            property.Name,
+            Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType,
+            column,
+            efProperty.GetColumnType(storeObject),
+            efProperty
+        );
     }
 }
 
 internal sealed record ErasureSubjectMetadata(
     Type EntityType,
-    Type SubjectType,
+    string Kind,
     IReadOnlyList<ErasureSubjectMember> Members
 )
 {
-    internal ErasureSubjectPredicate CreatePredicate(object subject)
-    {
-        if (!SubjectType.IsInstanceOfType(subject))
-        {
-            var subjectDescription =
-                Members.Count == 1
-                    ? $"property '{Members[0].Name}'"
-                    : $"properties {string.Join(", ", Members.Select(member => $"'{member.Name}'"))}";
-            throw new InvalidOperationException(
-                $"Erasure scope subject value of type {subject.GetType().Name} cannot be expressed against [ErasureSubject] {subjectDescription} on {EntityType.FullName}, which expects {SubjectType.Name}."
-            );
-        }
-
-        return new ErasureSubjectPredicate(
+    /// <summary>
+    /// The erasure service has already checked the subject against its kind's CLR type.
+    /// </summary>
+    internal ErasureSubjectPredicate CreatePredicate(object subject) =>
+        new(
             Members
                 .Select(member =>
                     new ErasureSubjectMatch(
@@ -108,11 +107,11 @@ internal sealed record ErasureSubjectMetadata(
                 )
                 .ToArray()
         );
-    }
 }
 
 internal sealed record ErasureSubjectMember(
     string Name,
+    Type SubjectType,
     string Column,
     string? StoreType,
     IProperty Property

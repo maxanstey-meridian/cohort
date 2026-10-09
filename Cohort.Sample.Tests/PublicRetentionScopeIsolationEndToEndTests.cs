@@ -77,7 +77,7 @@ public sealed class PublicRetentionScopeIsolationEndToEndTests(PostgresFixture f
             var erasure = services.GetRequiredService<IRetentionErasureService>();
             await erasure.EraseAsync(
                 new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+                new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
                 asOf
             );
 

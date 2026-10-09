@@ -34,19 +34,53 @@ internal sealed class RetentionErasureService(
         // Npgsql only writes UTC DateTimeOffsets to timestamptz.
         now = now.ToUniversalTime();
         await readinessValidator.ValidateAsync(ct);
+        ValidateSubject(scope);
 
         var run = new RetentionRun(
             db,
             auditWriter,
             auditNotifier,
             logger,
-            new SweepEvent.Started(Guid.NewGuid(), DateTimeOffset.UtcNow, SweepTriggerKind.Erasure, scope.DryRun, tenant.Id),
+            new SweepEvent.Started(
+                Guid.NewGuid(),
+                DateTimeOffset.UtcNow,
+                SweepTriggerKind.Erasure,
+                scope.DryRun,
+                tenant.Id,
+                scope.Kind
+            ),
             options.SweepBatchSize
         );
         // Built before the run exists: a request refused by policy leaves no attempted run.
         var plan = await BuildExecutionPlanAsync(tenant, scope, now, run, ct);
         await run.ExecuteAsync(() => run.RunEntitiesAsync(plan, strategies, ct), ct);
         return run.CreateErasureResult(scope);
+    }
+
+    /// <summary>
+    /// Refuses, before any run exists, a kind no retained entity declares (it would erase
+    /// nothing) and a subject that isn't of its kind's CLR type. Neither message includes
+    /// the subject's value.
+    /// </summary>
+    private void ValidateSubject(ErasureScope scope)
+    {
+        var kinds = validationState.For(db.Model).ErasureSubjectKinds;
+        if (!kinds.TryGetValue(scope.Kind, out var subjectType))
+        {
+            var declared = kinds.Count == 0
+                ? "none"
+                : string.Join(", ", kinds.Keys.Order(StringComparer.Ordinal).Select(kind => $"'{kind}'"));
+            throw new InvalidOperationException(
+                $"Erasure subject kind '{scope.Kind}' isn't declared by any retained entity's [ErasureSubject], so the erasure would match nothing. Declared kinds: {declared}."
+            );
+        }
+
+        if (!subjectType.IsInstanceOfType(scope.Subject))
+        {
+            throw new InvalidOperationException(
+                $"Erasure subject kind '{scope.Kind}' identifies subjects by {subjectType.Name}, but the scope's subject is a {scope.Subject.GetType().Name}."
+            );
+        }
     }
 
     private async Task<IReadOnlyList<SweepScope>> BuildExecutionPlanAsync(
@@ -65,7 +99,10 @@ internal sealed class RetentionErasureService(
                 continue;
             }
 
-            var subjectMetadata = validationState.For(db.Model).ErasureSubjects[entry.EntityType];
+            var subjectMetadata = validationState
+                .For(db.Model)
+                .ErasureSubjects[entry.EntityType]
+                .FirstOrDefault(metadata => string.Equals(metadata.Kind, scope.Kind, StringComparison.Ordinal));
             if (subjectMetadata is null)
             {
                 continue;
@@ -94,7 +131,7 @@ internal sealed class RetentionErasureService(
             if (rule.Strategy == Strategy.SoftDelete && !scope.AllowSoftDeleteAsErasure)
             {
                 throw new InvalidOperationException(
-                    $"Erasure for entity {entry.EntityType.FullName} (category '{entry.Category}') resolves to the SoftDelete strategy, which only sets the soft-delete flag and leaves personal data in place. If that genuinely satisfies the erasure request, opt in with new ErasureScope(subject, allowSoftDeleteAsErasure: true)."
+                    $"Erasure for entity {entry.EntityType.FullName} (category '{entry.Category}') resolves to the SoftDelete strategy, which only sets the soft-delete flag and leaves personal data in place. If that genuinely satisfies the erasure request, opt in with new ErasureScope(kind, subject, allowSoftDeleteAsErasure: true)."
                 );
             }
 

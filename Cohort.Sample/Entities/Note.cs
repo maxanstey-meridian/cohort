@@ -13,8 +13,11 @@ public sealed class Note
     public Guid Id { get; set; }
     public Guid TenantId { get; set; }
 
-    [ErasureSubject]
+    [ErasureSubject("user")]
     public Guid? SubjectId { get; set; }
+
+    [ErasureSubject("person")]
+    public Guid? PersonId { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public string Body { get; set; } = "";
 }

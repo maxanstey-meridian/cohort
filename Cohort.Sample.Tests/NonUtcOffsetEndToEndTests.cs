@@ -179,7 +179,7 @@ public sealed class NonUtcOffsetEndToEndTests(PostgresFixture fixture)
 
         var result = await erasureHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+            new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
             asOf.ToOffset(PlusOneHour)
         );
 

@@ -64,7 +64,7 @@ public sealed class ErasureCorpusTests(PostgresFixture fixture) : IntegrationTes
         var auditBefore = await ReadAuditStateAsync();
         var refused = () => host.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId),
+            new ErasureScope("user", subjectId),
             now
         );
         await refused.Should().ThrowAsync<InvalidOperationException>();
@@ -77,7 +77,7 @@ public sealed class ErasureCorpusTests(PostgresFixture fixture) : IntegrationTes
 
         var result = await host.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+            new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
             now
         );
 

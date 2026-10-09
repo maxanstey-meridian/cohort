@@ -65,7 +65,7 @@ public sealed class FailureSafetyCorpusTests(PostgresFixture fixture) : Integrat
             );
             var result = await host.RunErasureAsync(
                 new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+                new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
                 now
             );
 

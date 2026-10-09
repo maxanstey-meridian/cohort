@@ -17,7 +17,7 @@ All attributes live in `Cohort.Domain`.
 |---|---|
 | `[Anonymise(method, literal?)]` | Scrub this column when anonymising: `Null`, `EmptyString` or `FixedLiteral`. See [Anonymisation](/guides/anonymisation). |
 | `[AnonymiseWith(typeof(Factory))]` | Scrub this column with a registered `IAnonymiseValueFactory`. |
-| `[ErasureSubject]` | This column identifies the subject for [right-to-erasure](/guides/erasure). Can appear on several properties. |
+| `[ErasureSubject(kind)]` | This column identifies a subject of `kind` (such as `"user"`) for [right-to-erasure](/guides/erasure). Several properties may share a kind; all columns of one kind hold one CLR type. |
 
 ## Convention overrides
 

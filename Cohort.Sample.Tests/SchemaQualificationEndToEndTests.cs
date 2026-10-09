@@ -165,7 +165,7 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
                 .GetRequiredService<IRetentionErasureService>()
                 .EraseAsync(
                     tenant,
-                    new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+                    new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
                     now
                 );
             erasure.Counts.Where(count => count.Strategy != Strategy.Exempt)
@@ -334,7 +334,7 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
 
         var erasure = await services.GetRequiredService<IRetentionErasureService>().EraseAsync(
             tenant,
-            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+            new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
             now
         );
         erasure.Counts.Should().ContainSingle(count =>
@@ -767,7 +767,7 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
 
         public Guid Id { get; set; } = id;
         public Guid TenantId { get; set; } = tenantId;
-        [ErasureSubject]
+        [ErasureSubject("user")]
         public Guid SubjectId { get; set; } = subjectId;
         public DateTimeOffset CreatedAt { get; set; } = createdAt;
         public string Payload { get; set; } = payload;
@@ -828,7 +828,7 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
     {
         public Guid Id { get; set; } = id;
         public Guid TenantId { get; set; } = tenantId;
-        [ErasureSubject]
+        [ErasureSubject("user")]
         public Guid SubjectId { get; set; } = subjectId;
         public DateTimeOffset CreatedAt { get; set; } = createdAt;
         public string Payload { get; set; } = payload;
@@ -848,7 +848,7 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
     {
         public Guid Id { get; set; } = id;
         public Guid TenantId { get; set; } = tenantId;
-        [ErasureSubject]
+        [ErasureSubject("user")]
         public Guid SubjectId { get; set; } = subjectId;
         public DateTimeOffset CreatedAt { get; set; } = createdAt;
         [Anonymise(AnonymiseMethod.EmptyString)]

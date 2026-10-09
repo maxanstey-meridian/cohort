@@ -103,7 +103,7 @@ Entity record IDs can be `Guid`, integers, `numeric`, `string`/`citext`, or conv
 ## Runtime contracts
 
 - `IRetentionRuleProvider.GetCapabilities` declares every possible strategy; startup validates their union and runtime rejects undeclared strategies.
-- Startup validates `[ErasureSubject]` mapping and provider conversion metadata.
+- Startup validates `[ErasureSubject(kind)]` mapping, provider conversion metadata, and one CLR type per kind across the model. Erasure matches only columns of the scope's kind and refuses an undeclared kind or a wrong-type subject before a run exists; `sweep_run.ErasureSubjectKind` records the kind, never the subject.
 - `IRetentionSweep`, `IRetentionPreview`, `IRetentionErasureService`, `IRetentionHoldsRepository`, and row dispatch enforce PostgreSQL/model/schema readiness even without host startup.
 - The EF audit ledger is internal and unconditional. `IRetentionAuditObserver` is post-commit, bounded, isolated, and best effort.
 - Externally-derived failures use a sanitized type/code/diagnostic-ID envelope; Cohort-defined safe machine reasons may be plain. Diagnostic error text excludes subject/raw exception data, but row-detail observers deliberately receive sensitive `RecordId` and `TenantId`. Original exceptions remain only in correlated structured logs.

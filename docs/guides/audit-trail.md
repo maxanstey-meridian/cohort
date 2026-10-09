@@ -8,7 +8,7 @@ so the ledger and the data never disagree.
 
 | Table | One row per |
 |---|---|
-| `sweep_run` | Run: trigger kind, status, dry-run flag, tenant, start and settle times, error |
+| `sweep_run` | Run: trigger kind, erasure subject kind (erasures only, never the subject), status, dry-run flag, tenant, start and settle times, error |
 | `sweep_run_entity_summary` | Entity, category, tenant and strategy within a run |
 | `sweep_run_row_detail` | Mutated row, when per-row detail is on |
 

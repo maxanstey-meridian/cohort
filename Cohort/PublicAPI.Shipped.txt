@@ -138,8 +138,9 @@ Cohort.Application.SweepEvent.RowDetail.Strategy.get -> Cohort.Domain.Strategy
 Cohort.Application.SweepEvent.RowDetail.TenantId.get -> System.Guid
 Cohort.Application.SweepEvent.Started
 Cohort.Application.SweepEvent.Started.DryRun.get -> bool
+Cohort.Application.SweepEvent.Started.ErasureSubjectKind.get -> string?
 Cohort.Application.SweepEvent.Started.Equals(Cohort.Application.SweepEvent.Started? other) -> bool
-Cohort.Application.SweepEvent.Started.Started(System.Guid SweepId, System.DateTimeOffset At, Cohort.Application.SweepTriggerKind Trigger, bool DryRun, System.Guid TenantId) -> void
+Cohort.Application.SweepEvent.Started.Started(System.Guid SweepId, System.DateTimeOffset At, Cohort.Application.SweepTriggerKind Trigger, bool DryRun, System.Guid TenantId, string? ErasureSubjectKind = null) -> void
 Cohort.Application.SweepEvent.Started.TenantId.get -> System.Guid
 Cohort.Application.SweepEvent.Started.Trigger.get -> Cohort.Application.SweepTriggerKind
 Cohort.Application.SweepEvent.SweepEvent(Cohort.Application.SweepEvent! original) -> void
@@ -242,10 +243,12 @@ Cohort.Domain.ErasureScope.<Clone>$() -> Cohort.Domain.ErasureScope!
 Cohort.Domain.ErasureScope.AllowSoftDeleteAsErasure.get -> bool
 Cohort.Domain.ErasureScope.DryRun.get -> bool
 Cohort.Domain.ErasureScope.Equals(Cohort.Domain.ErasureScope? other) -> bool
-Cohort.Domain.ErasureScope.ErasureScope(object! subject, bool allowSoftDeleteAsErasure = false, bool dryRun = false) -> void
+Cohort.Domain.ErasureScope.ErasureScope(string! kind, object! subject, bool allowSoftDeleteAsErasure = false, bool dryRun = false) -> void
+Cohort.Domain.ErasureScope.Kind.get -> string!
 Cohort.Domain.ErasureScope.Subject.get -> object!
 Cohort.Domain.ErasureSubjectAttribute
-Cohort.Domain.ErasureSubjectAttribute.ErasureSubjectAttribute() -> void
+Cohort.Domain.ErasureSubjectAttribute.ErasureSubjectAttribute(string! kind) -> void
+Cohort.Domain.ErasureSubjectAttribute.Kind.get -> string!
 Cohort.Domain.ExemptFromRetentionAttribute
 Cohort.Domain.ExemptFromRetentionAttribute.ExemptFromRetentionAttribute(string! reason) -> void
 Cohort.Domain.ExemptFromRetentionAttribute.Reason.get -> string!

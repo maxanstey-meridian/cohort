@@ -24,8 +24,9 @@ entity and the problem.
 - `RetentionRule` rejects a negative `Period` or `LegalMin`, which would compute a future
   cutoff and sweep everything.
 - `[AnonymiseWith]` factories are registered exactly once as `IAnonymiseValueFactory`.
-- `[ErasureSubject]` properties map to physical columns with compatible effective and
-  provider types.
+- `[ErasureSubject(kind)]` kinds aren't blank, every column of one kind holds the same CLR
+  type across the model, and each marked property maps to a physical column with a
+  compatible provider type.
 
 ## Mapping shapes
 

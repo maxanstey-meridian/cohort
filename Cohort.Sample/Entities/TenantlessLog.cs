@@ -12,6 +12,6 @@ public sealed class TenantlessLog
 
     public string Payload { get; set; } = "";
 
-    [ErasureSubject]
+    [ErasureSubject("user")]
     public Guid? SubjectId { get; set; }
 }

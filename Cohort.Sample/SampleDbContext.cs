@@ -28,6 +28,7 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
             b.HasKey(n => n.Id);
             b.Property(n => n.TenantId);
             b.Property(n => n.SubjectId);
+            b.Property(n => n.PersonId);
             b.Property(n => n.CreatedAt).IsRequired();
             b.Property(n => n.Body).IsRequired();
         });

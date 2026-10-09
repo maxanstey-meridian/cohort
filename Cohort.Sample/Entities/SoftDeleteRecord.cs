@@ -9,7 +9,7 @@ public sealed class SoftDeleteRecord
     public Guid Id { get; set; }
     public Guid TenantId { get; set; }
 
-    [ErasureSubject]
+    [ErasureSubject("user")]
     public Guid? SubjectId { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public string Body { get; set; } = "";

@@ -134,7 +134,7 @@ var now = DateTimeOffset.UtcNow;
 await services.GetRequiredService<IRetentionPreview>().PreviewAsync(tenant, now, ct);
 await services.GetRequiredService<IRetentionSweep>().SweepAsync(tenant, now, ct);
 await services.GetRequiredService<IRetentionErasureService>()
-    .EraseAsync(tenant, new ErasureScope(subjectId), now, ct);
+    .EraseAsync(tenant, new ErasureScope("user", userId), now, ct);
 ```
 
 Thirty-day-old session notes are deleted, and year-old case contacts keep their row but
@@ -144,7 +144,9 @@ the run is written to Cohort's ledger.
 ## Also in the box
 
 - [Right-to-erasure](https://maxanstey-meridian.github.io/cohort/guides/erasure): erase one
-  subject's rows immediately. A positive `LegalMin` and active holds still block it.
+  subject's rows immediately. Columns name the kind of subject they hold
+  (`[ErasureSubject("user")]`), so a user erasure never touches a person column. A positive
+  `LegalMin` and active holds still block it.
 - [Legal holds](https://maxanstey-meridian.github.io/cohort/guides/legal-holds): a held row
   survives every strategy. `IRetentionDeletion` lets your own deletes respect holds too.
 - [Row handlers](https://maxanstey-meridian.github.io/cohort/guides/row-handlers): capture a

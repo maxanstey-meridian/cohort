@@ -900,7 +900,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         var result = await handlerHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+            new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
             asOf
         );
 
@@ -1150,7 +1150,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
 
         var result = await handlerHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true, dryRun: true),
+            new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true, dryRun: true),
             asOf
         );
 

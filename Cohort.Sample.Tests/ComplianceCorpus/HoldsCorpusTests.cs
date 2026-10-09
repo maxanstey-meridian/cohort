@@ -213,7 +213,7 @@ public sealed class HoldsCorpusTests(PostgresFixture fixture) : IntegrationTestB
 
         var result = await Host.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            new ErasureScope(subjectId, allowSoftDeleteAsErasure: true),
+            new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
             now
         );
 

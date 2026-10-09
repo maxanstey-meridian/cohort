@@ -51,6 +51,23 @@ public sealed class RetentionStartupValidatorTests
             );
     }
 
+    [Fact]
+    public async Task ValidateAsync_Rejects_A_Blank_Erasure_Subject_Kind()
+    {
+        var options = new DbContextOptionsBuilder<BlankErasureKindDbContext>()
+            .UseNpgsqlMetadataModel($"startup-validator-blank-erasure-kind-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new BlankErasureKindDbContext(options);
+
+        var act = async () =>
+            await CreateValidator(db, IdentityCategoryRepository()).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle().Which.Should().Be(
+            $"Retention category 'identity' for entity {typeof(BlankErasureKindRecord).FullName} failed startup validation: Erasure subject kind cannot be blank. (Parameter 'kind')"
+        );
+    }
+
     private static InMemoryCategoryRepository IdentityCategoryRepository() =>
         new(new Dictionary<string, ITestRetentionRule> { ["identity"] = ExemptResolver });
 
@@ -1215,6 +1232,30 @@ public sealed class RetentionStartupValidatorTests
                 entity.HasKey(record => record.Id);
             });
         }
+    }
+
+    private sealed class BlankErasureKindDbContext(
+        DbContextOptions<BlankErasureKindDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.ConfigureCohortTables();
+            modelBuilder.Entity<BlankErasureKindRecord>().HasKey(record => record.Id);
+        }
+    }
+
+    [Retain("identity", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-0000000000e1")]
+    private sealed class BlankErasureKindRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+
+        [ErasureSubject(" ")]
+        public Guid? SubjectId { get; init; }
+
+        public DateTimeOffset CreatedAt { get; init; }
     }
 
     private sealed class MissingRetentionIdentityDbContext(

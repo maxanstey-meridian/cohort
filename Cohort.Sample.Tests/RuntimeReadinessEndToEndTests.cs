@@ -235,7 +235,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
                 case PublicDatabaseOperation.Erasure:
                     await services.GetRequiredService<IRetentionErasureService>().EraseAsync(
                         tenant,
-                        new ErasureScope(Guid.NewGuid()),
+                        new ErasureScope("user", Guid.NewGuid()),
                         now,
                         ct
                     );

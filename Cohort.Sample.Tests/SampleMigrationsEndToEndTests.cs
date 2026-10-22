@@ -241,8 +241,17 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
             .Equal(System.Text.Encoding.UTF8.GetBytes(historicalLastError));
     }
 
-    [Fact]
-    public async Task Resolved_Period_Migration_Keeps_Each_Summary_Period_As_Months_And_Days()
+    [Theory]
+    // What 0.9 actually wrote: a TimeSpan is days plus a time of day, never months. The day
+    // count is kept as recorded, not re-expressed as years; the part of a day is dropped.
+    [InlineData("2555 days 12:00:00", 0, 2555)]
+    // A hand-written interval with years folds them into months.
+    [InlineData("7 years 3 days 12 hours", 84, 3)]
+    public async Task Resolved_Period_Migration_Keeps_Each_Summary_Period_As_Months_And_Days(
+        string historicalInterval,
+        int expectedMonths,
+        int expectedDays
+    )
     {
         var options = CreateOptions();
         var sweepId = Guid.NewGuid();
@@ -253,9 +262,9 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
             var migrator = db.Database.GetService<IMigrator>();
             await migrator.MigrateAsync("20260711150000_AddExplicitSweepRunStatus");
             await SeedHistoricalAuditRowsAsync(sweepId, tenantId);
-            // Years fold into months; the part of a day a TimeSpan could carry is dropped.
             await db.Database.ExecuteSqlRawAsync(
-                "UPDATE \"sweep_run_entity_summary\" SET \"ResolvedPeriod\" = INTERVAL '7 years 3 days 12 hours' WHERE \"SweepId\" = {0}",
+                "UPDATE \"sweep_run_entity_summary\" SET \"ResolvedPeriod\" = CAST({0} AS interval) WHERE \"SweepId\" = {1}",
+                historicalInterval,
                 sweepId
             );
 
@@ -270,8 +279,8 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
         command.Parameters.AddWithValue("sweepId", sweepId);
         await using var reader = await command.ExecuteReaderAsync();
         (await reader.ReadAsync()).Should().BeTrue();
-        reader.GetInt32(0).Should().Be(84);
-        reader.GetInt32(1).Should().Be(3);
+        reader.GetInt32(0).Should().Be(expectedMonths);
+        reader.GetInt32(1).Should().Be(expectedDays);
         (await GetColumnsAsync("sweep_run_entity_summary")).Should().NotContainKey("ResolvedPeriod");
     }
 

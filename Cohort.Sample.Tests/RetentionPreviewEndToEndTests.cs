@@ -245,23 +245,6 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
         return (bool)(await command.ExecuteScalarAsync())!;
     }
 
-    private sealed class StaticCategoryRepository(
-        IReadOnlyDictionary<string, ITestRetentionRule> resolvers
-    ) : ITestRetentionRuleProvider
-    {
-        private static readonly ITestRetentionRule ExemptFallback =
-            new StaticTestRetentionRule(
-                new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Exempt)
-            );
-
-        public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct)
-        {
-            return resolvers.TryGetValue(category, out var resolver)
-                ? Task.FromResult<ITestRetentionRule?>(resolver)
-                : Task.FromResult<ITestRetentionRule?>(ExemptFallback);
-        }
-    }
-
     private string GetConnectionString()
     {
         using var db = Host.CreateDbContext();

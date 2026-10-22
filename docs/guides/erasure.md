@@ -71,7 +71,7 @@ The run's audit row records the kind (`sweep_run.ErasureSubjectKind`, and
 
 Ordinary `Period` never delays erasure. Legal minimums and holds do:
 
-- With no positive `LegalMin`, Cohort adds no age condition at all. Null and future anchors
+- With no non-zero `LegalMin`, Cohort adds no age condition at all. Null and future anchors
   are eligible.
 - A non-zero `LegalMin` adds the strict condition `anchor < cutoff`, where the cutoff is the
   start of the day `LegalMin` before today, in the host's `TimeZone` (see

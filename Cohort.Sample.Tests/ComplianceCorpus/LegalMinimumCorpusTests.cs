@@ -220,6 +220,42 @@ public sealed class LegalMinimumCorpusTests(PostgresFixture fixture) : Integrati
         (await ReadResolvedPeriodAsync(march.SweepId)).Should().Be((84, 0));
     }
 
+    [Fact]
+    public async Task Preview_and_erasure_count_a_legal_minimum_in_the_host_time_zone()
+    {
+        var tenantId = Guid.NewGuid();
+        var tenant = new TenantContext(tenantId, "uk", new Dictionary<string, string>());
+        var subjectId = Guid.NewGuid();
+        // 23:30 BST on 1 Jul 2027: past the seven years on 2 Jul 2034 in London.
+        var firstJulyId = Guid.NewGuid();
+        // 00:30 BST on 2 Jul 2027, still 1 Jul in UTC: a UTC cutoff would reach it too.
+        var secondJulyId = Guid.NewGuid();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note { Id = firstJulyId, TenantId = tenantId, SubjectId = subjectId, CreatedAt = new DateTimeOffset(2027, 7, 1, 22, 30, 0, TimeSpan.Zero), Body = "1 Jul 2027 in London" },
+                new Note { Id = secondJulyId, TenantId = tenantId, SubjectId = subjectId, CreatedAt = new DateTimeOffset(2027, 7, 1, 23, 30, 0, TimeSpan.Zero), Body = "2 Jul 2027 in London" }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var host = new CohortTestHost(
+            ConnectionString,
+            new CalendarLegalMinimumRepository(),
+            new Dictionary<string, string?> { ["Cohort:TimeZone"] = "Europe/London" }
+        );
+        var now = new DateTimeOffset(2034, 7, 2, 12, 0, 0, TimeSpan.Zero);
+
+        var preview = await host.RunPreviewAsync(tenant, now);
+        await host.RunErasureAsync(tenant, new ErasureScope("user", subjectId), now);
+
+        preview.Counts.Should().Contain(count => count.EntityType == typeof(Note) && count.Affected == 1);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == firstJulyId)).Should().BeFalse();
+        (await verify.Notes.AnyAsync(note => note.Id == secondJulyId)).Should().BeTrue();
+    }
+
     private static TenantContext CreateTenant(Guid tenantId, string profile) =>
         new(tenantId, "uk", new Dictionary<string, string> { ["profile"] = profile });
 

@@ -194,6 +194,39 @@ public sealed class NonUtcOffsetEndToEndTests(PostgresFixture fixture)
         softDeleted.DeletedAt.Should().Be(asOf);
     }
 
+    [Fact]
+    public async Task Today_Comes_From_The_Configured_Zone_Not_From_The_Offset_Of_Now()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        // 23:30 UTC on 12 Apr is already 13 Apr at +01:00. In the default UTC zone today is
+        // 12 Apr, so 30 days back is 13 Mar and a row anchored on 13 Mar is kept.
+        var asOf = new DateTimeOffset(2026, 4, 12, 23, 30, 0, TimeSpan.Zero).ToOffset(PlusOneHour);
+        var sweptNoteId = Guid.NewGuid();
+        var erasedNoteId = Guid.NewGuid();
+        using var erasureHost = new CohortTestHost(ConnectionString, new LegalMinimumRuleProvider());
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note { Id = sweptNoteId, TenantId = tenantId, CreatedAt = new DateTimeOffset(2026, 3, 13, 12, 0, 0, TimeSpan.Zero), Body = "swept tenant row" },
+                new Note { Id = erasedNoteId, TenantId = tenantId, SubjectId = subjectId, CreatedAt = new DateTimeOffset(2026, 3, 13, 12, 0, 0, TimeSpan.Zero), Body = "erasure subject row" }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        var tenant = new TenantContext(tenantId, "uk", new Dictionary<string, string>());
+        var preview = await Host.RunPreviewAsync(tenant, asOf);
+        await erasureHost.RunErasureAsync(tenant, new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true), asOf);
+        await Host.RunSweepAsync(tenant, asOf);
+
+        preview.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note)).Which.Affected.Should().Be(0);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.Where(note => note.TenantId == tenantId).Select(note => note.Id).ToListAsync())
+            .Should()
+            .BeEquivalentTo([sweptNoteId, erasedNoteId]);
+    }
+
     private sealed class LegalMinimumRuleProvider : IRetentionRuleProvider
     {
         private readonly SampleRetentionRuleProvider sample = new();

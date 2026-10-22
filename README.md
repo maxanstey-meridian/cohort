@@ -145,7 +145,7 @@ the run is written to Cohort's ledger.
 
 - [Right-to-erasure](https://maxanstey-meridian.github.io/cohort/guides/erasure): erase one
   subject's rows immediately. Columns name the kind of subject they hold
-  (`[ErasureSubject("user")]`), so a user erasure never touches a person column. A positive
+  (`[ErasureSubject("user")]`), so a user erasure never touches a person column. A non-zero
   `LegalMin` and active holds still block it.
 - [Legal holds](https://maxanstey-meridian.github.io/cohort/guides/legal-holds): a held row
   survives every strategy. `IRetentionDeletion` lets your own deletes respect holds too.

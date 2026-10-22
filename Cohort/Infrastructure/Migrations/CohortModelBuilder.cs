@@ -2,6 +2,7 @@
 
 using Cohort.Infrastructure.Handlers;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Metadata.Builders;
 
 namespace Cohort.Infrastructure.Migrations;
@@ -92,6 +93,11 @@ public static class CohortModelBuilder
         }
 
         builder.HasKey(table.PrimaryKey.ToArray());
+        if (existing is not null && table.Role != CohortTableNames.SweepRowHandlerStatus)
+        {
+            EnsureNoUnwritableColumns(existing, table);
+        }
+
         foreach (var index in table.RequiredIndexes)
         {
             var indexBuilder = builder.HasIndex(index.Columns.ToArray()).IsUnique(index.Unique);
@@ -165,6 +171,40 @@ public static class CohortModelBuilder
 
         throw new InvalidOperationException(
             $"Entity {existing.ClrType.FullName} is mapped to table '{table.Name}', which Cohort manages, but its primary key ({string.Join(", ", keyNames)}) does not match the key Cohort expects ({string.Join(", ", table.PrimaryKey)}). This looks like a table-name collision rather than an intentional adoption; rename the entity's table, or map it with Cohort's key shape."
+        );
+    }
+
+    /// <summary>
+    /// Cohort inserts only the columns it manages. A required column it doesn't know about,
+    /// with no database default, would make every insert fail at run time, so it fails the
+    /// model instead. This is how a host entity still mapping a column Cohort has since
+    /// replaced (0.10.0's <c>ResolvedPeriod</c>) is caught before a sweep.
+    /// </summary>
+    private static void EnsureNoUnwritableColumns(
+        Microsoft.EntityFrameworkCore.Metadata.IMutableEntityType existing,
+        CohortSchemaContract.TableRequirement table
+    )
+    {
+        var unwritable = existing
+            .GetProperties()
+            .Where(property =>
+                !property.IsNullable
+                && property.FindAnnotation(RelationalAnnotationNames.DefaultValueSql) is null
+                && property.FindAnnotation(RelationalAnnotationNames.DefaultValue) is null
+                && property.FindAnnotation(RelationalAnnotationNames.ComputedColumnSql) is null
+                && !table.Columns.Any(column =>
+                    string.Equals(column.Name, property.Name, StringComparison.Ordinal)
+                )
+            )
+            .Select(property => property.Name)
+            .ToArray();
+        if (unwritable.Length == 0)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"Entity {existing.ClrType.FullName} is mapped to table '{table.Name}', which Cohort manages, but maps required column(s) Cohort does not write: {string.Join(", ", unwritable)}. Every Cohort insert into the table would fail. Remove the property (Cohort 0.10.0 replaced ResolvedPeriod with ResolvedMonths and ResolvedDays), make it nullable, or give it a database default."
         );
     }
 

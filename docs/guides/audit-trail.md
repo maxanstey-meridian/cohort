@@ -24,7 +24,7 @@ Summary rows carry:
 - skipped count
 - null-anchor count
 - resolved period: whichever of the period and legal minimum set the cutoff (the legal
-  minimum alone for an erasure), in two `integer` columns, `ResolvedMonths` and
+  minimum alone for an erasure, 0 and 0 when there is none), in two `integer` columns, `ResolvedMonths` and
   `ResolvedDays`. Years fold into months, so "7 years" is 84 months and 0 days.
 - optional provenance, in `RuleSource` and `RuleReason`
 
@@ -126,6 +126,12 @@ migrationBuilder.Sql(
     """);
 ```
 
-Use your Cohort schema if it isn't `public`. Any part of a day an old period carried is
-dropped.
+Use your Cohort schema if it isn't `public`. Old summaries keep their day count as recorded:
+a 0.9 rule of `TimeSpan.FromDays(2555)` becomes 0 months and 2,555 days, while the same rule
+written as `Years: 7` records 84 months and 0 days from now on. Any part of a day an old period
+carried is dropped.
+
+Apply the migration before starting 0.10.0. A 0.9 host can't write summaries once it has
+run, so don't mix versions across a rolling deploy. The code changes are listed under
+[Retention Rules](/guides/retention-rules#upgrading-to-0-10-0).
 :::

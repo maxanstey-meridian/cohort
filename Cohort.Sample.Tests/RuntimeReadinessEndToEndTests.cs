@@ -5,6 +5,8 @@ using Cohort.Infrastructure.Migrations;
 using Cohort.Sample.Entities;
 using Microsoft.Extensions.Configuration;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.Extensions.DependencyInjection;
 using Npgsql;
 
@@ -116,6 +118,40 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         await using var count = connection.CreateCommand();
         count.CommandText = "SELECT COUNT(*) FROM public.sweep_run";
         ((long)(await count.ExecuteScalarAsync())!).Should().Be(2);
+    }
+
+    [Fact]
+    public async Task Direct_sweep_refuses_a_0_9_schema_until_the_resolved_period_migration_is_applied()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        var options = new DbContextOptionsBuilder<SampleDbContext>()
+            .UseNpgsql(database.ConnectionString)
+            .Options;
+        await using (var db = new SampleDbContext(options))
+        {
+            await db.Database.GetService<IMigrator>()
+                .MigrateAsync("20261009090417_AddErasureSubjectKinds");
+        }
+
+        using var host = new CohortTestHost(database.ConnectionString);
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var now = new DateTimeOffset(2026, 7, 12, 12, 0, 0, TimeSpan.Zero);
+
+        var refused = () => host.RunSweepAsync(tenant, now);
+
+        var exception = await refused.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().Contain(error =>
+            error.Contains("ResolvedMonths", StringComparison.Ordinal)
+            && error.Contains("ResolvedDays", StringComparison.Ordinal)
+        );
+
+        await using (var db = new SampleDbContext(options))
+        {
+            await db.Database.MigrateAsync();
+        }
+
+        var result = await host.RunSweepAsync(tenant, now);
+        result.EntityFailures.Should().BeEmpty();
     }
 
     [Theory]

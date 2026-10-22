@@ -665,14 +665,6 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
-    private sealed class DeferredRuleResolver(RetentionRule rule) : ITestRetentionRule
-    {
-        public Task<RetentionRule> ResolveAsync(
-            RetentionResolutionContext ctx,
-            CancellationToken ct
-        ) => Task.FromResult(rule);
-    }
-
     private static RetentionStartupValidator CreateValidator(
         DbContext db,
         ITestRetentionRuleProvider repository
@@ -1309,19 +1301,5 @@ public sealed class RetentionStartupValidatorTests
     {
         public Guid Id { get; init; }
         public DateTimeOffset CreatedAt { get; init; }
-    }
-
-    private sealed class CountingCategoryRepository(ITestRetentionRuleProvider inner)
-        : ITestRetentionRuleProvider
-    {
-        private int getAsyncCount;
-
-        public int GetAsyncCount => Volatile.Read(ref getAsyncCount);
-
-        public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct)
-        {
-            Interlocked.Increment(ref getAsyncCount);
-            return inner.GetAsync(category, ct);
-        }
     }
 }

@@ -92,6 +92,7 @@ internal sealed class RetentionErasureService(
     )
     {
         var plan = new List<SweepScope>();
+        var timeZone = options.TimeZone;
         foreach (var entry in registry.Scan().Values)
         {
             if (entry.Tenant is null)
@@ -144,7 +145,7 @@ internal sealed class RetentionErasureService(
                         subjectMetadata.CreatePredicate(scope.Subject),
                         tenant,
                         now,
-                        options.TimeZone
+                        timeZone
                     )
                 );
             }

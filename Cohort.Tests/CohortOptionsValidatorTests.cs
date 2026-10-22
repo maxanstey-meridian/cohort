@@ -30,6 +30,17 @@ public sealed class CohortOptionsValidatorTests
     }
 
     [Theory]
+    [InlineData("UTC")]
+    [InlineData("Europe/London")]
+    [InlineData("GMT Standard Time")]
+    public void Validate_Accepts_IANA_And_Windows_Time_Zone_Ids(string timeZone)
+    {
+        var result = new CohortOptionsValidator().Validate(null, new CohortOptions { TimeZone = timeZone });
+
+        result.Succeeded.Should().BeTrue();
+    }
+
+    [Theory]
     [InlineData("PollInterval")]
     [InlineData("BatchSize")]
     [InlineData("MaxAttempts")]

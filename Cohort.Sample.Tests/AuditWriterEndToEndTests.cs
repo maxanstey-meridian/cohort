@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Data.Common;
 using Cohort.Application;
 using Cohort.Domain;
@@ -458,19 +457,6 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
             return resolvers.TryGetValue(category, out var resolver)
                 ? Task.FromResult<ITestRetentionRule?>(resolver)
                 : Task.FromResult<ITestRetentionRule?>(ExemptFallback);
-        }
-    }
-
-    private sealed class RecordingAuditObserver : IRetentionAuditObserver
-    {
-        private readonly ConcurrentQueue<SweepEvent> events = new();
-
-        public IReadOnlyList<SweepEvent> Events => events.ToArray();
-
-        public Task OnCommittedAsync(SweepEvent evt, CancellationToken ct)
-        {
-            events.Enqueue(evt);
-            return Task.CompletedTask;
         }
     }
 

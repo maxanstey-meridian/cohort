@@ -198,17 +198,6 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             .Equal("batch-keep-fresh");
     }
 
-    private sealed class OpaqueSoftDeleteRuleResolver : ITestRetentionRule
-    {
-        public Task<RetentionRule> ResolveAsync(
-            RetentionResolutionContext ctx,
-            CancellationToken ct
-        )
-        {
-            return Task.FromResult(new RetentionRule(new RetentionPeriod(Days: 30), Strategy.SoftDelete));
-        }
-    }
-
     private sealed class StaticCategoryRepository(
         IReadOnlyDictionary<string, ITestRetentionRule> resolvers
     ) : ITestRetentionRuleProvider

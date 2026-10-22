@@ -575,25 +575,6 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         throw new XunitException("Condition was not met within the allotted timeout.");
     }
 
-    private sealed class CountingCategoryRepository(IRetentionRuleProvider inner)
-        : IRetentionRuleProvider
-    {
-        public int GetAsyncCount => getAsyncCount;
-
-        private int getAsyncCount;
-
-        public RetentionCategoryCapabilities? GetCapabilities(string category)
-        {
-            Interlocked.Increment(ref getAsyncCount);
-            return inner.GetCapabilities(category);
-        }
-
-        public Task<RetentionRule?> ResolveAsync(
-            RetentionResolutionContext context,
-            CancellationToken ct
-        ) => inner.ResolveAsync(context, ct);
-    }
-
     private sealed class BlockingRuleProvider(IRetentionRuleProvider inner) : IRetentionRuleProvider
     {
         private readonly TaskCompletionSource entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -801,67 +782,6 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             {
                 provider.Record(logLevel, categoryName, formatter(state, exception));
             }
-        }
-    }
-
-    private sealed class TemporaryDatabase(string connectionString, string databaseName)
-        : IAsyncDisposable
-    {
-        public string ConnectionString => connectionString;
-
-        public static async Task<TemporaryDatabase> CreateAsync(string baseConnectionString)
-        {
-            var databaseName = $"cohort_worker_{Guid.NewGuid():N}";
-            var adminConnectionString = CreateAdminConnectionString(baseConnectionString);
-
-            await using var connection = new NpgsqlConnection(adminConnectionString);
-            await connection.OpenAsync();
-
-            await using (var command = connection.CreateCommand())
-            {
-                command.CommandText = $"CREATE DATABASE \"{databaseName}\"";
-                await command.ExecuteNonQueryAsync();
-            }
-
-            var builder = new NpgsqlConnectionStringBuilder(baseConnectionString)
-            {
-                Database = databaseName,
-            };
-
-            return new TemporaryDatabase(builder.ConnectionString, databaseName);
-        }
-
-        public async ValueTask DisposeAsync()
-        {
-            var adminConnectionString = CreateAdminConnectionString(connectionString);
-
-            await using var connection = new NpgsqlConnection(adminConnectionString);
-            await connection.OpenAsync();
-
-            await using (var terminate = connection.CreateCommand())
-            {
-                terminate.CommandText = $"""
-                    SELECT pg_terminate_backend(pid)
-                    FROM pg_stat_activity
-                    WHERE datname = '{databaseName}'
-                      AND pid <> pg_backend_pid()
-                    """;
-                await terminate.ExecuteNonQueryAsync();
-            }
-
-            await using var drop = connection.CreateCommand();
-            drop.CommandText = $"DROP DATABASE IF EXISTS \"{databaseName}\"";
-            await drop.ExecuteNonQueryAsync();
-        }
-
-        private static string CreateAdminConnectionString(string originalConnectionString)
-        {
-            var builder = new NpgsqlConnectionStringBuilder(originalConnectionString)
-            {
-                Database = "postgres",
-            };
-
-            return builder.ConnectionString;
         }
     }
 }

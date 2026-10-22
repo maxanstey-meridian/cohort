@@ -1837,17 +1837,6 @@ await using var verifyScope = services.CreateAsyncScope();
         }
     }
 
-    private sealed class OpaqueSoftDeleteRuleResolver : ITestRetentionRule
-    {
-        public Task<RetentionRule> ResolveAsync(
-            RetentionResolutionContext ctx,
-            CancellationToken ct
-        )
-        {
-            return Task.FromResult(new RetentionRule(new RetentionPeriod(Days: 30), Strategy.SoftDelete));
-        }
-    }
-
     private async Task<SweepRunRow> LoadRunAsync(Guid sweepId)
     {
         await using var db = Host.CreateDbContext();

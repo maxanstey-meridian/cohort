@@ -38,7 +38,9 @@ change up from your model like any other.
 
 Cohort validates the installed schema but never creates or upgrades it at runtime. Readiness
 requires the columns, keys, unique indexes (not deferrable) and named `CHECK` constraints
-Cohort relies on.
+Cohort relies on. It also refuses an extra `NOT NULL` column on a Cohort table that has no
+default and isn't an identity or generated column: Cohort's inserts leave it out, so every
+insert would fail.
 
 A missing performance-only index is logged as a warning rather than failing. Any index on
 the same key columns counts, unique or not.

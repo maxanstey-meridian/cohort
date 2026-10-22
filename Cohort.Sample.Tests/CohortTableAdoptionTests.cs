@@ -74,21 +74,6 @@ public sealed class CohortTableAdoptionTests
             .WithMessage("*sweep_run_entity_summary*table-name collision*");
     }
 
-    [Fact]
-    public void ConfigureCohortTables_Rejects_Entity_Summary_Still_Mapping_The_Replaced_ResolvedPeriod()
-    {
-        var options = new DbContextOptionsBuilder<PreCalendarSummaryDbContext>()
-            .UseNpgsqlMetadataModel($"pre-calendar-summary-{Guid.NewGuid()}")
-            .Options;
-        using var db = new PreCalendarSummaryDbContext(options);
-
-        var act = () => db.Model;
-
-        act.Should()
-            .Throw<InvalidOperationException>()
-            .WithMessage("*sweep_run_entity_summary*does not write: ResolvedPeriod*");
-    }
-
     private sealed class RogueSweepRunDbContext(DbContextOptions<RogueSweepRunDbContext> options)
         : DbContext(options)
     {
@@ -153,40 +138,6 @@ public sealed class CohortTableAdoptionTests
         public long NullAnchorCount { get; set; }
         public string? RuleSource { get; set; }
         public string? RuleReason { get; set; }
-    }
-
-    private sealed class PreCalendarSummaryDbContext(
-        DbContextOptions<PreCalendarSummaryDbContext> options
-    ) : DbContext(options)
-    {
-        protected override void OnModelCreating(ModelBuilder modelBuilder)
-        {
-            modelBuilder.Entity<PreCalendarSweepRunEntitySummary>(builder =>
-            {
-                builder.ToTable("sweep_run_entity_summary");
-                builder.HasKey(
-                    summary => new
-                    {
-                        summary.SweepId,
-                        summary.RetentionEntityId,
-                        summary.Category,
-                        summary.TenantId,
-                        summary.Strategy,
-                    }
-                );
-            });
-            modelBuilder.ConfigureCohortTables();
-        }
-    }
-
-    public sealed class PreCalendarSweepRunEntitySummary
-    {
-        public Guid SweepId { get; set; }
-        public Guid RetentionEntityId { get; set; }
-        public string Category { get; set; } = "";
-        public Guid TenantId { get; set; }
-        public int Strategy { get; set; }
-        public TimeSpan ResolvedPeriod { get; set; }
     }
 
     private sealed class CustomSchemaDbContext(DbContextOptions<CustomSchemaDbContext> options)

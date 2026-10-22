@@ -75,7 +75,7 @@ through the whole of its anniversary day:
   whatever the leap years in between;
 - from 31 March, one month back is the last day of February. So a row anchored on the last
   day of a shorter month can stay up to three days past its anniversary: one anchored on
-  28 February with a one-month period is kept until the end of 31 March;
+  28 February 2027 with a one-month period is kept until the end of 31 March 2027;
 - days are counted first, then years and months: the reverse of counting forward from the
   anchor, so a mixed period such as 1 month 28 days never reaches a row before its anniversary.
 

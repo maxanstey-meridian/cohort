@@ -17,10 +17,10 @@ public sealed class CohortOptions
     public bool KillSwitch { get; init; }
 
     /// <summary>
-    /// The time zone id (IANA, for example <c>Europe/London</c>; Windows ids are accepted too)
-    /// whose calendar retention periods are counted in: each period is counted back from
-    /// today's date in this zone, so a row is kept at least until the end of its anniversary
-    /// day there. Defaults to UTC. The schedule is always UTC.
+    /// The time zone id (IANA, for example <c>Europe/London</c>; Windows ids are accepted
+    /// where ICU is available) whose calendar retention periods are counted in: each period is
+    /// counted back from today's date in this zone, so a row is kept at least until the end of
+    /// its anniversary day there. Defaults to UTC. The schedule is always UTC.
     /// </summary>
     public string TimeZone { get; init; } = "UTC";
 

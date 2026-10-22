@@ -131,7 +131,9 @@ a 0.9 rule of `TimeSpan.FromDays(2555)` becomes 0 months and 2,555 days, while t
 written as `Years: 7` records 84 months and 0 days from now on. Any part of a day an old period
 carried is dropped.
 
-Apply the migration before starting 0.10.0. A 0.9 host can't write summaries once it has
-run, so don't mix versions across a rolling deploy. The code changes are listed under
+Apply the migration before starting 0.10.0. Once it has run, a 0.9 host can't write
+summaries, so don't mix versions across a rolling deploy. If the migration leaves
+`ResolvedPeriod` in place as a required column, readiness refuses to run until it's dropped.
+Drop it either way. The code changes are listed under
 [Retention Rules](/guides/retention-rules#upgrading-to-0-10-0).
 :::

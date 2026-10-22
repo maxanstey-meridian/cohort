@@ -68,5 +68,6 @@ columns or rows belong to it. So these are rejected:
 
 - The connection is PostgreSQL.
 - The installed Cohort schema has the required columns, keys, unique indexes and `CHECK`
-  constraints. See [Readiness](/reference/schema#readiness).
+  constraints, and no required column Cohort doesn't write. See
+  [Readiness](/reference/schema#readiness).
 - [Options](/reference/configuration) are in range.

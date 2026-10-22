@@ -45,6 +45,7 @@ internal sealed class CohortSchemaValidator(
             }
             var missing = new List<string>();
             var missingRecommended = new List<string>();
+            var unwritten = new List<string>();
 
             foreach (var table in CohortSchemaContract.Tables)
             {
@@ -71,6 +72,22 @@ internal sealed class CohortSchemaValidator(
                     {
                         missing.Add(
                             $"column capability '{table.Role}.{PostgreSqlIdentifier.Quote(column.Name)} {column.CatalogType} {(column.Nullable ? "NULL" : "NOT NULL")}{(column.Generated ? " GENERATED" : "")}' on table '{PostgreSqlIdentifier.Format(mappedTable)}'"
+                        );
+                    }
+                }
+
+                // Cohort inserts only its own columns, so a NOT NULL column it doesn't know about
+                // (such as 0.9's ResolvedPeriod left behind by a hand-edited migration) fails every
+                // insert unless the database fills it.
+                foreach (var ((columnTableId, columnName), actual) in columns)
+                {
+                    if (columnTableId == tableId
+                        && !actual.Nullable
+                        && !actual.FilledByDatabase
+                        && !table.Columns.Any(column => column.Name == columnName))
+                    {
+                        unwritten.Add(
+                            $"'{PostgreSqlIdentifier.Format(mappedTable)}.{PostgreSqlIdentifier.Quote(columnName)}'"
                         );
                     }
                 }
@@ -165,11 +182,22 @@ internal sealed class CohortSchemaValidator(
                 );
             }
 
+            var errors = new List<string>();
             if (missing.Count != 0)
             {
-                throw new RetentionConfigurationException([
-                    $"The configured PostgreSQL schema is missing Cohort runtime capabilities: {string.Join(", ", missing)}. Apply the host application's pending EF Core migrations before starting Cohort.",
-                ]);
+                errors.Add(
+                    $"The configured PostgreSQL schema is missing Cohort runtime capabilities: {string.Join(", ", missing)}. Apply the host application's pending EF Core migrations before starting Cohort."
+                );
+            }
+            if (unwritten.Count != 0)
+            {
+                errors.Add(
+                    $"Cohort tables have required columns Cohort does not write, so every Cohort insert into them would fail: {string.Join(", ", unwritten)}. Remove them from the host model and database (0.10.0 replaced ResolvedPeriod with ResolvedMonths and ResolvedDays), make them nullable, or give them a database default."
+                );
+            }
+            if (errors.Count != 0)
+            {
+                throw new RetentionConfigurationException(errors);
             }
         }
         finally
@@ -243,7 +271,8 @@ internal sealed class CohortSchemaValidator(
                    attidentity <> '' OR COALESCE(
                         pg_catalog.pg_get_expr(attrdef.adbin, attrdef.adrelid) LIKE 'nextval(%',
                        FALSE
-                   )
+                   ),
+                   attidentity <> '' OR attgenerated <> '' OR attrdef.adbin IS NOT NULL
             FROM pg_catalog.pg_attribute attribute
             JOIN pg_catalog.pg_type ON pg_type.oid = atttypid
             LEFT JOIN pg_catalog.pg_attrdef attrdef
@@ -266,7 +295,8 @@ internal sealed class CohortSchemaValidator(
                     reader.GetString(2),
                     reader.GetInt32(3),
                     reader.GetBoolean(4),
-                    reader.GetBoolean(5)
+                    reader.GetBoolean(5),
+                    reader.GetBoolean(6)
                 )
             );
         }
@@ -440,7 +470,8 @@ internal sealed class CohortSchemaValidator(
         string Type,
         int TypeModifier,
         bool Nullable,
-        bool Generated
+        bool Generated,
+        bool FilledByDatabase
     );
     private sealed record IndexStructure(
         uint TableId,

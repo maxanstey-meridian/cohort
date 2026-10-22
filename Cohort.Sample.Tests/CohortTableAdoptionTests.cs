@@ -130,7 +130,8 @@ public sealed class CohortTableAdoptionTests
         public Guid TenantId { get; set; }
         public int Strategy { get; set; }
         public DateTimeOffset At { get; set; }
-        public TimeSpan ResolvedPeriod { get; set; }
+        public int ResolvedMonths { get; set; }
+        public int ResolvedDays { get; set; }
         public long Affected { get; set; }
         public long HeldCount { get; set; }
         public long SkippedCount { get; set; }

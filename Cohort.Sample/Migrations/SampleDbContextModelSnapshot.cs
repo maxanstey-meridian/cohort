@@ -530,8 +530,11 @@ namespace Cohort.Sample.Migrations
                     b.Property<long>("NullAnchorCount")
                         .HasColumnType("bigint");
 
-                    b.Property<TimeSpan>("ResolvedPeriod")
-                        .HasColumnType("interval");
+                    b.Property<int>("ResolvedDays")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("ResolvedMonths")
+                        .HasColumnType("integer");
 
                     b.Property<string>("RuleReason")
                         .HasColumnType("text");

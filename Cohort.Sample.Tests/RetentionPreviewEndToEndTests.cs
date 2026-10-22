@@ -251,7 +251,7 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
     {
         private static readonly ITestRetentionRule ExemptFallback =
             new StaticTestRetentionRule(
-                new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+                new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Exempt)
             );
 
         public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct)

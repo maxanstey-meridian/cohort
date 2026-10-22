@@ -63,6 +63,7 @@ internal sealed class RetentionSweepEngine(
     )
     {
         var plan = new List<SweepScope>();
+        var timeZone = options.TimeZone;
         foreach (var entry in registry.Scan().Values)
         {
             if (
@@ -82,7 +83,7 @@ internal sealed class RetentionSweepEngine(
                     context,
                     ct
                 );
-                plan.Add(SweepScope.ForSweep(entry, rule, context));
+                plan.Add(SweepScope.ForSweep(entry, rule, context, timeZone));
             }
             catch (OperationCanceledException)
             {

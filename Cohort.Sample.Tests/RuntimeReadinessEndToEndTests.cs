@@ -329,7 +329,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             category == "session-key" ? new RetentionCategoryCapabilities([Strategy.Purge]) : null;
 
         public Task<RetentionRule?> ResolveAsync(RetentionResolutionContext context, CancellationToken ct) =>
-            Task.FromResult<RetentionRule?>(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge));
+            Task.FromResult<RetentionRule?>(new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge));
     }
 
     private sealed class UnsupportedProviderDbContext(

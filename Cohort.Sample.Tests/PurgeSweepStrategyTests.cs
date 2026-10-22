@@ -172,7 +172,7 @@ public sealed class PurgeSweepStrategyTests(PostgresFixture fixture)
     private sealed class PurgeCategoryRepository : ITestRetentionRuleProvider
     {
         private static readonly ITestRetentionRule Resolver = new StaticTestRetentionRule(
-            new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+            new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)
         );
 
         public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct) =>

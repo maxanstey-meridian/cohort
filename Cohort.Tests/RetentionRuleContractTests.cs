@@ -4,21 +4,36 @@ namespace Cohort.Tests;
 
 public sealed class RetentionRuleContractTests
 {
-    [Fact]
-    public void RetentionRule_Rejects_A_Negative_Period()
+    [Theory]
+    [InlineData(-1, 0, 0, "Years")]
+    [InlineData(0, -1, 0, "Months")]
+    [InlineData(0, 0, -1, "Days")]
+    [InlineData(int.MaxValue, 0, 0, "Years")]
+    public void RetentionPeriod_Rejects_A_Negative_Or_Unstorable_Part(
+        int years,
+        int months,
+        int days,
+        string parameterName
+    )
     {
-        var act = () => new RetentionRule(TimeSpan.FromDays(-30), Strategy.Purge);
+        var act = () => new RetentionPeriod(years, months, days);
 
-        act.Should().Throw<ArgumentOutOfRangeException>().WithParameterName("Period");
+        act.Should().Throw<ArgumentOutOfRangeException>().WithParameterName(parameterName);
     }
 
     [Fact]
-    public void RetentionRule_Rejects_A_Negative_Legal_Min()
+    public void RetentionPeriod_Carries_Twelve_Months_Into_A_Year_But_Never_Days_Into_A_Month()
     {
-        var act = () =>
-            new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge, TimeSpan.FromDays(-90));
+        new RetentionPeriod(Months: 18).Should().Be(new RetentionPeriod(Years: 1, Months: 6));
+        new RetentionPeriod(Days: 365).Should().NotBe(new RetentionPeriod(Years: 1));
+    }
 
-        act.Should().Throw<ArgumentOutOfRangeException>().WithParameterName("LegalMin");
+    [Fact]
+    public void RetentionRule_Requires_A_Period()
+    {
+        var act = () => new RetentionRule(null!, Strategy.Purge);
+
+        act.Should().Throw<ArgumentNullException>().WithParameterName("Period");
     }
 
     [Theory]
@@ -32,7 +47,7 @@ public sealed class RetentionRuleContractTests
     {
         var act = () =>
             new RetentionRule(
-                TimeSpan.FromDays(30),
+                new RetentionPeriod(Days: 30),
                 (Strategy)strategy,
                 AuditRowDetail: (AuditRowDetail)auditRowDetail
             );
@@ -45,7 +60,7 @@ public sealed class RetentionRuleContractTests
     {
         var act = () =>
             new RetentionRule(
-                TimeSpan.FromDays(30),
+                new RetentionPeriod(Days: 30),
                 Strategy.Purge,
                 AuditRowDetail: AuditRowDetail.Inherit
             );

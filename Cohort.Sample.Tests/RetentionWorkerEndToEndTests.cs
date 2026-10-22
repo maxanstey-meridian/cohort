@@ -640,7 +640,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             category == "second-install" ? new RetentionCategoryCapabilities([Strategy.Purge]) : null;
 
         public Task<RetentionRule?> ResolveAsync(RetentionResolutionContext context, CancellationToken ct) =>
-            Task.FromResult<RetentionRule?>(new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge));
+            Task.FromResult<RetentionRule?>(new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge));
     }
 
     private sealed class StaticTenantSource(params TenantContext[] tenants) : IRetentionTenantSource

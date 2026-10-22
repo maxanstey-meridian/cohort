@@ -58,7 +58,7 @@ public abstract record SweepEvent
             string Category,
             Guid TenantId,
             Strategy Strategy,
-            TimeSpan ResolvedPeriod,
+            RetentionPeriod ResolvedPeriod,
             long Affected,
             long HeldCount,
             long SkippedCount = 0,
@@ -73,7 +73,7 @@ public abstract record SweepEvent
             this.Category = RequiredText(Category, nameof(Category));
             this.TenantId = TenantId;
             this.Strategy = Defined(Strategy, nameof(Strategy));
-            this.ResolvedPeriod = NonNegative(ResolvedPeriod, nameof(ResolvedPeriod));
+            this.ResolvedPeriod = ResolvedPeriod ?? throw new ArgumentNullException(nameof(ResolvedPeriod));
             this.Affected = NonNegative(Affected, nameof(Affected));
             this.HeldCount = NonNegative(HeldCount, nameof(HeldCount));
             this.SkippedCount = NonNegative(SkippedCount, nameof(SkippedCount));
@@ -86,7 +86,11 @@ public abstract record SweepEvent
         public string Category { get; }
         public Guid TenantId { get; }
         public Strategy Strategy { get; }
-        public TimeSpan ResolvedPeriod { get; }
+        /// <summary>
+        /// The age a row had to reach: whichever of the period and the legal minimum set the
+        /// cutoff, or the legal minimum alone for an erasure.
+        /// </summary>
+        public RetentionPeriod ResolvedPeriod { get; }
         public long Affected { get; }
         public long HeldCount { get; }
         public long SkippedCount { get; }
@@ -104,7 +108,7 @@ public abstract record SweepEvent
             string Category,
             Guid TenantId,
             Strategy Strategy,
-            TimeSpan ResolvedPeriod,
+            RetentionPeriod ResolvedPeriod,
             long Affected,
             long SkippedCount,
             RetentionRuleProvenance? Provenance = null
@@ -117,7 +121,7 @@ public abstract record SweepEvent
             this.Category = RequiredText(Category, nameof(Category));
             this.TenantId = TenantId;
             this.Strategy = Defined(Strategy, nameof(Strategy));
-            this.ResolvedPeriod = NonNegative(ResolvedPeriod, nameof(ResolvedPeriod));
+            this.ResolvedPeriod = ResolvedPeriod ?? throw new ArgumentNullException(nameof(ResolvedPeriod));
             this.Affected = NonNegative(Affected, nameof(Affected));
             this.SkippedCount = NonNegative(SkippedCount, nameof(SkippedCount));
             this.Provenance = Provenance;
@@ -128,7 +132,11 @@ public abstract record SweepEvent
         public string Category { get; }
         public Guid TenantId { get; }
         public Strategy Strategy { get; }
-        public TimeSpan ResolvedPeriod { get; }
+        /// <summary>
+        /// The age a row had to reach: whichever of the period and the legal minimum set the
+        /// cutoff, or the legal minimum alone for an erasure.
+        /// </summary>
+        public RetentionPeriod ResolvedPeriod { get; }
         public long Affected { get; }
         public long SkippedCount { get; }
         public RetentionRuleProvenance? Provenance { get; }

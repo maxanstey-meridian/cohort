@@ -162,7 +162,7 @@ public sealed class StrategySemanticsCorpusTests(PostgresFixture fixture)
         {
             return Task.FromResult<ITestRetentionRule?>(
                 new StaticTestRetentionRule(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+                    new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Exempt)
                 )
             );
         }

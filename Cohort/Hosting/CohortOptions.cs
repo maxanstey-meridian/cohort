@@ -17,6 +17,13 @@ public sealed class CohortOptions
     public bool KillSwitch { get; init; }
 
     /// <summary>
+    /// The IANA time zone (for example <c>Europe/London</c>) whose calendar retention periods
+    /// are counted in: a row is kept until its anchor's date plus the period has passed in
+    /// this zone. Defaults to UTC. The schedule is always UTC.
+    /// </summary>
+    public string TimeZone { get; init; } = "UTC";
+
+    /// <summary>
     /// Maximum rows a strategy selects, locks, and mutates per transaction. Each batch
     /// commits independently, so a large backlog is retired incrementally instead of in
     /// one unbounded transaction.

@@ -41,9 +41,9 @@ Each category resolves through `IRetentionRuleProvider.ResolveAsync` to a `Reten
 
 ```csharp
 new RetentionRule(
-    Period: TimeSpan.FromDays(365),
+    Period: new RetentionPeriod(Years: 1),
     Strategy: Strategy.Anonymise,
-    LegalMin: TimeSpan.FromDays(180),               // optional
+    LegalMin: new RetentionPeriod(Months: 6),       // optional
     AuditRowDetail: AuditRowDetail.PerRow,          // optional, default SummaryOnly
     Provenance: new RetentionRuleProvenance(        // optional
         Source: "retention-policy-v4",
@@ -58,8 +58,29 @@ new RetentionRule(
   [Audit Trail](/guides/audit-trail).
 - `Provenance` is copied to the audit summary as `RuleSource` and `RuleReason`.
 
-`Period` and `LegalMin` must be non-negative. A negative period would compute a future
-cutoff and sweep everything, so `RetentionRule` rejects it.
+### Periods are calendar periods
+
+A `RetentionPeriod` is years, months and days, as retention schedules write them:
+`new RetentionPeriod(Years: 7)`, `new RetentionPeriod(Months: 18)`,
+`new RetentionPeriod(Days: 30)`. Twelve months carry into a year; days never carry into
+months, because a month has no fixed length.
+
+Cohort counts a period back from the date it is today in the host's
+[`TimeZone`](/reference/configuration#worker-and-sweeps), then cuts off at the start of the
+date that lands on. A row anchored on that date or later is kept, so a row is kept through
+the whole of its anniversary day and goes the day after:
+
+- a row anchored on 1 March 2027 with a 7-year period is kept until the end of 1 March 2034,
+  whatever the leap years in between;
+- from 31 March, one month back is the last day of February;
+- days are counted first, then years and months: the reverse of counting forward from the
+  anchor, so a mixed period such as 1 month 28 days never reaches a row before its anniversary.
+
+Where `Period` and `LegalMin` differ, the one that reaches further back from today wins. A
+month and 30 days can compare differently on different days of the year.
+
+A period's parts must be non-negative. A negative period would compute a future cutoff and
+sweep everything, so `RetentionPeriod` rejects it.
 
 `ResolveAsync` receives the category, the tenant and the logical time. A provider can
 therefore apply tenant-, jurisdiction- and time-specific policy. Return `null` when a

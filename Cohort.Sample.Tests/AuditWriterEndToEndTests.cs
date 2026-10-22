@@ -95,7 +95,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
                 {
                     ["short-lived"] = new StaticTestRetentionRule(
                         new RetentionRule(
-                            TimeSpan.FromDays(30),
+                            new RetentionPeriod(Days: 30),
                             Strategy.Purge,
                             AuditRowDetail: AuditRowDetail.PerRow,
                             Provenance: new RetentionRuleProvenance(
@@ -105,10 +105,10 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
                         )
                     ),
                     ["soft-delete"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.SoftDelete)
                     ),
                     ["anonymise"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
                     ),
                 }
             )
@@ -195,7 +195,8 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
                     "short-lived",
                     tenantId,
                     Strategy.Purge,
-                    TimeSpan.FromDays(30),
+                    ResolvedMonths: 0,
+                    ResolvedDays: 30,
                     1,
                     1,
                     0,
@@ -212,7 +213,8 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
                     "soft-delete",
                     tenantId,
                     Strategy.SoftDelete,
-                    TimeSpan.FromDays(30),
+                    ResolvedMonths: 0,
+                    ResolvedDays: 30,
                     1,
                     1,
                     0,
@@ -229,7 +231,8 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
                     "anonymise",
                     tenantId,
                     Strategy.Anonymise,
-                    TimeSpan.FromDays(30),
+                    ResolvedMonths: 0,
+                    ResolvedDays: 30,
                     1,
                     1,
                     0,
@@ -354,7 +357,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
         await using var db = Host.CreateDbContext();
         await using var command = await CreateCommandAsync(db, sweepId);
         command.CommandText = """
-            SELECT "SweepId", "EntityType", "Category", "TenantId", "Strategy", "ResolvedPeriod", "Affected", "HeldCount", "SkippedCount", "RuleSource", "RuleReason"
+            SELECT "SweepId", "EntityType", "Category", "TenantId", "Strategy", "ResolvedMonths", "ResolvedDays", "Affected", "HeldCount", "SkippedCount", "RuleSource", "RuleReason"
             FROM "sweep_run_entity_summary"
             WHERE "SweepId" = @sweepId
             ORDER BY "EntityType"
@@ -371,12 +374,13 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
                     reader.GetString(2),
                     reader.GetGuid(3),
                     (Strategy)reader.GetInt32(4),
-                    reader.GetFieldValue<TimeSpan>(5),
-                    reader.GetInt64(6),
+                    reader.GetInt32(5),
+                    reader.GetInt32(6),
                     reader.GetInt64(7),
                     reader.GetInt64(8),
-                    reader.IsDBNull(9) ? null : reader.GetString(9),
-                    reader.IsDBNull(10) ? null : reader.GetString(10)
+                    reader.GetInt64(9),
+                    reader.IsDBNull(10) ? null : reader.GetString(10),
+                    reader.IsDBNull(11) ? null : reader.GetString(11)
                 )
             );
         }
@@ -446,7 +450,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
     {
         private static readonly ITestRetentionRule ExemptFallback =
             new StaticTestRetentionRule(
-                new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+                new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Exempt)
             );
 
         public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct)
@@ -487,7 +491,8 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
         string Category,
         Guid TenantId,
         Strategy Strategy,
-        TimeSpan ResolvedPeriod,
+        int ResolvedMonths,
+        int ResolvedDays,
         long Affected,
         long HeldCount,
         long SkippedCount = 0,

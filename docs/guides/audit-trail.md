@@ -23,7 +23,9 @@ Summary rows carry:
 - held count
 - skipped count
 - null-anchor count
-- resolved period
+- resolved period: whichever of the period and legal minimum set the cutoff (the legal
+  minimum alone for an erasure), in two `integer` columns, `ResolvedMonths` and
+  `ResolvedDays`. Years fold into months, so "7 years" is 84 months and 0 days.
 - optional provenance, in `RuleSource` and `RuleReason`
 
 Within a run, a summary is uniquely identified by its
@@ -36,7 +38,7 @@ Tenantless runs are attributed to `Guid.Empty`, so summary keys stay unique.
 Per-row detail is opt-in. Set it on the rule:
 
 ```csharp
-new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge, AuditRowDetail: AuditRowDetail.PerRow)
+new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge, AuditRowDetail: AuditRowDetail.PerRow)
 ```
 
 or on the entity, which overrides the rule:
@@ -102,3 +104,28 @@ SQL values and subject identifiers are kept out of it, but the deliberately iden
 exception under the same diagnostic ID, so you can still diagnose it from protected logs.
 
 The ledger grows forever unless you opt in to [history pruning](/guides/history-pruning).
+
+## Upgrading to 0.10.0
+
+::: warning Breaking change
+`sweep_run_entity_summary.ResolvedPeriod` (`interval`) is replaced by two `integer` columns,
+`ResolvedMonths` and `ResolvedDays`, because a period now carries months. Add a migration:
+`dotnet ef migrations add` picks the change up from your model, and readiness refuses to run
+until it's applied.
+
+EF scaffolds it as a drop and two adds, which loses the period on existing summaries. Reorder
+it to add the two columns, copy each period across, then drop `ResolvedPeriod`:
+
+```csharp
+migrationBuilder.Sql(
+    """
+    UPDATE "public"."sweep_run_entity_summary"
+    SET "ResolvedMonths" = EXTRACT(YEAR FROM justify_hours("ResolvedPeriod"))::integer * 12
+                         + EXTRACT(MONTH FROM justify_hours("ResolvedPeriod"))::integer,
+        "ResolvedDays" = EXTRACT(DAY FROM justify_hours("ResolvedPeriod"))::integer;
+    """);
+```
+
+Use your Cohort schema if it isn't `public`. Any part of a day an old period carried is
+dropped.
+:::

@@ -202,7 +202,7 @@ public sealed class RetentionRuleProviderEndToEndTests(PostgresFixture fixture)
             };
             return Task.FromResult<RetentionRule?>(
                 new RetentionRule(
-                    isLenient ? TimeSpan.FromDays(60) : TimeSpan.FromDays(30),
+                    isLenient ? new RetentionPeriod(Days: 60) : new RetentionPeriod(Days: 30),
                     strategy
                 )
             );
@@ -238,7 +238,7 @@ public sealed class RetentionRuleProviderEndToEndTests(PostgresFixture fixture)
             if (nextCategory is null)
             {
                 var strategy = GetCapabilities(category)!.Strategies.Single();
-                return new RetentionRule(TimeSpan.FromDays(30), strategy);
+                return new RetentionRule(new RetentionPeriod(Days: 30), strategy);
             }
 
             if (path.Contains(nextCategory, StringComparer.Ordinal))
@@ -261,7 +261,7 @@ public sealed class RetentionRuleProviderEndToEndTests(PostgresFixture fixture)
             RetentionResolutionContext context,
             CancellationToken ct
         ) => Task.FromResult<RetentionRule?>(
-            new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+            new RetentionRule(new RetentionPeriod(Days: 30), Strategy.SoftDelete)
         );
     }
 
@@ -305,7 +305,7 @@ public sealed class RetentionRuleProviderEndToEndTests(PostgresFixture fixture)
         ) =>
             changed && context.Category == "short-lived"
                 ? Task.FromResult<RetentionRule?>(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    new RetentionRule(new RetentionPeriod(Days: 30), Strategy.SoftDelete)
                 )
                 : inner.ResolveAsync(context, ct);
 

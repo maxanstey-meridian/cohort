@@ -4,7 +4,7 @@ Project-specific agent instructions. Read this before writing tests or adding fe
 
 ## What Cohort is
 
-Standalone .NET 9 class library. Annotation-driven retention for EF Core consumers (Postgres-only SQL). Hosts annotate entities with `[Retain(category, anchor)]`, register an `IRetentionRuleProvider` with declared strategy capabilities, and Cohort previews, sweeps, or erases rows through public application ports. Ordinary retention uses `max(Period, LegalMin)`; subject erasure ignores `Period` but remains blocked by positive `LegalMin` and active holds.
+Standalone .NET 9 class library. Annotation-driven retention for EF Core consumers (Postgres-only SQL). Hosts annotate entities with `[Retain(category, anchor)]`, register an `IRetentionRuleProvider` with declared strategy capabilities, and Cohort previews, sweeps, or erases rows through public application ports. Ordinary retention uses whichever of `Period` and `LegalMin` reaches further back from today; subject erasure ignores `Period` but remains blocked by positive `LegalMin` and active holds.
 
 ## Test-writing rules — READ BEFORE WRITING ANY TEST
 

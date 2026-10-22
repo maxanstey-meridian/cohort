@@ -81,7 +81,7 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
         await using (var summaryCommand = verify.Database.GetDbConnection().CreateCommand())
         {
             summaryCommand.CommandText = """
-                SELECT "EntityType", "Category", "Strategy", "ResolvedPeriod", "Affected", "HeldCount", "SkippedCount"
+                SELECT "EntityType", "Category", "Strategy", "ResolvedMonths", "ResolvedDays", "Affected", "HeldCount", "SkippedCount"
                 FROM "sweep_run_entity_summary"
                 WHERE "SweepId" = @sweepId
                 ORDER BY "EntityType"
@@ -91,7 +91,7 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
             sweepId.Value = result.SweepId;
             summaryCommand.Parameters.Add(sweepId);
 
-            var summaries = new List<(string, string, Strategy, TimeSpan, long, long, long)>();
+            var summaries = new List<(string, string, Strategy, int, int, long, long, long)>();
             await using var reader = await summaryCommand.ExecuteReaderAsync();
             while (await reader.ReadAsync())
             {
@@ -100,10 +100,11 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
                         reader.GetString(0),
                         reader.GetString(1),
                         (Strategy)reader.GetInt32(2),
-                        reader.GetFieldValue<TimeSpan>(3),
-                        reader.GetInt64(4),
+                        reader.GetInt32(3),
+                        reader.GetInt32(4),
                         reader.GetInt64(5),
-                        reader.GetInt64(6)
+                        reader.GetInt64(6),
+                        reader.GetInt64(7)
                     )
                 );
             }
@@ -115,7 +116,8 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
                         typeof(ARestrictiveParent).FullName!,
                         "restrictive-fk",
                         Strategy.Purge,
-                        TimeSpan.FromDays(30),
+                        0,
+                        30,
                         1L,
                         0L,
                         0L
@@ -124,7 +126,8 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
                         typeof(ZRestrictiveChild).FullName!,
                         "restrictive-fk",
                         Strategy.Purge,
-                        TimeSpan.FromDays(30),
+                        0,
+                        30,
                         1L,
                         0L,
                         0L
@@ -151,7 +154,7 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
     private sealed class PurgeCategoryRepository : ITestRetentionRuleProvider
     {
         private static readonly ITestRetentionRule Resolver = new StaticTestRetentionRule(
-            new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+            new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)
         );
 
         public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct) =>

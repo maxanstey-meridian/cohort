@@ -27,6 +27,15 @@ internal sealed class CohortOptionsValidator : IValidateOptions<CohortOptions>
             }
         }
 
+        if (string.IsNullOrWhiteSpace(options.TimeZone))
+        {
+            errors.Add("Cohort TimeZone cannot be blank.");
+        }
+        else if (!TimeZoneInfo.TryFindSystemTimeZoneById(options.TimeZone, out _))
+        {
+            errors.Add($"Cohort TimeZone '{options.TimeZone}' is not a time zone this host knows.");
+        }
+
         if (options.SweepBatchSize < 1)
         {
             errors.Add("Cohort SweepBatchSize must be at least 1.");

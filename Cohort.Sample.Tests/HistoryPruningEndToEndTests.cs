@@ -352,9 +352,9 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
 
             INSERT INTO "sweep_run_entity_summary"
                 ("SweepId", "At", "EntityType", "RetentionEntityId", "Category", "TenantId", "Strategy",
-                 "ResolvedPeriod", "Affected", "HeldCount", "SkippedCount", "NullAnchorCount")
+                 "ResolvedMonths", "ResolvedDays", "Affected", "HeldCount", "SkippedCount", "NullAnchorCount")
             VALUES (@sweepId, @startedAt, 'Cohort.Sample.Entities.Note', @entityId, 'short-lived', @tenantId, @strategy,
-                    INTERVAL '30 days', 1, 0, 0, 0);
+                    0, 30, 1, 0, 0, 0);
 
             WITH detail AS (
                 INSERT INTO "sweep_run_row_detail"

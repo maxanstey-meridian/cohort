@@ -10,7 +10,7 @@ namespace Cohort.Sample.Tests;
 public sealed class RetentionStartupValidatorTests
 {
     private static readonly ITestRetentionRule ExemptResolver = new StaticTestRetentionRule(
-        new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Exempt)
     );
 
     [Fact]
@@ -111,7 +111,7 @@ public sealed class RetentionStartupValidatorTests
             new Dictionary<string, ITestRetentionRule>
             {
                 ["broken-sample"] = new StaticTestRetentionRule(
-                    new RetentionRule(TimeSpan.FromDays(90), Strategy.Purge)
+                    new RetentionRule(new RetentionPeriod(Days: 90), Strategy.Purge)
                 ),
             }
         );
@@ -188,7 +188,7 @@ public sealed class RetentionStartupValidatorTests
             new Dictionary<string, ITestRetentionRule>
             {
                 ["valid-category"] = new StaticTestRetentionRule(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)
                 ),
             }
         );
@@ -265,7 +265,7 @@ public sealed class RetentionStartupValidatorTests
             new Dictionary<string, ITestRetentionRule>
             {
                 ["invalid-soft-delete"] = new StaticTestRetentionRule(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    new RetentionRule(new RetentionPeriod(Days: 30), Strategy.SoftDelete)
                 ),
             }
         );
@@ -295,7 +295,7 @@ public sealed class RetentionStartupValidatorTests
             new Dictionary<string, ITestRetentionRule>
             {
                 ["missing-soft-delete-tenant"] = new StaticTestRetentionRule(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    new RetentionRule(new RetentionPeriod(Days: 30), Strategy.SoftDelete)
                 ),
             }
         );
@@ -323,13 +323,13 @@ public sealed class RetentionStartupValidatorTests
             new Dictionary<string, ITestRetentionRule>
             {
                 ["short-lived"] = new StaticTestRetentionRule(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
                 ),
                 ["soft-delete"] = new StaticTestRetentionRule(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    new RetentionRule(new RetentionPeriod(Days: 30), Strategy.SoftDelete)
                 ),
                 ["anonymise"] = new StaticTestRetentionRule(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
                 ),
                 // Other sample entities in SampleDbContext aren't the subject of this test;
                 // resolve them as Exempt so only the Anonymise-on-Note mismatch surfaces.
@@ -369,7 +369,7 @@ public sealed class RetentionStartupValidatorTests
             new Dictionary<string, ITestRetentionRule>
             {
                 ["required-null-anonymise"] = new StaticTestRetentionRule(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
                 ),
             }
         );
@@ -395,7 +395,7 @@ public sealed class RetentionStartupValidatorTests
             new Dictionary<string, ITestRetentionRule>
             {
                 ["structural-anonymise"] = new StaticTestRetentionRule(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
                 ),
             }
         );
@@ -439,7 +439,7 @@ public sealed class RetentionStartupValidatorTests
             new Dictionary<string, ITestRetentionRule>
             {
                 ["inheritance-base"] = new StaticTestRetentionRule(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)
                 ),
             }
         );
@@ -467,10 +467,10 @@ public sealed class RetentionStartupValidatorTests
             new Dictionary<string, ITestRetentionRule>
             {
                 ["cascade-parent"] = new StaticTestRetentionRule(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)
                 ),
                 ["cascade-child"] = new StaticTestRetentionRule(
-                    new RetentionRule(TimeSpan.FromDays(365), Strategy.Purge)
+                    new RetentionRule(new RetentionPeriod(Days: 365), Strategy.Purge)
                 ),
             }
         );
@@ -500,7 +500,7 @@ public sealed class RetentionStartupValidatorTests
             new Dictionary<string, ITestRetentionRule>
             {
                 ["structural-converters"] = new StaticTestRetentionRule(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    new RetentionRule(new RetentionPeriod(Days: 30), Strategy.SoftDelete)
                 ),
             }
         );
@@ -526,7 +526,7 @@ public sealed class RetentionStartupValidatorTests
             new Dictionary<string, ITestRetentionRule>
             {
                 ["self-cascade"] = new StaticTestRetentionRule(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)
                 ),
             }
         );
@@ -550,7 +550,7 @@ public sealed class RetentionStartupValidatorTests
             new Dictionary<string, ITestRetentionRule>
             {
                 ["duplicate-tenant-marker"] = new StaticTestRetentionRule(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)
                 ),
             }
         );
@@ -579,7 +579,7 @@ public sealed class RetentionStartupValidatorTests
             new Dictionary<string, ITestRetentionRule>
             {
                 ["naive-anchor"] = new StaticTestRetentionRule(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                    new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)
                 ),
             }
         );
@@ -611,7 +611,7 @@ public sealed class RetentionStartupValidatorTests
             new Dictionary<string, ITestRetentionRule>
             {
                 ["timestamptz-alias"] = new StaticTestRetentionRule(
-                    new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    new RetentionRule(new RetentionPeriod(Days: 30), Strategy.SoftDelete)
                 ),
             }
         );

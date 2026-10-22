@@ -231,7 +231,7 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
     private sealed class CategoryRepository(Strategy strategy) : ITestRetentionRuleProvider
     {
         private readonly ITestRetentionRule resolver = new StaticTestRetentionRule(
-            new RetentionRule(TimeSpan.FromDays(30), strategy)
+            new RetentionRule(new RetentionPeriod(Days: 30), strategy)
         );
 
         public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct) =>

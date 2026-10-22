@@ -546,7 +546,7 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
                 new Dictionary<string, ITestRetentionRule>
                 {
                     ["jsonb-anonymise"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
                     ),
                 }
             )
@@ -653,7 +653,7 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
             new StaticCategoryRepository(
                 new Dictionary<string, ITestRetentionRule>
                 {
-                    [category] = new StaticTestRetentionRule(new RetentionRule(TimeSpan.FromDays(30), strategy)),
+                    [category] = new StaticTestRetentionRule(new RetentionRule(new RetentionPeriod(Days: 30), strategy)),
                 }
             )
         );
@@ -683,10 +683,10 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
                 new Dictionary<string, ITestRetentionRule>
                 {
                     ["factory-backed-set-based"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
                     ),
                     ["factory-backed-per-row"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
                     ),
                 }
             )
@@ -725,10 +725,10 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
                 new Dictionary<string, ITestRetentionRule>
                 {
                     ["converted-original-value"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
                     ),
                     ["converted-set-based-value"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
                     ),
                 }
             )
@@ -1086,7 +1086,7 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         // (e.g. categories owned by other sample entities sharing SampleDbContext).
         private static readonly ITestRetentionRule ExemptFallback =
             new StaticTestRetentionRule(
-                new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+                new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Exempt)
             );
 
         public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct)

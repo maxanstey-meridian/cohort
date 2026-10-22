@@ -42,17 +42,17 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
                 {
                     resolver = new TransactionAssertingResolver(
                         provider.GetRequiredService<SampleDbContext>(),
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)
                     );
                     return new StaticCategoryRepository(
                         new Dictionary<string, ITestRetentionRule>
                         {
                             ["short-lived"] = resolver,
                             ["soft-delete"] = new StaticTestRetentionRule(
-                                new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                                new RetentionRule(new RetentionPeriod(Days: 30), Strategy.SoftDelete)
                             ),
                             ["anonymise"] = new StaticTestRetentionRule(
-                                new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                                new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
                             ),
                         }
                     );
@@ -170,7 +170,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
                 new Dictionary<string, ITestRetentionRule>
                 {
                     ["short-lived"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)
                     ),
                 }
             ),
@@ -205,7 +205,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             CancellationToken ct
         )
         {
-            return Task.FromResult(new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete));
+            return Task.FromResult(new RetentionRule(new RetentionPeriod(Days: 30), Strategy.SoftDelete));
         }
     }
 
@@ -215,7 +215,7 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
     {
         private static readonly ITestRetentionRule ExemptFallback =
             new StaticTestRetentionRule(
-                new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+                new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Exempt)
             );
 
         public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct)

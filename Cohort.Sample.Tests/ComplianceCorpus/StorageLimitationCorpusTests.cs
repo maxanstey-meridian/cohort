@@ -51,16 +51,16 @@ public sealed class StorageLimitationCorpusTests(PostgresFixture fixture)
         (await verify.Notes.AnyAsync(note => note.Id == freshId)).Should().BeTrue();
         (await verify.NullableAnchorEvents.AnyAsync(row => row.Id == nullAnchorId)).Should().BeTrue();
 
+        // A zero period keeps a row for the rest of its anchor's day, and no longer.
+        var startOfToday = new DateTimeOffset(2026, 7, 12, 0, 0, 0, TimeSpan.Zero);
         var zeroRetentionId = Guid.NewGuid();
+        var zeroRetentionTodayId = Guid.NewGuid();
         await using (var seedZeroRetention = Host.CreateDbContext())
         {
-            seedZeroRetention.Notes.Add(new Note
-            {
-                Id = zeroRetentionId,
-                TenantId = tenantId,
-                CreatedAt = now.AddTicks(-1),
-                Body = "zero retention",
-            });
+            seedZeroRetention.Notes.AddRange(
+                new Note { Id = zeroRetentionId, TenantId = tenantId, CreatedAt = startOfToday.AddTicks(-1), Body = "zero retention, yesterday" },
+                new Note { Id = zeroRetentionTodayId, TenantId = tenantId, CreatedAt = startOfToday, Body = "zero retention, today" }
+            );
             await seedZeroRetention.SaveChangesAsync();
         }
 
@@ -76,6 +76,9 @@ public sealed class StorageLimitationCorpusTests(PostgresFixture fixture)
         (await verifyZeroRetention.Notes.AnyAsync(note => note.Id == zeroRetentionId))
             .Should()
             .BeFalse();
+        (await verifyZeroRetention.Notes.AnyAsync(note => note.Id == zeroRetentionTodayId))
+            .Should()
+            .BeTrue();
     }
 
     private sealed class ZeroRetentionCategoryRepository : ITestRetentionRuleProvider
@@ -84,7 +87,7 @@ public sealed class StorageLimitationCorpusTests(PostgresFixture fixture)
         {
             var strategy = category == "short-lived" ? Strategy.Purge : Strategy.Exempt;
             return Task.FromResult<ITestRetentionRule?>(
-                new StaticTestRetentionRule(new RetentionRule(TimeSpan.Zero, strategy))
+                new StaticTestRetentionRule(new RetentionRule(new RetentionPeriod(), strategy))
             );
         }
     }

@@ -468,13 +468,13 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             await db.SaveChangesAsync();
         }
 
-        var legalMin = TimeSpan.FromDays(90);
+        var legalMin = new RetentionPeriod(Days: 90);
         using var erasureHost = new CohortTestHost(
             GetConnectionString(),
             CreateErasureCategoryRepository(
-                shortLivedRule: new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge, legalMin),
-                softDeleteRule: new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete, legalMin),
-                anonymiseRule: new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise, legalMin)
+                shortLivedRule: new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge, legalMin),
+                softDeleteRule: new RetentionRule(new RetentionPeriod(Days: 30), Strategy.SoftDelete, legalMin),
+                anonymiseRule: new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise, legalMin)
             )
         );
         await using var blocker = new NpgsqlConnection(GetConnectionString());
@@ -517,7 +517,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             changeEligibility.Parameters.AddWithValue("subjectChangedNoteId", subjectChangedNoteId);
             changeEligibility.Parameters.AddWithValue("replacementTenantId", replacementTenantId);
             changeEligibility.Parameters.AddWithValue("softDeleteId", tenantChangedSoftDeleteId);
-            changeEligibility.Parameters.AddWithValue("boundary", asOf - legalMin);
+            changeEligibility.Parameters.AddWithValue("boundary", asOf.AddDays(-legalMin.Days));
             changeEligibility.Parameters.AddWithValue("contactId", anchorChangedContactId);
             changeEligibility.Parameters.AddWithValue("holdId", Guid.NewGuid());
             changeEligibility.Parameters.AddWithValue("retentionEntityId", RetentionEntityIdentity.For<Note>());
@@ -723,10 +723,10 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                 new Dictionary<string, ITestRetentionRule>
                 {
                     ["citext-subject-purge"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)
                     ),
                     ["citext-subject-anonymise"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
                     ),
                 }
             )
@@ -769,7 +769,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                 new Dictionary<string, ITestRetentionRule>
                 {
                     ["bounded-subject-purge"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)
                     ),
                 }
             )
@@ -828,7 +828,7 @@ await using var verifyScope = services.CreateAsyncScope();
                 new Dictionary<string, ITestRetentionRule>
                 {
                     ["bounded-anonymise"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
                     ),
                 }
             )
@@ -884,7 +884,7 @@ await using var verifyScope = services.CreateAsyncScope();
                 new Dictionary<string, ITestRetentionRule>
                 {
                     ["model-variant"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)
                     ),
                 }
             )
@@ -943,7 +943,7 @@ await using var verifyScope = services.CreateAsyncScope();
                 new Dictionary<string, ITestRetentionRule>
                 {
                     ["single-subject-erasure"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(365), Strategy.Purge)
+                        new RetentionRule(new RetentionPeriod(Days: 365), Strategy.Purge)
                     ),
                 }
             )
@@ -985,7 +985,7 @@ await using var verifyScope = services.CreateAsyncScope();
             var verify = verifyScope.ServiceProvider.GetRequiredService<SinglePredicateResolutionDbContext>();
             (await verify.SingleSubjectRecords.CountAsync()).Should().Be(0);
             var summary = (await LoadSummariesAsync(verify, result.SweepId)).Should().ContainSingle().Which;
-            summary.ResolvedPeriod.Should().Be(TimeSpan.Zero);
+            (summary.ResolvedMonths, summary.ResolvedDays).Should().Be((0, 0));
             summary.NullAnchorCount.Should().Be(0);
         }
 
@@ -997,9 +997,9 @@ await using var verifyScope = services.CreateAsyncScope();
                 {
                     ["single-subject-erasure"] = new StaticTestRetentionRule(
                         new RetentionRule(
-                            TimeSpan.FromDays(365),
+                            new RetentionPeriod(Days: 365),
                             Strategy.Purge,
-                            TimeSpan.FromDays(90)
+                            new RetentionPeriod(Days: 90)
                         )
                     ),
                 }
@@ -1010,14 +1010,16 @@ await using var verifyScope = services.CreateAsyncScope();
             var exactBoundaryId = Guid.NewGuid();
             var eligibleId = Guid.NewGuid();
             var futureAnchorId = Guid.NewGuid();
+            // 90 days back from 12 Apr is 12 Jan, so a row anchored at any time on 12 Jan is kept.
+            var startOfBoundaryDay = new DateTimeOffset(2026, 1, 12, 0, 0, 0, TimeSpan.Zero);
             await using (var seedScope = services.CreateAsyncScope())
             {
                 var db = seedScope.ServiceProvider.GetRequiredService<SinglePredicateResolutionDbContext>();
                 await db.Database.EnsureCreatedAsync();
                 db.SingleSubjectRecords.AddRange(
                     new SingleSubjectPredicateRecord { Id = nullAnchorId, TenantId = tenantId, CustomerReference = subjectId, CreatedAt = null },
-                    new SingleSubjectPredicateRecord { Id = exactBoundaryId, TenantId = tenantId, CustomerReference = subjectId, CreatedAt = asOf.AddDays(-90) },
-                    new SingleSubjectPredicateRecord { Id = eligibleId, TenantId = tenantId, CustomerReference = subjectId, CreatedAt = asOf.AddDays(-90).AddTicks(-1) },
+                    new SingleSubjectPredicateRecord { Id = exactBoundaryId, TenantId = tenantId, CustomerReference = subjectId, CreatedAt = startOfBoundaryDay },
+                    new SingleSubjectPredicateRecord { Id = eligibleId, TenantId = tenantId, CustomerReference = subjectId, CreatedAt = startOfBoundaryDay.AddTicks(-1) },
                     new SingleSubjectPredicateRecord { Id = futureAnchorId, TenantId = tenantId, CustomerReference = subjectId, CreatedAt = asOf.AddDays(1) }
                 );
                 await db.SaveChangesAsync();
@@ -1051,7 +1053,7 @@ await using var verifyScope = services.CreateAsyncScope();
                 .Should()
                 .BeEquivalentTo([nullAnchorId, exactBoundaryId, futureAnchorId]);
             var summary = (await LoadSummariesAsync(verify, result.SweepId)).Should().ContainSingle().Which;
-            summary.ResolvedPeriod.Should().Be(TimeSpan.FromDays(90));
+            (summary.ResolvedMonths, summary.ResolvedDays).Should().Be((0, 90));
             summary.NullAnchorCount.Should().Be(1);
         }
     }
@@ -1066,7 +1068,7 @@ await using var verifyScope = services.CreateAsyncScope();
                 new Dictionary<string, ITestRetentionRule>
                 {
                     ["multi-subject-erasure"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge, AuditRowDetail: AuditRowDetail.PerRow)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge, AuditRowDetail: AuditRowDetail.PerRow)
                     ),
                 }
             )
@@ -1121,10 +1123,10 @@ await using var verifyScope = services.CreateAsyncScope();
                 new Dictionary<string, ITestRetentionRule>
                 {
                     ["incompatible-multi-subject-erasure"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)
                     ),
                     ["incompatible-kind-erasure"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)
                     ),
                 }
             )
@@ -1842,7 +1844,7 @@ await using var verifyScope = services.CreateAsyncScope();
             CancellationToken ct
         )
         {
-            return Task.FromResult(new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete));
+            return Task.FromResult(new RetentionRule(new RetentionPeriod(Days: 30), Strategy.SoftDelete));
         }
     }
 
@@ -1884,7 +1886,7 @@ await using var verifyScope = services.CreateAsyncScope();
     {
         await using var command = await CreateCommandAsync(db, sweepId);
         command.CommandText = """
-            SELECT "SweepId", "EntityType", "Category", "TenantId", "Strategy", "ResolvedPeriod", "Affected", "HeldCount", "SkippedCount", "RuleSource", "RuleReason", "NullAnchorCount"
+            SELECT "SweepId", "EntityType", "Category", "TenantId", "Strategy", "ResolvedMonths", "ResolvedDays", "Affected", "HeldCount", "SkippedCount", "RuleSource", "RuleReason", "NullAnchorCount"
             FROM "sweep_run_entity_summary"
             WHERE "SweepId" = @sweepId
             ORDER BY "EntityType"
@@ -1901,13 +1903,14 @@ await using var verifyScope = services.CreateAsyncScope();
                     reader.GetString(2),
                     reader.GetGuid(3),
                     (Strategy)reader.GetInt32(4),
-                    reader.GetFieldValue<TimeSpan>(5),
-                    reader.GetInt64(6),
+                    reader.GetInt32(5),
+                    reader.GetInt32(6),
                     reader.GetInt64(7),
                     reader.GetInt64(8),
-                    reader.IsDBNull(9) ? null : reader.GetString(9),
+                    reader.GetInt64(9),
                     reader.IsDBNull(10) ? null : reader.GetString(10),
-                    reader.GetInt64(11)
+                    reader.IsDBNull(11) ? null : reader.GetString(11),
+                    reader.GetInt64(12)
                 )
             );
         }
@@ -1985,7 +1988,7 @@ await using var verifyScope = services.CreateAsyncScope();
     {
         private static readonly ITestRetentionRule ExemptFallback =
             new StaticTestRetentionRule(
-                new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+                new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Exempt)
             );
 
         public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct)
@@ -2013,7 +2016,8 @@ await using var verifyScope = services.CreateAsyncScope();
         string Category,
         Guid TenantId,
         Strategy Strategy,
-        TimeSpan ResolvedPeriod,
+        int ResolvedMonths,
+        int ResolvedDays,
         long Affected,
         long HeldCount,
         long SkippedCount = 0,
@@ -2074,16 +2078,16 @@ await using var verifyScope = services.CreateAsyncScope();
                 ["short-lived"] = new StaticTestRetentionRule(
                     shortLivedRule
                         ?? new RetentionRule(
-                            TimeSpan.FromDays(30),
+                            new RetentionPeriod(Days: 30),
                             Strategy.Purge,
                             AuditRowDetail: AuditRowDetail.PerRow
                         )
                 ),
                 ["soft-delete"] = new StaticTestRetentionRule(
-                    softDeleteRule ?? new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    softDeleteRule ?? new RetentionRule(new RetentionPeriod(Days: 30), Strategy.SoftDelete)
                 ),
                 ["anonymise"] = new StaticTestRetentionRule(
-                    anonymiseRule ?? new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    anonymiseRule ?? new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
                 ),
             }
         );
@@ -2104,16 +2108,16 @@ await using var verifyScope = services.CreateAsyncScope();
                 new Dictionary<string, ITestRetentionRule>
                 {
                     ["factory-backed-set-based-erasure"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
                     ),
                     ["factory-backed-per-row-erasure"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
                     ),
                     ["converted-set-based-erasure"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
                     ),
                     ["converted-original-value-erasure"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
                     ),
                 }
             )
@@ -2160,7 +2164,7 @@ await using var verifyScope = services.CreateAsyncScope();
                 new Dictionary<string, ITestRetentionRule>
                 {
                     ["short-lived"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)
                     ),
                 }
             )
@@ -2187,7 +2191,7 @@ await using var verifyScope = services.CreateAsyncScope();
                 new Dictionary<string, ITestRetentionRule>
                 {
                     ["short-lived"] = new StaticTestRetentionRule(
-                        new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)
                     ),
                 }
             )

@@ -2101,16 +2101,16 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                 ["short-lived"] = new StaticTestRetentionRule(
                     shortLivedRule
                         ?? new RetentionRule(
-                            TimeSpan.FromDays(30),
+                            new RetentionPeriod(Days: 30),
                             Strategy.Purge,
                             AuditRowDetail: AuditRowDetail.PerRow
                         )
                 ),
                 ["soft-delete"] = new StaticTestRetentionRule(
-                    softDeleteRule ?? new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete)
+                    softDeleteRule ?? new RetentionRule(new RetentionPeriod(Days: 30), Strategy.SoftDelete)
                 ),
                 ["anonymise"] = new StaticTestRetentionRule(
-                    anonymiseRule ?? new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise)
+                    anonymiseRule ?? new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
                 ),
             }
         );
@@ -2157,7 +2157,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     {
         private static readonly ITestRetentionRule ExemptFallback =
             new StaticTestRetentionRule(
-                new RetentionRule(TimeSpan.FromDays(30), Strategy.Exempt)
+                new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Exempt)
             );
 
         public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct)

@@ -92,11 +92,11 @@ Cohort.Application.SweepEvent.Completed.TotalAffected.get -> long
 Cohort.Application.SweepEvent.EntityProgress
 Cohort.Application.SweepEvent.EntityProgress.Affected.get -> long
 Cohort.Application.SweepEvent.EntityProgress.Category.get -> string!
-Cohort.Application.SweepEvent.EntityProgress.EntityProgress(System.Guid SweepId, System.DateTimeOffset At, System.Type! EntityType, System.Guid RetentionEntityId, string! Category, System.Guid TenantId, Cohort.Domain.Strategy Strategy, System.TimeSpan ResolvedPeriod, long Affected, long SkippedCount, Cohort.Domain.RetentionRuleProvenance? Provenance = null) -> void
+Cohort.Application.SweepEvent.EntityProgress.EntityProgress(System.Guid SweepId, System.DateTimeOffset At, System.Type! EntityType, System.Guid RetentionEntityId, string! Category, System.Guid TenantId, Cohort.Domain.Strategy Strategy, Cohort.Domain.RetentionPeriod! ResolvedPeriod, long Affected, long SkippedCount, Cohort.Domain.RetentionRuleProvenance? Provenance = null) -> void
 Cohort.Application.SweepEvent.EntityProgress.EntityType.get -> System.Type!
 Cohort.Application.SweepEvent.EntityProgress.Equals(Cohort.Application.SweepEvent.EntityProgress? other) -> bool
 Cohort.Application.SweepEvent.EntityProgress.Provenance.get -> Cohort.Domain.RetentionRuleProvenance?
-Cohort.Application.SweepEvent.EntityProgress.ResolvedPeriod.get -> System.TimeSpan
+Cohort.Application.SweepEvent.EntityProgress.ResolvedPeriod.get -> Cohort.Domain.RetentionPeriod!
 Cohort.Application.SweepEvent.EntityProgress.RetentionEntityId.get -> System.Guid
 Cohort.Application.SweepEvent.EntityProgress.SkippedCount.get -> long
 Cohort.Application.SweepEvent.EntityProgress.Strategy.get -> Cohort.Domain.Strategy
@@ -104,13 +104,13 @@ Cohort.Application.SweepEvent.EntityProgress.TenantId.get -> System.Guid
 Cohort.Application.SweepEvent.EntitySummary
 Cohort.Application.SweepEvent.EntitySummary.Affected.get -> long
 Cohort.Application.SweepEvent.EntitySummary.Category.get -> string!
-Cohort.Application.SweepEvent.EntitySummary.EntitySummary(System.Guid SweepId, System.DateTimeOffset At, System.Type! EntityType, System.Guid RetentionEntityId, string! Category, System.Guid TenantId, Cohort.Domain.Strategy Strategy, System.TimeSpan ResolvedPeriod, long Affected, long HeldCount, long SkippedCount = 0, long NullAnchorCount = 0, Cohort.Domain.RetentionRuleProvenance? Provenance = null) -> void
+Cohort.Application.SweepEvent.EntitySummary.EntitySummary(System.Guid SweepId, System.DateTimeOffset At, System.Type! EntityType, System.Guid RetentionEntityId, string! Category, System.Guid TenantId, Cohort.Domain.Strategy Strategy, Cohort.Domain.RetentionPeriod! ResolvedPeriod, long Affected, long HeldCount, long SkippedCount = 0, long NullAnchorCount = 0, Cohort.Domain.RetentionRuleProvenance? Provenance = null) -> void
 Cohort.Application.SweepEvent.EntitySummary.EntityType.get -> System.Type!
 Cohort.Application.SweepEvent.EntitySummary.Equals(Cohort.Application.SweepEvent.EntitySummary? other) -> bool
 Cohort.Application.SweepEvent.EntitySummary.HeldCount.get -> long
 Cohort.Application.SweepEvent.EntitySummary.NullAnchorCount.get -> long
 Cohort.Application.SweepEvent.EntitySummary.Provenance.get -> Cohort.Domain.RetentionRuleProvenance?
-Cohort.Application.SweepEvent.EntitySummary.ResolvedPeriod.get -> System.TimeSpan
+Cohort.Application.SweepEvent.EntitySummary.ResolvedPeriod.get -> Cohort.Domain.RetentionPeriod!
 Cohort.Application.SweepEvent.EntitySummary.RetentionEntityId.get -> System.Guid
 Cohort.Application.SweepEvent.EntitySummary.SkippedCount.get -> long
 Cohort.Application.SweepEvent.EntitySummary.Strategy.get -> Cohort.Domain.Strategy
@@ -320,6 +320,13 @@ Cohort.Domain.RetentionHoldRequest.RecordId.get -> string!
 Cohort.Domain.RetentionHoldRequest.RetentionEntityId.get -> System.Guid
 Cohort.Domain.RetentionHoldRequest.RetentionHoldRequest(System.Guid holdId, System.Guid retentionEntityId, string! recordId, System.Guid? tenantId, string! reason, System.DateTimeOffset createdAt, System.DateTimeOffset? expiresAt = null) -> void
 Cohort.Domain.RetentionHoldRequest.TenantId.get -> System.Guid?
+Cohort.Domain.RetentionPeriod
+Cohort.Domain.RetentionPeriod.<Clone>$() -> Cohort.Domain.RetentionPeriod!
+Cohort.Domain.RetentionPeriod.Days.get -> int
+Cohort.Domain.RetentionPeriod.Equals(Cohort.Domain.RetentionPeriod? other) -> bool
+Cohort.Domain.RetentionPeriod.Months.get -> int
+Cohort.Domain.RetentionPeriod.RetentionPeriod(int Years = 0, int Months = 0, int Days = 0) -> void
+Cohort.Domain.RetentionPeriod.Years.get -> int
 Cohort.Domain.RetentionRecordIdAttribute
 Cohort.Domain.RetentionRecordIdAttribute.RetentionRecordIdAttribute() -> void
 Cohort.Domain.RetentionResolutionContext
@@ -337,10 +344,10 @@ Cohort.Domain.RetentionRule
 Cohort.Domain.RetentionRule.<Clone>$() -> Cohort.Domain.RetentionRule!
 Cohort.Domain.RetentionRule.AuditRowDetail.get -> Cohort.Domain.AuditRowDetail
 Cohort.Domain.RetentionRule.Equals(Cohort.Domain.RetentionRule? other) -> bool
-Cohort.Domain.RetentionRule.LegalMin.get -> System.TimeSpan?
-Cohort.Domain.RetentionRule.Period.get -> System.TimeSpan
+Cohort.Domain.RetentionRule.LegalMin.get -> Cohort.Domain.RetentionPeriod?
+Cohort.Domain.RetentionRule.Period.get -> Cohort.Domain.RetentionPeriod!
 Cohort.Domain.RetentionRule.Provenance.get -> Cohort.Domain.RetentionRuleProvenance?
-Cohort.Domain.RetentionRule.RetentionRule(System.TimeSpan Period, Cohort.Domain.Strategy Strategy, System.TimeSpan? LegalMin = null, Cohort.Domain.AuditRowDetail AuditRowDetail = Cohort.Domain.AuditRowDetail.SummaryOnly, Cohort.Domain.RetentionRuleProvenance? Provenance = null) -> void
+Cohort.Domain.RetentionRule.RetentionRule(Cohort.Domain.RetentionPeriod! Period, Cohort.Domain.Strategy Strategy, Cohort.Domain.RetentionPeriod? LegalMin = null, Cohort.Domain.AuditRowDetail AuditRowDetail = Cohort.Domain.AuditRowDetail.SummaryOnly, Cohort.Domain.RetentionRuleProvenance? Provenance = null) -> void
 Cohort.Domain.RetentionRule.Strategy.get -> Cohort.Domain.Strategy
 Cohort.Domain.RetentionRuleProvenance
 Cohort.Domain.RetentionRuleProvenance.<Clone>$() -> Cohort.Domain.RetentionRuleProvenance!
@@ -410,6 +417,8 @@ Cohort.Hosting.CohortOptions.Schedule.get -> string?
 Cohort.Hosting.CohortOptions.Schedule.init -> void
 Cohort.Hosting.CohortOptions.SweepBatchSize.get -> int
 Cohort.Hosting.CohortOptions.SweepBatchSize.init -> void
+Cohort.Hosting.CohortOptions.TimeZone.get -> string!
+Cohort.Hosting.CohortOptions.TimeZone.init -> void
 Cohort.Hosting.HistoryPruningOptions
 Cohort.Hosting.HistoryPruningOptions.FailedRunRetention.get -> System.TimeSpan?
 Cohort.Hosting.HistoryPruningOptions.FailedRunRetention.init -> void
@@ -523,6 +532,9 @@ override Cohort.Domain.RetentionHold.ToString() -> string!
 override Cohort.Domain.RetentionHoldRequest.Equals(object? obj) -> bool
 override Cohort.Domain.RetentionHoldRequest.GetHashCode() -> int
 override Cohort.Domain.RetentionHoldRequest.ToString() -> string!
+override Cohort.Domain.RetentionPeriod.Equals(object? obj) -> bool
+override Cohort.Domain.RetentionPeriod.GetHashCode() -> int
+override Cohort.Domain.RetentionPeriod.ToString() -> string!
 override Cohort.Domain.RetentionResolutionContext.Equals(object? obj) -> bool
 override Cohort.Domain.RetentionResolutionContext.GetHashCode() -> int
 override Cohort.Domain.RetentionResolutionContext.ToString() -> string!
@@ -600,6 +612,8 @@ static Cohort.Domain.RetentionHold.operator !=(Cohort.Domain.RetentionHold? left
 static Cohort.Domain.RetentionHold.operator ==(Cohort.Domain.RetentionHold? left, Cohort.Domain.RetentionHold? right) -> bool
 static Cohort.Domain.RetentionHoldRequest.operator !=(Cohort.Domain.RetentionHoldRequest? left, Cohort.Domain.RetentionHoldRequest? right) -> bool
 static Cohort.Domain.RetentionHoldRequest.operator ==(Cohort.Domain.RetentionHoldRequest? left, Cohort.Domain.RetentionHoldRequest? right) -> bool
+static Cohort.Domain.RetentionPeriod.operator !=(Cohort.Domain.RetentionPeriod? left, Cohort.Domain.RetentionPeriod? right) -> bool
+static Cohort.Domain.RetentionPeriod.operator ==(Cohort.Domain.RetentionPeriod? left, Cohort.Domain.RetentionPeriod? right) -> bool
 static Cohort.Domain.RetentionResolutionContext.operator !=(Cohort.Domain.RetentionResolutionContext? left, Cohort.Domain.RetentionResolutionContext? right) -> bool
 static Cohort.Domain.RetentionResolutionContext.operator ==(Cohort.Domain.RetentionResolutionContext? left, Cohort.Domain.RetentionResolutionContext? right) -> bool
 static Cohort.Domain.RetentionRule.operator !=(Cohort.Domain.RetentionRule? left, Cohort.Domain.RetentionRule? right) -> bool

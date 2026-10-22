@@ -25,6 +25,8 @@ internal sealed class CohortOptionsSnapshot : IRetentionExecutionSettings, IDisp
 
     public TimeSpan AuditObserverTimeout => Current.AuditObservers.Timeout;
 
+    public TimeZoneInfo TimeZone => TimeZoneInfo.FindSystemTimeZoneById(Current.TimeZone);
+
     public void Dispose()
     {
         reloadSubscription?.Dispose();

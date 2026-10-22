@@ -73,8 +73,10 @@ Ordinary `Period` never delays erasure. Legal minimums and holds do:
 
 - With no positive `LegalMin`, Cohort adds no age condition at all. Null and future anchors
   are eligible.
-- A positive `LegalMin` adds the strict condition `anchor < now - LegalMin`. A row exactly
-  on the boundary, or with a null anchor, stays blocked. Blocked null anchors are reported in
+- A non-zero `LegalMin` adds the strict condition `anchor < cutoff`, where the cutoff is the
+  start of the day `LegalMin` before today, in the host's `TimeZone` (see
+  [periods](/guides/retention-rules#periods-are-calendar-periods)). A row anchored on that
+  day, or with a null anchor, stays blocked. Blocked null anchors are reported in
   `NullAnchorCount`.
 - Active holds always block erasure.
 

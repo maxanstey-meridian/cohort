@@ -209,7 +209,7 @@ public sealed class NonUtcOffsetEndToEndTests(PostgresFixture fixture)
             var rule = await sample.ResolveAsync(context, ct);
             return rule is null
                 ? null
-                : new RetentionRule(rule.Period, rule.Strategy, TimeSpan.FromDays(30), rule.AuditRowDetail);
+                : new RetentionRule(rule.Period, rule.Strategy, new RetentionPeriod(Days: 30), rule.AuditRowDetail);
         }
     }
 }

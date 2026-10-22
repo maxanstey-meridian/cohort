@@ -53,7 +53,7 @@ public sealed class RetentionRules : IRetentionRuleProvider
     {
         RetentionRule? rule = context.Category switch
         {
-            "session-notes" => new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge),
+            "session-notes" => new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge),
             _ => null,
         };
 

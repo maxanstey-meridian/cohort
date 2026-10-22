@@ -9,6 +9,7 @@ startup.
     "Schedule": "0 2 * * *",
     "DryRun": false,
     "KillSwitch": false,
+    "TimeZone": "Europe/London",
     "SweepBatchSize": 5000,
     "AuditObservers": {
       "Timeout": "00:00:05"
@@ -30,6 +31,7 @@ startup.
 | `Schedule` | `null` | Cron expression, evaluated in **UTC**. `null` disables the worker. |
 | `DryRun` | `false` | Run **scheduled** sweeps as count-only audited runs instead of mutating data. They keep the same run and entity audit trail, with `sweep_run.DryRun` set. Only the worker reads it: explicit requests carry their own flag (`RetentionSweepRequest.Tenanted(..., dryRun: true)`, `new ErasureScope(..., dryRun: true)`) and are honoured as written. |
 | `KillSwitch` | `false` | Stop between tenant passes: the tenant in progress finishes, and the remaining tenants and future occurrences are skipped. It also stops [history pruning](/guides/history-pruning) after the batch in progress. |
+| `TimeZone` | `UTC` | IANA time zone whose calendar [retention periods](/guides/retention-rules#periods-are-calendar-periods) are counted in: a row is kept until the end of the day its anchor's date plus the period falls on, in this zone. Must be a zone the host knows (the host needs tzdata). The schedule stays UTC. |
 | `SweepBatchSize` | `5000` | Maximum rows selected, locked and mutated per transaction. Each batch commits independently. At least 1. |
 | `AuditObservers:Timeout` | `00:00:05` | Maximum time Cohort waits for each observer to handle one committed event. Each observer has its own timeout. At most 1 hour. |
 

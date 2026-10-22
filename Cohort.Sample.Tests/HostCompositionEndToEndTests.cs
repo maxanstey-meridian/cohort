@@ -24,7 +24,7 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
             new SingleCategoryRepository(
                 "valid",
                 new RetentionRule(
-                    TimeSpan.FromDays(30),
+                    new RetentionPeriod(Days: 30),
                     Strategy.Purge,
                     AuditRowDetail: AuditRowDetail.PerRow
                 )

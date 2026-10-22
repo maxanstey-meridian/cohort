@@ -8,27 +8,27 @@ public sealed class SampleRetentionRuleProvider : IRetentionRuleProvider
     private static readonly IReadOnlyDictionary<string, RetentionRule> Rules =
         new Dictionary<string, RetentionRule>
         {
-            ["short-lived"] = new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge),
-            ["blob-cleanup"] = new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge),
-            ["soft-delete"] = new RetentionRule(TimeSpan.FromDays(30), Strategy.SoftDelete),
-            ["anonymise"] = new RetentionRule(TimeSpan.FromDays(30), Strategy.Anonymise),
+            ["short-lived"] = new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge),
+            ["blob-cleanup"] = new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge),
+            ["soft-delete"] = new RetentionRule(new RetentionPeriod(Days: 30), Strategy.SoftDelete),
+            ["anonymise"] = new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise),
             ["tombstone-anonymise"] = new RetentionRule(
-                TimeSpan.FromDays(30),
+                new RetentionPeriod(Days: 30),
                 Strategy.Anonymise
             ),
-            ["tenantless-purge"] = new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge),
+            ["tenantless-purge"] = new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge),
             ["nullable-anchor-purge"] = new RetentionRule(
-                TimeSpan.FromDays(30),
+                new RetentionPeriod(Days: 30),
                 Strategy.Purge
             ),
             ["tenantless-softdelete"] = new RetentionRule(
-                TimeSpan.FromDays(30),
+                new RetentionPeriod(Days: 30),
                 Strategy.SoftDelete
             ),
             // Category default is SummaryOnly — the entity [Retain] attribute overrides to PerRow,
             // which is exactly what CohortConventionsEndToEndTests / PerRowAuditOverride tests assert.
             ["per-row-audit-override"] = new RetentionRule(
-                TimeSpan.FromDays(30),
+                new RetentionPeriod(Days: 30),
                 Strategy.Purge,
                 AuditRowDetail: AuditRowDetail.SummaryOnly
             ),

@@ -91,7 +91,10 @@ internal static class CohortSchemaContract
                 Column<string>("Category", "text"),
                 Column<Guid>("TenantId", "uuid"),
                 Column<int>("Strategy", "integer", "int4"),
-                Column<TimeSpan>("ResolvedPeriod", "interval"),
+                // The resolved calendar period, months and days kept apart (years fold into
+                // months: 7 years is 84 months).
+                Column<int>("ResolvedMonths", "integer", "int4"),
+                Column<int>("ResolvedDays", "integer", "int4"),
                 Column<long>("Affected", "bigint", "int8"),
                 Column<long>("HeldCount", "bigint", "int8"),
                 Column<long>("SkippedCount", "bigint", "int8"),

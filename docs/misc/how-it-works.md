@@ -20,7 +20,8 @@ expressed in SQL.
 2. **Order.** Retained entities are processed in foreign-key order, dependents before their
    principals, so a retained child is purged before its retained parent.
 3. **Resolve.** For each entity, the category's rule is resolved for this tenant and time.
-   The cutoff is `now - max(Period, LegalMin)`.
+   The cutoff is the start of the day `Period` or `LegalMin` (whichever reaches further back)
+   before today, counted in calendar years, months and days in the host's `TimeZone`.
 4. **Batch.** Candidate rows past the cutoff, in the tenant and not held, are selected with
    `FOR UPDATE SKIP LOCKED` in batches of `SweepBatchSize`. Each batch runs any `OnBeforeAsync`
    handlers, mutates, writes its audit rows and queues handler work, then **commits on its

@@ -19,6 +19,17 @@ public sealed class CohortOptionsValidatorTests
     }
 
     [Theory]
+    [InlineData("")]
+    [InlineData("Mars/Olympus_Mons")]
+    public void Validate_Rejects_A_Time_Zone_The_Host_Does_Not_Know(string timeZone)
+    {
+        var result = new CohortOptionsValidator().Validate(null, new CohortOptions { TimeZone = timeZone });
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().ContainSingle(message => message.Contains("TimeZone"));
+    }
+
+    [Theory]
     [InlineData("PollInterval")]
     [InlineData("BatchSize")]
     [InlineData("MaxAttempts")]

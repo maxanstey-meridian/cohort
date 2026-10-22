@@ -21,8 +21,9 @@ entity and the problem.
   entity in it. For example, an entity that may be anonymised needs an `AnonymisedAt` marker,
   and one that may be soft-deleted needs a soft-delete flag.
 - At run time, a rule whose strategy wasn't declared is rejected.
-- `RetentionRule` rejects a negative `Period` or `LegalMin`, which would compute a future
-  cutoff and sweep everything.
+- `RetentionPeriod` rejects a negative part, which would compute a future cutoff and sweep
+  everything.
+- `TimeZone` must name a time zone the host knows.
 - `[AnonymiseWith]` factories are registered exactly once as `IAnonymiseValueFactory`.
 - `[ErasureSubject(kind)]` kinds aren't blank, every column of one kind holds the same CLR
   type across the model, and each marked property maps to a physical column with a

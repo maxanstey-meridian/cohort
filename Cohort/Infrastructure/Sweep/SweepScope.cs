@@ -12,47 +12,46 @@ internal sealed record SweepScope(
     TenantContext Tenant,
     DateTimeOffset Now,
     DateTimeOffset? Cutoff,
+    RetentionPeriod ResolvedPeriod,
     ErasureSubjectPredicate? Subject
 )
 {
+    /// <summary>
+    /// <see cref="ResolvedPeriod"/> is the age recorded on audit summaries: whichever of the
+    /// period and the legal minimum set the cutoff.
+    /// </summary>
     public static SweepScope ForSweep(
         RetentionEntry entry,
         RetentionRule rule,
-        RetentionResolutionContext context
-    ) =>
-        new(
-            entry,
-            rule,
-            context.Tenant,
+        RetentionResolutionContext context,
+        TimeZoneInfo timeZone
+    )
+    {
+        var (cutoff, resolvedPeriod) = CutoffCalculator.ResolveSweep(
             context.Now,
-            CutoffCalculator.Compute(context.Now, rule.Period, rule.LegalMin),
-            Subject: null
+            rule.Period,
+            rule.LegalMin,
+            timeZone
         );
+        return new(entry, rule, context.Tenant, context.Now, cutoff, resolvedPeriod, Subject: null);
+    }
 
+    /// <summary>
+    /// <see cref="ResolvedPeriod"/> is the legal minimum alone, because an erasure ignores
+    /// the period.
+    /// </summary>
     public static SweepScope ForErasure(
         RetentionEntry entry,
         RetentionRule rule,
         ErasureSubjectPredicate subject,
         TenantContext tenant,
-        DateTimeOffset now
-    ) =>
-        new(
-            entry,
-            rule,
-            tenant,
-            now,
-            CutoffCalculator.ComputeErasureCutoff(now, rule.LegalMin),
-            subject
-        );
-
-    /// <summary>
-    /// The age recorded on audit summaries: the effective retention period for a sweep, the
-    /// legal minimum alone for an erasure (which ignores the period).
-    /// </summary>
-    public TimeSpan ResolvedPeriod =>
-        Subject is null
-            ? CutoffCalculator.ResolveEffectivePeriod(Rule.Period, Rule.LegalMin)
-            : CutoffCalculator.ResolveErasureMinimumAge(Rule.LegalMin);
+        DateTimeOffset now,
+        TimeZoneInfo timeZone
+    )
+    {
+        var (cutoff, minimumAge) = CutoffCalculator.ResolveErasure(now, rule.LegalMin, timeZone);
+        return new(entry, rule, tenant, now, cutoff, minimumAge, subject);
+    }
 
     /// <summary>
     /// A sweep skips rows another run has locked and retires them next time; an erasure

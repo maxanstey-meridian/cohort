@@ -242,6 +242,40 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
     }
 
     [Fact]
+    public async Task Resolved_Period_Migration_Keeps_Each_Summary_Period_As_Months_And_Days()
+    {
+        var options = CreateOptions();
+        var sweepId = Guid.NewGuid();
+        var tenantId = Guid.NewGuid();
+
+        await using (var db = new SampleDbContext(options))
+        {
+            var migrator = db.Database.GetService<IMigrator>();
+            await migrator.MigrateAsync("20260711150000_AddExplicitSweepRunStatus");
+            await SeedHistoricalAuditRowsAsync(sweepId, tenantId);
+            // Years fold into months; the part of a day a TimeSpan could carry is dropped.
+            await db.Database.ExecuteSqlRawAsync(
+                "UPDATE \"sweep_run_entity_summary\" SET \"ResolvedPeriod\" = INTERVAL '7 years 3 days 12 hours' WHERE \"SweepId\" = {0}",
+                sweepId
+            );
+
+            await migrator.MigrateAsync();
+        }
+
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            "SELECT \"ResolvedMonths\", \"ResolvedDays\" FROM \"sweep_run_entity_summary\" WHERE \"SweepId\" = @sweepId";
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        await using var reader = await command.ExecuteReaderAsync();
+        (await reader.ReadAsync()).Should().BeTrue();
+        reader.GetInt32(0).Should().Be(84);
+        reader.GetInt32(1).Should().Be(3);
+        (await GetColumnsAsync("sweep_run_entity_summary")).Should().NotContainKey("ResolvedPeriod");
+    }
+
+    [Fact]
     public async Task Handler_State_Constraint_Migration_Requeues_Legacy_InFlight_Work()
     {
         var options = CreateOptions();

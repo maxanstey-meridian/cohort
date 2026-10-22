@@ -445,7 +445,7 @@ public sealed class RetentionScopeCorpusTests(PostgresFixture fixture) : Integra
             RetentionResolutionContext context,
             CancellationToken ct
         ) => Task.FromResult<RetentionRule?>(
-            new RetentionRule(TimeSpan.FromDays(30), Strategy.Purge)
+            new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)
         );
     }
 

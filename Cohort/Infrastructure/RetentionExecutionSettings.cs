@@ -9,4 +9,7 @@ internal interface IRetentionExecutionSettings
     public int SweepBatchSize { get; }
 
     public TimeSpan AuditObserverTimeout { get; }
+
+    /// <summary>The zone whose calendar retention periods are counted in.</summary>
+    public TimeZoneInfo TimeZone { get; }
 }

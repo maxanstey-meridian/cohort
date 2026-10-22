@@ -138,7 +138,14 @@ internal sealed class RetentionErasureService(
             try
             {
                 plan.Add(
-                    SweepScope.ForErasure(entry, rule, subjectMetadata.CreatePredicate(scope.Subject), tenant, now)
+                    SweepScope.ForErasure(
+                        entry,
+                        rule,
+                        subjectMetadata.CreatePredicate(scope.Subject),
+                        tenant,
+                        now,
+                        options.TimeZone
+                    )
                 );
             }
             catch (Exception ex)

@@ -12,7 +12,8 @@ internal sealed class RetentionPreviewService(
     RetentionRegistry registry,
     IRetentionRuleProvider ruleProvider,
     RetentionRuntimeReadinessValidator readinessValidator,
-    IEnumerable<SweepStrategy> sweepStrategies
+    IEnumerable<SweepStrategy> sweepStrategies,
+    IRetentionExecutionSettings settings
 )
 {
     private readonly IReadOnlyDictionary<Strategy, SweepStrategy> strategies =
@@ -38,6 +39,7 @@ internal sealed class RetentionPreviewService(
 
         var startedAt = DateTimeOffset.UtcNow;
         var counts = new List<EntitySweepCount>();
+        var timeZone = settings.TimeZone;
         var connection = db.Database.GetDbConnection();
         await db.Database.OpenConnectionAsync(ct);
         try
@@ -61,7 +63,7 @@ internal sealed class RetentionPreviewService(
                 if (rule.Strategy != Strategy.Exempt)
                 {
                     var strategy = strategies[rule.Strategy];
-                    var scope = SweepScope.ForSweep(entry, rule, context);
+                    var scope = SweepScope.ForSweep(entry, rule, context, timeZone);
                     affected = await strategy.CountAsync(scope, SweepCount.Eligible, connection, ct);
                     held = await strategy.CountAsync(scope, SweepCount.Held, connection, ct);
                     nullAnchors = await strategy.CountAsync(scope, SweepCount.NullAnchor, connection, ct);

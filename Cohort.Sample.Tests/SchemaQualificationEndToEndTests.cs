@@ -271,8 +271,8 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
                     ("SweepId", "StartedAt", "Status", "SettledAt", "Duration", "TriggerKind", "DryRun", "TenantId", "TotalAffected", "Error")
                 VALUES (@sweepId, @createdAt, 1, @settledAt, interval '1 second', 2, false, @tenantId, 1, @historicalError);
                 INSERT INTO public.sweep_run_entity_summary
-                    ("SweepId", "At", "EntityType", "RetentionEntityId", "Category", "TenantId", "Strategy", "ResolvedPeriod", "Affected", "HeldCount", "SkippedCount", "NullAnchorCount", "RuleSource", "RuleReason")
-                VALUES (@sweepId, @settledAt, @entityType, @retentionEntityId, 'qualified', @tenantId, 0, interval '30 days', 1, 0, 0, 0, 'historical', 'before move');
+                    ("SweepId", "At", "EntityType", "RetentionEntityId", "Category", "TenantId", "Strategy", "ResolvedMonths", "ResolvedDays", "Affected", "HeldCount", "SkippedCount", "NullAnchorCount", "RuleSource", "RuleReason")
+                VALUES (@sweepId, @settledAt, @entityType, @retentionEntityId, 'qualified', @tenantId, 0, 0, 30, 1, 0, 0, 0, 'historical', 'before move');
                 INSERT INTO public.sweep_run_row_detail
                     ("Id", "SweepId", "At", "EntityType", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId", "CapturedPayload")
                 VALUES (900001, @sweepId, @settledAt, @entityType, @retentionEntityId, @recordId, 'qualified', 0, @tenantId, NULL);
@@ -353,7 +353,7 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
                        run."SweepId", run."StartedAt", run."Status", run."SettledAt", run."Duration",
                        run."TriggerKind", run."DryRun", run."TenantId", run."TotalAffected", run."Error",
                        summary."SweepId", summary."At", summary."EntityType", summary."RetentionEntityId",
-                       summary."Category", summary."TenantId", summary."Strategy", summary."ResolvedPeriod",
+                       summary."Category", summary."TenantId", summary."Strategy", summary."ResolvedMonths", summary."ResolvedDays",
                        summary."Affected", summary."HeldCount", summary."SkippedCount", summary."NullAnchorCount",
                        summary."RuleSource", summary."RuleReason",
                        detail."Id", detail."SweepId", detail."At", detail."EntityType",
@@ -401,36 +401,37 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
             reader.GetString(22).Should().Be("qualified");
             reader.GetGuid(23).Should().Be(tenantId);
             reader.GetInt32(24).Should().Be(0);
-            reader.GetFieldValue<TimeSpan>(25).Should().Be(TimeSpan.FromDays(30));
-            reader.GetInt64(26).Should().Be(1);
-            reader.GetInt64(27).Should().Be(0);
+            reader.GetInt32(25).Should().Be(0);
+            reader.GetInt32(26).Should().Be(30);
+            reader.GetInt64(27).Should().Be(1);
             reader.GetInt64(28).Should().Be(0);
             reader.GetInt64(29).Should().Be(0);
-            reader.GetString(30).Should().Be("historical");
-            reader.GetString(31).Should().Be("before move");
-            reader.GetInt64(32).Should().Be(900001);
-            reader.GetGuid(33).Should().Be(historicalSweepId);
-            reader.GetFieldValue<DateTimeOffset>(34).Should().Be(settledAt);
-            reader.GetString(35).Should().Be(typeof(QualifiedRecord).FullName);
-            reader.GetGuid(36).Should().Be(QualifiedRecord.RetentionId);
-            reader.GetString(37).Should().Be(heldId.ToString());
-            reader.GetString(38).Should().Be("qualified");
-            reader.GetInt32(39).Should().Be(0);
-            reader.GetGuid(40).Should().Be(tenantId);
-            reader.IsDBNull(41).Should().BeTrue();
-            reader.GetInt64(42).Should().Be(900001);
+            reader.GetInt64(30).Should().Be(0);
+            reader.GetString(31).Should().Be("historical");
+            reader.GetString(32).Should().Be("before move");
+            reader.GetInt64(33).Should().Be(900001);
+            reader.GetGuid(34).Should().Be(historicalSweepId);
+            reader.GetFieldValue<DateTimeOffset>(35).Should().Be(settledAt);
+            reader.GetString(36).Should().Be(typeof(QualifiedRecord).FullName);
+            reader.GetGuid(37).Should().Be(QualifiedRecord.RetentionId);
+            reader.GetString(38).Should().Be(heldId.ToString());
+            reader.GetString(39).Should().Be("qualified");
+            reader.GetInt32(40).Should().Be(0);
+            reader.GetGuid(41).Should().Be(tenantId);
+            reader.IsDBNull(42).Should().BeTrue();
             reader.GetInt64(43).Should().Be(900001);
-            reader.GetString(44).Should().Be("historical-handler");
-            reader.GetInt32(45).Should().Be(0);
-            reader.GetInt32(46).Should().Be(2);
-            reader.GetInt32(47).Should().Be(1);
-            reader.GetFieldValue<DateTimeOffset>(48).Should().Be(createdAt);
+            reader.GetInt64(44).Should().Be(900001);
+            reader.GetString(45).Should().Be("historical-handler");
+            reader.GetInt32(46).Should().Be(0);
+            reader.GetInt32(47).Should().Be(2);
+            reader.GetInt32(48).Should().Be(1);
             reader.GetFieldValue<DateTimeOffset>(49).Should().Be(createdAt);
-            reader.IsDBNull(50).Should().BeTrue();
+            reader.GetFieldValue<DateTimeOffset>(50).Should().Be(createdAt);
             reader.IsDBNull(51).Should().BeTrue();
-            reader.GetFieldValue<DateTimeOffset>(52).Should().Be(settledAt);
-            reader.GetString(53).Should().Be("historical handler error before move");
-            reader.GetInt64(54).Should().Be(0);
+            reader.IsDBNull(52).Should().BeTrue();
+            reader.GetFieldValue<DateTimeOffset>(53).Should().Be(settledAt);
+            reader.GetString(54).Should().Be("historical handler error before move");
+            reader.GetInt64(55).Should().Be(0);
         }
 
         await AssertExactMovedSchemaContractAsync(connectionString);
@@ -791,17 +792,17 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
             context.Category switch
             {
                 "qualified" => new RetentionRule(
-                    TimeSpan.FromDays(30),
+                    new RetentionPeriod(Days: 30),
                     Strategy.Purge,
                     AuditRowDetail: AuditRowDetail.PerRow
                 ),
                 "qualified-soft-delete" => new RetentionRule(
-                    TimeSpan.FromDays(30),
+                    new RetentionPeriod(Days: 30),
                     Strategy.SoftDelete,
                     AuditRowDetail: AuditRowDetail.PerRow
                 ),
                 "qualified-anonymise" => new RetentionRule(
-                    TimeSpan.FromDays(30),
+                    new RetentionPeriod(Days: 30),
                     Strategy.Anonymise,
                     AuditRowDetail: AuditRowDetail.PerRow
                 ),

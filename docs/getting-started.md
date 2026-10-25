@@ -105,11 +105,12 @@ Preview first. It counts what would change without writing anything:
 var tenant = new TenantContext(tenantId, "uk", new Dictionary<string, string>());
 
 var preview = await services.GetRequiredService<IRetentionPreview>()
-    .PreviewAsync(tenant, DateTimeOffset.UtcNow, ct);
+    .PreviewAsync(tenant, ct: ct);
 var result = await services.GetRequiredService<IRetentionSweep>().SweepAsync(tenant, ct);
 ```
 
-The sweep takes "today" from the database's clock, the same clock legal holds expire by.
+The preview and the sweep take "today" from the database's clock, the same clock legal holds
+expire by.
 
 The sweep deletes this tenant's session notes older than 30 days, skips any under a legal
 hold, and records the run in `sweep_run`.

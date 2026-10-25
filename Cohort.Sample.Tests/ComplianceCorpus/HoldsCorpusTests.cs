@@ -55,7 +55,8 @@ public sealed class HoldsCorpusTests(PostgresFixture fixture) : IntegrationTestB
                 CancellationToken.None
             );
             await holds.RemoveAsync(removedHoldId, now.AddHours(-1), CancellationToken.None);
-            // CreateAsync refuses an expiry already past, so an expired hold is history seeded directly.
+            // CreateAsync refuses an expiry already past, so an expired hold is history seeded
+            // directly.
             await services.GetRequiredService<SampleDbContext>().Database.ExecuteSqlAsync(
                 $"""
                 INSERT INTO "retention_holds"

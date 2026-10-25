@@ -2,8 +2,10 @@ using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure;
 using Cohort.Sample.Entities;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+
 using Npgsql;
 
 namespace Cohort.Sample.Tests;
@@ -11,7 +13,6 @@ namespace Cohort.Sample.Tests;
 public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
     : IntegrationTestBase(fixture)
 {
-
     [Fact]
     public async Task Preview_Path_Counts_Anonymise_Candidates_Without_Modifying_Rows()
     {
@@ -208,6 +209,38 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
                 "preview-measured-held",
                 "preview-measured-null-anchor"
             );
+    }
+
+    [Fact]
+    public async Task A_Preview_Without_A_Time_Uses_The_Database_Clock_And_May_Look_Ahead()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var databaseNow = await LoadDatabaseNowAsync();
+        await using (var db = Host.CreateDbContext())
+        {
+            // 30-day purge: one note is due by the database's clock, the other in ten days.
+            db.Notes.AddRange(
+                new Note { Id = Guid.NewGuid(), TenantId = tenant.Id, CreatedAt = databaseNow.AddDays(-40), Body = "due" },
+                new Note { Id = Guid.NewGuid(), TenantId = tenant.Id, CreatedAt = databaseNow.AddDays(-20), Body = "not-yet-due" }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        var today = await Host.RunPreviewAsync(tenant);
+        var lookAhead = await Host.RunPreviewAsync(tenant, databaseNow.AddDays(15));
+
+        today.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note))
+            .Which.Affected.Should().Be(1);
+        lookAhead.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note))
+            .Which.Affected.Should().Be(2);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.CountAsync(note => note.TenantId == tenant.Id)).Should().Be(2);
+    }
+
+    private async Task<DateTimeOffset> LoadDatabaseNowAsync()
+    {
+        await using var db = Host.CreateDbContext();
+        return await db.Database.SqlQuery<DateTimeOffset>($"""SELECT statement_timestamp() AS "Value" """).SingleAsync();
     }
 
     private async Task CreateHoldAsync(

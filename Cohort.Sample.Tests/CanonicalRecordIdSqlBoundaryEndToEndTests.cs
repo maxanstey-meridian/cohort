@@ -1,11 +1,14 @@
 using System.Globalization;
+
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
 using Cohort.Infrastructure.Migrations;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+
 using Npgsql;
 
 namespace Cohort.Sample.Tests;
@@ -162,33 +165,8 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
         // case-insensitively ('ABC' = 'abc'). A hold must protect the row the request resolved to.
         await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
         var asOf = new DateTimeOffset(2026, 7, 11, 12, 0, 0, TimeSpan.Zero);
-        var services = new ServiceCollection();
-        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().AddInMemoryCollection().Build());
-        services.AddLogging();
-        services.AddDbContext<SpelledRecordIdDbContext>(options => options.UseNpgsql(database.ConnectionString));
-        services.AddSingleton<IRetentionRuleProvider>(new CategoryRepository(Strategy.Purge));
-        services.AddSingleton(RetentionExecutionScope.Unisolated);
-        services.AddCohort<SpelledRecordIdDbContext>();
-        await using var provider = services.BuildServiceProvider(validateScopes: true);
-
-        await using (var scope = provider.CreateAsyncScope())
-        {
-            var db = scope.ServiceProvider.GetRequiredService<SpelledRecordIdDbContext>();
-            await db.Database.EnsureCreatedAsync();
-            db.Add(new NumericKeyedRecord { Id = 1.00m, CreatedAt = asOf.AddDays(-60) });
-            db.Add(new CitextKeyedRecord { Id = "ABC", CreatedAt = asOf.AddDays(-60) });
-            await db.SaveChangesAsync();
-
-            var holds = scope.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>();
-            await holds.CreateAsync(
-                new RetentionHoldRequest(Guid.NewGuid(), RetentionEntityIdentity.For<NumericKeyedRecord>(), "1", null, "numeric", asOf),
-                CancellationToken.None
-            );
-            await holds.CreateAsync(
-                new RetentionHoldRequest(Guid.NewGuid(), RetentionEntityIdentity.For<CitextKeyedRecord>(), "abc", null, "citext", asOf),
-                CancellationToken.None
-            );
-        }
+        await using var provider = BuildSpelledServiceProvider(database.ConnectionString);
+        await SeedSpelledRecordsAsync(provider, asOf);
 
         var result = await provider.GetRequiredService<IRetentionSweep>().ExecuteAsync(
             RetentionSweepRequest.Tenantless(asOf)
@@ -203,6 +181,91 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
             SELECT string_agg("RecordId", ',' ORDER BY "RecordId") FROM "retention_holds"
             """;
         (await command.ExecuteScalarAsync()).Should().Be("1.00,ABC");
+    }
+
+    [Fact]
+    public async Task Deletion_Checks_Numeric_And_Citext_Holds_Through_Their_Own_Store_Types()
+    {
+        // The deletion's "active holds whose row is missing" check casts each hold's stored text
+        // to its entity's key type. A deletion that removes no held row must pass every cast; one
+        // that removes the numeric row held as "1.00" (requested as "1") must be refused.
+        await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
+        var asOf = new DateTimeOffset(2026, 7, 11, 12, 0, 0, TimeSpan.Zero);
+        await using var provider = BuildSpelledServiceProvider(database.ConnectionString);
+        var (numericHoldId, _) = await SeedSpelledRecordsAsync(provider, asOf);
+        var unheldTarget = new RetentionTarget(RetentionEntityIdentity.For<NumericKeyedRecord>(), "2", null);
+
+        await using (var scope = provider.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<SpelledRecordIdDbContext>();
+            var refused = () => scope.ServiceProvider.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [unheldTarget],
+                ct => db.Set<NumericKeyedRecord>().Where(record => record.Id <= 2m).ExecuteDeleteAsync(ct)
+            );
+
+            await refused.Should().ThrowAsync<InvalidOperationException>().WithMessage($"*{numericHoldId}*");
+        }
+
+        await using (var scope = provider.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<SpelledRecordIdDbContext>();
+            var outcome = await scope.ServiceProvider.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [unheldTarget],
+                ct => db.Set<NumericKeyedRecord>().Where(record => record.Id == 2m).ExecuteDeleteAsync(ct)
+            );
+
+            outcome.Should().Be(RetentionDeletionOutcome.Executed);
+        }
+
+        await using var verify = new NpgsqlConnection(database.ConnectionString);
+        await verify.OpenAsync();
+        await using var command = verify.CreateCommand();
+        command.CommandText = """
+            SELECT string_agg("Id"::text, ',' ORDER BY "Id") FROM "numeric_keyed_record"
+            """;
+        (await command.ExecuteScalarAsync()).Should().Be("1.00");
+    }
+
+    private static ServiceProvider BuildSpelledServiceProvider(string connectionString)
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().AddInMemoryCollection().Build());
+        services.AddLogging();
+        services.AddDbContext<SpelledRecordIdDbContext>(options => options.UseNpgsql(connectionString));
+        services.AddSingleton<IRetentionRuleProvider>(new CategoryRepository(Strategy.Purge));
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
+        services.AddCohort<SpelledRecordIdDbContext>();
+        return services.BuildServiceProvider(validateScopes: true);
+    }
+
+    /// <summary>
+    /// Seeds numeric 1.00 held as "1", citext "ABC" held as "abc", and an unheld numeric 2.
+    /// </summary>
+    private static async Task<(Guid NumericHoldId, Guid CitextHoldId)> SeedSpelledRecordsAsync(
+        ServiceProvider provider,
+        DateTimeOffset asOf
+    )
+    {
+        var numericHoldId = Guid.NewGuid();
+        var citextHoldId = Guid.NewGuid();
+        await using var scope = provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<SpelledRecordIdDbContext>();
+        await db.Database.EnsureCreatedAsync();
+        db.Add(new NumericKeyedRecord { Id = 1.00m, CreatedAt = asOf.AddDays(-60) });
+        db.Add(new NumericKeyedRecord { Id = 2m, CreatedAt = asOf });
+        db.Add(new CitextKeyedRecord { Id = "ABC", CreatedAt = asOf.AddDays(-60) });
+        await db.SaveChangesAsync();
+
+        var holds = scope.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>();
+        await holds.CreateAsync(
+            new RetentionHoldRequest(numericHoldId, RetentionEntityIdentity.For<NumericKeyedRecord>(), "1", null, "numeric", asOf),
+            CancellationToken.None
+        );
+        await holds.CreateAsync(
+            new RetentionHoldRequest(citextHoldId, RetentionEntityIdentity.For<CitextKeyedRecord>(), "abc", null, "citext", asOf),
+            CancellationToken.None
+        );
+        return (numericHoldId, citextHoldId);
     }
 
     private static ServiceProvider BuildServiceProvider(

@@ -1,6 +1,7 @@
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -53,9 +54,10 @@ public sealed class CohortTestHost(
         return await sweep.ExecuteAsync(RetentionSweepRequest.Tenanted(tenant, now), ct);
     }
 
+    /// <summary>Previews the tenant as of <paramref name="now"/>, or the database clock.</summary>
     public async Task<RetentionSweepResult> RunPreviewAsync(
         TenantContext tenant,
-        DateTimeOffset now,
+        DateTimeOffset? now = null,
         CancellationToken ct = default
     )
     {

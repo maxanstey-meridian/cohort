@@ -41,7 +41,15 @@ internal sealed class RetentionRuntimeReadinessValidator(
             await startupValidator.ValidateAsync(ct);
             await schemaValidator.ValidateAsync(ct);
             await ValidateRecordIdColumnTypesAsync(ct);
-            await ValidateStoredEntityIdentitiesAsync(ct);
+            // The hold check runs on its own connection, outside the caller's transaction, so its
+            // success stands whatever transaction the caller is in; cache it apart from the checks
+            // that read through the caller's connection.
+            if (!readiness.StoredEntityIdentitiesValidated)
+            {
+                await ValidateStoredEntityIdentitiesAsync(ct);
+                readiness.StoredEntityIdentitiesValidated = true;
+            }
+
             if (db.Database.CurrentTransaction is null)
             {
                 readiness.Validated = true;
@@ -166,16 +174,20 @@ internal sealed class RetentionRuntimeReadinessValidator(
             ct
         );
         var systemDb = scope.ServiceProvider.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext);
-        if (CreateKey(systemDb) != CreateKey(db))
-        {
-            throw new RetentionConfigurationException([
-                "Cohort's readiness scope resolved a DbContext with a different model or database from the calling scope's. Cohort checks holds across tenants in a System(Readiness) scope, so every scope must reach the same database and model.",
-            ]);
-        }
-
+        var callerDatabase = await ReadServerDatabaseIdentityAsync(db, holds, ct);
         await systemDb.Database.OpenConnectionAsync(ct);
         try
         {
+            if (
+                !ReferenceEquals(systemDb.Model, db.Model)
+                || await ReadServerDatabaseIdentityAsync(systemDb, holds, ct) != callerDatabase
+            )
+            {
+                throw new RetentionConfigurationException([
+                    "Cohort's readiness scope resolved a DbContext with a different model or database from the calling scope's. Cohort checks holds across tenants in a System(Readiness) scope, so every scope must reach the same database and model.",
+                ]);
+            }
+
             await using var command = new SqlParams { ["registered"] = registered }.CreateCommand(
                 systemDb.Database.GetDbConnection(),
                 null,
@@ -213,14 +225,58 @@ internal sealed class RetentionRuntimeReadinessValidator(
         }
     }
 
-    // Readiness depends on the model (and so Cohort's table mapping) and on the database it
-    // runs against; Npgsql's DataSource already carries host and port.
-    private RetentionRuntimeReadinessKey CreateKey() => CreateKey(db);
-
-    private static RetentionRuntimeReadinessKey CreateKey(DbContext context)
+    /// <summary>
+    /// Which database a context's connection reaches, as the server sees it. Connection strings
+    /// spell one database many ways (<c>localhost</c> or <c>127.0.0.1</c>, a pooler or the direct
+    /// port), so the database name, the server's start time and the hold table's OID decide
+    /// sameness instead. Reads in the context's current transaction when it has one.
+    /// </summary>
+    private static async Task<ServerDatabaseIdentity> ReadServerDatabaseIdentityAsync(
+        DbContext context,
+        string holds,
+        CancellationToken ct
+    )
     {
-        var connection = context.Database.GetDbConnection();
-        return new RetentionRuntimeReadinessKey(context.Model, connection.DataSource, connection.Database);
+        await context.Database.OpenConnectionAsync(ct);
+        try
+        {
+            await using var command = new SqlParams { ["holds"] = holds }.CreateCommand(
+                context.Database.GetDbConnection(),
+                context.Database.CurrentTransaction?.GetDbTransaction(),
+                """
+                SELECT pg_catalog.current_database()::text,
+                       pg_catalog.pg_postmaster_start_time(),
+                       pg_catalog.to_regclass(@holds)::oid::bigint
+                """
+            );
+            await using var reader = await command.ExecuteReaderAsync(ct);
+            await reader.ReadAsync(ct);
+            return new ServerDatabaseIdentity(
+                reader.GetString(0),
+                reader.GetFieldValue<DateTime>(1),
+                reader.IsDBNull(2) ? null : reader.GetInt64(2)
+            );
+        }
+        finally
+        {
+            await context.Database.CloseConnectionAsync();
+        }
+    }
+
+    private sealed record ServerDatabaseIdentity(
+        string Database,
+        DateTime ServerStartedAt,
+        long? HoldsTableOid
+    );
+
+    // Readiness depends on the model (and so Cohort's table mapping) and on the database it
+    // runs against; Npgsql's DataSource already carries host and port. This only keys the
+    // cache, so two spellings of one database each validate once; whether two contexts reach
+    // the same database is decided on the server.
+    private RetentionRuntimeReadinessKey CreateKey()
+    {
+        var connection = db.Database.GetDbConnection();
+        return new RetentionRuntimeReadinessKey(db.Model, connection.DataSource, connection.Database);
     }
 
     private void ValidateProvider()
@@ -272,4 +328,10 @@ internal sealed class RetentionRuntimeReadinessEntry
     internal SemaphoreSlim Gate { get; } = new(1, 1);
 
     internal volatile bool Validated;
+
+    /// <summary>
+    /// The cross-tenant hold check passed. Set even when the caller was in a transaction, because
+    /// that check never reads through the caller's connection.
+    /// </summary>
+    internal volatile bool StoredEntityIdentitiesValidated;
 }

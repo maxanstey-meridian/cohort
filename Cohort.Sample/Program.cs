@@ -1,8 +1,9 @@
-using Cohort.Domain;
 using Cohort.Application;
+using Cohort.Domain;
 using Cohort.Hosting;
 using Cohort.Sample;
 using Cohort.Sample.Entities;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -33,7 +34,7 @@ try
     var previewService = scope.ServiceProvider.GetRequiredService<IRetentionPreview>();
     var sweepService = scope.ServiceProvider.GetRequiredService<IRetentionSweep>();
 
-    var preview = await previewService.PreviewAsync(previewTenant, DateTimeOffset.UtcNow);
+    var preview = await previewService.PreviewAsync(previewTenant);
 
     logger.LogInformation(
         "Attributes wired: found {Count} retention entries",

@@ -46,11 +46,12 @@ RetentionExecutionContext.System(RetentionSystemWork Work)
 | Each `OnAfterAsync` delivery, in its own scope | `Tenant` of the row, or `System(TenantlessPass)` for a tenantless row |
 | History pruning | `System(HistoryPruning)` |
 | Startup readiness | `System(Readiness)` |
-| Readiness's check of holds across every tenant, the first time any of the above (or `IRetentionHoldsRepository`, `IRetentionDeletion` or a `Caller` erasure) runs readiness, in its own scope | `System(Readiness)` |
+| Readiness's cross-tenant hold check, whichever operation runs readiness first | `System(Readiness)` |
 
-Apart from that one readiness scope, `IRetentionHoldsRepository` and `IRetentionDeletion`
-create no scope of their own. They run in your scope, under whatever isolation you already
-applied to it.
+The first operation can be any of the above, `IRetentionHoldsRepository`,
+`IRetentionDeletion` or a `Caller` erasure. Apart from that readiness scope,
+`IRetentionHoldsRepository` and `IRetentionDeletion` create no scope of their own. They run in
+your scope, under whatever isolation you already applied to it.
 
 ## System work
 
@@ -60,7 +61,7 @@ System work deliberately spans tenants, or touches tables that have no tenant:
 |---|---|
 | `Readiness` | Catalog checks, and integrity checks across every tenant |
 | `WorkerCoordination` | The worker's advisory lock, occurrence ledger and tenant source |
-| `TenantlessPass` | Sweeps, previews and handler deliveries for `[RetentionTenantless]` entities |
+| `TenantlessPass` | Sweeps, previews, erasures and handler deliveries for `[RetentionTenantless]` entities |
 | `RowDispatch` | Claiming, settling, recovering and scrubbing every tenant's queued handler work |
 | `HistoryPruning` | Pruning Cohort's run history and inactive holds |
 
@@ -159,6 +160,11 @@ Session-level settings need a direct connection or session-mode pooling. Behind 
 transaction-pooling PgBouncer they would leak between clients, and Cohort's session advisory
 locks would not hold either. Npgsql resets session state when a connection returns to its
 pool.
+
+Each scope uses its own connection. The worker holds its coordination connection for the
+whole iteration and opens another for each pass, and the first readiness check can take one
+more in its own `System(Readiness)` scope. A pool of one connection hangs the worker; leave
+headroom.
 
 ## Grants
 

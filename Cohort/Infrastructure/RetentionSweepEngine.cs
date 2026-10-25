@@ -2,6 +2,7 @@ using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure.Audit;
 using Cohort.Infrastructure.Sweep;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -41,13 +42,15 @@ internal sealed class RetentionSweepEngine(
     {
         await readinessValidator.ValidateAsync(ct);
         var now = await DatabaseClock.ResolveRunTimeAsync(db, at, dryRun, ct);
+        // Every time the run records is the database's; without a requested time, "now" is.
+        var startedAt = at is null ? now : await DatabaseClock.NowAsync(db, ct);
 
         var run = new RetentionRun(
             db,
             auditWriter,
             auditNotifier,
             logger,
-            new SweepEvent.Started(Guid.NewGuid(), DateTimeOffset.UtcNow, trigger, dryRun, tenant.Id),
+            new SweepEvent.Started(Guid.NewGuid(), startedAt, trigger, dryRun, tenant.Id),
             options.SweepBatchSize
         );
         await run.ExecuteAsync(
@@ -69,10 +72,7 @@ internal sealed class RetentionSweepEngine(
         var timeZone = options.TimeZone;
         foreach (var entry in registry.Scan().Values)
         {
-            if (
-                (scope == SweepEntityScope.TenantedOnly && entry.Tenant is null)
-                || (scope == SweepEntityScope.TenantlessOnly && entry.Tenant is not null)
-            )
+            if (!scope.Includes(entry))
             {
                 continue;
             }
@@ -110,4 +110,11 @@ internal enum SweepEntityScope
 {
     TenantedOnly,
     TenantlessOnly,
+}
+
+internal static class SweepEntityScopeExtensions
+{
+    /// <summary>Whether <paramref name="entry"/> is one of the entities the scope covers.</summary>
+    internal static bool Includes(this SweepEntityScope scope, RetentionEntry entry) =>
+        scope == SweepEntityScope.TenantedOnly ? entry.Tenant is not null : entry.Tenant is null;
 }

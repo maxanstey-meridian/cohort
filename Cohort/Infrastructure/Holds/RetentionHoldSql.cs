@@ -4,19 +4,39 @@ namespace Cohort.Infrastructure.Holds;
 
 internal static class RetentionHoldSql
 {
-    private const string DatabaseClock = "pg_catalog.statement_timestamp()";
-
     /// <summary>
     /// The one definition of "this hold protects": created, not yet expired and not yet removed
-    /// at <paramref name="atSql"/>, which defaults to the database clock. Every hold check
-    /// (mutation, deletion, reporting) uses it, so none can disagree with another.
+    /// on the database clock. Every hold check (mutation, deletion, reporting) uses it, so none
+    /// can disagree with another.
     /// </summary>
-    internal static string ActivePredicate(string holdAlias, string atSql = DatabaseClock)
+    internal static string ActivePredicate(string holdAlias)
     {
+        const string now = DatabaseClock.Sql;
         return $"""
-            {holdAlias}."CreatedAt" <= {atSql}
-                  AND ({holdAlias}."ExpiresAt" IS NULL OR {holdAlias}."ExpiresAt" > {atSql})
-                  AND ({holdAlias}."RemovedAt" IS NULL OR {holdAlias}."RemovedAt" > {atSql})
+            {holdAlias}."CreatedAt" <= {now}
+                  AND ({holdAlias}."ExpiresAt" IS NULL OR {holdAlias}."ExpiresAt" > {now})
+                  AND ({holdAlias}."RemovedAt" IS NULL OR {holdAlias}."RemovedAt" > {now})
+            """;
+    }
+
+    /// <summary>
+    /// Selects one row when an active hold covers <c>@recordId</c> (a canonical record id) of
+    /// <c>@retentionEntityId</c>, scoped to <c>@tenantId</c> when <paramref name="tenanted"/>,
+    /// otherwise to tenantless holds.
+    /// </summary>
+    internal static string BuildActiveHoldForRecord(RelationalObjectName holdsTable, bool tenanted)
+    {
+        var tenantLine = tenanted
+            ? @"hold.""TenantId"" = @tenantId"
+            : @"hold.""TenantId"" IS NULL";
+        return $"""
+            SELECT 1
+            FROM {PostgreSqlIdentifier.Format(holdsTable)} AS hold
+            WHERE hold."RetentionEntityId" = @retentionEntityId
+              AND hold."RecordId" = @recordId
+              AND {tenantLine}
+              AND {ActivePredicate("hold")}
+            LIMIT 1
             """;
     }
 
@@ -59,6 +79,14 @@ internal static class RetentionHoldSql
         IReadOnlyList<RetentionEntry> entries
     )
     {
+        if (entries.Count == 0)
+        {
+            throw new ArgumentException(
+                "At least one retained entity is required to find holds without a row.",
+                nameof(entries)
+            );
+        }
+
         var parameters = new SqlParams();
         var branches = new List<string>(entries.Count);
         for (var index = 0; index < entries.Count; index++)

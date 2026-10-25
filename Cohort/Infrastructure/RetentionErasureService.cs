@@ -2,6 +2,7 @@ using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure.Audit;
 using Cohort.Infrastructure.Sweep;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
@@ -32,14 +33,10 @@ internal sealed class RetentionErasureService(
     )
     {
         ArgumentNullException.ThrowIfNull(request);
-        var (tenant, entities) = request switch
-        {
-            RetentionErasureRequest.TenantedRequest tenanted =>
-                (tenanted.Tenant, SweepEntityScope.TenantedOnly),
-            RetentionErasureRequest.TenantlessRequest =>
-                (TenantContext.Tenantless, SweepEntityScope.TenantlessOnly),
-            _ => throw new ArgumentOutOfRangeException(nameof(request)),
-        };
+        var tenant = request.RunTenant;
+        var entities = request is RetentionErasureRequest.TenantlessRequest
+            ? SweepEntityScope.TenantlessOnly
+            : SweepEntityScope.TenantedOnly;
         var scope = request.Scope;
         var callerCommit = request.Transaction == ErasureTransaction.Caller
             ? await ValidateCallerTransactionAsync(ct)
@@ -48,6 +45,8 @@ internal sealed class RetentionErasureService(
         await readinessValidator.ValidateAsync(ct);
         ValidateSubject(scope, entities);
         var now = await DatabaseClock.ResolveRunTimeAsync(db, request.At, scope.DryRun, ct);
+        // Every time the run records is the database's; without a requested time, "now" is.
+        var startedAt = request.At is null ? now : await DatabaseClock.NowAsync(db, ct);
 
         var run = new RetentionRun(
             db,
@@ -56,7 +55,7 @@ internal sealed class RetentionErasureService(
             logger,
             new SweepEvent.Started(
                 Guid.NewGuid(),
-                DateTimeOffset.UtcNow,
+                startedAt,
                 SweepTriggerKind.Erasure,
                 scope.DryRun,
                 tenant.Id,
@@ -124,7 +123,7 @@ internal sealed class RetentionErasureService(
     {
         var validation = validationState.For(db.Model);
         var declared = registry.Scan().Values
-            .Where(entry => InScope(entry, entities))
+            .Where(entry => entities.Includes(entry))
             .SelectMany(entry => validation.ErasureSubjects[entry.EntityType])
             .Select(metadata => metadata.Kind)
             .ToHashSet(StringComparer.Ordinal);
@@ -148,9 +147,6 @@ internal sealed class RetentionErasureService(
         }
     }
 
-    private static bool InScope(RetentionEntry entry, SweepEntityScope entities) =>
-        entities == SweepEntityScope.TenantedOnly ? entry.Tenant is not null : entry.Tenant is null;
-
     private async Task<IReadOnlyList<SweepScope>> BuildExecutionPlanAsync(
         TenantContext tenant,
         SweepEntityScope entities,
@@ -166,7 +162,7 @@ internal sealed class RetentionErasureService(
         {
             // A tenanted erasure never reaches tenantless rows (no tenant owns them), and a
             // tenantless one never reaches a tenant's.
-            if (!InScope(entry, entities))
+            if (!entities.Includes(entry))
             {
                 continue;
             }

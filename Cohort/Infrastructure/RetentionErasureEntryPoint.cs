@@ -14,7 +14,7 @@ namespace Cohort.Infrastructure;
 /// </summary>
 internal sealed class RetentionErasureEntryPoint(
     IServiceScopeFactory scopeFactory,
-    IServiceProvider callerServices
+    RetentionErasureService callerScopeErasure
 ) : IRetentionErasureService
 {
     public async Task<ErasureResult> ExecuteAsync(
@@ -26,17 +26,11 @@ internal sealed class RetentionErasureEntryPoint(
 
         if (request.Transaction == ErasureTransaction.Caller)
         {
-            return await callerServices.GetRequiredService<RetentionErasureService>().ExecuteAsync(request, ct);
+            return await callerScopeErasure.ExecuteAsync(request, ct);
         }
 
-        var tenantId = request switch
-        {
-            RetentionErasureRequest.TenantedRequest tenanted => tenanted.Tenant.Id,
-            RetentionErasureRequest.TenantlessRequest => Guid.Empty,
-            _ => throw new ArgumentOutOfRangeException(nameof(request)),
-        };
         await using var executionScope = await scopeFactory.CreateEnteredScopeAsync(
-            RetentionExecutionScopes.ForTenant(tenantId),
+            RetentionExecutionScopes.For(request.RunTenant),
             ct
         );
         return await executionScope.ServiceProvider

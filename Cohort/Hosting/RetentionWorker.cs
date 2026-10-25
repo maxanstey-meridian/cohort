@@ -416,7 +416,7 @@ internal sealed class RetentionWorker(
     )
     {
         await using var passScope = await scopeFactory.CreateEnteredScopeAsync(
-            RetentionExecutionScopes.ForTenant(tenant.Id),
+            RetentionExecutionScopes.For(tenant),
             ct
         );
         return await passScope.ServiceProvider.GetRequiredService<RetentionSweepEngine>().RunAsync(

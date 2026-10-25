@@ -13,7 +13,12 @@ so the ledger and the data never disagree.
 | `sweep_run_row_detail` | Mutated row, when per-row detail is on |
 
 A run commits its `Started` row before any mutation. A terminal event then sets `Status` to
-`Succeeded`, `PartiallyFailed`, `Failed` or `Cancelled` and records `SettledAt`.
+`Succeeded`, `PartiallyFailed`, `Failed` or `Cancelled` and records `SettledAt`. Every time
+the ledger records comes from the database clock.
+
+- An erasure inside your own transaction commits nothing on its own: `Started`, its batches
+  and its status commit or roll back with your transaction. See
+  [Erasing inside your own transaction](/guides/erasure#erasing-inside-your-own-transaction).
 
 Summary rows carry:
 
@@ -77,6 +82,9 @@ lifecycle order.
 
 - Events are delivered after commit. A batch's `RowDetail` and `EntityProgress` events wait
   until its mutation transaction commits, and rolled-back events are never delivered.
+- An erasure inside your own transaction delivers every event, `Started` included, only
+  after your transaction commits. See
+  [Erasing inside your own transaction](/guides/erasure#erasing-inside-your-own-transaction).
 - Each observer is isolated and bounded by `AuditObservers:Timeout`. Exceptions and timeouts
   are logged, but never change committed data, the result or the run status.
 - Delivery is best effort, with no durable outbox. A process crash can lose a notification

@@ -1,7 +1,9 @@
 using System.Data;
+
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure.Sweep;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -26,25 +28,22 @@ internal sealed class RetentionPreviewService(
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        var (tenant, includeEntry) = request switch
-        {
-            RetentionPreviewRequest.TenantedRequest tenanted =>
-                (tenanted.Tenant, (Func<RetentionEntry, bool>)(entry => entry.Tenant is not null)),
-            RetentionPreviewRequest.TenantlessRequest =>
-                (TenantContext.Tenantless, entry => entry.Tenant is null),
-            _ => throw new ArgumentOutOfRangeException(nameof(request)),
-        };
+        var tenant = request.RunTenant;
+        Func<RetentionEntry, bool> includeEntry = request is RetentionPreviewRequest.TenantlessRequest
+            ? entry => entry.Tenant is null
+            : entry => entry.Tenant is not null;
 
         await readinessValidator.ValidateAsync(ct);
+        // A preview changes nothing, so any requested time is allowed, later ones included.
+        var now = request.At ?? await DatabaseClock.NowAsync(db, ct);
 
-        var startedAt = DateTimeOffset.UtcNow;
+        var startedAt = request.At is null ? now : await DatabaseClock.NowAsync(db, ct);
         var counts = new List<EntitySweepCount>();
         var timeZone = settings.TimeZone;
         var connection = db.Database.GetDbConnection();
         await db.Database.OpenConnectionAsync(ct);
         try
         {
-
             foreach (
                 var entry in registry
                     .Scan()
@@ -52,7 +51,7 @@ internal sealed class RetentionPreviewService(
                     .OrderBy(entry => entry.EntityType.FullName, StringComparer.Ordinal)
             )
             {
-                var context = new RetentionResolutionContext(entry.Category, tenant, request.At);
+                var context = new RetentionResolutionContext(entry.Category, tenant, now);
                 var rule = await RetentionRuleProviderResolution.ResolveAsync(
                     ruleProvider,
                     readinessValidator.ValidatedCapabilities,
@@ -87,6 +86,11 @@ internal sealed class RetentionPreviewService(
             await db.Database.CloseConnectionAsync();
         }
 
-        return new RetentionSweepResult(Guid.NewGuid(), startedAt, DateTimeOffset.UtcNow, counts);
+        return new RetentionSweepResult(
+            Guid.NewGuid(),
+            startedAt,
+            await DatabaseClock.NowAsync(db, ct),
+            counts
+        );
     }
 }

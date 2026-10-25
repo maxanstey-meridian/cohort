@@ -1,4 +1,5 @@
 using System.Data;
+using System.Data.Common;
 
 using Cohort.Application;
 using Cohort.Domain;
@@ -47,7 +48,8 @@ internal sealed class RetentionRun(
     /// Takes the run lock, commits Started, runs <paramref name="body"/>, then settles the
     /// run: Completed or PartiallyFailed when the body returns, Cancelled or Failed when it
     /// throws. The lock is taken first so recovery never sees a Started run without a live
-    /// owner.
+    /// owner. In the caller's transaction there is no lock and nothing commits: Started and
+    /// the settlement are written into that transaction, and commit or roll back with it.
     /// </summary>
     public async Task ExecuteAsync(Func<Task> body, CancellationToken ct)
     {
@@ -58,9 +60,10 @@ internal sealed class RetentionRun(
             // inside a transaction that may already be aborted.
             callerCommit.AfterCommit(
                 db.Database.CurrentTransaction!,
+                IsStillWrittenAsync,
                 NotifyDeferredAsync,
                 () => logger.LogInformation(
-                    "Cohort {Operation} {SweepId} rolled back with the caller's transaction; no ledger row of the attempt remains, and nothing it changed was kept.",
+                    "Cohort {Operation} {SweepId} rolled back with the caller's transaction or one of its savepoints; no ledger row of the attempt remains, and nothing it changed was kept.",
                     operation,
                     SweepId
                 )
@@ -109,29 +112,22 @@ internal sealed class RetentionRun(
             await body();
 
             ct.ThrowIfCancellationRequested();
-            var at = DateTimeOffset.UtcNow;
-            await WriteDurableAsync(
-                failures.Count > 0
-                    ? new SweepEvent.PartiallyFailed(SweepId, at, at - started.At, AffectedTotal, TruncateError(string.Join("\n", failures)))
-                    : new SweepEvent.Completed(SweepId, at, at - started.At, AffectedTotal),
-                CancellationToken.None
-            );
-            settledAt = at;
+            await SettleAsync(at => failures.Count > 0
+                ? new SweepEvent.PartiallyFailed(SweepId, at, at - started.At, AffectedTotal, TruncateError(string.Join("\n", failures)))
+                : new SweepEvent.Completed(SweepId, at, at - started.At, AffectedTotal));
         }
         catch (OperationCanceledException ex) when (startedPersisted && ct.IsCancellationRequested)
         {
             var diagnostic = RetentionFailureDiagnostic.Create(ex);
             logger.LogWarning(ex, "Cohort {Operation} {SweepId} was cancelled. Diagnostic {DiagnosticId}.", operation, SweepId, diagnostic.DiagnosticIdText);
-            var at = DateTimeOffset.UtcNow;
-            await TrySettleAsync(new SweepEvent.Cancelled(SweepId, at, diagnostic.ToString(), at - started.At, AffectedTotal));
+            await TrySettleAsync(at => new SweepEvent.Cancelled(SweepId, at, diagnostic.ToString(), at - started.At, AffectedTotal));
             throw;
         }
         catch (Exception ex) when (startedPersisted)
         {
             var diagnostic = RetentionFailureDiagnostic.Create(ex);
             logger.LogError(ex, "Cohort {Operation} {SweepId} failed. Diagnostic {DiagnosticId}.", operation, SweepId, diagnostic.DiagnosticIdText);
-            var at = DateTimeOffset.UtcNow;
-            await TrySettleAsync(new SweepEvent.Failed(SweepId, at, diagnostic.ToString(), at - started.At, AffectedTotal));
+            await TrySettleAsync(at => new SweepEvent.Failed(SweepId, at, diagnostic.ToString(), at - started.At, AffectedTotal));
             throw;
         }
     }
@@ -170,17 +166,20 @@ internal sealed class RetentionRun(
                     await callerTransaction.ReleaseAsync(EntitySavepoint, ct);
                 }
             }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
             catch (Exception ex)
             {
                 if (callerTransaction is not null)
                 {
+                    // A cancelled statement aborts the caller's transaction as a failed one
+                    // does; rolling back to the savepoint lets the run still settle in it.
                     await callerTransaction.RollbackAsync(EntitySavepoint, CancellationToken.None);
                     counts.RemoveAll(count => count.EntityType == scope.Entry.EntityType);
                     deferredEvents.RemoveRange(deferredMark, deferredEvents.Count - deferredMark);
+                }
+
+                if (ex is OperationCanceledException)
+                {
+                    throw;
                 }
 
                 RecordEntityFailure(scope.Entry.EntityType, ex, "failed for");
@@ -215,7 +214,7 @@ internal sealed class RetentionRun(
     {
         var entry = scope.Entry;
         var rule = scope.Rule;
-        var eventAt = DateTimeOffset.UtcNow;
+        var eventAt = await DatabaseClock.NowAsync(db, ct);
         var connection = db.Database.GetDbConnection();
         long affected = 0, skipped = 0, held = 0, nullAnchors = 0;
 
@@ -274,12 +273,13 @@ internal sealed class RetentionRun(
     /// <summary>
     /// Mutates in batches, each selecting, locking and changing at most one batch of rows in
     /// its own transaction, so a large backlog retires incrementally and a failure loses only
-    /// the current batch.
+    /// the current batch. In the caller's transaction the batches still bound each statement,
+    /// but none commits on its own: the entity's savepoint and the caller's commit decide.
     /// </summary>
     private async Task<(long Affected, long Skipped)> ExecuteBatchesAsync(
         SweepStrategy strategy,
         SweepScope scope,
-        DateTimeOffset eventAt,
+        DateTimeOffset entityAt,
         CancellationToken ct
     )
     {
@@ -289,6 +289,7 @@ internal sealed class RetentionRun(
             (entry.AuditRowDetail == AuditRowDetail.Inherit ? rule.AuditRowDetail : entry.AuditRowDetail)
             == AuditRowDetail.PerRow;
         long affected = 0, skipped = 0;
+        DateTimeOffset? nextBatchAt = entityAt;
 
         while (true)
         {
@@ -296,18 +297,22 @@ internal sealed class RetentionRun(
 
             SweepExecutionResult execution;
             List<SweepEvent> committed = [];
-            // READ COMMITTED: the lock query and mutation must see a hold committed after discovery.
-            // In the caller's transaction (READ COMMITTED, checked on entry) a batch neither
-            // begins nor commits; it commits with the caller.
+            // READ COMMITTED: the lock query and mutation must see a hold committed after
+            // discovery. In the caller's transaction (READ COMMITTED, checked on entry) a batch
+            // neither begins nor commits; it commits with the caller.
             await using (var batchTransaction = callerCommit is null
                 ? await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct)
                 : null)
             {
+                // The batch's rows and events carry the database's time; the first batch
+                // reuses the time the entity just read.
+                var eventAt = nextBatchAt ?? await DatabaseClock.NowAsync(db, ct);
+                nextBatchAt = null;
                 execution = await strategy.ExecuteAsync(
                     scope,
                     db.Database.GetDbConnection(),
                     (batchTransaction ?? db.Database.CurrentTransaction!).GetDbTransaction(),
-                    new SweepMutationContext(SweepId, DateTimeOffset.UtcNow, batchSize),
+                    new SweepMutationContext(SweepId, eventAt, batchSize),
                     ct
                 );
 
@@ -408,6 +413,21 @@ internal sealed class RetentionRun(
         }
     }
 
+    /// <summary>
+    /// Asked inside the caller's transaction just before it commits: whether the run's ledger
+    /// row is still there, or a rollback to a savepoint taken before the run removed it.
+    /// </summary>
+    private async Task<bool> IsStillWrittenAsync(DbTransaction transaction, CancellationToken ct)
+    {
+        var sweepRun = PostgreSqlIdentifier.Format(CohortStoreTables.FromModel(db.Model).SweepRun);
+        await using var command = new SqlParams { ["sweepId"] = SweepId }.CreateCommand(
+            transaction.Connection!,
+            transaction,
+            $"SELECT EXISTS (SELECT 1 FROM {sweepRun} WHERE \"SweepId\" = @sweepId)"
+        );
+        return await command.ExecuteScalarAsync(ct) is true;
+    }
+
     private async Task NotifyDeferredAsync()
     {
         foreach (var evt in deferredEvents)
@@ -416,11 +436,26 @@ internal sealed class RetentionRun(
         }
     }
 
-    private async Task TrySettleAsync(SweepEvent terminal)
+    /// <summary>
+    /// Writes the terminal event, stamped with the database's time like every other event of
+    /// the run. Bounded by the settlement timeout rather than the run's token, so a cancelled
+    /// run still settles.
+    /// </summary>
+    private async Task SettleAsync(Func<DateTimeOffset, SweepEvent> terminal)
+    {
+        using var timeout = new CancellationTokenSource(AuditSettlementTimeout);
+        var at = await DatabaseClock.NowAsync(db, timeout.Token);
+        var evt = terminal(at);
+        await auditWriter.WriteAsync(evt, timeout.Token);
+        await NotifyAsync(evt);
+        settledAt = at;
+    }
+
+    private async Task TrySettleAsync(Func<DateTimeOffset, SweepEvent> terminal)
     {
         try
         {
-            await WriteDurableAsync(terminal, CancellationToken.None);
+            await SettleAsync(terminal);
         }
         catch (Exception settlementException)
         {

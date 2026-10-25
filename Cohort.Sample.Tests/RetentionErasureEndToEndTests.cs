@@ -1,14 +1,17 @@
 using System.Data;
 using System.Data.Common;
+
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
 using Cohort.Infrastructure;
 using Cohort.Infrastructure.Migrations;
 using Cohort.Sample.Entities;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+
 using Npgsql;
 
 namespace Cohort.Sample.Tests;
@@ -942,7 +945,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             await create.Should().ThrowAsync<InvalidOperationException>();
         }
 
-                await using (var scope = services.CreateAsyncScope())
+        await using (var scope = services.CreateAsyncScope())
         {
             var result = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
                 RetentionErasureRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), new ErasureScope("email", "ABCDEFGH-2"), asOf)
@@ -950,7 +953,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             result.EntityFailures.Should().BeEmpty();
         }
 
-await using var verifyScope = services.CreateAsyncScope();
+        await using var verifyScope = services.CreateAsyncScope();
         var verify = verifyScope.ServiceProvider.GetRequiredService<BoundedSubjectDbContext>();
         (await verify.Set<BoundedSubjectRecord>().CountAsync()).Should().Be(1);
     }
@@ -2031,6 +2034,209 @@ await using var verifyScope = services.CreateAsyncScope();
         (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeTrue();
     }
 
+    [Fact]
+    public async Task Caller_Mode_Entity_Failure_Undoes_Only_That_Entity()
+    {
+        // The anonymise literal overflows varchar(8) (SQLSTATE 22001), which aborts the
+        // caller's transaction mid-entity; the entity's savepoint must undo just that entity.
+        await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
+        var observer = new RecordingObserver();
+        await using var services = BuildPredicateResolutionServiceProvider<CallerPartialFailureDbContext>(
+            database.ConnectionString,
+            new StaticCategoryRepository(
+                new Dictionary<string, ITestRetentionRule>
+                {
+                    ["bounded-anonymise"] = new StaticTestRetentionRule(
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
+                    ),
+                    ["caller-purge"] = new StaticTestRetentionRule(
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)
+                    ),
+                }
+            ),
+            services => services.AddSingleton<IRetentionAuditObserver>(observer)
+        );
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var createdAt = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var failingId = Guid.NewGuid();
+        var purgedId = Guid.NewGuid();
+        var markerId = Guid.NewGuid();
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<CallerPartialFailureDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.Add(new BoundedAnonymiseRecord { Id = failingId, TenantId = tenant.Id, SubjectId = subject, Email = "a@b.c", CreatedAt = createdAt });
+            db.Add(new CallerPurgeRecord { Id = purgedId, TenantId = tenant.Id, SubjectId = subject, CreatedAt = createdAt });
+            await db.SaveChangesAsync();
+        }
+
+        ErasureResult result;
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<CallerPartialFailureDbContext>();
+            await using var transaction = await db.Database.BeginTransactionAsync();
+            db.Add(new CallerMarker { Id = markerId });
+            await db.SaveChangesAsync();
+
+            result = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(tenant, new ErasureScope("user", subject), transaction: ErasureTransaction.Caller)
+            );
+            observer.Events.Should().BeEmpty();
+            await transaction.CommitAsync();
+        }
+
+        result.EntityFailures.Should().ContainSingle().Which.Should().Contain("code=sqlstate:22001");
+        result.Counts.Should().NotContain(count => count.EntityType == typeof(BoundedAnonymiseRecord));
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(CallerPurgeRecord))
+            .Which.Affected.Should().Be(1);
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var verify = scope.ServiceProvider.GetRequiredService<CallerPartialFailureDbContext>();
+            (await verify.Set<CallerMarker>().AnyAsync(marker => marker.Id == markerId)).Should().BeTrue();
+            (await verify.Set<CallerPurgeRecord>().AnyAsync(record => record.Id == purgedId)).Should().BeFalse();
+            var failed = await verify.Set<BoundedAnonymiseRecord>().SingleAsync(record => record.Id == failingId);
+            failed.Email.Should().Be("a@b.c");
+            failed.AnonymisedAt.Should().BeNull();
+            ((SweepRunStatus)await verify.Database
+                .SqlQuery<int>($"""SELECT "Status" AS "Value" FROM "sweep_run" WHERE "SweepId" = {result.SweepId}""")
+                .SingleAsync()).Should().Be(SweepRunStatus.PartiallyFailed);
+            (await verify.Database
+                .SqlQuery<string>($"""SELECT "EntityType" AS "Value" FROM "sweep_run_entity_summary" WHERE "SweepId" = {result.SweepId}""")
+                .ToListAsync()).Should().Equal(typeof(CallerPurgeRecord).FullName);
+        }
+
+        observer.Events.Should().ContainSingle(evt => evt is SweepEvent.EntitySummary)
+            .Which.As<SweepEvent.EntitySummary>().EntityType.Should().Be(typeof(CallerPurgeRecord));
+        observer.Events.Should().NotContain(evt =>
+            (evt is SweepEvent.EntityProgress && ((SweepEvent.EntityProgress)evt).EntityType == typeof(BoundedAnonymiseRecord))
+            || (evt is SweepEvent.EntitySummary && ((SweepEvent.EntitySummary)evt).EntityType == typeof(BoundedAnonymiseRecord))
+        );
+        observer.Events.Should().StartWith(observer.Events.OfType<SweepEvent.Started>().Single())
+            .And.EndWith(observer.Events.OfType<SweepEvent.PartiallyFailed>().Single());
+    }
+
+    [Fact]
+    public async Task Caller_Rollback_To_A_Savepoint_Before_The_Erasure_Leaves_No_Ledger_And_Tells_No_Observer()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, markerId) = await SeedCallerErasureAsync(tenant.Id, subject);
+        var observer = new RecordingObserver();
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configureServices: services => services.AddSingleton<IRetentionAuditObserver>(observer)
+        );
+        var request = RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller);
+
+        await host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            var erasure = services.GetRequiredService<IRetentionErasureService>();
+            await using var transaction = await db.Database.BeginTransactionAsync();
+            (await db.Notes.SingleAsync(note => note.Id == markerId)).Body = "marker-after";
+            await db.SaveChangesAsync();
+
+            await transaction.CreateSavepointAsync("before_erasure");
+            await erasure.ExecuteAsync(request);
+            await transaction.RollbackToSavepointAsync("before_erasure");
+            await transaction.CommitAsync();
+        });
+
+        observer.Events.Should().BeEmpty();
+        (await CountRunsAsync(tenant.Id)).Should().Be(0);
+        await using (var verify = Host.CreateDbContext())
+        {
+            (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeTrue();
+            (await verify.Notes.SingleAsync(note => note.Id == markerId)).Body.Should().Be("marker-after");
+        }
+
+        // A savepoint taken after the erasure, rolled back, leaves the erasure in place; so does
+        // a savepoint operation that fails and is recovered from before the commit.
+        var kept = await host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            await using var transaction = await db.Database.BeginTransactionAsync();
+            var erased = await services.GetRequiredService<IRetentionErasureService>().ExecuteAsync(request);
+
+            await transaction.CreateSavepointAsync("after_erasure");
+            var releaseMissing = () => transaction.ReleaseSavepointAsync("missing");
+            await releaseMissing.Should().ThrowAsync<PostgresException>();
+            await transaction.RollbackToSavepointAsync("after_erasure");
+            await transaction.CommitAsync();
+            return erased;
+        });
+
+        (await LoadRunStatusAsync(kept.SweepId)).Should().Be(SweepRunStatus.Succeeded);
+        observer.Events.Should().StartWith(observer.Events.OfType<SweepEvent.Started>().Single())
+            .And.EndWith(observer.Events.OfType<SweepEvent.Completed>().Single());
+        observer.Events.Should().OnlyContain(evt => evt.SweepId == kept.SweepId);
+        await using var afterKept = Host.CreateDbContext();
+        (await afterKept.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task Caller_Mode_Cancellation_Mid_Statement_Leaves_The_Callers_Transaction_Usable_And_Settles_Cancelled()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, markerId) = await SeedCallerErasureAsync(tenant.Id, subject);
+        var observer = new RecordingObserver();
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configureServices: services => services.AddSingleton<IRetentionAuditObserver>(observer)
+        );
+
+        // Another session holds the note, so the erasure's FOR UPDATE waits in a statement
+        // that the cancellation then interrupts, aborting the caller's transaction.
+        await using var blocker = new NpgsqlConnection(ConnectionString);
+        await blocker.OpenAsync();
+        await using var blockerTransaction = await blocker.BeginTransactionAsync();
+        await using (var lockCommand = blocker.CreateCommand())
+        {
+            lockCommand.Transaction = blockerTransaction;
+            lockCommand.CommandText = """SELECT "Id" FROM "notes" WHERE "Id" = @id FOR UPDATE""";
+            lockCommand.Parameters.AddWithValue("id", erasedId);
+            await lockCommand.ExecuteNonQueryAsync();
+        }
+
+        await host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            await using var transaction = await db.Database.BeginTransactionAsync();
+            (await db.Notes.SingleAsync(note => note.Id == markerId)).Body = "marker-after";
+            await db.SaveChangesAsync();
+
+            using var cancellation = new CancellationTokenSource();
+            var erasure = services.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller),
+                cancellation.Token
+            );
+            await WaitForBlockedRowMutationAsync(blocker.ProcessID);
+            await cancellation.CancelAsync();
+            var cancelled = () => erasure;
+            await cancelled.Should().ThrowAsync<OperationCanceledException>();
+
+            // Still usable: the run settled Cancelled inside it.
+            ((SweepRunStatus)await db.Database
+                .SqlQuery<int>($"""SELECT "Status" AS "Value" FROM "sweep_run" WHERE "TenantId" = {tenant.Id}""")
+                .SingleAsync()).Should().Be(SweepRunStatus.Cancelled);
+            await transaction.CommitAsync();
+        });
+        await blockerTransaction.RollbackAsync();
+
+        (await CountRunsAsync(tenant.Id)).Should().Be(1);
+        observer.Events.Should().StartWith(observer.Events.OfType<SweepEvent.Started>().Single())
+            .And.EndWith(observer.Events.OfType<SweepEvent.Cancelled>().Single());
+        observer.Events.Should().NotContain(evt =>
+            (evt is SweepEvent.EntityProgress && ((SweepEvent.EntityProgress)evt).EntityType == typeof(Note))
+            || (evt is SweepEvent.EntitySummary && ((SweepEvent.EntitySummary)evt).EntityType == typeof(Note))
+        );
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeTrue();
+        (await verify.Notes.SingleAsync(note => note.Id == markerId)).Body.Should().Be("marker-after");
+    }
+
     private static ErasureScope CallerScope(Guid subject) =>
         new("user", subject, allowSoftDeleteAsErasure: true);
 
@@ -2076,6 +2282,19 @@ await using var verifyScope = services.CreateAsyncScope();
             command.Parameters.AddWithValue("sweepId", evt.SweepId);
             var status = await command.ExecuteScalarAsync(ct);
             seen.Enqueue((evt.GetType().Name, status is int value ? (SweepRunStatus)value : null));
+        }
+    }
+
+    private sealed class RecordingObserver : IRetentionAuditObserver
+    {
+        private readonly System.Collections.Concurrent.ConcurrentQueue<SweepEvent> events = new();
+
+        public IReadOnlyList<SweepEvent> Events => [.. events];
+
+        public Task OnCommittedAsync(SweepEvent evt, CancellationToken ct)
+        {
+            events.Enqueue(evt);
+            return Task.CompletedTask;
         }
     }
 
@@ -2359,7 +2578,8 @@ await using var verifyScope = services.CreateAsyncScope();
 
     private static ServiceProvider BuildPredicateResolutionServiceProvider<TContext>(
         string connectionString,
-        ITestRetentionRuleProvider repository
+        ITestRetentionRuleProvider repository,
+        Action<IServiceCollection>? configureServices = null
     )
         where TContext : DbContext
     {
@@ -2370,6 +2590,7 @@ await using var verifyScope = services.CreateAsyncScope();
         services.AddSingleton<IRetentionRuleProvider>(repository);
         services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<TContext>();
+        configureServices?.Invoke(services);
         return services.BuildServiceProvider(validateScopes: true);
     }
 
@@ -3068,6 +3289,41 @@ internal sealed class BoundedAnonymiseRecord
 
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset? AnonymisedAt { get; set; }
+}
+
+internal sealed class CallerPartialFailureDbContext(DbContextOptions<CallerPartialFailureDbContext> options)
+    : DbContext(options)
+{
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<BoundedAnonymiseRecord>(builder =>
+        {
+            builder.ToTable("bounded_anonymise_records");
+            builder.Property(record => record.Email).HasMaxLength(8);
+        });
+        modelBuilder.Entity<CallerPurgeRecord>().ToTable("caller_purge_records");
+        modelBuilder.Entity<CallerMarker>().ToTable("caller_markers");
+        modelBuilder.ConfigureCohortTables();
+    }
+}
+
+[Retain("caller-purge", nameof(CreatedAt))]
+[RetentionEntityId("00000000-0000-0000-0001-0000000000b3")]
+internal sealed class CallerPurgeRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+
+    [ErasureSubject("user")]
+    public Guid SubjectId { get; set; }
+
+    public DateTimeOffset CreatedAt { get; set; }
+}
+
+/// <summary>The caller's own change, made in the transaction the erasure joins.</summary>
+internal sealed class CallerMarker
+{
+    public Guid Id { get; set; }
 }
 
 internal sealed class TenantlessKindDbContext(DbContextOptions<TenantlessKindDbContext> options)

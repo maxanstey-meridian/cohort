@@ -1,4 +1,5 @@
 using Cohort.Application;
+using Cohort.Domain;
 
 using Microsoft.Extensions.DependencyInjection;
 
@@ -28,6 +29,12 @@ internal static class RetentionExecutionScopes
             throw;
         }
     }
+
+    /// <summary>
+    /// The context for one tenant's work, or the tenantless pass for
+    /// <see cref="TenantContext.Tenantless"/>.
+    /// </summary>
+    internal static RetentionExecutionContext For(TenantContext tenant) => ForTenant(tenant.Id);
 
     /// <summary>
     /// The context for one tenant's work, or the tenantless pass for <see cref="Guid.Empty"/>,

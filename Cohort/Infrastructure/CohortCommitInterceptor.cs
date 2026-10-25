@@ -12,8 +12,9 @@ namespace Cohort.Infrastructure;
 /// <summary>
 /// Runs work Cohort deferred until a caller's transaction commits (an erasure joined with
 /// <c>ErasureTransaction.Caller</c> tells its audit observers only then), and drops it when
-/// the transaction rolls back or fails. EF has no other commit hook. <c>AddCohort</c> adds
-/// one instance to the host's DbContext options.
+/// the transaction rolls back or fails, or when the work's own rows are gone by the time it
+/// commits (the caller rolled back to a savepoint taken before it). EF has no other commit
+/// hook. <c>AddCohort</c> adds one instance to the host's DbContext options.
 /// </summary>
 internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> logger)
     : DbTransactionInterceptor
@@ -31,9 +32,19 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
 
     /// <summary>
     /// Runs <paramref name="committed"/> once <paramref name="transaction"/> commits, or
-    /// <paramref name="dropped"/> if it rolls back or fails instead.
+    /// <paramref name="dropped"/> if it rolls back or fails instead. Just before the commit,
+    /// <paramref name="stillWritten"/> asks, inside the transaction, whether the work's rows
+    /// survived: a rollback to a savepoint taken before them leaves the transaction
+    /// committable without them. EF tells interceptors of a savepoint rollback but not which
+    /// savepoint, and a raw <c>ROLLBACK TO SAVEPOINT</c> isn't seen at all, so the rows are
+    /// the only reliable answer.
     /// </summary>
-    internal void AfterCommit(IDbContextTransaction transaction, Func<Task> committed, Action dropped)
+    internal void AfterCommit(
+        IDbContextTransaction transaction,
+        Func<DbTransaction, CancellationToken, Task<bool>> stillWritten,
+        Func<Task> committed,
+        Action dropped
+    )
     {
         var dbTransaction = transaction.GetDbTransaction();
         lock (pending)
@@ -44,10 +55,35 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
                 pending.AddOrUpdate(dbTransaction, deferred);
             }
 
-            deferred.Work.Add(new DeferredWork(committed, dropped));
+            deferred.Work.Add(new DeferredWork(stillWritten, committed, dropped));
         }
     }
 
+    // Deliberately blocking: EF's synchronous commit has no async hook. The wait is bounded by
+    // the stillWritten query and AuditObservers:Timeout; CommitAsync is the supported path.
+    public override InterceptionResult TransactionCommitting(
+        DbTransaction transaction,
+        TransactionEventData eventData,
+        InterceptionResult result
+    )
+    {
+        DropUnwrittenAsync(transaction, eventData.TransactionId, CancellationToken.None).GetAwaiter().GetResult();
+        return result;
+    }
+
+    public override async ValueTask<InterceptionResult> TransactionCommittingAsync(
+        DbTransaction transaction,
+        TransactionEventData eventData,
+        InterceptionResult result,
+        CancellationToken cancellationToken = default
+    )
+    {
+        await DropUnwrittenAsync(transaction, eventData.TransactionId, cancellationToken);
+        return result;
+    }
+
+    // Deliberately blocking, as for TransactionCommitting: delivery is bounded by
+    // AuditObservers:Timeout, and CommitAsync is the supported path.
     public override void TransactionCommitted(DbTransaction transaction, TransactionEndEventData eventData) =>
         RunAsync(transaction, eventData.TransactionId).GetAwaiter().GetResult();
 
@@ -71,8 +107,15 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
     }
 
     // A failed commit may not have committed; deferred work is best effort, so it is dropped.
-    public override void TransactionFailed(DbTransaction transaction, TransactionErrorEventData eventData) =>
-        Drop(transaction, eventData.TransactionId);
+    // A failed savepoint operation leaves the transaction open and possibly still committable,
+    // so its work waits for the commit's check.
+    public override void TransactionFailed(DbTransaction transaction, TransactionErrorEventData eventData)
+    {
+        if (EndsTransaction(eventData))
+        {
+            Drop(transaction, eventData.TransactionId);
+        }
+    }
 
     public override Task TransactionFailedAsync(
         DbTransaction transaction,
@@ -80,8 +123,54 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
         CancellationToken cancellationToken = default
     )
     {
-        Drop(transaction, eventData.TransactionId);
+        TransactionFailed(transaction, eventData);
         return Task.CompletedTask;
+    }
+
+    private static bool EndsTransaction(TransactionErrorEventData eventData) =>
+        eventData.Action is "Commit" or "Rollback";
+
+    private async Task DropUnwrittenAsync(DbTransaction transaction, Guid transactionId, CancellationToken ct)
+    {
+        List<DeferredWork> work;
+        lock (pending)
+        {
+            if (!pending.TryGetValue(transaction, out var deferred) || deferred.TransactionId != transactionId)
+            {
+                return;
+            }
+
+            work = [.. deferred.Work];
+        }
+
+        foreach (var item in work)
+        {
+            bool written;
+            // The caller's commit must not fail because of Cohort's check; an unanswered
+            // check drops the work, since it can't be shown to have committed.
+            try
+            {
+                written = await item.StillWritten(transaction, ct);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Cohort could not check whether work deferred until a caller's transaction committed was still part of it.");
+                written = false;
+            }
+
+            if (!written)
+            {
+                lock (pending)
+                {
+                    if (pending.TryGetValue(transaction, out var deferred))
+                    {
+                        deferred.Work.Remove(item);
+                    }
+                }
+
+                Report(item);
+            }
+        }
     }
 
     private async Task RunAsync(DbTransaction transaction, Guid transactionId)
@@ -104,14 +193,19 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
     {
         foreach (var work in Take(transaction, transactionId))
         {
-            try
-            {
-                work.Dropped();
-            }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "Cohort could not report work dropped with a caller's transaction.");
-            }
+            Report(work);
+        }
+    }
+
+    private void Report(DeferredWork work)
+    {
+        try
+        {
+            work.Dropped();
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Cohort could not report work dropped with a caller's transaction.");
         }
     }
 
@@ -134,5 +228,15 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
         public List<DeferredWork> Work { get; } = [];
     }
 
-    private sealed record DeferredWork(Func<Task> Committed, Action Dropped);
+    // A class, not a record: work is removed by identity.
+    private sealed class DeferredWork(
+        Func<DbTransaction, CancellationToken, Task<bool>> stillWritten,
+        Func<Task> committed,
+        Action dropped
+    )
+    {
+        public Func<DbTransaction, CancellationToken, Task<bool>> StillWritten { get; } = stillWritten;
+        public Func<Task> Committed { get; } = committed;
+        public Action Dropped { get; } = dropped;
+    }
 }

@@ -56,6 +56,9 @@ public abstract record RetentionSweepRequest
 
     public bool DryRun { get; }
 
+    /// <summary>The tenant the run is scoped and audited under.</summary>
+    internal abstract TenantContext RunTenant { get; }
+
     public static RetentionSweepRequest Tenanted(
         TenantContext tenant,
         DateTimeOffset? at = null,
@@ -84,6 +87,8 @@ public abstract record RetentionSweepRequest
         }
 
         public TenantContext Tenant { get; }
+
+        internal override TenantContext RunTenant => Tenant;
     }
 
     public sealed record TenantlessRequest : RetentionSweepRequest
@@ -94,5 +99,7 @@ public abstract record RetentionSweepRequest
             bool dryRun
         )
             : base(at, trigger, dryRun) { }
+
+        internal override TenantContext RunTenant => TenantContext.Tenantless;
     }
 }

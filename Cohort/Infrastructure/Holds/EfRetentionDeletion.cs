@@ -45,7 +45,8 @@ internal sealed class EfRetentionDeletion(
         }
 
         // Pending changes would be saved inside the hold-checked transaction without being
-        // checked, or leak out unsaved. They belong to the host, so refuse rather than discard them.
+        // checked, or leak out unsaved. They belong to the host, so refuse rather than discard
+        // them.
         if (db.ChangeTracker.HasChanges())
         {
             throw new InvalidOperationException(
@@ -188,15 +189,10 @@ internal sealed class EfRetentionDeletion(
         await using var command = parameters.CreateCommand(
             db.Database.GetDbConnection(),
             transaction,
-            $"""
-            SELECT 1
-            FROM {PostgreSqlIdentifier.Format(tables.RetentionHolds)} AS hold
-            WHERE hold."RetentionEntityId" = @retentionEntityId
-              AND hold."RecordId" = @recordId
-              {(target.Entry.Tenant is not null ? "AND hold.\"TenantId\" = @tenantId" : "AND hold.\"TenantId\" IS NULL")}
-              AND {RetentionHoldSql.ActivePredicate("hold")}
-            LIMIT 1
-            """
+            RetentionHoldSql.BuildActiveHoldForRecord(
+                tables.RetentionHolds,
+                tenanted: target.Entry.Tenant is not null
+            )
         );
         return await command.ExecuteScalarAsync(ct) is not null;
     }

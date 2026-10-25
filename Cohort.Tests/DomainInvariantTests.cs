@@ -99,6 +99,28 @@ public sealed class DomainInvariantTests
         RetentionSweepRequest.Tenantless().At.Should().BeNull();
     }
 
+    [Fact]
+    public void A_Tenantless_Erasure_Cannot_Join_The_Callers_Transaction()
+    {
+        var caller = () => RetentionErasureRequest.Tenantless(
+            new ErasureScope("user", Guid.NewGuid()),
+            transaction: ErasureTransaction.Caller
+        );
+
+        caller.Should().Throw<ArgumentException>()
+            .WithParameterName("transaction")
+            .WithMessage("A tenantless erasure can't join the caller's transaction*");
+    }
+
+    [Fact]
+    public void A_Preview_Request_Keeps_Its_Time_In_Utc_And_Defaults_To_The_Database_Clock()
+    {
+        var at = new DateTimeOffset(2026, 4, 12, 13, 0, 0, TimeSpan.FromHours(1));
+
+        RetentionPreviewRequest.Tenantless(at).At.Should().Be(at).And.Subject!.Value.Offset.Should().Be(TimeSpan.Zero);
+        RetentionPreviewRequest.Tenantless().At.Should().BeNull();
+    }
+
     [Theory]
     [InlineData(SweepTriggerKind.Erasure, null)]
     [InlineData(SweepTriggerKind.Erasure, " ")]

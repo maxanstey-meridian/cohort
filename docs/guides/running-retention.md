@@ -14,9 +14,12 @@ test. Both go through the same execution model.
 | `IRetentionDeletion` | Lets your own deletes take part in hold protection. See [Legal Holds](/guides/legal-holds#deleting-around-holds). |
 
 ```csharp
-await services.GetRequiredService<IRetentionPreview>().PreviewAsync(tenant, DateTimeOffset.UtcNow, ct);
+await services.GetRequiredService<IRetentionPreview>().PreviewAsync(tenant, ct: ct);
 await services.GetRequiredService<IRetentionSweep>().SweepAsync(tenant, ct);
-await services.GetRequiredService<IRetentionErasureService>()
+
+// The erasure service is scoped.
+await using var scope = services.CreateAsyncScope();
+await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>()
     .EraseAsync(tenant, new ErasureScope("user", userId), ct);
 ```
 
@@ -36,17 +39,16 @@ A dry run counts what it would change and writes the same run and entity audit t
 
 ### Which "today"
 
-Sweeps and erasures take "today" from the database's clock (`statement_timestamp()`), the
-clock that legal holds expire by, so an application server whose clock runs fast can't
-delete a row before its anniversary. Leave the time out.
+Previews, sweeps and erasures take "today" from the database's clock
+(`statement_timestamp()`), the clock that legal holds expire by, so an application server
+whose clock runs fast can't delete a row before its anniversary. Leave the time out.
 
-- You may pass a time (`RetentionSweepRequest.Tenanted(tenant, at)`,
+- You may pass a time (`PreviewAsync(tenant, at)`, `RetentionSweepRequest.Tenanted(tenant, at)`,
   `RetentionErasureRequest.Tenanted(tenant, scope, at)`). An earlier time is allowed, because
   it keeps more.
 - A run that changes rows refuses a time later than the database's with an
   `ArgumentOutOfRangeException`, before any run is recorded.
-- Dry runs and previews accept any time, so you can look ahead. A preview still takes its
-  time from you.
+- Dry runs and previews change no rows, so they accept any time and can look ahead.
 
 ### Scopes and transactions
 
@@ -66,7 +68,8 @@ have open on it. See
   decorators can be singletons. An erasure decorator is scoped, because the service it wraps
   is.
 - Each fresh scope is entered through your `IRetentionExecutionScope` as the request's tenant
-  before it touches the database. See [Tenant Isolation](/guides/tenant-isolation).
+  (`System(TenantlessPass)` for tenantless rows and requests) before it touches the database.
+  See [Tenant Isolation](/guides/tenant-isolation).
 - Caller times (`now`, `createdAt`, `expiresAt`, `removedAt`, ...) can carry any offset.
   Cohort normalises them to UTC at the boundary.
 
@@ -143,6 +146,26 @@ the host.
   [history pruning](/guides/history-pruning) after the batch in progress.
 
 Both are read live from configuration, so flipping them doesn't need a restart.
+
+## Upgrading to 0.11.0
+
+::: warning Breaking change
+0.11.0 takes "today" from the database clock and enters every scope it creates through a hook
+you register.
+
+- `SweepAsync(tenant, now)` becomes `SweepAsync(tenant)`.
+- `SweepAsync(tenant, now, trigger)` is removed. Use
+  `ExecuteAsync(RetentionSweepRequest.Tenanted(tenant, trigger: ...))`.
+- `RetentionSweepRequest.At` is optional and defaults to the database clock. A real (non-dry)
+  sweep refuses a later time; see [Which "today"](#which-today).
+- `RetentionPreviewRequest.At` and `PreviewAsync`'s time are optional and default to the
+  database clock. Drop the `DateTimeOffset.UtcNow` you passed; keep a time only to look ahead.
+- Register an `IRetentionExecutionScope`. Startup refuses a host without one. Without
+  row-level security, register `RetentionExecutionScope.Unisolated`. See
+  [Tenant Isolation](/guides/tenant-isolation).
+- Erasure changes are listed under
+  [Right-to-Erasure](/guides/erasure#upgrading-to-0-11-0).
+:::
 
 ## Before you start the host
 

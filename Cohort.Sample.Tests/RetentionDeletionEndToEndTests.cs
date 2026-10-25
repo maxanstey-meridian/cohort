@@ -300,6 +300,54 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Callback_Deleting_A_Held_Integer_Keyed_Row_Is_Refused()
+    {
+        // The held row's id is an integer the hold stores canonically ("00042" as "42"), so the
+        // after-callback check must match it through the integer branch, not a uuid one.
+        var tenantId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        const int externalId = 42;
+        await SeedNotesAsync(tenantId, noteId);
+        await using (var db = Host.CreateDbContext())
+        {
+            db.ExternalNumberedLogs.Add(new ExternalNumberedLog
+            {
+                Id = Guid.NewGuid(),
+                ExternalId = externalId,
+                CreatedAt = DateTimeOffset.UtcNow.AddDays(-60),
+                Payload = "held log",
+            });
+            await db.SaveChangesAsync();
+        }
+
+        var holdId = Guid.NewGuid();
+        await Host.RunWithServicesAsync(services =>
+            services.GetRequiredService<IRetentionHoldsRepository>().CreateAsync(
+                new RetentionHoldRequest(holdId, RetentionEntityIdentity.For<ExternalNumberedLog>(), "00042", null, "held log", DateTimeOffset.UtcNow),
+                CancellationToken.None
+            )
+        );
+
+        var act = () => Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            await services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [new RetentionTarget(RetentionEntityIdentity.For<Note>(), noteId.ToString(), tenantId)],
+                async ct =>
+                {
+                    await db.Notes.Where(note => note.Id == noteId).ExecuteDeleteAsync(ct);
+                    await db.ExternalNumberedLogs.Where(log => log.ExternalId == externalId).ExecuteDeleteAsync(ct);
+                }
+            );
+        });
+
+        await act.Should().ThrowAsync<InvalidOperationException>().WithMessage($"*{holdId}*");
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
+        (await verify.ExternalNumberedLogs.AnyAsync(log => log.ExternalId == externalId)).Should().BeTrue();
+    }
+
+    [Fact]
     public async Task Callback_Returning_With_Unsaved_Changes_Is_Refused_And_Cannot_Be_Saved_Later()
     {
         var tenantId = Guid.NewGuid();

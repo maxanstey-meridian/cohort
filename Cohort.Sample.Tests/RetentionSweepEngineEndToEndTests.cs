@@ -1,8 +1,10 @@
 using System.Data;
+
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure;
 using Cohort.Sample.Entities;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -252,6 +254,84 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         await using var verify = Host.CreateDbContext();
         (await verify.Notes.Where(note => note.TenantId == tenant.Id).Select(note => note.Body).ToListAsync())
             .Should().Equal("not-yet-due");
+    }
+
+    [Fact]
+    public async Task Every_Time_A_Sweep_Records_Or_Reports_Comes_From_The_Database_Clock()
+    {
+        // An explicit earlier time sets the cutoff only: what the run records is when it ran.
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var asOf = new DateTimeOffset(2026, 4, 11, 12, 0, 0, TimeSpan.Zero);
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note { Id = Guid.NewGuid(), TenantId = tenant.Id, CreatedAt = asOf.AddDays(-120), Body = "first-batch" },
+                new Note { Id = Guid.NewGuid(), TenantId = tenant.Id, CreatedAt = asOf.AddDays(-120), Body = "second-batch" }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        var observer = new RecordingObserver();
+        using var sweepHost = new CohortTestHost(
+            GetConnectionString(),
+            new StaticCategoryRepository(
+                new Dictionary<string, ITestRetentionRule>
+                {
+                    ["short-lived"] = new StaticTestRetentionRule(
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge, AuditRowDetail: AuditRowDetail.PerRow)
+                    ),
+                }
+            ),
+            new Dictionary<string, string?>
+            {
+                [$"{Cohort.Hosting.CohortOptions.SectionName}:SweepBatchSize"] = "1",
+            },
+            services => services.AddSingleton<IRetentionAuditObserver>(observer)
+        );
+
+        var before = await LoadDatabaseNowAsync();
+        var result = await sweepHost.RunSweepAsync(tenant, asOf);
+        var after = await LoadDatabaseNowAsync();
+
+        var events = observer.Events.Where(evt => evt.SweepId == result.SweepId).ToList();
+        events.Should().OnlyContain(evt => evt.At >= before && evt.At <= after);
+        var started = events.OfType<SweepEvent.Started>().Single();
+        var completed = events.OfType<SweepEvent.Completed>().Single();
+        result.StartedAt.Should().Be(started.At);
+        result.CompletedAt.Should().Be(completed.At);
+        completed.Duration.Should().Be(completed.At - started.At);
+        var rowDetails = events.OfType<SweepEvent.RowDetail>().ToList();
+        rowDetails.Should().HaveCount(2);
+        rowDetails[1].At.Should().BeOnOrAfter(rowDetails[0].At);
+
+        // The ledger stores exactly what observers were told. Where the host's clock is finer
+        // than PostgreSQL's microseconds, a host-clock time would not round-trip unchanged.
+        await using var verify = Host.CreateDbContext();
+        var run = await verify.Database
+            .SqlQuery<StoredRunTimes>($"""SELECT "StartedAt", "SettledAt", "Duration" FROM "sweep_run" WHERE "SweepId" = {result.SweepId}""")
+            .SingleAsync();
+        run.Should().Be(new StoredRunTimes(started.At, completed.At, completed.Duration));
+        (await verify.Database
+            .SqlQuery<DateTimeOffset>($"""SELECT "At" AS "Value" FROM "sweep_run_entity_summary" WHERE "SweepId" = {result.SweepId} AND "RetentionEntityId" = {Note.RetentionIdentity}""")
+            .SingleAsync()).Should().Be(events.OfType<SweepEvent.EntitySummary>().Single(summary => summary.EntityType == typeof(Note)).At);
+        (await verify.Database
+            .SqlQuery<DateTimeOffset>($"""SELECT "At" AS "Value" FROM "sweep_run_row_detail" WHERE "SweepId" = {result.SweepId} ORDER BY "At" """)
+            .ToListAsync()).Should().Equal(rowDetails.Select(rowDetail => rowDetail.At));
+    }
+
+    private sealed record StoredRunTimes(DateTimeOffset StartedAt, DateTimeOffset? SettledAt, TimeSpan? Duration);
+
+    private sealed class RecordingObserver : IRetentionAuditObserver
+    {
+        private readonly System.Collections.Concurrent.ConcurrentQueue<SweepEvent> events = new();
+
+        public IReadOnlyList<SweepEvent> Events => [.. events];
+
+        public Task OnCommittedAsync(SweepEvent evt, CancellationToken ct)
+        {
+            events.Enqueue(evt);
+            return Task.CompletedTask;
+        }
     }
 
     private async Task<DateTimeOffset> LoadDatabaseNowAsync()

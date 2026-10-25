@@ -7,38 +7,22 @@ namespace Cohort.Infrastructure;
 
 internal sealed class ScopeOwnedRetentionSweep(IServiceScopeFactory scopeFactory) : IRetentionSweep
 {
-    public Task<RetentionSweepResult> ExecuteAsync(
+    public async Task<RetentionSweepResult> ExecuteAsync(
         RetentionSweepRequest request,
         CancellationToken ct = default
     )
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        var (tenant, scope) = request switch
-        {
-            RetentionSweepRequest.TenantedRequest tenanted =>
-                (tenanted.Tenant, SweepEntityScope.TenantedOnly),
-            RetentionSweepRequest.TenantlessRequest =>
-                (TenantContext.Tenantless, SweepEntityScope.TenantlessOnly),
-            _ => throw new ArgumentOutOfRangeException(nameof(request)),
-        };
-
-        return RunAsync(tenant, request, scope, ct);
-    }
-
-    private async Task<RetentionSweepResult> RunAsync(
-        TenantContext tenant,
-        RetentionSweepRequest request,
-        SweepEntityScope entities,
-        CancellationToken ct
-    )
-    {
+        var entities = request is RetentionSweepRequest.TenantlessRequest
+            ? SweepEntityScope.TenantlessOnly
+            : SweepEntityScope.TenantedOnly;
         await using var scope = await scopeFactory.CreateEnteredScopeAsync(
-            RetentionExecutionScopes.ForTenant(tenant.Id),
+            RetentionExecutionScopes.For(request.RunTenant),
             ct
         );
         return await scope.ServiceProvider
             .GetRequiredService<RetentionSweepEngine>()
-            .RunAsync(tenant, request.At, request.Trigger, entities, request.DryRun, ct);
+            .RunAsync(request.RunTenant, request.At, request.Trigger, entities, request.DryRun, ct);
     }
 }

@@ -71,6 +71,9 @@ public abstract record RetentionErasureRequest
 
     public ErasureTransaction Transaction { get; }
 
+    /// <summary>The tenant the run is scoped and audited under.</summary>
+    internal abstract TenantContext RunTenant { get; }
+
     /// <summary>Erases the subject from the tenant's tenanted entities.</summary>
     public static RetentionErasureRequest Tenanted(
         TenantContext tenant,
@@ -81,7 +84,9 @@ public abstract record RetentionErasureRequest
 
     /// <summary>
     /// Erases the subject from <see cref="RetentionTenantlessAttribute"/> entities, which no
-    /// tenant owns. A tenanted request never reaches them.
+    /// tenant owns. A tenanted request never reaches them. Always
+    /// <see cref="ErasureTransaction.Owned"/>: tenantless rows are erased under Cohort's own
+    /// <c>System(TenantlessPass)</c> execution scope, never under one the caller entered.
     /// </summary>
     public static RetentionErasureRequest Tenantless(
         ErasureScope scope,
@@ -104,6 +109,8 @@ public abstract record RetentionErasureRequest
         }
 
         public TenantContext Tenant { get; }
+
+        internal override TenantContext RunTenant => Tenant;
     }
 
     public sealed record TenantlessRequest : RetentionErasureRequest
@@ -113,6 +120,19 @@ public abstract record RetentionErasureRequest
             DateTimeOffset? at,
             ErasureTransaction transaction
         )
-            : base(scope, at, transaction) { }
+            : base(scope, at, transaction)
+        {
+            // A Caller erasure runs under whatever execution scope the host entered, which
+            // for a tenantless request would be the wrong one (a tenant's, or none).
+            if (transaction == ErasureTransaction.Caller)
+            {
+                throw new ArgumentException(
+                    "A tenantless erasure can't join the caller's transaction: tenantless rows are erased only under Cohort's own System(TenantlessPass) execution scope. Use ErasureTransaction.Owned.",
+                    nameof(transaction)
+                );
+            }
+        }
+
+        internal override TenantContext RunTenant => TenantContext.Tenantless;
     }
 }

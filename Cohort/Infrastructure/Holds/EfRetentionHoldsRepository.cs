@@ -27,8 +27,8 @@ internal sealed class EfRetentionHoldsRepository(
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        // A hold with an unknown stable identity or record-id format the sweep-side NOT EXISTS match
-        // never hits would look persisted while protecting nothing. Fail loudly instead.
+        // A hold with an unknown stable identity or record-id format the sweep-side NOT EXISTS
+        // match never hits would look persisted while protecting nothing. Fail loudly instead.
         var entry = targetResolver.ResolveTarget(request.RetentionEntityId);
         RetentionTargetResolver.ValidateTenantOwnership(entry, request.TenantId, "Retention hold");
         await readinessValidator.ValidateAsync(ct);
@@ -80,10 +80,10 @@ internal sealed class EfRetentionHoldsRepository(
                     @holdId, @retentionEntityId, @recordId, @tenantId, @reason,
                     -- A hold is active from the moment it commits; never let an application clock
                     -- ahead of Postgres defer that.
-                    LEAST(@createdAt, pg_catalog.statement_timestamp()),
+                    LEAST(@createdAt, {DatabaseClock.Sql}),
                     CAST(@expiresAt AS timestamptz), NULL
                 WHERE CAST(@expiresAt AS timestamptz) IS NULL
-                   OR CAST(@expiresAt AS timestamptz) > pg_catalog.statement_timestamp()
+                   OR CAST(@expiresAt AS timestamptz) > {DatabaseClock.Sql}
                 """
             );
             if (await command.ExecuteNonQueryAsync(ct) == 0)
@@ -248,15 +248,10 @@ internal sealed class EfRetentionHoldsRepository(
             await using var command = parameters.CreateCommand(
                 db.Database.GetDbConnection(),
                 transaction,
-                $"""
-                SELECT 1
-                FROM {PostgreSqlIdentifier.Format(tables.RetentionHolds)} AS hold
-                WHERE hold."RetentionEntityId" = @retentionEntityId
-                  AND hold."RecordId" = @recordId
-                  {(entry.Tenant is not null ? "AND hold.\"TenantId\" = @tenantId" : "AND hold.\"TenantId\" IS NULL")}
-                  AND {RetentionHoldSql.ActivePredicate("hold")}
-                LIMIT 1
-                """
+                RetentionHoldSql.BuildActiveHoldForRecord(
+                    tables.RetentionHolds,
+                    tenanted: entry.Tenant is not null
+                )
             );
             return await command.ExecuteScalarAsync(ct) is not null;
         }

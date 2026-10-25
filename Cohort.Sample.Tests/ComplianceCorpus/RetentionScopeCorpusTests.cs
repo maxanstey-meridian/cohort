@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
@@ -9,7 +11,6 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 
 using Npgsql;
-using System.Collections.Concurrent;
 
 namespace Cohort.Sample.Tests.ComplianceCorpus;
 
@@ -78,11 +79,17 @@ public sealed class RetentionScopeCorpusTests(PostgresFixture fixture) : Integra
         {
             db.RetainedRows.Add(new PublicRetainedRow
             {
-                Id = retainedId, TenantId = tenantId, CreatedAt = now.AddDays(-60), Payload = "mutate",
+                Id = retainedId,
+                TenantId = tenantId,
+                CreatedAt = now.AddDays(-60),
+                Payload = "mutate",
             });
             db.UnannotatedRows.Add(new PublicUnannotatedRow
             {
-                Id = unannotatedId, TenantId = tenantId, CreatedAt = now.AddDays(-60), Payload = "survive",
+                Id = unannotatedId,
+                TenantId = tenantId,
+                CreatedAt = now.AddDays(-60),
+                Payload = "survive",
             });
             await db.SaveChangesAsync();
         }
@@ -202,7 +209,7 @@ public sealed class RetentionScopeCorpusTests(PostgresFixture fixture) : Integra
         {
             var sweep = host.Services.GetRequiredService<IRetentionSweep>();
             var execute = () => sweep.ExecuteAsync(
-                RetentionSweepRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), DateTimeOffset.UtcNow)
+                RetentionSweepRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()))
             );
             await execute.Should().ThrowAsync<RetentionConfigurationException>().WithMessage(message);
         }

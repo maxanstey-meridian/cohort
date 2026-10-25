@@ -9,6 +9,9 @@ namespace Cohort.Infrastructure;
 /// </summary>
 internal static class DatabaseClock
 {
+    /// <summary>The database clock in SQL. Every comparison against "now" in Cohort's SQL uses it.</summary>
+    internal const string Sql = "pg_catalog.statement_timestamp()";
+
     internal static async Task<DateTimeOffset> NowAsync(DbContext db, CancellationToken ct)
     {
         await db.Database.OpenConnectionAsync(ct);
@@ -19,7 +22,7 @@ internal static class DatabaseClock
             await using var command = new SqlParams().CreateCommand(
                 db.Database.GetDbConnection(),
                 db.Database.CurrentTransaction?.GetDbTransaction(),
-                "SELECT pg_catalog.statement_timestamp()"
+                $"SELECT {Sql}"
             );
             var value = await command.ExecuteScalarAsync(ct);
             return value switch
@@ -50,7 +53,8 @@ internal static class DatabaseClock
     )
     {
         var databaseNow = await NowAsync(db, ct);
-        var now = requested?.ToUniversalTime() ?? databaseNow;
+        // Requests normalise their time to UTC when they're built.
+        var now = requested ?? databaseNow;
         if (!dryRun && now > databaseNow)
         {
             throw new ArgumentOutOfRangeException(

@@ -96,3 +96,11 @@ virtual Cohort.Application.RetentionErasureRequest.PrintMembers(System.Text.Stri
 *REMOVED*Cohort.Application.RetentionSweepRequest.At.get -> System.DateTimeOffset
 *REMOVED*static Cohort.Application.RetentionSweepRequest.Tenanted(Cohort.Domain.TenantContext! tenant, System.DateTimeOffset at, Cohort.Application.SweepTriggerKind trigger = Cohort.Application.SweepTriggerKind.Manual, bool dryRun = false) -> Cohort.Application.RetentionSweepRequest!
 *REMOVED*static Cohort.Application.RetentionSweepRequest.Tenantless(System.DateTimeOffset at, Cohort.Application.SweepTriggerKind trigger = Cohort.Application.SweepTriggerKind.Manual, bool dryRun = false) -> Cohort.Application.RetentionSweepRequest!
+*REMOVED*Cohort.Application.IRetentionPreview.PreviewAsync(Cohort.Domain.TenantContext! tenant, System.DateTimeOffset now, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Cohort.Domain.RetentionSweepResult!>!
+Cohort.Application.IRetentionPreview.PreviewAsync(Cohort.Domain.TenantContext! tenant, System.DateTimeOffset? at = null, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Cohort.Domain.RetentionSweepResult!>!
+*REMOVED*Cohort.Application.RetentionPreviewRequest.At.get -> System.DateTimeOffset
+Cohort.Application.RetentionPreviewRequest.At.get -> System.DateTimeOffset?
+*REMOVED*static Cohort.Application.RetentionPreviewRequest.Tenanted(Cohort.Domain.TenantContext! tenant, System.DateTimeOffset at) -> Cohort.Application.RetentionPreviewRequest!
+static Cohort.Application.RetentionPreviewRequest.Tenanted(Cohort.Domain.TenantContext! tenant, System.DateTimeOffset? at = null) -> Cohort.Application.RetentionPreviewRequest!
+*REMOVED*static Cohort.Application.RetentionPreviewRequest.Tenantless(System.DateTimeOffset at) -> Cohort.Application.RetentionPreviewRequest!
+static Cohort.Application.RetentionPreviewRequest.Tenantless(System.DateTimeOffset? at = null) -> Cohort.Application.RetentionPreviewRequest!

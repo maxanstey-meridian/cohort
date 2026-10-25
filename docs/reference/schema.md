@@ -85,14 +85,16 @@ Holds store the `RetentionEntityId` of the entity they protect. If an entity's
 identity never match a row again. Readiness therefore refuses to run while an active hold
 names an identity no retained entity in the model declares, and names each such identity and
 its count of holds. Expired and removed holds, and audit history, are not checked. The check
-reads holds across every tenant, so it runs in its own `System(Readiness)` scope whichever
-operation triggered readiness.
+reads holds across every tenant, so it runs once per database in its own `System(Readiness)`
+scope, whichever operation triggered readiness. That scope must reach the same database as
+the caller. The server decides that (database name, server start time and the holds table),
+so `localhost` versus `127.0.0.1`, or a pooler versus a direct port, is fine.
 
 The fix is to restore `[RetentionEntityId("old id")]` on the entity. If the change is
 deliberate, re-point the holds as part of deploying the new identity:
 
 ```sql
-UPDATE public.retention_holds
+UPDATE public.retention_holds  -- or the schema you passed to ConfigureCohortTables
 SET "RetentionEntityId" = '<new id>'
 WHERE "RetentionEntityId" = '<old id>';
 ```
@@ -111,13 +113,17 @@ them is a breaking change, recorded in the changelog like any other change to th
 | Table | Tenant column | Special values |
 |---|---|---|
 | `retention_holds` | `TenantId uuid NULL` | `NULL` is a hold on a tenantless row |
-| `sweep_run` | `TenantId uuid` | `00000000-0000-0000-0000-000000000000` (`Guid.Empty`) is a tenantless pass |
+| `sweep_run` | `TenantId uuid` | `00000000-0000-0000-0000-000000000000` (`Guid.Empty`) is a tenantless pass or erasure |
 | `sweep_run_entity_summary` | `TenantId uuid` | `Guid.Empty`, as above |
 | `sweep_run_row_detail` | `TenantId uuid` | `Guid.Empty`, as above |
 | `sweep_row_handler_status` | none | Reached through `SweepRunRowDetailId` → `sweep_run_row_detail.TenantId` |
 
-Cohort only touches `Guid.Empty` and `NULL` rows in system scopes, so tenant policies
-shouldn't match them. Example policies, with the tenant in a custom setting:
+Cohort only touches `Guid.Empty` rows in system scopes, so tenant policies shouldn't match
+them. `NULL` holds are different: tenant scopes read them but never write them. A host that
+calls `IRetentionDeletion` or `IRetentionHoldsRepository` in a tenant's scope on a tenantless
+row must see that row's holds, or the row looks unheld and its deletion goes ahead. So the
+holds policies let a tenant read `NULL` holds and write only its own; create and remove holds
+on tenantless rows in a system scope. Example policies, with the tenant in a custom setting:
 
 ```sql
 CREATE POLICY tenant_isolation ON public.sweep_run
@@ -126,14 +132,21 @@ CREATE POLICY tenant_isolation ON public.sweep_run_entity_summary
   USING ("TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
 CREATE POLICY tenant_isolation ON public.sweep_run_row_detail
   USING ("TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
-CREATE POLICY tenant_isolation ON public.retention_holds
-  USING ("TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);  -- NULL rows: system only
+CREATE POLICY holds_read ON public.retention_holds FOR SELECT
+  USING ("TenantId" IS NULL OR "TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+CREATE POLICY holds_write ON public.retention_holds FOR ALL
+  USING ("TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
 CREATE POLICY tenant_isolation ON public.sweep_row_handler_status
   USING (EXISTS (
     SELECT 1 FROM public.sweep_run_row_detail detail
     WHERE detail."Id" = sweep_row_handler_status."SweepRunRowDetailId"
       AND detail."TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid));
 ```
+
+Permissive policies combine with `OR`, but only those for the command at hand: a `SELECT`
+passes either holds policy, while `INSERT`, `UPDATE` and `DELETE` only have `holds_write`, whose
+`USING` also checks new rows. Use the schema you passed to `ConfigureCohortTables` in place of
+`public`.
 
 `NULLIF` matters: once a session has set a custom setting, clearing or resetting it leaves an
 empty string rather than `NULL`, and `''::uuid` is an error. Remember `ENABLE` and, if the

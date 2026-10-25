@@ -103,8 +103,8 @@ public enum RetentionSystemWork
     WorkerCoordination = 1,
 
     /// <summary>
-    /// Sweeps, previews and row-handler deliveries for <c>[RetentionTenantless]</c> entities,
-    /// which have no tenant column.
+    /// Sweeps, previews, erasures and row-handler deliveries for <c>[RetentionTenantless]</c>
+    /// entities, which have no tenant column.
     /// </summary>
     TenantlessPass = 2,
 

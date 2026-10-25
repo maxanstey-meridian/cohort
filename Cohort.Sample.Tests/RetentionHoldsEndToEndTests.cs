@@ -410,43 +410,11 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
         // would be purged. Cohort states READ COMMITTED at its own transactions, so a database,
         // role or connection-string default can't change that.
         await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
-        var databaseName = new NpgsqlConnectionStringBuilder(database.ConnectionString).Database;
-        await using (var admin = new NpgsqlConnection(ConnectionString))
-        {
-            await admin.OpenAsync();
-            await ExecuteNonQueryAsync(
-                admin,
-                transaction: null,
-                $"ALTER DATABASE \"{databaseName}\" SET default_transaction_isolation = 'repeatable read'"
-            );
-        }
-
         using var host = new CohortTestHost(database.ConnectionString);
         var tenantId = Guid.NewGuid();
         var noteId = Guid.NewGuid();
         var holdId = Guid.NewGuid();
-        var asOf = DateTimeOffset.UtcNow;
-        await using (var db = host.CreateDbContext())
-        {
-            await db.Database.MigrateAsync();
-            db.Notes.Add(new Note
-            {
-                Id = noteId,
-                TenantId = tenantId,
-                CreatedAt = asOf.AddDays(-120),
-                Body = "repeatable-read default",
-            });
-            await db.SaveChangesAsync();
-        }
-
-        // Control: a bare BEGIN on this database really does start REPEATABLE READ.
-        await using (var control = new NpgsqlConnection(database.ConnectionString))
-        {
-            await control.OpenAsync();
-            await using var command = control.CreateCommand();
-            command.CommandText = "BEGIN; SHOW transaction_isolation;";
-            (await command.ExecuteScalarAsync()).Should().Be("repeatable read");
-        }
+        await SeedRepeatableReadDefaultDatabaseAsync(database, host, tenantId, noteId);
 
         var result = await RaceHoldAgainstMutationAsync(
             host,
@@ -465,6 +433,90 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
         await using var verify = host.CreateDbContext();
         (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
         (await verify.HeldRecords.AnyAsync(hold => hold.HoldId == holdId)).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Deletion_Keeps_Its_Transaction_Read_Committed_Under_A_Repeatable_Read_Database_Default()
+    {
+        // Under REPEATABLE READ the deletion's snapshot would be fixed when it canonicalises the
+        // target, before the advisory lock: a hold that commits while the deletion waits would
+        // stay invisible to both hold checks and the callback would delete the held row.
+        await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
+        using var host = new CohortTestHost(database.ConnectionString);
+        var tenantId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        var holdId = Guid.NewGuid();
+        var callbackRan = false;
+        await SeedRepeatableReadDefaultDatabaseAsync(database, host, tenantId, noteId);
+
+        var outcome = await RaceHoldAgainstMutationAsync(
+            host,
+            database.ConnectionString,
+            RetentionEntityIdentity.For<Note>(),
+            noteId,
+            tenantId,
+            holdId,
+            () => host.RunWithServicesAsync(async services =>
+            {
+                var db = services.GetRequiredService<SampleDbContext>();
+                return await services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                    [new RetentionTarget(RetentionEntityIdentity.For<Note>(), noteId.ToString(), tenantId)],
+                    async ct =>
+                    {
+                        callbackRan = true;
+                        await db.Notes.Where(note => note.Id == noteId).ExecuteDeleteAsync(ct);
+                    }
+                );
+            })
+        );
+
+        outcome.Should().Be(RetentionDeletionOutcome.Protected);
+        callbackRan.Should().BeFalse();
+        await using var verify = host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
+        (await verify.HeldRecords.AnyAsync(hold => hold.HoldId == holdId)).Should().BeTrue();
+    }
+
+    /// <summary>
+    /// Sets the temporary database's default isolation to REPEATABLE READ, migrates it, seeds
+    /// one old note, and proves a bare BEGIN there really starts REPEATABLE READ.
+    /// </summary>
+    private async Task SeedRepeatableReadDefaultDatabaseAsync(
+        TemporaryDatabase database,
+        CohortTestHost host,
+        Guid tenantId,
+        Guid noteId
+    )
+    {
+        var databaseName = new NpgsqlConnectionStringBuilder(database.ConnectionString).Database;
+        await using (var admin = new NpgsqlConnection(ConnectionString))
+        {
+            await admin.OpenAsync();
+            await ExecuteNonQueryAsync(
+                admin,
+                transaction: null,
+                $"ALTER DATABASE \"{databaseName}\" SET default_transaction_isolation = 'repeatable read'"
+            );
+        }
+
+        await using (var db = host.CreateDbContext())
+        {
+            await db.Database.MigrateAsync();
+            db.Notes.Add(new Note
+            {
+                Id = noteId,
+                TenantId = tenantId,
+                CreatedAt = DateTimeOffset.UtcNow.AddDays(-120),
+                Body = "repeatable-read default",
+            });
+            await db.SaveChangesAsync();
+        }
+
+        await using var control = new NpgsqlConnection(database.ConnectionString);
+        await control.OpenAsync();
+        await using var command = control.CreateCommand();
+        command.CommandText = "BEGIN; SHOW transaction_isolation;";
+        (await command.ExecuteScalarAsync()).Should().Be("repeatable read");
     }
 
     [Fact]

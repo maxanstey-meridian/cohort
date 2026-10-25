@@ -31,6 +31,7 @@ namespace Cohort.Sample.Tests;
 public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
 {
     private const string TenantRole = "cohort_rls_tenant";
+    private static readonly Guid LogEntityId = Guid.Parse("6d1c2a9b-58e4-4f0a-b1d7-3c9e8f2a4b60");
     private static readonly DateTimeOffset AsOf = new(2026, 4, 11, 12, 0, 0, TimeSpan.Zero);
 
     private static readonly RetentionExecutionContext WorkerCoordination =
@@ -406,6 +407,76 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Tenant_Scoped_Deletion_Of_A_Held_Tenantless_Row_Is_Refused()
+    {
+        // A host deleting shared, tenantless data from a tenant's request scope must see the
+        // row's NULL-tenant hold; hidden by the holds policy, the row would look unheld.
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        var tenantA = Guid.NewGuid();
+        var log = Log("log-held");
+        await CreateSchemaWithPoliciesAsync(database.ConnectionString);
+        await SeedAsync(database.ConnectionString, [], [log]);
+        var holdId = await SeedTenantlessHoldAsync(database.ConnectionString, log.Id);
+        using var host = BuildHost(
+            database.ConnectionString,
+            services =>
+            {
+                services.AddSingleton(new EntryLog());
+                services.AddScoped<IRetentionExecutionScope, RecordingExecutionScope>();
+            }
+        );
+        await using var scope = host.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<RlsDbContext>();
+        db.Access = new RetentionExecutionContext.Tenant(tenantA);
+        var holds = scope.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>();
+
+        var outcome = await scope.ServiceProvider.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+            [new RetentionTarget(LogEntityId, log.Id.ToString(), tenantId: null)],
+            ct => db.Logs.Where(row => row.Id == log.Id).ExecuteDeleteAsync(ct)
+        );
+
+        outcome.Should().Be(RetentionDeletionOutcome.Protected);
+        (await holds.HasActiveHoldAsync(LogEntityId, log.Id.ToString(), tenantId: null, CancellationToken.None))
+            .Should().BeTrue();
+        (await holds.ListActiveAsync(CancellationToken.None)).Select(hold => hold.HoldId).Should().Equal(holdId);
+        (await LoadLogPayloadsAsync(database.ConnectionString)).Should().Equal("log-held");
+    }
+
+    [Fact]
+    public async Task Tenant_Scope_Cannot_Create_Or_Remove_A_Tenantless_Hold()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        var tenantA = Guid.NewGuid();
+        var held = Log("log-held");
+        var unheld = Log("log-unheld");
+        await CreateSchemaWithPoliciesAsync(database.ConnectionString);
+        await SeedAsync(database.ConnectionString, [], [held, unheld]);
+        var holdId = await SeedTenantlessHoldAsync(database.ConnectionString, held.Id);
+        using var host = BuildHost(
+            database.ConnectionString,
+            services =>
+            {
+                services.AddSingleton(new EntryLog());
+                services.AddScoped<IRetentionExecutionScope, RecordingExecutionScope>();
+            }
+        );
+        await using var scope = host.Services.CreateAsyncScope();
+        scope.ServiceProvider.GetRequiredService<RlsDbContext>().Access = new RetentionExecutionContext.Tenant(tenantA);
+        var holds = scope.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>();
+
+        var create = () => holds.CreateAsync(
+            new RetentionHoldRequest(Guid.NewGuid(), LogEntityId, unheld.Id.ToString(), tenantId: null, "litigation", DateTimeOffset.UtcNow),
+            CancellationToken.None
+        );
+        var remove = () => holds.RemoveAsync(holdId, DateTimeOffset.UtcNow, CancellationToken.None);
+
+        (await create.Should().ThrowAsync<PostgresException>())
+            .Which.SqlState.Should().Be(PostgresErrorCodes.InsufficientPrivilege);
+        await remove.Should().ThrowAsync<InvalidOperationException>().WithMessage("*could not be removed*");
+        (await LoadActiveHoldIdsAsync(database.ConnectionString)).Should().Equal(holdId);
+    }
+
+    [Fact]
     public async Task Startup_Refuses_A_Host_Without_An_Execution_Scope()
     {
         await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
@@ -509,10 +580,15 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             ALTER TABLE public.sweep_row_handler_status ENABLE ROW LEVEL SECURITY;
             ALTER TABLE public.sweep_row_handler_status FORCE ROW LEVEL SECURITY;
 
-            -- rls_logs has no tenant column and no policy: only system work reaches it.
+            -- rls_logs has no tenant column: shared data every tenant may use, invisible to a
+            -- scope working for no one.
+            CREATE POLICY shared_with_tenants ON public.rls_logs
+                USING (NULLIF(current_setting('app.tenant_id', true), '') IS NOT NULL);
             CREATE POLICY tenant_isolation ON public.rls_notes
                 USING ("TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
-            CREATE POLICY tenant_isolation ON public.retention_holds
+            CREATE POLICY holds_read ON public.retention_holds FOR SELECT
+                USING ("TenantId" IS NULL OR "TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+            CREATE POLICY holds_write ON public.retention_holds FOR ALL
                 USING ("TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
             CREATE POLICY tenant_isolation ON public.sweep_run
                 USING ("TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
@@ -536,6 +612,36 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
         db.Notes.AddRange(notes);
         db.Logs.AddRange(logs);
         await db.SaveChangesAsync();
+    }
+
+    private static async Task<Guid> SeedTenantlessHoldAsync(string connectionString, Guid logId)
+    {
+        var holdId = Guid.NewGuid();
+        await using var owner = CreateOwnerContext(connectionString);
+        await owner.Database.ExecuteSqlAsync(
+            $"""
+            INSERT INTO "retention_holds"
+                ("HoldId", "RetentionEntityId", "RecordId", "TenantId", "Reason", "CreatedAt", "ExpiresAt", "RemovedAt")
+            VALUES ({holdId}, {LogEntityId}, {logId.ToString()}, NULL, 'litigation', {DateTimeOffset.UtcNow.AddDays(-1)}, NULL, NULL)
+            """
+        );
+        return holdId;
+    }
+
+    private static async Task<List<Guid>> LoadActiveHoldIdsAsync(string connectionString)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """SELECT "HoldId" FROM "retention_holds" WHERE "RemovedAt" IS NULL""";
+        var holdIds = new List<Guid>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            holdIds.Add(reader.GetGuid(0));
+        }
+
+        return holdIds;
     }
 
     private static async Task SeedSettledRunAsync(string connectionString, Guid tenantId, DateTimeOffset startedAt)
@@ -800,7 +906,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
 
     [Retain("rls-short", nameof(CreatedAt))]
     [RetentionTenantless]
-    [RetentionEntityId("6d1c2a9b-58e4-4f0a-b1d7-3c9e8f2a4b60")]
+    [RetentionEntityId("6d1c2a9b-58e4-4f0a-b1d7-3c9e8f2a4b60")] // LogEntityId
     private sealed class RlsLog
     {
         public Guid Id { get; set; }

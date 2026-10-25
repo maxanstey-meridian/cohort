@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
@@ -9,6 +11,7 @@ using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 using Npgsql;
 
@@ -293,17 +296,126 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     {
         // The cross-tenant hold check runs in its own System(Readiness) scope; if the host routed
         // that scope elsewhere, it would certify the caller's database from another one.
-        await using var tenantDatabase = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
-        await using (var db = new SampleDbContext(
-            new DbContextOptionsBuilder<SampleDbContext>().UseNpgsql(tenantDatabase.ConnectionString).Options
-        ))
+        await using var tenantDatabase = await MigratedTemporaryDatabaseAsync();
+        await using var provider = BuildSystemRoutedProvider(
+            tenantDatabase.ConnectionString,
+            fixture.ConnectionString
+        );
+
+        var act = () => InvokePreviewAsync(provider);
+
+        (await act.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                error.Contains("different model or database", StringComparison.Ordinal)
+            );
+    }
+
+    [Fact]
+    public async Task Readiness_accepts_a_system_scope_that_reaches_the_same_database_through_a_differently_spelled_connection_string()
+    {
+        // localhost and 127.0.0.1, or a pooler and the direct port, are one database to the
+        // server; only the server can say so.
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        var spelledDifferently = new NpgsqlConnectionStringBuilder(database.ConnectionString)
         {
-            await db.Database.MigrateAsync();
+            ApplicationName = "cohort-readiness",
+        };
+        spelledDifferently.Host = spelledDifferently.Host == "localhost" ? "127.0.0.1" : "localhost";
+        await using var provider = BuildSystemRoutedProvider(
+            database.ConnectionString,
+            spelledDifferently.ConnectionString
+        );
+
+        await InvokePreviewAsync(provider);
+    }
+
+    [Fact]
+    public async Task Readiness_runs_the_hold_check_once_for_calls_inside_a_caller_transaction()
+    {
+        // The hold check reads on its own pooled connection, so the caller's transaction cannot
+        // change its answer; a second call in that transaction must not take another connection.
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        var executionScope = new RecordingExecutionScope();
+        using var host = new CohortTestHost(
+            database.ConnectionString,
+            configureServices: services =>
+            {
+                services.RemoveAll<IRetentionExecutionScope>();
+                services.AddSingleton<IRetentionExecutionScope>(executionScope);
+            }
+        );
+        var readiness = new RetentionExecutionContext.System(RetentionSystemWork.Readiness);
+
+        await host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            var holds = services.GetRequiredService<IRetentionHoldsRepository>();
+            await using var transaction = await db.Database.BeginTransactionAsync();
+
+            await holds.ListActiveAsync(CancellationToken.None);
+            executionScope.Entered.Should().ContainSingle(context => context == readiness);
+
+            await holds.ListActiveAsync(CancellationToken.None);
+            executionScope.Entered.Should().ContainSingle(context => context == readiness);
+        });
+    }
+
+    [Fact]
+    public async Task Readiness_refuses_an_orphaned_active_hold_when_no_entity_is_retained()
+    {
+        // Removing the last [Retain] orphans its holds just as renaming an identity does.
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        var options = new DbContextOptionsBuilder<NoRetainedEntityDbContext>()
+            .UseNpgsql(database.ConnectionString)
+            .Options;
+        var oldIdentity = Guid.NewGuid();
+        await using (var db = new NoRetainedEntityDbContext(options))
+        {
+            await db.Database.ExecuteSqlRawAsync(db.Database.GenerateCreateScript());
+            await InsertHoldAsync(db, Guid.NewGuid(), oldIdentity, Guid.NewGuid().ToString(), Guid.NewGuid(), expiresAt: null, removedAt: null);
         }
+
         var services = new ServiceCollection();
         services.AddLogging();
         services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
-        services.AddScoped(_ => new DatabaseRoute(tenantDatabase.ConnectionString));
+        services.AddDbContext<NoRetainedEntityDbContext>(builder => builder.UseNpgsql(database.ConnectionString));
+        services.AddSingleton<IRetentionRuleProvider>(new SessionKeyRuleProvider());
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
+        services.AddCohort<NoRetainedEntityDbContext>();
+        await using var provider = services.BuildServiceProvider(validateScopes: true);
+
+        var act = () => provider.GetRequiredService<IRetentionSweep>().ExecuteAsync(
+            RetentionSweepRequest.Tenantless()
+        );
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle(error =>
+            error.Contains($"'{oldIdentity}'", StringComparison.Ordinal)
+            && error.Contains("1 active hold(s)", StringComparison.Ordinal)
+        );
+    }
+
+    private async Task<TemporaryDatabase> MigratedTemporaryDatabaseAsync()
+    {
+        var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using var db = new SampleDbContext(
+            new DbContextOptionsBuilder<SampleDbContext>().UseNpgsql(database.ConnectionString).Options
+        );
+        await db.Database.MigrateAsync();
+        return database;
+    }
+
+    // Every scope reaches callerConnectionString until it is entered as System work, which the
+    // host routes to systemConnectionString.
+    private static ServiceProvider BuildSystemRoutedProvider(
+        string callerConnectionString,
+        string systemConnectionString
+    )
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
+        services.AddScoped(_ => new DatabaseRoute(callerConnectionString));
         services.AddDbContext<SampleDbContext>((provider, options) =>
             options.UseNpgsql(provider.GetRequiredService<DatabaseRoute>().ConnectionString)
         );
@@ -317,17 +429,23 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             provider.GetRequiredService<OriginalValueTombstoneFactory>()
         );
         services.AddScoped<IRetentionExecutionScope>(provider =>
-            new SystemWorkRoutingScope(provider.GetRequiredService<DatabaseRoute>(), fixture.ConnectionString)
+            new SystemWorkRoutingScope(provider.GetRequiredService<DatabaseRoute>(), systemConnectionString)
         );
         services.AddCohort<SampleDbContext>();
-        await using var provider = services.BuildServiceProvider(validateScopes: true);
+        return services.BuildServiceProvider(validateScopes: true);
+    }
 
-        var act = () => InvokePreviewAsync(provider);
+    private sealed class RecordingExecutionScope : IRetentionExecutionScope
+    {
+        private readonly ConcurrentQueue<RetentionExecutionContext> entered = new();
 
-        (await act.Should().ThrowAsync<RetentionConfigurationException>())
-            .Which.Errors.Should().ContainSingle(error =>
-                error.Contains("different model or database", StringComparison.Ordinal)
-            );
+        public IReadOnlyCollection<RetentionExecutionContext> Entered => entered;
+
+        public ValueTask EnterAsync(RetentionExecutionContext context, CancellationToken ct)
+        {
+            entered.Enqueue(context);
+            return ValueTask.CompletedTask;
+        }
     }
 
     private sealed class SystemWorkRoutingScope(DatabaseRoute route, string systemConnectionString)
@@ -355,6 +473,19 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     )
     {
         await using var db = new SampleDbContext(options);
+        await InsertHoldAsync(db, holdId, retentionEntityId, recordId, tenantId, expiresAt, removedAt);
+    }
+
+    private static async Task InsertHoldAsync(
+        DbContext db,
+        Guid holdId,
+        Guid retentionEntityId,
+        string recordId,
+        Guid tenantId,
+        DateTimeOffset? expiresAt,
+        DateTimeOffset? removedAt
+    )
+    {
         var createdAt = DateTimeOffset.UtcNow.AddDays(-10);
         await db.Database.ExecuteSqlAsync(
             $"""
@@ -408,7 +539,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         await using var provider = services.BuildServiceProvider(validateScopes: true);
 
         var act = () => provider.GetRequiredService<IRetentionSweep>().ExecuteAsync(
-            RetentionSweepRequest.Tenantless(DateTimeOffset.UtcNow)
+            RetentionSweepRequest.Tenantless()
         );
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
@@ -563,6 +694,15 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
             modelBuilder.Entity<SessionKeyRecord>().ToTable("session_key_records");
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    private sealed class NoRetainedEntityDbContext(DbContextOptions<NoRetainedEntityDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
             modelBuilder.ConfigureCohortTables();
         }
     }

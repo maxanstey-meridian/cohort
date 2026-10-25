@@ -133,13 +133,16 @@ Set a cron schedule and the hosted worker sweeps every tenant:
 Or call the services yourself:
 
 ```csharp
-await services.GetRequiredService<IRetentionPreview>().PreviewAsync(tenant, DateTimeOffset.UtcNow, ct);
+await services.GetRequiredService<IRetentionPreview>().PreviewAsync(tenant, ct: ct);
 await services.GetRequiredService<IRetentionSweep>().SweepAsync(tenant, ct);
-await services.GetRequiredService<IRetentionErasureService>()
+
+// The erasure service is scoped.
+await using var scope = services.CreateAsyncScope();
+await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>()
     .EraseAsync(tenant, new ErasureScope("user", userId), ct);
 ```
 
-Sweeps and erasures run as of the database clock. A tenanted erasure never touches
+Previews, sweeps and erasures run as of the database clock. A tenanted erasure never touches
 `[RetentionTenantless]` entities; erase those with `RetentionErasureRequest.Tenantless`. An
 erasure can also join your own open transaction (`ErasureTransaction.Caller`) and commit or
 roll back with it.

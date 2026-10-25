@@ -15,14 +15,8 @@ internal sealed class ScopeOwnedRetentionPreview(IServiceScopeFactory scopeFacto
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        var tenantId = request switch
-        {
-            RetentionPreviewRequest.TenantedRequest tenanted => tenanted.Tenant.Id,
-            RetentionPreviewRequest.TenantlessRequest => Guid.Empty,
-            _ => throw new ArgumentOutOfRangeException(nameof(request)),
-        };
         await using var scope = await scopeFactory.CreateEnteredScopeAsync(
-            RetentionExecutionScopes.ForTenant(tenantId),
+            RetentionExecutionScopes.For(request.RunTenant),
             ct
         );
         var preview = scope.ServiceProvider.GetRequiredService<RetentionPreviewService>();

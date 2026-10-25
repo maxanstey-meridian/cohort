@@ -47,20 +47,25 @@ Kinds compare exactly (ordinal, case-sensitive), and a property carries at most 
 ## Erasing
 
 ```csharp
-var result = await services.GetRequiredService<IRetentionErasureService>()
+await using var scope = services.CreateAsyncScope();
+var result = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>()
     .EraseAsync(tenant, new ErasureScope("person", personId), ct);
 ```
+
+The service is scoped, so resolve it from a scope (in a request handler, inject it).
 
 `EraseAsync` is shorthand for `ExecuteAsync(RetentionErasureRequest.Tenanted(tenant, scope))`.
 The request is where the other choices go:
 
 ```csharp
-var erasure = services.GetRequiredService<IRetentionErasureService>();
+await using var scope = services.CreateAsyncScope();
+var erasure = scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
+var subject = new ErasureScope("person", personId);
 
-await erasure.ExecuteAsync(RetentionErasureRequest.Tenanted(tenant, scope), ct);
-await erasure.ExecuteAsync(RetentionErasureRequest.Tenantless(scope), ct);
+await erasure.ExecuteAsync(RetentionErasureRequest.Tenanted(tenant, subject), ct);
+await erasure.ExecuteAsync(RetentionErasureRequest.Tenantless(subject), ct);
 await erasure.ExecuteAsync(
-    RetentionErasureRequest.Tenanted(tenant, scope, transaction: ErasureTransaction.Caller), ct);
+    RetentionErasureRequest.Tenanted(tenant, subject, transaction: ErasureTransaction.Caller), ct);
 ```
 
 Cohort erases rows that meet all four conditions:
@@ -194,29 +199,57 @@ What changes compared with an ordinary erasure:
 
 - **Nothing commits on its own.** `Started`, every batch and the final status are written
   through your transaction. Cohort never commits or rolls it back; on any error, including
-  cancellation, the exception reaches you and the transaction is yours to roll back.
+  cancellation, the exception reaches you and the transaction is yours to roll back. A
+  cancellation mid-entity undoes that entity to its savepoint first, so the run still
+  settles `Cancelled` in your transaction.
 - **One entity's failure still doesn't stop the rest.** Each entity runs under a savepoint,
   so a failure undoes only that entity's changes. It's reported in
   `ErasureResult.EntityFailures` and the run settles `PartiallyFailed`. Check the result
   before you commit.
-- **A rollback leaves no ledger row.** If you roll back, the attempt leaves no `sweep_run`
-  row, because the ledger is part of the same transaction. Nothing it changed was kept
-  either, so the erasure didn't happen. Cohort logs the rollback at Information with the
-  sweep ID.
+- **A rollback leaves no ledger row.** If you roll back, including to a savepoint taken
+  before the erasure, the attempt leaves no `sweep_run` row, because the ledger is part of
+  the same transaction. Nothing it changed was kept either, so the erasure didn't happen.
+  Cohort logs the rollback at Information with the sweep ID when it sees it: an explicit
+  `RollbackAsync`, or a commit after a rollback to such a savepoint. A transaction disposed
+  without a commit or rollback logs nothing, because EF raises no event for it.
 - **Locks are held until you commit.** Row and entity locks last until your transaction
   ends, so a concurrent sweep or hold of the same rows waits for you. Keep the transaction
   short.
 - **Observers hear about it after the commit.** Audit observers are told of every event of
   the run, `Started` to `Completed`, only once your commit has succeeded, and never if you
-  roll back. Commit through EF (`transaction.CommitAsync()`) so Cohort sees it.
+  roll back. Commit through EF so Cohort sees it. `CommitAsync` is the supported path: a
+  synchronous `Commit()` blocks while observers are told, each for up to
+  `AuditObservers:Timeout` per event.
 - **Row handlers run after the commit.** `OnBeforeAsync` runs inside your transaction.
   `OnAfterAsync` work is queued in the same transaction, so the dispatcher only sees it once
   you commit, and a rollback discards it.
+- **Your change tracker isn't refreshed.** The erasure changes rows with SQL, so entities
+  your context already tracks keep their old values. Load and change your own rows before
+  erasing, or call `ChangeTracker.Clear()` after.
 - **Your execution scope isn't called.** The erasure runs in your scope, under whatever
   tenant isolation you already applied to it. See [Tenant Isolation](/guides/tenant-isolation).
 
 A dry run with `Caller` is allowed. It writes its audit rows into your transaction and
 changes nothing else.
+
+## Upgrading to 0.11.0
+
+::: warning Breaking change
+0.11.0 reshapes the erasure API around a request and the database clock.
+
+- `EraseAsync(tenant, scope, now, ct)` becomes `EraseAsync(tenant, scope, ct)`. Erasure runs
+  as of the database clock.
+- `IRetentionErasureService` is scoped. Resolve it from a scope or inject it into scoped
+  services; a singleton can't inject it.
+- Subject columns on `[RetentionTenantless]` entities are erased only by a tenantless
+  request, `RetentionErasureRequest.Tenantless(scope)`. A tenanted request no longer reaches
+  them, and a kind only tenantless entities declare is refused for it.
+- A tenantless request can't use `ErasureTransaction.Caller`, and is refused.
+- `RetentionErasureRequest.At` is optional and defaults to the database clock. A real
+  erasure refuses a later time before any run is recorded; a dry run accepts any time.
+- Every timestamp the run records or reports (`sweep_run`, summaries, row details, observer
+  events, `ErasureResult`) comes from the database clock.
+:::
 
 ## Upgrading to 0.9.0
 

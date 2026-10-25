@@ -129,7 +129,12 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
                     tenantId,
                     Strategy.Purge,
                     1,
-                    HeldCount: 1
+                    HeldCount: 1,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
         result
@@ -141,7 +146,12 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
                     tenantId,
                     Strategy.SoftDelete,
                     1,
-                    HeldCount: 1
+                    HeldCount: 1,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
         result
@@ -153,7 +163,12 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
                     tenantId,
                     Strategy.Anonymise,
                     1,
-                    HeldCount: 1
+                    HeldCount: 1,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
 
@@ -266,7 +281,11 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
                     summary.Strategy,
                     summary.Affected,
                     summary.HeldCount,
-                    summary.SkippedCount
+                    summary.SkippedCount,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 ))
             );
 

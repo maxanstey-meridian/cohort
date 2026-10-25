@@ -247,7 +247,13 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
                     "anonymise",
                     tenantA,
                     Strategy.Anonymise,
-                    1
+                    1,
+                    HeldCount: 0,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
 
@@ -377,7 +383,12 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
                     tenantId,
                     Strategy.Anonymise,
                     2,
-                    HeldCount: 1
+                    HeldCount: 1,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
 

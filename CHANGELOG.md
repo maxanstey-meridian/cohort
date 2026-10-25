@@ -50,6 +50,35 @@ unprotected without an error.
   models their own schema with `ConfigureCohortTables(schema)`.
 - Every transaction in which Cohort changes rows or checks holds states READ COMMITTED
   instead of relying on the driver.
+- Results report what a run left: `EntitySweepCount` and `SweepEvent.EntitySummary` gain
+  `RetainedCount` (kept by a legal minimum or an Exempt rule), `DeferredCount` (still due but
+  not reached) and `BlockedCount`; `SweepEvent.EntityProgress` gains `BlockedCount`. Every
+  count on `EntitySweepCount` is now a required constructor argument. `ErasureResult.Complete`
+  is true only when nothing of the subject is left.
+- `sweep_run_entity_summary` gains `RetainedCount`, `DeferredCount` and `BlockedCount`
+  (`bigint NOT NULL`). Hosts add a migration; readiness refuses to run until it's applied.
+- A run whose `OnBeforeAsync` skipped rows settles `PartiallyFailed`, with a `rows-skipped`
+  reason in `Error` and `EntityFailures`. An erasure that left rows deferred or blocked settles
+  `PartiallyFailed` with `rows-missed` or `rows-blocked`. A sweep whose rows another
+  transaction had locked counts them in `DeferredCount` and stays `Succeeded`.
+  `EntityFailures` is empty exactly when the run succeeded.
+- A row that can't be retired yet is blocked and counted, not fatal. A purge leaves out rows
+  still referenced through a `RESTRICT` or `NO ACTION` foreign key (read from `pg_catalog`,
+  so database-only keys count). Any other integrity-constraint rejection (SQLSTATE class 23)
+  blocks only that row: Cohort splits the batch under savepoints, the rest commits, and a
+  Warning names the constraint. A full batch in which every row is refused fails the entity.
+  Batches Cohort owns check constraints immediately, so a deferred constraint blocks its row
+  rather than failing the commit.
+- `OnBeforeAsync` runs in a read-only savepoint that is always rolled back. A database error
+  in a handler skips only its row instead of failing the batch, and a handler that writes
+  through the sweep's `DbContext` now fails (`sqlstate:25006`).
+- Readiness refuses an anonymise its column can never take: a literal or empty string the
+  column type rejects (length, type or domain CHECK), `Null` into a column the database
+  declares NOT NULL, one shared value (`FixedLiteral`, `EmptyString`, a `Static` factory, or
+  `Null` under `NULLS NOT DISTINCT`) on a unique index with no filter, a literal on a
+  foreign-key column, and any anonymise of a column a foreign key references. A host whose
+  anonymise failed on every run now fails at startup.
+- Cohort requires PostgreSQL 16 or later and refuses an older server with its own message.
 
 Upgrade: [Running Retention](https://maxanstey-meridian.github.io/cohort/guides/running-retention#upgrading-to-0-11-0),
 [Right-to-Erasure](https://maxanstey-meridian.github.io/cohort/guides/erasure#upgrading-to-0-11-0),

@@ -190,7 +190,19 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         result
             .Counts.Should()
             .Contain(
-                new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 3)
+                new EntitySweepCount(
+                    typeof(Note),
+                    "short-lived",
+                    tenantId,
+                    Strategy.Purge,
+                    3,
+                    HeldCount: 0,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
+                )
             );
         result.EntityFailures.Should().BeEmpty();
 

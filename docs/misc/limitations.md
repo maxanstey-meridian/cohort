@@ -6,6 +6,8 @@ These are the deliberate limits of Cohort, so you don't discover them in product
 
 - **PostgreSQL only.** The SQL relies on `RETURNING`, `= ANY()`, `FOR UPDATE ... SKIP LOCKED`
   and advisory locks. There's no SQL Server or SQLite support, and none is planned.
+- **PostgreSQL 16 or later.** Startup checks anonymised columns with `pg_input_is_valid`,
+  which PostgreSQL 16 added; an older server is refused.
 - **You own the schema.** Cohort never creates or migrates its tables at runtime. See
   [Schema & Migrations](/reference/schema).
 

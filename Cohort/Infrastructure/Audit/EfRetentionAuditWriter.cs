@@ -67,9 +67,11 @@ internal sealed class EfRetentionAuditWriter(
             $"""
             INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRunEntitySummary)} AS current_summary
                 ("SweepId", "At", "EntityType", "RetentionEntityId", "Category", "TenantId", "Strategy",
-                 "ResolvedMonths", "ResolvedDays", "Affected", "HeldCount", "SkippedCount", "NullAnchorCount", "RuleSource", "RuleReason")
+                 "ResolvedMonths", "ResolvedDays", "Affected", "HeldCount", "SkippedCount", "NullAnchorCount",
+                 "RetainedCount", "DeferredCount", "BlockedCount", "RuleSource", "RuleReason")
             VALUES (@sweepId, @at, @entityType, @retentionEntityId, @category, @tenantId, @strategy,
-                    @resolvedMonths, @resolvedDays, @affected, @heldCount, @skippedCount, @nullAnchorCount, @ruleSource, @ruleReason)
+                    @resolvedMonths, @resolvedDays, @affected, @heldCount, @skippedCount, @nullAnchorCount,
+                    @retainedCount, @deferredCount, @blockedCount, @ruleSource, @ruleReason)
             ON CONFLICT ("SweepId", "RetentionEntityId", "Category", "TenantId", "Strategy")
             DO UPDATE SET
                 "EntityType" = EXCLUDED."EntityType",
@@ -78,6 +80,9 @@ internal sealed class EfRetentionAuditWriter(
                 "ResolvedDays" = EXCLUDED."ResolvedDays",
                 "HeldCount" = EXCLUDED."HeldCount",
                 "NullAnchorCount" = EXCLUDED."NullAnchorCount",
+                "RetainedCount" = EXCLUDED."RetainedCount",
+                "DeferredCount" = EXCLUDED."DeferredCount",
+                "BlockedCount" = EXCLUDED."BlockedCount",
                 "RuleSource" = EXCLUDED."RuleSource",
                 "RuleReason" = EXCLUDED."RuleReason"
             """,
@@ -96,6 +101,9 @@ internal sealed class EfRetentionAuditWriter(
                 ["heldCount"] = summary.HeldCount,
                 ["skippedCount"] = summary.SkippedCount,
                 ["nullAnchorCount"] = summary.NullAnchorCount,
+                ["retainedCount"] = summary.RetainedCount,
+                ["deferredCount"] = summary.DeferredCount,
+                ["blockedCount"] = summary.BlockedCount,
                 ["ruleSource"] = summary.Provenance?.Source,
                 ["ruleReason"] = summary.Provenance?.Reason,
             },
@@ -110,14 +118,17 @@ internal sealed class EfRetentionAuditWriter(
             WITH upserted_summary AS (
                 INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRunEntitySummary)} AS current_summary
                     ("SweepId", "At", "EntityType", "RetentionEntityId", "Category", "TenantId", "Strategy",
-                     "ResolvedMonths", "ResolvedDays", "Affected", "HeldCount", "SkippedCount", "NullAnchorCount", "RuleSource", "RuleReason")
+                     "ResolvedMonths", "ResolvedDays", "Affected", "HeldCount", "SkippedCount", "NullAnchorCount",
+                     "RetainedCount", "DeferredCount", "BlockedCount", "RuleSource", "RuleReason")
                 VALUES (@sweepId, @at, @entityType, @retentionEntityId, @category, @tenantId, @strategy,
-                        @resolvedMonths, @resolvedDays, @affected, 0, @skippedCount, 0, @ruleSource, @ruleReason)
+                        @resolvedMonths, @resolvedDays, @affected, 0, @skippedCount, 0,
+                        0, 0, @blockedCount, @ruleSource, @ruleReason)
                 ON CONFLICT ("SweepId", "RetentionEntityId", "Category", "TenantId", "Strategy")
                 DO UPDATE SET
                     "EntityType" = EXCLUDED."EntityType",
                     "Affected" = current_summary."Affected" + EXCLUDED."Affected",
-                    "SkippedCount" = current_summary."SkippedCount" + EXCLUDED."SkippedCount"
+                    "SkippedCount" = current_summary."SkippedCount" + EXCLUDED."SkippedCount",
+                    "BlockedCount" = current_summary."BlockedCount" + EXCLUDED."BlockedCount"
                 RETURNING 1
             )
             UPDATE {PostgreSqlIdentifier.Format(tables.SweepRun)}
@@ -138,6 +149,7 @@ internal sealed class EfRetentionAuditWriter(
                 ["resolvedDays"] = progress.ResolvedPeriod.Days,
                 ["affected"] = progress.Affected,
                 ["skippedCount"] = progress.SkippedCount,
+                ["blockedCount"] = progress.BlockedCount,
                 ["ruleSource"] = progress.Provenance?.Source,
                 ["ruleReason"] = progress.Provenance?.Reason,
             },

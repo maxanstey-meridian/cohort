@@ -38,7 +38,25 @@ public string Phone { get; set; } = "";
 | `EmptyString` | `""` |
 | `FixedLiteral` | The literal you pass |
 
-A literal that won't fit its column fails that entity's sweep, rather than being truncated.
+Cohort checks each anonymised column in the database when the host starts and refuses to run
+if the write could never succeed:
+
+- an `EmptyString` or `FixedLiteral` value the column type won't accept: too long for a
+  `varchar(n)` or `char(n)`, not valid input for the type (a `uuid`, `jsonb` or integer column
+  behind a string converter), or refused by a domain's `CHECK`
+- `Null` into a column the database declares `NOT NULL`, directly or through its domain, even
+  when the EF model says nullable
+- `EmptyString`, `FixedLiteral` or a `Static` factory on a column covered by a unique index that
+  has no filter and doesn't include the record ID, because every anonymised row would get the
+  same value (also `Null` when the index is `NULLS NOT DISTINCT`). A unique index filtered on
+  `"AnonymisedAt" IS NULL` is fine
+- `EmptyString` or `FixedLiteral` on a foreign-key column, since a literal can't name a row
+  that exists
+- any method on a column another table's foreign key references, because changing it is
+  either refused or silently rewrites the referencing rows
+
+Table `CHECK` constraints, partial and expression unique indexes, and values from per-row
+factories can't be checked in advance; a row they reject fails at run time.
 
 ## Custom values
 

@@ -1,5 +1,6 @@
 using System.Data;
 using System.Data.Common;
+using System.Runtime.ExceptionServices;
 
 using Cohort.Application;
 using Cohort.Domain;
@@ -152,6 +153,7 @@ internal sealed class RetentionRun(
         CancellationToken ct
     )
     {
+        plan = await ReferencingForeignKeySql.AttachAsync(db.Database.GetDbConnection(), plan, ct);
         foreach (var scope in RetentionExecutionPlanOrderer.Order(db, plan, scope => scope.Entry, logger))
         {
             // In the caller's transaction a failed statement would abort everything after it,
@@ -230,17 +232,23 @@ internal sealed class RetentionRun(
         var rule = scope.Rule;
         var eventAt = await DatabaseClock.NowAsync(db, ct);
         var connection = db.Database.GetDbConnection();
-        long affected = 0, skipped = 0, held = 0, nullAnchors = 0;
+        long affected = 0, skipped = 0, held = 0, nullAnchors = 0, retained = 0, deferred = 0, blocked = 0;
 
         if (strategy is not null)
         {
             if (started.DryRun)
             {
                 affected = await strategy.CountAsync(scope, SweepCount.Eligible, connection, ct);
+                blocked = await strategy.CountAsync(scope, SweepCount.Blocked, connection, ct);
             }
             else
             {
-                (affected, skipped) = await ExecuteBatchesAsync(strategy, scope, eventAt, ct);
+                (affected, skipped, var refused) = await ExecuteBatchesAsync(strategy, scope, eventAt, ct);
+                // Measured once the loop is done, like held rows: what is still due and was
+                // neither changed, skipped nor refused by this run, and what a reference
+                // still blocks besides the rows a constraint refused.
+                deferred = await strategy.CountDeferredAsync(scope, SweepId, refused, connection, ct);
+                blocked = refused.Count + await strategy.CountBlockedAsync(scope, refused, connection, ct);
             }
 
             // Held rows are measured directly (in scope, eligible, actively held) rather
@@ -250,10 +258,21 @@ internal sealed class RetentionRun(
             if (scope.Cutoff is not null)
             {
                 nullAnchors = await strategy.CountAsync(scope, SweepCount.NullAnchor, connection, ct);
+                // What an erasure's legal minimum keeps; a sweep's younger rows are simply
+                // not due yet.
+                if (scope.Subject is not null)
+                {
+                    retained = await strategy.CountAsync(scope, SweepCount.RetainedByRule, connection, ct);
+                }
             }
         }
+        else if (scope.Subject is not null)
+        {
+            // An Exempt rule keeps every one of the subject's rows from the erasure.
+            retained = await SweepStrategy.CountSubjectRowsAsync(scope, connection, ct);
+        }
 
-        var count = new EntitySweepCount(entry.EntityType, entry.Category, scope.Tenant.Id, rule.Strategy, affected, held, skipped, nullAnchors);
+        var count = new EntitySweepCount(entry.EntityType, entry.Category, scope.Tenant.Id, rule.Strategy, affected, held, skipped, nullAnchors, retained, deferred, blocked);
         // Mutated rows count even if the summary write fails; a dry run's prediction
         // counts only once its summary is recorded.
         if (!started.DryRun)
@@ -274,6 +293,9 @@ internal sealed class RetentionRun(
                 held,
                 skipped,
                 nullAnchors,
+                retained,
+                deferred,
+                blocked,
                 rule.Provenance
             ),
             ct
@@ -282,6 +304,44 @@ internal sealed class RetentionRun(
         {
             ReplaceCount(count);
         }
+
+        RecordRowsLeft(count);
+    }
+
+    /// <summary>
+    /// Turns rows the run should have changed but didn't into run failures, so the run
+    /// settles PartiallyFailed and <c>EntityFailures</c> is empty exactly when the ledger says
+    /// Succeeded. Skipped rows always count; deferred and blocked rows count only for an
+    /// erasure, since a sweep's next run retires them by design. The reasons are
+    /// Cohort-defined plain codes and carry no row data.
+    /// </summary>
+    private void RecordRowsLeft(EntitySweepCount count)
+    {
+        var erasure = started.Trigger == SweepTriggerKind.Erasure;
+        RecordRowsLeft(count.EntityType, "rows-skipped", count.SkippedCount);
+        if (erasure)
+        {
+            RecordRowsLeft(count.EntityType, "rows-missed", count.DeferredCount);
+            RecordRowsLeft(count.EntityType, "rows-blocked", count.BlockedCount);
+        }
+    }
+
+    private void RecordRowsLeft(Type entityType, string reason, long rows)
+    {
+        if (rows == 0)
+        {
+            return;
+        }
+
+        failures.Add($"reason={reason};entityType={entityType.FullName};count={rows}");
+        logger.LogWarning(
+            "Cohort {Operation} {SweepId} left {Count} row(s) of entity {EntityType} in scope ({Reason}).",
+            operation,
+            SweepId,
+            rows,
+            entityType.FullName,
+            reason
+        );
     }
 
     /// <summary>
@@ -289,8 +349,11 @@ internal sealed class RetentionRun(
     /// its own transaction, so a large backlog retires incrementally and a failure loses only
     /// the current batch. In the caller's transaction the batches still bound each statement,
     /// but none commits on its own: the entity's savepoint and the caller's commit decide.
+    /// Rows a constraint refuses are blocked and left out of later batches; a full batch in
+    /// which every row is refused fails the entity, since the cause is then the rule or the
+    /// schema rather than the rows, and bisecting the rest of the table would find the same.
     /// </summary>
-    private async Task<(long Affected, long Skipped)> ExecuteBatchesAsync(
+    private async Task<(long Affected, long Skipped, IReadOnlyCollection<string> Blocked)> ExecuteBatchesAsync(
         SweepStrategy strategy,
         SweepScope scope,
         DateTimeOffset entityAt,
@@ -303,6 +366,7 @@ internal sealed class RetentionRun(
             (entry.AuditRowDetail == AuditRowDetail.Inherit ? rule.AuditRowDetail : entry.AuditRowDetail)
             == AuditRowDetail.PerRow;
         long affected = 0, skipped = 0;
+        var blocked = new HashSet<string>(StringComparer.Ordinal);
         DateTimeOffset? nextBatchAt = entityAt;
 
         while (true)
@@ -318,6 +382,20 @@ internal sealed class RetentionRun(
                 ? await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct)
                 : null)
             {
+                if (batchTransaction is not null)
+                {
+                    // Deferred constraints fail inside the statement that broke them, where the
+                    // row can be blocked, rather than failing the whole batch at COMMIT. Only
+                    // in Cohort's own transaction: in the caller's it would also check the
+                    // caller's pending work early and change the mode of everything after.
+                    await using var immediate = new SqlParams().CreateCommand(
+                        db.Database.GetDbConnection(),
+                        batchTransaction.GetDbTransaction(),
+                        "SET CONSTRAINTS ALL IMMEDIATE"
+                    );
+                    await immediate.ExecuteNonQueryAsync(ct);
+                }
+
                 // The batch's rows and events carry the database's time; the first batch
                 // reuses the time the entity just read.
                 var eventAt = nextBatchAt ?? await DatabaseClock.NowAsync(db, ct);
@@ -326,9 +404,17 @@ internal sealed class RetentionRun(
                     scope,
                     db.Database.GetDbConnection(),
                     (batchTransaction ?? db.Database.CurrentTransaction!).GetDbTransaction(),
-                    new SweepMutationContext(SweepId, eventAt, batchSize),
+                    new SweepMutationContext(SweepId, eventAt, batchSize, blocked),
                     ct
                 );
+                if (
+                    execution.CandidateCount == batchSize
+                    && execution.BlockedRecordIds.Count == execution.CandidateCount
+                    && execution.BlockFailure is { } refusal
+                )
+                {
+                    ExceptionDispatchInfo.Throw(refusal);
+                }
 
                 // Row-detail audit commits with the batch whose mutations it documents: a
                 // crash later in the run cannot lose evidence for rows already changed, and
@@ -357,6 +443,7 @@ internal sealed class RetentionRun(
                     scope.ResolvedPeriod,
                     execution.AffectedRecordIds.Count,
                     execution.SkippedCount,
+                    execution.BlockedRecordIds.Count,
                     rule.Provenance
                 );
                 await auditWriter.WriteAsync(progress, ct);
@@ -375,17 +462,18 @@ internal sealed class RetentionRun(
 
             affected += execution.AffectedRecordIds.Count;
             skipped += execution.SkippedCount;
-            ReplaceCount(new EntitySweepCount(entry.EntityType, entry.Category, scope.Tenant.Id, rule.Strategy, affected, 0, skipped, 0));
+            blocked.UnionWith(execution.BlockedRecordIds);
+            ReplaceCount(new EntitySweepCount(entry.EntityType, entry.Category, scope.Tenant.Id, rule.Strategy, affected, 0, skipped, 0, 0, 0, blocked.Count));
 
-            // A short batch means the scope is exhausted. A full batch that neither mutated
-            // nor skipped anything would reselect the same rows forever; the remainder is
-            // left for the next run.
+            // A short batch means the scope is exhausted. A full batch that neither mutated,
+            // skipped nor blocked anything would reselect the same rows forever; the
+            // remainder is left for the next run.
             if (
                 execution.CandidateCount < batchSize
-                || (execution.AffectedRecordIds.Count == 0 && execution.SkippedRecordIds.Count == 0)
+                || (execution.AffectedRecordIds.Count == 0 && execution.SkippedRecordIds.Count == 0 && execution.BlockedRecordIds.Count == 0)
             )
             {
-                return (affected, skipped);
+                return (affected, skipped, blocked);
             }
         }
     }

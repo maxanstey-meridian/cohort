@@ -303,6 +303,18 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     Body = "other-exempt-erasure-subject-record",
                 }
             );
+            // Retained, but its category resolves to an Exempt rule, so the erasure keeps it.
+            db.TombstoneRecords.Add(
+                new TombstoneRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
+                    ExternalId = Guid.NewGuid(),
+                    DisplayName = "exempt-rule-tombstone",
+                }
+            );
             await db.SaveChangesAsync();
         }
 
@@ -331,7 +343,12 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     tenantId,
                     Strategy.Purge,
                     1,
-                    HeldCount: 1
+                    HeldCount: 1,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
         result
@@ -343,7 +360,12 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     tenantId,
                     Strategy.SoftDelete,
                     1,
-                    HeldCount: 1
+                    HeldCount: 1,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
         result
@@ -355,9 +377,36 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     tenantId,
                     Strategy.Anonymise,
                     1,
-                    HeldCount: 1
+                    HeldCount: 1,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
+
+        // An Exempt rule keeps every one of the subject's rows, and says so.
+        result
+            .Counts.Should()
+            .Contain(
+                new EntitySweepCount(
+                    typeof(TombstoneRecord),
+                    "tombstone-anonymise",
+                    tenantId,
+                    Strategy.Exempt,
+                    0,
+                    HeldCount: 0,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 1,
+                    DeferredCount: 0,
+                    BlockedCount: 0
+                )
+            );
+        // Held rows and the Exempt row would both be left: the real run would not be complete.
+        result.Complete.Should().BeFalse();
+        result.EntityFailures.Should().BeEmpty();
 
         var run = await LoadRunAsync(result.SweepId);
         var rowDetails = await LoadRowDetailsAsync(result.SweepId);
@@ -508,7 +557,19 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         result
             .Counts.Should()
             .Contain(
-                new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+                new EntitySweepCount(
+                    typeof(Note),
+                    "short-lived",
+                    tenantId,
+                    Strategy.Purge,
+                    1,
+                    HeldCount: 0,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
+                )
             );
 
         await using var verify = Host.CreateDbContext();
@@ -756,7 +817,19 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
         result.EntityFailures.Should().BeEmpty();
         result.Counts.Should().ContainSingle().Which.Should().Be(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+            new EntitySweepCount(
+                typeof(Note),
+                "short-lived",
+                tenantId,
+                Strategy.Purge,
+                1,
+                HeldCount: 0,
+                SkippedCount: 0,
+                NullAnchorCount: 0,
+                RetainedCount: 0,
+                DeferredCount: 0,
+                BlockedCount: 0
+            )
         );
         (await LoadRowDetailsAsync(result.SweepId)).Should().ContainSingle()
             .Which.RecordId.Should().Be(personNoteId.ToString());
@@ -792,7 +865,19 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         );
 
         person.Counts.Should().ContainSingle().Which.Should().Be(
-            new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+            new EntitySweepCount(
+                typeof(Note),
+                "short-lived",
+                tenantId,
+                Strategy.Purge,
+                1,
+                HeldCount: 0,
+                SkippedCount: 0,
+                NullAnchorCount: 0,
+                RetainedCount: 0,
+                DeferredCount: 0,
+                BlockedCount: 0
+            )
         );
         (await LoadRunAsync(person.SweepId)).TotalAffected.Should().Be(1);
         (await LoadErasureSubjectKindAsync(person.SweepId)).Should().Be("person");
@@ -960,10 +1045,10 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task An_Anonymise_Literal_Longer_Than_Its_Column_Fails_The_Entity_Instead_Of_Being_Truncated()
+    public async Task An_Anonymise_Literal_Longer_Than_Its_Column_Is_Refused_Before_The_Erasure_Runs()
     {
-        // The literal is bound without the column's length modifier, so PostgreSQL rejects it
-        // rather than silently cutting it to fit varchar(8).
+        // The literal could never fit varchar(8), so readiness refuses the model before a run
+        // exists rather than letting every erasure fail the entity.
         await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
         await using var services = BuildPredicateResolutionServiceProvider<BoundedAnonymiseDbContext>(
             database.ConnectionString,
@@ -990,11 +1075,15 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
         await using (var scope = services.CreateAsyncScope())
         {
-            var result = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+            var erase = () => scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
                 RetentionErasureRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), new ErasureScope("user", subjectId), asOf)
             );
-            // 22001: string_data_right_truncation, "value too long for type character varying(8)".
-            result.EntityFailures.Should().ContainSingle().Which.Should().Contain("code=sqlstate:22001");
+
+            var refused = await erase.Should().ThrowAsync<RetentionConfigurationException>();
+            refused.Which.Errors.Should().ContainSingle().Which.Should()
+                .Contain(typeof(BoundedAnonymiseRecord).FullName!)
+                .And.Contain("member Email")
+                .And.Contain("not valid for its column type character varying(8)");
         }
 
         await using var verifyScope = services.CreateAsyncScope();
@@ -1002,6 +1091,8 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         var record = await verify.Set<BoundedAnonymiseRecord>().SingleAsync();
         record.Email.Should().Be("a@b.c");
         record.AnonymisedAt.Should().BeNull();
+        (await verify.Database.SqlQuery<long>($"""SELECT COUNT(*) AS "Value" FROM "sweep_run" """).SingleAsync())
+            .Should().Be(0);
     }
 
     [Fact]
@@ -1118,15 +1209,25 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     "single-subject-erasure",
                     tenantId,
                     Strategy.Purge,
-                    2
+                    2,
+                    HeldCount: 0,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
             await using var verifyScope = services.CreateAsyncScope();
             var verify = verifyScope.ServiceProvider.GetRequiredService<SinglePredicateResolutionDbContext>();
             (await verify.SingleSubjectRecords.CountAsync()).Should().Be(0);
+            // No legal minimum, no holds, Purge: nothing of the subject is left.
+            result.EntityFailures.Should().BeEmpty();
+            result.Complete.Should().BeTrue();
             var summary = (await LoadSummariesAsync(verify, result.SweepId)).Should().ContainSingle().Which;
             (summary.ResolvedMonths, summary.ResolvedDays).Should().Be((0, 0));
             summary.NullAnchorCount.Should().Be(0);
+            (summary.RetainedCount, summary.DeferredCount, summary.BlockedCount).Should().Be((0, 0, 0));
         }
 
         await using (var database = await TemporaryDatabase.CreateAsync(GetConnectionString()))
@@ -1182,9 +1283,17 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     tenantId,
                     Strategy.Purge,
                     1,
-                    NullAnchorCount: 1
+                    HeldCount: 0,
+                    SkippedCount: 0,
+                    NullAnchorCount: 1,
+                    // The exact-boundary and future-anchored rows: the legal minimum keeps them.
+                    RetainedCount: 2,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
+            result.Complete.Should().BeFalse();
+            result.EntityFailures.Should().BeEmpty();
             await using var verifyScope = services.CreateAsyncScope();
             var verify = verifyScope.ServiceProvider.GetRequiredService<SinglePredicateResolutionDbContext>();
             (await verify.SingleSubjectRecords.Select(record => record.Id).ToListAsync())
@@ -1193,6 +1302,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             var summary = (await LoadSummariesAsync(verify, result.SweepId)).Should().ContainSingle().Which;
             (summary.ResolvedMonths, summary.ResolvedDays).Should().Be((0, 90));
             summary.NullAnchorCount.Should().Be(1);
+            summary.RetainedCount.Should().Be(2);
         }
     }
 
@@ -1387,7 +1497,12 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     tenantId,
                     Strategy.Purge,
                     2,
-                    HeldCount: 1
+                    HeldCount: 1,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
 
@@ -1517,7 +1632,13 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     "short-lived",
                     tenantId,
                     Strategy.Purge,
-                    1
+                    1,
+                    HeldCount: 0,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
 
@@ -1681,7 +1802,13 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     "factory-backed-set-based-erasure",
                     tenantId,
                     Strategy.Anonymise,
-                    2
+                    2,
+                    HeldCount: 0,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
         result
@@ -1695,7 +1822,12 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     tenantId,
                     Strategy.Anonymise,
                     2,
-                    HeldCount: 1
+                    HeldCount: 1,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
 
@@ -2038,8 +2170,9 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     [Fact]
     public async Task Caller_Mode_Entity_Failure_Undoes_Only_That_Entity()
     {
-        // The anonymise literal overflows varchar(8) (SQLSTATE 22001), which aborts the
-        // caller's transaction mid-entity; the entity's savepoint must undo just that entity.
+        // A trigger refuses the anonymise (SQLSTATE P0001), a failure readiness can't foresee,
+        // which aborts the caller's transaction mid-entity; the entity's savepoint must undo just
+        // that entity.
         await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
         var observer = new RecordingObserver();
         await using var services = BuildPredicateResolutionServiceProvider<CallerPartialFailureDbContext>(
@@ -2067,6 +2200,14 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         {
             var db = scope.ServiceProvider.GetRequiredService<CallerPartialFailureDbContext>();
             await db.Database.EnsureCreatedAsync();
+            await db.Database.ExecuteSqlRawAsync(
+                """
+                CREATE FUNCTION refuse_update() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN RAISE EXCEPTION 'refused'; END $$;
+                CREATE TRIGGER refuse_update BEFORE UPDATE ON bounded_anonymise_records
+                    FOR EACH ROW EXECUTE FUNCTION refuse_update();
+                """
+            );
             db.Add(new BoundedAnonymiseRecord { Id = failingId, TenantId = tenant.Id, SubjectId = subject, Email = "a@b.c", CreatedAt = createdAt });
             db.Add(new CallerPurgeRecord { Id = purgedId, TenantId = tenant.Id, SubjectId = subject, CreatedAt = createdAt });
             await db.SaveChangesAsync();
@@ -2087,7 +2228,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             await transaction.CommitAsync();
         }
 
-        result.EntityFailures.Should().ContainSingle().Which.Should().Contain("code=sqlstate:22001");
+        result.EntityFailures.Should().ContainSingle().Which.Should().Contain("code=sqlstate:P0001");
         result.Counts.Should().NotContain(count => count.EntityType == typeof(BoundedAnonymiseRecord));
         result.Counts.Should().ContainSingle(count => count.EntityType == typeof(CallerPurgeRecord))
             .Which.Affected.Should().Be(1);
@@ -2699,7 +2840,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     {
         await using var command = await CreateCommandAsync(db, sweepId);
         command.CommandText = """
-            SELECT "SweepId", "EntityType", "Category", "TenantId", "Strategy", "ResolvedMonths", "ResolvedDays", "Affected", "HeldCount", "SkippedCount", "RuleSource", "RuleReason", "NullAnchorCount"
+            SELECT "SweepId", "EntityType", "Category", "TenantId", "Strategy", "ResolvedMonths", "ResolvedDays", "Affected", "HeldCount", "SkippedCount", "RuleSource", "RuleReason", "NullAnchorCount", "RetainedCount", "DeferredCount", "BlockedCount"
             FROM "sweep_run_entity_summary"
             WHERE "SweepId" = @sweepId
             ORDER BY "EntityType"
@@ -2723,7 +2864,10 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     reader.GetInt64(9),
                     reader.IsDBNull(10) ? null : reader.GetString(10),
                     reader.IsDBNull(11) ? null : reader.GetString(11),
-                    reader.GetInt64(12)
+                    reader.GetInt64(12),
+                    reader.GetInt64(13),
+                    reader.GetInt64(14),
+                    reader.GetInt64(15)
                 )
             );
         }
@@ -2839,7 +2983,10 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         long SkippedCount = 0,
         string? RuleSource = null,
         string? RuleReason = null,
-        long NullAnchorCount = 0
+        long NullAnchorCount = 0,
+        long RetainedCount = 0,
+        long DeferredCount = 0,
+        long BlockedCount = 0
     );
 
     private sealed record SweepRunRowDetailRow(
@@ -3500,11 +3647,7 @@ internal sealed class CallerPartialFailureDbContext(DbContextOptions<CallerParti
 {
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
-        modelBuilder.Entity<BoundedAnonymiseRecord>(builder =>
-        {
-            builder.ToTable("bounded_anonymise_records");
-            builder.Property(record => record.Email).HasMaxLength(8);
-        });
+        modelBuilder.Entity<BoundedAnonymiseRecord>().ToTable("bounded_anonymise_records");
         modelBuilder.Entity<CallerPurgeRecord>().ToTable("caller_purge_records");
         modelBuilder.Entity<CallerMarker>().ToTable("caller_markers");
         modelBuilder.ConfigureCohortTables();

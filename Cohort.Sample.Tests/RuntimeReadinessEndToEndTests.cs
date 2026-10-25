@@ -161,6 +161,41 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Direct_sweep_refuses_a_0_10_schema_until_the_retained_deferred_and_blocked_counts_migration_is_applied()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        var options = new DbContextOptionsBuilder<SampleDbContext>()
+            .UseNpgsql(database.ConnectionString)
+            .Options;
+        await using (var db = new SampleDbContext(options))
+        {
+            await db.Database.GetService<IMigrator>()
+                .MigrateAsync("20261022095727_StoreResolvedPeriodAsMonthsAndDays");
+        }
+
+        using var host = new CohortTestHost(database.ConnectionString);
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var now = new DateTimeOffset(2026, 7, 12, 12, 0, 0, TimeSpan.Zero);
+
+        var refused = () => host.RunSweepAsync(tenant, now);
+
+        var exception = await refused.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().Contain(error =>
+            error.Contains("RetainedCount", StringComparison.Ordinal)
+            && error.Contains("DeferredCount", StringComparison.Ordinal)
+            && error.Contains("BlockedCount", StringComparison.Ordinal)
+        );
+
+        await using (var db = new SampleDbContext(options))
+        {
+            await db.Database.MigrateAsync();
+        }
+
+        var result = await host.RunSweepAsync(tenant, now);
+        result.EntityFailures.Should().BeEmpty();
+    }
+
+    [Fact]
     public async Task Direct_sweep_refuses_a_required_column_cohort_does_not_write_and_accepts_ones_the_database_fills()
     {
         await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
@@ -415,6 +450,193 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             error.Contains($"'{oldIdentity}'", StringComparison.Ordinal)
             && error.Contains("1 active hold(s)", StringComparison.Ordinal)
         );
+    }
+
+    [Theory]
+    [InlineData("ALTER TABLE public.anonymise_literal_records ALTER COLUMN \"Label\" TYPE character varying(8)", "character varying(8)")]
+    [InlineData("ALTER TABLE public.anonymise_literal_records ALTER COLUMN \"Label\" TYPE character(4)", "character(4)")]
+    [InlineData("ALTER TABLE public.anonymise_literal_records ALTER COLUMN \"Label\" TYPE uuid USING NULL", "uuid")]
+    public async Task Readiness_refuses_a_fixed_literal_its_column_cannot_take(string ddl, string columnType)
+    {
+        // The model says text; only the catalog knows the column became varchar(8), a char(4)
+        // declared by column type alone, or a uuid. "[redacted]" is too long for the first two
+        // and not a uuid, so every anonymise of these rows would fail at runtime.
+        await using var database = await AnonymiseTargetDatabaseAsync(ddl);
+        await using var provider = BuildAnonymiseTargetProvider(database.ConnectionString);
+
+        var errors = await ReadinessErrorsAsync(provider);
+
+        errors.Should().ContainSingle(error =>
+            error.Contains(typeof(AnonymiseLiteralRecord).FullName!, StringComparison.Ordinal)
+            && error.Contains("member Label", StringComparison.Ordinal)
+            && error.Contains($"not valid for its column type {columnType}", StringComparison.Ordinal)
+        );
+    }
+
+    [Fact]
+    public async Task Readiness_refuses_an_empty_string_rejected_by_a_domain_check()
+    {
+        await using var database = await AnonymiseTargetDatabaseAsync(
+            """
+            CREATE DOMAIN nonblank AS text CHECK (VALUE <> '');
+            ALTER TABLE public.anonymise_empty_string_records ALTER COLUMN "Label" TYPE nonblank;
+            """
+        );
+        await using var provider = BuildAnonymiseTargetProvider(database.ConnectionString);
+
+        var errors = await ReadinessErrorsAsync(provider);
+
+        errors.Should().ContainSingle(error =>
+            error.Contains(typeof(AnonymiseEmptyStringRecord).FullName!, StringComparison.Ordinal)
+            && error.Contains("member Label", StringComparison.Ordinal)
+            && error.Contains("not valid for its column type nonblank", StringComparison.Ordinal)
+        );
+    }
+
+    [Fact]
+    public async Task Readiness_refuses_a_fixed_literal_on_an_unfiltered_unique_index()
+    {
+        await using var database = await AnonymiseTargetDatabaseAsync(
+            """CREATE UNIQUE INDEX anonymise_literal_label ON public.anonymise_literal_records ("Label")"""
+        );
+        await using var provider = BuildAnonymiseTargetProvider(database.ConnectionString);
+
+        var errors = await ReadinessErrorsAsync(provider);
+
+        errors.Should().ContainSingle(error =>
+            error.Contains(typeof(AnonymiseLiteralRecord).FullName!, StringComparison.Ordinal)
+            && error.Contains("member Label", StringComparison.Ordinal)
+            && error.Contains("unique", StringComparison.Ordinal)
+        );
+    }
+
+    [Fact]
+    public async Task Readiness_accepts_a_fixed_literal_on_a_unique_index_filtered_on_anonymised_at()
+    {
+        // Only rows not yet anonymised must be unique, so every anonymised row may share the literal.
+        await using var database = await AnonymiseTargetDatabaseAsync(
+            """CREATE UNIQUE INDEX anonymise_literal_label ON public.anonymise_literal_records ("Label") WHERE "AnonymisedAt" IS NULL"""
+        );
+        await using var provider = BuildAnonymiseTargetProvider(database.ConnectionString);
+
+        var result = await provider.GetRequiredService<IRetentionSweep>().ExecuteAsync(
+            RetentionSweepRequest.Tenantless()
+        );
+
+        result.EntityFailures.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task Readiness_refuses_null_on_a_unique_index_that_treats_nulls_as_equal()
+    {
+        await using var database = await AnonymiseTargetDatabaseAsync(
+            """CREATE UNIQUE INDEX anonymise_null_label ON public.anonymise_null_records ("Label") NULLS NOT DISTINCT"""
+        );
+        await using var provider = BuildAnonymiseTargetProvider(database.ConnectionString);
+
+        var errors = await ReadinessErrorsAsync(provider);
+
+        errors.Should().ContainSingle(error =>
+            error.Contains(typeof(AnonymiseNullRecord).FullName!, StringComparison.Ordinal)
+            && error.Contains("member Label", StringComparison.Ordinal)
+            && error.Contains("unique", StringComparison.Ordinal)
+        );
+    }
+
+    [Fact]
+    public async Task Readiness_refuses_a_literal_on_a_foreign_key_column()
+    {
+        await using var database = await AnonymiseTargetDatabaseAsync(
+            """
+            CREATE TABLE public.anonymise_labels ("Code" text PRIMARY KEY);
+            ALTER TABLE public.anonymise_literal_records
+                ADD FOREIGN KEY ("Label") REFERENCES public.anonymise_labels ("Code");
+            """
+        );
+        await using var provider = BuildAnonymiseTargetProvider(database.ConnectionString);
+
+        var errors = await ReadinessErrorsAsync(provider);
+
+        errors.Should().ContainSingle(error =>
+            error.Contains(typeof(AnonymiseLiteralRecord).FullName!, StringComparison.Ordinal)
+            && error.Contains("member Label", StringComparison.Ordinal)
+            && error.Contains("foreign key", StringComparison.Ordinal)
+        );
+    }
+
+    [Fact]
+    public async Task Readiness_refuses_anonymising_a_referenced_key()
+    {
+        // Even Null: while a row references the key, NO ACTION refuses the update, and CASCADE or
+        // SET NULL would silently rewrite another table.
+        await using var database = await AnonymiseTargetDatabaseAsync(
+            """
+            ALTER TABLE public.anonymise_null_records ADD CONSTRAINT anonymise_null_label UNIQUE ("Label");
+            CREATE TABLE public.anonymise_label_users (
+                "Label" text REFERENCES public.anonymise_null_records ("Label")
+            );
+            """
+        );
+        await using var provider = BuildAnonymiseTargetProvider(database.ConnectionString);
+
+        var errors = await ReadinessErrorsAsync(provider);
+
+        errors.Should().ContainSingle(error =>
+            error.Contains(typeof(AnonymiseNullRecord).FullName!, StringComparison.Ordinal)
+            && error.Contains("member Label", StringComparison.Ordinal)
+            && error.Contains("referenced by a foreign key", StringComparison.Ordinal)
+        );
+    }
+
+    [Fact]
+    public async Task Readiness_refuses_null_into_a_column_the_database_declares_not_null()
+    {
+        // The model says nullable; the database was changed underneath it.
+        await using var database = await AnonymiseTargetDatabaseAsync(
+            """ALTER TABLE public.anonymise_null_records ALTER COLUMN "Label" SET NOT NULL"""
+        );
+        await using var provider = BuildAnonymiseTargetProvider(database.ConnectionString);
+
+        var errors = await ReadinessErrorsAsync(provider);
+
+        errors.Should().ContainSingle(error =>
+            error.Contains(typeof(AnonymiseNullRecord).FullName!, StringComparison.Ordinal)
+            && error.Contains("member Label", StringComparison.Ordinal)
+            && error.Contains("NOT NULL", StringComparison.Ordinal)
+        );
+    }
+
+    private async Task<TemporaryDatabase> AnonymiseTargetDatabaseAsync(string ddl)
+    {
+        var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using var db = new AnonymiseTargetDbContext(
+            new DbContextOptionsBuilder<AnonymiseTargetDbContext>().UseNpgsql(database.ConnectionString).Options
+        );
+        await db.Database.ExecuteSqlRawAsync(db.Database.GenerateCreateScript());
+        await db.Database.ExecuteSqlRawAsync(ddl);
+        return database;
+    }
+
+    private static ServiceProvider BuildAnonymiseTargetProvider(string connectionString)
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
+        services.AddDbContext<AnonymiseTargetDbContext>(builder => builder.UseNpgsql(connectionString));
+        services.AddSingleton<IRetentionRuleProvider>(new AnonymiseTargetRuleProvider());
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
+        services.AddCohort<AnonymiseTargetDbContext>();
+        return services.BuildServiceProvider(validateScopes: true);
+    }
+
+    private static async Task<IReadOnlyList<string>> ReadinessErrorsAsync(ServiceProvider provider)
+    {
+        var act = () => provider.GetRequiredService<IRetentionSweep>().ExecuteAsync(
+            RetentionSweepRequest.Tenantless()
+        );
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        return exception.Which.Errors;
     }
 
     private async Task<TemporaryDatabase> MigratedTemporaryDatabaseAsync()
@@ -745,6 +967,69 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
 
         public Task<RetentionRule?> ResolveAsync(RetentionResolutionContext context, CancellationToken ct) =>
             Task.FromResult<RetentionRule?>(new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge));
+    }
+
+    private sealed class AnonymiseTargetDbContext(DbContextOptions<AnonymiseTargetDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<AnonymiseLiteralRecord>().ToTable("anonymise_literal_records");
+            modelBuilder.Entity<AnonymiseEmptyStringRecord>().ToTable("anonymise_empty_string_records");
+            modelBuilder.Entity<AnonymiseNullRecord>().ToTable("anonymise_null_records");
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    [Retain("anonymise-target", nameof(CreatedAt))]
+    [RetentionEntityId("5b0f6c1e-2d7a-4e83-9c41-7a6e3f2d9b18")]
+    [RetentionTenantless]
+    private sealed class AnonymiseLiteralRecord
+    {
+        public Guid Id { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
+
+        [Anonymise(AnonymiseMethod.FixedLiteral, "[redacted]")]
+        public string Label { get; set; } = "";
+
+        public DateTimeOffset? AnonymisedAt { get; set; }
+    }
+
+    [Retain("anonymise-target", nameof(CreatedAt))]
+    [RetentionEntityId("8e2a4d7c-1f3b-4a65-b0d9-6c5e8f1a2b37")]
+    [RetentionTenantless]
+    private sealed class AnonymiseEmptyStringRecord
+    {
+        public Guid Id { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
+
+        [Anonymise(AnonymiseMethod.EmptyString)]
+        public string Label { get; set; } = "";
+
+        public DateTimeOffset? AnonymisedAt { get; set; }
+    }
+
+    [Retain("anonymise-target", nameof(CreatedAt))]
+    [RetentionEntityId("c4d9e1a2-7b6f-4c38-8a5d-2e1f9b7c3d60")]
+    [RetentionTenantless]
+    private sealed class AnonymiseNullRecord
+    {
+        public Guid Id { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
+
+        [Anonymise(AnonymiseMethod.Null)]
+        public string? Label { get; set; }
+
+        public DateTimeOffset? AnonymisedAt { get; set; }
+    }
+
+    private sealed class AnonymiseTargetRuleProvider : IRetentionRuleProvider
+    {
+        public RetentionCategoryCapabilities? GetCapabilities(string category) =>
+            category == "anonymise-target" ? new RetentionCategoryCapabilities([Strategy.Anonymise]) : null;
+
+        public Task<RetentionRule?> ResolveAsync(RetentionResolutionContext context, CancellationToken ct) =>
+            Task.FromResult<RetentionRule?>(new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise));
     }
 
     private sealed class UnsupportedProviderDbContext(

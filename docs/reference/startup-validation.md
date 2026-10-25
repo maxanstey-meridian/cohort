@@ -61,6 +61,13 @@ columns or rows belong to it. So these are rejected:
   unique index. A filtered index doesn't make it unique.
 - Record-ID types whose text form depends on session settings are rejected. See
   [Identities](/reference/schema#identities).
+- Each anonymised column can take what Cohort writes to it, checked against the database
+  catalog: an `EmptyString` or `FixedLiteral` value is valid input for the column's type
+  (length, type and domain `CHECK` included); `Null` doesn't go into a column the database
+  declares `NOT NULL`; a value every row shares (`EmptyString`, `FixedLiteral`, a `Static`
+  factory) isn't written to a column under an unfiltered unique index without the record ID;
+  a literal isn't written to a foreign-key column; and no anonymised column is referenced by a
+  foreign key. See [Anonymisation](/guides/anonymisation).
 
 ## Foreign keys
 
@@ -71,10 +78,14 @@ columns or rows belong to it. So these are rejected:
   itself through a self-reference.
 - Retained entities can't form a foreign-key cycle. Cohort sweeps dependents before their
   principals, so it needs an order.
+- `RESTRICT` and `NO ACTION` dependents are expected and aren't refused. A purge leaves a row
+  they still reference in place and reports it in `BlockedCount`; the next run tries it
+  again. A child that never expires, or whose category can't purge, keeps its parent's
+  `BlockedCount` from ever shrinking.
 
 ## Database
 
-- The connection is PostgreSQL.
+- The connection is PostgreSQL, version 16 or later.
 - The installed Cohort schema has the required columns, keys, unique indexes and `CHECK`
   constraints, and no required column Cohort doesn't write. See
   [Readiness](/reference/schema#readiness).

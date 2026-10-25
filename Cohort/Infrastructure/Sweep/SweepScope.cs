@@ -58,6 +58,13 @@ internal sealed record SweepScope(
     /// must wait for them, because it has to cover every one of the subject's rows.
     /// </summary>
     public bool SkipLocked => Subject is null;
+
+    /// <summary>
+    /// Foreign keys whose referencing rows keep a row from being deleted (Purge only; see
+    /// <see cref="ReferencingForeignKeySql.AttachAsync"/>). Referenced rows are left out of
+    /// the candidates and counted as blocked.
+    /// </summary>
+    public IReadOnlyList<ReferencingForeignKey> BlockingReferences { get; init; } = [];
 }
 
 internal enum SweepCount
@@ -70,4 +77,15 @@ internal enum SweepCount
 
     /// <summary>Rows it could act on whose anchor is NULL, so no cutoff ever matches them.</summary>
     NullAnchor,
+
+    /// <summary>
+    /// Rows in scope but for the cutoff (anchor on or after it), held or not: what an
+    /// erasure's rule keeps. Zero without a cutoff.
+    /// </summary>
+    RetainedByRule,
+
+    /// <summary>
+    /// Rows it would act on now but for a blocking reference (held rows count as held).
+    /// </summary>
+    Blocked,
 }

@@ -287,6 +287,56 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
     }
 
     [Fact]
+    public async Task Result_Counts_Migration_Adds_Retained_Deferred_And_Blocked_Counts_As_Zero_To_Existing_Summaries()
+    {
+        var options = CreateOptions();
+        var sweepId = Guid.NewGuid();
+
+        await using (var db = new SampleDbContext(options))
+        {
+            var migrator = db.Database.GetService<IMigrator>();
+            await migrator.MigrateAsync("20261022095727_StoreResolvedPeriodAsMonthsAndDays");
+            await db.Database.ExecuteSqlRawAsync(
+                """
+                INSERT INTO "sweep_run"
+                    ("SweepId", "StartedAt", "Status", "SettledAt", "Duration", "TriggerKind", "DryRun", "TenantId", "TotalAffected")
+                VALUES ({0}, {1}, 1, {1}, interval '1 second', 2, FALSE, {2}, 1);
+                INSERT INTO "sweep_run_entity_summary"
+                    ("SweepId", "At", "EntityType", "RetentionEntityId", "Category", "TenantId", "Strategy",
+                     "ResolvedMonths", "ResolvedDays", "Affected", "HeldCount", "SkippedCount", "NullAnchorCount")
+                VALUES ({0}, {1}, 'Cohort.Sample.Entities.Note', {3}, 'short-lived', {2}, 0, 0, 30, 1, 0, 0, 0);
+                """,
+                sweepId,
+                new DateTimeOffset(2026, 10, 1, 12, 0, 0, TimeSpan.Zero),
+                Guid.NewGuid(),
+                RetentionEntityIdentity.For<Note>()
+            );
+
+            await migrator.MigrateAsync();
+        }
+
+        var columns = await GetColumnsAsync("sweep_run_entity_summary");
+        foreach (var column in new[] { "RetainedCount", "DeferredCount", "BlockedCount" })
+        {
+            columns.Should().ContainKey(column);
+            columns[column].DataType.Should().Be("bigint");
+            columns[column].IsNullable.Should().BeFalse();
+        }
+
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            "SELECT \"RetainedCount\", \"DeferredCount\", \"BlockedCount\" FROM \"sweep_run_entity_summary\" WHERE \"SweepId\" = @sweepId";
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        await using var reader = await command.ExecuteReaderAsync();
+        (await reader.ReadAsync()).Should().BeTrue();
+        reader.GetInt64(0).Should().Be(0);
+        reader.GetInt64(1).Should().Be(0);
+        reader.GetInt64(2).Should().Be(0);
+    }
+
+    [Fact]
     public async Task Handler_State_Constraint_Migration_Requeues_Legacy_InFlight_Work()
     {
         var options = CreateOptions();

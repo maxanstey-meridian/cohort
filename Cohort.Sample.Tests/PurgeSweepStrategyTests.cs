@@ -68,7 +68,13 @@ public sealed class PurgeSweepStrategyTests(PostgresFixture fixture)
                     "short-lived",
                     tenantA,
                     Strategy.Purge,
-                    1
+                    1,
+                    HeldCount: 0,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
 
@@ -133,7 +139,12 @@ public sealed class PurgeSweepStrategyTests(PostgresFixture fixture)
                     tenantId,
                     Strategy.Purge,
                     1,
-                    HeldCount: 1
+                    HeldCount: 1,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
 

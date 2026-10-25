@@ -377,10 +377,32 @@ public sealed class SweepConcurrencyAndVolumeEndToEndTests(PostgresFixture fixtu
             timeout.Token
         );
 
+        // The two locked rows are still due: counted as deferred, and a sweep that left only
+        // deferred rows for its next run still succeeds.
         result
             .Counts.Should()
-            .Contain(count => count.EntityType == typeof(Note) && count.Affected == 2);
+            .Contain(count => count.EntityType == typeof(Note) && count.Affected == 2 && count.DeferredCount == 2);
+        result.EntityFailures.Should().BeEmpty();
         await blockerTransaction.CommitAsync();
+
+        await using (var ledger = new NpgsqlConnection(GetConnectionString()))
+        {
+            await ledger.OpenAsync();
+            await using var command = ledger.CreateCommand();
+            command.CommandText = """
+                SELECT run."Status", summary."DeferredCount"
+                FROM "sweep_run" AS run
+                JOIN "sweep_run_entity_summary" AS summary ON summary."SweepId" = run."SweepId"
+                WHERE run."SweepId" = @sweepId
+                  AND summary."RetentionEntityId" = @retentionEntityId
+                """;
+            command.Parameters.AddWithValue("sweepId", result.SweepId);
+            command.Parameters.AddWithValue("retentionEntityId", RetentionEntityIdentity.For<Note>());
+            await using var reader = await command.ExecuteReaderAsync();
+            (await reader.ReadAsync()).Should().BeTrue();
+            ((SweepRunStatus)reader.GetInt32(0)).Should().Be(SweepRunStatus.Succeeded);
+            reader.GetInt64(1).Should().Be(2);
+        }
 
         await using var verify = Host.CreateDbContext();
         var remainingIds = await verify.Notes

@@ -341,7 +341,19 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         result
             .Counts.Should()
             .Contain(
-                new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+                new EntitySweepCount(
+                    typeof(Note),
+                    "short-lived",
+                    tenantId,
+                    Strategy.Purge,
+                    1,
+                    HeldCount: 0,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
+                )
             );
         sink.BeforeCalls.Should().Equal("high", "low");
 
@@ -764,7 +776,11 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             asOf
         );
 
-        result.EntityFailures.Should().BeEmpty();
+        // The skipped row makes the run PartiallyFailed, with a plain reason naming the entity.
+        result.EntityFailures.Should().ContainSingle().Which.Should().Be("reason=rows-skipped;entityType=Cohort.Sample.Entities.Note;count=1");
+        (await LoadRunStatusAndErrorAsync(result.SweepId))
+            .Should()
+            .Be((SweepRunStatus.PartiallyFailed, "reason=rows-skipped;entityType=Cohort.Sample.Entities.Note;count=1"));
         result
             .Counts.Should()
             .Contain(
@@ -774,7 +790,12 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     tenantId,
                     Strategy.Purge,
                     1,
-                    SkippedCount: 1
+                    HeldCount: 0,
+                    SkippedCount: 1,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
 
@@ -783,6 +804,235 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             (await verify.Notes.AnyAsync(note => note.Id == healthyNoteId)).Should().BeFalse();
             (await verify.Notes.AnyAsync(note => note.Id == failingNoteId)).Should().BeTrue();
         }
+    }
+
+    [Fact]
+    public async Task Sweep_Skips_Only_The_Row_Whose_OnBefore_Hits_A_Database_Error()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var failingNoteId = Guid.NewGuid();
+        var healthyNoteId = Guid.NewGuid();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = failingNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-300),
+                    Body = DatabaseTouchingNoteHandler.DivideByZeroBody,
+                },
+                new Note
+                {
+                    Id = healthyNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-100),
+                    Body = "after-the-database-error",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
+                services.AddSingleton(new WriteTarget(Guid.Empty)).AddRowHandler<Note, DatabaseTouchingNoteHandler>()
+        );
+
+        // Both rows share one batch: the failing statement must not abort it.
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        result.EntityFailures.Should().ContainSingle().Which.Should().Be("reason=rows-skipped;entityType=Cohort.Sample.Entities.Note;count=1");
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note))
+            .Which.Should().Match<EntitySweepCount>(count => count.Affected == 1 && count.SkippedCount == 1);
+        var deadLettered = (await LoadHandlerStatusesAsync(result.SweepId)).Single(status => status.State == DeadLetteredState);
+        deadLettered.LastError.Should().MatchRegex("^type=Npgsql\\.PostgresException;code=sqlstate:22012;diagnosticId=[0-9a-f]{32}$");
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == healthyNoteId)).Should().BeFalse();
+        (await verify.Notes.AnyAsync(note => note.Id == failingNoteId)).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Sweep_Refuses_An_OnBefore_That_Writes_Through_The_Sweep_Transaction()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var healthyNoteId = Guid.NewGuid();
+        var writingNoteId = Guid.NewGuid();
+        var bystanderNoteId = Guid.NewGuid();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                // Oldest, so the batch has already deleted it and written its row detail
+                // when the writing handler runs: read-only must still be accepted then.
+                new Note
+                {
+                    Id = healthyNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-300),
+                    Body = "before-the-write",
+                },
+                new Note
+                {
+                    Id = writingNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-100),
+                    Body = DatabaseTouchingNoteHandler.WritingBody,
+                },
+                // Out of scope (another tenant): only the handler's write could change it.
+                new Note
+                {
+                    Id = bystanderNoteId,
+                    TenantId = Guid.NewGuid(),
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "bystander",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
+                services.AddSingleton(new WriteTarget(bystanderNoteId)).AddRowHandler<Note, DatabaseTouchingNoteHandler>()
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        result.EntityFailures.Should().ContainSingle().Which.Should().Be("reason=rows-skipped;entityType=Cohort.Sample.Entities.Note;count=1");
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note))
+            .Which.Should().Match<EntitySweepCount>(count => count.Affected == 1 && count.SkippedCount == 1);
+        var deadLettered = (await LoadHandlerStatusesAsync(result.SweepId)).Single(status => status.State == DeadLetteredState);
+        deadLettered.LastError.Should().MatchRegex("^type=Npgsql\\.PostgresException;code=sqlstate:25006;diagnosticId=[0-9a-f]{32}$");
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == healthyNoteId)).Should().BeFalse();
+        (await verify.Notes.AnyAsync(note => note.Id == writingNoteId)).Should().BeTrue();
+        (await verify.Notes.SingleAsync(note => note.Id == bystanderNoteId)).Body.Should().Be("bystander");
+    }
+
+    [Fact]
+    public async Task OnBefore_Can_Read_Related_Rows_On_The_Sweep_Transaction()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var sweptNoteId = Guid.NewGuid();
+        var relatedNoteId = Guid.NewGuid();
+        var recorder = new CollectionSnapshotRecorder();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = sweptNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-100),
+                    Body = DatabaseTouchingNoteHandler.ReadingBody,
+                },
+                // Too young to sweep: the handler looks it up while the swept row is locked.
+                new Note
+                {
+                    Id = relatedNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "related-body",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
+                services
+                    .AddSingleton(new WriteTarget(relatedNoteId))
+                    .AddSingleton(recorder)
+                    .AddRowHandler<Note, DatabaseTouchingNoteHandler>()
+        );
+
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+        await handlerHost.RunWithServicesAsync(async services =>
+            await services.GetRequiredService<IRetentionRowDispatcher>().FlushAsync()
+        );
+
+        result.EntityFailures.Should().BeEmpty();
+        recorder.Snapshot.Should().NotBeNull();
+        recorder.Snapshot!["related"].Should().Be("related-body");
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == sweptNoteId)).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task A_Live_Erasure_Whose_OnBefore_Skips_A_Row_Is_Partially_Failed_And_Not_Complete()
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var failingNoteId = Guid.NewGuid();
+        var erasedNoteId = Guid.NewGuid();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = failingNoteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-2),
+                    Body = SelectivelyFailingNoteHandler.FailingBody,
+                },
+                new Note
+                {
+                    Id = erasedNoteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "erase-me",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
+                services.AddRowHandler<Note, SelectivelyFailingNoteHandler>()
+        );
+
+        var result = await handlerHost.RunErasureAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
+            asOf
+        );
+
+        const string reason = "reason=rows-skipped;entityType=Cohort.Sample.Entities.Note;count=1";
+        result.EntityFailures.Should().ContainSingle().Which.Should().Be(reason);
+        result.Complete.Should().BeFalse();
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note))
+            .Which.Should().Match<EntitySweepCount>(count => count.Affected == 1 && count.SkippedCount == 1 && count.DeferredCount == 0);
+        (await LoadRunStatusAndErrorAsync(result.SweepId))
+            .Should()
+            .Be((SweepRunStatus.PartiallyFailed, reason));
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.Where(note => note.SubjectId == subjectId).Select(note => note.Id).ToListAsync())
+            .Should()
+            .Equal(failingNoteId);
     }
 
     [Fact]
@@ -916,7 +1166,12 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     tenantId,
                     Strategy.Purge,
                     1,
-                    HeldCount: 1
+                    HeldCount: 1,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
         result
@@ -928,7 +1183,12 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     tenantId,
                     Strategy.SoftDelete,
                     1,
-                    HeldCount: 1
+                    HeldCount: 1,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
         result
@@ -942,7 +1202,12 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     tenantId,
                     Strategy.Anonymise,
                     1,
-                    HeldCount: 1
+                    HeldCount: 1,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
         sink.BeforeCalls.Should()
@@ -1160,7 +1425,19 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         result
             .Counts.Should()
             .Contain(
-                new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 1)
+                new EntitySweepCount(
+                    typeof(Note),
+                    "short-lived",
+                    tenantId,
+                    Strategy.Purge,
+                    1,
+                    HeldCount: 0,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
+                )
             );
         result
             .Counts.Should()
@@ -1170,7 +1447,13 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     "soft-delete",
                     tenantId,
                     Strategy.SoftDelete,
-                    1
+                    1,
+                    HeldCount: 0,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
         result
@@ -1181,7 +1464,13 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     "anonymise",
                     tenantId,
                     Strategy.Anonymise,
-                    1
+                    1,
+                    HeldCount: 0,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
         sink.BeforeCalls.Should().BeEmpty();
@@ -1752,7 +2041,10 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             await serviceProvider.GetRequiredService<IRetentionRowDispatcher>().FlushAsync();
         });
 
-        result.EntityFailures.Should().BeEmpty();
+        result.EntityFailures.Should().ContainSingle().Which.Should().Be("reason=rows-skipped;entityType=Cohort.Sample.Entities.Note;count=1");
+        (await LoadRunStatusAndErrorAsync(result.SweepId))
+            .Should()
+            .Be((SweepRunStatus.PartiallyFailed, "reason=rows-skipped;entityType=Cohort.Sample.Entities.Note;count=1"));
         result
             .Counts.Should()
             .Contain(
@@ -1762,7 +2054,12 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     tenantId,
                     Strategy.Purge,
                     0,
-                    SkippedCount: 1
+                    HeldCount: 0,
+                    SkippedCount: 1,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
         recorder.Snapshot.Should().BeNull();
@@ -1963,6 +2260,18 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         throw new TimeoutException(
             $"Timed out waiting for a handler status row that matched the requested predicate for sweep {sweepId}."
         );
+    }
+
+    private async Task<(SweepRunStatus Status, string? Error)> LoadRunStatusAndErrorAsync(Guid sweepId)
+    {
+        await using var connection = new NpgsqlConnection(GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """SELECT "Status", "Error" FROM "sweep_run" WHERE "SweepId" = @sweepId""";
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        await using var reader = await command.ExecuteReaderAsync();
+        (await reader.ReadAsync()).Should().BeTrue();
+        return ((SweepRunStatus)reader.GetInt32(0), reader.IsDBNull(1) ? null : reader.GetString(1));
     }
 
     private async Task<IReadOnlyList<EntitySummaryRow>> LoadEntitySummariesAsync(Guid sweepId)
@@ -2474,6 +2783,53 @@ file sealed class SelectivelyFailingNoteHandler : IRetentionHandler<Note>
         }
 
         ctx.Snapshot["body"] = row.Body;
+        return Task.CompletedTask;
+    }
+}
+
+file sealed record WriteTarget(Guid NoteId);
+
+/// <summary>
+/// Touches the database through the sweep's own DbContext from OnBefore: a failing
+/// statement, a write, or a read of a related row, chosen by the row's body.
+/// </summary>
+file sealed class DatabaseTouchingNoteHandler(SampleDbContext db, WriteTarget target, IServiceProvider services)
+    : IRetentionHandler<Note>
+{
+    public const string DivideByZeroBody = "divide-by-zero-before-delete";
+    public const string WritingBody = "write-before-delete";
+    public const string ReadingBody = "read-before-delete";
+
+    public async Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        switch (row.Body)
+        {
+            case DivideByZeroBody:
+                await db.Database.ExecuteSqlRawAsync("SELECT 1 / 0", ct);
+                break;
+            case WritingBody:
+                await db.Notes
+                    .Where(note => note.Id == target.NoteId)
+                    .ExecuteUpdateAsync(setters => setters.SetProperty(note => note.Body, "overwritten-by-handler"), ct);
+                break;
+            case ReadingBody:
+                ctx.Snapshot["related"] = await db.Notes
+                    .AsNoTracking()
+                    .Where(note => note.Id == target.NoteId)
+                    .Select(note => note.Body)
+                    .SingleAsync(ct);
+                break;
+        }
+
+        ctx.Snapshot["body"] = row.Body;
+    }
+
+    public Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
+    {
+        if (services.GetService<CollectionSnapshotRecorder>() is { } recorder)
+        {
+            recorder.Snapshot = new Dictionary<string, object?>(ctx.Snapshot);
+        }
         return Task.CompletedTask;
     }
 }

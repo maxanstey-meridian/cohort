@@ -276,8 +276,8 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
                     ("SweepId", "StartedAt", "Status", "SettledAt", "Duration", "TriggerKind", "DryRun", "TenantId", "TotalAffected", "Error")
                 VALUES (@sweepId, @createdAt, 1, @settledAt, interval '1 second', 2, false, @tenantId, 1, @historicalError);
                 INSERT INTO public.sweep_run_entity_summary
-                    ("SweepId", "At", "EntityType", "RetentionEntityId", "Category", "TenantId", "Strategy", "ResolvedMonths", "ResolvedDays", "Affected", "HeldCount", "SkippedCount", "NullAnchorCount", "RuleSource", "RuleReason")
-                VALUES (@sweepId, @settledAt, @entityType, @retentionEntityId, 'qualified', @tenantId, 0, 0, 30, 1, 0, 0, 0, 'historical', 'before move');
+                    ("SweepId", "At", "EntityType", "RetentionEntityId", "Category", "TenantId", "Strategy", "ResolvedMonths", "ResolvedDays", "Affected", "HeldCount", "SkippedCount", "NullAnchorCount", "RetainedCount", "DeferredCount", "BlockedCount", "RuleSource", "RuleReason")
+                VALUES (@sweepId, @settledAt, @entityType, @retentionEntityId, 'qualified', @tenantId, 0, 0, 30, 1, 0, 0, 0, 0, 0, 0, 'historical', 'before move');
                 INSERT INTO public.sweep_run_row_detail
                     ("Id", "SweepId", "At", "EntityType", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId", "CapturedPayload")
                 VALUES (900001, @sweepId, @settledAt, @entityType, @retentionEntityId, @recordId, 'qualified', 0, @tenantId, NULL);

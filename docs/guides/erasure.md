@@ -113,16 +113,43 @@ The run's audit row records the kind (`sweep_run.ErasureSubjectKind`, and
 
 ## What still blocks erasure
 
-Ordinary `Period` never delays erasure. Legal minimums and holds do:
+Ordinary `Period` never delays erasure. Legal minimums, holds and Exempt rules do:
 
 - With no non-zero `LegalMin`, Cohort adds no age condition at all. Null and future anchors
   are eligible.
 - A non-zero `LegalMin` adds the strict condition `anchor < cutoff`, where the cutoff is the
   start of the day `LegalMin` before today, in the host's `TimeZone` (see
-  [periods](/guides/retention-rules#periods-are-calendar-periods)). A row anchored on that
-  day, or with a null anchor, stays blocked. Blocked null anchors are reported in
-  `NullAnchorCount`.
+  [periods](/guides/retention-rules#periods-are-calendar-periods)). A row anchored on or
+  after that day, or with a null anchor, stays.
+- A category that resolves to `Exempt` keeps every one of the subject's rows.
+- A row another table still references through a `RESTRICT` or `NO ACTION` foreign key can't
+  be purged, and a row any other integrity constraint refuses (a check, a unique index, a
+  constraint trigger) can't be changed. Both count as blocked. Delete or re-point the
+  referencing rows, then erase again.
 - Active holds always block erasure.
+
+Each `EntitySweepCount` in the result says what the erasure left of the subject, and why. The
+counts don't overlap:
+
+| Count | Rows left because |
+|---|---|
+| `HeldCount` | an active hold covers them |
+| `NullAnchorCount` | their anchor is null, so a legal-minimum cutoff never matches them |
+| `RetainedCount` | the rule keeps them: younger than the legal minimum, or every row under an `Exempt` rule |
+| `SkippedCount` | a row handler's `OnBeforeAsync` failed, so the row was left unchanged |
+| `DeferredCount` | they were still due when the run finished with the entity, but it never reached them (they came into scope mid-run, or the batch loop stopped) |
+| `BlockedCount` | a database constraint stopped Cohort changing them |
+
+`ErasureResult.Complete` reads them for you. It is `true` only when no entity failed and every
+one of those counts is zero, so nothing of the subject remains in the requested scope. A dry
+run's `Complete` says whether the real run would be.
+
+Skipped, deferred and blocked rows also make the run `PartiallyFailed`: each adds a plain
+reason to `EntityFailures` and to the run's `Error`, such as
+`reason=rows-skipped;entityType=MyApp.Note;count=1` (`rows-missed` for deferred rows,
+`rows-blocked` for blocked ones). Held, null-anchor and retained rows are the rules working
+as configured, so they leave the run `Succeeded` and only show in the counts and in
+`Complete`.
 
 ## Soft delete is not erasure
 
@@ -153,7 +180,8 @@ An ordinary erasure (`ErasureTransaction.Owned`, the default) uses the same
 - One entity's failure is recorded in `ErasureResult.EntityFailures`, and in the run's
   `PartiallyFailed` status and `Error`. Erasure carries on with the subject's data in the
   remaining entities.
-- Held counts are measured directly, in dry runs too.
+- Held, null-anchor and retained counts are measured directly, in dry runs too. Deferred
+  rows are measured once each entity's batches are done, in real runs only.
 
 One difference: a sweep skips rows another transaction has locked, but erasure waits for
 them (`FOR UPDATE` rather than `SKIP LOCKED`). An erasure request mustn't silently miss a row
@@ -233,9 +261,13 @@ What changes compared with an ordinary erasure:
   [Tenant Isolation](/guides/tenant-isolation)). `CommitAsync` is the supported path: a
   synchronous `Commit()` blocks while observers are told, each for up to
   `AuditObservers:Timeout` per event.
-- **Row handlers run after the commit.** `OnBeforeAsync` runs inside your transaction.
+- **Row handlers run after the commit.** `OnBeforeAsync` runs inside your transaction, in a
+  read-only savepoint.
   `OnAfterAsync` work is queued in the same transaction, so the dispatcher only sees it once
   you commit, and a rollback discards it.
+- **Your deferred constraints stay deferred.** Cohort doesn't change your transaction's
+  constraint mode, so a change of Cohort's that breaks a deferred constraint fails your
+  `COMMIT`, not the row, and is not counted as blocked.
 - **Your change tracker isn't refreshed.** The erasure changes rows with SQL, so entities
   your context already tracks keep their old values. Load and change your own rows before
   erasing, or call `ChangeTracker.Clear()` after.
@@ -264,6 +296,13 @@ changes nothing else.
 - Every timestamp the run records or reports (`sweep_run`, summaries, row details, observer
   events, `ErasureResult`) comes from the database clock. `DeletedAt`/`AnonymisedAt` markers
   keep the run's time.
+- The result says what the erasure left: `EntitySweepCount` gains `RetainedCount`,
+  `DeferredCount` and `BlockedCount`, and `ErasureResult.Complete` is true only when nothing
+  of the subject remains. See [What still blocks erasure](#what-still-blocks-erasure).
+- An erasure that left rows skipped, deferred or blocked settles `PartiallyFailed`, with a
+  `rows-skipped`, `rows-missed` or `rows-blocked` reason in `EntityFailures` and `Error`.
+- Add the summary-column migration described under
+  [Audit Trail](/guides/audit-trail#upgrading-to-0-11-0).
 :::
 
 ## Upgrading to 0.9.0

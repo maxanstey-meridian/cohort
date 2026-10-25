@@ -30,11 +30,20 @@ builder.Services.AddRowHandler<Attachment, DeleteAttachmentBlob>(
 
 Both methods are optional. The interface supplies no-op defaults.
 
-- **`OnBeforeAsync`** runs inside the sweep transaction, before the row is mutated. Use it to
-  capture what you'll need later into `ctx.Snapshot`. Treat it as capture-only, for two
-  reasons: an external side effect here survives a transaction rollback, and it can run for a
-  row that's then withheld, for example by a hold created mid-sweep. If it throws, the row is
-  left unmutated and the work is dead-lettered.
+- **`OnBeforeAsync`** runs in a read-only savepoint inside the sweep transaction, before the
+  row is mutated. Use it to capture what you'll need later into `ctx.Snapshot`. Database reads
+  through the sweep's `DbContext` see the row as it's about to be mutated, along with any
+  related rows. A write through that context fails the handler (`sqlstate:25006`), and so
+  does any database error, without harming the rest of the batch: the savepoint is always
+  rolled back. External side effects still belong in `OnAfterAsync`: they survive a rollback,
+  they run while the batch holds its row locks, and they can run for a row that's then
+  withheld, for example by a hold created mid-sweep or a constraint that refuses the change.
+  A write to the row being swept through another connection waits on the sweep's own row
+  lock. If the handler throws, the row is left unmutated, the work is dead-lettered, and the
+  row counts in `SkippedCount`. A run that
+  skipped rows settles `PartiallyFailed`, with a
+  `reason=rows-skipped;entityType=…;count=n` line in `EntityFailures` and the run's `Error`.
+  The next run tries the row again.
 - **`OnAfterAsync`** runs after commit, from a durable queue, with the snapshot you captured.
   This is where side effects belong.
 

@@ -64,7 +64,19 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
 
         result
             .Counts.Should()
-            .Contain(new EntitySweepCount(typeof(Note), "short-lived", tenantA, Strategy.Purge, 0));
+            .Contain(new EntitySweepCount(
+                typeof(Note),
+                "short-lived",
+                tenantA,
+                Strategy.Purge,
+                0,
+                HeldCount: 0,
+                SkippedCount: 0,
+                NullAnchorCount: 0,
+                RetainedCount: 0,
+                DeferredCount: 0,
+                BlockedCount: 0
+            ));
         result
             .Counts.Should()
             .Contain(
@@ -73,7 +85,13 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
                     "soft-delete",
                     tenantA,
                     Strategy.SoftDelete,
-                    0
+                    0,
+                    HeldCount: 0,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
         result
@@ -84,7 +102,13 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
                     "anonymise",
                     tenantA,
                     Strategy.Anonymise,
-                    1
+                    1,
+                    HeldCount: 0,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
 

@@ -61,8 +61,11 @@ public abstract record SweepEvent
             RetentionPeriod ResolvedPeriod,
             long Affected,
             long HeldCount,
-            long SkippedCount = 0,
-            long NullAnchorCount = 0,
+            long SkippedCount,
+            long NullAnchorCount,
+            long RetainedCount,
+            long DeferredCount,
+            long BlockedCount,
             RetentionRuleProvenance? Provenance = null
         )
         {
@@ -78,6 +81,9 @@ public abstract record SweepEvent
             this.HeldCount = NonNegative(HeldCount, nameof(HeldCount));
             this.SkippedCount = NonNegative(SkippedCount, nameof(SkippedCount));
             this.NullAnchorCount = NonNegative(NullAnchorCount, nameof(NullAnchorCount));
+            this.RetainedCount = NonNegative(RetainedCount, nameof(RetainedCount));
+            this.DeferredCount = NonNegative(DeferredCount, nameof(DeferredCount));
+            this.BlockedCount = NonNegative(BlockedCount, nameof(BlockedCount));
             this.Provenance = Provenance;
         }
 
@@ -95,6 +101,15 @@ public abstract record SweepEvent
         public long HeldCount { get; }
         public long SkippedCount { get; }
         public long NullAnchorCount { get; }
+        /// <summary>Erasure only: the subject's rows the resolved rule keeps.</summary>
+        public long RetainedCount { get; }
+        /// <summary>
+        /// Real runs only: rows still due after the entity's batches that the run neither
+        /// changed nor skipped.
+        /// </summary>
+        public long DeferredCount { get; }
+        /// <summary>Rows a database constraint stopped Cohort changing.</summary>
+        public long BlockedCount { get; }
         public RetentionRuleProvenance? Provenance { get; }
     }
 
@@ -111,6 +126,7 @@ public abstract record SweepEvent
             RetentionPeriod ResolvedPeriod,
             long Affected,
             long SkippedCount,
+            long BlockedCount,
             RetentionRuleProvenance? Provenance = null
         )
         {
@@ -124,6 +140,7 @@ public abstract record SweepEvent
             this.ResolvedPeriod = ResolvedPeriod ?? throw new ArgumentNullException(nameof(ResolvedPeriod));
             this.Affected = NonNegative(Affected, nameof(Affected));
             this.SkippedCount = NonNegative(SkippedCount, nameof(SkippedCount));
+            this.BlockedCount = NonNegative(BlockedCount, nameof(BlockedCount));
             this.Provenance = Provenance;
         }
 
@@ -139,6 +156,7 @@ public abstract record SweepEvent
         public RetentionPeriod ResolvedPeriod { get; }
         public long Affected { get; }
         public long SkippedCount { get; }
+        public long BlockedCount { get; }
         public RetentionRuleProvenance? Provenance { get; }
     }
 

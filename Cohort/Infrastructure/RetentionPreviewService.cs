@@ -55,14 +55,17 @@ internal sealed class RetentionPreviewService(
                     context,
                     ct
                 );
-                long affected = 0, held = 0, nullAnchors = 0;
+                long affected = 0, held = 0, nullAnchors = 0, blocked = 0;
                 if (rule.Strategy != Strategy.Exempt)
                 {
                     var strategy = strategies[rule.Strategy];
-                    var scope = SweepScope.ForSweep(entry, rule, context, timeZone);
+                    var scope = (
+                        await ReferencingForeignKeySql.AttachAsync(connection, [SweepScope.ForSweep(entry, rule, context, timeZone)], ct)
+                    )[0];
                     affected = await strategy.CountAsync(scope, SweepCount.Eligible, connection, ct);
                     held = await strategy.CountAsync(scope, SweepCount.Held, connection, ct);
                     nullAnchors = await strategy.CountAsync(scope, SweepCount.NullAnchor, connection, ct);
+                    blocked = await strategy.CountAsync(scope, SweepCount.Blocked, connection, ct);
                 }
 
                 counts.Add(
@@ -73,7 +76,14 @@ internal sealed class RetentionPreviewService(
                         rule.Strategy,
                         affected,
                         held,
-                        NullAnchorCount: nullAnchors
+                        SkippedCount: 0,
+                        NullAnchorCount: nullAnchors,
+                        // A preview erases nothing and runs nothing, so nothing is retained
+                        // from an erasure or left behind by a run. Rows a reference blocks
+                        // are known up front.
+                        RetainedCount: 0,
+                        DeferredCount: 0,
+                        BlockedCount: blocked
                     )
                 );
             }

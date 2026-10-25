@@ -16,6 +16,13 @@ A run commits its `Started` row before any mutation. A terminal event then sets 
 `Succeeded`, `PartiallyFailed`, `Failed` or `Cancelled` and records `SettledAt`. Every time
 the ledger records comes from the database clock.
 
+`PartiallyFailed` means the run finished but left work it should have done: an entity failed,
+a row handler's `OnBeforeAsync` skipped rows, or an erasure left rows deferred or blocked.
+`Error` then lists one line per cause, the same lines as the result's `EntityFailures`; rows
+left behind read `reason=rows-skipped;entityType=…;count=n` (`rows-missed`, `rows-blocked` for
+an erasure). A sweep's deferred and blocked rows don't count, since its next run retries
+them. `EntityFailures` is empty exactly when the run is `Succeeded`.
+
 - An erasure inside your own transaction commits nothing on its own: `Started`, its batches
   and its status commit or roll back with your transaction. See
   [Erasing inside your own transaction](/guides/erasure#erasing-inside-your-own-transaction).
@@ -26,8 +33,16 @@ Summary rows carry:
 - strategy
 - affected count
 - held count
-- skipped count
+- skipped count: rows left unchanged because a row handler's `OnBeforeAsync` failed
 - null-anchor count
+- retained count, erasure only: the subject's rows the rule keeps, younger than the legal
+  minimum or under an `Exempt` rule
+- deferred count, real runs only: rows still due when the run finished with the entity that
+  it neither changed nor skipped, such as rows another transaction had locked
+- blocked count: rows a database constraint stopped Cohort changing: rows a purge left
+  because a `RESTRICT` or `NO ACTION` foreign key still references them, and rows an
+  integrity constraint refused during the run. Their record IDs aren't recorded; a Warning
+  log names the refusing constraint
 - resolved period: whichever of the period and legal minimum set the cutoff (the legal
   minimum alone for an erasure, 0 and 0 when there is none), in two `integer` columns, `ResolvedMonths` and
   `ResolvedDays`. Years fold into months, so "7 years" is 84 months and 0 days.
@@ -112,6 +127,27 @@ SQL values and subject identifiers are kept out of it, but the deliberately iden
 exception under the same diagnostic ID, so you can still diagnose it from protected logs.
 
 The ledger grows forever unless you opt in to [history pruning](/guides/history-pruning).
+
+## Upgrading to 0.11.0
+
+::: warning Breaking change
+`sweep_run_entity_summary` gains three required `bigint` columns: `RetainedCount`,
+`DeferredCount` and `BlockedCount`. Add a migration: `dotnet ef migrations add` picks them up
+from your model, and readiness refuses to run until it's applied. EF scaffolds each as
+`AddColumn<long>(…, nullable: false, defaultValue: 0L)`, which fills existing summaries with 0;
+keep it as scaffolded.
+
+Apply the migration before starting 0.11.0, and don't mix versions across a rolling deploy:
+a summary a 0.10 host writes would record 0 for counts it never measured.
+
+A run whose row handlers skipped rows now settles `PartiallyFailed` instead of `Succeeded`,
+with a `rows-skipped` reason, so alerts on run status will see these runs.
+
+A row a database constraint refuses no longer fails its whole entity. It's counted in
+`BlockedCount`, the rest of the entity is swept, and a sweep whose only leftovers are
+blocked rows stays `Succeeded`. Alerts that watched for entity failures caused by foreign
+keys should watch `BlockedCount` instead.
+:::
 
 ## Upgrading to 0.10.0
 

@@ -46,7 +46,19 @@ public sealed class RetentionRuleProviderEndToEndTests(PostgresFixture fixture)
         result
             .Counts.Should()
             .Contain(
-                new EntitySweepCount(typeof(Note), "short-lived", tenantId, Strategy.Purge, 0)
+                new EntitySweepCount(
+                    typeof(Note),
+                    "short-lived",
+                    tenantId,
+                    Strategy.Purge,
+                    0,
+                    HeldCount: 0,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
+                )
             );
         result
             .Counts.Should()
@@ -56,7 +68,13 @@ public sealed class RetentionRuleProviderEndToEndTests(PostgresFixture fixture)
                     "soft-delete",
                     tenantId,
                     Strategy.SoftDelete,
-                    0
+                    0,
+                    HeldCount: 0,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
         result
@@ -67,7 +85,13 @@ public sealed class RetentionRuleProviderEndToEndTests(PostgresFixture fixture)
                     "anonymise",
                     tenantId,
                     Strategy.Anonymise,
-                    0
+                    0,
+                    HeldCount: 0,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
 

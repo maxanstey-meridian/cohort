@@ -8,6 +8,8 @@ using Cohort.Infrastructure.Holds;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 
+using Npgsql;
+
 namespace Cohort.Infrastructure.Sweep;
 
 // Raw SQL here interpolates only identifiers quoted from the EF model and validated store
@@ -19,10 +21,16 @@ namespace Cohort.Infrastructure.Sweep;
 /// are in play; the strategy says which of those it has not yet handled
 /// (<see cref="EligibilitySql"/>) and how it changes one (<see cref="CreateMutation"/>).
 /// Candidates are discovered, entity-locked and row-locked, then mutated in one statement,
-/// or row by row when handlers run or the new values depend on each row.
+/// or row by row when handlers run or the new values depend on each row. A row an
+/// integrity constraint refuses is blocked rather than failing its batch: the bulk statement
+/// is bisected under savepoints to find it, and on the row-by-row path each row's change
+/// has its own savepoint.
 /// </summary>
 internal abstract class SweepStrategy(DbContext db, IServiceProvider services, ILogger logger)
 {
+    private const string MutationSavepoint = "cohort_mutation";
+    private const string OnBeforeSavepoint = "cohort_on_before";
+
     private static readonly MethodInfo RowByRowMethod = typeof(SweepStrategy).GetMethod(
         nameof(ExecuteRowByRowAsync),
         BindingFlags.Instance | BindingFlags.NonPublic
@@ -54,16 +62,109 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
         var parameters = new SqlParams();
         var where = count switch
         {
-            SweepCount.Eligible => $"{ScopeSql(scope, parameters)} AND {HoldExclusion(scope, parameters)}",
+            SweepCount.Eligible => DueSql(scope, parameters),
             SweepCount.Held => $"{ScopeSql(scope, parameters)} AND NOT {HoldExclusion(scope, parameters)}",
             // No hold exclusion: a held NULL-anchor row is just as invisible to retention.
-            SweepCount.NullAnchor => ScopeSql(scope, parameters, nullAnchors: true),
+            SweepCount.NullAnchor => ScopeSql(scope, parameters, AnchorFilter.Null),
+            // No hold exclusion: the rule keeps the row whether or not it is also held.
+            SweepCount.RetainedByRule => ScopeSql(scope, parameters, AnchorFilter.OnOrAfterCutoff),
+            SweepCount.Blocked => null,
             _ => throw new ArgumentOutOfRangeException(nameof(count), count, null),
         };
+        return where is null
+            ? await CountBlockedAsync(scope, [], conn, ct)
+            : await CountWhereAsync(scope.Entry, where, parameters, conn, ct);
+    }
+
+    /// <summary>
+    /// Rows that would be due but for a blocking reference, leaving out
+    /// <paramref name="alreadyBlocked"/>: rows the run already counted as blocked when a
+    /// constraint refused them.
+    /// </summary>
+    public async Task<long> CountBlockedAsync(
+        SweepScope scope,
+        IReadOnlyCollection<string> alreadyBlocked,
+        DbConnection conn,
+        CancellationToken ct
+    )
+    {
+        EnsureHandles(scope);
+        if (scope.BlockingReferences.Count == 0)
+        {
+            return 0;
+        }
+
+        var parameters = new SqlParams();
+        return await CountWhereAsync(
+            scope.Entry,
+            $"{ScopeSql(scope, parameters)} AND {HoldExclusion(scope, parameters)} AND NOT ({ReferencingForeignKeySql.NotReferencedSql(scope)}){NotAnyRecordIdSql(scope.Entry, "alreadyBlockedIds", alreadyBlocked, parameters)}",
+            parameters,
+            conn,
+            ct
+        );
+    }
+
+    /// <summary>
+    /// Rows still due once run <paramref name="sweepId"/> has finished its batches for the
+    /// entity that the run did not record (as skipped by a failing OnBefore) or find
+    /// <paramref name="blocked"/>: locked by another transaction, not reached before the loop
+    /// stopped, or come into scope mid-run. Measured once after the loop rather than per
+    /// batch, because a row that stays locked is rediscovered by every batch. Referenced
+    /// rows aren't due, so blocked rows are never counted twice.
+    /// </summary>
+    public async Task<long> CountDeferredAsync(
+        SweepScope scope,
+        Guid sweepId,
+        IReadOnlyCollection<string> blocked,
+        DbConnection conn,
+        CancellationToken ct
+    )
+    {
+        EnsureHandles(scope);
+
+        var parameters = new SqlParams();
+        return await CountWhereAsync(
+            scope.Entry,
+            $"{DueSql(scope, parameters)}{NotRecordedByRunSql(scope, sweepId, parameters)}{NotAnyRecordIdSql(scope.Entry, "blockedRecordIds", blocked, parameters)}",
+            parameters,
+            conn,
+            ct
+        );
+    }
+
+    /// <summary>
+    /// Every row of the scope's subject in its tenant, with no cutoff, eligibility or hold
+    /// filter: what an Exempt rule keeps from an erasure. Static because Exempt has no
+    /// strategy instance.
+    /// </summary>
+    internal static async Task<long> CountSubjectRowsAsync(
+        SweepScope scope,
+        DbConnection conn,
+        CancellationToken ct
+    )
+    {
+        if (scope.Subject is null)
+        {
+            throw new ArgumentException("Only an erasure scope has subject rows.", nameof(scope));
+        }
+
+        var parameters = new SqlParams();
+        var clauses = SubjectAndTenantSql(scope, parameters);
+        return await CountWhereAsync(scope.Entry, string.Join(" AND ", clauses), parameters, conn, ct);
+    }
+
+    private static async Task<long> CountWhereAsync(
+        RetentionEntry entry,
+        string where,
+        SqlParams parameters,
+        DbConnection conn,
+        CancellationToken ct
+    )
+    {
         await using var command = parameters.CreateCommand(
             conn,
             null,
-            $"SELECT pg_catalog.count(*) FROM {PostgreSqlIdentifier.Format(scope.Entry.Table)} AS target WHERE {where}"
+            $"SELECT pg_catalog.count(*) FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target WHERE {where}"
         );
         return (long)(await command.ExecuteScalarAsync(ct))!;
     }
@@ -91,24 +192,16 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
             : RetentionHandlerSupport.ResolveHandlers(services, entry.EntityType);
         if (handlers.Count == 0 && !mutation.RowByRow)
         {
-            var parameters = new SqlParams { ["candidateIds"] = candidates.ToArray() };
-            mutation.AddParameters(parameters, null);
-            await using var command = parameters.CreateCommand(
-                conn,
-                transaction,
-                $"""
-                {mutation.HeadSql}
-                WHERE {ScopeSql(scope, parameters)}
-                  AND {RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "candidateIds")}
-                  AND {HoldExclusion(scope, parameters)}
-                RETURNING {RecordIdSql.TextExpression("target", entry.RecordId)}
-                """
-            );
-            var affected = await ReadRecordIdsAsync(command, ct);
+            var affected = new List<string>();
+            var blocked = new BlockedRows();
+            await MutateBisectingAsync(scope, mutation, conn, transaction, candidates, affected, blocked, ct);
+            LogBlocked(scope, execution, blocked);
             return new SweepExecutionResult(
                 affected,
-                candidates.Count - affected.Count,
-                CandidateCount: candidates.Count
+                candidates.Count - affected.Count - blocked.RecordIds.Count,
+                CandidateCount: candidates.Count,
+                BlockedRecordIds: blocked.RecordIds,
+                BlockFailure: blocked.FirstFailure
             );
         }
 
@@ -121,6 +214,66 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
                 this,
                 [scope, conn, transaction, candidates, mutation, handlers, execution, ct]
             )!;
+    }
+
+    /// <summary>
+    /// Changes <paramref name="recordIds"/> in one statement under a savepoint. When an
+    /// integrity constraint refuses it, the savepoint is rolled back and each half is tried
+    /// on its own, until the refused rows are found one by one: about 2k·log2(n/k)
+    /// statements for k refused rows, where a savepoint per row would cost n.
+    /// </summary>
+    private async Task MutateBisectingAsync(
+        SweepScope scope,
+        SweepMutation mutation,
+        DbConnection conn,
+        DbTransaction transaction,
+        IReadOnlyList<string> recordIds,
+        List<string> affected,
+        BlockedRows blocked,
+        CancellationToken ct
+    )
+    {
+        var entry = scope.Entry;
+        var parameters = new SqlParams { ["candidateIds"] = recordIds.ToArray() };
+        mutation.AddParameters(parameters, null);
+        await using var command = parameters.CreateCommand(
+            conn,
+            transaction,
+            $"""
+            {mutation.HeadSql}
+            WHERE {ScopeSql(scope, parameters)}
+              AND {RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "candidateIds")}
+              AND {HoldExclusion(scope, parameters)}
+            RETURNING {RecordIdSql.TextExpression("target", entry.RecordId)}
+            """
+        );
+
+        // Cohort's own savepoints ignore cancellation, like the entity savepoint: a cancelled
+        // ROLLBACK TO would leave the batch aborted with no way back.
+        await transaction.SaveAsync(MutationSavepoint, CancellationToken.None);
+        DbException refusal;
+        try
+        {
+            var changed = await ReadRecordIdsAsync(command, ct);
+            await transaction.ReleaseAsync(MutationSavepoint, CancellationToken.None);
+            affected.AddRange(changed);
+            return;
+        }
+        catch (DbException ex) when (IsIntegrityViolation(ex))
+        {
+            await transaction.RollbackAsync(MutationSavepoint, CancellationToken.None);
+            refusal = ex;
+        }
+
+        if (recordIds.Count == 1)
+        {
+            blocked.Add(recordIds[0], refusal);
+            return;
+        }
+
+        var half = recordIds.Count / 2;
+        await MutateBisectingAsync(scope, mutation, conn, transaction, recordIds.Take(half).ToArray(), affected, blocked, ct);
+        await MutateBisectingAsync(scope, mutation, conn, transaction, recordIds.Skip(half).ToArray(), affected, blocked, ct);
     }
 
     private async Task<SweepExecutionResult> ExecuteRowByRowAsync<TEntity>(
@@ -159,6 +312,7 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
 
         var affected = new List<string>();
         var skipped = new List<string>();
+        var blocked = new BlockedRows();
         var heldCount = candidates.Count - rows.Count;
         foreach (var row in rows)
         {
@@ -179,13 +333,7 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
                     scope.Tenant.Id,
                     execution.At
                 );
-                var result = await RetentionHandlerSupport.InvokeOnBeforeAsync(
-                    handlers,
-                    entry.EntityType,
-                    row,
-                    before,
-                    ct
-                );
+                var result = await InvokeOnBeforeReadOnlyAsync(conn, transaction, handlers, entry.EntityType, row, before, ct);
                 if (!result.Succeeded)
                 {
                     var skippedId = await RecordIdSql.CanonicalizeAsync(
@@ -228,8 +376,23 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
                 RETURNING {RecordIdSql.TextExpression("target", entry.RecordId)}
                 """
             );
+            await transaction.SaveAsync(MutationSavepoint, CancellationToken.None);
+            object? changed;
+            try
+            {
+                changed = await command.ExecuteScalarAsync(ct);
+                await transaction.ReleaseAsync(MutationSavepoint, CancellationToken.None);
+            }
+            catch (DbException ex) when (IsIntegrityViolation(ex))
+            {
+                // Refused by a constraint: nothing changed, so no OnAfter work is queued.
+                await transaction.RollbackAsync(MutationSavepoint, CancellationToken.None);
+                blocked.Add(await RecordIdSql.CanonicalizeAsync(conn, transaction, entry.RecordId, recordKey, ct), ex);
+                continue;
+            }
+
             // No row back: a hold landed after the row was loaded.
-            if (await command.ExecuteScalarAsync(ct) is not string recordId)
+            if (changed is not string recordId)
             {
                 heldCount++;
                 continue;
@@ -253,14 +416,91 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
             affected.Add(recordId);
         }
 
+        LogBlocked(scope, execution, blocked);
         return new SweepExecutionResult(
             affected,
             heldCount,
             RowDetailsPersisted: handlers.Count > 0,
             SkippedCount: skipped.Count,
             CandidateCount: candidates.Count,
-            SkippedRecordIds: skipped
+            SkippedRecordIds: skipped,
+            BlockedRecordIds: blocked.RecordIds,
+            BlockFailure: blocked.FirstFailure
         );
+    }
+
+    /// <summary>
+    /// Runs the OnBefore handlers inside a read-only savepoint that is always rolled back.
+    /// Handlers that inject the host's DbContext share the sweep's connection and
+    /// transaction: a database error in one leaves the transaction usable for the rest of
+    /// the batch, and a write fails (SQLSTATE 25006) instead of committing with it. Rolling
+    /// back also restores read-write mode and releases anything the handler locked.
+    /// </summary>
+    private static async Task<OnBeforeInvocationResult> InvokeOnBeforeReadOnlyAsync(
+        DbConnection conn,
+        DbTransaction transaction,
+        IReadOnlyList<ResolvedRetentionHandler> handlers,
+        Type entityType,
+        object row,
+        RetentionBeforeContext before,
+        CancellationToken ct
+    )
+    {
+        await transaction.SaveAsync(OnBeforeSavepoint, CancellationToken.None);
+        OnBeforeInvocationResult result;
+        try
+        {
+            await using (var readOnly = new SqlParams().CreateCommand(conn, transaction, "SET LOCAL transaction_read_only = on"))
+            {
+                await readOnly.ExecuteNonQueryAsync(ct);
+            }
+
+            result = await RetentionHandlerSupport.InvokeOnBeforeAsync(handlers, entityType, row, before, ct);
+        }
+        catch
+        {
+            // Cancelled, or Cohort's own statement failed: the batch is abandoned with the
+            // original exception, so a failed rollback mustn't replace it.
+            try
+            {
+                await transaction.RollbackAsync(OnBeforeSavepoint, CancellationToken.None);
+            }
+            catch (Exception)
+            {
+                // The batch transaction is discarded either way.
+            }
+
+            throw;
+        }
+
+        await transaction.RollbackAsync(OnBeforeSavepoint, CancellationToken.None);
+        return result;
+    }
+
+    private static bool IsIntegrityViolation(DbException exception) =>
+        exception.SqlState is { Length: 5 } sqlState && sqlState.StartsWith("23", StringComparison.Ordinal);
+
+    /// <summary>
+    /// One warning per refusing constraint, naming it and its SQLSTATE but no row: the
+    /// constraint is schema metadata, the record ids are not logged.
+    /// </summary>
+    private void LogBlocked(SweepScope scope, SweepMutationContext? execution, BlockedRows blocked)
+    {
+        foreach (var group in blocked.Failures.GroupBy(failure => (failure.SqlState, Constraint: (failure as PostgresException)?.ConstraintName)))
+        {
+            var first = group.First();
+            var diagnostic = RetentionFailureDiagnostic.Create(first);
+            logger.LogWarning(
+                first,
+                "Cohort run {SweepId} left {Count} row(s) of entity {EntityType} unchanged: constraint {ConstraintName} refused them (sqlstate {SqlState}). They count as blocked and are retried by the next run. Diagnostic {DiagnosticId}.",
+                execution?.SweepId,
+                group.Count(),
+                scope.Entry.EntityType.FullName,
+                group.Key.Constraint ?? "(unnamed)",
+                group.Key.SqlState,
+                diagnostic.DiagnosticIdText
+            );
+        }
     }
 
     /// <summary>
@@ -306,9 +546,8 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
                 $"""
                 SELECT {RecordIdSql.TextExpression("target", entry.RecordId)}
                 FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
-                WHERE {ScopeSql(scope, parameters)}
+                WHERE {DueSql(scope, parameters)}
                   AND {RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "candidateIds")}
-                  AND {HoldExclusion(scope, parameters)}
                 ORDER BY {OrderBySql(entry)}
                 FOR UPDATE{(scope.SkipLocked ? " SKIP LOCKED" : "")}
                 """
@@ -336,32 +575,15 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
     {
         var entry = scope.Entry;
         var parameters = new SqlParams();
-        var exclusions = "";
-        if (attempted.Count > 0)
-        {
-            parameters["attemptedRecordIds"] = attempted.ToArray();
-            exclusions += $"\n  AND NOT ({RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "attemptedRecordIds")})";
-        }
+        var exclusions = NotAnyRecordIdSql(
+            entry,
+            "attemptedRecordIds",
+            [.. attempted, .. execution?.ExcludedRecordIds ?? []],
+            parameters
+        );
         if (execution is not null)
         {
-            parameters["excludedSweepId"] = execution.SweepId;
-            parameters["excludedRetentionEntityId"] = entry.RetentionEntityId;
-            parameters["excludedCategory"] = entry.Category;
-            parameters["excludedStrategy"] = (int)HandlesStrategy;
-            parameters["excludedTenantId"] = scope.Tenant.Id;
-            exclusions += $"""
-
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {PostgreSqlIdentifier.Format(entry.CohortTables.SweepRunRowDetail)} AS prior_detail
-                      WHERE prior_detail."SweepId" = @excludedSweepId
-                        AND prior_detail."RetentionEntityId" = @excludedRetentionEntityId
-                        AND prior_detail."RecordId" = {RecordIdSql.TextExpression("target", entry.RecordId)}
-                        AND prior_detail."Category" = @excludedCategory
-                        AND prior_detail."Strategy" = @excludedStrategy
-                        AND prior_detail."TenantId" = @excludedTenantId
-                  )
-                """;
+            exclusions += NotRecordedByRunSql(scope, execution.SweepId, parameters);
         }
         if (limit is not null)
         {
@@ -374,8 +596,7 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
             $"""
             SELECT {RecordIdSql.TextExpression("target", entry.RecordId)}
             FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
-            WHERE {ScopeSql(scope, parameters)}{exclusions}
-              AND {HoldExclusion(scope, parameters)}
+            WHERE {DueSql(scope, parameters)}{exclusions}
             ORDER BY {OrderBySql(entry)}
             {(limit is null ? "" : "LIMIT @batchSize")}
             """
@@ -384,13 +605,100 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
     }
 
     /// <summary>
-    /// The scope's rows, restricted to the tenant and to rows this strategy has not handled.
-    /// With <paramref name="nullAnchors"/>, rows whose anchor is NULL replace the cutoff.
+    /// Rows the strategy may act on now: in scope, not actively held, and not referenced
+    /// through a blocking foreign key. Discovery, the row lock and the eligible and deferred
+    /// counts share it, so a row excluded from one is excluded from all.
     /// </summary>
-    private string ScopeSql(SweepScope scope, SqlParams parameters, bool nullAnchors = false)
+    private string DueSql(SweepScope scope, SqlParams parameters) =>
+        ReferencingForeignKeySql.NotReferencedSql(scope) is { Length: > 0 } notReferenced
+            ? $"{ScopeSql(scope, parameters)} AND {HoldExclusion(scope, parameters)} AND {notReferenced}"
+            : $"{ScopeSql(scope, parameters)} AND {HoldExclusion(scope, parameters)}";
+
+    /// <summary>Excludes <paramref name="recordIds"/>, or "" when there are none.</summary>
+    private static string NotAnyRecordIdSql(
+        RetentionEntry entry,
+        string parameterName,
+        IReadOnlyCollection<string> recordIds,
+        SqlParams parameters
+    )
+    {
+        if (recordIds.Count == 0)
+        {
+            return "";
+        }
+
+        parameters[parameterName] = recordIds.ToArray();
+        return $"\n  AND NOT ({RecordIdSql.EqualsAnyParameter("target", entry.RecordId, parameterName)})";
+    }
+
+    /// <summary>
+    /// Excludes rows run <paramref name="sweepId"/> already recorded for this entity, such as
+    /// rows a failing OnBefore skipped: they stay eligible, so reselecting them would re-fail
+    /// them forever, and counting them as deferred would count them twice.
+    /// </summary>
+    private string NotRecordedByRunSql(SweepScope scope, Guid sweepId, SqlParams parameters)
     {
         var entry = scope.Entry;
-        var anchor = $"target.{PostgreSqlIdentifier.Quote(entry.AnchorColumn)}";
+        parameters["excludedSweepId"] = sweepId;
+        parameters["excludedRetentionEntityId"] = entry.RetentionEntityId;
+        parameters["excludedCategory"] = entry.Category;
+        parameters["excludedStrategy"] = (int)HandlesStrategy;
+        parameters["excludedTenantId"] = scope.Tenant.Id;
+        return $"""
+
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {PostgreSqlIdentifier.Format(entry.CohortTables.SweepRunRowDetail)} AS prior_detail
+                  WHERE prior_detail."SweepId" = @excludedSweepId
+                    AND prior_detail."RetentionEntityId" = @excludedRetentionEntityId
+                    AND prior_detail."RecordId" = {RecordIdSql.TextExpression("target", entry.RecordId)}
+                    AND prior_detail."Category" = @excludedCategory
+                    AND prior_detail."Strategy" = @excludedStrategy
+                    AND prior_detail."TenantId" = @excludedTenantId
+              )
+            """;
+    }
+
+    /// <summary>
+    /// The scope's rows, restricted to the tenant and to rows this strategy has not handled.
+    /// <paramref name="anchor"/> picks which side of the cutoff the anchor must fall:
+    /// before it (the rows retention acts on), NULL (rows no cutoff ever matches), or on or
+    /// after it (rows the rule keeps; none without a cutoff).
+    /// </summary>
+    private string ScopeSql(SweepScope scope, SqlParams parameters, AnchorFilter anchor = AnchorFilter.BeforeCutoff)
+    {
+        var entry = scope.Entry;
+        var anchorColumn = $"target.{PostgreSqlIdentifier.Quote(entry.AnchorColumn)}";
+        var clauses = SubjectAndTenantSql(scope, parameters);
+        switch (anchor)
+        {
+            case AnchorFilter.Null:
+                clauses.Add($"{anchorColumn} IS NULL");
+                break;
+            case AnchorFilter.BeforeCutoff when scope.Cutoff is { } cutoff:
+                parameters["cutoff"] = cutoff;
+                clauses.Add($"{anchorColumn} < @cutoff");
+                break;
+            case AnchorFilter.OnOrAfterCutoff when scope.Cutoff is { } cutoff:
+                parameters["cutoff"] = cutoff;
+                clauses.Add($"{anchorColumn} >= @cutoff");
+                break;
+            case AnchorFilter.OnOrAfterCutoff:
+                clauses.Add("FALSE");
+                break;
+        }
+        if (EligibilitySql(entry) is { Length: > 0 } eligibility)
+        {
+            clauses.Add(eligibility);
+        }
+
+        return clauses.Count == 0 ? "TRUE" : string.Join(" AND ", clauses);
+    }
+
+    /// <summary>The scope's subject (for an erasure) and tenant clauses.</summary>
+    private static List<string> SubjectAndTenantSql(SweepScope scope, SqlParams parameters)
+    {
+        var entry = scope.Entry;
         var clauses = new List<string>();
         if (scope.Subject is { } subject)
         {
@@ -402,26 +710,13 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
             }
             clauses.Add($"({string.Join(" OR ", matches)})");
         }
-        if (nullAnchors)
-        {
-            clauses.Add($"{anchor} IS NULL");
-        }
-        else if (scope.Cutoff is { } cutoff)
-        {
-            parameters["cutoff"] = cutoff;
-            clauses.Add($"{anchor} < @cutoff");
-        }
         if (entry.Tenant is { } tenant)
         {
             parameters["tenantId"] = scope.Tenant.Id;
             clauses.Add($"target.{PostgreSqlIdentifier.Quote(tenant.TenantColumn)} = @tenantId");
         }
-        if (EligibilitySql(entry) is { Length: > 0 } eligibility)
-        {
-            clauses.Add(eligibility);
-        }
 
-        return clauses.Count == 0 ? "TRUE" : string.Join(" AND ", clauses);
+        return clauses;
     }
 
     private static string HoldExclusion(SweepScope scope, SqlParams parameters)
@@ -467,6 +762,33 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
 
         return recordIds;
     }
+}
+
+/// <summary>Rows one batch found blocked, with the refusals that blocked them.</summary>
+internal sealed class BlockedRows
+{
+    private readonly List<string> recordIds = [];
+    private readonly List<DbException> failures = [];
+
+    public IReadOnlyList<string> RecordIds => recordIds;
+
+    public IReadOnlyList<DbException> Failures => failures;
+
+    public DbException? FirstFailure => failures.Count == 0 ? null : failures[0];
+
+    public void Add(string recordId, DbException failure)
+    {
+        recordIds.Add(recordId);
+        failures.Add(failure);
+    }
+}
+
+/// <summary>Which side of the cutoff a scope's anchor must fall; see <c>ScopeSql</c>.</summary>
+internal enum AnchorFilter
+{
+    BeforeCutoff,
+    Null,
+    OnOrAfterCutoff,
 }
 
 /// <summary>

@@ -84,7 +84,12 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
                     Guid.Empty,
                     Strategy.Anonymise,
                     1,
-                    HeldCount: 1
+                    HeldCount: 1,
+                    SkippedCount: 0,
+                    NullAnchorCount: 0,
+                    RetainedCount: 0,
+                    DeferredCount: 0,
+                    BlockedCount: 0
                 )
             );
 

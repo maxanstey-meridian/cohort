@@ -23,10 +23,14 @@ expressed in SQL.
    The cutoff is the start of the day `Period` or `LegalMin` (whichever reaches further back)
    before today, counted in calendar years, months and days in the host's `TimeZone`.
 4. **Batch.** Candidate rows past the cutoff, in the tenant and not held, are selected with
-   `FOR UPDATE SKIP LOCKED` in batches of `SweepBatchSize`. Each batch runs any `OnBeforeAsync`
-   handlers, mutates, writes its audit rows and queues handler work, then **commits on its
-   own**. A large backlog never sits in one unbounded transaction, and a failure loses only
-   the current batch.
+   `FOR UPDATE SKIP LOCKED` in batches of `SweepBatchSize` (an erasure waits for locked rows
+   instead). A purge also leaves out rows still referenced through a `RESTRICT` or
+   `NO ACTION` foreign key, read from `pg_catalog`. Each batch runs any `OnBeforeAsync`
+   handlers, each in a read-only savepoint that is always rolled back, mutates, writes its
+   audit rows and queues handler work, then **commits on its own**. A large backlog never
+   sits in one unbounded transaction, and a failure loses only the current batch. A batch
+   checks its constraints immediately, so a deferred constraint fails at its statement, not
+   at `COMMIT`.
 5. **Settle.** A terminal event sets `Status` to `Succeeded`, `PartiallyFailed`, `Failed` or
    `Cancelled` and records `SettledAt`.
 
@@ -37,9 +41,29 @@ Along the way:
 - Rows skipped by a failing `OnBeforeAsync` are excluded from the run's remaining batches.
   They're dead-lettered once and left for the next run, so a failing row can't spin the batch
   loop or block the eligible rows behind it. A batch that makes no progress at all stops the
-  loop for that entity.
-- `HeldCount` is measured directly, by counting rows past the cutoff with an active hold. It
-  isn't inferred from candidate arithmetic.
+  loop for that entity. Skipped rows make the run `PartiallyFailed`, with a `rows-skipped`
+  reason in `Error` and `EntityFailures`.
+- A row an integrity constraint refuses (any SQLSTATE class 23 error: a foreign key, a check,
+  a unique index, a constraint trigger) is blocked, not fatal. The batch's statement is
+  bisected under savepoints until the refused rows are found, or on the row-by-row path each
+  row's change has its own savepoint. The rest of the batch commits, blocked rows are left out
+  of the run's remaining batches, and a Warning names the constraint (never the row). A full
+  batch in which every row is refused fails the entity instead, since the cause is then the
+  rule or the schema.
+- `HeldCount` and `BlockedCount` are measured directly: rows past the cutoff with an active
+  hold, and rows still referenced through a blocking foreign key, plus the rows a constraint
+  refused during the run. Neither is inferred from candidate arithmetic. A sweep's blocked
+  rows leave it `Succeeded`, like held rows, and the next run tries them again; an erasure
+  with blocked rows settles `PartiallyFailed` with a `rows-blocked` reason.
+- Once an entity's batches are done, the rows still due that the run neither changed nor
+  skipped are counted once, in `DeferredCount`: rows another transaction had locked (a sweep
+  skips them), rows the loop stopped before reaching, and rows that came into scope
+  mid-run. A sweep's next run retires them, so they leave it `Succeeded`; an erasure that
+  missed rows settles `PartiallyFailed` with a `rows-missed` reason.
+- An erasure also reports what its rule keeps in `RetainedCount` (rows younger than the
+  legal minimum, or every row under an `Exempt` rule), and `ErasureResult.Complete` says
+  whether anything of the subject was left. See
+  [What still blocks erasure](/guides/erasure#what-still-blocks-erasure).
 
 ## Crash recovery
 

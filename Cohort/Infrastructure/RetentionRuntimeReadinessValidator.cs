@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 
 using Cohort.Application;
+using Cohort.Domain;
 using Cohort.Infrastructure.Holds;
 
 using Microsoft.EntityFrameworkCore;
@@ -15,10 +16,14 @@ internal sealed class RetentionRuntimeReadinessValidator(
     CohortSchemaValidator schemaValidator,
     RetentionRegistry registry,
     RetentionRuntimeReadinessState state,
-    IServiceScopeFactory scopeFactory
+    IServiceScopeFactory scopeFactory,
+    IEnumerable<IAnonymiseValueFactory> anonymiseValueFactories
 )
 {
-    internal IReadOnlyDictionary<string, Cohort.Domain.RetentionCategoryCapabilities>
+    // pg_input_is_valid, which the anonymise-target check relies on, arrived in PostgreSQL 16.
+    private const int MinimumServerVersionNum = 160000;
+
+    internal IReadOnlyDictionary<string, RetentionCategoryCapabilities>
         ValidatedCapabilities => startupValidator.ValidatedCapabilities;
 
     public async Task ValidateAsync(CancellationToken ct = default)
@@ -38,9 +43,11 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 return;
             }
 
+            await ValidateServerVersionAsync(ct);
             await startupValidator.ValidateAsync(ct);
             await schemaValidator.ValidateAsync(ct);
             await ValidateRecordIdColumnTypesAsync(ct);
+            await ValidateAnonymiseTargetsAsync(ct);
             // The hold check runs on its own connection, outside the caller's transaction, so its
             // success stands whatever transaction the caller is in; cache it apart from the checks
             // that read through the caller's connection.
@@ -147,6 +154,248 @@ internal sealed class RetentionRuntimeReadinessValidator(
             if (errors.Count != 0)
             {
                 throw new RetentionConfigurationException([.. errors]);
+            }
+        }
+        finally
+        {
+            await db.Database.CloseConnectionAsync();
+        }
+    }
+
+    /// <summary>
+    /// The startup check knows only an anonymise target's CLR type; the column decides what the
+    /// UPDATE can write. Ask the catalog, which sees domains, column types declared without a
+    /// length and migration drift, for each target column's facts, and test each literal with
+    /// the column type's own input function (typmod included) so that a literal the column can't
+    /// take fails here instead of on every run.
+    /// </summary>
+    private async Task ValidateAnonymiseTargetsAsync(CancellationToken ct)
+    {
+        var targets = registry
+            .Scan()
+            .Values.Where(entry =>
+                ValidatedCapabilities.TryGetValue(entry.Category, out var capabilities)
+                && capabilities.Strategies.Contains(Strategy.Anonymise)
+            )
+            .SelectMany(entry => entry.AnonymiseFields.Select(field => (Entry: entry, Field: field)))
+            .ToArray();
+        if (targets.Length == 0)
+        {
+            return;
+        }
+
+        await db.Database.OpenConnectionAsync(ct);
+        try
+        {
+            await using var command = new SqlParams
+            {
+                ["schemas"] = targets.Select(target => target.Entry.Table.Schema).ToArray(),
+                ["tables"] = targets.Select(target => target.Entry.Table.Name).ToArray(),
+                ["columns"] = targets.Select(target => target.Field.ColumnName).ToArray(),
+                ["record_id_columns"] = targets
+                    .Select(target => target.Entry.RecordId.RecordIdColumn)
+                    .ToArray(),
+                ["probes"] = targets.Select(target => ProbeValue(target.Entry, target.Field)).ToArray(),
+            }.CreateCommand(
+                db.Database.GetDbConnection(),
+                db.Database.CurrentTransaction?.GetDbTransaction(),
+                """
+                SELECT requested.ordinal,
+                       pg_catalog.format_type(attribute.atttypid, attribute.atttypmod),
+                       attribute.attnotnull OR pgtype.typnotnull,
+                       CASE WHEN requested.probe IS NULL THEN NULL
+                            ELSE pg_catalog.pg_input_is_valid(
+                                requested.probe,
+                                pg_catalog.format_type(attribute.atttypid, attribute.atttypmod)
+                            )
+                       END,
+                       EXISTS (
+                           SELECT 1 FROM pg_catalog.pg_index unique_index
+                           WHERE unique_index.indrelid = relation.oid
+                             AND unique_index.indisunique
+                             AND unique_index.indpred IS NULL
+                             AND unique_index.indexprs IS NULL
+                             AND attribute.attnum = ANY(unique_index.indkey)
+                             AND NOT (record_id.attnum = ANY(unique_index.indkey))
+                       ),
+                       EXISTS (
+                           SELECT 1 FROM pg_catalog.pg_index unique_index
+                           WHERE unique_index.indrelid = relation.oid
+                             AND unique_index.indisunique
+                             AND unique_index.indnullsnotdistinct
+                             AND unique_index.indpred IS NULL
+                             AND unique_index.indexprs IS NULL
+                             AND attribute.attnum = ANY(unique_index.indkey)
+                             AND NOT (record_id.attnum = ANY(unique_index.indkey))
+                       ),
+                       EXISTS (
+                           SELECT 1 FROM pg_catalog.pg_constraint foreign_key
+                           WHERE foreign_key.contype = 'f'
+                             AND foreign_key.conrelid = relation.oid
+                             AND attribute.attnum = ANY(foreign_key.conkey)
+                       ),
+                       EXISTS (
+                           SELECT 1 FROM pg_catalog.pg_constraint foreign_key
+                           WHERE foreign_key.contype = 'f'
+                             AND foreign_key.confrelid = relation.oid
+                             AND attribute.attnum = ANY(foreign_key.confkey)
+                       )
+                FROM ROWS FROM (
+                    pg_catalog.unnest(@schemas),
+                    pg_catalog.unnest(@tables),
+                    pg_catalog.unnest(@columns),
+                    pg_catalog.unnest(@record_id_columns),
+                    pg_catalog.unnest(@probes)
+                ) WITH ORDINALITY AS requested(schema_name, table_name, column_name, record_id_column, probe, ordinal)
+                JOIN pg_catalog.pg_namespace namespace ON namespace.nspname = requested.schema_name
+                JOIN pg_catalog.pg_class relation
+                  ON relation.relnamespace = namespace.oid AND relation.relname = requested.table_name
+                JOIN pg_catalog.pg_attribute attribute
+                  ON attribute.attrelid = relation.oid
+                 AND attribute.attname = requested.column_name
+                 AND attribute.attnum > 0
+                 AND NOT attribute.attisdropped
+                JOIN pg_catalog.pg_type pgtype ON pgtype.oid = attribute.atttypid
+                JOIN pg_catalog.pg_attribute record_id
+                  ON record_id.attrelid = relation.oid
+                 AND record_id.attname = requested.record_id_column
+                 AND record_id.attnum > 0
+                 AND NOT record_id.attisdropped
+                """
+            );
+
+            var errors = new SortedSet<string>(StringComparer.Ordinal);
+            await using (var reader = await command.ExecuteReaderAsync(ct))
+            {
+                while (await reader.ReadAsync(ct))
+                {
+                    var (entry, field) = targets[(int)reader.GetInt64(0) - 1];
+                    var columnType = reader.GetString(1);
+                    var notNull = reader.GetBoolean(2);
+                    var probeValid = reader.IsDBNull(3) || reader.GetBoolean(3);
+                    var unfilteredUnique = reader.GetBoolean(4);
+                    var nullsNotDistinctUnique = reader.GetBoolean(5);
+                    var foreignKeyChild = reader.GetBoolean(6);
+                    var referencedKey = reader.GetBoolean(7);
+
+                    var method = field is AnonymiseLiteralField literal ? literal.Method : (AnonymiseMethod?)null;
+                    var writesOneValue =
+                        method is AnonymiseMethod.FixedLiteral or AnonymiseMethod.EmptyString
+                        || field is AnonymiseFactoryField factoryField && IsStaticFactory(factoryField);
+                    var target =
+                        $"Anonymise convention on {entry.EntityType.FullName}: {(field is AnonymiseFactoryField ? "[AnonymiseWith]" : "[Anonymise]")} member {field.MemberName} writes column {PostgreSqlIdentifier.Format(entry.Table)}.{PostgreSqlIdentifier.Quote(field.ColumnName)}";
+
+                    if (!probeValid)
+                    {
+                        var value = method is AnonymiseMethod.EmptyString
+                            ? "the empty string"
+                            : $"the literal '{((AnonymiseLiteralField)field).Literal}'";
+                        errors.Add(
+                            $"{target}, but {value} is not valid for its column type {columnType} (too long, the wrong shape, or refused by a domain check), so every anonymise of these rows would fail. Change the literal or the column."
+                        );
+                    }
+
+                    if (method is AnonymiseMethod.Null && notNull)
+                    {
+                        errors.Add(
+                            $"{target}, which uses Null but the column is NOT NULL in the database, so every anonymise of these rows would fail. Make the column nullable or choose another method."
+                        );
+                    }
+
+                    if (
+                        (writesOneValue && unfilteredUnique)
+                        || (method is AnonymiseMethod.Null && nullsNotDistinctUnique)
+                    )
+                    {
+                        errors.Add(
+                            $"{target}, which a unique index covers without the record id or a filter, but every anonymised row would get the same value, so the second row anonymised would fail. Filter the index on the anonymised-at column (WHERE \"{entry.AnonymisedAt?.AnonymisedAtColumn ?? "AnonymisedAt"}\" IS NULL), include the record id in it, or use a per-row [AnonymiseWith] factory."
+                        );
+                    }
+
+                    if ((method is AnonymiseMethod.FixedLiteral or AnonymiseMethod.EmptyString) && foreignKeyChild)
+                    {
+                        errors.Add(
+                            $"{target}, which is a foreign key column, and a literal can't satisfy the foreign key. Use Null or a factory that returns a key that exists."
+                        );
+                    }
+
+                    if (referencedKey)
+                    {
+                        errors.Add(
+                            $"{target}, which is referenced by a foreign key, so anonymising it would be refused while a row references it or would silently rewrite the referencing rows (ON UPDATE CASCADE or SET NULL). Anonymise the referencing rows instead, or stop referencing this column."
+                        );
+                    }
+                }
+            }
+
+            if (errors.Count != 0)
+            {
+                throw new RetentionConfigurationException([.. errors]);
+            }
+        }
+        finally
+        {
+            await db.Database.CloseConnectionAsync();
+        }
+    }
+
+    /// <summary>
+    /// The text the column's input function must accept: the literal as the UPDATE sends it,
+    /// after the property's value converter. Null, factories and a literal whose provider value
+    /// isn't text have no probe; their structural checks still run.
+    /// </summary>
+    private string? ProbeValue(RetentionEntry entry, AnonymiseField field)
+    {
+        if (field is not AnonymiseLiteralField literal)
+        {
+            return null;
+        }
+
+        string? value = literal.Method switch
+        {
+            AnonymiseMethod.EmptyString => string.Empty,
+            AnonymiseMethod.FixedLiteral => literal.Literal,
+            _ => null,
+        };
+        if (value is null)
+        {
+            return null;
+        }
+
+        var converter = db
+            .Model.FindEntityType(entry.EntityType)
+            ?.FindProperty(field.MemberName)
+            ?.GetTypeMapping()
+            .Converter;
+        return (converter?.ConvertToProvider(value) ?? value) as string;
+    }
+
+    private bool IsStaticFactory(AnonymiseFactoryField field) =>
+        anonymiseValueFactories.FirstOrDefault(factory => factory.GetType() == field.FactoryType)
+            ?.ExecutionMode
+        is AnonymiseFactoryExecutionMode.Static;
+
+    /// <summary>
+    /// Cohort's catalog checks call <c>pg_input_is_valid</c>, which PostgreSQL 16 added, so
+    /// refuse an older server before any of them runs.
+    /// </summary>
+    private async Task ValidateServerVersionAsync(CancellationToken ct)
+    {
+        await db.Database.OpenConnectionAsync(ct);
+        try
+        {
+            await using var command = new SqlParams().CreateCommand(
+                db.Database.GetDbConnection(),
+                db.Database.CurrentTransaction?.GetDbTransaction(),
+                "SELECT pg_catalog.current_setting('server_version_num')::integer, pg_catalog.current_setting('server_version')"
+            );
+            await using var reader = await command.ExecuteReaderAsync(ct);
+            await reader.ReadAsync(ct);
+            if (reader.GetInt32(0) < MinimumServerVersionNum)
+            {
+                throw new RetentionConfigurationException([
+                    $"Cohort requires PostgreSQL 16 or later; the database server is PostgreSQL {reader.GetString(1)}.",
+                ]);
             }
         }
         finally

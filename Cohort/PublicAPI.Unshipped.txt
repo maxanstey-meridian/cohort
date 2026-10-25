@@ -104,3 +104,22 @@ Cohort.Application.RetentionPreviewRequest.At.get -> System.DateTimeOffset?
 static Cohort.Application.RetentionPreviewRequest.Tenanted(Cohort.Domain.TenantContext! tenant, System.DateTimeOffset? at = null) -> Cohort.Application.RetentionPreviewRequest!
 *REMOVED*static Cohort.Application.RetentionPreviewRequest.Tenantless(System.DateTimeOffset at) -> Cohort.Application.RetentionPreviewRequest!
 static Cohort.Application.RetentionPreviewRequest.Tenantless(System.DateTimeOffset? at = null) -> Cohort.Application.RetentionPreviewRequest!
+*REMOVED*Cohort.Application.SweepEvent.EntityProgress.EntityProgress(System.Guid SweepId, System.DateTimeOffset At, System.Type! EntityType, System.Guid RetentionEntityId, string! Category, System.Guid TenantId, Cohort.Domain.Strategy Strategy, Cohort.Domain.RetentionPeriod! ResolvedPeriod, long Affected, long SkippedCount, Cohort.Domain.RetentionRuleProvenance? Provenance = null) -> void
+*REMOVED*Cohort.Application.SweepEvent.EntitySummary.EntitySummary(System.Guid SweepId, System.DateTimeOffset At, System.Type! EntityType, System.Guid RetentionEntityId, string! Category, System.Guid TenantId, Cohort.Domain.Strategy Strategy, Cohort.Domain.RetentionPeriod! ResolvedPeriod, long Affected, long HeldCount, long SkippedCount = 0, long NullAnchorCount = 0, Cohort.Domain.RetentionRuleProvenance? Provenance = null) -> void
+*REMOVED*Cohort.Domain.EntitySweepCount.Deconstruct(out System.Type! EntityType, out string! Category, out System.Guid TenantId, out Cohort.Domain.Strategy Strategy, out long Affected, out long HeldCount, out long SkippedCount, out long NullAnchorCount) -> void
+*REMOVED*Cohort.Domain.EntitySweepCount.EntitySweepCount(System.Type! EntityType, string! Category, System.Guid TenantId, Cohort.Domain.Strategy Strategy, long Affected, long HeldCount = 0, long SkippedCount = 0, long NullAnchorCount = 0) -> void
+Cohort.Application.SweepEvent.EntityProgress.BlockedCount.get -> long
+Cohort.Application.SweepEvent.EntityProgress.EntityProgress(System.Guid SweepId, System.DateTimeOffset At, System.Type! EntityType, System.Guid RetentionEntityId, string! Category, System.Guid TenantId, Cohort.Domain.Strategy Strategy, Cohort.Domain.RetentionPeriod! ResolvedPeriod, long Affected, long SkippedCount, long BlockedCount, Cohort.Domain.RetentionRuleProvenance? Provenance = null) -> void
+Cohort.Application.SweepEvent.EntitySummary.BlockedCount.get -> long
+Cohort.Application.SweepEvent.EntitySummary.DeferredCount.get -> long
+Cohort.Application.SweepEvent.EntitySummary.EntitySummary(System.Guid SweepId, System.DateTimeOffset At, System.Type! EntityType, System.Guid RetentionEntityId, string! Category, System.Guid TenantId, Cohort.Domain.Strategy Strategy, Cohort.Domain.RetentionPeriod! ResolvedPeriod, long Affected, long HeldCount, long SkippedCount, long NullAnchorCount, long RetainedCount, long DeferredCount, long BlockedCount, Cohort.Domain.RetentionRuleProvenance? Provenance = null) -> void
+Cohort.Application.SweepEvent.EntitySummary.RetainedCount.get -> long
+Cohort.Domain.EntitySweepCount.BlockedCount.get -> long
+Cohort.Domain.EntitySweepCount.BlockedCount.init -> void
+Cohort.Domain.EntitySweepCount.Deconstruct(out System.Type! EntityType, out string! Category, out System.Guid TenantId, out Cohort.Domain.Strategy Strategy, out long Affected, out long HeldCount, out long SkippedCount, out long NullAnchorCount, out long RetainedCount, out long DeferredCount, out long BlockedCount) -> void
+Cohort.Domain.EntitySweepCount.DeferredCount.get -> long
+Cohort.Domain.EntitySweepCount.DeferredCount.init -> void
+Cohort.Domain.EntitySweepCount.EntitySweepCount(System.Type! EntityType, string! Category, System.Guid TenantId, Cohort.Domain.Strategy Strategy, long Affected, long HeldCount, long SkippedCount, long NullAnchorCount, long RetainedCount, long DeferredCount, long BlockedCount) -> void
+Cohort.Domain.EntitySweepCount.RetainedCount.get -> long
+Cohort.Domain.EntitySweepCount.RetainedCount.init -> void
+Cohort.Domain.ErasureResult.Complete.get -> bool

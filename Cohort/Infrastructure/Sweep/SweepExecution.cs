@@ -6,7 +6,9 @@ internal sealed record SweepExecutionResult(
     bool RowDetailsPersisted = false,
     int SkippedCount = 0,
     int CandidateCount = 0,
-    IReadOnlyList<string>? SkippedRecordIds = null
+    IReadOnlyList<string>? SkippedRecordIds = null,
+    IReadOnlyList<string>? BlockedRecordIds = null,
+    Exception? BlockFailure = null
 )
 {
     /// <summary>
@@ -16,12 +18,24 @@ internal sealed record SweepExecutionResult(
     /// re-insert its audit row detail under the same sweep id.
     /// </summary>
     public IReadOnlyList<string> SkippedRecordIds { get; init; } = SkippedRecordIds ?? [];
+
+    /// <summary>
+    /// Record ids an integrity constraint (SQLSTATE class 23) refused to let the strategy
+    /// change; <see cref="BlockFailure"/> is the first refusal. Not persisted: the engine
+    /// counts them and excludes them from later batches of the same run.
+    /// </summary>
+    public IReadOnlyList<string> BlockedRecordIds { get; init; } = BlockedRecordIds ?? [];
 }
 
+/// <summary>
+/// One batch of a real run. <c>ExcludedRecordIds</c> are rows earlier batches of the run
+/// found blocked, left out of discovery so they aren't tried again in the same run.
+/// </summary>
 internal sealed record SweepMutationContext(
     Guid SweepId,
     DateTimeOffset At,
-    int? BatchSize = null
+    int? BatchSize = null,
+    IReadOnlyCollection<string>? ExcludedRecordIds = null
 );
 
 internal sealed record ErasureSubjectPredicate

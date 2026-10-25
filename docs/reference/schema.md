@@ -175,4 +175,7 @@ registers, and when two EF models share one set of Cohort tables.
   `ConfigureCohortTables(schema)`.
 - Hosts with row-level security: let tenant scopes read `NULL`-tenant holds, as the
   [example policies](#row-level-security) do.
+- Add a migration: `sweep_run_entity_summary` gains `RetainedCount`, `DeferredCount` and
+  `BlockedCount` (`bigint NOT NULL`). Readiness refuses to run until it's applied. See
+  [Audit Trail](/guides/audit-trail#upgrading-to-0-11-0).
 :::

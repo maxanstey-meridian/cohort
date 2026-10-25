@@ -520,6 +520,12 @@ namespace Cohort.Sample.Migrations
                     b.Property<DateTimeOffset>("At")
                         .HasColumnType("timestamp with time zone");
 
+                    b.Property<long>("BlockedCount")
+                        .HasColumnType("bigint");
+
+                    b.Property<long>("DeferredCount")
+                        .HasColumnType("bigint");
+
                     b.Property<string>("EntityType")
                         .IsRequired()
                         .HasColumnType("text");
@@ -535,6 +541,9 @@ namespace Cohort.Sample.Migrations
 
                     b.Property<int>("ResolvedMonths")
                         .HasColumnType("integer");
+
+                    b.Property<long>("RetainedCount")
+                        .HasColumnType("bigint");
 
                     b.Property<string>("RuleReason")
                         .HasColumnType("text");

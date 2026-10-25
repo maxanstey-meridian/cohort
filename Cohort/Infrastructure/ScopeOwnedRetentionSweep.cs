@@ -7,19 +7,19 @@ namespace Cohort.Infrastructure;
 
 internal sealed class ScopeOwnedRetentionSweep(IServiceScopeFactory scopeFactory) : IRetentionSweep
 {
-    public async Task<RetentionSweepResult> ExecuteAsync(
+    public Task<RetentionSweepResult> ExecuteAsync(
         RetentionSweepRequest request,
         CancellationToken ct = default
     )
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        await using var scope = await scopeFactory.CreateEnteredScopeAsync(
+        return scopeFactory.RunInScopeAsync(
             RetentionExecutionScopes.For(request.RunTenant),
+            services => services
+                .GetRequiredService<RetentionSweepEngine>()
+                .RunAsync(request.RunTenant, request.At, request.Trigger, SweepEntityScopes.For(request.RunTenant), request.DryRun, ct),
             ct
         );
-        return await scope.ServiceProvider
-            .GetRequiredService<RetentionSweepEngine>()
-            .RunAsync(request.RunTenant, request.At, request.Trigger, SweepEntityScopes.For(request.RunTenant), request.DryRun, ct);
     }
 }

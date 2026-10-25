@@ -4,7 +4,7 @@
 Cohort.Application.IRetentionHoldsRepository.HasActiveHoldAsync(System.Guid retentionEntityId, string! recordId, System.Guid? tenantId, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task<bool>!
 Cohort.Application.IRetentionHoldsRepository.ListActiveAsync(System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task<System.Collections.Generic.IReadOnlyList<Cohort.Domain.RetentionHold!>!>!
 Cohort.Application.IRetentionExecutionScope
-Cohort.Application.IRetentionExecutionScope.EnterAsync(Cohort.Application.RetentionExecutionContext! context, System.Threading.CancellationToken ct) -> System.Threading.Tasks.ValueTask
+Cohort.Application.IRetentionExecutionScope.RunAsync(Cohort.Application.RetentionExecutionContext! context, System.Func<System.Threading.Tasks.Task!>! work, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task!
 Cohort.Application.RetentionExecutionContext
 Cohort.Application.RetentionExecutionContext.RetentionExecutionContext(Cohort.Application.RetentionExecutionContext! original) -> void
 Cohort.Application.RetentionExecutionContext.System

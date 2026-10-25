@@ -215,9 +215,9 @@ public static class ServiceCollectionExtensions
 
     private sealed class MissingRetentionExecutionScope : IRetentionExecutionScope
     {
-        public ValueTask EnterAsync(RetentionExecutionContext context, CancellationToken ct) =>
+        public Task RunAsync(RetentionExecutionContext context, Func<Task> work, CancellationToken ct) =>
             throw new RetentionConfigurationException([
-                "No IRetentionExecutionScope has been registered. Cohort tells it whose work each scope it creates is doing, so a host's tenant isolation covers Cohort's own work. "
+                "No IRetentionExecutionScope has been registered. Cohort runs each scope's work through it and says whose work it is, so a host's tenant isolation covers Cohort's own work. "
                     + "Register your host's hook with services.AddScoped<IRetentionExecutionScope, YourExecutionScope>(), "
                     + "or, for a host without tenant isolation, services.AddSingleton(RetentionExecutionScope.Unisolated).",
             ]);

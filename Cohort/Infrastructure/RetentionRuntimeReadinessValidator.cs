@@ -169,12 +169,28 @@ internal sealed class RetentionRuntimeReadinessValidator(
         var registered = registry.Scan().Values.Select(entry => entry.RetentionEntityId).ToArray();
         var holds = PostgreSqlIdentifier.Format(CohortStoreTables.FromModel(db.Model).RetentionHolds);
 
-        await using var scope = await scopeFactory.CreateEnteredScopeAsync(
+        var callerDatabase = await ReadServerDatabaseIdentityAsync(db, holds, ct);
+        await scopeFactory.RunInScopeAsync(
             new RetentionExecutionContext.System(RetentionSystemWork.Readiness),
+            services => ValidateStoredEntityIdentitiesAsync(
+                services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext),
+                registered,
+                holds,
+                callerDatabase,
+                ct
+            ),
             ct
         );
-        var systemDb = scope.ServiceProvider.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext);
-        var callerDatabase = await ReadServerDatabaseIdentityAsync(db, holds, ct);
+    }
+
+    private async Task ValidateStoredEntityIdentitiesAsync(
+        DbContext systemDb,
+        Guid[] registered,
+        string holds,
+        ServerDatabaseIdentity callerDatabase,
+        CancellationToken ct
+    )
+    {
         await systemDb.Database.OpenConnectionAsync(ct);
         try
         {

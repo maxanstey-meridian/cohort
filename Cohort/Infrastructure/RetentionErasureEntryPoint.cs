@@ -7,10 +7,10 @@ namespace Cohort.Infrastructure;
 
 /// <summary>
 /// The scoped <see cref="IRetentionErasureService"/>. An <see cref="ErasureTransaction.Owned"/>
-/// erasure runs in a fresh scope it creates and enters, as the sweep and preview ports do, so
-/// it never shares the caller's DbContext. A <see cref="ErasureTransaction.Caller"/> erasure
-/// runs on this scope's DbContext and joins its open transaction; the host already entered
-/// that scope, so the execution-scope hook isn't called.
+/// erasure runs in a fresh scope it creates, through the host's execution-scope hook, as the
+/// sweep and preview ports do, so it never shares the caller's DbContext. A
+/// <see cref="ErasureTransaction.Caller"/> erasure runs on this scope's DbContext and joins its
+/// open transaction; the host already set that scope up, so the hook isn't called.
 /// </summary>
 internal sealed class RetentionErasureEntryPoint(
     IServiceScopeFactory scopeFactory,
@@ -32,12 +32,10 @@ internal sealed class RetentionErasureEntryPoint(
                 .ExecuteAsync(request, ct);
         }
 
-        await using var executionScope = await scopeFactory.CreateEnteredScopeAsync(
+        return await scopeFactory.RunInScopeAsync(
             RetentionExecutionScopes.For(request.RunTenant),
+            services => services.GetRequiredService<RetentionErasureService>().ExecuteAsync(request, ct),
             ct
         );
-        return await executionScope.ServiceProvider
-            .GetRequiredService<RetentionErasureService>()
-            .ExecuteAsync(request, ct);
     }
 }

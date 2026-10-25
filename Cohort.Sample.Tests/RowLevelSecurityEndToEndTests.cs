@@ -748,24 +748,24 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
     /// <summary>The host's hook: tells its DbContext whose work the scope does.</summary>
     private sealed class RecordingExecutionScope(RlsDbContext db, EntryLog entries) : IRetentionExecutionScope
     {
-        public ValueTask EnterAsync(RetentionExecutionContext context, CancellationToken ct)
+        public Task RunAsync(RetentionExecutionContext context, Func<Task> work, CancellationToken ct)
         {
             db.Access = context;
             entries.Add(context);
-            return ValueTask.CompletedTask;
+            return work();
         }
     }
 
     private sealed class WrongTenantExecutionScope(RlsDbContext db, EntryLog entries, Guid wrongTenant)
         : IRetentionExecutionScope
     {
-        public ValueTask EnterAsync(RetentionExecutionContext context, CancellationToken ct)
+        public Task RunAsync(RetentionExecutionContext context, Func<Task> work, CancellationToken ct)
         {
             entries.Add(context);
             db.Access = context is RetentionExecutionContext.Tenant
                 ? new RetentionExecutionContext.Tenant(wrongTenant)
                 : context;
-            return ValueTask.CompletedTask;
+            return work();
         }
     }
 

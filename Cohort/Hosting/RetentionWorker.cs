@@ -142,19 +142,26 @@ internal sealed class RetentionWorker(
         return false;
     }
 
-    internal async Task RunIterationAsync(
+    // The iteration scope coordinates across tenants: the worker lock, the occurrence ledger
+    // and the tenant source. Each pass runs in its own scope, as its tenant, inside this work.
+    internal Task RunIterationAsync(
+        DateTimeOffset occurrence,
+        bool dryRun,
+        CancellationToken ct
+    ) =>
+        scopeFactory.RunInScopeAsync(
+            new RetentionExecutionContext.System(RetentionSystemWork.WorkerCoordination),
+            services => RunIterationAsync(services, occurrence, dryRun, ct),
+            ct
+        );
+
+    private async Task RunIterationAsync(
+        IServiceProvider services,
         DateTimeOffset occurrence,
         bool dryRun,
         CancellationToken ct
     )
     {
-        // The iteration scope coordinates across tenants: the worker lock, the occurrence
-        // ledger and the tenant source. Each pass gets its own scope, entered as its tenant.
-        await using var scope = await scopeFactory.CreateEnteredScopeAsync(
-            new RetentionExecutionContext.System(RetentionSystemWork.WorkerCoordination),
-            ct
-        );
-        var services = scope.ServiceProvider;
         await services
             .GetRequiredService<RetentionRuntimeReadinessValidator>()
             .ValidateAsync(ct);
@@ -415,16 +422,16 @@ internal sealed class RetentionWorker(
         CancellationToken ct
     )
     {
-        await using var passScope = await scopeFactory.CreateEnteredScopeAsync(
+        return await scopeFactory.RunInScopeAsync(
             RetentionExecutionScopes.For(tenant),
-            ct
-        );
-        return await passScope.ServiceProvider.GetRequiredService<RetentionSweepEngine>().RunAsync(
-            tenant,
-            null,
-            SweepTriggerKind.Scheduled,
-            scope,
-            dryRun,
+            services => services.GetRequiredService<RetentionSweepEngine>().RunAsync(
+                tenant,
+                null,
+                SweepTriggerKind.Scheduled,
+                scope,
+                dryRun,
+                ct
+            ),
             ct
         );
     }

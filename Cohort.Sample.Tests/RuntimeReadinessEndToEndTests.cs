@@ -463,24 +463,24 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
 
         public IReadOnlyCollection<RetentionExecutionContext> Entered => entered;
 
-        public ValueTask EnterAsync(RetentionExecutionContext context, CancellationToken ct)
+        public Task RunAsync(RetentionExecutionContext context, Func<Task> work, CancellationToken ct)
         {
             entered.Enqueue(context);
-            return ValueTask.CompletedTask;
+            return work();
         }
     }
 
     private sealed class SystemWorkRoutingScope(DatabaseRoute route, string systemConnectionString)
         : IRetentionExecutionScope
     {
-        public ValueTask EnterAsync(RetentionExecutionContext context, CancellationToken ct)
+        public Task RunAsync(RetentionExecutionContext context, Func<Task> work, CancellationToken ct)
         {
             if (context is RetentionExecutionContext.System)
             {
                 route.ConnectionString = systemConnectionString;
             }
 
-            return ValueTask.CompletedTask;
+            return work();
         }
     }
 

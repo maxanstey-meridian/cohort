@@ -156,6 +156,62 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task The_Hosts_Execution_Scope_Wraps_Cohorts_Work_So_Its_Async_Flow_Reaches_It()
+    {
+        // A host sets its tenant (or a Sluice flow) in an AsyncLocal around the work; host code
+        // Cohort calls during that work, here the rule provider, must see it.
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        var rules = new FlowRecordingRuleProvider(
+            new SingleCategoryRepository("caller-erasure", new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge))
+        );
+        await using var provider = BuildFlowProvider(database.ConnectionString, rules, new FlowingExecutionScope());
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        await SeedCallerErasureRecordAsync(provider, tenant.Id, subject);
+
+        await provider.GetRequiredService<IRetentionSweep>().ExecuteAsync(RetentionSweepRequest.Tenanted(tenant));
+        await using (var scope = provider.CreateAsyncScope())
+        {
+            await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(tenant, new ErasureScope("user", subject))
+            );
+        }
+
+        rules.Seen.Should().HaveCountGreaterThanOrEqualTo(2)
+            .And.OnlyContain(context => context == new RetentionExecutionContext.Tenant(tenant.Id));
+        FlowingExecutionScope.Current.Value.Should().BeNull();
+    }
+
+    [Theory]
+    [InlineData(HookFault.Skips, "*returned without running*")]
+    [InlineData(HookFault.RunsTwice, "*more than once*")]
+    [InlineData(HookFault.DoesNotAwait, "*returned before*finished*")]
+    [InlineData(HookFault.SwallowsFailure, "*rule store down*")]
+    public async Task Cohort_Refuses_An_Execution_Scope_That_Does_Not_Await_Its_Work_Exactly_Once(
+        HookFault fault,
+        string message
+    )
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        var rules = new FlowRecordingRuleProvider(
+            new SingleCategoryRepository("caller-erasure", new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)),
+            failWith: fault == HookFault.SwallowsFailure ? "rule store down" : null
+        );
+        await using var provider = BuildFlowProvider(database.ConnectionString, rules, new FaultyExecutionScope(fault));
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        await SeedCallerErasureRecordAsync(provider, tenant.Id, Guid.NewGuid());
+
+        var sweep = () => provider.GetRequiredService<IRetentionSweep>().ExecuteAsync(RetentionSweepRequest.Tenanted(tenant));
+
+        await sweep.Should().ThrowAsync<Exception>().WithMessage(message);
+        await using var scope = provider.CreateAsyncScope();
+        var runs = await scope.ServiceProvider.GetRequiredService<CallerErasureDbContext>().Database
+            .SqlQueryRaw<int>("SELECT count(*)::int AS \"Value\" FROM \"sweep_run\"")
+            .SingleAsync();
+        runs.Should().Be(fault is HookFault.Skips or HookFault.SwallowsFailure ? 0 : 1);
+    }
+
+    [Fact]
     public async Task Caller_Erasure_Refuses_A_Context_Built_Outside_The_Container()
     {
         await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
@@ -199,6 +255,118 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
         builder.Services.AddSingleton(RetentionExecutionScope.Unisolated);
         builder.Services.AddCohort<TContext>();
         return builder.Build();
+    }
+
+    private static ServiceProvider BuildFlowProvider(
+        string connectionString,
+        IRetentionRuleProvider rules,
+        IRetentionExecutionScope executionScope
+    )
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
+        services.AddSingleton(rules);
+        services.AddSingleton(executionScope);
+        services.AddCohort<CallerErasureDbContext>();
+        services.AddDbContext<CallerErasureDbContext>(options => options.UseNpgsql(connectionString));
+        return services.BuildServiceProvider(validateScopes: true);
+    }
+
+    private static async Task SeedCallerErasureRecordAsync(IServiceProvider provider, Guid tenantId, Guid subject)
+    {
+        await using var scope = provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<CallerErasureDbContext>();
+        await db.Database.EnsureCreatedAsync();
+        db.Records.Add(new CallerErasureRecord { Id = Guid.NewGuid(), TenantId = tenantId, SubjectId = subject, CreatedAt = DateTimeOffset.UtcNow.AddDays(-1) });
+        await db.SaveChangesAsync();
+    }
+
+    /// <summary>A host that keeps whose work this is in an AsyncLocal, set around the work.</summary>
+    private sealed class FlowingExecutionScope : IRetentionExecutionScope
+    {
+        public static readonly AsyncLocal<RetentionExecutionContext?> Current = new();
+
+        public async Task RunAsync(RetentionExecutionContext context, Func<Task> work, CancellationToken ct)
+        {
+            var outer = Current.Value;
+            Current.Value = context;
+            try
+            {
+                await work();
+            }
+            finally
+            {
+                Current.Value = outer;
+            }
+        }
+    }
+
+    public enum HookFault
+    {
+        Skips,
+        RunsTwice,
+        DoesNotAwait,
+        SwallowsFailure,
+    }
+
+    /// <summary>A hook that gets tenant work wrong in one way and runs system work properly.</summary>
+    private sealed class FaultyExecutionScope(HookFault fault) : IRetentionExecutionScope
+    {
+        public async Task RunAsync(RetentionExecutionContext context, Func<Task> work, CancellationToken ct)
+        {
+            if (context is not RetentionExecutionContext.Tenant)
+            {
+                await work();
+                return;
+            }
+
+            switch (fault)
+            {
+                case HookFault.Skips:
+                    return;
+                case HookFault.RunsTwice:
+                    await work();
+                    try
+                    {
+                        await work();
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        // Swallows Cohort's refusal of the second run.
+                    }
+
+                    return;
+                case HookFault.DoesNotAwait:
+                    _ = work();
+                    return;
+                case HookFault.SwallowsFailure:
+                    try
+                    {
+                        await work();
+                    }
+                    catch (Exception)
+                    {
+                        // Logs and carries on, as a careless hook might.
+                    }
+
+                    return;
+            }
+        }
+    }
+
+    private sealed class FlowRecordingRuleProvider(SingleCategoryRepository inner, string? failWith = null)
+        : ITestRetentionRuleProvider
+    {
+        private readonly System.Collections.Concurrent.ConcurrentQueue<RetentionExecutionContext?> seen = new();
+
+        public IReadOnlyList<RetentionExecutionContext?> Seen => [.. seen];
+
+        public Task<ITestRetentionRule?> GetAsync(string requestedCategory, CancellationToken ct)
+        {
+            seen.Enqueue(FlowingExecutionScope.Current.Value);
+            return failWith is null ? inner.GetAsync(requestedCategory, ct) : throw new InvalidOperationException(failWith);
+        }
     }
 
     private sealed class SingleCategoryRepository(string category, RetentionRule rule)

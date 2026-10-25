@@ -507,60 +507,63 @@ internal sealed class RetentionRowDispatcher(
         {
             // Each delivery runs as the row's tenant, so host handler code never runs under a
             // system scope against tenanted rows.
-            await using var scope = await scopeFactory.CreateEnteredScopeAsync(
+            recordOutcome = await scopeFactory.RunInScopeAsync<Func<Task>>(
                 RetentionExecutionScopes.ForTenant(claimed.TenantId),
+                async services =>
+                {
+                    var entityType = ResolveEntityType(
+                        claimed,
+                        services.GetRequiredService<RetentionRegistry>()
+                    );
+                    var handlers = RetentionHandlerSupport.ResolveHandlers(services, entityType);
+                    var claimedIdentity = RetentionTypeIdentity.Normalize(claimed.HandlerType);
+                    // Identity first; type-name fallback so rows queued before a handler gained
+                    // an explicit identity still resolve.
+                    var handler =
+                        handlers.FirstOrDefault(candidate =>
+                            string.Equals(candidate.HandlerIdentity, claimedIdentity, StringComparison.Ordinal)
+                        )
+                        ?? handlers.FirstOrDefault(candidate =>
+                            string.Equals(candidate.HandlerTypeName, claimedIdentity, StringComparison.Ordinal)
+                        );
+                    if (handler is null)
+                    {
+                        // Retrying cannot heal an unregistered identity: the handler was renamed
+                        // without an explicit identity, or removed.
+                        return async () =>
+                        {
+                            await MarkDeadLetteredAsync(
+                                claimed,
+                                "The queued retention row handler is not registered. If it was renamed, register it with an explicit identity so queued work survives renames.",
+                                ct
+                            );
+                            await ClearSettledPayloadAsync(claimed.RowDetailId);
+                        };
+                    }
+                    else
+                    {
+                        var snapshot = RetentionSnapshotSerializer.Deserialize(
+                            claimed.CapturedPayload,
+                            entityType,
+                            handlers.Select(resolved => resolved.Instance.GetType().Assembly)
+                        );
+                        await InvokeOnAfterAsync(entityType, handler.Instance, claimed, snapshot, handlerCts.Token);
+                        return async () =>
+                        {
+                            await SettleAsync(
+                                claimed,
+                                """
+                                "State" = {0}, "CompletedAt" = {1}, "ClaimedAt" = NULL, "ClaimToken" = NULL, "LastError" = NULL
+                                """,
+                                [Succeeded, DateTimeOffset.UtcNow],
+                                CancellationToken.None
+                            );
+                            await ClearSettledPayloadAsync(claimed.RowDetailId);
+                        };
+                    }
+                },
                 handlerCts.Token
             );
-            var entityType = ResolveEntityType(
-                claimed,
-                scope.ServiceProvider.GetRequiredService<RetentionRegistry>()
-            );
-            var handlers = RetentionHandlerSupport.ResolveHandlers(scope.ServiceProvider, entityType);
-            var claimedIdentity = RetentionTypeIdentity.Normalize(claimed.HandlerType);
-            // Identity first; type-name fallback so rows queued before a handler gained
-            // an explicit identity still resolve.
-            var handler =
-                handlers.FirstOrDefault(candidate =>
-                    string.Equals(candidate.HandlerIdentity, claimedIdentity, StringComparison.Ordinal)
-                )
-                ?? handlers.FirstOrDefault(candidate =>
-                    string.Equals(candidate.HandlerTypeName, claimedIdentity, StringComparison.Ordinal)
-                );
-            if (handler is null)
-            {
-                // Retrying cannot heal an unregistered identity: the handler was renamed
-                // without an explicit identity, or removed.
-                recordOutcome = async () =>
-                {
-                    await MarkDeadLetteredAsync(
-                        claimed,
-                        "The queued retention row handler is not registered. If it was renamed, register it with an explicit identity so queued work survives renames.",
-                        ct
-                    );
-                    await ClearSettledPayloadAsync(claimed.RowDetailId);
-                };
-            }
-            else
-            {
-                var snapshot = RetentionSnapshotSerializer.Deserialize(
-                    claimed.CapturedPayload,
-                    entityType,
-                    handlers.Select(resolved => resolved.Instance.GetType().Assembly)
-                );
-                await InvokeOnAfterAsync(entityType, handler.Instance, claimed, snapshot, handlerCts.Token);
-                recordOutcome = async () =>
-                {
-                    await SettleAsync(
-                        claimed,
-                        """
-                        "State" = {0}, "CompletedAt" = {1}, "ClaimedAt" = NULL, "ClaimToken" = NULL, "LastError" = NULL
-                        """,
-                        [Succeeded, DateTimeOffset.UtcNow],
-                        CancellationToken.None
-                    );
-                    await ClearSettledPayloadAsync(claimed.RowDetailId);
-                };
-            }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -753,21 +756,25 @@ internal sealed class RetentionRowDispatcher(
     }
 
     // Once per poll or flush, not per statement: the result is cached after the first pass.
-    private async Task ValidateReadinessAsync(CancellationToken ct)
-    {
-        await using var scope = await scopeFactory.CreateEnteredScopeAsync(RowDispatch, ct);
-        await scope.ServiceProvider.GetRequiredService<RetentionRuntimeReadinessValidator>().ValidateAsync(ct);
-    }
+    private Task ValidateReadinessAsync(CancellationToken ct) =>
+        scopeFactory.RunInScopeAsync(
+            RowDispatch,
+            services => services.GetRequiredService<RetentionRuntimeReadinessValidator>().ValidateAsync(ct),
+            ct
+        );
 
-    private async Task<TResult> WithDbAsync<TResult>(
+    private Task<TResult> WithDbAsync<TResult>(
         Func<DbContext, Task<TResult>> action,
         CancellationToken ct
     )
     {
         ct.ThrowIfCancellationRequested();
         // Claims, settlement, recovery and scrubbing span every tenant's queued work.
-        await using var scope = await scopeFactory.CreateEnteredScopeAsync(RowDispatch, ct);
-        return await action(scope.ServiceProvider.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext));
+        return scopeFactory.RunInScopeAsync(
+            RowDispatch,
+            services => action(services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext)),
+            ct
+        );
     }
 
     private Task WithDbAsync(Func<DbContext, Task> action, CancellationToken ct) =>

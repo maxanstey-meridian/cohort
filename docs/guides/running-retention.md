@@ -67,7 +67,7 @@ have open on it. See
 - Decorators can wrap these services, for metrics or an approval gate. Sweep and preview
   decorators can be singletons. An erasure decorator is scoped, because the service it wraps
   is.
-- Each fresh scope is entered through your `IRetentionExecutionScope` as the request's tenant
+- Each fresh scope runs its work through your `IRetentionExecutionScope` as the request's tenant
   (`System(TenantlessPass)` for tenantless rows and requests) before it touches the database.
   See [Tenant Isolation](/guides/tenant-isolation).
 - Caller times (`now`, `createdAt`, `expiresAt`, `removedAt`, ...) can carry any offset.
@@ -150,7 +150,7 @@ Both are read live from configuration, so flipping them doesn't need a restart.
 ## Upgrading to 0.11.0
 
 ::: warning Breaking change
-0.11.0 takes "today" from the database clock and enters every scope it creates through a hook
+0.11.0 takes "today" from the database clock and runs every scope it creates through a hook
 you register.
 
 - `SweepAsync(tenant, now)` becomes `SweepAsync(tenant)`.

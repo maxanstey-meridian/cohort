@@ -8,18 +8,17 @@ namespace Cohort.Infrastructure;
 internal sealed class ScopeOwnedRetentionPreview(IServiceScopeFactory scopeFactory)
     : IRetentionPreview
 {
-    public async Task<RetentionSweepResult> ExecuteAsync(
+    public Task<RetentionSweepResult> ExecuteAsync(
         RetentionPreviewRequest request,
         CancellationToken ct = default
     )
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        await using var scope = await scopeFactory.CreateEnteredScopeAsync(
+        return scopeFactory.RunInScopeAsync(
             RetentionExecutionScopes.For(request.RunTenant),
+            services => services.GetRequiredService<RetentionPreviewService>().ExecuteAsync(request, ct),
             ct
         );
-        var preview = scope.ServiceProvider.GetRequiredService<RetentionPreviewService>();
-        return await preview.ExecuteAsync(request, ct);
     }
 }

@@ -86,7 +86,7 @@ public abstract record RetentionErasureRequest
     /// Erases the subject from <see cref="RetentionTenantlessAttribute"/> entities, which no
     /// tenant owns. A tenanted request never reaches them. Always
     /// <see cref="ErasureTransaction.Owned"/>: tenantless rows are erased under Cohort's own
-    /// <c>System(TenantlessPass)</c> execution scope, never under one the caller entered.
+    /// <c>System(TenantlessPass)</c> execution scope, never under one the caller set up.
     /// </summary>
     public static RetentionErasureRequest Tenantless(ErasureScope scope, DateTimeOffset? at = null) =>
         new TenantlessRequest(scope, at);

@@ -91,10 +91,11 @@ internal sealed class RetentionHistoryPruner(
             return new RetentionHistoryPruneResult(0, 0);
         }
 
-        await using (var scope = await scopeFactory.CreateEnteredScopeAsync(HistoryPruning, ct))
-        {
-            await scope.ServiceProvider.GetRequiredService<RetentionRuntimeReadinessValidator>().ValidateAsync(ct);
-        }
+        await scopeFactory.RunInScopeAsync(
+            HistoryPruning,
+            services => services.GetRequiredService<RetentionRuntimeReadinessValidator>().ValidateAsync(ct),
+            ct
+        );
 
         var now = DateTimeOffset.UtcNow;
         var succeededCutoff = Cutoff(now, pruning.SucceededRunRetention);
@@ -144,14 +145,29 @@ internal sealed class RetentionHistoryPruner(
     /// row details (handler statuses cascade), entity summaries and the runs themselves in one
     /// transaction.
     /// </summary>
-    private async Task<int> PruneRunBatchAsync(
+    private Task<int> PruneRunBatchAsync(
+        DateTimeOffset? succeededCutoff,
+        DateTimeOffset? failedCutoff,
+        CancellationToken ct
+    ) =>
+        scopeFactory.RunInScopeAsync(
+            HistoryPruning,
+            services => PruneRunBatchAsync(
+                services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext),
+                succeededCutoff,
+                failedCutoff,
+                ct
+            ),
+            ct
+        );
+
+    private static async Task<int> PruneRunBatchAsync(
+        DbContext db,
         DateTimeOffset? succeededCutoff,
         DateTimeOffset? failedCutoff,
         CancellationToken ct
     )
     {
-        await using var scope = await scopeFactory.CreateEnteredScopeAsync(HistoryPruning, ct);
-        var db = scope.ServiceProvider.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext);
         var tables = new QuotedTables(CohortStoreTables.FromModel(db.Model));
         object[] parameters =
         [
@@ -246,10 +262,19 @@ internal sealed class RetentionHistoryPruner(
     /// before the cutoff. The eligibility test reads only the hold's own columns, so the
     /// lock re-evaluates it against the latest committed version of each claimed row.
     /// </summary>
-    private async Task<int> PruneHoldBatchAsync(DateTimeOffset cutoff, CancellationToken ct)
+    private Task<int> PruneHoldBatchAsync(DateTimeOffset cutoff, CancellationToken ct) =>
+        scopeFactory.RunInScopeAsync(
+            HistoryPruning,
+            services => PruneHoldBatchAsync(
+                services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext),
+                cutoff,
+                ct
+            ),
+            ct
+        );
+
+    private static async Task<int> PruneHoldBatchAsync(DbContext db, DateTimeOffset cutoff, CancellationToken ct)
     {
-        await using var scope = await scopeFactory.CreateEnteredScopeAsync(HistoryPruning, ct);
-        var db = scope.ServiceProvider.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext);
         var holds = PostgreSqlIdentifier.Format(CohortStoreTables.FromModel(db.Model).RetentionHolds);
         return await db.Database.ExecuteSqlRawAsync(
             $$"""

@@ -8,10 +8,12 @@ Cohort tells the host whose work it is doing, and closes paths where rows were d
 unprotected without an error.
 
 - Hosts register an `IRetentionExecutionScope`; startup refuses a host without one. Cohort
-  calls it with `Tenant(id)` or a named `System(work)` before any database work in every scope
-  it creates, so a host's row-level security covers sweeps, previews, erasures, row-handler
-  delivery, pruning and readiness. Each scheduled worker pass runs in its own scope, entered as
-  its tenant. Hosts without isolation register `RetentionExecutionScope.Unisolated`. Apply
+  runs every scope's work through its `RunAsync(context, work, ct)`, with `Tenant(id)` or a
+  named `System(work)`, so a host's row-level security covers sweeps, previews, erasures,
+  row-handler delivery, pruning and readiness. Whatever the host sets around the work (its
+  tenant, an `AsyncLocal` such as a Sluice flow) encloses all of it; a hook that skips the work,
+  runs it twice or doesn't await it is refused, and a failure it swallows is rethrown. Each scheduled worker pass runs in its own scope, as its
+  tenant. Hosts without isolation register `RetentionExecutionScope.Unisolated`. Apply
   isolation when a connection opens: Cohort runs some statements outside EF's command pipeline.
 - `schema.md` documents Cohort's tenant columns and sentinels (`Guid.Empty` runs, `NULL`
   holds) as a schema contract for host row-level-security policies. Tenant scopes must be

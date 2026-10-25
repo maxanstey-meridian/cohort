@@ -27,9 +27,13 @@ silent run as the table owner. See [Startup Validation](/reference/startup-valid
 
 ## What Cohort tells you
 
-Cohort resolves your hook from every scope it creates and calls `EnterAsync` once, before
-anything in that scope touches the database. The context is either one tenant's work or a
-named kind of system work:
+Cohort resolves your hook from every scope it creates and calls `RunAsync` once, with all of
+that scope's work: nothing in the scope touches the database until you run it. Set up the
+scope, then await the work exactly once. Whatever you put around the call encloses everything
+Cohort does in the scope, including an `AsyncLocal` value or a `using` block (a Sluice flow,
+say). Cohort refuses a hook that returns without running the work, runs it twice, or returns
+before it finishes, and rethrows a failure of the work the hook swallowed. The context is
+either one tenant's work or a named kind of system work:
 
 ```csharp
 RetentionExecutionContext.Tenant(Guid TenantId)
@@ -39,7 +43,7 @@ RetentionExecutionContext.System(RetentionSystemWork Work)
 | Where | Context |
 |---|---|
 | `IRetentionSweep`, `IRetentionPreview` | `Tenant` for a tenanted request, `System(TenantlessPass)` for a tenantless one |
-| `IRetentionErasureService` | `Tenant` for a tenanted request, `System(TenantlessPass)` for a tenantless one. Not called for `ErasureTransaction.Caller`: that erasure runs in your scope, which you already entered |
+| `IRetentionErasureService` | `Tenant` for a tenanted request, `System(TenantlessPass)` for a tenantless one. Not called for `ErasureTransaction.Caller`: that erasure runs in your scope, which you already set up |
 | Scheduled worker iteration: its lock, occurrence ledger and tenant source | `System(WorkerCoordination)` |
 | Each scheduled pass, in its own scope | `Tenant`, or `System(TenantlessPass)` for the tenantless pass |
 | Row-handler dispatch: claim, settle, recovery and payload scrub | `System(RowDispatch)` |
@@ -72,11 +76,14 @@ tenant".
 
 ## Rules Cohort keeps
 
-- **One context per scope.** Cohort enters each scope exactly once and never changes it.
-  Different work gets a new scope.
+- **One context per scope.** Cohort runs each scope's work once and never changes its
+  context. Different work gets a new scope.
+- **Calls nest.** Each scheduled pass runs inside the worker's `WorkerCoordination` work, and
+  readiness's `System(Readiness)` check can run inside any operation's work. Restore whatever
+  you set when the work returns, as a `using` block or `try`/`finally` does.
 - **Tenanted work only runs as `Tenant`.** `OnBeforeAsync` runs inside its tenant's sweep
-  scope. Each `OnAfterAsync` delivery gets its own scope, entered as the row's tenant before
-  the handler is resolved. No host code runs under `System` against tenanted rows. Handlers
+  scope. Each `OnAfterAsync` delivery gets its own scope, run as the row's tenant, and the
+  handler is resolved inside that work. No host code runs under `System` against tenanted rows. Handlers
   for tenantless entities run under `System(TenantlessPass)`, against rows no tenant owns.
 - **Savepoints sit inside your isolation.** Cohort only creates savepoints after its
   transactions start, so a setting you apply when the connection opens or the transaction
@@ -94,10 +101,10 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
 
 public sealed class AppExecutionScope(AppDbContext db) : IRetentionExecutionScope
 {
-    public ValueTask EnterAsync(RetentionExecutionContext context, CancellationToken ct)
+    public Task RunAsync(RetentionExecutionContext context, Func<Task> work, CancellationToken ct)
     {
         db.RowSecurity = context;
-        return ValueTask.CompletedTask;
+        return work();
     }
 }
 ```

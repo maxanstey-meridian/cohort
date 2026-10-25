@@ -122,8 +122,8 @@ public sealed class ArchitectureBoundaryTests
             .Check(Architecture);
     }
 
-    // Every DI scope Cohort creates must be entered through the host's IRetentionExecutionScope
-    // before it touches the database, or the host's tenant isolation silently misses that work.
+    // Every DI scope Cohort creates must run its work through the host's IRetentionExecutionScope,
+    // or the host's tenant isolation silently misses that work.
     [Fact]
     public void Only_The_Execution_Scope_Helper_Creates_Di_Scopes()
     {

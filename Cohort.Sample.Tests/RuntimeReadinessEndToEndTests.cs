@@ -329,18 +329,26 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         await InvokePreviewAsync(provider);
     }
 
-    // A host name becomes its IPv4 address and a loopback address becomes "localhost"; any
-    // other address keeps its spelling, and the ApplicationName still makes the strings differ.
+    // The same server under another name: a host name becomes one of its addresses, a loopback
+    // address becomes "localhost", and any other address its reverse-DNS name.
     private static string AlternateSpelling(string host)
     {
-        if (System.Net.IPAddress.TryParse(host, out var address))
+        var alternate = System.Net.IPAddress.TryParse(host, out var address)
+            ? System.Net.IPAddress.IsLoopback(address)
+                ? "localhost"
+                : System.Net.Dns.GetHostEntry(address).HostName
+            : System.Net.Dns.GetHostAddresses(host)
+                .OrderBy(candidate => candidate.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+                .FirstOrDefault()
+                ?.ToString();
+        if (alternate is null || string.Equals(alternate, host, StringComparison.OrdinalIgnoreCase))
         {
-            return System.Net.IPAddress.IsLoopback(address) ? "localhost" : host;
+            throw new InvalidOperationException(
+                $"Test needs a second spelling of the database host '{host}' and found none."
+            );
         }
 
-        return System.Net.Dns.GetHostAddresses(host)
-            .First(candidate => candidate.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-            .ToString();
+        return alternate.Contains(':') ? $"[{alternate}]" : alternate;
     }
 
     [Fact]

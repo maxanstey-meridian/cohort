@@ -2241,7 +2241,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task A_Failed_Commit_Check_Keeps_The_Callers_Commit_And_Still_Tells_Observers(bool synchronousCommit)
+    public async Task A_Commit_Cohort_Cannot_Confirm_Afterwards_Keeps_The_Callers_Commit_And_Tells_No_Observer(bool synchronousCommit)
     {
         var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
         var subject = Guid.NewGuid();
@@ -2255,9 +2255,8 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                 .AddSingleton<ILoggerProvider>(logs)
         );
 
-        // The caller switches, for the rest of its transaction, to a role that can't read
-        // sweep_run, so Cohort's pre-commit check fails with 42501. Unguarded, that error
-        // would abort the transaction and turn the COMMIT into a silent rollback.
+        // The caller switches its session, past the commit, to a role that can't read
+        // sweep_run, so Cohort's post-commit check fails with 42501.
         var role = $"cohort_no_read_{Guid.NewGuid():N}";
         await ExecuteOnOwnConnectionAsync($"CREATE ROLE {role}");
         try
@@ -2272,7 +2271,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller)
                 );
 
-                var setRole = "SET LOCAL ROLE " + role;
+                var setRole = "SET SESSION ROLE " + role;
                 await db.Database.ExecuteSqlRawAsync(setRole);
                 if (synchronousCommit)
                 {
@@ -2283,6 +2282,8 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                     await transaction.CommitAsync();
                 }
 
+                // The role outlives the commit on this physical connection; keep it out of the pool.
+                NpgsqlConnection.ClearPool((NpgsqlConnection)db.Database.GetDbConnection());
                 return erased;
             });
 
@@ -2293,9 +2294,9 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             }
 
             (await LoadRunStatusAsync(result.SweepId)).Should().Be(SweepRunStatus.Succeeded);
-            // The check couldn't answer, so the committed run's events are still delivered.
-            observer.Events.Should().StartWith(observer.Events.OfType<SweepEvent.Started>().Single())
-                .And.EndWith(observer.Events.OfType<SweepEvent.Completed>().Single());
+            // The run committed, but Cohort couldn't confirm it, so observers hear nothing:
+            // a missed event is within best effort, a reported one that didn't happen isn't.
+            observer.Events.Should().BeEmpty();
             logs.Entries.Should().ContainSingle(entry =>
                 entry.Level == LogLevel.Warning && entry.Message.Contains("could not confirm") && entry.Message.Contains(result.SweepId.ToString()));
             logs.Entries.Should().NotContain(entry => entry.Message.Contains("rolled back"));
@@ -2304,6 +2305,57 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         {
             await ExecuteOnOwnConnectionAsync($"DROP ROLE {role}");
         }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Committing_An_Aborted_Caller_Transaction_Keeps_Nothing_And_Tells_No_Observer(bool synchronousCommit)
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, markerId) = await SeedCallerErasureAsync(tenant.Id, subject);
+        var observer = new RecordingObserver();
+        var logs = new RecordingLogProvider();
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configureServices: services => services
+                .AddSingleton<IRetentionAuditObserver>(observer)
+                .AddSingleton<ILoggerProvider>(logs)
+        );
+
+        await host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            await using var transaction = await db.Database.BeginTransactionAsync();
+            (await db.Notes.SingleAsync(note => note.Id == markerId)).Body = "marker-after";
+            await db.SaveChangesAsync();
+            await services.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller)
+            );
+
+            // The caller's own statement fails and it carries on: the transaction is aborted,
+            // and PostgreSQL answers its COMMIT with a rollback.
+            var failing = () => db.Database.ExecuteSqlRawAsync("SELECT 1 / 0");
+            (await failing.Should().ThrowAsync<PostgresException>()).Which.SqlState.Should().Be(PostgresErrorCodes.DivisionByZero);
+            // The driver reports success, so only the check after the commit can tell.
+            if (synchronousCommit)
+            {
+                transaction.Commit();
+            }
+            else
+            {
+                await transaction.CommitAsync();
+            }
+        });
+
+        observer.Events.Should().BeEmpty();
+        logs.Entries.Should().ContainSingle(entry => entry.Level == LogLevel.Information && entry.Message.Contains("no committed ledger row"));
+        logs.Entries.Should().NotContain(entry => entry.Message.Contains("could not confirm"));
+        (await CountRunsAsync(tenant.Id)).Should().Be(0);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeTrue();
+        (await verify.Notes.SingleAsync(note => note.Id == markerId)).Body.Should().Be("marker-before");
     }
 
     [Fact]

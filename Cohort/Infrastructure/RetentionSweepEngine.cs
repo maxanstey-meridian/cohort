@@ -114,11 +114,10 @@ internal static class SweepEntityScopes
 {
     /// <summary>
     /// The entities a run under <paramref name="tenant"/> covers: tenantless ones for
-    /// <see cref="TenantContext.Tenantless"/>, tenanted ones otherwise. Mirrors
-    /// <see cref="RetentionExecutionScopes.For(TenantContext)"/>.
+    /// <see cref="TenantContext.Tenantless"/>, tenanted ones otherwise.
     /// </summary>
     internal static SweepEntityScope For(TenantContext tenant) =>
-        tenant.Id == Guid.Empty ? SweepEntityScope.TenantlessOnly : SweepEntityScope.TenantedOnly;
+        tenant.IsTenantless ? SweepEntityScope.TenantlessOnly : SweepEntityScope.TenantedOnly;
 
     /// <summary>Whether <paramref name="entry"/> is one of the entities the scope covers.</summary>
     internal static bool Includes(this SweepEntityScope scope, RetentionEntry entry) =>

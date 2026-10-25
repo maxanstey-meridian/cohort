@@ -58,20 +58,22 @@ internal sealed class RetentionRun(
             // No run lock: Started stays invisible to recovery until the caller commits, and
             // by then the run has settled. A session lock would also have to be released
             // inside a transaction that may already be aborted. The ledger table is resolved
-            // now, so the commit-time check touches no model metadata.
+            // now, so the post-commit check touches no model metadata.
             var sweepRun = PostgreSqlIdentifier.Format(CohortStoreTables.FromModel(db.Model).SweepRun);
             callerCommit.AfterCommit(
                 db.Database.CurrentTransaction!,
-                transaction => IsStillWrittenAsync(transaction, sweepRun),
+                connection => IsCommittedAsync(connection, sweepRun),
                 NotifyDeferredAsync,
-                () => logger.LogInformation(
-                    "Cohort {Operation} {SweepId} rolled back with the caller's transaction or one of its savepoints; no ledger row of the attempt remains, and nothing it changed was kept.",
+                committedWithoutRows => logger.LogInformation(
+                    committedWithoutRows
+                        ? "Cohort {Operation} {SweepId} has no committed ledger row the caller's connection can see: it rolled back with one of the caller's savepoints or an aborted transaction, or the connection's session can't read sweep_run. Its observer events are dropped."
+                        : "Cohort {Operation} {SweepId} rolled back with the caller's transaction; no ledger row of the attempt remains, and nothing it changed was kept.",
                     operation,
                     SweepId
                 ),
                 exception => logger.LogWarning(
                     exception,
-                    "Cohort could not confirm, before the caller's transaction committed, that {Operation} {SweepId} was still part of it; its observers are told of it if the transaction commits.",
+                    "Cohort could not confirm that the caller's commit kept {Operation} {SweepId}; dropping its observer events rather than reporting a run that may not have happened.",
                     operation,
                     SweepId
                 )
@@ -426,14 +428,15 @@ internal sealed class RetentionRun(
     }
 
     /// <summary>
-    /// Asked inside the caller's transaction just before it commits: whether the run's ledger
-    /// row is still there, or a rollback to a savepoint taken before the run removed it.
+    /// Asked on the caller's connection once its transaction has committed, outside any
+    /// transaction: the run's ledger row exists only if the commit kept the run, rather than
+    /// a rollback to a savepoint taken before it, or an aborted transaction, discarding it.
     /// </summary>
-    private async Task<bool> IsStillWrittenAsync(DbTransaction transaction, string sweepRun)
+    private async Task<bool> IsCommittedAsync(DbConnection connection, string sweepRun)
     {
         await using var command = new SqlParams { ["sweepId"] = SweepId }.CreateCommand(
-            transaction.Connection!,
-            transaction,
+            connection,
+            null,
             $"SELECT EXISTS (SELECT 1 FROM {sweepRun} WHERE \"SweepId\" = @sweepId)"
         );
         return await command.ExecuteScalarAsync(CancellationToken.None) is true;

@@ -164,7 +164,7 @@ Cohort scope does, and for the grants the tenant role needs.
 
 ::: warning Breaking change
 0.11.0 refuses to run while an active hold names an entity identity the model no longer
-registers, and allows one Cohort table set per EF model.
+registers, and when two EF models share one set of Cohort tables.
 
 - Before upgrading, look for active holds under identities your model no longer declares, and
   re-point or end them as [Changed entity identities](#changed-entity-identities) shows.

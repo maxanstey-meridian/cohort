@@ -31,6 +31,9 @@ public sealed record TenantContext
 
     public Guid Id { get; }
 
+    /// <summary>Whether this is <see cref="Tenantless"/>, the only context with an empty ID.</summary>
+    internal bool IsTenantless => Id == Guid.Empty;
+
     public string? Jurisdiction { get; }
 
     public IReadOnlyDictionary<string, string> Tags

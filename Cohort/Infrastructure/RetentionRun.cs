@@ -193,7 +193,9 @@ internal sealed class RetentionRun(
                     deferredEvents.RemoveRange(deferredMark, deferredEvents.Count - deferredMark);
                 }
 
-                if (ex is OperationCanceledException)
+                // Only the run's own cancellation stops the run; any other is this entity's
+                // failure.
+                if (ex is OperationCanceledException && ct.IsCancellationRequested)
                 {
                     throw;
                 }
@@ -248,7 +250,9 @@ internal sealed class RetentionRun(
                 // neither changed, skipped nor refused by this run, and what a reference
                 // still blocks besides the rows a constraint refused.
                 deferred = await strategy.CountDeferredAsync(scope, SweepId, refused, connection, ct);
-                blocked = refused.Count + await strategy.CountBlockedAsync(scope, refused, connection, ct);
+                var referenced = await strategy.CountBlockedAsync(scope, refused, connection, ct);
+                LogReferenced(scope, referenced);
+                blocked = refused.Count + referenced;
             }
 
             // Held rows are measured directly (in scope, eligible, actively held) rather
@@ -309,15 +313,38 @@ internal sealed class RetentionRun(
     }
 
     /// <summary>
+    /// One warning for rows left out because a foreign key still references them, naming the
+    /// keys that can (schema metadata) but no row. Rows a constraint refused when tried are
+    /// logged by the strategy, per constraint.
+    /// </summary>
+    private void LogReferenced(SweepScope scope, long referenced)
+    {
+        if (referenced == 0)
+        {
+            return;
+        }
+
+        logger.LogWarning(
+            "Cohort {Operation} {SweepId} left {Count} row(s) of entity {EntityType} unchanged: a row still references them through one of {ConstraintNames}. They count as blocked and are retried by the next run.",
+            operation,
+            SweepId,
+            referenced,
+            scope.Entry.EntityType.FullName,
+            string.Join(", ", scope.BlockingReferences.Select(reference => reference.ConstraintName))
+        );
+    }
+
+    /// <summary>
     /// Turns rows the run should have changed but didn't into run failures, so the run
     /// settles PartiallyFailed and <c>EntityFailures</c> is empty exactly when the ledger says
-    /// Succeeded. Skipped rows always count; deferred and blocked rows count only for an
-    /// erasure, since a sweep's next run retires them by design. The reasons are
+    /// Succeeded. Skipped rows always count; deferred and blocked rows count only for a real
+    /// erasure, since a sweep's next run retires them by design and a dry run changes
+    /// nothing (its <c>Complete</c> says what the real run would leave). The reasons are
     /// Cohort-defined plain codes and carry no row data.
     /// </summary>
     private void RecordRowsLeft(EntitySweepCount count)
     {
-        var erasure = started.Trigger == SweepTriggerKind.Erasure;
+        var erasure = started.Trigger == SweepTriggerKind.Erasure && !started.DryRun;
         RecordRowsLeft(count.EntityType, "rows-skipped", count.SkippedCount);
         if (erasure)
         {

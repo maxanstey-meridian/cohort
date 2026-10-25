@@ -5,6 +5,7 @@ using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure.Handlers;
 
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
@@ -53,9 +54,12 @@ internal static class RetentionHandlerSupport
     /// <summary>
     /// Runs every handler's OnBefore and captures the snapshot after each one, so a value
     /// that cannot round-trip to OnAfter fails the handler that left it, before the row
-    /// is mutated.
+    /// is mutated. A handler that leaves unsaved changes on <paramref name="db"/> fails too:
+    /// they would otherwise be saved with whatever the context's owner saves next, which in
+    /// a caller-transaction erasure commits with it.
     /// </summary>
     public static async Task<OnBeforeInvocationResult> InvokeOnBeforeAsync(
+        DbContext db,
         IReadOnlyList<ResolvedRetentionHandler> handlers,
         Type entityType,
         object row,
@@ -71,18 +75,25 @@ internal static class RetentionHandlerSupport
             {
                 var invocation = handler.OnBeforeMethod.Invoke(handler.Instance, [row, ctx, ct]);
                 await (Task)invocation!;
+                if (db.ChangeTracker.HasChanges())
+                {
+                    return OnBeforeInvocationResult.LeftUnsavedChanges(handler);
+                }
+
                 capturedPayload = RetentionSnapshotSerializer.Capture(
                     ctx.Snapshot,
                     entityType,
                     handlerAssemblies
                 );
             }
+            // Only the run's own cancellation stops the run. A handler's own (an HttpClient
+            // timeout is a TaskCanceledException) is that handler failing its row.
             catch (System.Reflection.TargetInvocationException ex)
-                when (ex.InnerException is OperationCanceledException cancellation)
+                when (ex.InnerException is OperationCanceledException cancellation && ct.IsCancellationRequested)
             {
                 throw cancellation;
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
                 throw;
             }
@@ -139,7 +150,9 @@ internal static class RetentionHandlerSupport
 
     /// <summary>
     /// Records a row left unmutated because an OnBefore handler failed, with that handler's
-    /// status dead-lettered. No snapshot is kept: nothing will run after it.
+    /// status dead-lettered. No snapshot is kept: nothing will run after it. An exception is
+    /// recorded as the sanitized diagnostic envelope; a failure Cohort found itself as its
+    /// plain reason.
     /// </summary>
     public static async Task PersistBeforeFailureAsync(
         DbConnection conn,
@@ -149,12 +162,13 @@ internal static class RetentionHandlerSupport
         Strategy strategy,
         Guid tenantId,
         string recordId,
-        ResolvedRetentionHandler failedHandler,
-        Exception failure,
+        OnBeforeInvocationResult failed,
         ILogger logger,
         CancellationToken ct
     )
     {
+        var failedHandler = failed.FailedHandler
+            ?? throw new ArgumentException("Only a failed OnBefore leaves a row unmutated.", nameof(failed));
         var rowDetailId = await InsertRowDetailAsync(
             conn,
             transaction,
@@ -167,14 +181,31 @@ internal static class RetentionHandlerSupport
             ct
         );
 
-        var diagnostic = RetentionFailureDiagnostic.Create(failure);
-        logger.LogError(
-            failure,
-            "Cohort row handler failed before mutation for sweep {SweepId} and entity {EntityType}. Diagnostic {DiagnosticId}.",
-            execution.SweepId,
-            entry.EntityType.FullName,
-            diagnostic.DiagnosticIdText
-        );
+        string lastError;
+        if (failed.Failure is { } failure)
+        {
+            var diagnostic = RetentionFailureDiagnostic.Create(failure);
+            lastError = diagnostic.ToString();
+            logger.LogError(
+                failure,
+                "Cohort row handler failed before mutation for sweep {SweepId} and entity {EntityType}. Diagnostic {DiagnosticId}.",
+                execution.SweepId,
+                entry.EntityType.FullName,
+                diagnostic.DiagnosticIdText
+            );
+        }
+        else
+        {
+            lastError = $"reason={failed.FailureReason}";
+            logger.LogError(
+                "Cohort row handler {HandlerType} failed before mutation for sweep {SweepId} and entity {EntityType} ({Reason}).",
+                failedHandler.HandlerTypeName,
+                execution.SweepId,
+                entry.EntityType.FullName,
+                failed.FailureReason
+            );
+        }
+
         await InsertHandlerStatusAsync(
             conn,
             transaction,
@@ -182,7 +213,7 @@ internal static class RetentionHandlerSupport
             rowDetailId,
             failedHandler,
             execution.At,
-            diagnostic.ToString(),
+            lastError,
             ct
         );
     }
@@ -295,11 +326,21 @@ internal sealed class ResolvedRetentionHandler(
 internal sealed record OnBeforeInvocationResult(
     ResolvedRetentionHandler? FailedHandler,
     Exception? Failure,
-    string? CapturedPayload = null
+    string? CapturedPayload = null,
+    string? FailureReason = null
 )
 {
+    /// <summary>
+    /// The plain reason recorded for a handler that returned with unsaved changes on the
+    /// run's DbContext. Cohort-defined, so it carries no handler or row data.
+    /// </summary>
+    public const string UnsavedChangesReason = "on-before-unsaved-changes";
+
     public static OnBeforeInvocationResult Captured(string capturedPayload) =>
         new(null, null, capturedPayload);
+
+    public static OnBeforeInvocationResult LeftUnsavedChanges(ResolvedRetentionHandler handler) =>
+        new(handler, null, FailureReason: UnsavedChangesReason);
 
     public bool Succeeded => FailedHandler is null;
 }

@@ -35,7 +35,13 @@ Both methods are optional. The interface supplies no-op defaults.
   through the sweep's `DbContext` see the row as it's about to be mutated, along with any
   related rows. A write through that context fails the handler (`sqlstate:25006`), and so
   does any database error, without harming the rest of the batch: the savepoint is always
-  rolled back. External side effects still belong in `OnAfterAsync`: they survive a rollback,
+  rolled back. So does returning with unsaved changes on that context (an `Add` or a changed
+  entity never saved, recorded as `reason=on-before-unsaved-changes`). Whatever a handler
+  leaves in the change tracker, a failed `SaveChanges` included, is discarded, so it can't be
+  saved later, for example by your own `SaveChangesAsync` after a
+  [caller-transaction erasure](/guides/erasure#erasing-inside-your-own-transaction). A
+  cancellation the handler raises itself, such as an `HttpClient` timeout, is a failure like
+  any other; only the run's own token stops the run. External side effects still belong in `OnAfterAsync`: they survive a rollback,
   they run while the batch holds its row locks, and they can run for a row that's then
   withheld, for example by a hold created mid-sweep or a constraint that refuses the change.
   A write to the row being swept through another connection waits on the sweep's own row

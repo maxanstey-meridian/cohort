@@ -168,7 +168,9 @@ new ErasureScope("person", personId, dryRun: true)
 ```
 
 A dry run counts what the erasure would change and writes its audit trail without changing
-any row. `ErasureResult.DryRun` tells you which kind of run it was.
+any row. `ErasureResult.DryRun` tells you which kind of run it was. It never settles
+`PartiallyFailed` for rows it predicts the real run would leave, blocked ones included: read
+`Complete` and the counts.
 
 ## How it runs
 
@@ -262,7 +264,8 @@ What changes compared with an ordinary erasure:
   synchronous `Commit()` blocks while observers are told, each for up to
   `AuditObservers:Timeout` per event.
 - **Row handlers run after the commit.** `OnBeforeAsync` runs inside your transaction, in a
-  read-only savepoint.
+  read-only savepoint, and anything it leaves in your context's change tracker is discarded
+  (see [row handlers](/guides/row-handlers)).
   `OnAfterAsync` work is queued in the same transaction, so the dispatcher only sees it once
   you commit, and a rollback discards it.
 - **Your deferred constraints stay deferred.** Cohort doesn't change your transaction's

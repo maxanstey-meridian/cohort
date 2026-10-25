@@ -61,13 +61,16 @@ columns or rows belong to it. So these are rejected:
   unique index. A filtered index doesn't make it unique.
 - Record-ID types whose text form depends on session settings are rejected. See
   [Identities](/reference/schema#identities).
+- Each retained table and its record-ID column exist in the database.
 - Each anonymised column can take what Cohort writes to it, checked against the database
-  catalog: an `EmptyString` or `FixedLiteral` value is valid input for the column's type
-  (length, type and domain `CHECK` included); `Null` doesn't go into a column the database
-  declares `NOT NULL`; a value every row shares (`EmptyString`, `FixedLiteral`, a `Static`
-  factory) isn't written to a column under an unfiltered unique index without the record ID;
-  a literal isn't written to a foreign-key column; and no anonymised column is referenced by a
-  foreign key. See [Anonymisation](/guides/anonymisation).
+  catalog: the column exists and the model's store type can be assigned to its type without
+  an explicit cast; an `EmptyString` or `FixedLiteral` value, after the value converter, is
+  valid input for both types (length, type and domain `CHECK` included); `Null` doesn't go
+  into a column the database declares `NOT NULL`, directly or through nested domains; a value
+  every row shares (`EmptyString`, `FixedLiteral`, a `Static` factory) isn't written to a
+  column in the key of an unfiltered unique index whose key lacks the record ID; a literal
+  isn't written to a foreign-key column; and no anonymised column is referenced by a foreign
+  key. See [Anonymisation](/guides/anonymisation).
 
 ## Foreign keys
 

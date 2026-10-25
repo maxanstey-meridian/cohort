@@ -156,8 +156,13 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
     public async Task A_Parent_Referenced_By_An_Unretained_Child_Is_Blocked_And_The_Rest_Are_Swept()
     {
         await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
+        var logs = new RecordingLogProvider();
         // Batch size 1: the referenced parent is the oldest, so it would head every batch.
-        await using var services = BuildServiceProvider(database.ConnectionString, batchSize: 1);
+        await using var services = BuildServiceProvider(
+            database.ConnectionString,
+            batchSize: 1,
+            configure: services => services.AddSingleton<ILoggerProvider>(logs)
+        );
         var tenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
         var referencedId = Guid.NewGuid();
@@ -186,6 +191,62 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
         (await LoadSummaryAsync(database.ConnectionString, result.SweepId, typeof(ARestrictiveParent)))
             .Should().Be(new SummaryCounts(Affected: 2, Deferred: 0, Blocked: 1));
         (await LoadParentIdsAsync(services)).Should().Equal(referencedId);
+        // The warning names the keys that can hold the rows, never the rows.
+        logs.Entries.Should().ContainSingle(entry =>
+                entry.Level == LogLevel.Warning
+                && entry.Message.Contains(typeof(ARestrictiveParent).FullName!, StringComparison.Ordinal)
+                && entry.Message.Contains("FK_restrictive_fk_host_invoices_restrictive_fk_parents_ParentId", StringComparison.Ordinal))
+            .Which.Message.Should().Contain("1 row(s)");
+        logs.Entries.Should().NotContain(entry => entry.Message.Contains(referencedId.ToString(), StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task A_Row_That_References_Itself_Is_Purged_And_One_Its_Own_Table_Still_References_Is_Blocked()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
+        var logs = new RecordingLogProvider();
+        await using var services = BuildServiceProvider(
+            database.ConnectionString,
+            configure: services => services.AddSingleton<ILoggerProvider>(logs)
+        );
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var selfReferencingId = Guid.NewGuid();
+        var referencedId = Guid.NewGuid();
+        var youngReferrerId = Guid.NewGuid();
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<RestrictiveForeignKeyDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.Parents.AddRange(
+                Parent(selfReferencingId, tenantId, asOf.AddDays(-300)),
+                Parent(referencedId, tenantId, asOf.AddDays(-200)),
+                // Not due yet, and still pointing at its due parent.
+                Parent(youngReferrerId, tenantId, asOf.AddDays(-1))
+            );
+            await db.SaveChangesAsync();
+        }
+        // A database-only self-reference (NO ACTION) the EF model doesn't know about.
+        await ExecuteAsync(
+            database.ConnectionString,
+            $"""
+            ALTER TABLE restrictive_fk_parents
+                ADD COLUMN "ReferencesId" uuid CONSTRAINT restrictive_fk_parent_self REFERENCES restrictive_fk_parents ("Id");
+            UPDATE restrictive_fk_parents SET "ReferencesId" = "Id" WHERE "Id" = '{selfReferencingId}';
+            UPDATE restrictive_fk_parents SET "ReferencesId" = '{referencedId}' WHERE "Id" = '{youngReferrerId}';
+            """
+        );
+
+        var result = await SweepAsync(services, tenantId, asOf);
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(ARestrictiveParent))
+            .Which.Should().Match<EntitySweepCount>(count =>
+                count.Affected == 1 && count.BlockedCount == 1 && count.DeferredCount == 0);
+        (await LoadParentIdsAsync(services)).Should().Equal(referencedId, youngReferrerId);
+        logs.Entries.Should().Contain(entry =>
+            entry.Level == LogLevel.Warning && entry.Message.Contains("restrictive_fk_parent_self", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -406,8 +467,10 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
         (await ScalarAsync<long>(database.ConnectionString, "SELECT last_value FROM guard_attempts")).Should().Be(3);
     }
 
-    [Fact]
-    public async Task Erasure_Reports_A_Referenced_Row_As_Blocked()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Erasure_Reports_A_Referenced_Row_As_Blocked(bool dryRun)
     {
         await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
         await using var services = BuildServiceProvider(database.ConnectionString);
@@ -434,18 +497,27 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
             result = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
                 RetentionErasureRequest.Tenanted(
                     new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                    new ErasureScope("person", subjectId),
+                    new ErasureScope("person", subjectId, dryRun: dryRun),
                     asOf
                 )
             );
         }
 
-        const string reason = "reason=rows-blocked;entityType=Cohort.Sample.Tests.RestrictiveForeignKeySweepEndToEndTests+ARestrictiveParent;count=1";
-        result.EntityFailures.Should().ContainSingle().Which.Should().Be(reason);
         result.Complete.Should().BeFalse();
         result.Counts.Should().ContainSingle(count => count.EntityType == typeof(ARestrictiveParent))
             .Which.Should().Match<EntitySweepCount>(count =>
                 count.Affected == 1 && count.BlockedCount == 1 && count.DeferredCount == 0);
+        if (dryRun)
+        {
+            // A prediction: Complete says the real run would leave the row, but nothing failed.
+            result.EntityFailures.Should().BeEmpty();
+            (await LoadRunStatusAsync(database.ConnectionString, result.SweepId)).Should().Be(SweepRunStatus.Succeeded);
+            (await LoadParentIdsAsync(services)).Should().HaveCount(2);
+            return;
+        }
+
+        const string reason = "reason=rows-blocked;entityType=Cohort.Sample.Tests.RestrictiveForeignKeySweepEndToEndTests+ARestrictiveParent;count=1";
+        result.EntityFailures.Should().ContainSingle().Which.Should().Be(reason);
         (await LoadRunStatusAsync(database.ConnectionString, result.SweepId)).Should().Be(SweepRunStatus.PartiallyFailed);
         (await LoadParentIdsAsync(services)).Should().Equal(referencedId);
     }

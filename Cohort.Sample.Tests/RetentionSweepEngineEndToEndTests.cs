@@ -352,6 +352,60 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         return await db.Database.SqlQuery<DateTimeOffset>($"""SELECT statement_timestamp() AS "Value" """).SingleAsync();
     }
 
+    [Fact]
+    public async Task A_Rule_Provider_Timing_Out_Fails_Only_Its_Entity_Not_The_Sweep()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 11, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120),
+                    Body = "provider-timeout",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        var purge = new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge);
+        using var sweepHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
+            {
+                services.RemoveAll<IRetentionRuleProvider>();
+                services.AddSingleton<IRetentionRuleProvider>(
+                    new StaticCategoryRepository(
+                        new Dictionary<string, ITestRetentionRule>
+                        {
+                            ["short-lived"] = new TimingOutResolver(purge),
+                            ["soft-delete"] = new StaticTestRetentionRule(
+                                new RetentionRule(new RetentionPeriod(Days: 30), Strategy.SoftDelete)
+                            ),
+                            ["anonymise"] = new StaticTestRetentionRule(
+                                new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
+                            ),
+                        }
+                    )
+                );
+            }
+        );
+
+        var result = await sweepHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        result.EntityFailures.Should().ContainSingle()
+            .Which.Should().StartWith("type=System.Threading.Tasks.TaskCanceledException;");
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
+    }
+
     private async Task<long> CountRunsAsync(Guid tenantId)
     {
         await using var db = Host.CreateDbContext();
@@ -391,6 +445,15 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
         (await reader.ReadAsync()).Should().BeTrue();
         reader.IsDBNull(0).Should().BeFalse();
         reader.GetInt64(1).Should().Be(expectedAffected);
+    }
+
+    private sealed class TimingOutResolver(RetentionRule rule) : ITestRetentionRule
+    {
+        // An HttpClient timeout is a TaskCanceledException, though nobody cancelled the sweep.
+        public Task<RetentionRule> ResolveAsync(RetentionResolutionContext ctx, CancellationToken ct) =>
+            throw new TaskCanceledException("Simulated rule store timeout.");
+
+        public RetentionRule? TryResolveAtStartup() => rule;
     }
 
     private sealed class TransactionAssertingResolver(SampleDbContext db, RetentionRule rule)

@@ -921,6 +921,124 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         (await verify.Notes.SingleAsync(note => note.Id == bystanderNoteId)).Body.Should().Be("bystander");
     }
 
+    [Theory]
+    [InlineData(DatabaseTouchingNoteHandler.StagingBody, "^reason=on-before-unsaved-changes$")]
+    [InlineData(DatabaseTouchingNoteHandler.FailedSaveBody, "^type=Npgsql\\.PostgresException;code=sqlstate:25006;diagnosticId=[0-9a-f]{32}$")]
+    public async Task A_Caller_Transaction_Erasure_Discards_What_An_OnBefore_Left_On_The_Callers_Context(
+        string body,
+        string expectedError
+    )
+    {
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var stagingNoteId = Guid.NewGuid();
+        var bystanderNoteId = Guid.NewGuid();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note
+                {
+                    Id = stagingNoteId,
+                    TenantId = tenantId,
+                    SubjectId = subjectId,
+                    CreatedAt = asOf.AddDays(-2),
+                    Body = body,
+                },
+                // Not the subject's: only the handler's tracked change could touch it.
+                new Note
+                {
+                    Id = bystanderNoteId,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-1),
+                    Body = "bystander",
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
+                services.AddSingleton(new WriteTarget(bystanderNoteId)).AddRowHandler<Note, DatabaseTouchingNoteHandler>()
+        );
+
+        var result = await handlerHost.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            await using var transaction = await db.Database.BeginTransactionAsync();
+            var erased = await services.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(
+                    new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                    new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
+                    asOf,
+                    transaction: ErasureTransaction.Caller
+                )
+            );
+
+            // The caller's own save in its transaction must not carry the handler's change.
+            db.ChangeTracker.HasChanges().Should().BeFalse();
+            await db.SaveChangesAsync();
+            await transaction.CommitAsync();
+            return erased;
+        });
+
+        result.EntityFailures.Should().ContainSingle().Which.Should().Be("reason=rows-skipped;entityType=Cohort.Sample.Entities.Note;count=1");
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note))
+            .Which.Should().Match<EntitySweepCount>(count => count.Affected == 0 && count.SkippedCount == 1);
+        var status = (await LoadHandlerStatusesAsync(result.SweepId)).Single();
+        status.State.Should().Be(DeadLetteredState);
+        status.LastError.Should().MatchRegex(expectedError);
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == stagingNoteId)).Should().BeTrue();
+        (await verify.Notes.SingleAsync(note => note.Id == bystanderNoteId)).Body.Should().Be("bystander");
+        (await verify.Notes.AnyAsync(note => note.Body == DatabaseTouchingNoteHandler.StagedBody)).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task A_Handlers_Own_Cancellation_Skips_Its_Row_Instead_Of_Failing_The_Run()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var synchronousId = Guid.NewGuid();
+        var asynchronousId = Guid.NewGuid();
+        var healthyId = Guid.NewGuid();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note { Id = synchronousId, TenantId = tenantId, CreatedAt = asOf.AddDays(-300), Body = TimingOutNoteHandler.SynchronousBody },
+                new Note { Id = asynchronousId, TenantId = tenantId, CreatedAt = asOf.AddDays(-200), Body = TimingOutNoteHandler.AsynchronousBody },
+                new Note { Id = healthyId, TenantId = tenantId, CreatedAt = asOf.AddDays(-100), Body = "healthy" }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services => services.AddRowHandler<Note, TimingOutNoteHandler>()
+        );
+
+        // An HttpClient timeout is a TaskCanceledException, but the sweep was not cancelled.
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        result.EntityFailures.Should().ContainSingle().Which.Should().Be("reason=rows-skipped;entityType=Cohort.Sample.Entities.Note;count=2");
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note))
+            .Which.Should().Match<EntitySweepCount>(count => count.Affected == 1 && count.SkippedCount == 2);
+        (await LoadHandlerStatusesAsync(result.SweepId)).Where(status => status.State == DeadLetteredState)
+            .Should().HaveCount(2)
+            .And.OnlyContain(status => status.LastError!.StartsWith("type=System.Threading.Tasks.TaskCanceledException;", StringComparison.Ordinal));
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.Where(note => note.TenantId == tenantId).Select(note => note.Id).ToListAsync())
+            .Should().BeEquivalentTo([synchronousId, asynchronousId]);
+    }
+
     [Fact]
     public async Task OnBefore_Can_Read_Related_Rows_On_The_Sweep_Transaction()
     {
@@ -2789,6 +2907,31 @@ file sealed class SelectivelyFailingNoteHandler : IRetentionHandler<Note>
 
 file sealed record WriteTarget(Guid NoteId);
 
+/// <summary>Throws its own cancellation, as an HttpClient timeout does, chosen by the row's body.</summary>
+file sealed class TimingOutNoteHandler : IRetentionHandler<Note>
+{
+    public const string SynchronousBody = "time-out-synchronously";
+    public const string AsynchronousBody = "time-out-asynchronously";
+
+    public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
+    {
+        if (string.Equals(row.Body, SynchronousBody, StringComparison.Ordinal))
+        {
+            throw new TaskCanceledException("Simulated HttpClient timeout.");
+        }
+
+        return string.Equals(row.Body, AsynchronousBody, StringComparison.Ordinal)
+            ? TimeOutAsync()
+            : Task.CompletedTask;
+    }
+
+    private static async Task TimeOutAsync()
+    {
+        await Task.Yield();
+        throw new TaskCanceledException("Simulated HttpClient timeout.");
+    }
+}
+
 /// <summary>
 /// Touches the database through the sweep's own DbContext from OnBefore: a failing
 /// statement, a write, or a read of a related row, chosen by the row's body.
@@ -2799,6 +2942,9 @@ file sealed class DatabaseTouchingNoteHandler(SampleDbContext db, WriteTarget ta
     public const string DivideByZeroBody = "divide-by-zero-before-delete";
     public const string WritingBody = "write-before-delete";
     public const string ReadingBody = "read-before-delete";
+    public const string StagingBody = "stage-before-delete";
+    public const string FailedSaveBody = "save-before-delete";
+    public const string StagedBody = "staged-by-handler";
 
     public async Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
     {
@@ -2818,6 +2964,15 @@ file sealed class DatabaseTouchingNoteHandler(SampleDbContext db, WriteTarget ta
                     .Where(note => note.Id == target.NoteId)
                     .Select(note => note.Body)
                     .SingleAsync(ct);
+                break;
+            case StagingBody:
+                // Tracked but never saved: nothing reaches the database from OnBefore.
+                db.Notes.Add(new Note { Id = Guid.NewGuid(), TenantId = row.TenantId, CreatedAt = row.CreatedAt, Body = StagedBody });
+                break;
+            case FailedSaveBody:
+                // The save fails read-only (25006) and leaves its entry Modified.
+                (await db.Notes.SingleAsync(note => note.Id == target.NoteId, ct)).Body = "overwritten-by-handler";
+                await db.SaveChangesAsync(ct);
                 break;
         }
 

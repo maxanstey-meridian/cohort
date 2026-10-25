@@ -47,7 +47,9 @@ Along the way:
   a unique index, a constraint trigger) is blocked, not fatal. The batch's statement is
   bisected under savepoints until the refused rows are found, or on the row-by-row path each
   row's change has its own savepoint. The rest of the batch commits, blocked rows are left out
-  of the run's remaining batches, and a Warning names the constraint (never the row). A full
+  of the run's remaining batches, and a Warning names the constraint (never the row). Rows
+  left out up front because a foreign key still references them get one Warning per entity
+  naming the keys that can block it. A full
   batch in which every row is refused fails the entity instead, since the cause is then the
   rule or the schema.
 - `HeldCount` and `BlockedCount` are measured directly: rows past the cutoff with an active

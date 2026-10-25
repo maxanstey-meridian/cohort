@@ -3,10 +3,13 @@ using System.Collections.Concurrent;
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure.Holds;
+using Cohort.Infrastructure.Sweep;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
+
+using Npgsql;
 
 namespace Cohort.Infrastructure;
 
@@ -17,11 +20,11 @@ internal sealed class RetentionRuntimeReadinessValidator(
     RetentionRegistry registry,
     RetentionRuntimeReadinessState state,
     IServiceScopeFactory scopeFactory,
-    IEnumerable<IAnonymiseValueFactory> anonymiseValueFactories
+    AnonymiseAssignmentResolver assignments
 )
 {
     // pg_input_is_valid, which the anonymise-target check relies on, arrived in PostgreSQL 16.
-    private const int MinimumServerVersionNum = 160000;
+    private static readonly Version MinimumServerVersion = new(16, 0);
 
     internal IReadOnlyDictionary<string, RetentionCategoryCapabilities>
         ValidatedCapabilities => startupValidator.ValidatedCapabilities;
@@ -72,6 +75,8 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// Cohort stores a record id as its column's text form. The model's store type name cannot
     /// show a domain, and the startup check only knows type names, so resolve each record-id
     /// column's catalog type through domains, arrays and ranges to the types it is built on.
+    /// A retained table or record-id column the database no longer has fails every run, so it is
+    /// refused here too.
     /// </summary>
     private async Task ValidateRecordIdColumnTypesAsync(CancellationToken ct)
     {
@@ -94,23 +99,23 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 db.Database.CurrentTransaction?.GetDbTransaction(),
                 """
                 WITH RECURSIVE record_id_column AS (
-                    SELECT requested.ordinal, attribute.atttypid AS type_id
+                    SELECT requested.ordinal, relation.oid AS relation_id, attribute.atttypid AS type_id
                     FROM ROWS FROM (
                         pg_catalog.unnest(@schemas),
                         pg_catalog.unnest(@tables),
                         pg_catalog.unnest(@columns)
                     ) WITH ORDINALITY AS requested(schema_name, table_name, column_name, ordinal)
-                    JOIN pg_catalog.pg_namespace namespace ON namespace.nspname = requested.schema_name
-                    JOIN pg_catalog.pg_class relation
+                    LEFT JOIN pg_catalog.pg_namespace namespace ON namespace.nspname = requested.schema_name
+                    LEFT JOIN pg_catalog.pg_class relation
                       ON relation.relnamespace = namespace.oid AND relation.relname = requested.table_name
-                    JOIN pg_catalog.pg_attribute attribute
+                    LEFT JOIN pg_catalog.pg_attribute attribute
                       ON attribute.attrelid = relation.oid
                      AND attribute.attname = requested.column_name
                      AND attribute.attnum > 0
                      AND NOT attribute.attisdropped
                 ),
                 built_on(ordinal, type_id) AS (
-                    SELECT ordinal, type_id FROM record_id_column
+                    SELECT ordinal, type_id FROM record_id_column WHERE type_id IS NOT NULL
                     UNION
                     SELECT built_on.ordinal,
                            CASE
@@ -125,7 +130,11 @@ internal sealed class RetentionRuntimeReadinessValidator(
                     LEFT JOIN pg_catalog.pg_range over_multirange ON over_multirange.rngmultitypid = pgtype.oid
                     WHERE pgtype.typtype IN ('d', 'r', 'm') OR pgtype.typcategory = 'A'
                 )
-                SELECT built_on.ordinal, pgtype.typname
+                SELECT ordinal, NULL::pg_catalog.name, relation_id IS NULL
+                FROM record_id_column
+                WHERE type_id IS NULL
+                UNION ALL
+                SELECT built_on.ordinal, pgtype.typname, NULL
                 FROM built_on
                 JOIN pg_catalog.pg_type pgtype ON pgtype.oid = built_on.type_id
                 JOIN pg_catalog.pg_namespace namespace ON namespace.oid = pgtype.typnamespace
@@ -138,13 +147,23 @@ internal sealed class RetentionRuntimeReadinessValidator(
             {
                 while (await reader.ReadAsync(ct))
                 {
+                    var entry = entries[(int)reader.GetInt64(0) - 1];
+                    if (reader.IsDBNull(1))
+                    {
+                        errors.Add(
+                            reader.GetBoolean(2)
+                                ? $"Retained entity {entry.EntityType.FullName}: table {PostgreSqlIdentifier.Format(entry.Table)} was not found in the database, so every run would fail. Apply the host application's pending EF Core migrations, or map the entity to the table it lives in."
+                                : $"Record-id convention on {entry.EntityType.FullName}: record-id column {PostgreSqlIdentifier.Format(entry.Table)}.{PostgreSqlIdentifier.Quote(entry.RecordId.RecordIdColumn)} was not found in the database, so every run would fail. Apply the host application's pending EF Core migrations, or map the record id to the column it lives in."
+                        );
+                        continue;
+                    }
+
                     var typeName = reader.GetString(1);
                     if (!RetentionStartupValidator.HasSessionDependentText(typeName))
                     {
                         continue;
                     }
 
-                    var entry = entries[(int)reader.GetInt64(0) - 1];
                     errors.Add(
                         $"Record-id convention on {entry.EntityType.FullName}: record-id column {PostgreSqlIdentifier.Format(entry.Table)}.{PostgreSqlIdentifier.Quote(entry.RecordId.RecordIdColumn)} is built on '{typeName}', whose text form depends on session settings (TimeZone, DateStyle, IntervalStyle, extra_float_digits), so holds and audit rows could silently stop matching. Use a uuid, integer, numeric, or text record id, or mark a stable unique column with [RetentionRecordId]."
                     );
@@ -164,10 +183,12 @@ internal sealed class RetentionRuntimeReadinessValidator(
 
     /// <summary>
     /// The startup check knows only an anonymise target's CLR type; the column decides what the
-    /// UPDATE can write. Ask the catalog, which sees domains, column types declared without a
-    /// length and migration drift, for each target column's facts, and test each literal with
-    /// the column type's own input function (typmod included) so that a literal the column can't
-    /// take fails here instead of on every run.
+    /// UPDATE can write. Ask the catalog, which sees domains (nested ones included), column types
+    /// declared without a length and migration drift, for each target column's facts. The UPDATE
+    /// casts each value to the model's store type and PostgreSQL then assigns it to the column,
+    /// so the model's type must reach the column's without an explicit cast, and each literal is
+    /// tested with both types' input functions (the column's typmod included), so that a value
+    /// the column can't take fails here instead of on every run.
     /// </summary>
     private async Task ValidateAnonymiseTargetsAsync(CancellationToken ct)
     {
@@ -184,6 +205,8 @@ internal sealed class RetentionRuntimeReadinessValidator(
             return;
         }
 
+        var errors = new SortedSet<string>(StringComparer.Ordinal);
+        var probes = targets.Select(target => ProbeValue(target.Entry, target.Field, errors)).ToArray();
         await db.Database.OpenConnectionAsync(ct);
         try
         {
@@ -195,103 +218,197 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 ["record_id_columns"] = targets
                     .Select(target => target.Entry.RecordId.RecordIdColumn)
                     .ToArray(),
-                ["probes"] = targets.Select(target => ProbeValue(target.Entry, target.Field)).ToArray(),
+                ["cast_types"] = targets
+                    .Select(target => PostgresStoreTypeSql.CastType(target.Field.StoreType))
+                    .ToArray(),
+                ["probes"] = probes,
             }.CreateCommand(
                 db.Database.GetDbConnection(),
                 db.Database.CurrentTransaction?.GetDbTransaction(),
                 """
+                WITH RECURSIVE requested AS (
+                    SELECT requested.ordinal,
+                           requested.cast_type,
+                           requested.probe,
+                           relation.oid AS relation_id,
+                           record_id.attnum AS record_id_attnum,
+                           attribute.attnum,
+                           attribute.atttypid,
+                           attribute.attnotnull,
+                           pg_catalog.format_type(attribute.atttypid, attribute.atttypmod) AS column_type,
+                           pg_catalog.to_regtype(requested.cast_type) AS cast_type_id
+                    FROM ROWS FROM (
+                        pg_catalog.unnest(@schemas),
+                        pg_catalog.unnest(@tables),
+                        pg_catalog.unnest(@columns),
+                        pg_catalog.unnest(@record_id_columns),
+                        pg_catalog.unnest(@cast_types),
+                        pg_catalog.unnest(@probes)
+                    ) WITH ORDINALITY AS requested(schema_name, table_name, column_name, record_id_column, cast_type, probe, ordinal)
+                    LEFT JOIN pg_catalog.pg_namespace namespace ON namespace.nspname = requested.schema_name
+                    LEFT JOIN pg_catalog.pg_class relation
+                      ON relation.relnamespace = namespace.oid AND relation.relname = requested.table_name
+                    LEFT JOIN pg_catalog.pg_attribute attribute
+                      ON attribute.attrelid = relation.oid
+                     AND attribute.attname = requested.column_name
+                     AND attribute.attnum > 0
+                     AND NOT attribute.attisdropped
+                    LEFT JOIN pg_catalog.pg_attribute record_id
+                      ON record_id.attrelid = relation.oid
+                     AND record_id.attname = requested.record_id_column
+                     AND record_id.attnum > 0
+                     AND NOT record_id.attisdropped
+                ),
+                -- Each type through its domains to its base type (level 0) and, for an array, its
+                -- element type through the element's domains (level 1), as PostgreSQL coerces.
+                type_chain(type_id, level, step_id) AS (
+                    SELECT pgtype.oid, 0, pgtype.oid
+                    FROM pg_catalog.pg_type pgtype
+                    WHERE pgtype.oid IN (SELECT atttypid FROM requested UNION SELECT cast_type_id FROM requested)
+                    UNION ALL
+                    SELECT chain.type_id,
+                           CASE WHEN step.typtype = 'd' THEN chain.level ELSE 1 END,
+                           CASE WHEN step.typtype = 'd' THEN step.typbasetype ELSE step.typelem END
+                    FROM type_chain chain
+                    JOIN pg_catalog.pg_type step ON step.oid = chain.step_id
+                    WHERE step.typtype = 'd' OR (chain.level = 0 AND step.typcategory = 'A')
+                ),
+                type_base AS (
+                    SELECT chain.type_id,
+                           pg_catalog.bool_or(step.typnotnull) FILTER (WHERE chain.level = 0) AS not_null,
+                           pg_catalog.max(step.oid) FILTER (WHERE chain.level = 0 AND step.typtype <> 'd') AS base_id,
+                           pg_catalog.max(step.typcategory::text) FILTER (WHERE chain.level = 0 AND step.typtype <> 'd') AS base_category,
+                           pg_catalog.max(step.oid) FILTER (WHERE chain.level = 1 AND step.typtype <> 'd') AS element_id,
+                           pg_catalog.max(step.typcategory::text) FILTER (WHERE chain.level = 1 AND step.typtype <> 'd') AS element_category
+                    FROM type_chain chain
+                    JOIN pg_catalog.pg_type step ON step.oid = chain.step_id
+                    GROUP BY chain.type_id
+                )
                 SELECT requested.ordinal,
-                       pg_catalog.format_type(attribute.atttypid, attribute.atttypmod),
-                       attribute.attnotnull OR pgtype.typnotnull,
+                       requested.relation_id IS NOT NULL AND requested.record_id_attnum IS NOT NULL,
+                       requested.attnum IS NOT NULL,
+                       requested.column_type,
+                       requested.attnotnull OR column_type.not_null,
                        CASE WHEN requested.probe IS NULL THEN NULL
-                            ELSE pg_catalog.pg_input_is_valid(
-                                requested.probe,
-                                pg_catalog.format_type(attribute.atttypid, attribute.atttypmod)
-                            )
+                            ELSE pg_catalog.pg_input_is_valid(requested.probe, requested.column_type)
                        END,
+                       CASE WHEN requested.probe IS NULL OR requested.cast_type_id IS NULL THEN NULL
+                            ELSE pg_catalog.pg_input_is_valid(requested.probe, requested.cast_type)
+                       END,
+                       -- PostgreSQL's assignment coercion (find_coercion_pathway): domains reduce
+                       -- to their base types; a pg_cast row decides alone; arrays coerce through
+                       -- their elements; any type reaches a string type through text I/O.
+                       CASE WHEN requested.cast_type IS NULL THEN true
+                            WHEN requested.cast_type_id IS NULL THEN NULL
+                            WHEN cast_type.base_id = column_type.base_id THEN true
+                            WHEN base_cast.oid IS NOT NULL THEN base_cast.castcontext IN ('a', 'i')
+                            WHEN cast_type.base_category = 'A' AND column_type.base_category = 'A' THEN
+                                 cast_type.element_id = column_type.element_id
+                                 OR CASE WHEN element_cast.oid IS NOT NULL THEN element_cast.castcontext IN ('a', 'i')
+                                         ELSE column_type.element_category = 'S'
+                                    END
+                            ELSE column_type.base_category = 'S'
+                       END,
+                       COALESCE(unique_key.unique_without_record_id, false),
+                       COALESCE(unique_key.nulls_not_distinct, false),
                        EXISTS (
-                           SELECT 1 FROM pg_catalog.pg_index unique_index
-                           WHERE unique_index.indrelid = relation.oid
-                             AND unique_index.indisunique
-                             AND unique_index.indpred IS NULL
-                             AND unique_index.indexprs IS NULL
-                             AND attribute.attnum = ANY(unique_index.indkey)
-                             AND NOT (record_id.attnum = ANY(unique_index.indkey))
-                       ),
-                       EXISTS (
-                           SELECT 1 FROM pg_catalog.pg_index unique_index
-                           WHERE unique_index.indrelid = relation.oid
-                             AND unique_index.indisunique
-                             AND unique_index.indnullsnotdistinct
-                             AND unique_index.indpred IS NULL
-                             AND unique_index.indexprs IS NULL
-                             AND attribute.attnum = ANY(unique_index.indkey)
-                             AND NOT (record_id.attnum = ANY(unique_index.indkey))
+                           SELECT 1 FROM pg_catalog.pg_constraint foreign_key
+                           WHERE foreign_key.contype = 'f'
+                             AND foreign_key.conrelid = requested.relation_id
+                             AND requested.attnum = ANY(foreign_key.conkey)
                        ),
                        EXISTS (
                            SELECT 1 FROM pg_catalog.pg_constraint foreign_key
                            WHERE foreign_key.contype = 'f'
-                             AND foreign_key.conrelid = relation.oid
-                             AND attribute.attnum = ANY(foreign_key.conkey)
-                       ),
-                       EXISTS (
-                           SELECT 1 FROM pg_catalog.pg_constraint foreign_key
-                           WHERE foreign_key.contype = 'f'
-                             AND foreign_key.confrelid = relation.oid
-                             AND attribute.attnum = ANY(foreign_key.confkey)
+                             AND foreign_key.confrelid = requested.relation_id
+                             AND requested.attnum = ANY(foreign_key.confkey)
                        )
-                FROM ROWS FROM (
-                    pg_catalog.unnest(@schemas),
-                    pg_catalog.unnest(@tables),
-                    pg_catalog.unnest(@columns),
-                    pg_catalog.unnest(@record_id_columns),
-                    pg_catalog.unnest(@probes)
-                ) WITH ORDINALITY AS requested(schema_name, table_name, column_name, record_id_column, probe, ordinal)
-                JOIN pg_catalog.pg_namespace namespace ON namespace.nspname = requested.schema_name
-                JOIN pg_catalog.pg_class relation
-                  ON relation.relnamespace = namespace.oid AND relation.relname = requested.table_name
-                JOIN pg_catalog.pg_attribute attribute
-                  ON attribute.attrelid = relation.oid
-                 AND attribute.attname = requested.column_name
-                 AND attribute.attnum > 0
-                 AND NOT attribute.attisdropped
-                JOIN pg_catalog.pg_type pgtype ON pgtype.oid = attribute.atttypid
-                JOIN pg_catalog.pg_attribute record_id
-                  ON record_id.attrelid = relation.oid
-                 AND record_id.attname = requested.record_id_column
-                 AND record_id.attnum > 0
-                 AND NOT record_id.attisdropped
+                FROM requested
+                LEFT JOIN type_base column_type ON column_type.type_id = requested.atttypid
+                LEFT JOIN type_base cast_type ON cast_type.type_id = requested.cast_type_id
+                LEFT JOIN pg_catalog.pg_cast base_cast
+                  ON base_cast.castsource = cast_type.base_id AND base_cast.casttarget = column_type.base_id
+                LEFT JOIN pg_catalog.pg_cast element_cast
+                  ON element_cast.castsource = cast_type.element_id
+                 AND element_cast.casttarget = column_type.element_id
+                -- Unfiltered, non-expression unique indexes whose key (not their INCLUDE columns)
+                -- holds the column but not the record id.
+                CROSS JOIN LATERAL (
+                    SELECT pg_catalog.bool_or(true) AS unique_without_record_id,
+                           pg_catalog.bool_or(unique_index.indnullsnotdistinct) AS nulls_not_distinct
+                    FROM pg_catalog.pg_index unique_index
+                    CROSS JOIN LATERAL (
+                        VALUES ((unique_index.indkey::pg_catalog.int2[])[0:unique_index.indnkeyatts - 1])
+                    ) AS index_key(columns)
+                    WHERE unique_index.indrelid = requested.relation_id
+                      AND unique_index.indisunique
+                      AND unique_index.indpred IS NULL
+                      AND unique_index.indexprs IS NULL
+                      AND requested.attnum = ANY(index_key.columns)
+                      AND NOT (requested.record_id_attnum = ANY(index_key.columns))
+                ) unique_key
                 """
             );
 
-            var errors = new SortedSet<string>(StringComparer.Ordinal);
             await using (var reader = await command.ExecuteReaderAsync(ct))
             {
                 while (await reader.ReadAsync(ct))
                 {
                     var (entry, field) = targets[(int)reader.GetInt64(0) - 1];
-                    var columnType = reader.GetString(1);
-                    var notNull = reader.GetBoolean(2);
-                    var probeValid = reader.IsDBNull(3) || reader.GetBoolean(3);
-                    var unfilteredUnique = reader.GetBoolean(4);
-                    var nullsNotDistinctUnique = reader.GetBoolean(5);
-                    var foreignKeyChild = reader.GetBoolean(6);
-                    var referencedKey = reader.GetBoolean(7);
+                    // The record-id check, which runs first, refuses a missing table or record id.
+                    if (!reader.GetBoolean(1))
+                    {
+                        continue;
+                    }
+
+                    var target = TargetDescription(entry, field);
+                    if (!reader.GetBoolean(2))
+                    {
+                        errors.Add(
+                            $"{target}, which was not found in the database, so every anonymise of these rows would fail. Apply the host application's pending EF Core migrations, or map the member to the column it lives in."
+                        );
+                        continue;
+                    }
+
+                    var columnType = reader.GetString(3);
+                    var notNull = reader.GetBoolean(4);
+                    var probeValidForColumn = reader.IsDBNull(5) || reader.GetBoolean(5);
+                    var probeValidForStoreType = reader.IsDBNull(6) || reader.GetBoolean(6);
+                    bool? storeTypeAssignable = reader.IsDBNull(7) ? null : reader.GetBoolean(7);
+                    var unfilteredUnique = reader.GetBoolean(8);
+                    var nullsNotDistinctUnique = reader.GetBoolean(9);
+                    var foreignKeyChild = reader.GetBoolean(10);
+                    var referencedKey = reader.GetBoolean(11);
 
                     var method = field is AnonymiseLiteralField literal ? literal.Method : (AnonymiseMethod?)null;
                     var writesOneValue =
                         method is AnonymiseMethod.FixedLiteral or AnonymiseMethod.EmptyString
-                        || field is AnonymiseFactoryField factoryField && IsStaticFactory(factoryField);
-                    var target =
-                        $"Anonymise convention on {entry.EntityType.FullName}: {(field is AnonymiseFactoryField ? "[AnonymiseWith]" : "[Anonymise]")} member {field.MemberName} writes column {PostgreSqlIdentifier.Format(entry.Table)}.{PostgreSqlIdentifier.Quote(field.ColumnName)}";
+                        || field is AnonymiseFactoryField factoryField && assignments.IsStatic(factoryField);
+                    var castType = PostgresStoreTypeSql.CastType(field.StoreType);
 
-                    if (!probeValid)
+                    if (storeTypeAssignable is null)
+                    {
+                        errors.Add(
+                            $"{target}, whose model store type {castType} is not a type the database knows, so every anonymise of these rows would fail. Bring the model and the column back in line."
+                        );
+                    }
+                    else if (storeTypeAssignable is false)
+                    {
+                        errors.Add(
+                            $"{target}, whose model store type {castType} can't be assigned to its column type {columnType} (Cohort's UPDATE casts the value to the model's type, and PostgreSQL has no assignment cast from it), so every anonymise of these rows would fail. Bring the model and the column back in line."
+                        );
+                    }
+
+                    if (!probeValidForColumn || !probeValidForStoreType)
                     {
                         var value = method is AnonymiseMethod.EmptyString
                             ? "the empty string"
                             : $"the literal '{((AnonymiseLiteralField)field).Literal}'";
+                        var type = probeValidForColumn
+                            ? $"its model store type {castType}"
+                            : $"its column type {columnType}";
                         errors.Add(
-                            $"{target}, but {value} is not valid for its column type {columnType} (too long, the wrong shape, or refused by a domain check), so every anonymise of these rows would fail. Change the literal or the column."
+                            $"{target}, but {value} is not valid for {type} (too long, the wrong shape, or refused by a domain check), so every anonymise of these rows would fail. Change the literal or the column."
                         );
                     }
 
@@ -308,7 +425,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
                     )
                     {
                         errors.Add(
-                            $"{target}, which a unique index covers without the record id or a filter, but every anonymised row would get the same value, so the second row anonymised would fail. Filter the index on the anonymised-at column (WHERE \"{entry.AnonymisedAt?.AnonymisedAtColumn ?? "AnonymisedAt"}\" IS NULL), include the record id in it, or use a per-row [AnonymiseWith] factory."
+                            $"{target}, which a unique index covers without the record id or a filter, but every anonymised row would get the same value, so the second row anonymised would fail. Filter the index on the anonymised-at column (WHERE \"{entry.AnonymisedAt!.AnonymisedAtColumn}\" IS NULL), include the record id in its key, or use a per-row [AnonymiseWith] factory."
                         );
                     }
 
@@ -339,41 +456,34 @@ internal sealed class RetentionRuntimeReadinessValidator(
         }
     }
 
+    private static string TargetDescription(RetentionEntry entry, AnonymiseField field) =>
+        $"Anonymise convention on {entry.EntityType.FullName}: {(field is AnonymiseFactoryField ? "[AnonymiseWith]" : "[Anonymise]")} member {field.MemberName} writes column {PostgreSqlIdentifier.Format(entry.Table)}.{PostgreSqlIdentifier.Quote(field.ColumnName)}";
+
     /// <summary>
-    /// The text the column's input function must accept: the literal as the UPDATE sends it,
-    /// after the property's value converter. Null, factories and a literal whose provider value
-    /// isn't text have no probe; their structural checks still run.
+    /// The text the input functions must accept: the literal exactly as the UPDATE sends it.
+    /// Null, factories and a literal whose provider value isn't text have no probe; their
+    /// structural checks still run. A converter that refuses the literal would throw on every
+    /// run, so it is refused here.
     /// </summary>
-    private string? ProbeValue(RetentionEntry entry, AnonymiseField field)
+    private string? ProbeValue(RetentionEntry entry, AnonymiseField field, ISet<string> errors)
     {
         if (field is not AnonymiseLiteralField literal)
         {
             return null;
         }
 
-        string? value = literal.Method switch
+        try
         {
-            AnonymiseMethod.EmptyString => string.Empty,
-            AnonymiseMethod.FixedLiteral => literal.Literal,
-            _ => null,
-        };
-        if (value is null)
+            return assignments.ProviderLiteral(entry, literal) as string;
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
         {
+            errors.Add(
+                $"{TargetDescription(entry, field)}, but its value converter threw {exception.GetType().Name} converting the {(literal.Method is AnonymiseMethod.EmptyString ? "empty string" : $"literal '{literal.Literal}'")}, so every anonymise of these rows would fail. Change the literal or the converter."
+            );
             return null;
         }
-
-        var converter = db
-            .Model.FindEntityType(entry.EntityType)
-            ?.FindProperty(field.MemberName)
-            ?.GetTypeMapping()
-            .Converter;
-        return (converter?.ConvertToProvider(value) ?? value) as string;
     }
-
-    private bool IsStaticFactory(AnonymiseFactoryField field) =>
-        anonymiseValueFactories.FirstOrDefault(factory => factory.GetType() == field.FactoryType)
-            ?.ExecutionMode
-        is AnonymiseFactoryExecutionMode.Static;
 
     /// <summary>
     /// Cohort's catalog checks call <c>pg_input_is_valid</c>, which PostgreSQL 16 added, so
@@ -384,17 +494,12 @@ internal sealed class RetentionRuntimeReadinessValidator(
         await db.Database.OpenConnectionAsync(ct);
         try
         {
-            await using var command = new SqlParams().CreateCommand(
-                db.Database.GetDbConnection(),
-                db.Database.CurrentTransaction?.GetDbTransaction(),
-                "SELECT pg_catalog.current_setting('server_version_num')::integer, pg_catalog.current_setting('server_version')"
-            );
-            await using var reader = await command.ExecuteReaderAsync(ct);
-            await reader.ReadAsync(ct);
-            if (reader.GetInt32(0) < MinimumServerVersionNum)
+            // Npgsql reads the server's version from the startup handshake.
+            var connection = (NpgsqlConnection)db.Database.GetDbConnection();
+            if (connection.PostgreSqlVersion < MinimumServerVersion)
             {
                 throw new RetentionConfigurationException([
-                    $"Cohort requires PostgreSQL 16 or later; the database server is PostgreSQL {reader.GetString(1)}.",
+                    $"Cohort requires PostgreSQL 16 or later; the database server is PostgreSQL {connection.ServerVersion}.",
                 ]);
             }
         }

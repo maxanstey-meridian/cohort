@@ -86,7 +86,7 @@ internal sealed class RetentionSweepEngine(
                 );
                 plan.Add(SweepScope.ForSweep(entry, rule, context, timeZone));
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
                 throw;
             }

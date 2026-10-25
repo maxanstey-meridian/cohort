@@ -97,6 +97,7 @@ public static class ServiceCollectionExtensions
         services.TryAddScoped<RetentionStartupValidator>();
         services.TryAddScoped<CohortSchemaValidator>();
         services.TryAddSingleton<RetentionRuntimeReadinessState>();
+        services.TryAddScoped<AnonymiseAssignmentResolver>();
         services.TryAddScoped<RetentionRuntimeReadinessValidator>();
         services.TryAddScoped<RetentionSweepEngine>();
         services.TryAddSingleton<IRetentionSweep, ScopeOwnedRetentionSweep>();

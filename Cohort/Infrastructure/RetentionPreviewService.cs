@@ -41,6 +41,7 @@ internal sealed class RetentionPreviewService(
         await db.Database.OpenConnectionAsync(ct);
         try
         {
+            var plan = new List<SweepScope>();
             foreach (
                 var entry in registry
                     .Scan()
@@ -55,13 +56,18 @@ internal sealed class RetentionPreviewService(
                     context,
                     ct
                 );
+                plan.Add(SweepScope.ForSweep(entry, rule, context, timeZone));
+            }
+
+            // The blocking keys for every scope in one catalog read, as a run reads them.
+            foreach (var scope in await ReferencingForeignKeySql.AttachAsync(connection, plan, ct))
+            {
+                var entry = scope.Entry;
+                var rule = scope.Rule;
                 long affected = 0, held = 0, nullAnchors = 0, blocked = 0;
                 if (rule.Strategy != Strategy.Exempt)
                 {
                     var strategy = strategies[rule.Strategy];
-                    var scope = (
-                        await ReferencingForeignKeySql.AttachAsync(connection, [SweepScope.ForSweep(entry, rule, context, timeZone)], ct)
-                    )[0];
                     affected = await strategy.CountAsync(scope, SweepCount.Eligible, connection, ct);
                     held = await strategy.CountAsync(scope, SweepCount.Held, connection, ct);
                     nullAnchors = await strategy.CountAsync(scope, SweepCount.NullAnchor, connection, ct);

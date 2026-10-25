@@ -21,8 +21,23 @@ internal sealed class AnonymiseAssignmentResolver(
     {
         return entry
             .AnonymiseFields.OfType<AnonymiseFactoryField>()
-            .Any(field => ResolveFactory(field).ExecutionMode is not AnonymiseFactoryExecutionMode.Static);
+            .Any(field => !IsStatic(field));
     }
+
+    /// <summary>
+    /// Whether the field's factory runs once per batch, so that every row in it gets the same
+    /// value.
+    /// </summary>
+    internal bool IsStatic(AnonymiseFactoryField field) =>
+        ResolveFactory(field).ExecutionMode is AnonymiseFactoryExecutionMode.Static;
+
+    /// <summary>
+    /// The literal's value exactly as the UPDATE sends it: after the property's value converter,
+    /// and null for <see cref="AnonymiseMethod.Null"/>. A converter that refuses the literal
+    /// throws here as it would on every run.
+    /// </summary>
+    internal object? ProviderLiteral(RetentionEntry entry, AnonymiseLiteralField field) =>
+        ConvertAssignmentValueToProvider(entry, field, CreateLiteralAssignmentValue(field));
 
     private IReadOnlyList<AnonymiseFactoryField> GetOriginalValueFields(RetentionEntry entry)
     {
@@ -47,9 +62,7 @@ internal sealed class AnonymiseAssignmentResolver(
             values[field.MemberName] = field switch
             {
                 AnonymiseLiteralField literalField => CreateLiteralAssignmentValue(literalField),
-                AnonymiseFactoryField factoryField
-                    when ResolveFactory(factoryField).ExecutionMode
-                        is AnonymiseFactoryExecutionMode.Static => ResolveFactory(
+                AnonymiseFactoryField factoryField when IsStatic(factoryField) => ResolveFactory(
                         factoryField
                     )
                     .Create(
@@ -133,9 +146,7 @@ internal sealed class AnonymiseAssignmentResolver(
         return field switch
         {
             AnonymiseLiteralField literalField => CreateLiteralAssignmentValue(literalField),
-            AnonymiseFactoryField factoryField
-                when ResolveFactory(factoryField).ExecutionMode
-                    is not AnonymiseFactoryExecutionMode.Static => ResolveFactory(
+            AnonymiseFactoryField factoryField when !IsStatic(factoryField) => ResolveFactory(
                     factoryField
                 )
                 .Create(

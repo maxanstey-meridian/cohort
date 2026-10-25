@@ -58,6 +58,10 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
     )
     {
         EnsureHandles(scope);
+        if (count == SweepCount.Blocked)
+        {
+            return await CountBlockedAsync(scope, [], conn, ct);
+        }
 
         var parameters = new SqlParams();
         var where = count switch
@@ -68,12 +72,9 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
             SweepCount.NullAnchor => ScopeSql(scope, parameters, AnchorFilter.Null),
             // No hold exclusion: the rule keeps the row whether or not it is also held.
             SweepCount.RetainedByRule => ScopeSql(scope, parameters, AnchorFilter.OnOrAfterCutoff),
-            SweepCount.Blocked => null,
             _ => throw new ArgumentOutOfRangeException(nameof(count), count, null),
         };
-        return where is null
-            ? await CountBlockedAsync(scope, [], conn, ct)
-            : await CountWhereAsync(scope.Entry, where, parameters, conn, ct);
+        return await CountWhereAsync(scope.Entry, where, parameters, conn, ct);
     }
 
     /// <summary>
@@ -352,8 +353,7 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
                         scope.Rule.Strategy,
                         scope.Tenant.Id,
                         skippedId,
-                        result.FailedHandler!,
-                        result.Failure!,
+                        result,
                         logger,
                         ct
                     );
@@ -435,8 +435,13 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
     /// transaction: a database error in one leaves the transaction usable for the rest of
     /// the batch, and a write fails (SQLSTATE 25006) instead of committing with it. Rolling
     /// back also restores read-write mode and releases anything the handler locked.
+    /// Read-only can't reach the change tracker, so whatever a handler left tracked there
+    /// (an unsaved Add, or the entries of a save that failed) is discarded: in a
+    /// caller-transaction erasure the context is the caller's, and its next save would
+    /// commit it. Cohort loads rows untracked and a caller's context has no unsaved changes
+    /// on entry, so every change discarded is the handler's.
     /// </summary>
-    private static async Task<OnBeforeInvocationResult> InvokeOnBeforeReadOnlyAsync(
+    private async Task<OnBeforeInvocationResult> InvokeOnBeforeReadOnlyAsync(
         DbConnection conn,
         DbTransaction transaction,
         IReadOnlyList<ResolvedRetentionHandler> handlers,
@@ -455,10 +460,11 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
                 await readOnly.ExecuteNonQueryAsync(ct);
             }
 
-            result = await RetentionHandlerSupport.InvokeOnBeforeAsync(handlers, entityType, row, before, ct);
+            result = await RetentionHandlerSupport.InvokeOnBeforeAsync(db, handlers, entityType, row, before, ct);
         }
         catch
         {
+            DiscardTrackedChanges();
             // Cancelled, or Cohort's own statement failed: the batch is abandoned with the
             // original exception, so a failed rollback mustn't replace it.
             try
@@ -474,7 +480,35 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
         }
 
         await transaction.RollbackAsync(OnBeforeSavepoint, CancellationToken.None);
+        DiscardTrackedChanges();
         return result;
+    }
+
+    /// <summary>
+    /// Puts the change tracker back as OnBefore found it: added entries are detached and
+    /// changed or deleted ones get their original values back, so entities the context's
+    /// owner already tracked stay tracked.
+    /// </summary>
+    private void DiscardTrackedChanges()
+    {
+        if (!db.ChangeTracker.HasChanges())
+        {
+            return;
+        }
+
+        foreach (var entry in db.ChangeTracker.Entries().ToArray())
+        {
+            switch (entry.State)
+            {
+                case EntityState.Added:
+                    entry.State = EntityState.Detached;
+                    break;
+                case EntityState.Modified or EntityState.Deleted:
+                    entry.CurrentValues.SetValues(entry.OriginalValues);
+                    entry.State = EntityState.Unchanged;
+                    break;
+            }
+        }
     }
 
     private static bool IsIntegrityViolation(DbException exception) =>

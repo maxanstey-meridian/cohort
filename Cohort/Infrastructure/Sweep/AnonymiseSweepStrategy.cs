@@ -1,4 +1,3 @@
-using Cohort.Application;
 using Cohort.Domain;
 
 using Microsoft.EntityFrameworkCore;
@@ -9,13 +8,11 @@ namespace Cohort.Infrastructure.Sweep;
 
 internal sealed class AnonymiseSweepStrategy(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
-    IEnumerable<IAnonymiseValueFactory> anonymiseValueFactories,
+    AnonymiseAssignmentResolver assignments,
     IServiceProvider services,
     ILogger<AnonymiseSweepStrategy> logger
 ) : SweepStrategy(db, services, logger)
 {
-    private readonly AnonymiseAssignmentResolver assignments = new(db, anonymiseValueFactories);
-
     public override Strategy HandlesStrategy => Strategy.Anonymise;
 
     protected override void Validate(RetentionEntry entry)

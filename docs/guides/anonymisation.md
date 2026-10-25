@@ -41,15 +41,20 @@ public string Phone { get; set; } = "";
 Cohort checks each anonymised column in the database when the host starts and refuses to run
 if the write could never succeed:
 
-- an `EmptyString` or `FixedLiteral` value the column type won't accept: too long for a
-  `varchar(n)` or `char(n)`, not valid input for the type (a `uuid`, `jsonb` or integer column
-  behind a string converter), or refused by a domain's `CHECK`
-- `Null` into a column the database declares `NOT NULL`, directly or through its domain, even
-  when the EF model says nullable
-- `EmptyString`, `FixedLiteral` or a `Static` factory on a column covered by a unique index that
-  has no filter and doesn't include the record ID, because every anonymised row would get the
-  same value (also `Null` when the index is `NULLS NOT DISTINCT`). A unique index filtered on
-  `"AnonymisedAt" IS NULL` is fine
+- a column the database doesn't have, or one whose type the EF model's store type can't be
+  assigned to: Cohort's UPDATE casts each value, `Null` and factory values included, to the
+  model's store type, so a model that says `text` over a column migrated to `uuid` or `jsonb`
+  fails every run
+- an `EmptyString` or `FixedLiteral` value, after the property's value converter, that the
+  model's store type or the column type won't accept: too long for a `varchar(n)` or `char(n)`,
+  not valid input for the type (a `uuid`, `jsonb` or integer column behind a string converter),
+  or refused by a domain's `CHECK`; or a literal the value converter throws on
+- `Null` into a column the database declares `NOT NULL`, directly or through its domain (or a
+  domain that domain is built on), even when the EF model says nullable
+- `EmptyString`, `FixedLiteral` or a `Static` factory on a column in the key of a unique index
+  that has no filter and doesn't have the record ID in its key, because every anonymised row
+  would get the same value (also `Null` when the index is `NULLS NOT DISTINCT`). A unique index
+  filtered on `"AnonymisedAt" IS NULL` is fine, and so is a column the index only `INCLUDE`s
 - `EmptyString` or `FixedLiteral` on a foreign-key column, since a literal can't name a row
   that exists
 - any method on a column another table's foreign key references, because changing it is

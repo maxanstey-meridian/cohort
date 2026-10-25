@@ -71,13 +71,24 @@ unprotected without an error.
   rather than failing the commit.
 - `OnBeforeAsync` runs in a read-only savepoint that is always rolled back. A database error
   in a handler skips only its row instead of failing the batch, and a handler that writes
-  through the sweep's `DbContext` now fails (`sqlstate:25006`).
-- Readiness refuses an anonymise its column can never take: a literal or empty string the
-  column type rejects (length, type or domain CHECK), `Null` into a column the database
-  declares NOT NULL, one shared value (`FixedLiteral`, `EmptyString`, a `Static` factory, or
-  `Null` under `NULLS NOT DISTINCT`) on a unique index with no filter, a literal on a
-  foreign-key column, and any anonymise of a column a foreign key references. A host whose
-  anonymise failed on every run now fails at startup.
+  through the sweep's `DbContext` now fails (`sqlstate:25006`). Anything a handler leaves in
+  the change tracker, a failed `SaveChanges` included, is discarded, and unsaved changes fail
+  its row (`reason=on-before-unsaved-changes`), so a caller-transaction erasure's next save
+  can't commit them.
+- A handler's or rule provider's own cancellation (an `HttpClient` timeout, say) fails only
+  its row or entity; only the run's own cancellation stops the run.
+- A dry-run erasure doesn't settle `PartiallyFailed` for rows it predicts would be left; read
+  `Complete`. Rows a foreign key keeps from a purge get one Warning per entity naming the keys.
+- Readiness refuses an anonymise its column can never take: a column or retained table the
+  database no longer has; a model store type the column type can't be assigned to without an
+  explicit cast (any method, `Null` included); a literal or empty string, after its value
+  converter, that the model's type or the column type rejects (length, type or domain CHECK),
+  or that the converter throws on; `Null` into a column the database declares NOT NULL,
+  directly or through nested domains; one shared value (`FixedLiteral`, `EmptyString`, a
+  `Static` factory, or `Null` under `NULLS NOT DISTINCT`) on a unique index with no filter
+  whose key lacks the record id (`INCLUDE` columns don't count); a literal on a foreign-key
+  column; and any anonymise of a column a foreign key references. A host whose anonymise
+  failed on every run now fails at startup.
 - Cohort requires PostgreSQL 16 or later and refuses an older server with its own message.
 
 Upgrade: [Running Retention](https://maxanstey-meridian.github.io/cohort/guides/running-retention#upgrading-to-0-11-0),

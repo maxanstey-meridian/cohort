@@ -182,7 +182,7 @@ internal sealed class RetentionErasureService(
                     ct
                 );
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
                 throw;
             }

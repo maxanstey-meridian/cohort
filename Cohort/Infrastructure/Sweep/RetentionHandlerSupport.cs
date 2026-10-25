@@ -22,9 +22,10 @@ internal static class RetentionHandlerSupport
 
     /// <summary>
     /// The handlers registered with <c>AddRowHandler</c> for <paramref name="entityType"/>,
-    /// in priority order. Validation refuses a handler service <c>AddRowHandler</c> didn't
-    /// register (<see cref="RetentionHandlerServiceRegistrations"/>), so every handler
-    /// resolved here has its registration.
+    /// in priority order. Validation refuses a handler service in the host's
+    /// <see cref="IServiceCollection"/> that <c>AddRowHandler</c> didn't register
+    /// (<see cref="RetentionHandlerServiceRegistrations"/>); one the provider resolves
+    /// alongside them without a registration (another container's) is refused here.
     /// </summary>
     public static IReadOnlyList<ResolvedRetentionHandler> ResolveHandlers(
         IServiceProvider services,
@@ -48,7 +49,14 @@ internal static class RetentionHandlerSupport
             .Cast<object>()
             .Select(handler =>
             {
-                var registration = registrations[handler.GetType()];
+                if (!registrations.TryGetValue(handler.GetType(), out var registration))
+                {
+                    throw new RetentionConfigurationException(
+                        [RetentionHandlerServiceRegistrations.NotRegisteredError(
+                            $"Row handler {handler.GetType().FullName}, resolved as IRetentionHandler<{entityType.FullName}>,")]
+                    );
+                }
+
                 return new ResolvedRetentionHandler(
                     handler,
                     handlerInterface,
@@ -344,27 +352,29 @@ internal sealed class RetentionHandlerServiceRegistrations(IServiceCollection se
                      && descriptor.ServiceType.GetGenericTypeDefinition() == typeof(IRetentionHandler<>)))
         {
             var entity = descriptor.ServiceType.IsGenericTypeDefinition ? null : descriptor.ServiceType.GenericTypeArguments[0];
-            var handler = descriptor.IsKeyedService
-                ? null
-                : descriptor.ImplementationType ?? descriptor.ImplementationInstance?.GetType();
-            if (entity is not null && handler is not null
-                && registrations.Any(registration => registration.EntityType == entity && registration.HandlerType == handler))
-            {
-                registeredServices.Add((entity, handler));
-                continue;
-            }
-
             var service = entity is null ? "IRetentionHandler<>" : $"IRetentionHandler<{entity.FullName}>";
+
+            // Only AddRowHandler's own shape, scoped by type, runs in each batch's scope. A
+            // singleton or instance registered first makes AddRowHandler's add a no-op, so
+            // a matching registration isn't enough.
             var registered = descriptor switch
             {
                 { IsKeyedService: true } => $"A keyed {service} service",
                 { ImplementationFactory: not null } => $"A factory-registered {service} service",
-                _ => $"Row handler {handler!.FullName}, registered as {service},",
+                { ImplementationInstance: { } instance } => $"An instance of {instance.GetType().FullName}, registered as {service},",
+                { Lifetime: not ServiceLifetime.Scoped } =>
+                    $"Row handler {descriptor.ImplementationType!.FullName}, registered as a {descriptor.Lifetime.ToString().ToLowerInvariant()} {service},",
+                _ when entity is not null && registrations.Any(registration =>
+                    registration.EntityType == entity && registration.HandlerType == descriptor.ImplementationType) => null,
+                _ => $"Row handler {descriptor.ImplementationType!.FullName}, registered as {service},",
             };
-            errors.Add(
-                $"{registered} isn't registered with AddRowHandler, so it would never run while its rows are still swept or erased. "
-                    + $"Register it with services.AddRowHandler<TEntity, THandler>() instead, which lets DI construct it in each batch's scope; a row handler can't be an instance, a factory or keyed."
-            );
+            if (registered is null)
+            {
+                registeredServices.Add((entity!, descriptor.ImplementationType!));
+                continue;
+            }
+
+            errors.Add(NotRegisteredError(registered));
         }
 
         foreach (var duplicate in registeredServices.GroupBy(pair => pair).Where(group => group.Count() > 1))
@@ -376,6 +386,10 @@ internal sealed class RetentionHandlerServiceRegistrations(IServiceCollection se
 
         return errors;
     }
+
+    public static string NotRegisteredError(string registered) =>
+        $"{registered} isn't registered with AddRowHandler alone, so it wouldn't run in each batch's scope, or at all while its rows are still swept or erased. "
+            + "Register it only with services.AddRowHandler<TEntity, THandler>(), which lets DI construct it in each batch's scope; a row handler can't be a singleton, transient, an instance, a factory, keyed or open generic.";
 }
 
 internal sealed class ResolvedRetentionHandler(

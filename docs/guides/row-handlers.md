@@ -29,9 +29,10 @@ builder.Services.AddRowHandler<Attachment, DeleteAttachmentBlob>(
 ```
 
 `AddRowHandler` is the only way to register a handler. Cohort constructs it from each batch's
-DI scope, so it can't be an instance or a factory. Startup refuses an `IRetentionHandler<T>`
-service that `AddRowHandler` didn't register, or one registered twice, and names the handler
-type. On a host that was never started, every Cohort operation refuses it instead.
+DI scope, so it can't be a singleton, transient, an instance, a factory, keyed or an open
+generic. Startup refuses an `IRetentionHandler<T>` service in any other shape, including a
+singleton or instance you registered before calling `AddRowHandler` (which makes its own
+registration a no-op), or one registered twice, and names the handler type. On a host that was never started, every Cohort operation refuses it instead.
 
 Both methods are optional. The interface supplies no-op defaults.
 

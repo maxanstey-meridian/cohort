@@ -51,6 +51,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
             await schemaValidator.ValidateAsync(ct);
             await ValidateRecordIdColumnTypesAsync(ct);
             await ValidateAnonymiseTargetsAsync(ct);
+            await ValidateReferencedMarkerColumnsAsync(ct);
             // The hold check runs on its own connection, outside the caller's transaction, so its
             // success stands whatever transaction the caller is in; cache it apart from the checks
             // that read through the caller's connection.
@@ -442,6 +443,101 @@ internal sealed class RetentionRuntimeReadinessValidator(
                             $"{target}, which is referenced by a foreign key, so anonymising it would be refused while a row references it or would silently rewrite the referencing rows (ON UPDATE CASCADE or SET NULL). Anonymise the referencing rows instead, or stop referencing this column."
                         );
                     }
+                }
+            }
+
+            if (errors.Count != 0)
+            {
+                throw new RetentionConfigurationException([.. errors]);
+            }
+        }
+        finally
+        {
+            await db.Database.CloseConnectionAsync();
+        }
+    }
+
+    /// <summary>
+    /// An update must never change a key another table references: the foreign key would refuse
+    /// it while a row references it, or silently rewrite the referencing rows. The anonymise
+    /// check covers the anonymised columns; this covers the columns the update strategies always
+    /// write, the soft-delete flag and deleted-at, and the anonymised-at marker.
+    /// </summary>
+    private async Task ValidateReferencedMarkerColumnsAsync(CancellationToken ct)
+    {
+        var markers = registry
+            .Scan()
+            .Values.Where(entry => ValidatedCapabilities.ContainsKey(entry.Category))
+            .SelectMany(entry =>
+            {
+                var strategies = ValidatedCapabilities[entry.Category].Strategies;
+                var columns = new List<(RetentionEntry Entry, string Strategy, string Member, string Column)>();
+                if (strategies.Contains(Strategy.SoftDelete) && entry.SoftDelete is { } softDelete)
+                {
+                    columns.Add((entry, "soft-deleting", softDelete.IsDeletedMember, softDelete.IsDeletedColumn));
+                    if (softDelete is { DeletedAtMember: { } member, DeletedAtColumn: { } column })
+                    {
+                        columns.Add((entry, "soft-deleting", member, column));
+                    }
+                }
+
+                if (strategies.Contains(Strategy.Anonymise) && entry.AnonymisedAt is { } anonymisedAt)
+                {
+                    columns.Add((entry, "anonymising", anonymisedAt.AnonymisedAtMember, anonymisedAt.AnonymisedAtColumn));
+                }
+
+                return columns;
+            })
+            .ToArray();
+        if (markers.Length == 0)
+        {
+            return;
+        }
+
+        await db.Database.OpenConnectionAsync(ct);
+        try
+        {
+            await using var command = new SqlParams
+            {
+                ["schemas"] = markers.Select(marker => marker.Entry.Table.Schema).ToArray(),
+                ["tables"] = markers.Select(marker => marker.Entry.Table.Name).ToArray(),
+                ["columns"] = markers.Select(marker => marker.Column).ToArray(),
+            }.CreateCommand(
+                db.Database.GetDbConnection(),
+                db.Database.CurrentTransaction?.GetDbTransaction(),
+                """
+                SELECT requested.ordinal
+                FROM ROWS FROM (
+                    pg_catalog.unnest(@schemas),
+                    pg_catalog.unnest(@tables),
+                    pg_catalog.unnest(@columns)
+                ) WITH ORDINALITY AS requested(schema_name, table_name, column_name, ordinal)
+                JOIN pg_catalog.pg_namespace namespace ON namespace.nspname = requested.schema_name
+                JOIN pg_catalog.pg_class relation
+                  ON relation.relnamespace = namespace.oid AND relation.relname = requested.table_name
+                JOIN pg_catalog.pg_attribute attribute
+                  ON attribute.attrelid = relation.oid
+                 AND attribute.attname = requested.column_name
+                 AND attribute.attnum > 0
+                 AND NOT attribute.attisdropped
+                WHERE EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_constraint foreign_key
+                    WHERE foreign_key.contype = 'f'
+                      AND foreign_key.confrelid = relation.oid
+                      AND attribute.attnum = ANY(foreign_key.confkey)
+                )
+                """
+            );
+
+            var errors = new SortedSet<string>(StringComparer.Ordinal);
+            await using (var reader = await command.ExecuteReaderAsync(ct))
+            {
+                while (await reader.ReadAsync(ct))
+                {
+                    var (entry, strategy, member, column) = markers[(int)reader.GetInt64(0) - 1];
+                    errors.Add(
+                        $"Retained entity {entry.EntityType.FullName}: member {member} writes column {PostgreSqlIdentifier.Format(entry.Table)}.{PostgreSqlIdentifier.Quote(column)}, which is referenced by a foreign key, so {strategy} a row would be refused while a row references it or would silently rewrite the referencing rows (ON UPDATE CASCADE or SET NULL). Stop referencing this column."
+                    );
                 }
             }
 

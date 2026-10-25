@@ -650,6 +650,68 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Readiness_refuses_a_referenced_anonymised_at_marker()
+    {
+        // Every anonymise writes the marker, so a key over it changes on every row.
+        await using var database = await AnonymiseTargetDatabaseAsync(
+            """
+            ALTER TABLE public.anonymise_null_records ADD CONSTRAINT anonymise_null_marker UNIQUE ("Id", "AnonymisedAt");
+            CREATE TABLE public.anonymise_marker_users (
+                "RecordId" uuid,
+                "RecordAnonymisedAt" timestamp with time zone,
+                FOREIGN KEY ("RecordId", "RecordAnonymisedAt")
+                    REFERENCES public.anonymise_null_records ("Id", "AnonymisedAt")
+            );
+            """
+        );
+        await using var provider = BuildAnonymiseTargetProvider(database.ConnectionString);
+
+        var errors = await ReadinessErrorsAsync(provider);
+
+        errors.Should().ContainSingle(error =>
+            error.Contains(typeof(AnonymiseNullRecord).FullName!, StringComparison.Ordinal)
+            && error.Contains("member AnonymisedAt", StringComparison.Ordinal)
+            && error.Contains("referenced by a foreign key", StringComparison.Ordinal)
+        );
+    }
+
+    [Fact]
+    public async Task Readiness_refuses_a_referenced_soft_delete_flag()
+    {
+        // "Children may only reference live parents": a soft-delete of a row with children would
+        // be refused row by row.
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await using (var connection = new NpgsqlConnection(database.ConnectionString))
+        {
+            await connection.OpenAsync();
+            await using var command = new NpgsqlCommand(
+                """
+                ALTER TABLE public.soft_delete_records ADD CONSTRAINT soft_delete_live UNIQUE ("Id", "IsDeleted");
+                CREATE TABLE public.soft_delete_children (
+                    "ParentId" uuid,
+                    "ParentIsDeleted" boolean,
+                    FOREIGN KEY ("ParentId", "ParentIsDeleted")
+                        REFERENCES public.soft_delete_records ("Id", "IsDeleted")
+                );
+                """,
+                connection
+            );
+            await command.ExecuteNonQueryAsync();
+        }
+
+        using var host = new CohortTestHost(database.ConnectionString);
+
+        var act = () => host.RunSweepAsync(new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()));
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle(error =>
+            error.Contains(typeof(SoftDeleteRecord).FullName!, StringComparison.Ordinal)
+            && error.Contains("member IsDeleted", StringComparison.Ordinal)
+            && error.Contains("soft-deleting", StringComparison.Ordinal)
+        );
+    }
+
+    [Fact]
     public async Task Readiness_refuses_null_into_a_column_the_database_declares_not_null()
     {
         // The model says nullable; the database was changed underneath it.

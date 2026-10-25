@@ -1,6 +1,7 @@
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
+using Cohort.Infrastructure.Sweep;
 using Cohort.Sample.Entities;
 
 using Microsoft.Extensions.Configuration;
@@ -74,6 +75,10 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     [InlineData("instance")]
     [InlineData("factory")]
     [InlineData("duplicate")]
+    [InlineData("singleton-first")]
+    [InlineData("instance-first")]
+    [InlineData("keyed")]
+    [InlineData("open-generic")]
     public async Task Validation_Refuses_A_Handler_Service_Not_Registered_With_AddRowHandler(string registration)
     {
         var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder();
@@ -98,7 +103,22 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
                 break;
             case "duplicate":
                 builder.Services.AddRowHandler<Note, UnconstructableNoteHandler>();
+                builder.Services.AddScoped<IRetentionHandler<Note>, UnconstructableNoteHandler>();
+                break;
+            // A singleton or instance registered first makes AddRowHandler's own add a no-op.
+            case "singleton-first":
                 builder.Services.AddSingleton<IRetentionHandler<Note>, UnconstructableNoteHandler>();
+                builder.Services.AddRowHandler<Note, UnconstructableNoteHandler>();
+                break;
+            case "instance-first":
+                builder.Services.AddSingleton<IRetentionHandler<Note>>(new InstanceNoteHandler());
+                builder.Services.AddRowHandler<Note, InstanceNoteHandler>();
+                break;
+            case "keyed":
+                builder.Services.AddKeyedScoped<IRetentionHandler<Note>, UnconstructableNoteHandler>("k");
+                break;
+            case "open-generic":
+                builder.Services.AddScoped(typeof(IRetentionHandler<>), typeof(OpenHandler<>));
                 break;
         }
 
@@ -109,23 +129,45 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
             host.Services.GetRequiredService<IRetentionSweep>()
                 .ExecuteAsync(RetentionSweepRequest.Tenantless(dryRun: true));
 
+        var named = registration switch
+        {
+            "factory" or "keyed" => $"IRetentionHandler<{typeof(Note).FullName}>",
+            "open-generic" => "IRetentionHandler<>",
+            "instance" or "instance-first" => typeof(InstanceNoteHandler).FullName!,
+            _ => typeof(UnconstructableNoteHandler).FullName!,
+        };
         foreach (var act in new[] { start, sweep })
         {
             var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
             exception
                 .Which.Errors.Should()
                 .ContainSingle(error =>
-                    error.Contains(registration == "factory"
-                            ? $"IRetentionHandler<{typeof(Note).FullName}>"
-                            : registration == "instance"
-                                ? typeof(InstanceNoteHandler).FullName!
-                                : typeof(UnconstructableNoteHandler).FullName!,
-                        StringComparison.Ordinal)
+                    error.Contains(named, StringComparison.Ordinal)
                     && error.Contains("AddRowHandler", StringComparison.Ordinal)
                 );
         }
 
         UnconstructableNoteHandler.Constructed.Should().BeFalse();
+    }
+
+    // A container can resolve a handler the IServiceCollection scan never saw; resolving it
+    // refuses it the same way instead of failing on a missing registration.
+    [Fact]
+    public void Resolving_A_Handler_Without_A_Registration_Refuses_It()
+    {
+        var services = new ServiceCollection();
+        services.AddRowHandler<Note, InstanceNoteHandler>();
+        services.AddScoped<IRetentionHandler<Note>, StrayNoteHandler>();
+        using var provider = services.BuildServiceProvider();
+        using var scope = provider.CreateScope();
+
+        var act = () => RetentionHandlerSupport.ResolveHandlers(scope.ServiceProvider, typeof(Note));
+
+        act.Should().Throw<RetentionConfigurationException>()
+            .Which.Errors.Should().ContainSingle(error =>
+                error.Contains(typeof(StrayNoteHandler).FullName!, StringComparison.Ordinal)
+                && error.Contains("AddRowHandler", StringComparison.Ordinal)
+            );
     }
 
     private sealed class UnconstructableNoteHandler : IRetentionHandler<Note>
@@ -140,6 +182,10 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     private sealed class InstanceNoteHandler : IRetentionHandler<Note>;
+
+    private sealed class StrayNoteHandler : IRetentionHandler<Note>;
+
+    private sealed class OpenHandler<TEntity> : IRetentionHandler<TEntity>;
 
     private sealed class MultiStrategyRuleProvider : IRetentionRuleProvider
     {

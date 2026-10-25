@@ -87,9 +87,11 @@ unprotected without an error.
   from the handler scope, not the caller's, so caller-scoped state such as a scoped "current
   user" isn't there; what your `IRetentionExecutionScope` sets up, or an `AsyncLocal`, still
   flows. The execution scope now also runs for each such batch.
-- Registering an `IRetentionHandler<T>` without `AddRowHandler` (by type, instance, factory or
-  key), or registering one handler twice, fails startup and names the handler; on a host that
-  was never started, every Cohort operation refuses it.
+- Registering an `IRetentionHandler<T>` that `AddRowHandler` didn't (by type without it; as
+  a singleton, transient or instance, even before `AddRowHandler`; by factory, key or open
+  generic `IRetentionHandler<>`), or registering one handler twice, fails startup and names the handler; on
+  a host that was never started, every Cohort operation refuses it. An open-generic handler
+  that used to run for every entity is refused: register it per entity.
 - `ErasureTransaction.Caller` and `IRetentionDeletion` detect changes before refusing a
   context with unsaved changes, so an edit made with automatic change detection off is
   refused too.
@@ -107,7 +109,8 @@ unprotected without an error.
   directly or through nested domains; one shared value (`FixedLiteral`, `EmptyString`, a
   `Static` factory, or `Null` under `NULLS NOT DISTINCT`) on a unique index with no filter
   whose key lacks the record id (`INCLUDE` columns don't count); a literal on a foreign-key
-  column; and any anonymise of a column a foreign key references. A host whose anonymise
+  column; and any anonymise of a column a foreign key references, or a soft-delete flag,
+  deleted-at or anonymised-at marker one references. A host whose anonymise
   failed on every run now fails at startup.
 - Cohort requires PostgreSQL 16 or later and refuses an older server with its own message.
 

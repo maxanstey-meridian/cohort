@@ -380,7 +380,7 @@ internal sealed class RetentionRun(
     /// raises for RESTRICT and NO ACTION alike, directly or through a cascade) depends on each
     /// row's children, and mixed refusals mean row-level causes, so those rows are only blocked
     /// and the run moves on. An update never changes a referenced key (readiness refuses
-    /// anonymising one), so a foreign key refusing it refuses the value the rule writes.
+    /// one an anonymise, a soft-delete or the anonymised-at marker writes), so a foreign key refusing it refuses the value the rule writes.
     /// </summary>
     private static DbException? SchemaWideRefusal(Strategy strategy, IReadOnlyList<DbException> failures)
     {

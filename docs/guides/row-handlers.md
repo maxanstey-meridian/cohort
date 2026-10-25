@@ -32,7 +32,15 @@ builder.Services.AddRowHandler<Attachment, DeleteAttachmentBlob>(
 DI scope, so it can't be a singleton, transient, an instance, a factory, keyed or an open
 generic. Startup refuses an `IRetentionHandler<T>` service in any other shape, including a
 singleton or instance you registered before calling `AddRowHandler` (which makes its own
-registration a no-op), or one registered twice, and names the handler type. On a host that was never started, every Cohort operation refuses it instead.
+registration a no-op), or one registered twice, and names the handler type. On a host that
+was never started, every Cohort operation refuses it instead.
+
+Cohort supports handlers registered through `IServiceCollection` only. These checks read
+the service collection, so a handler registered straight into a third-party container's own
+builder (Autofac's `ContainerBuilder`, say) is out of their reach. For an entity that has no
+`AddRowHandler` registration, it would never run while its rows are swept or erased.
+Register handlers with `AddRowHandler`, even when a third-party container builds the
+provider.
 
 Both methods are optional. The interface supplies no-op defaults.
 

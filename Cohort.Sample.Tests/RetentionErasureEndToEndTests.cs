@@ -17,11 +17,12 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     : IntegrationTestBase(fixture)
 {
     [Fact]
-    public async Task Tenant_Erasure_Leaves_Tenantless_Subject_Data_Untouched_And_Unaudited()
+    public async Task Tenanted_Erasure_Leaves_Tenantless_Rows_And_Tenantless_Erasure_Erases_Them()
     {
         var tenantId = Guid.NewGuid();
         var subject = Guid.NewGuid();
         var recordId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
 
         await using (var db = Host.CreateDbContext())
@@ -56,11 +57,92 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         (await LoadRowDetailsAsync(result.SweepId))
             .Should()
             .NotContain(detail => detail.EntityType == typeof(TenantlessLog).FullName);
+        await using (var verifyTenanted = Host.CreateDbContext())
+        {
+            var tenantless = await verifyTenanted.TenantlessLogs.SingleAsync(log => log.Id == recordId);
+            tenantless.Payload.Should().Be("tenantless-erasure-payload");
+            tenantless.SubjectId.Should().Be(subject);
+        }
 
+        // A tenantless request reaches the tenantless row, and only it.
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note
+                {
+                    Id = noteId,
+                    TenantId = tenantId,
+                    CreatedAt = EligibleErasureCreatedAt(asOf),
+                    Body = "tenanted-subject-note",
+                    SubjectId = subject,
+                }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        var tenantlessResult = await Host.RunErasureAsync(
+            RetentionErasureRequest.Tenantless(new ErasureScope("user", subject), asOf)
+        );
+
+        tenantlessResult.EntityFailures.Should().BeEmpty();
+        tenantlessResult.Counts.Should().ContainSingle(count => count.Affected > 0)
+            .Which.EntityType.Should().Be(typeof(TenantlessLog));
+        await using (var verify = Host.CreateDbContext())
+        {
+            (await verify.TenantlessLogs.AnyAsync(log => log.Id == recordId)).Should().BeFalse();
+            (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
+        }
+
+        var run = await LoadRunAsync(tenantlessResult.SweepId);
+        run.TenantId.Should().Be(Guid.Empty);
+        run.Trigger.Should().Be(SweepTriggerKind.Erasure);
+        (await LoadErasureSubjectKindAsync(tenantlessResult.SweepId)).Should().Be("user");
+        (await LoadSummariesAsync(tenantlessResult.SweepId))
+            .Should()
+            .ContainSingle(summary => summary.EntityType == typeof(TenantlessLog).FullName)
+            .Which.Affected.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task Tenantless_Erasure_Leaves_A_Row_Under_A_Tenantless_Hold()
+    {
+        var subject = Guid.NewGuid();
+        var erasedId = Guid.NewGuid();
+        var heldId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.TenantlessLogs.AddRange(
+                new TenantlessLog { Id = erasedId, CreatedAt = EligibleErasureCreatedAt(asOf), Payload = "erased", SubjectId = subject },
+                new TenantlessLog { Id = heldId, CreatedAt = EligibleErasureCreatedAt(asOf), Payload = "held", SubjectId = subject }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        await Host.RunWithServicesAsync(services =>
+            services.GetRequiredService<IRetentionHoldsRepository>().CreateAsync(
+                new RetentionHoldRequest(
+                    Guid.NewGuid(),
+                    RetentionEntityIdentity.For<TenantlessLog>(),
+                    heldId.ToString("D"),
+                    null,
+                    "tenantless litigation hold",
+                    DateTimeOffset.UtcNow.AddMinutes(-1)
+                ),
+                CancellationToken.None
+            )
+        );
+
+        var result = await Host.RunErasureAsync(
+            RetentionErasureRequest.Tenantless(new ErasureScope("user", subject), asOf)
+        );
+
+        var count = result.Counts.Should().ContainSingle(count => count.EntityType == typeof(TenantlessLog)).Subject;
+        count.Affected.Should().Be(1);
+        count.HeldCount.Should().Be(1);
         await using var verify = Host.CreateDbContext();
-        var tenantless = await verify.TenantlessLogs.SingleAsync(log => log.Id == recordId);
-        tenantless.Payload.Should().Be("tenantless-erasure-payload");
-        tenantless.SubjectId.Should().Be(subject);
+        (await verify.TenantlessLogs.Select(log => log.Id).ToListAsync()).Should().Equal(heldId);
     }
 
     [Fact]
@@ -581,9 +663,70 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
         var exception = await act.Should().ThrowAsync<InvalidOperationException>();
         exception.Which.Message.Should().Be(
-            "Erasure subject kind 'customer' isn't declared by any retained entity's [ErasureSubject], so the erasure would match nothing. Declared kinds: 'person', 'user'."
+            "Erasure subject kind 'customer' isn't declared by any tenanted retained entity's [ErasureSubject], so the erasure would match nothing. Declared kinds: 'person', 'user'."
         );
         (await CountRunsAsync(tenantId)).Should().Be(0);
+    }
+
+    [Fact]
+    public async Task A_Kind_Only_Tenantless_Entities_Declare_Is_Refused_For_A_Tenanted_Erasure_And_Erased_By_A_Tenantless_One()
+    {
+        var tenantId = Guid.NewGuid();
+        var deviceId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        await using var services = BuildPredicateResolutionServiceProvider<TenantlessKindDbContext>(
+            database.ConnectionString,
+            new StaticCategoryRepository(
+                new Dictionary<string, ITestRetentionRule>
+                {
+                    ["kind-scope"] = new StaticTestRetentionRule(
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)
+                    ),
+                }
+            )
+        );
+        await using (var seedScope = services.CreateAsyncScope())
+        {
+            var db = seedScope.ServiceProvider.GetRequiredService<TenantlessKindDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.DeviceLogs.Add(new TenantlessDeviceLog { Id = Guid.NewGuid(), DeviceId = deviceId, CreatedAt = asOf.AddDays(-1) });
+            await db.SaveChangesAsync();
+        }
+
+        var tenanted = async () =>
+        {
+            await using var scope = services.CreateAsyncScope();
+            await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(
+                    new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                    new ErasureScope("device", deviceId),
+                    asOf
+                )
+            );
+        };
+
+        (await tenanted.Should().ThrowAsync<InvalidOperationException>()).Which.Message.Should().Be(
+            "Erasure subject kind 'device' isn't declared by any tenanted retained entity's [ErasureSubject], so the erasure would match nothing. Declared kinds: 'user'."
+        );
+        await using (var verifyScope = services.CreateAsyncScope())
+        {
+            var db = verifyScope.ServiceProvider.GetRequiredService<TenantlessKindDbContext>();
+            (await db.Database.SqlQuery<long>($"""SELECT COUNT(*) AS "Value" FROM "sweep_run" """).SingleAsync())
+                .Should().Be(0);
+        }
+
+        ErasureResult result;
+        await using (var scope = services.CreateAsyncScope())
+        {
+            result = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenantless(new ErasureScope("device", deviceId), asOf)
+            );
+        }
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(TenantlessDeviceLog))
+            .Which.Affected.Should().Be(1);
     }
 
     [Fact]
@@ -745,10 +888,8 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
         await using (var scope = services.CreateAsyncScope())
         {
-            await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().EraseAsync(
-                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope("email", "bob@x.com"),
-                asOf
+            await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), new ErasureScope("email", "bob@x.com"), asOf)
             );
         }
 
@@ -803,10 +944,8 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
                 await using (var scope = services.CreateAsyncScope())
         {
-            var result = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().EraseAsync(
-                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope("email", "ABCDEFGH-2"),
-                asOf
+            var result = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), new ErasureScope("email", "ABCDEFGH-2"), asOf)
             );
             result.EntityFailures.Should().BeEmpty();
         }
@@ -847,10 +986,8 @@ await using var verifyScope = services.CreateAsyncScope();
 
         await using (var scope = services.CreateAsyncScope())
         {
-            var result = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().EraseAsync(
-                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope("user", subjectId),
-                asOf
+            var result = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), new ErasureScope("user", subjectId), asOf)
             );
             // 22001: string_data_right_truncation, "value too long for type character varying(8)".
             result.EntityFailures.Should().ContainSingle().Which.Should().Contain("code=sqlstate:22001");
@@ -889,6 +1026,7 @@ await using var verifyScope = services.CreateAsyncScope();
                 }
             )
         );
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<ModelVariantDbContext>();
         await using var provider = services.BuildServiceProvider(validateScopes: true);
         var tenantId = Guid.NewGuid();
@@ -910,7 +1048,7 @@ await using var verifyScope = services.CreateAsyncScope();
         await using (var scope = provider.CreateAsyncScope())
         {
             await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>()
-                .EraseAsync(tenant, new ErasureScope("user", subjectId), asOf);
+                .ExecuteAsync(RetentionErasureRequest.Tenanted(tenant, new ErasureScope("user", subjectId), asOf));
         }
 
         ErasureResult extended;
@@ -918,7 +1056,7 @@ await using var verifyScope = services.CreateAsyncScope();
         await using (var scope = provider.CreateAsyncScope())
         {
             extended = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>()
-                .EraseAsync(tenant, new ErasureScope("user", subjectId), asOf);
+                .ExecuteAsync(RetentionErasureRequest.Tenanted(tenant, new ErasureScope("user", subjectId), asOf));
         }
 
         extended.EntityFailures.Should().BeEmpty();
@@ -965,10 +1103,8 @@ await using var verifyScope = services.CreateAsyncScope();
             {
                 result = await executionScope.ServiceProvider
                     .GetRequiredService<IRetentionErasureService>()
-                    .EraseAsync(
-                        new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                        new ErasureScope("user", subjectId),
-                        asOf
+                    .ExecuteAsync(
+                        RetentionErasureRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), new ErasureScope("user", subjectId), asOf)
                     );
             }
 
@@ -1030,10 +1166,8 @@ await using var verifyScope = services.CreateAsyncScope();
             {
                 result = await executionScope.ServiceProvider
                     .GetRequiredService<IRetentionErasureService>()
-                    .EraseAsync(
-                        new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                        new ErasureScope("user", subjectId),
-                        asOf
+                    .ExecuteAsync(
+                        RetentionErasureRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), new ErasureScope("user", subjectId), asOf)
                     );
             }
 
@@ -1097,10 +1231,8 @@ await using var verifyScope = services.CreateAsyncScope();
         ErasureResult result;
         await using (var scope = services.CreateAsyncScope())
         {
-            result = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().EraseAsync(
-                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope("user", subjectId),
-                asOf
+            result = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), new ErasureScope("user", subjectId), asOf)
             );
         }
 
@@ -1237,10 +1369,8 @@ await using var verifyScope = services.CreateAsyncScope();
         {
             var erasureService =
                 scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
-            previewResult = await erasureService.EraseAsync(
-                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true, dryRun: true),
-                asOf
+            previewResult = await erasureService.ExecuteAsync(
+                RetentionErasureRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true, dryRun: true), asOf)
             );
         }
 
@@ -1281,10 +1411,8 @@ await using var verifyScope = services.CreateAsyncScope();
         {
             var erasureService =
                 scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
-            liveResult = await erasureService.EraseAsync(
-                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
-                asOf
+            liveResult = await erasureService.ExecuteAsync(
+                RetentionErasureRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true), asOf)
             );
         }
 
@@ -1372,10 +1500,8 @@ await using var verifyScope = services.CreateAsyncScope();
         {
             var erasureService =
                 scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
-            result = await erasureService.EraseAsync(
-                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
-                asOf
+            result = await erasureService.ExecuteAsync(
+                RetentionErasureRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true), asOf)
             );
         }
 
@@ -1538,10 +1664,8 @@ await using var verifyScope = services.CreateAsyncScope();
         {
             var erasureService =
                 scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
-            result = await erasureService.EraseAsync(
-                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
-                asOf
+            result = await erasureService.ExecuteAsync(
+                RetentionErasureRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true), asOf)
             );
         }
 
@@ -1676,6 +1800,283 @@ await using var verifyScope = services.CreateAsyncScope();
                 CancellationToken.None
             );
         });
+    }
+
+    [Fact]
+    public async Task A_Real_Erasure_Refuses_A_Time_Later_Than_The_Database_Clock_Before_Any_Run()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        await using (var db = Host.CreateDbContext())
+        {
+            var databaseNow = await db.Database
+                .SqlQuery<DateTimeOffset>($"""SELECT statement_timestamp() AS "Value" """)
+                .SingleAsync();
+            // A 30-day legal minimum still blocks this note for ten days by the database's clock.
+            db.Notes.Add(new Note { Id = noteId, TenantId = tenant.Id, SubjectId = subject, CreatedAt = databaseNow.AddDays(-20), Body = "legal-min" });
+            await db.SaveChangesAsync();
+        }
+
+        using var host = new CohortTestHost(
+            GetConnectionString(),
+            CreateErasureCategoryRepository(
+                shortLivedRule: new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge, LegalMin: new RetentionPeriod(Days: 30))
+            )
+        );
+        var erase = () => host.RunErasureAsync(
+            tenant,
+            new ErasureScope("user", subject, allowSoftDeleteAsErasure: true),
+            DateTimeOffset.UtcNow.AddDays(15)
+        );
+
+        (await erase.Should().ThrowAsync<ArgumentOutOfRangeException>())
+            .Which.Message.Should().StartWith("A run that changes rows can't use a time later than the database's");
+        (await CountRunsAsync(tenant.Id)).Should().Be(0);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Caller_Transaction_Erasure_Commits_With_The_Callers_Own_Change()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, markerId) = await SeedCallerErasureAsync(tenant.Id, subject);
+        var observer = new LedgerVisibilityObserver(ConnectionString);
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configureServices: services => services.AddSingleton<IRetentionAuditObserver>(observer)
+        );
+
+        var result = await host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            await using var transaction = await db.Database.BeginTransactionAsync();
+            (await db.Notes.SingleAsync(note => note.Id == markerId)).Body = "marker-after";
+            await db.SaveChangesAsync();
+
+            var erased = await services.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller)
+            );
+
+            // Nothing is visible, or told to observers, before the caller commits.
+            observer.Seen.Should().BeEmpty();
+            (await CountRunsAsync(tenant.Id)).Should().Be(0);
+            await transaction.CommitAsync();
+            return erased;
+        });
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note)).Which.Affected.Should().Be(1);
+        await using (var verify = Host.CreateDbContext())
+        {
+            (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeFalse();
+            (await verify.Notes.SingleAsync(note => note.Id == markerId)).Body.Should().Be("marker-after");
+        }
+
+        (await LoadRunStatusAsync(result.SweepId)).Should().Be(SweepRunStatus.Succeeded);
+        observer.Seen.Select(seen => seen.Event).Should().StartWith(new[] { "Started" }).And.EndWith("Completed");
+        // Each delivery, Started included, already saw the committed, settled run from
+        // another connection.
+        observer.Seen.Should().OnlyContain(seen => seen.RunStatus == SweepRunStatus.Succeeded);
+    }
+
+    [Fact]
+    public async Task Caller_Transaction_Rollback_Leaves_No_Erasure_And_No_Ledger()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, markerId) = await SeedCallerErasureAsync(tenant.Id, subject);
+        var observer = new LedgerVisibilityObserver(ConnectionString);
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configureServices: services => services.AddSingleton<IRetentionAuditObserver>(observer)
+        );
+
+        await host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            var erasure = services.GetRequiredService<IRetentionErasureService>();
+            var request = RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller);
+
+            await using (var rolledBack = await db.Database.BeginTransactionAsync())
+            {
+                await erasure.ExecuteAsync(request);
+                await rolledBack.RollbackAsync();
+            }
+
+            // Disposed without commit or rollback: no event fires.
+            await using (var abandoned = await db.Database.BeginTransactionAsync())
+            {
+                await erasure.ExecuteAsync(request);
+            }
+
+            // A later commit on the same connection (Npgsql recycles the transaction object)
+            // must not deliver the abandoned erasure's events.
+            await using var later = await db.Database.BeginTransactionAsync();
+            (await db.Notes.SingleAsync(note => note.Id == markerId)).Body = "marker-after";
+            await db.SaveChangesAsync();
+            await later.CommitAsync();
+        });
+
+        observer.Seen.Should().BeEmpty();
+        (await CountRunsAsync(tenant.Id)).Should().Be(0);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeTrue();
+        (await verify.Notes.SingleAsync(note => note.Id == markerId)).Body.Should().Be("marker-after");
+    }
+
+    [Fact]
+    public async Task Caller_Mode_Refuses_Without_A_Usable_Open_Transaction()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, markerId) = await SeedCallerErasureAsync(tenant.Id, subject);
+        var request = RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller);
+
+        await Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            var erasure = services.GetRequiredService<IRetentionErasureService>();
+
+            var withoutTransaction = () => erasure.ExecuteAsync(request);
+            (await withoutTransaction.Should().ThrowAsync<InvalidOperationException>()).Which.Message.Should().Be(
+                "ErasureTransaction.Caller needs an open transaction on the scoped DbContext."
+            );
+
+            await using (var transaction = await db.Database.BeginTransactionAsync())
+            {
+                (await db.Notes.SingleAsync(note => note.Id == markerId)).Body = "unsaved";
+                var withUnsavedChanges = () => erasure.ExecuteAsync(request);
+                (await withUnsavedChanges.Should().ThrowAsync<InvalidOperationException>()).Which.Message.Should().Be(
+                    "ErasureTransaction.Caller needs a DbContext with no unsaved changes; save or discard them before erasing."
+                );
+                db.ChangeTracker.Clear();
+            }
+
+            await using (var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.RepeatableRead))
+            {
+                var underSnapshot = () => erasure.ExecuteAsync(request);
+                (await underSnapshot.Should().ThrowAsync<InvalidOperationException>()).Which.Message.Should().StartWith(
+                    "ErasureTransaction.Caller needs a READ COMMITTED transaction, but the caller's is REPEATABLE READ"
+                );
+            }
+        });
+
+        (await CountRunsAsync(tenant.Id)).Should().Be(0);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Caller_Mode_Holds_Entity_Locks_Until_Commit()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var (erasedId, _) = await SeedCallerErasureAsync(tenant.Id, subject);
+
+        var sweep = await Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            await using var transaction = await db.Database.BeginTransactionAsync();
+            await services.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller)
+            );
+            var callerBackend = await db.Database.SqlQuery<int>($"""SELECT pg_backend_pid() AS "Value" """).SingleAsync();
+
+            // The erased note is also due for an ordinary sweep, which must wait for the
+            // caller's entity lock rather than act on the uncommitted erasure.
+            var concurrentSweep = Host.RunSweepAsync(tenant, asOf);
+            await WaitForBlockedRowMutationAsync(callerBackend);
+            concurrentSweep.IsCompleted.Should().BeFalse();
+
+            await transaction.CommitAsync();
+            return await concurrentSweep.WaitAsync(TimeSpan.FromSeconds(10));
+        });
+
+        // Once it can lock the row, the sweep finds the erasure already took it.
+        sweep.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note)).Which.Affected.Should().Be(0);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task Caller_Mode_Dry_Run_Counts_Without_Changing_Rows()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, _) = await SeedCallerErasureAsync(tenant.Id, subject);
+
+        var result = await Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            await using var transaction = await db.Database.BeginTransactionAsync();
+            var dryRun = await services.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(
+                    tenant,
+                    new ErasureScope("user", subject, dryRun: true, allowSoftDeleteAsErasure: true),
+                    transaction: ErasureTransaction.Caller
+                )
+            );
+            await transaction.CommitAsync();
+            return dryRun;
+        });
+
+        result.DryRun.Should().BeTrue();
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note)).Which.Affected.Should().Be(1);
+        (await LoadRunStatusAsync(result.SweepId)).Should().Be(SweepRunStatus.Succeeded);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeTrue();
+    }
+
+    private static ErasureScope CallerScope(Guid subject) =>
+        new("user", subject, allowSoftDeleteAsErasure: true);
+
+    /// <summary>One note to erase for the subject and one marker note the caller changes.</summary>
+    private async Task<(Guid ErasedId, Guid MarkerId)> SeedCallerErasureAsync(Guid tenantId, Guid subject)
+    {
+        var erasedId = Guid.NewGuid();
+        var markerId = Guid.NewGuid();
+        var createdAt = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero).AddDays(-45);
+        await using var db = Host.CreateDbContext();
+        db.Notes.AddRange(
+            new Note { Id = erasedId, TenantId = tenantId, SubjectId = subject, CreatedAt = createdAt, Body = "erase-me" },
+            new Note { Id = markerId, TenantId = tenantId, CreatedAt = DateTimeOffset.UtcNow, Body = "marker-before" }
+        );
+        await db.SaveChangesAsync();
+        return (erasedId, markerId);
+    }
+
+    private async Task<SweepRunStatus> LoadRunStatusAsync(Guid sweepId)
+    {
+        await using var db = Host.CreateDbContext();
+        return (SweepRunStatus)await db.Database
+            .SqlQuery<int>($"""SELECT "Status" AS "Value" FROM "sweep_run" WHERE "SweepId" = {sweepId}""")
+            .SingleAsync();
+    }
+
+    /// <summary>
+    /// Records each event with the run's status as another connection sees it at delivery,
+    /// which shows whether the ledger had committed by then.
+    /// </summary>
+    private sealed class LedgerVisibilityObserver(string connectionString) : IRetentionAuditObserver
+    {
+        private readonly System.Collections.Concurrent.ConcurrentQueue<(string Event, SweepRunStatus? RunStatus)> seen = new();
+
+        public IReadOnlyList<(string Event, SweepRunStatus? RunStatus)> Seen => [.. seen];
+
+        public async Task OnCommittedAsync(SweepEvent evt, CancellationToken ct)
+        {
+            await using var connection = new NpgsqlConnection(connectionString);
+            await connection.OpenAsync(ct);
+            await using var command = connection.CreateCommand();
+            command.CommandText = """SELECT "Status" FROM "sweep_run" WHERE "SweepId" = @sweepId""";
+            command.Parameters.AddWithValue("sweepId", evt.SweepId);
+            var status = await command.ExecuteScalarAsync(ct);
+            seen.Enqueue((evt.GetType().Name, status is int value ? (SweepRunStatus)value : null));
+        }
     }
 
     private static DateTimeOffset EligibleErasureCreatedAt(DateTimeOffset asOf)
@@ -1967,6 +2368,7 @@ await using var verifyScope = services.CreateAsyncScope();
         services.AddLogging();
         services.AddDbContext<TContext>(options => options.UseNpgsql(connectionString));
         services.AddSingleton<IRetentionRuleProvider>(repository);
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<TContext>();
         return services.BuildServiceProvider(validateScopes: true);
     }
@@ -2131,6 +2533,7 @@ await using var verifyScope = services.CreateAsyncScope();
         services.AddSingleton<IAnonymiseValueFactory>(sp =>
             sp.GetRequiredService<ConvertedOriginalValueErasureFactory>()
         );
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<FactoryBackedErasureDbContext>();
 
         return services.BuildServiceProvider(validateScopes: true);
@@ -2158,6 +2561,7 @@ await using var verifyScope = services.CreateAsyncScope();
                 }
             )
         );
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<MultiSubjectDbContext>();
 
         return services.BuildServiceProvider(validateScopes: true);
@@ -2185,6 +2589,7 @@ await using var verifyScope = services.CreateAsyncScope();
                 }
             )
         );
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<ConvertedErasureSubjectDbContext>();
 
         return services.BuildServiceProvider(validateScopes: true);
@@ -2663,6 +3068,54 @@ internal sealed class BoundedAnonymiseRecord
 
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset? AnonymisedAt { get; set; }
+}
+
+internal sealed class TenantlessKindDbContext(DbContextOptions<TenantlessKindDbContext> options)
+    : DbContext(options)
+{
+    public DbSet<TenantedUserRecord> UserRecords => Set<TenantedUserRecord>();
+    public DbSet<TenantlessDeviceLog> DeviceLogs => Set<TenantlessDeviceLog>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<TenantedUserRecord>(builder =>
+        {
+            builder.ToTable("tenanted_user_records");
+            builder.HasKey(record => record.Id);
+        });
+        modelBuilder.Entity<TenantlessDeviceLog>(builder =>
+        {
+            builder.ToTable("tenantless_device_logs");
+            builder.HasKey(record => record.Id);
+        });
+        modelBuilder.ConfigureCohortTables();
+    }
+}
+
+[Retain("kind-scope", nameof(CreatedAt))]
+[RetentionEntityId("00000000-0000-0000-0001-0000000000c1")]
+internal sealed class TenantedUserRecord
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+
+    [ErasureSubject("user")]
+    public Guid? UserId { get; set; }
+
+    public DateTimeOffset CreatedAt { get; set; }
+}
+
+[Retain("kind-scope", nameof(CreatedAt))]
+[RetentionTenantless]
+[RetentionEntityId("00000000-0000-0000-0001-0000000000c2")]
+internal sealed class TenantlessDeviceLog
+{
+    public Guid Id { get; set; }
+
+    [ErasureSubject("device")]
+    public Guid? DeviceId { get; set; }
+
+    public DateTimeOffset CreatedAt { get; set; }
 }
 
 internal sealed class SinglePredicateResolutionDbContext(

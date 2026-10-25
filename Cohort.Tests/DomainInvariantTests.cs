@@ -5,14 +5,16 @@ namespace Cohort.Tests;
 
 public sealed class DomainInvariantTests
 {
-    [Fact]
-    public void Retention_Hold_Request_Rejects_Expiry_Before_Creation()
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(0)]
+    public void Retention_Hold_Request_Rejects_Expiry_Not_After_Creation(long expiryOffsetTicks)
     {
         var createdAt = DateTimeOffset.Parse("2026-01-02T00:00:00+00:00");
 
         var act = () => CreateHold(
             createdAt: createdAt,
-            expiresAt: createdAt.AddTicks(-1)
+            expiresAt: createdAt.AddTicks(expiryOffsetTicks)
         );
 
         act.Should().Throw<ArgumentOutOfRangeException>().WithParameterName("ExpiresAt");
@@ -38,6 +40,22 @@ public sealed class DomainInvariantTests
             new TenantContext(Guid.Empty, "uk", new Dictionary<string, string>());
 
         act.Should().Throw<ArgumentException>().WithParameterName("id");
+    }
+
+    [Fact]
+    public void Tenant_Execution_Context_Rejects_The_Reserved_Tenantless_Identity()
+    {
+        var act = () => new RetentionExecutionContext.Tenant(Guid.Empty);
+
+        act.Should().Throw<ArgumentException>().WithParameterName("tenantId");
+    }
+
+    [Fact]
+    public void System_Execution_Context_Rejects_Undefined_Work()
+    {
+        var act = () => new RetentionExecutionContext.System((RetentionSystemWork)99);
+
+        act.Should().Throw<ArgumentOutOfRangeException>().WithParameterName("work");
     }
 
     [Theory]
@@ -66,6 +84,19 @@ public sealed class DomainInvariantTests
 
         tenanted.Should().Throw<ArgumentException>().WithParameterName("trigger");
         tenantless.Should().Throw<ArgumentException>().WithParameterName("trigger");
+    }
+
+    [Fact]
+    public void An_Erasure_Request_Needs_A_Defined_Transaction_Mode_And_Keeps_Its_Time_In_Utc()
+    {
+        var scope = new ErasureScope("user", Guid.NewGuid());
+        var undefined = () => RetentionErasureRequest.Tenantless(scope, transaction: (ErasureTransaction)7);
+        var at = new DateTimeOffset(2026, 4, 12, 13, 0, 0, TimeSpan.FromHours(1));
+
+        undefined.Should().Throw<ArgumentOutOfRangeException>().WithParameterName("transaction");
+        RetentionErasureRequest.Tenantless(scope, at).At.Should().Be(at).And.Subject!.Value.Offset.Should().Be(TimeSpan.Zero);
+        RetentionErasureRequest.Tenantless(scope).At.Should().BeNull();
+        RetentionSweepRequest.Tenantless().At.Should().BeNull();
     }
 
     [Theory]

@@ -31,7 +31,9 @@ public sealed class ArchitectureBoundaryTests
         .LoadAssemblies(
             typeof(Cohort.Domain.RetentionRule).Assembly,
             // Loaded so AreAssignableTo(BackgroundService) can resolve the framework base type.
-            typeof(BackgroundService).Assembly
+            typeof(BackgroundService).Assembly,
+            // Loaded so the scope-creation rule can resolve the DI scope factory methods.
+            typeof(Microsoft.Extensions.DependencyInjection.IServiceScopeFactory).Assembly
         )
         .Build();
 
@@ -117,6 +119,27 @@ public sealed class ArchitectureBoundaryTests
             .AreAssignableTo(typeof(BackgroundService))
             .Should()
             .NotResideInNamespaceMatching(Infrastructure)
+            .Check(Architecture);
+    }
+
+    // Every DI scope Cohort creates must be entered through the host's IRetentionExecutionScope
+    // before it touches the database, or the host's tenant isolation silently misses that work.
+    [Fact]
+    public void Only_The_Execution_Scope_Helper_Creates_Di_Scopes()
+    {
+        Types()
+            .That()
+            .ResideInAssembly(typeof(Cohort.Domain.RetentionRule).Assembly)
+            .And()
+            .DoNotHaveFullNameMatching(@"^Cohort\.Infrastructure\.RetentionExecutionScopes$")
+            .Should()
+            .NotCallAny(
+                MethodMembers()
+                    .That()
+                    .HaveNameStartingWith("CreateAsyncScope")
+                    .Or()
+                    .HaveNameStartingWith("CreateScope")
+            )
             .Check(Architecture);
     }
 

@@ -25,6 +25,16 @@ These are the deliberate limits of Cohort, so you don't discover them in product
 - Anonymisation ships `Null`, `EmptyString` and `FixedLiteral`. Hashing, format-preserving
   and other schemes belong in an `IAnonymiseValueFactory` you own.
 
+## Tenant isolation
+
+- System work spans tenants by design. The worker's coordination, row-handler dispatch,
+  history pruning and readiness read and write every tenant's Cohort rows. Your
+  `IRetentionExecutionScope` decides how a system scope is authorised and audited. See
+  [Tenant Isolation](/guides/tenant-isolation).
+- Cohort's tables key tenants on `TenantId`, with fixed sentinels for tenantless work. Write
+  your policies against those columns; there is no mapping to a column name of your own. See
+  [Row-level security](/reference/schema#row-level-security).
+
 ## Delivery
 
 - Row-handler `OnAfterAsync` is at-least-once, not exactly-once. Handlers must be idempotent.

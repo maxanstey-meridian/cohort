@@ -10,16 +10,14 @@ test. Both go through the same execution model.
 |---|---|
 | `IRetentionPreview` | Counts what a sweep would change. Writes nothing. |
 | `IRetentionSweep` | Runs the real sweep and records it in the ledger. |
-| `IRetentionErasureService` | Erases one subject's rows within the same rules. See [Right-to-Erasure](/guides/erasure). |
+| `IRetentionErasureService` | Erases one subject's rows within the same rules, in Cohort's transaction or yours. See [Right-to-Erasure](/guides/erasure). |
 | `IRetentionDeletion` | Lets your own deletes take part in hold protection. See [Legal Holds](/guides/legal-holds#deleting-around-holds). |
 
 ```csharp
-var now = DateTimeOffset.UtcNow;
-
-await services.GetRequiredService<IRetentionPreview>().PreviewAsync(tenant, now, ct);
-await services.GetRequiredService<IRetentionSweep>().SweepAsync(tenant, now, ct);
+await services.GetRequiredService<IRetentionPreview>().PreviewAsync(tenant, DateTimeOffset.UtcNow, ct);
+await services.GetRequiredService<IRetentionSweep>().SweepAsync(tenant, ct);
 await services.GetRequiredService<IRetentionErasureService>()
-    .EraseAsync(tenant, new ErasureScope("user", userId), now, ct);
+    .EraseAsync(tenant, new ErasureScope("user", userId), ct);
 ```
 
 `SweepAsync(tenant, ...)` sweeps that tenant's tenanted entities. Tenantless entities hold
@@ -28,26 +26,49 @@ one shared row set, so they're swept with an explicit tenantless request:
 ```csharp
 var sweep = services.GetRequiredService<IRetentionSweep>();
 
-await sweep.ExecuteAsync(RetentionSweepRequest.Tenanted(tenant, now), ct);
-await sweep.ExecuteAsync(RetentionSweepRequest.Tenantless(now), ct);
-await sweep.ExecuteAsync(RetentionSweepRequest.Tenanted(tenant, now, dryRun: true), ct);
+await sweep.ExecuteAsync(RetentionSweepRequest.Tenanted(tenant), ct);
+await sweep.ExecuteAsync(RetentionSweepRequest.Tenantless(), ct);
+await sweep.ExecuteAsync(RetentionSweepRequest.Tenanted(tenant, dryRun: true), ct);
 ```
 
 A dry run counts what it would change and writes the same run and entity audit trail, with
 `sweep_run.DryRun` set, without changing any row.
 
+### Which "today"
+
+Sweeps and erasures take "today" from the database's clock (`statement_timestamp()`), the
+clock that legal holds expire by, so an application server whose clock runs fast can't
+delete a row before its anniversary. Leave the time out.
+
+- You may pass a time (`RetentionSweepRequest.Tenanted(tenant, at)`,
+  `RetentionErasureRequest.Tenanted(tenant, scope, at)`). An earlier time is allowed, because
+  it keeps more.
+- A run that changes rows refuses a time later than the database's with an
+  `ArgumentOutOfRangeException`, before any run is recorded.
+- Dry runs and previews accept any time, so you can look ahead. A preview still takes its
+  time from you.
+
 ### Scopes and transactions
 
-`IRetentionSweep`, `IRetentionPreview` and `IRetentionErasureService` are singletons that own
-their scope. Every call runs in a fresh DI scope, so Cohort's raw SQL never shares your
-tracked `DbContext` or your ambient transaction.
+`IRetentionSweep` and `IRetentionPreview` are singletons that own their scope. Every call runs
+in a fresh DI scope, so Cohort's raw SQL never shares your tracked `DbContext` or your
+ambient transaction.
+
+`IRetentionErasureService` is **scoped**. An ordinary erasure (`ErasureTransaction.Owned`)
+behaves like a sweep and runs in a fresh scope of its own. An erasure with
+`ErasureTransaction.Caller` runs on your scope's `DbContext` and joins the transaction you
+have open on it. See
+[Erasing inside your own transaction](/guides/erasure#erasing-inside-your-own-transaction).
 
 - Pass operation context through the request. Your caller-scoped services and transactions
-  don't flow into the operation.
-- Singleton decorators can wrap these services, for metrics or an approval gate. A scoped
-  decorator mustn't depend on its own scope taking part in Cohort's work.
-- Caller times (`now`, `createdAt`, `asOf`, ...) can carry any offset. Cohort normalises them
-  to UTC at the boundary.
+  don't flow into the operation, except into a `Caller` erasure.
+- Decorators can wrap these services, for metrics or an approval gate. Sweep and preview
+  decorators can be singletons. An erasure decorator is scoped, because the service it wraps
+  is.
+- Each fresh scope is entered through your `IRetentionExecutionScope` as the request's tenant
+  before it touches the database. See [Tenant Isolation](/guides/tenant-isolation).
+- Caller times (`now`, `createdAt`, `expiresAt`, `removedAt`, ...) can carry any offset.
+  Cohort normalises them to UTC at the boundary.
 
 These services also check PostgreSQL, model and schema readiness themselves, so they're safe
 to call from a host that never ran Cohort's startup validation.

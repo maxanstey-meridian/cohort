@@ -389,6 +389,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         builder.Services.AddSingleton<IAnonymiseValueFactory>(sp =>
             sp.GetRequiredService<OriginalValueTombstoneFactory>()
         );
+        builder.Services.AddSingleton(RetentionExecutionScope.Unisolated);
         builder.Services.AddCohort<SampleDbContext>();
         configureServices(builder.Services);
 
@@ -412,6 +413,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         );
         builder.Services.AddDbContext<SecondInstallDbContext>(options => options.UseNpgsql(fixture.ConnectionString));
         builder.Services.AddSingleton<IRetentionRuleProvider, SecondInstallRuleProvider>();
+        builder.Services.AddSingleton(RetentionExecutionScope.Unisolated);
         builder.Services.AddCohort<SecondInstallDbContext>();
         return new WorkerTestHost(builder.Build(), builder.Configuration);
     }

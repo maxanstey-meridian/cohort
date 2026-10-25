@@ -60,11 +60,12 @@ public sealed record RetentionHoldRequest
         DateTimeOffset? expiresAt,
         DateTimeOffset createdAt
     ) =>
-        expiresAt < createdAt
+        // A hold that expires when it is created protects nothing.
+        expiresAt <= createdAt
             ? throw new ArgumentOutOfRangeException(
                 nameof(ExpiresAt),
                 expiresAt,
-                "Expiry cannot be before creation."
+                "Expiry must be after creation."
             )
             : expiresAt;
 }

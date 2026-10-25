@@ -55,6 +55,10 @@ row's handlers in order. A failed attempt retries with exponential backoff from
 `BaseBackoff`. After `MaxAttempts`, the work is dead-lettered with a sanitized `LastError`.
 All of these are [configurable](/reference/configuration).
 
+Each delivery runs in its own DI scope, entered as the row's tenant before the handler is
+resolved, and `OnBeforeAsync` runs in its tenant's sweep scope. So a host's tenant isolation
+applies to handler code too. See [Tenant Isolation](/guides/tenant-isolation).
+
 ### Claim timeout
 
 Each delivery holds its claim for `RowHandlerDispatch:ClaimTimeout`, five minutes by default.

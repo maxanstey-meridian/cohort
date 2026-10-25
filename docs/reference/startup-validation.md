@@ -4,6 +4,14 @@ Cohort would rather not start than run a retention model it can't execute safely
 on this page is checked when the host starts, before any row is touched. A failure names the
 entity and the problem.
 
+## Required services
+
+- An `IRetentionExecutionScope` is registered. Cohort calls it before any database work in
+  each scope it creates, so a host's tenant isolation covers Cohort's own work. Hosts without
+  tenant isolation register `RetentionExecutionScope.Unisolated`. Without either, the host
+  fails to start, and a host that skips startup validation fails on its first Cohort call. See
+  [Tenant Isolation](/guides/tenant-isolation).
+
 ## Annotations and identity
 
 - Every retained entity has a `[RetentionEntityId]`. Missing, empty, malformed and duplicate
@@ -70,4 +78,7 @@ columns or rows belong to it. So these are rejected:
 - The installed Cohort schema has the required columns, keys, unique indexes and `CHECK`
   constraints, and no required column Cohort doesn't write. See
   [Readiness](/reference/schema#readiness).
+- No active hold names a `[RetentionEntityId]` that no retained entity in the model declares
+  any more. Such a hold would never match its row again, so the row would lose its protection
+  without an error. See [Changed entity identities](/reference/schema#changed-entity-identities).
 - [Options](/reference/configuration) are in range.

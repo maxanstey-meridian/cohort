@@ -30,9 +30,8 @@ public sealed class PublicRetentionScopeIsolationEndToEndTests(PostgresFixture f
             await db.SaveChangesAsync();
 
             var sweep = services.GetRequiredService<IRetentionSweep>();
-            await sweep.SweepAsync(
-                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                asOf
+            await sweep.ExecuteAsync(
+                RetentionSweepRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), asOf)
             );
 
             record.IsDeleted.Should().BeFalse();
@@ -75,10 +74,8 @@ public sealed class PublicRetentionScopeIsolationEndToEndTests(PostgresFixture f
             await db.SaveChangesAsync();
 
             var erasure = services.GetRequiredService<IRetentionErasureService>();
-            await erasure.EraseAsync(
-                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
-                asOf
+            await erasure.ExecuteAsync(
+                RetentionErasureRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true), asOf)
             );
 
             contact.EmailAddress.Should().Be("person@example.com");

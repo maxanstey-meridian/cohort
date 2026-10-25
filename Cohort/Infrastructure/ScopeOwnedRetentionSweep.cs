@@ -1,5 +1,6 @@
 using Cohort.Application;
 using Cohort.Domain;
+
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Infrastructure;
@@ -32,7 +33,10 @@ internal sealed class ScopeOwnedRetentionSweep(IServiceScopeFactory scopeFactory
         CancellationToken ct
     )
     {
-        await using var scope = scopeFactory.CreateAsyncScope();
+        await using var scope = await scopeFactory.CreateEnteredScopeAsync(
+            RetentionExecutionScopes.ForTenant(tenant.Id),
+            ct
+        );
         return await scope.ServiceProvider
             .GetRequiredService<RetentionSweepEngine>()
             .RunAsync(tenant, request.At, request.Trigger, entities, request.DryRun, ct);

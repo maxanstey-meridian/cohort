@@ -62,6 +62,7 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<TContext>()
         );
         services.TryAddSingleton<IRetentionRuleProvider, MissingRetentionRuleProvider>();
+        services.TryAddSingleton<IRetentionExecutionScope, MissingRetentionExecutionScope>();
         services.AddScoped<EfRetentionAuditWriter>();
         services.AddScoped<RetentionAuditNotifier>();
         services.TryAddScoped<RetentionTargetResolver>();
@@ -79,7 +80,17 @@ public static class ServiceCollectionExtensions
         services.TryAddScoped<RetentionPreviewService>();
         services.TryAddSingleton<IRetentionPreview, ScopeOwnedRetentionPreview>();
         services.TryAddScoped<RetentionErasureService>();
-        services.TryAddSingleton<IRetentionErasureService, ScopeOwnedRetentionErasureService>();
+        // Scoped: a Caller-transaction erasure runs on the calling scope's DbContext.
+        services.TryAddScoped<IRetentionErasureService, RetentionErasureEntryPoint>();
+        // EF has no other commit hook: Caller-transaction erasures defer their observers to
+        // the caller's commit through this interceptor. Singleton options configuration, so
+        // it also reaches pooled contexts and factories, and it is appended to (never
+        // replaces) the host's own interceptors.
+        services.TryAddSingleton<CohortCommitInterceptor>();
+        services.ConfigureDbContext<TContext>(
+            (sp, options) => options.AddInterceptors(sp.GetRequiredService<CohortCommitInterceptor>()),
+            ServiceLifetime.Singleton
+        );
         services.TryAddScoped<RetentionRegistry>();
         services.TryAddScoped<ErasureSubjectMetadataResolver>();
         services.TryAddSingleton<RetentionValidationState>();
@@ -200,6 +211,16 @@ public static class ServiceCollectionExtensions
 
             return Task.FromResult<IReadOnlyList<TenantContext>>([tenant]);
         }
+    }
+
+    private sealed class MissingRetentionExecutionScope : IRetentionExecutionScope
+    {
+        public ValueTask EnterAsync(RetentionExecutionContext context, CancellationToken ct) =>
+            throw new RetentionConfigurationException([
+                "No IRetentionExecutionScope has been registered. Cohort tells it whose work each scope it creates is doing, so a host's tenant isolation covers Cohort's own work. "
+                    + "Register your host's hook with services.AddScoped<IRetentionExecutionScope, YourExecutionScope>(), "
+                    + "or, for a host without tenant isolation, services.AddSingleton(RetentionExecutionScope.Unisolated).",
+            ]);
     }
 
     private sealed class MissingRetentionRuleProvider : IRetentionRuleProvider

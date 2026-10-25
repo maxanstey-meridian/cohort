@@ -1,8 +1,10 @@
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Sample.Entities;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+
 using Npgsql;
 
 namespace Cohort.Sample.Tests;
@@ -152,27 +154,33 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
     [Fact]
     public async Task Repository_Path_Can_Create_List_Check_And_Remove_Holds_Through_The_Default_Ef_Repository()
     {
-        var activeHoldId = Guid.NewGuid();
-        var expiredHoldId = Guid.NewGuid();
+        var indefiniteHoldId = Guid.NewGuid();
+        var expiringHoldId = Guid.NewGuid();
         var removedHoldId = Guid.NewGuid();
-        var activeRecordId = Guid.NewGuid();
-        var expiredRecordId = Guid.NewGuid();
+        var removedLaterHoldId = Guid.NewGuid();
+        var indefiniteRecordId = Guid.NewGuid();
+        var expiringRecordId = Guid.NewGuid();
         var removedRecordId = Guid.NewGuid();
+        var removedLaterRecordId = Guid.NewGuid();
         var tenantId = Guid.NewGuid();
-        var createdAt = new DateTimeOffset(2026, 4, 10, 12, 0, 0, TimeSpan.Zero);
-        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        // Whole seconds: Postgres keeps microseconds, so tick-precise times wouldn't round-trip.
+        var now = DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        var createdAt = now.AddDays(-2);
+        var expiresAt = now.AddDays(30);
+        var removedLaterAt = now.AddDays(1);
         await SeedNotesAsync(
             tenantId,
-            activeRecordId,
-            expiredRecordId,
-            removedRecordId
+            indefiniteRecordId,
+            expiringRecordId,
+            removedRecordId,
+            removedLaterRecordId
         );
 
         await CreateHoldAsync(
             new RetentionHoldRequest(
-                activeHoldId,
+                indefiniteHoldId,
                 RetentionEntityIdentity.For<Note>(),
-                activeRecordId.ToString(),
+                indefiniteRecordId.ToString(),
                 tenantId,
                 "investigation",
                 createdAt
@@ -180,13 +188,13 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
         );
         await CreateHoldAsync(
             new RetentionHoldRequest(
-                expiredHoldId,
+                expiringHoldId,
                 RetentionEntityIdentity.For<Note>(),
-                expiredRecordId.ToString(),
+                expiringRecordId.ToString(),
                 tenantId,
-                "expired investigation",
+                "expiring investigation",
                 createdAt,
-                asOf.AddHours(-1)
+                expiresAt
             )
         );
         await CreateHoldAsync(
@@ -199,105 +207,57 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
                 createdAt
             )
         );
+        await CreateHoldAsync(
+            new RetentionHoldRequest(
+                removedLaterHoldId,
+                RetentionEntityIdentity.For<Note>(),
+                removedLaterRecordId.ToString(),
+                tenantId,
+                "removed later investigation",
+                createdAt
+            )
+        );
 
-        var activeBeforeRemoval = await HasActiveHoldAsync(
-            RetentionEntityIdentity.For<Note>(), activeRecordId, tenantId, asOf
+        var removedBeforeRemoval = await HasActiveHoldAsync(
+            RetentionEntityIdentity.For<Note>(), removedRecordId, tenantId
         );
-        var activeBeforeCreation = await HasActiveHoldAsync(
-            RetentionEntityIdentity.For<Note>(),
-            activeRecordId,
-            tenantId,
-            createdAt.AddMinutes(-1)
-        );
-        var expiredAtQueryTime = await HasActiveHoldAsync(
-            RetentionEntityIdentity.For<Note>(), expiredRecordId, tenantId, asOf
-        );
-        var removedAtQueryTime = await HasActiveHoldAsync(
-            RetentionEntityIdentity.For<Note>(), removedRecordId, tenantId, asOf
-        );
-        var listedBeforeRemoval = await ListActiveAsync(asOf);
+        (await ListActiveAsync()).Should().HaveCount(4);
 
-        await RemoveHoldAsync(removedHoldId, asOf.AddMinutes(-30));
+        await RemoveHoldAsync(removedHoldId, now.AddMinutes(-30));
+        await RemoveHoldAsync(removedLaterHoldId, removedLaterAt);
 
-        var activeAfterRemoval = await HasActiveHoldAsync(
-            RetentionEntityIdentity.For<Note>(), removedRecordId, tenantId, asOf
-        );
-        var listedAfterRemoval = await ListActiveAsync(asOf);
-
-        activeBeforeRemoval.Should().BeTrue();
-        activeBeforeCreation.Should().BeFalse();
-        expiredAtQueryTime.Should().BeFalse();
-        removedAtQueryTime.Should().BeTrue();
-        listedBeforeRemoval.Should().HaveCount(2);
-        listedBeforeRemoval
+        var listed = await ListActiveAsync();
+        removedBeforeRemoval.Should().BeTrue();
+        (await HasActiveHoldAsync(RetentionEntityIdentity.For<Note>(), indefiniteRecordId, tenantId))
             .Should()
-            .Contain(
-                new RetentionHold(
-                    activeHoldId,
-                    RetentionEntityIdentity.For<Note>(),
-                    activeRecordId.ToString(),
-                    tenantId,
-                    "investigation",
-                    createdAt,
-                    null,
-                    null
-                )
-            );
-        listedBeforeRemoval
+            .BeTrue();
+        (await HasActiveHoldAsync(RetentionEntityIdentity.For<Note>(), expiringRecordId, tenantId))
             .Should()
-            .Contain(
-                new RetentionHold(
-                    removedHoldId,
-                    RetentionEntityIdentity.For<Note>(),
-                    removedRecordId.ToString(),
-                    tenantId,
-                    "removed investigation",
-                    createdAt,
-                    null,
-                    null
-                )
-            );
-        activeAfterRemoval.Should().BeFalse();
-        listedAfterRemoval.Should().ContainSingle();
-        listedAfterRemoval[0]
+            .BeTrue();
+        (await HasActiveHoldAsync(RetentionEntityIdentity.For<Note>(), removedRecordId, tenantId))
             .Should()
-            .Be(
-                new RetentionHold(
-                    activeHoldId,
-                    RetentionEntityIdentity.For<Note>(),
-                    activeRecordId.ToString(),
-                    tenantId,
-                    "investigation",
-                    createdAt,
-                    null,
-                    null
-                )
-            );
+            .BeFalse();
+        (await HasActiveHoldAsync(RetentionEntityIdentity.For<Note>(), removedLaterRecordId, tenantId))
+            .Should()
+            .BeTrue();
+        listed.Should().BeEquivalentTo(
+            [
+                new RetentionHold(indefiniteHoldId, RetentionEntityIdentity.For<Note>(), indefiniteRecordId.ToString(), tenantId, "investigation", createdAt, null, null),
+                new RetentionHold(expiringHoldId, RetentionEntityIdentity.For<Note>(), expiringRecordId.ToString(), tenantId, "expiring investigation", createdAt, expiresAt, null),
+                new RetentionHold(removedLaterHoldId, RetentionEntityIdentity.For<Note>(), removedLaterRecordId.ToString(), tenantId, "removed later investigation", createdAt, null, removedLaterAt),
+            ]
+        );
 
         await using var verify = Host.CreateDbContext();
-        var stored = await verify.HeldRecords.OrderBy(record => record.Reason).ToListAsync();
-        stored.Should().HaveCount(3);
-        stored
-            .Select(record => record.Reason)
-            .Should()
-            .Equal("expired investigation", "investigation", "removed investigation");
-        stored.Single(record => record.HoldId == activeHoldId).RemovedAt.Should().BeNull();
-        stored
-            .Single(record => record.HoldId == expiredHoldId)
-            .ExpiresAt.Should()
-            .Be(asOf.AddHours(-1));
-        stored
-            .Single(record => record.HoldId == removedHoldId)
-            .RemovedAt.Should()
-            .Be(asOf.AddMinutes(-30));
+        var stored = await verify.HeldRecords.SingleAsync(record => record.HoldId == removedHoldId);
+        stored.RemovedAt.Should().Be(now.AddMinutes(-30));
     }
 
     [Fact]
-    public async Task Hold_Is_Active_When_CreatedAt_Equals_AsOf()
+    public async Task Hold_Is_Active_As_Soon_As_CreateAsync_Returns()
     {
         var recordId = Guid.NewGuid();
         var tenantId = Guid.NewGuid();
-        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
         await SeedNotesAsync(tenantId, recordId);
 
         await CreateHoldAsync(
@@ -307,13 +267,204 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
                 recordId.ToString(),
                 tenantId,
                 "created boundary",
-                asOf
+                DateTimeOffset.UtcNow
             )
         );
 
-        (await HasActiveHoldAsync(RetentionEntityIdentity.For<Note>(), recordId, tenantId, asOf))
+        (await HasActiveHoldAsync(RetentionEntityIdentity.For<Note>(), recordId, tenantId))
             .Should()
             .BeTrue();
+    }
+
+    [Fact]
+    public async Task HasActiveHold_Agrees_With_The_Sweep_On_The_Database_Clock()
+    {
+        var tenantId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        var holdId = Guid.NewGuid();
+        var tenant = new TenantContext(tenantId, "uk", new Dictionary<string, string>());
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(new Note
+            {
+                Id = noteId,
+                TenantId = tenantId,
+                CreatedAt = DateTimeOffset.UtcNow.AddDays(-120),
+                Body = "api and sweep agree",
+            });
+            await db.SaveChangesAsync();
+        }
+
+        // Expires shortly: active now on both the API and the sweep.
+        await CreateHoldAsync(
+            new RetentionHoldRequest(
+                holdId,
+                RetentionEntityIdentity.For<Note>(),
+                noteId.ToString(),
+                tenantId,
+                "short hold",
+                DateTimeOffset.UtcNow.AddMinutes(-1),
+                DateTimeOffset.UtcNow.AddMinutes(5)
+            )
+        );
+        var heldOnApi = await HasActiveHoldAsync(RetentionEntityIdentity.For<Note>(), noteId, tenantId);
+        var heldSweep = await Host.RunSweepAsync(tenant);
+
+        // Removed a minute ago on the database clock: inactive on both.
+        await RemoveHoldAsync(holdId, DateTimeOffset.UtcNow.AddMinutes(-1));
+        var releasedOnApi = await HasActiveHoldAsync(RetentionEntityIdentity.For<Note>(), noteId, tenantId);
+        var listedAfterRelease = await ListActiveAsync();
+        var releasedSweep = await Host.RunSweepAsync(tenant);
+
+        heldOnApi.Should().BeTrue();
+        heldSweep.Counts.Should().ContainSingle(count =>
+            count.EntityType == typeof(Note) && count.Affected == 0 && count.HeldCount == 1
+        );
+        releasedOnApi.Should().BeFalse();
+        listedAfterRelease.Should().NotContain(hold => hold.HoldId == holdId);
+        releasedSweep.Counts.Should().ContainSingle(count =>
+            count.EntityType == typeof(Note) && count.Affected == 1 && count.HeldCount == 0
+        );
+    }
+
+    [Fact]
+    public async Task CreateAsync_Refuses_An_Expiry_That_Has_Already_Passed()
+    {
+        var tenantId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        var holdId = Guid.NewGuid();
+        await SeedNotesAsync(tenantId, noteId);
+
+        // Passes the request's own check (expiry after creation), but the database clock has
+        // already passed the expiry, so the hold would never protect.
+        var create = () => CreateHoldAsync(
+            new RetentionHoldRequest(
+                holdId,
+                RetentionEntityIdentity.For<Note>(),
+                noteId.ToString(),
+                tenantId,
+                "already expired",
+                DateTimeOffset.UtcNow.AddDays(-10),
+                DateTimeOffset.UtcNow.AddDays(-1)
+            )
+        );
+
+        await create.Should().ThrowAsync<InvalidOperationException>().WithMessage($"*'{holdId}'*not after the database clock*");
+        await using var verify = Host.CreateDbContext();
+        (await verify.HeldRecords.AnyAsync()).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task CreateAsync_Refusing_A_Passed_Expiry_Leaves_The_Callers_Transaction_Usable()
+    {
+        var tenantId = Guid.NewGuid();
+        var refusedRecordId = Guid.NewGuid();
+        var committedRecordId = Guid.NewGuid();
+        var committedHoldId = Guid.NewGuid();
+        await SeedNotesAsync(tenantId, refusedRecordId, committedRecordId);
+
+        await Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            var repository = services.GetRequiredService<IRetentionHoldsRepository>();
+            await using var transaction = await db.Database.BeginTransactionAsync();
+
+            var create = () => repository.CreateAsync(
+                new RetentionHoldRequest(
+                    Guid.NewGuid(),
+                    RetentionEntityIdentity.For<Note>(),
+                    refusedRecordId.ToString(),
+                    tenantId,
+                    "already expired",
+                    DateTimeOffset.UtcNow.AddDays(-10),
+                    DateTimeOffset.UtcNow.AddDays(-1)
+                ),
+                CancellationToken.None
+            );
+            await create.Should().ThrowAsync<InvalidOperationException>();
+
+            (await db.Notes.CountAsync(note => note.TenantId == tenantId)).Should().Be(2);
+            await repository.CreateAsync(
+                new RetentionHoldRequest(
+                    committedHoldId,
+                    RetentionEntityIdentity.For<Note>(),
+                    committedRecordId.ToString(),
+                    tenantId,
+                    "valid hold in the same transaction",
+                    DateTimeOffset.UtcNow
+                ),
+                CancellationToken.None
+            );
+            await transaction.CommitAsync();
+        });
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.HeldRecords.SingleAsync()).HoldId.Should().Be(committedHoldId);
+    }
+
+    [Fact]
+    public async Task Sweep_Keeps_Cohort_Transactions_Read_Committed_Under_A_Repeatable_Read_Database_Default()
+    {
+        // Under REPEATABLE READ the sweep's snapshot would be fixed at discovery: a hold that
+        // commits while the sweep waits on the advisory lock would stay invisible and the row
+        // would be purged. Cohort states READ COMMITTED at its own transactions, so a database,
+        // role or connection-string default can't change that.
+        await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
+        var databaseName = new NpgsqlConnectionStringBuilder(database.ConnectionString).Database;
+        await using (var admin = new NpgsqlConnection(ConnectionString))
+        {
+            await admin.OpenAsync();
+            await ExecuteNonQueryAsync(
+                admin,
+                transaction: null,
+                $"ALTER DATABASE \"{databaseName}\" SET default_transaction_isolation = 'repeatable read'"
+            );
+        }
+
+        using var host = new CohortTestHost(database.ConnectionString);
+        var tenantId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        var holdId = Guid.NewGuid();
+        var asOf = DateTimeOffset.UtcNow;
+        await using (var db = host.CreateDbContext())
+        {
+            await db.Database.MigrateAsync();
+            db.Notes.Add(new Note
+            {
+                Id = noteId,
+                TenantId = tenantId,
+                CreatedAt = asOf.AddDays(-120),
+                Body = "repeatable-read default",
+            });
+            await db.SaveChangesAsync();
+        }
+
+        // Control: a bare BEGIN on this database really does start REPEATABLE READ.
+        await using (var control = new NpgsqlConnection(database.ConnectionString))
+        {
+            await control.OpenAsync();
+            await using var command = control.CreateCommand();
+            command.CommandText = "BEGIN; SHOW transaction_isolation;";
+            (await command.ExecuteScalarAsync()).Should().Be("repeatable read");
+        }
+
+        var result = await RaceHoldAgainstMutationAsync(
+            host,
+            database.ConnectionString,
+            RetentionEntityIdentity.For<Note>(),
+            noteId,
+            tenantId,
+            holdId,
+            () => host.RunSweepAsync(new TenantContext(tenantId, "uk", new Dictionary<string, string>()))
+        );
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().ContainSingle(count =>
+            count.EntityType == typeof(Note) && count.Affected == 0 && count.HeldCount == 1
+        );
+        await using var verify = host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
+        (await verify.HeldRecords.AnyAsync(hold => hold.HoldId == holdId)).Should().BeTrue();
     }
 
     [Fact]
@@ -448,10 +599,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
             )
         );
 
-        var result = await Host.RunSweepAsync(
-            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            DateTimeOffset.UtcNow
-        );
+        var result = await Host.RunSweepAsync(new TenantContext(tenantId, "uk", new Dictionary<string, string>()));
 
         result.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note) && count.HeldCount == 1);
         await using var verify = Host.CreateDbContext();
@@ -492,7 +640,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
 
         await create.Should().ThrowAsync<Exception>();
         var holds = await Host.RunWithServicesAsync(services =>
-            services.GetRequiredService<IRetentionHoldsRepository>().ListActiveAsync(DateTimeOffset.UtcNow, CancellationToken.None)
+            services.GetRequiredService<IRetentionHoldsRepository>().ListActiveAsync(CancellationToken.None)
         );
         holds.Should().NotContain(hold => hold.HoldId == holdId);
     }
@@ -553,8 +701,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
             await HasActiveHoldAsync(
                 RetentionEntityIdentity.For<Note>(),
                 noteId,
-                rowTenantId,
-                new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero)
+                rowTenantId
             )
         )
             .Should()
@@ -639,10 +786,9 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
                 RetentionEntityIdentity.For<ExternalNumberedLog>(),
                 "000042",
                 null,
-                asOf,
                 CancellationToken.None
             );
-            var holds = await repository.ListActiveAsync(asOf, CancellationToken.None);
+            var holds = await repository.ListActiveAsync(CancellationToken.None);
             return (active, holds.Single(hold => hold.HoldId == holdId));
         });
 
@@ -689,7 +835,6 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
                 RetentionEntityIdentity.For<ExternalNumberedLog>(),
                 "abc",
                 null,
-                asOf,
                 CancellationToken.None
             );
             await create.Should().ThrowAsync<InvalidOperationException>();
@@ -745,20 +890,19 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
         });
     }
 
-    private Task<IReadOnlyList<RetentionHold>> ListActiveAsync(DateTimeOffset asOf)
+    private Task<IReadOnlyList<RetentionHold>> ListActiveAsync()
     {
         return Host.RunWithServicesAsync(async services =>
         {
             var repository = services.GetRequiredService<IRetentionHoldsRepository>();
-            return await repository.ListActiveAsync(asOf, CancellationToken.None);
+            return await repository.ListActiveAsync(CancellationToken.None);
         });
     }
 
     private Task<bool> HasActiveHoldAsync(
         Guid retentionEntityId,
         Guid recordId,
-        Guid tenantId,
-        DateTimeOffset asOf
+        Guid tenantId
     )
     {
         return Host.RunWithServicesAsync(async services =>
@@ -768,7 +912,6 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
                 retentionEntityId,
                 recordId.ToString(),
                 tenantId,
-                asOf,
                 CancellationToken.None
             );
         });
@@ -839,6 +982,8 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
     )
     {
         return RaceHoldAgainstMutationAsync(
+            Host,
+            ConnectionString,
             retentionEntityId,
             recordId,
             tenantId,
@@ -851,6 +996,8 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
     }
 
     private async Task<TResult> RaceHoldAgainstMutationAsync<TResult>(
+        CohortTestHost host,
+        string connectionString,
         Guid retentionEntityId,
         Guid recordId,
         Guid tenantId,
@@ -865,7 +1012,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
 
         try
         {
-            await using (var setup = new NpgsqlConnection(ConnectionString))
+            await using (var setup = new NpgsqlConnection(connectionString))
             {
                 await setup.OpenAsync();
                 await ExecuteNonQueryAsync(
@@ -889,7 +1036,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
                 );
             }
 
-            blockerConnection = new NpgsqlConnection(ConnectionString);
+            blockerConnection = new NpgsqlConnection(connectionString);
             await blockerConnection.OpenAsync();
             blockerTransaction = await blockerConnection.BeginTransactionAsync();
             await ExecuteNonQueryAsync(
@@ -898,14 +1045,17 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
                 $"SELECT pg_advisory_xact_lock({testBarrierKey})"
             );
 
-            var createHold = CreateHoldAsync(
-                new RetentionHoldRequest(
-                    holdId,
-                    retentionEntityId,
-                    recordId.ToString(),
-                    tenantId,
-                    "concurrent legal hold",
-                    DateTimeOffset.UtcNow
+            var createHold = host.RunWithServicesAsync(services =>
+                services.GetRequiredService<IRetentionHoldsRepository>().CreateAsync(
+                    new RetentionHoldRequest(
+                        holdId,
+                        retentionEntityId,
+                        recordId.ToString(),
+                        tenantId,
+                        "concurrent legal hold",
+                        DateTimeOffset.UtcNow
+                    ),
+                    CancellationToken.None
                 )
             );
             await WaitForAdvisoryLockWaiterAsync(
@@ -941,7 +1091,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
                     await blockerConnection.DisposeAsync();
                 }
 
-                await using var cleanup = new NpgsqlConnection(ConnectionString);
+                await using var cleanup = new NpgsqlConnection(connectionString);
                 await cleanup.OpenAsync();
                 await ExecuteNonQueryAsync(
                     cleanup,

@@ -30,6 +30,11 @@ somewhere else, together:
 modelBuilder.ConfigureCohortTables("retention");
 ```
 
+Each EF model gets its own set of Cohort tables. Two applications or models that share one
+database put their Cohort tables in different schemas, with `ConfigureCohortTables(schema)`.
+Readiness checks every active hold in the set against the model's retained entities, so a
+model sharing another model's tables sees that model's holds as orphaned and refuses to run.
+
 Then generate a migration and apply it before starting the host or calling any Cohort
 service. If a Cohort upgrade changes its tables, `dotnet ef migrations add` picks the
 change up from your model like any other.
@@ -72,3 +77,68 @@ Record-ID types whose text form depends on session settings are rejected at star
 `bytea`. Their canonical text could change between sessions and silently detach holds.
 Readiness checks the record-ID column's actual catalog type, so domains, arrays and ranges
 built on those types are rejected too.
+
+### Changed entity identities
+
+Holds store the `RetentionEntityId` of the entity they protect. If an entity's
+`[RetentionEntityId]` changes, or its `[Retain]` is removed, holds stored under the old
+identity never match a row again. Readiness therefore refuses to run while an active hold
+names an identity no retained entity in the model declares, and names each such identity and
+its count of holds. Expired and removed holds, and audit history, are not checked. The check
+reads holds across every tenant, so it runs in its own `System(Readiness)` scope whichever
+operation triggered readiness.
+
+The fix is to restore `[RetentionEntityId("old id")]` on the entity. If the change is
+deliberate, re-point the holds as part of deploying the new identity:
+
+```sql
+UPDATE public.retention_holds
+SET "RetentionEntityId" = '<new id>'
+WHERE "RetentionEntityId" = '<old id>';
+```
+
+If the holds' protection is genuinely no longer wanted, end them instead by setting
+`"RemovedAt"` to the current time. During a rolling deploy, a replica still running the old
+code can create a hold under the old identity after a new replica has passed readiness;
+another reason not to change identities.
+
+## Row-level security
+
+A host that enforces tenant isolation with PostgreSQL row-level security writes policies for
+Cohort's tables too. These tenant columns and sentinel values are a schema contract: changing
+them is a breaking change, recorded in the changelog like any other change to these tables.
+
+| Table | Tenant column | Special values |
+|---|---|---|
+| `retention_holds` | `TenantId uuid NULL` | `NULL` is a hold on a tenantless row |
+| `sweep_run` | `TenantId uuid` | `00000000-0000-0000-0000-000000000000` (`Guid.Empty`) is a tenantless pass |
+| `sweep_run_entity_summary` | `TenantId uuid` | `Guid.Empty`, as above |
+| `sweep_run_row_detail` | `TenantId uuid` | `Guid.Empty`, as above |
+| `sweep_row_handler_status` | none | Reached through `SweepRunRowDetailId` → `sweep_run_row_detail.TenantId` |
+
+Cohort only touches `Guid.Empty` and `NULL` rows in system scopes, so tenant policies
+shouldn't match them. Example policies, with the tenant in a custom setting:
+
+```sql
+CREATE POLICY tenant_isolation ON public.sweep_run
+  USING ("TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+CREATE POLICY tenant_isolation ON public.sweep_run_entity_summary
+  USING ("TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+CREATE POLICY tenant_isolation ON public.sweep_run_row_detail
+  USING ("TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+CREATE POLICY tenant_isolation ON public.retention_holds
+  USING ("TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);  -- NULL rows: system only
+CREATE POLICY tenant_isolation ON public.sweep_row_handler_status
+  USING (EXISTS (
+    SELECT 1 FROM public.sweep_run_row_detail detail
+    WHERE detail."Id" = sweep_row_handler_status."SweepRunRowDetailId"
+      AND detail."TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid));
+```
+
+`NULLIF` matters: once a session has set a custom setting, clearing or resetting it leaves an
+empty string rather than `NULL`, and `''::uuid` is an error. Remember `ENABLE` and, if the
+connecting role owns the tables, `FORCE ROW LEVEL SECURITY` on each table.
+
+Policies only bite if Cohort's work runs as the right tenant. See
+[Tenant Isolation](/guides/tenant-isolation) for the hook that tells your host whose work each
+Cohort scope does, and for the grants the tenant role needs.

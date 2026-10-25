@@ -41,15 +41,16 @@ public sealed class CohortTestHost(
         return scope.ServiceProvider.GetRequiredService<RetentionRegistry>().Scan();
     }
 
+    /// <summary>Sweeps the tenant as of <paramref name="now"/>, or the database clock.</summary>
     public async Task<RetentionSweepResult> RunSweepAsync(
         TenantContext tenant,
-        DateTimeOffset now,
+        DateTimeOffset? now = null,
         CancellationToken ct = default
     )
     {
         await using var scope = _services.CreateAsyncScope();
         var sweep = scope.ServiceProvider.GetRequiredService<IRetentionSweep>();
-        return await sweep.SweepAsync(tenant, now, ct);
+        return await sweep.ExecuteAsync(RetentionSweepRequest.Tenanted(tenant, now), ct);
     }
 
     public async Task<RetentionSweepResult> RunPreviewAsync(
@@ -63,16 +64,24 @@ public sealed class CohortTestHost(
         return await preview.PreviewAsync(tenant, now, ct);
     }
 
-    public async Task<ErasureResult> RunErasureAsync(
+    /// <summary>
+    /// Erases the subject from the tenant as of <paramref name="now"/>, or the database clock.
+    /// </summary>
+    public Task<ErasureResult> RunErasureAsync(
         TenantContext tenant,
         ErasureScope scope,
-        DateTimeOffset now,
+        DateTimeOffset? now = null,
+        CancellationToken ct = default
+    ) => RunErasureAsync(RetentionErasureRequest.Tenanted(tenant, scope, now), ct);
+
+    public async Task<ErasureResult> RunErasureAsync(
+        RetentionErasureRequest request,
         CancellationToken ct = default
     )
     {
         await using var scopeServices = _services.CreateAsyncScope();
         var erasure = scopeServices.ServiceProvider.GetRequiredService<IRetentionErasureService>();
-        return await erasure.EraseAsync(tenant, scope, now, ct);
+        return await erasure.ExecuteAsync(request, ct);
     }
 
     public async Task<TResult> RunWithServicesAsync<TResult>(

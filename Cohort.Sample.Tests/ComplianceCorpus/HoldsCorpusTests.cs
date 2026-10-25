@@ -1,8 +1,10 @@
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Sample.Entities;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+
 using Npgsql;
 
 namespace Cohort.Sample.Tests.ComplianceCorpus;
@@ -53,9 +55,13 @@ public sealed class HoldsCorpusTests(PostgresFixture fixture) : IntegrationTestB
                 CancellationToken.None
             );
             await holds.RemoveAsync(removedHoldId, now.AddHours(-1), CancellationToken.None);
-            await holds.CreateAsync(
-                new RetentionHoldRequest(Guid.NewGuid(), Note.RetentionIdentity, expiredId.ToString(), tenantId, "expired restriction", now.AddDays(-2), now.AddDays(-1)),
-                CancellationToken.None
+            // CreateAsync refuses an expiry already past, so an expired hold is history seeded directly.
+            await services.GetRequiredService<SampleDbContext>().Database.ExecuteSqlAsync(
+                $"""
+                INSERT INTO "retention_holds"
+                    ("HoldId", "RetentionEntityId", "RecordId", "TenantId", "Reason", "CreatedAt", "ExpiresAt", "RemovedAt")
+                VALUES ({Guid.NewGuid()}, {Note.RetentionIdentity}, {expiredId.ToString()}, {tenantId}, 'expired restriction', {now.AddDays(-2)}, {now.AddDays(-1)}, NULL)
+                """
             );
             await holds.CreateAsync(
                 new RetentionHoldRequest(Guid.NewGuid(), Guid.Parse("6107ff39-bf33-413c-889e-6347c909ba15"), softDeleteId.ToString(), tenantId, "soft-delete restriction", now.AddDays(-1)),

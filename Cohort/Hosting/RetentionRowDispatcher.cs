@@ -1,10 +1,13 @@
 using System.Collections.Concurrent;
+using System.Data;
 using System.Reflection;
+
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure;
 using Cohort.Infrastructure.Handlers;
 using Cohort.Infrastructure.Sweep;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -41,6 +44,9 @@ internal sealed class RetentionRowDispatcher(
     private const int InFlight = (int)SweepRowHandlerDispatchState.InFlight;
     private const int Succeeded = (int)SweepRowHandlerDispatchState.Succeeded;
     private const int DeadLettered = (int)SweepRowHandlerDispatchState.DeadLettered;
+
+    private static readonly RetentionExecutionContext RowDispatch =
+        new RetentionExecutionContext.System(RetentionSystemWork.RowDispatch);
 
     private DateTimeOffset lastPayloadScrubAt = DateTimeOffset.MinValue;
 
@@ -339,7 +345,7 @@ internal sealed class RetentionRowDispatcher(
                 var tables = Table(db);
                 var now = DateTimeOffset.UtcNow;
                 var leaseCutoff = OperationalTime.SubtractSaturating(now, dispatch.ClaimTimeout);
-                await using var transaction = await db.Database.BeginTransactionAsync(ct);
+                await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
 
                 // Expired claims that already used their last attempt are dead-lettered
                 // (with every later handler for the same row) instead of reclaimed.
@@ -499,7 +505,12 @@ internal sealed class RetentionRowDispatcher(
         Func<Task> recordOutcome;
         try
         {
-            await using var scope = scopeFactory.CreateAsyncScope();
+            // Each delivery runs as the row's tenant, so host handler code never runs under a
+            // system scope against tenanted rows.
+            await using var scope = await scopeFactory.CreateEnteredScopeAsync(
+                RetentionExecutionScopes.ForTenant(claimed.TenantId),
+                handlerCts.Token
+            );
             var entityType = ResolveEntityType(
                 claimed,
                 scope.ServiceProvider.GetRequiredService<RetentionRegistry>()
@@ -656,7 +667,7 @@ internal sealed class RetentionRowDispatcher(
         return WithDbAsync(
             async db =>
             {
-                await using var transaction = await db.Database.BeginTransactionAsync(ct);
+                await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
                 var settled = await UpdateOwnedAsync(db, claimed, DeadLetterAssignments, [DeadLettered, now, lastError], ct);
                 if (settled != 1)
                 {
@@ -744,7 +755,7 @@ internal sealed class RetentionRowDispatcher(
     // Once per poll or flush, not per statement: the result is cached after the first pass.
     private async Task ValidateReadinessAsync(CancellationToken ct)
     {
-        await using var scope = scopeFactory.CreateAsyncScope();
+        await using var scope = await scopeFactory.CreateEnteredScopeAsync(RowDispatch, ct);
         await scope.ServiceProvider.GetRequiredService<RetentionRuntimeReadinessValidator>().ValidateAsync(ct);
     }
 
@@ -754,7 +765,8 @@ internal sealed class RetentionRowDispatcher(
     )
     {
         ct.ThrowIfCancellationRequested();
-        await using var scope = scopeFactory.CreateAsyncScope();
+        // Claims, settlement, recovery and scrubbing span every tenant's queued work.
+        await using var scope = await scopeFactory.CreateEnteredScopeAsync(RowDispatch, ct);
         return await action(scope.ServiceProvider.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext));
     }
 

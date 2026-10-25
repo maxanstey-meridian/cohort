@@ -7,7 +7,7 @@ All attributes live in `Cohort.Domain`.
 | Attribute | Meaning |
 |---|---|
 | `[Retain(category, anchorMember)]` | The entity is retained in `category`, aged by the `anchorMember` column. Optional `AuditRowDetail` overrides the rule's [per-row audit](/guides/audit-trail#per-row-detail) setting. |
-| `[RetentionEntityId("uuid")]` | Required on every retained entity. A permanent identity that holds, audit rows and handler work refer to. Never change it. |
+| `[RetentionEntityId("uuid")]` | Required on every retained entity. A permanent identity that holds, audit rows and handler work refer to. Never change it: readiness refuses to run while an active hold still names an identity the model no longer declares ([remedy](/reference/schema#changed-entity-identities)). |
 | `[ExemptFromRetention(reason)]` | Documents that an entity is deliberately not retained. Optional: unannotated entities are already exempt. |
 | `[RetentionTenantless]` | The entity is global and has no tenant column. |
 

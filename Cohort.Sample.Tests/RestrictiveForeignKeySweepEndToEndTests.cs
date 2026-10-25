@@ -45,7 +45,7 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
 
         var result = await services
             .GetRequiredService<IRetentionSweep>()
-            .SweepAsync(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), asOf);
+            .ExecuteAsync(RetentionSweepRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), asOf));
 
         result.EntityFailures.Should().BeEmpty();
         result.Counts.Should().ContainSingle(count => count.EntityType == typeof(ARestrictiveParent));
@@ -147,6 +147,7 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
             options.UseNpgsql(connectionString)
         );
         services.AddSingleton<IRetentionRuleProvider>(new PurgeCategoryRepository());
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<RestrictiveForeignKeyDbContext>();
         return services.BuildServiceProvider(validateScopes: true);
     }

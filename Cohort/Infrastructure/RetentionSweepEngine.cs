@@ -27,10 +27,12 @@ internal sealed class RetentionSweepEngine(
     /// Runs one audited sweep over the scope's entities. A dry run counts what a sweep would
     /// change and writes the same audit trail without mutating anything: the audited
     /// counterpart of <see cref="IRetentionPreview"/>, which writes no audit at all.
+    /// <paramref name="at"/> null sweeps as of the database clock; a real sweep refuses a
+    /// later time before any run exists.
     /// </summary>
     public async Task<RetentionSweepResult> RunAsync(
         TenantContext tenant,
-        DateTimeOffset now,
+        DateTimeOffset? at,
         SweepTriggerKind trigger,
         SweepEntityScope scope,
         bool dryRun,
@@ -38,6 +40,7 @@ internal sealed class RetentionSweepEngine(
     )
     {
         await readinessValidator.ValidateAsync(ct);
+        var now = await DatabaseClock.ResolveRunTimeAsync(db, at, dryRun, ct);
 
         var run = new RetentionRun(
             db,

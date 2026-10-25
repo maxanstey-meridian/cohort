@@ -1,6 +1,9 @@
+using System.Data;
+
 using Cohort.Application;
 using Cohort.Infrastructure;
 using Cohort.Infrastructure.Handlers;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -38,6 +41,9 @@ internal sealed class RetentionHistoryPruner(
     private const int HandlerDeadLettered = (int)SweepRowHandlerDispatchState.DeadLettered;
 
     internal const int BatchSize = 100;
+
+    private static readonly RetentionExecutionContext HistoryPruning =
+        new RetentionExecutionContext.System(RetentionSystemWork.HistoryPruning);
     private static readonly TimeSpan Interval = TimeSpan.FromHours(1);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -85,7 +91,7 @@ internal sealed class RetentionHistoryPruner(
             return new RetentionHistoryPruneResult(0, 0);
         }
 
-        await using (var scope = scopeFactory.CreateAsyncScope())
+        await using (var scope = await scopeFactory.CreateEnteredScopeAsync(HistoryPruning, ct))
         {
             await scope.ServiceProvider.GetRequiredService<RetentionRuntimeReadinessValidator>().ValidateAsync(ct);
         }
@@ -144,7 +150,7 @@ internal sealed class RetentionHistoryPruner(
         CancellationToken ct
     )
     {
-        await using var scope = scopeFactory.CreateAsyncScope();
+        await using var scope = await scopeFactory.CreateEnteredScopeAsync(HistoryPruning, ct);
         var db = scope.ServiceProvider.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext);
         var tables = new QuotedTables(CohortStoreTables.FromModel(db.Model));
         object[] parameters =
@@ -162,7 +168,7 @@ internal sealed class RetentionHistoryPruner(
             BatchSize,
         ];
 
-        await using var transaction = await db.Database.BeginTransactionAsync(ct);
+        await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
         var sweepIds = await db.Database
             .SqlQueryRaw<Guid>(
                 $$"""
@@ -242,7 +248,7 @@ internal sealed class RetentionHistoryPruner(
     /// </summary>
     private async Task<int> PruneHoldBatchAsync(DateTimeOffset cutoff, CancellationToken ct)
     {
-        await using var scope = scopeFactory.CreateAsyncScope();
+        await using var scope = await scopeFactory.CreateEnteredScopeAsync(HistoryPruning, ct);
         var db = scope.ServiceProvider.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext);
         var holds = PostgreSqlIdentifier.Format(CohortStoreTables.FromModel(db.Model).RetentionHolds);
         return await db.Database.ExecuteSqlRawAsync(

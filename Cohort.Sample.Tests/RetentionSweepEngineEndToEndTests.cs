@@ -198,6 +198,76 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
             .Equal("batch-keep-fresh");
     }
 
+    [Fact]
+    public async Task A_Real_Sweep_Refuses_A_Time_Later_Than_The_Database_Clock_Before_Any_Run()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var noteId = Guid.NewGuid();
+        var databaseNow = await LoadDatabaseNowAsync();
+        await using (var db = Host.CreateDbContext())
+        {
+            // 30-day purge: not due for another ten days by the database's clock.
+            db.Notes.Add(new Note { Id = noteId, TenantId = tenant.Id, CreatedAt = databaseNow.AddDays(-20), Body = "not-yet-due" });
+            await db.SaveChangesAsync();
+        }
+
+        var lookAhead = DateTimeOffset.UtcNow.AddDays(15);
+        var sweep = () => Host.RunSweepAsync(tenant, lookAhead);
+
+        (await sweep.Should().ThrowAsync<ArgumentOutOfRangeException>())
+            .Which.Message.Should().StartWith("A run that changes rows can't use a time later than the database's");
+        (await CountRunsAsync(tenant.Id)).Should().Be(0);
+
+        // A dry run may look ahead: it counts the note and changes nothing.
+        var dryRun = await Host.RunWithServicesAsync(services =>
+            services.GetRequiredService<IRetentionSweep>().ExecuteAsync(
+                RetentionSweepRequest.Tenanted(tenant, lookAhead, dryRun: true)
+            )
+        );
+
+        dryRun.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note))
+            .Which.Affected.Should().Be(1);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task A_Sweep_Without_A_Time_Uses_The_Database_Clock()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var databaseNow = await LoadDatabaseNowAsync();
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                new Note { Id = Guid.NewGuid(), TenantId = tenant.Id, CreatedAt = databaseNow.AddDays(-40), Body = "due" },
+                new Note { Id = Guid.NewGuid(), TenantId = tenant.Id, CreatedAt = databaseNow.AddDays(-20), Body = "not-yet-due" }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        var result = await Host.RunSweepAsync(tenant);
+
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note))
+            .Which.Affected.Should().Be(1);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.Where(note => note.TenantId == tenant.Id).Select(note => note.Body).ToListAsync())
+            .Should().Equal("not-yet-due");
+    }
+
+    private async Task<DateTimeOffset> LoadDatabaseNowAsync()
+    {
+        await using var db = Host.CreateDbContext();
+        return await db.Database.SqlQuery<DateTimeOffset>($"""SELECT statement_timestamp() AS "Value" """).SingleAsync();
+    }
+
+    private async Task<long> CountRunsAsync(Guid tenantId)
+    {
+        await using var db = Host.CreateDbContext();
+        return await db.Database
+            .SqlQuery<long>($"""SELECT COUNT(*) AS "Value" FROM "sweep_run" WHERE "TenantId" = {tenantId}""")
+            .SingleAsync();
+    }
+
     private sealed class StaticCategoryRepository(
         IReadOnlyDictionary<string, ITestRetentionRule> resolvers
     ) : ITestRetentionRuleProvider

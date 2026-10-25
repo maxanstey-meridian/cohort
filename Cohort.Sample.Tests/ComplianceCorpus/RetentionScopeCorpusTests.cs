@@ -89,8 +89,8 @@ public sealed class RetentionScopeCorpusTests(PostgresFixture fixture) : Integra
 
         using var host = BuildHost<PublicScopeDbContext>(new RecordingObserver());
         var sweep = host.Services.GetRequiredService<IRetentionSweep>();
-        var result = await sweep.SweepAsync(
-            new TenantContext(tenantId, "uk", new Dictionary<string, string>()), now
+        var result = await sweep.ExecuteAsync(
+            RetentionSweepRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), now)
         );
 
         result.Counts.Should().ContainSingle(count =>
@@ -201,9 +201,8 @@ public sealed class RetentionScopeCorpusTests(PostgresFixture fixture) : Integra
         using (var host = BuildHost<TContext>(observer))
         {
             var sweep = host.Services.GetRequiredService<IRetentionSweep>();
-            var execute = () => sweep.SweepAsync(
-                new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-                DateTimeOffset.UtcNow
+            var execute = () => sweep.ExecuteAsync(
+                RetentionSweepRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), DateTimeOffset.UtcNow)
             );
             await execute.Should().ThrowAsync<RetentionConfigurationException>().WithMessage(message);
         }
@@ -218,6 +217,7 @@ public sealed class RetentionScopeCorpusTests(PostgresFixture fixture) : Integra
         builder.Services.AddDbContext<TContext>(options => options.UseNpgsql(ConnectionString));
         builder.Services.AddSingleton<IRetentionRuleProvider, ScopeRuleProvider>();
         builder.Services.AddSingleton<IRetentionAuditObserver>(observer);
+        builder.Services.AddSingleton(RetentionExecutionScope.Unisolated);
         builder.Services.AddCohort<TContext>();
         return builder.Build();
     }

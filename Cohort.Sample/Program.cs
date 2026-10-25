@@ -66,7 +66,7 @@ try
     );
     await db.SaveChangesAsync();
 
-    var sweep = await sweepService.SweepAsync(previewTenant, DateTimeOffset.UtcNow);
+    var sweep = await sweepService.SweepAsync(previewTenant);
     foreach (var count in sweep.Counts)
     {
         logger.LogInformation(

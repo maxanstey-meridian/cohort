@@ -104,6 +104,9 @@ startup check that every entity can actually carry it out.
 
 ```csharp
 builder.Services.AddSingleton<IRetentionRuleProvider, RetentionRules>();
+// No tenant isolation in the database. With row-level security, register your own
+// IRetentionExecutionScope instead (see the Tenant Isolation guide).
+builder.Services.AddSingleton(RetentionExecutionScope.Unisolated);
 builder.Services.AddCohort<AppDbContext>();
 ```
 
@@ -130,12 +133,16 @@ Set a cron schedule and the hosted worker sweeps every tenant:
 Or call the services yourself:
 
 ```csharp
-var now = DateTimeOffset.UtcNow;
-await services.GetRequiredService<IRetentionPreview>().PreviewAsync(tenant, now, ct);
-await services.GetRequiredService<IRetentionSweep>().SweepAsync(tenant, now, ct);
+await services.GetRequiredService<IRetentionPreview>().PreviewAsync(tenant, DateTimeOffset.UtcNow, ct);
+await services.GetRequiredService<IRetentionSweep>().SweepAsync(tenant, ct);
 await services.GetRequiredService<IRetentionErasureService>()
-    .EraseAsync(tenant, new ErasureScope("user", userId), now, ct);
+    .EraseAsync(tenant, new ErasureScope("user", userId), ct);
 ```
+
+Sweeps and erasures run as of the database clock. A tenanted erasure never touches
+`[RetentionTenantless]` entities; erase those with `RetentionErasureRequest.Tenantless`. An
+erasure can also join your own open transaction (`ErasureTransaction.Caller`) and commit or
+roll back with it.
 
 Thirty-day-old session notes are deleted, and year-old case contacts keep their row but
 lose their email and name. Every query is scoped to the tenant, held rows are skipped, and

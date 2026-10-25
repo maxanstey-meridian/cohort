@@ -4,10 +4,21 @@ namespace Cohort.Application;
 /// Coordinates host-owned deletion with Cohort retention holds.
 /// </summary>
 /// <remarks>
+/// <para>
 /// This service is scoped. Resolve it and the DbContext registered by AddCohort from the same
-/// dependency-injection scope. Cohort starts and commits the transaction; the callback runs on
-/// that scoped DbContext inside the transaction and must persist its changes before returning.
-/// Callback exceptions are propagated and the transaction is rolled back.
+/// dependency-injection scope, and make every change through that context: writes through
+/// another context or connection commit outside the transaction. Cohort starts and commits the
+/// transaction; the callback runs on that scoped DbContext inside it.
+/// </para>
+/// <para>
+/// Cohort throws <see cref="InvalidOperationException"/> when the context has unsaved changes
+/// on entry, before doing anything. Once the callback has run, Cohort throws and rolls back
+/// when the callback returned with unsaved changes, or when any row with an active hold was
+/// deleted inside the transaction, listed or not (EF or database cascades and raw SQL
+/// included). Callback exceptions are propagated and the transaction is rolled back. After a
+/// refusal or failure once the callback has run, the context's change tracker is cleared, so
+/// a later save can't apply the callback's changes unguarded.
+/// </para>
 /// </remarks>
 public interface IRetentionDeletion
 {

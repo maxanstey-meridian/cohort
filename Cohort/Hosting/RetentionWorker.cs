@@ -1,6 +1,7 @@
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -147,15 +148,20 @@ internal sealed class RetentionWorker(
         CancellationToken ct
     )
     {
-        await using var scope = scopeFactory.CreateAsyncScope();
+        // The iteration scope coordinates across tenants: the worker lock, the occurrence
+        // ledger and the tenant source. Each pass gets its own scope, entered as its tenant.
+        await using var scope = await scopeFactory.CreateEnteredScopeAsync(
+            new RetentionExecutionContext.System(RetentionSystemWork.WorkerCoordination),
+            ct
+        );
         var services = scope.ServiceProvider;
         await services
             .GetRequiredService<RetentionRuntimeReadinessValidator>()
             .ValidateAsync(ct);
         var db = services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext);
 
-        // The advisory lock is session-scoped, so the connection must stay open for the
-        // whole iteration; the sweep itself reuses the already-open scoped connection.
+        // The advisory lock is session-scoped, so this coordination connection stays open for
+        // the whole iteration; each pass runs on its own scope's connection.
         await db.Database.OpenConnectionAsync(ct);
         // Two replicas firing at the same cron instant must not both sweep: double mutations
         // are mostly benign, but doubled audit runs and doubled handler side effects are not.
@@ -258,7 +264,6 @@ internal sealed class RetentionWorker(
     )
     {
         var entries = services.GetRequiredService<RetentionRegistry>().Scan().Values;
-        var engine = services.GetRequiredService<RetentionSweepEngine>();
         var hasTenantedEntries = entries.Any(entry => entry.Tenant is not null);
         var tenants = hasTenantedEntries
             ? MaterializeTenants(
@@ -288,7 +293,6 @@ internal sealed class RetentionWorker(
                 try
                 {
                     var result = await RunPassAsync(
-                        engine,
                         tenant,
                         SweepEntityScope.TenantedOnly,
                         dryRun,
@@ -331,7 +335,6 @@ internal sealed class RetentionWorker(
             try
             {
                 var result = await RunPassAsync(
-                    engine,
                     TenantContext.Tenantless,
                     SweepEntityScope.TenantlessOnly,
                     dryRun,
@@ -405,17 +408,20 @@ internal sealed class RetentionWorker(
             );
     }
 
-    private static Task<RetentionSweepResult> RunPassAsync(
-        RetentionSweepEngine engine,
+    private async Task<RetentionSweepResult> RunPassAsync(
         TenantContext tenant,
         SweepEntityScope scope,
         bool dryRun,
         CancellationToken ct
     )
     {
-        return engine.RunAsync(
+        await using var passScope = await scopeFactory.CreateEnteredScopeAsync(
+            RetentionExecutionScopes.ForTenant(tenant.Id),
+            ct
+        );
+        return await passScope.ServiceProvider.GetRequiredService<RetentionSweepEngine>().RunAsync(
             tenant,
-            DateTimeOffset.UtcNow,
+            null,
             SweepTriggerKind.Scheduled,
             scope,
             dryRun,

@@ -1,4 +1,6 @@
+using Cohort.Application;
 using Cohort.Infrastructure;
+
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 
@@ -9,7 +11,10 @@ internal sealed class RetentionValidationHostedService(IServiceScopeFactory scop
 {
     public async Task StartAsync(CancellationToken cancellationToken)
     {
-        await using var scope = scopeFactory.CreateAsyncScope();
+        await using var scope = await scopeFactory.CreateEnteredScopeAsync(
+            new RetentionExecutionContext.System(RetentionSystemWork.Readiness),
+            cancellationToken
+        );
         await scope
             .ServiceProvider.GetRequiredService<RetentionRuntimeReadinessValidator>()
             .ValidateAsync(cancellationToken);

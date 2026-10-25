@@ -36,9 +36,8 @@ runs as failed first.
 
 A hold is deleted once the earlier of its `RemovedAt` and `ExpiresAt` is older than
 `InactiveHoldRetention`. Active holds are never deleted, including holds with no expiry.
-
-`ListActiveAsync` and `HasActiveHoldAsync` with an `asOf` older than `InactiveHoldRetention`
-can therefore answer "not held" for a hold that has since been pruned.
+`ListActiveAsync` and `HasActiveHoldAsync` only answer for now, so pruning never changes what
+they report.
 
 ## How it runs
 

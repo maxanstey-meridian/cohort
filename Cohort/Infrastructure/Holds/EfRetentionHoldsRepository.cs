@@ -1,7 +1,10 @@
+using System.Data;
 using System.Data.Common;
+
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure.Sweep;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
@@ -35,7 +38,7 @@ internal sealed class EfRetentionHoldsRepository(
         {
             var existingTransaction = db.Database.CurrentTransaction;
             await using var ownedTransaction = existingTransaction is null
-                ? await db.Database.BeginTransactionAsync(ct)
+                ? await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct)
                 : null;
             var transaction = (existingTransaction ?? ownedTransaction)!.GetDbTransaction();
             var recordId = await targetResolver.CanonicaliseRecordIdAsync(
@@ -67,19 +70,29 @@ internal sealed class EfRetentionHoldsRepository(
             }.CreateCommand(
                 db.Database.GetDbConnection(),
                 transaction,
+                // An expiry the database clock has already reached would store a hold that never
+                // protects. Refuse it by row count, not a SQL error, so a caller-owned transaction
+                // stays usable. CAST: an untyped NULL can't be inferred in IS NULL.
                 $"""
                 INSERT INTO {PostgreSqlIdentifier.Format(tables.RetentionHolds)}
                     ("HoldId", "RetentionEntityId", "RecordId", "TenantId", "Reason", "CreatedAt", "ExpiresAt", "RemovedAt")
-                VALUES (
+                SELECT
                     @holdId, @retentionEntityId, @recordId, @tenantId, @reason,
                     -- A hold is active from the moment it commits; never let an application clock
                     -- ahead of Postgres defer that.
                     LEAST(@createdAt, pg_catalog.statement_timestamp()),
-                    @expiresAt, NULL
-                )
+                    CAST(@expiresAt AS timestamptz), NULL
+                WHERE CAST(@expiresAt AS timestamptz) IS NULL
+                   OR CAST(@expiresAt AS timestamptz) > pg_catalog.statement_timestamp()
                 """
             );
-            await command.ExecuteNonQueryAsync(ct);
+            if (await command.ExecuteNonQueryAsync(ct) == 0)
+            {
+                throw new InvalidOperationException(
+                    $"Retention hold '{request.HoldId}' expires at {request.ExpiresAt:O}, which is not after the database clock. It would persist while protecting nothing."
+                );
+            }
+
             if (ownedTransaction is not null)
             {
                 await ownedTransaction.CommitAsync(ct);
@@ -157,24 +170,19 @@ internal sealed class EfRetentionHoldsRepository(
         }
     }
 
-    public async Task<IReadOnlyList<RetentionHold>> ListActiveAsync(
-        DateTimeOffset asOf,
-        CancellationToken ct
-    )
+    public async Task<IReadOnlyList<RetentionHold>> ListActiveAsync(CancellationToken ct)
     {
         await readinessValidator.ValidateAsync(ct);
         await db.Database.OpenConnectionAsync(ct);
         try
         {
-            await using var command = new SqlParams { ["asOf"] = asOf.ToUniversalTime() }.CreateCommand(
+            await using var command = new SqlParams().CreateCommand(
                 db.Database.GetDbConnection(),
                 db.Database.CurrentTransaction?.GetDbTransaction(),
                 $"""
                 SELECT "HoldId", "RetentionEntityId", "RecordId", "TenantId", "Reason", "CreatedAt", "ExpiresAt", "RemovedAt"
-                FROM {PostgreSqlIdentifier.Format(tables.RetentionHolds)}
-                WHERE "CreatedAt" <= @asOf
-                  AND ("ExpiresAt" IS NULL OR "ExpiresAt" > @asOf)
-                  AND ("RemovedAt" IS NULL OR "RemovedAt" > @asOf)
+                FROM {PostgreSqlIdentifier.Format(tables.RetentionHolds)} AS hold
+                WHERE {RetentionHoldSql.ActivePredicate("hold")}
                 ORDER BY "RetentionEntityId", "RecordId", "HoldId"
                 """
             );
@@ -209,7 +217,6 @@ internal sealed class EfRetentionHoldsRepository(
         Guid retentionEntityId,
         string recordId,
         Guid? tenantId,
-        DateTimeOffset asOf,
         CancellationToken ct
     )
     {
@@ -232,7 +239,6 @@ internal sealed class EfRetentionHoldsRepository(
                     "Retention hold",
                     ct
                 ),
-                ["asOf"] = asOf.ToUniversalTime(),
             };
             if (entry.Tenant is not null)
             {
@@ -244,13 +250,11 @@ internal sealed class EfRetentionHoldsRepository(
                 transaction,
                 $"""
                 SELECT 1
-                FROM {PostgreSqlIdentifier.Format(tables.RetentionHolds)}
-                WHERE "RetentionEntityId" = @retentionEntityId
-                  AND "RecordId" = @recordId
-                  {(entry.Tenant is not null ? "AND \"TenantId\" = @tenantId" : "AND \"TenantId\" IS NULL")}
-                  AND "CreatedAt" <= @asOf
-                  AND ("ExpiresAt" IS NULL OR "ExpiresAt" > @asOf)
-                  AND ("RemovedAt" IS NULL OR "RemovedAt" > @asOf)
+                FROM {PostgreSqlIdentifier.Format(tables.RetentionHolds)} AS hold
+                WHERE hold."RetentionEntityId" = @retentionEntityId
+                  AND hold."RecordId" = @recordId
+                  {(entry.Tenant is not null ? "AND hold.\"TenantId\" = @tenantId" : "AND hold.\"TenantId\" IS NULL")}
+                  AND {RetentionHoldSql.ActivePredicate("hold")}
                 LIMIT 1
                 """
             );

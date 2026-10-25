@@ -57,7 +57,7 @@ public sealed class PurgeSweepStrategyTests(PostgresFixture fixture)
 
         var result = await services
             .GetRequiredService<IRetentionSweep>()
-            .SweepAsync(new TenantContext(tenantA, "uk", new Dictionary<string, string>()), asOf);
+            .ExecuteAsync(RetentionSweepRequest.Tenanted(new TenantContext(tenantA, "uk", new Dictionary<string, string>()), asOf));
 
         result
             .Counts.Should()
@@ -121,7 +121,7 @@ public sealed class PurgeSweepStrategyTests(PostgresFixture fixture)
 
         var result = await services
             .GetRequiredService<IRetentionSweep>()
-            .SweepAsync(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), asOf);
+            .ExecuteAsync(RetentionSweepRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), asOf));
 
         result
             .Counts.Should()
@@ -165,6 +165,7 @@ public sealed class PurgeSweepStrategyTests(PostgresFixture fixture)
         services.AddLogging();
         services.AddDbContext<PurgeTestDbContext>(options => options.UseNpgsql(connectionString));
         services.AddSingleton<IRetentionRuleProvider>(new PurgeCategoryRepository());
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<PurgeTestDbContext>();
         return services.BuildServiceProvider(validateScopes: true);
     }

@@ -1,14 +1,17 @@
+using System.Text.RegularExpressions;
+
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
 using Cohort.Infrastructure;
 using Cohort.Infrastructure.Migrations;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+
 using Npgsql;
-using System.Text.RegularExpressions;
 
 namespace Cohort.Sample.Tests;
 
@@ -115,7 +118,7 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
                     ),
                     default
                 );
-                (await holds.ListActiveAsync(now, default)).Should().ContainSingle();
+                (await holds.ListActiveAsync(default)).Should().ContainSingle();
             }
 
             var tenant = new TenantContext(tenantId, "uk", new Dictionary<string, string>());
@@ -123,7 +126,7 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
             preview.Counts.Where(count => count.Strategy != Strategy.Exempt)
                 .Should().HaveCount(3).And.OnlyContain(count => count.Affected == 1);
 
-            var sweep = await services.GetRequiredService<IRetentionSweep>().SweepAsync(tenant, now);
+            var sweep = await services.GetRequiredService<IRetentionSweep>().ExecuteAsync(RetentionSweepRequest.Tenanted(tenant, now));
             sweep.EntityFailures.Should().BeEmpty();
             sweep.Counts.Where(count => count.Strategy != Strategy.Exempt)
                 .Should().HaveCount(3).And.OnlyContain(count => count.Affected == 1);
@@ -161,13 +164,15 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
                 await db.SaveChangesAsync();
             }
 
-            var erasure = await services
-                .GetRequiredService<IRetentionErasureService>()
-                .EraseAsync(
-                    tenant,
-                    new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
-                    now
-                );
+            ErasureResult erasure;
+            await using (var erasureScope = services.CreateAsyncScope())
+            {
+                erasure = await erasureScope.ServiceProvider
+                    .GetRequiredService<IRetentionErasureService>()
+                    .ExecuteAsync(
+                        RetentionErasureRequest.Tenanted(tenant, new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true), now)
+                    );
+            }
             erasure.Counts.Where(count => count.Strategy != Strategy.Exempt)
                 .Should().HaveCount(3).And.OnlyContain(count => count.Affected == 1);
 
@@ -306,11 +311,11 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
         await using (var scope = services.CreateAsyncScope())
         {
             var holds = scope.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>();
-            (await holds.ListActiveAsync(now, default))
+            (await holds.ListActiveAsync(default))
                 .Should().ContainSingle(hold => hold.HoldId == holdId);
         }
 
-        var sweep = await services.GetRequiredService<IRetentionSweep>().SweepAsync(tenant, now);
+        var sweep = await services.GetRequiredService<IRetentionSweep>().ExecuteAsync(RetentionSweepRequest.Tenanted(tenant, now));
         sweep.Counts.Should().ContainSingle(count =>
             count.EntityType == typeof(QualifiedRecord)
             && count.Affected == 1
@@ -332,11 +337,13 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
             await db.SaveChangesAsync();
         }
 
-        var erasure = await services.GetRequiredService<IRetentionErasureService>().EraseAsync(
-            tenant,
-            new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
-            now
-        );
+        ErasureResult erasure;
+        await using (var erasureScope = services.CreateAsyncScope())
+        {
+            erasure = await erasureScope.ServiceProvider.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(tenant, new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true), now)
+            );
+        }
         erasure.Counts.Should().ContainSingle(count =>
             count.EntityType == typeof(QualifiedRecord) && count.Affected == 1
         );
@@ -541,6 +548,7 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
         );
         services.AddDbContext<QualifiedDbContext>(options => options.UseNpgsql(connectionString));
         services.AddSingleton<IRetentionRuleProvider, QualifiedRuleProvider>();
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<QualifiedDbContext>();
         services.AddRowHandler<QualifiedRecord, QualifiedRecordHandler>();
         services.AddRowHandler<QualifiedSoftDeleteRecord, QualifiedSoftDeleteRecordHandler>();

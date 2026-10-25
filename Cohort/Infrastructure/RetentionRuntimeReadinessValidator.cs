@@ -1,5 +1,8 @@
 using System.Collections.Concurrent;
+
 using Cohort.Application;
+using Cohort.Infrastructure.Holds;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
@@ -11,7 +14,8 @@ internal sealed class RetentionRuntimeReadinessValidator(
     RetentionStartupValidator startupValidator,
     CohortSchemaValidator schemaValidator,
     RetentionRegistry registry,
-    RetentionRuntimeReadinessState state
+    RetentionRuntimeReadinessState state,
+    IServiceScopeFactory scopeFactory
 )
 {
     internal IReadOnlyDictionary<string, Cohort.Domain.RetentionCategoryCapabilities>
@@ -37,6 +41,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
             await startupValidator.ValidateAsync(ct);
             await schemaValidator.ValidateAsync(ct);
             await ValidateRecordIdColumnTypesAsync(ct);
+            await ValidateStoredEntityIdentitiesAsync(ct);
             if (db.Database.CurrentTransaction is null)
             {
                 readiness.Validated = true;
@@ -142,12 +147,80 @@ internal sealed class RetentionRuntimeReadinessValidator(
         }
     }
 
+    /// <summary>
+    /// A hold names its entity by <c>[RetentionEntityId]</c>, which lives only in code. Once no
+    /// retained entity declares that identity, no sweep, erasure or deletion matches the hold
+    /// again and its row loses protection silently, so refuse while an active hold names one.
+    /// Holds span tenants, so this runs in its own <see cref="RetentionSystemWork.Readiness"/>
+    /// scope whatever scope readiness was called from: a tenant's scope would see only that
+    /// tenant's holds under row-level security. It also runs when no entity is retained, since
+    /// removing the last <c>[Retain]</c> orphans holds the same way.
+    /// </summary>
+    private async Task ValidateStoredEntityIdentitiesAsync(CancellationToken ct)
+    {
+        var registered = registry.Scan().Values.Select(entry => entry.RetentionEntityId).ToArray();
+        var holds = PostgreSqlIdentifier.Format(CohortStoreTables.FromModel(db.Model).RetentionHolds);
+
+        await using var scope = await scopeFactory.CreateEnteredScopeAsync(
+            new RetentionExecutionContext.System(RetentionSystemWork.Readiness),
+            ct
+        );
+        var systemDb = scope.ServiceProvider.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext);
+        if (CreateKey(systemDb) != CreateKey(db))
+        {
+            throw new RetentionConfigurationException([
+                "Cohort's readiness scope resolved a DbContext with a different model or database from the calling scope's. Cohort checks holds across tenants in a System(Readiness) scope, so every scope must reach the same database and model.",
+            ]);
+        }
+
+        await systemDb.Database.OpenConnectionAsync(ct);
+        try
+        {
+            await using var command = new SqlParams { ["registered"] = registered }.CreateCommand(
+                systemDb.Database.GetDbConnection(),
+                null,
+                $"""
+                SELECT hold."RetentionEntityId", pg_catalog.count(*)
+                FROM {holds} AS hold
+                WHERE NOT (hold."RetentionEntityId" = ANY(@registered))
+                  AND {RetentionHoldSql.ActivePredicate("hold")}
+                GROUP BY hold."RetentionEntityId"
+                ORDER BY hold."RetentionEntityId"
+                """
+            );
+
+            var errors = new List<string>();
+            await using (var reader = await command.ExecuteReaderAsync(ct))
+            {
+                while (await reader.ReadAsync(ct))
+                {
+                    var id = reader.GetGuid(0);
+                    var count = reader.GetInt64(1);
+                    errors.Add(
+                        $"Retention entity identity '{id}' is not registered by any retained entity in the EF model, but {count} active hold(s) name it. Sweeps, erasures and deletions would no longer honour those holds. Restore [RetentionEntityId(\"{id}\")] on the entity it belonged to. If the change is deliberate, re-point the holds first: UPDATE {holds} SET \"RetentionEntityId\" = '<new id>' WHERE \"RetentionEntityId\" = '{id}'; or, only if their protection is no longer wanted, end them: UPDATE {holds} SET \"RemovedAt\" = pg_catalog.statement_timestamp() WHERE \"RetentionEntityId\" = '{id}' AND (\"RemovedAt\" IS NULL OR \"RemovedAt\" > pg_catalog.statement_timestamp())."
+                    );
+                }
+            }
+
+            if (errors.Count != 0)
+            {
+                throw new RetentionConfigurationException(errors);
+            }
+        }
+        finally
+        {
+            await systemDb.Database.CloseConnectionAsync();
+        }
+    }
+
     // Readiness depends on the model (and so Cohort's table mapping) and on the database it
     // runs against; Npgsql's DataSource already carries host and port.
-    private RetentionRuntimeReadinessKey CreateKey()
+    private RetentionRuntimeReadinessKey CreateKey() => CreateKey(db);
+
+    private static RetentionRuntimeReadinessKey CreateKey(DbContext context)
     {
-        var connection = db.Database.GetDbConnection();
-        return new RetentionRuntimeReadinessKey(db.Model, connection.DataSource, connection.Database);
+        var connection = context.Database.GetDbConnection();
+        return new RetentionRuntimeReadinessKey(context.Model, connection.DataSource, connection.Database);
     }
 
     private void ValidateProvider()

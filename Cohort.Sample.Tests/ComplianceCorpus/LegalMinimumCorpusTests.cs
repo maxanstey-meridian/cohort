@@ -175,18 +175,18 @@ public sealed class LegalMinimumCorpusTests(PostgresFixture fixture) : Integrati
     {
         var tenantId = Guid.NewGuid();
         var tenant = new TenantContext(tenantId, "uk", new Dictionary<string, string>());
-        // Seven years from 1 Mar 2027 cross two leap days: as 2,555 days these rows went on 27 Feb 2034.
+        // Seven years from 1 Mar 2017 cross two leap days: as 2,555 days these rows went on 27 Feb 2024.
         var marchDayBeforeId = Guid.NewGuid();
         var marchAnniversaryId = Guid.NewGuid();
-        // 00:30 BST on 2 Jul 2027, still 1 Jul in UTC.
+        // 00:30 BST on 2 Jul 2017, still 1 Jul in UTC.
         var julyAnniversaryId = Guid.NewGuid();
 
         await using (var db = Host.CreateDbContext())
         {
             db.Notes.AddRange(
-                new Note { Id = marchDayBeforeId, TenantId = tenantId, CreatedAt = new DateTimeOffset(2027, 2, 28, 23, 30, 0, TimeSpan.Zero), Body = "28 Feb 2027" },
-                new Note { Id = marchAnniversaryId, TenantId = tenantId, CreatedAt = new DateTimeOffset(2027, 3, 1, 0, 30, 0, TimeSpan.Zero), Body = "1 Mar 2027" },
-                new Note { Id = julyAnniversaryId, TenantId = tenantId, CreatedAt = new DateTimeOffset(2027, 7, 1, 23, 30, 0, TimeSpan.Zero), Body = "2 Jul 2027 in London" }
+                new Note { Id = marchDayBeforeId, TenantId = tenantId, CreatedAt = new DateTimeOffset(2017, 2, 28, 23, 30, 0, TimeSpan.Zero), Body = "28 Feb 2017" },
+                new Note { Id = marchAnniversaryId, TenantId = tenantId, CreatedAt = new DateTimeOffset(2017, 3, 1, 0, 30, 0, TimeSpan.Zero), Body = "1 Mar 2017" },
+                new Note { Id = julyAnniversaryId, TenantId = tenantId, CreatedAt = new DateTimeOffset(2017, 7, 1, 23, 30, 0, TimeSpan.Zero), Body = "2 Jul 2017 in London" }
             );
             await db.SaveChangesAsync();
         }
@@ -197,10 +197,10 @@ public sealed class LegalMinimumCorpusTests(PostgresFixture fixture) : Integrati
             new Dictionary<string, string?> { ["Cohort:TimeZone"] = "Europe/London" }
         );
 
-        // Late on 1 Mar 2034: the seventh anniversary of 1 Mar 2027, not of 28 Feb.
-        var march = await host.RunSweepAsync(tenant, new DateTimeOffset(2034, 3, 1, 23, 30, 0, TimeSpan.Zero));
-        // 2 Jul 2034 in London keeps the row anchored on 2 Jul 2027 there.
-        await host.RunSweepAsync(tenant, new DateTimeOffset(2034, 7, 2, 12, 0, 0, TimeSpan.Zero));
+        // Late on 1 Mar 2024: the seventh anniversary of 1 Mar 2017, not of 28 Feb.
+        var march = await host.RunSweepAsync(tenant, new DateTimeOffset(2024, 3, 1, 23, 30, 0, TimeSpan.Zero));
+        // 2 Jul 2024 in London keeps the row anchored on 2 Jul 2017 there.
+        await host.RunSweepAsync(tenant, new DateTimeOffset(2024, 7, 2, 12, 0, 0, TimeSpan.Zero));
 
         await using (var verify = Host.CreateDbContext())
         {
@@ -209,7 +209,7 @@ public sealed class LegalMinimumCorpusTests(PostgresFixture fixture) : Integrati
             (await verify.Notes.AnyAsync(note => note.Id == julyAnniversaryId)).Should().BeTrue();
         }
 
-        await host.RunSweepAsync(tenant, new DateTimeOffset(2034, 7, 3, 12, 0, 0, TimeSpan.Zero));
+        await host.RunSweepAsync(tenant, new DateTimeOffset(2024, 7, 3, 12, 0, 0, TimeSpan.Zero));
 
         await using (var verifyNextDay = Host.CreateDbContext())
         {
@@ -226,16 +226,16 @@ public sealed class LegalMinimumCorpusTests(PostgresFixture fixture) : Integrati
         var tenantId = Guid.NewGuid();
         var tenant = new TenantContext(tenantId, "uk", new Dictionary<string, string>());
         var subjectId = Guid.NewGuid();
-        // 23:30 BST on 1 Jul 2027: past the seven years on 2 Jul 2034 in London.
+        // 23:30 BST on 1 Jul 2017: past the seven years on 2 Jul 2024 in London.
         var firstJulyId = Guid.NewGuid();
-        // 00:30 BST on 2 Jul 2027, still 1 Jul in UTC: a UTC cutoff would reach it too.
+        // 00:30 BST on 2 Jul 2017, still 1 Jul in UTC: a UTC cutoff would reach it too.
         var secondJulyId = Guid.NewGuid();
 
         await using (var db = Host.CreateDbContext())
         {
             db.Notes.AddRange(
-                new Note { Id = firstJulyId, TenantId = tenantId, SubjectId = subjectId, CreatedAt = new DateTimeOffset(2027, 7, 1, 22, 30, 0, TimeSpan.Zero), Body = "1 Jul 2027 in London" },
-                new Note { Id = secondJulyId, TenantId = tenantId, SubjectId = subjectId, CreatedAt = new DateTimeOffset(2027, 7, 1, 23, 30, 0, TimeSpan.Zero), Body = "2 Jul 2027 in London" }
+                new Note { Id = firstJulyId, TenantId = tenantId, SubjectId = subjectId, CreatedAt = new DateTimeOffset(2017, 7, 1, 22, 30, 0, TimeSpan.Zero), Body = "1 Jul 2017 in London" },
+                new Note { Id = secondJulyId, TenantId = tenantId, SubjectId = subjectId, CreatedAt = new DateTimeOffset(2017, 7, 1, 23, 30, 0, TimeSpan.Zero), Body = "2 Jul 2017 in London" }
             );
             await db.SaveChangesAsync();
         }
@@ -245,7 +245,7 @@ public sealed class LegalMinimumCorpusTests(PostgresFixture fixture) : Integrati
             new CalendarLegalMinimumRepository(),
             new Dictionary<string, string?> { ["Cohort:TimeZone"] = "Europe/London" }
         );
-        var now = new DateTimeOffset(2034, 7, 2, 12, 0, 0, TimeSpan.Zero);
+        var now = new DateTimeOffset(2024, 7, 2, 12, 0, 0, TimeSpan.Zero);
 
         var preview = await host.RunPreviewAsync(tenant, now);
         await host.RunErasureAsync(tenant, new ErasureScope("user", subjectId), now);

@@ -446,9 +446,8 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
             await db.SaveChangesAsync();
         }
 
-        await services.GetRequiredService<IRetentionSweep>().SweepAsync(
-            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            asOf
+        await services.GetRequiredService<IRetentionSweep>().ExecuteAsync(
+            RetentionSweepRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), asOf)
         );
 
         await using (var scope = services.CreateAsyncScope())
@@ -503,9 +502,8 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
             await db.SaveChangesAsync();
         }
 
-        await services.GetRequiredService<IRetentionSweep>().SweepAsync(
-            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            asOf
+        await services.GetRequiredService<IRetentionSweep>().ExecuteAsync(
+            RetentionSweepRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), asOf)
         );
 
         await using (var scope = services.CreateAsyncScope())
@@ -551,6 +549,7 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
                 }
             )
         );
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<JsonbAnonymiseDbContext>();
         await using var provider = services.BuildServiceProvider(validateScopes: true);
         var tenantId = Guid.NewGuid();
@@ -564,9 +563,8 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
             await db.SaveChangesAsync();
         }
 
-        var result = await provider.GetRequiredService<IRetentionSweep>().SweepAsync(
-            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            asOf
+        var result = await provider.GetRequiredService<IRetentionSweep>().ExecuteAsync(
+            RetentionSweepRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), asOf)
         );
 
         result.EntityFailures.Should().BeEmpty();
@@ -596,9 +594,8 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
             await db.SaveChangesAsync();
         }
 
-        var result = await provider.GetRequiredService<IRetentionSweep>().SweepAsync(
-            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            asOf
+        var result = await provider.GetRequiredService<IRetentionSweep>().ExecuteAsync(
+            RetentionSweepRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), asOf)
         );
 
         result.EntityFailures.Should().BeEmpty();
@@ -628,9 +625,8 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
             await db.SaveChangesAsync();
         }
 
-        var result = await provider.GetRequiredService<IRetentionSweep>().SweepAsync(
-            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            asOf
+        var result = await provider.GetRequiredService<IRetentionSweep>().ExecuteAsync(
+            RetentionSweepRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), asOf)
         );
 
         result.EntityFailures.Should().BeEmpty();
@@ -658,6 +654,7 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
             )
         );
         configure(services);
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<TContext>();
         return services.BuildServiceProvider(validateScopes: true);
     }
@@ -703,6 +700,7 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         services.AddSingleton<IAnonymiseValueFactory>(sp =>
             sp.GetRequiredService<OriginalValueEchoFactory>()
         );
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<FactoryBackedSweepDbContext>();
 
         return services.BuildServiceProvider(validateScopes: true);
@@ -741,6 +739,7 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         services.AddSingleton<IAnonymiseValueFactory>(sp =>
             sp.GetRequiredService<ConvertedOriginalValueFactory>()
         );
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<ConvertedOriginalValueDbContext>();
 
         return services.BuildServiceProvider(validateScopes: true);

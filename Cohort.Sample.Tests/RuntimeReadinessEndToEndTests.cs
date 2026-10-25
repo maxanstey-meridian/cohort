@@ -3,11 +3,13 @@ using Cohort.Domain;
 using Cohort.Hosting;
 using Cohort.Infrastructure.Migrations;
 using Cohort.Sample.Entities;
-using Microsoft.Extensions.Configuration;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+
 using Npgsql;
 
 namespace Cohort.Sample.Tests;
@@ -23,6 +25,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
         services.AddDbContext<UnsupportedProviderDbContext>();
         services.AddSingleton<IRetentionRuleProvider>(new SampleRetentionRuleProvider());
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<UnsupportedProviderDbContext>();
         await using var provider = services.BuildServiceProvider(validateScopes: true);
         var preview = provider.GetRequiredService<IRetentionPreview>();
@@ -78,7 +81,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         var now = new DateTimeOffset(2026, 7, 12, 12, 0, 0, TimeSpan.Zero);
 
         var firstCall = () => host.RunWithServicesAsync(services =>
-            services.GetRequiredService<IRetentionSweep>().SweepAsync(tenant, now)
+            services.GetRequiredService<IRetentionSweep>().ExecuteAsync(RetentionSweepRequest.Tenanted(tenant, now))
         );
 
         await firstCall.Should().ThrowAsync<RetentionConfigurationException>();
@@ -99,7 +102,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         }
 
         var result = await host.RunWithServicesAsync(services =>
-            services.GetRequiredService<IRetentionSweep>().SweepAsync(tenant, now)
+            services.GetRequiredService<IRetentionSweep>().ExecuteAsync(RetentionSweepRequest.Tenanted(tenant, now))
         );
         result.EntityFailures.Should().BeEmpty();
         ruleProvider.CapabilityCallCount.Should().Be(callsAfterFailedReadiness);
@@ -111,7 +114,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             await breakSchemaAgain.ExecuteNonQueryAsync();
         }
         await host.RunWithServicesAsync(services =>
-            services.GetRequiredService<IRetentionSweep>().SweepAsync(tenant, now)
+            services.GetRequiredService<IRetentionSweep>().ExecuteAsync(RetentionSweepRequest.Tenanted(tenant, now))
         );
 
         ruleProvider.CapabilityCallCount.Should().Be(callsAfterFailedReadiness);
@@ -203,6 +206,171 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         result.EntityFailures.Should().BeEmpty();
     }
 
+    [Fact]
+    public async Task Direct_sweep_refuses_an_active_hold_whose_entity_identity_is_no_longer_registered()
+    {
+        // A hold stored under an identity the code no longer declares would never match a row
+        // again, so the sweep would purge the held note without a word.
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        var options = new DbContextOptionsBuilder<SampleDbContext>()
+            .UseNpgsql(database.ConnectionString)
+            .Options;
+        var tenantId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        var holdId = Guid.NewGuid();
+        var oldIdentity = Guid.NewGuid();
+        await using (var db = new SampleDbContext(options))
+        {
+            await db.Database.MigrateAsync();
+            db.Notes.Add(new Note
+            {
+                Id = noteId,
+                TenantId = tenantId,
+                CreatedAt = DateTimeOffset.UtcNow.AddDays(-400),
+                Body = "held",
+            });
+            await db.SaveChangesAsync();
+        }
+        await InsertHoldAsync(options, holdId, oldIdentity, noteId.ToString(), tenantId, expiresAt: null, removedAt: null);
+
+        using var host = new CohortTestHost(database.ConnectionString);
+        var tenant = new TenantContext(tenantId, "uk", new Dictionary<string, string>());
+
+        var refused = () => host.RunSweepAsync(tenant);
+
+        var exception = await refused.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle(error =>
+            error.Contains($"'{oldIdentity}'", StringComparison.Ordinal)
+            && error.Contains("1 active hold(s)", StringComparison.Ordinal)
+            && error.Contains($"[RetentionEntityId(\"{oldIdentity}\")]", StringComparison.Ordinal)
+        );
+        (await NoteExistsAsync(options, noteId)).Should().BeTrue();
+
+        // Re-pointing the hold at the entity's current identity is the remedy; the refusal was
+        // not cached, so the next sweep checks again and honours the hold.
+        await using (var db = new SampleDbContext(options))
+        {
+            await db.Database.ExecuteSqlAsync(
+                $"""UPDATE "retention_holds" SET "RetentionEntityId" = {RetentionEntityIdentity.For<Note>()} WHERE "HoldId" = {holdId}"""
+            );
+        }
+
+        var result = await host.RunSweepAsync(tenant);
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note))
+            .Which.HeldCount.Should().Be(1);
+        (await NoteExistsAsync(options, noteId)).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Readiness_ignores_expired_and_removed_holds_under_an_unregistered_entity_identity()
+    {
+        // Only a hold that still protects something is lost when its identity goes; history is not.
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        var options = new DbContextOptionsBuilder<SampleDbContext>()
+            .UseNpgsql(database.ConnectionString)
+            .Options;
+        var tenantId = Guid.NewGuid();
+        var oldIdentity = Guid.NewGuid();
+        await using (var db = new SampleDbContext(options))
+        {
+            await db.Database.MigrateAsync();
+        }
+        var past = DateTimeOffset.UtcNow.AddDays(-1);
+        await InsertHoldAsync(options, Guid.NewGuid(), oldIdentity, Guid.NewGuid().ToString(), tenantId, expiresAt: past, removedAt: null);
+        await InsertHoldAsync(options, Guid.NewGuid(), oldIdentity, Guid.NewGuid().ToString(), tenantId, expiresAt: null, removedAt: past);
+
+        using var host = new CohortTestHost(database.ConnectionString);
+
+        var result = await host.RunSweepAsync(new TenantContext(tenantId, "uk", new Dictionary<string, string>()));
+
+        result.EntityFailures.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task Readiness_refuses_a_host_whose_system_scope_reaches_a_different_database()
+    {
+        // The cross-tenant hold check runs in its own System(Readiness) scope; if the host routed
+        // that scope elsewhere, it would certify the caller's database from another one.
+        await using var tenantDatabase = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using (var db = new SampleDbContext(
+            new DbContextOptionsBuilder<SampleDbContext>().UseNpgsql(tenantDatabase.ConnectionString).Options
+        ))
+        {
+            await db.Database.MigrateAsync();
+        }
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
+        services.AddScoped(_ => new DatabaseRoute(tenantDatabase.ConnectionString));
+        services.AddDbContext<SampleDbContext>((provider, options) =>
+            options.UseNpgsql(provider.GetRequiredService<DatabaseRoute>().ConnectionString)
+        );
+        services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
+        services.AddSingleton<GuidTombstoneFactory>();
+        services.AddSingleton<OriginalValueTombstoneFactory>();
+        services.AddSingleton<IAnonymiseValueFactory>(provider =>
+            provider.GetRequiredService<GuidTombstoneFactory>()
+        );
+        services.AddSingleton<IAnonymiseValueFactory>(provider =>
+            provider.GetRequiredService<OriginalValueTombstoneFactory>()
+        );
+        services.AddScoped<IRetentionExecutionScope>(provider =>
+            new SystemWorkRoutingScope(provider.GetRequiredService<DatabaseRoute>(), fixture.ConnectionString)
+        );
+        services.AddCohort<SampleDbContext>();
+        await using var provider = services.BuildServiceProvider(validateScopes: true);
+
+        var act = () => InvokePreviewAsync(provider);
+
+        (await act.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                error.Contains("different model or database", StringComparison.Ordinal)
+            );
+    }
+
+    private sealed class SystemWorkRoutingScope(DatabaseRoute route, string systemConnectionString)
+        : IRetentionExecutionScope
+    {
+        public ValueTask EnterAsync(RetentionExecutionContext context, CancellationToken ct)
+        {
+            if (context is RetentionExecutionContext.System)
+            {
+                route.ConnectionString = systemConnectionString;
+            }
+
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private static async Task InsertHoldAsync(
+        DbContextOptions<SampleDbContext> options,
+        Guid holdId,
+        Guid retentionEntityId,
+        string recordId,
+        Guid tenantId,
+        DateTimeOffset? expiresAt,
+        DateTimeOffset? removedAt
+    )
+    {
+        await using var db = new SampleDbContext(options);
+        var createdAt = DateTimeOffset.UtcNow.AddDays(-10);
+        await db.Database.ExecuteSqlAsync(
+            $"""
+            INSERT INTO "retention_holds"
+                ("HoldId", "RetentionEntityId", "RecordId", "TenantId", "Reason", "CreatedAt", "ExpiresAt", "RemovedAt")
+            VALUES ({holdId}, {retentionEntityId}, {recordId}, {tenantId}, 'litigation', {createdAt}, {expiresAt}, {removedAt})
+            """
+        );
+    }
+
+    private static async Task<bool> NoteExistsAsync(DbContextOptions<SampleDbContext> options, Guid noteId)
+    {
+        await using var db = new SampleDbContext(options);
+        return await db.Notes.AnyAsync(note => note.Id == noteId);
+    }
+
     [Theory]
     [InlineData("CREATE DOMAIN session_instant AS timestamptz", "session_instant")]
     [InlineData("CREATE DOMAIN session_ids AS timestamptz[]", "session_ids")]
@@ -235,6 +403,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
         services.AddDbContext<SessionKeyDbContext>(builder => builder.UseNpgsql(database.ConnectionString));
         services.AddSingleton<IRetentionRuleProvider>(new SessionKeyRuleProvider());
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<SessionKeyDbContext>();
         await using var provider = services.BuildServiceProvider(validateScopes: true);
 
@@ -287,6 +456,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         services.AddSingleton<IAnonymiseValueFactory>(provider =>
             provider.GetRequiredService<OriginalValueTombstoneFactory>()
         );
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<SampleDbContext>();
         await using var provider = services.BuildServiceProvider(validateScopes: true);
 
@@ -312,16 +482,14 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             switch (operation)
             {
                 case PublicDatabaseOperation.Sweep:
-                    await services.GetRequiredService<IRetentionSweep>().SweepAsync(tenant, now, ct);
+                    await services.GetRequiredService<IRetentionSweep>().ExecuteAsync(RetentionSweepRequest.Tenanted(tenant, now), ct);
                     break;
                 case PublicDatabaseOperation.Preview:
                     await services.GetRequiredService<IRetentionPreview>().PreviewAsync(tenant, now, ct);
                     break;
                 case PublicDatabaseOperation.Erasure:
-                    await services.GetRequiredService<IRetentionErasureService>().EraseAsync(
-                        tenant,
-                        new ErasureScope("user", Guid.NewGuid()),
-                        now,
+                    await services.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                        RetentionErasureRequest.Tenanted(tenant, new ErasureScope("user", Guid.NewGuid()), now),
                         ct
                     );
                     break;

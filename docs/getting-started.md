@@ -31,7 +31,9 @@ public sealed class SessionNote
 - `[Retain("session-notes", nameof(CreatedAt))]` puts the entity in the `session-notes`
   category and ages its rows by `CreatedAt`.
 - `[RetentionEntityId]` is the entity's permanent identity. Holds, audit rows and handler
-  work refer to it, so generate a UUID once and never change it.
+  work refer to it, so generate a UUID once and never change it. Readiness refuses to run
+  while an active hold still uses an old identity
+  ([remedy](/reference/schema#changed-entity-identities)).
 - `Id` and `TenantId` are found by convention. Other names work too, as described in
   [Attributes](/reference/attributes).
 
@@ -64,12 +66,16 @@ public sealed class RetentionRules : IRetentionRuleProvider
 
 ## Register and migrate
 
-Register the provider before `AddCohort`:
+Register the provider and an execution scope before `AddCohort`:
 
 ```csharp
 builder.Services.AddSingleton<IRetentionRuleProvider, RetentionRules>();
+builder.Services.AddSingleton(RetentionExecutionScope.Unisolated);
 builder.Services.AddCohort<AppDbContext>();
 ```
+
+`Unisolated` is for a host without tenant isolation in the database. A host with row-level
+security registers its own hook instead. See [Tenant Isolation](/guides/tenant-isolation).
 
 Add Cohort's tables to your model:
 
@@ -97,11 +103,13 @@ Preview first. It counts what would change without writing anything:
 
 ```csharp
 var tenant = new TenantContext(tenantId, "uk", new Dictionary<string, string>());
-var now = DateTimeOffset.UtcNow;
 
-var preview = await services.GetRequiredService<IRetentionPreview>().PreviewAsync(tenant, now, ct);
-var result = await services.GetRequiredService<IRetentionSweep>().SweepAsync(tenant, now, ct);
+var preview = await services.GetRequiredService<IRetentionPreview>()
+    .PreviewAsync(tenant, DateTimeOffset.UtcNow, ct);
+var result = await services.GetRequiredService<IRetentionSweep>().SweepAsync(tenant, ct);
 ```
+
+The sweep takes "today" from the database's clock, the same clock legal holds expire by.
 
 The sweep deletes this tenant's session notes older than 30 days, skips any under a legal
 hold, and records the run in `sweep_run`.

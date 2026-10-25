@@ -14,30 +14,27 @@ public interface IRetentionSweep
         CancellationToken ct = default
     );
 
+    /// <summary>
+    /// Sweeps the tenant's tenanted entities as of the database clock, audited as
+    /// <see cref="SweepTriggerKind.Manual"/>. Pass a <see cref="RetentionSweepRequest"/> to
+    /// <see cref="ExecuteAsync"/> for a tenantless, dry or differently triggered run.
+    /// </summary>
     public Task<RetentionSweepResult> SweepAsync(
         TenantContext tenant,
-        DateTimeOffset now,
         CancellationToken ct = default
-    ) => ExecuteAsync(RetentionSweepRequest.Tenanted(tenant, now), ct);
-
-    public Task<RetentionSweepResult> SweepAsync(
-        TenantContext tenant,
-        DateTimeOffset now,
-        SweepTriggerKind trigger,
-        CancellationToken ct = default
-    ) => ExecuteAsync(RetentionSweepRequest.Tenanted(tenant, now, trigger), ct);
+    ) => ExecuteAsync(RetentionSweepRequest.Tenanted(tenant), ct);
 }
 
 public abstract record RetentionSweepRequest
 {
     private RetentionSweepRequest(
-        DateTimeOffset at,
+        DateTimeOffset? at,
         SweepTriggerKind trigger,
         bool dryRun
     )
     {
         // Npgsql only writes UTC DateTimeOffsets to timestamptz.
-        At = at.ToUniversalTime();
+        At = at?.ToUniversalTime();
         // An erasure run names the kind of subject it erased, which a sweep has none of.
         Trigger =
             trigger == SweepTriggerKind.Erasure
@@ -49,7 +46,11 @@ public abstract record RetentionSweepRequest
         DryRun = dryRun;
     }
 
-    public DateTimeOffset At { get; }
+    /// <summary>
+    /// The time the sweep treats as now. Null uses the database clock. A real (non-dry)
+    /// sweep refuses a time later than the database clock.
+    /// </summary>
+    public DateTimeOffset? At { get; }
 
     public SweepTriggerKind Trigger { get; }
 
@@ -57,13 +58,13 @@ public abstract record RetentionSweepRequest
 
     public static RetentionSweepRequest Tenanted(
         TenantContext tenant,
-        DateTimeOffset at,
+        DateTimeOffset? at = null,
         SweepTriggerKind trigger = SweepTriggerKind.Manual,
         bool dryRun = false
     ) => new TenantedRequest(tenant, at, trigger, dryRun);
 
     public static RetentionSweepRequest Tenantless(
-        DateTimeOffset at,
+        DateTimeOffset? at = null,
         SweepTriggerKind trigger = SweepTriggerKind.Manual,
         bool dryRun = false
     ) => new TenantlessRequest(at, trigger, dryRun);
@@ -72,7 +73,7 @@ public abstract record RetentionSweepRequest
     {
         internal TenantedRequest(
             TenantContext tenant,
-            DateTimeOffset at,
+            DateTimeOffset? at,
             SweepTriggerKind trigger,
             bool dryRun
         )
@@ -88,7 +89,7 @@ public abstract record RetentionSweepRequest
     public sealed record TenantlessRequest : RetentionSweepRequest
     {
         internal TenantlessRequest(
-            DateTimeOffset at,
+            DateTimeOffset? at,
             SweepTriggerKind trigger,
             bool dryRun
         )

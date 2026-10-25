@@ -167,6 +167,7 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
         services.AddLogging();
         services.AddDbContext<SpelledRecordIdDbContext>(options => options.UseNpgsql(database.ConnectionString));
         services.AddSingleton<IRetentionRuleProvider>(new CategoryRepository(Strategy.Purge));
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<SpelledRecordIdDbContext>();
         await using var provider = services.BuildServiceProvider(validateScopes: true);
 
@@ -219,6 +220,7 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
             options.UseNpgsql(connectionString)
         );
         services.AddSingleton<IRetentionRuleProvider>(new CategoryRepository(strategy));
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<CanonicalRecordIdDbContext>();
         if (registerHandler)
         {

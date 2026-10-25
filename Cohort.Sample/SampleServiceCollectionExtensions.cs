@@ -35,6 +35,7 @@ public static class SampleServiceCollectionExtensions
         services.AddSingleton<IAnonymiseValueFactory>(sp =>
             sp.GetRequiredService<OriginalValueTombstoneFactory>()
         );
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<SampleDbContext>();
 
         return services;

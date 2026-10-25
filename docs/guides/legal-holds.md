@@ -19,12 +19,18 @@ await holds.CreateAsync(
 ```
 
 `holds` is the scoped `IRetentionHoldsRepository`. It also offers `RemoveAsync`,
-`ListActiveAsync` and `HasActiveHoldAsync`. Pass `expiresAt: null` for a hold that lasts
+`ListActiveAsync` and `HasActiveHoldAsync`, which report the holds that protect now (see
+[When a hold protects](#when-a-hold-protects)). Pass `expiresAt: null` for a hold that lasts
 until it's removed.
 
 `CreateAsync` validates the request, so a hold can't silently protect nothing:
 
-- `retentionEntityId` must identify a retained entity in the current EF model.
+- `retentionEntityId` must identify a retained entity in the current EF model. It must stay
+  that way: readiness refuses to run while an active hold names an identity the model no
+  longer declares ([remedy](/reference/schema#changed-entity-identities)).
+- `expiresAt`, when set, must be after `createdAt` and later than the database clock. An
+  already-passed expiry throws `InvalidOperationException` without aborting a transaction you
+  own.
 - `recordId` is parsed and canonicalised using the key's PostgreSQL store type. For a Guid
   key, malformed values are rejected. Integer, string and provider-converted keys keep their
   own canonical representation.
@@ -54,13 +60,14 @@ logical `now`. A hold created yesterday protects its row even from a backdated s
 - A hold protects from the moment it commits. Its stored `CreatedAt` is the earlier of the
   requested value and the database clock, so an application clock running ahead can't open a
   gap where a new hold doesn't yet protect.
-- `ExpiresAt` and `RemovedAt` are stored as given. The hold stops protecting once the
-  database clock passes them.
+- `RemovedAt` is stored as given. `ExpiresAt` is stored as given too, but must still be in
+  the future when the hold is created. The hold stops protecting once the database clock
+  passes either.
 
-`ListActiveAsync` and `HasActiveHoldAsync` are reporting queries. They evaluate the same
-columns against the `asOf` you pass. If [history pruning](/guides/history-pruning) is on,
-asking about a moment older than `InactiveHoldRetention` can answer "not held" for a hold
-that has since been pruned.
+`ListActiveAsync` and `HasActiveHoldAsync` answer for now, on the same database clock and with
+the same rule mutations use, so a report never disagrees with what a sweep would do. They
+don't answer for past moments: [history pruning](/guides/history-pruning) removes holds that
+stopped protecting long ago, so the table can't answer those reliably.
 
 ## Deleting around holds
 
@@ -90,7 +97,22 @@ then runs your callback inside the same EF and Postgres transaction.
 - If any target is held, it returns `Protected` without running the callback.
 - If the callback throws, the exception propagates and everything rolls back.
 
-`IRetentionDeletion` is scoped. Resolve it and your `DbContext` from the same DI scope,
-list every row the callback will delete, and save the callback's changes through that
-context. The operation owns the transaction, so call it when the context has no transaction
-open.
+Cohort checks the callback's work before it commits:
+
+- The context must have no unsaved changes when you call `ExecuteAsync`, or it throws
+  `InvalidOperationException` before doing anything.
+- The callback must save its changes. Returning with unsaved changes throws and rolls back.
+- If any row with an active hold disappears inside the transaction, `ExecuteAsync` throws
+  and rolls back, naming the hold IDs. That covers rows the callback didn't list, EF
+  cascades, database `ON DELETE CASCADE` and raw SQL. A hold whose row was already gone
+  before the callback ran doesn't count.
+- After a refusal or failure once the callback has run, the context's change tracker is
+  cleared, so a later `SaveChanges` can't apply the callback's changes outside the hold check.
+
+This guards deletion only. A callback that anonymises or soft-deletes a held row leaves the
+row in place, so Cohort can't see it.
+
+`IRetentionDeletion` is scoped. Resolve it and your `DbContext` from the same DI scope, and
+make every change through that context. Cohort can't see writes made through another
+context or connection: they commit on their own, outside the transaction. The operation owns
+the transaction, so call it when the context has no transaction open.

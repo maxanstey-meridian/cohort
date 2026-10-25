@@ -1,13 +1,17 @@
 using System.Diagnostics;
+
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
 using Cohort.Infrastructure.Handlers;
 using Cohort.Sample.Entities;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+
 using Npgsql;
+
 using Xunit.Sdk;
 
 namespace Cohort.Sample.Tests;
@@ -182,6 +186,42 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Hold_Reporting_Gives_The_Same_Answer_Before_And_After_Pruning()
+    {
+        // Reporting answers for now on the database clock, and pruning only removes holds that
+        // stopped protecting before its cutoff, so pruning can never change a reported answer.
+        var tenantId = Guid.NewGuid();
+        var expiredRecordId = Guid.NewGuid();
+        var heldRecordId = Guid.NewGuid();
+        await SeedHoldAsync(Now.AddDays(-100), removedAt: null, expiredRecordId, tenantId);
+        var activeHold = await SeedHoldAsync(expiresAt: null, removedAt: null, heldRecordId, tenantId);
+        using var host = CreateHost(inactiveHoldRetention: "1.00:00:00");
+
+        var before = await ReportAsync(host);
+        var result = await PruneAsync(host);
+        var after = await ReportAsync(host);
+
+        result.Should().Be(new RetentionHistoryPruneResult(Runs: 0, Holds: 1));
+        (await LoadHoldIdsAsync()).Should().BeEquivalentTo([activeHold]);
+        before.Should().BeEquivalentTo(after);
+        after.Listed.Should().BeEquivalentTo([activeHold]);
+        after.ExpiredHeld.Should().BeFalse();
+        after.ActiveHeld.Should().BeTrue();
+
+        Task<(List<Guid> Listed, bool ExpiredHeld, bool ActiveHeld)> ReportAsync(CohortTestHost reportHost) =>
+            reportHost.RunWithServicesAsync(async services =>
+            {
+                var holds = services.GetRequiredService<IRetentionHoldsRepository>();
+                var listed = await holds.ListActiveAsync(CancellationToken.None);
+                return (
+                    listed.Select(hold => hold.HoldId).ToList(),
+                    await holds.HasActiveHoldAsync(Note.RetentionIdentity, expiredRecordId.ToString(), tenantId, CancellationToken.None),
+                    await holds.HasActiveHoldAsync(Note.RetentionIdentity, heldRecordId.ToString(), tenantId, CancellationToken.None)
+                );
+            });
+    }
+
+    [Fact]
     public async Task Prune_Works_Through_A_Backlog_In_Batches_In_One_Pass()
     {
         const int backlog = RetentionHistoryPruner.BatchSize + 1;
@@ -267,6 +307,7 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
         builder.Services.AddSingleton<IAnonymiseValueFactory>(sp =>
             sp.GetRequiredService<OriginalValueTombstoneFactory>()
         );
+        builder.Services.AddSingleton(RetentionExecutionScope.Unisolated);
         builder.Services.AddCohort<SampleDbContext>();
         using var app = builder.Build();
 
@@ -395,7 +436,12 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
         return sweepId;
     }
 
-    private async Task<Guid> SeedHoldAsync(DateTimeOffset? expiresAt, DateTimeOffset? removedAt)
+    private async Task<Guid> SeedHoldAsync(
+        DateTimeOffset? expiresAt,
+        DateTimeOffset? removedAt,
+        Guid? recordId = null,
+        Guid? tenantId = null
+    )
     {
         var holdId = Guid.NewGuid();
         await using var connection = new NpgsqlConnection(ConnectionString);
@@ -408,8 +454,8 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
             """;
         command.Parameters.AddWithValue("holdId", holdId);
         command.Parameters.AddWithValue("entityId", Note.RetentionIdentity);
-        command.Parameters.AddWithValue("recordId", Guid.NewGuid().ToString());
-        command.Parameters.AddWithValue("tenantId", Guid.NewGuid());
+        command.Parameters.AddWithValue("recordId", (recordId ?? Guid.NewGuid()).ToString());
+        command.Parameters.AddWithValue("tenantId", tenantId ?? Guid.NewGuid());
         command.Parameters.AddWithValue("createdAt", Now.AddDays(-1000));
         command.Parameters.Add(new NpgsqlParameter("expiresAt", NpgsqlTypes.NpgsqlDbType.TimestampTz)
         {

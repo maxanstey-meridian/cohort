@@ -25,6 +25,21 @@ internal static class RecordIdSql
             : $"CAST({targetAlias}.{PostgreSqlIdentifier.Quote(recordId.RecordIdColumn)} AS text) = CAST(@{parameterName} AS text)";
     }
 
+    /// <summary>
+    /// Like <see cref="EqualsParameter"/>, for a text SQL expression such as a hold's stored
+    /// <c>RecordId</c>. A value that doesn't parse as the store type fails the statement.
+    /// </summary>
+    internal static string EqualsExpression(
+        string targetAlias,
+        RecordIdConvention recordId,
+        string textExpression
+    )
+    {
+        return PostgresStoreTypeSql.CastType(recordId.RecordIdStoreType) is { } storeType
+            ? $"{targetAlias}.{PostgreSqlIdentifier.Quote(recordId.RecordIdColumn)} = CAST({textExpression} AS {storeType})"
+            : $"CAST({targetAlias}.{PostgreSqlIdentifier.Quote(recordId.RecordIdColumn)} AS text) = {textExpression}";
+    }
+
     internal static string EqualsAnyParameter(
         string targetAlias,
         RecordIdConvention recordId,

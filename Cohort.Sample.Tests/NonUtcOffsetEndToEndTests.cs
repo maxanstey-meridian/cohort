@@ -1,6 +1,7 @@
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Sample.Entities;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -17,76 +18,87 @@ public sealed class NonUtcOffsetEndToEndTests(PostgresFixture fixture)
     public async Task Holds_Created_Queried_And_Removed_With_Non_Utc_Offsets_Behave_As_Utc()
     {
         var tenantId = Guid.NewGuid();
-        var recordId = Guid.NewGuid();
-        var holdId = Guid.NewGuid();
-        var createdAt = new DateTimeOffset(2026, 4, 10, 12, 0, 0, TimeSpan.Zero);
-        var expiresAt = new DateTimeOffset(2026, 4, 20, 12, 0, 0, TimeSpan.Zero);
-        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
-        var removedAt = asOf.AddMinutes(-30);
+        var removedRecordId = Guid.NewGuid();
+        var keptRecordId = Guid.NewGuid();
+        var removedHoldId = Guid.NewGuid();
+        var keptHoldId = Guid.NewGuid();
+        // Whole seconds: Postgres keeps microseconds, so tick-precise times wouldn't round-trip.
+        var now = DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        var createdAt = now.AddDays(-2);
+        var expiresAt = now.AddDays(8);
+        var removedAt = now.AddMinutes(-30);
+        var removedLaterAt = now.AddDays(1);
 
         await using (var db = Host.CreateDbContext())
         {
-            db.Notes.Add(new Note
-            {
-                Id = recordId,
-                TenantId = tenantId,
-                CreatedAt = DateTimeOffset.UtcNow,
-                Body = "non-utc hold target",
-            });
+            db.Notes.AddRange(
+                new Note { Id = removedRecordId, TenantId = tenantId, CreatedAt = DateTimeOffset.UtcNow, Body = "non-utc hold target" },
+                new Note { Id = keptRecordId, TenantId = tenantId, CreatedAt = DateTimeOffset.UtcNow, Body = "non-utc hold target" }
+            );
             await db.SaveChangesAsync();
         }
 
         var observed = await Host.RunWithServicesAsync(async services =>
         {
             var repository = services.GetRequiredService<IRetentionHoldsRepository>();
-            await repository.CreateAsync(
-                new RetentionHoldRequest(
-                    holdId,
-                    RetentionEntityIdentity.For<Note>(),
-                    recordId.ToString(),
-                    tenantId,
-                    "non-utc hold",
-                    createdAt.ToOffset(PlusOneHour),
-                    expiresAt.ToOffset(PlusOneHour)
-                ),
-                CancellationToken.None
-            );
+            foreach (var (holdId, recordId) in new[] { (removedHoldId, removedRecordId), (keptHoldId, keptRecordId) })
+            {
+                await repository.CreateAsync(
+                    new RetentionHoldRequest(
+                        holdId,
+                        RetentionEntityIdentity.For<Note>(),
+                        recordId.ToString(),
+                        tenantId,
+                        "non-utc hold",
+                        createdAt.ToOffset(PlusOneHour),
+                        expiresAt.ToOffset(PlusOneHour)
+                    ),
+                    CancellationToken.None
+                );
+            }
+
             var activeBeforeRemoval = await repository.HasActiveHoldAsync(
                 RetentionEntityIdentity.For<Note>(),
-                recordId.ToString(),
+                removedRecordId.ToString(),
                 tenantId,
-                asOf.ToOffset(PlusOneHour),
                 CancellationToken.None
             );
-            var listed = await repository.ListActiveAsync(asOf.ToOffset(PlusOneHour), CancellationToken.None);
-            await repository.RemoveAsync(holdId, removedAt.ToOffset(PlusOneHour), CancellationToken.None);
-            var activeAfterRemoval = await repository.HasActiveHoldAsync(
+            await repository.RemoveAsync(removedHoldId, removedAt.ToOffset(PlusOneHour), CancellationToken.None);
+            await repository.RemoveAsync(keptHoldId, removedLaterAt.ToOffset(PlusOneHour), CancellationToken.None);
+            var removedAfterRemoval = await repository.HasActiveHoldAsync(
                 RetentionEntityIdentity.For<Note>(),
-                recordId.ToString(),
+                removedRecordId.ToString(),
                 tenantId,
-                asOf.ToOffset(PlusOneHour),
                 CancellationToken.None
             );
-            return (activeBeforeRemoval, listed, activeAfterRemoval);
+            var keptAfterRemoval = await repository.HasActiveHoldAsync(
+                RetentionEntityIdentity.For<Note>(),
+                keptRecordId.ToString(),
+                tenantId,
+                CancellationToken.None
+            );
+            var listed = await repository.ListActiveAsync(CancellationToken.None);
+            return (activeBeforeRemoval, removedAfterRemoval, keptAfterRemoval, listed);
         });
 
         observed.activeBeforeRemoval.Should().BeTrue();
+        observed.removedAfterRemoval.Should().BeFalse();
+        observed.keptAfterRemoval.Should().BeTrue();
         observed.listed.Should().ContainSingle().Which.Should().Be(
             new RetentionHold(
-                holdId,
+                keptHoldId,
                 RetentionEntityIdentity.For<Note>(),
-                recordId.ToString(),
+                keptRecordId.ToString(),
                 tenantId,
                 "non-utc hold",
                 createdAt,
                 expiresAt,
-                null
+                removedLaterAt
             )
         );
-        observed.activeAfterRemoval.Should().BeFalse();
 
         await using var verify = Host.CreateDbContext();
-        var stored = await verify.HeldRecords.SingleAsync(hold => hold.HoldId == holdId);
+        var stored = await verify.HeldRecords.SingleAsync(hold => hold.HoldId == removedHoldId);
         stored.CreatedAt.Should().Be(createdAt);
         stored.ExpiresAt.Should().Be(expiresAt);
         stored.RemovedAt.Should().Be(removedAt);

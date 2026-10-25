@@ -1,4 +1,8 @@
+using System.Data;
+using System.Data.Common;
+
 using Cohort.Application;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
@@ -7,6 +11,7 @@ namespace Cohort.Infrastructure.Holds;
 
 internal sealed class EfRetentionDeletion(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
+    RetentionRegistry registry,
     RetentionTargetResolver targetResolver,
     RetentionRuntimeReadinessValidator readinessValidator
 ) : IRetentionDeletion
@@ -39,8 +44,18 @@ internal sealed class EfRetentionDeletion(
             );
         }
 
+        // Pending changes would be saved inside the hold-checked transaction without being
+        // checked, or leak out unsaved. They belong to the host, so refuse rather than discard them.
+        if (db.ChangeTracker.HasChanges())
+        {
+            throw new InvalidOperationException(
+                "Retention deletion needs a DbContext with no unsaved changes; save or discard them before calling ExecuteAsync."
+            );
+        }
+
         await readinessValidator.ValidateAsync(ct);
-        await using var transaction = await db.Database.BeginTransactionAsync(ct);
+        // The hold checks rely on each statement taking a fresh snapshot after the advisory lock.
+        await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
         var dbTransaction = transaction.GetDbTransaction();
         var resolvedTargets = new List<ResolvedTarget>(requestedTargets.Length);
 
@@ -90,14 +105,73 @@ internal sealed class EfRetentionDeletion(
             }
         }
 
-        await deletion(ct);
-        await transaction.CommitAsync(ct);
+        // The listed targets are unheld, but the callback can remove more than it listed (an
+        // unlisted row, a client or database cascade, raw SQL). Any active hold whose row
+        // disappears inside this transaction is a violation, whatever removed it. Holds already
+        // orphaned before the callback are not this deletion's doing.
+        var orphanedBefore = await ReadActiveHoldsWithoutRowAsync(dbTransaction, ct);
+        try
+        {
+            await deletion(ct);
+            if (db.ChangeTracker.HasChanges())
+            {
+                throw new InvalidOperationException(
+                    "The retention deletion callback returned with unsaved changes. Save them inside the callback; nothing was committed."
+                );
+            }
+
+            var violated = (await ReadActiveHoldsWithoutRowAsync(dbTransaction, ct))
+                .Except(orphanedBefore)
+                .Order()
+                .ToArray();
+            if (violated.Length > 0)
+            {
+                throw new InvalidOperationException(
+                    $"The retention deletion callback deleted rows protected by active holds ({string.Join(", ", violated)}). Nothing was committed."
+                );
+            }
+
+            await transaction.CommitAsync(ct);
+        }
+        catch
+        {
+            // The transaction rolls back on dispose. Anything still tracked (an unsaved Remove, or
+            // the entries of a SaveChanges that failed) would otherwise apply on the host's next
+            // save, outside the lock and the hold check.
+            db.ChangeTracker.Clear();
+            throw;
+        }
+
         return RetentionDeletionOutcome.Executed;
+    }
+
+    private async Task<HashSet<Guid>> ReadActiveHoldsWithoutRowAsync(
+        DbTransaction transaction,
+        CancellationToken ct
+    )
+    {
+        var (sql, parameters) = RetentionHoldSql.BuildActiveHoldsWithoutRow(
+            tables.RetentionHolds,
+            registry.Scan().Values.ToList()
+        );
+        await using var command = parameters.CreateCommand(
+            db.Database.GetDbConnection(),
+            transaction,
+            sql
+        );
+        var holdIds = new HashSet<Guid>();
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            holdIds.Add(reader.GetGuid(0));
+        }
+
+        return holdIds;
     }
 
     private async Task<bool> HasActiveHoldAsync(
         ResolvedTarget target,
-        System.Data.Common.DbTransaction transaction,
+        DbTransaction transaction,
         CancellationToken ct
     )
     {
@@ -116,13 +190,11 @@ internal sealed class EfRetentionDeletion(
             transaction,
             $"""
             SELECT 1
-            FROM {PostgreSqlIdentifier.Format(tables.RetentionHolds)}
-            WHERE "RetentionEntityId" = @retentionEntityId
-              AND "RecordId" = @recordId
-              {(target.Entry.Tenant is not null ? "AND \"TenantId\" = @tenantId" : "AND \"TenantId\" IS NULL")}
-              AND "CreatedAt" <= pg_catalog.statement_timestamp()
-              AND ("ExpiresAt" IS NULL OR "ExpiresAt" > pg_catalog.statement_timestamp())
-              AND ("RemovedAt" IS NULL OR "RemovedAt" > pg_catalog.statement_timestamp())
+            FROM {PostgreSqlIdentifier.Format(tables.RetentionHolds)} AS hold
+            WHERE hold."RetentionEntityId" = @retentionEntityId
+              AND hold."RecordId" = @recordId
+              {(target.Entry.Tenant is not null ? "AND hold.\"TenantId\" = @tenantId" : "AND hold.\"TenantId\" IS NULL")}
+              AND {RetentionHoldSql.ActivePredicate("hold")}
             LIMIT 1
             """
         );

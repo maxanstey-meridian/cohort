@@ -75,7 +75,7 @@ internal static class RetentionHandlerSupport
             {
                 var invocation = handler.OnBeforeMethod.Invoke(handler.Instance, [row, ctx, ct]);
                 await (Task)invocation!;
-                if (db.ChangeTracker.HasChanges())
+                if (HasUnsavedChanges(db))
                 {
                     return OnBeforeInvocationResult.LeftUnsavedChanges(handler);
                 }
@@ -112,6 +112,24 @@ internal static class RetentionHandlerSupport
             capturedPayload
                 ?? RetentionSnapshotSerializer.Capture(ctx.Snapshot, entityType, handlerAssemblies)
         );
+    }
+
+    /// <summary>
+    /// Detects explicitly, so a context with automatic detection turned off is still
+    /// checked. Detection that throws (a handler changed a tracked entity's key) is the
+    /// handler's unsaved change too.
+    /// </summary>
+    public static bool HasUnsavedChanges(DbContext db)
+    {
+        try
+        {
+            db.ChangeTracker.DetectChanges();
+            return db.ChangeTracker.HasChanges();
+        }
+        catch (Exception)
+        {
+            return true;
+        }
     }
 
     /// <summary>
@@ -322,6 +340,16 @@ internal sealed class ResolvedRetentionHandler(
             $"Could not resolve {nameof(IRetentionHandler<object>.OnBeforeAsync)} for handler interface {handlerInterface.FullName}."
         );
 }
+
+/// <summary>
+/// An OnBefore handler left changes on the caller's DbContext in a caller-transaction
+/// erasure that Cohort couldn't undo. It fails the whole erasure rather than one entity:
+/// a partially failed result would leave the caller free to commit.
+/// </summary>
+internal sealed class OnBeforeChangesNotUndoneException()
+    : InvalidOperationException(
+        "An OnBefore handler left changes on the caller's DbContext that Cohort could not undo, so Cohort cleared its change tracker and failed the erasure. Entities the context tracked are no longer tracked; discard it, or reload what you need, before saving."
+    );
 
 internal sealed record OnBeforeInvocationResult(
     ResolvedRetentionHandler? FailedHandler,

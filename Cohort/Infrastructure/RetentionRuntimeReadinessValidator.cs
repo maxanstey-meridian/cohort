@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Data.Common;
 
 using Cohort.Application;
 using Cohort.Domain;
@@ -9,7 +10,6 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
 
-using Npgsql;
 
 namespace Cohort.Infrastructure;
 
@@ -494,12 +494,13 @@ internal sealed class RetentionRuntimeReadinessValidator(
         await db.Database.OpenConnectionAsync(ct);
         try
         {
-            // Npgsql reads the server's version from the startup handshake.
-            var connection = (NpgsqlConnection)db.Database.GetDbConnection();
-            if (connection.PostgreSqlVersion < MinimumServerVersion)
+            // Asked of the server rather than read off NpgsqlConnection: a host may hand EF a
+            // wrapped DbConnection (a profiler, say).
+            var (version, versionText) = await ReadServerVersionAsync(db.Database.GetDbConnection(), ct);
+            if (version < MinimumServerVersion)
             {
                 throw new RetentionConfigurationException([
-                    $"Cohort requires PostgreSQL 16 or later; the database server is PostgreSQL {connection.ServerVersion}.",
+                    $"Cohort requires PostgreSQL 16 or later; the database server is PostgreSQL {versionText}.",
                 ]);
             }
         }
@@ -507,6 +508,23 @@ internal sealed class RetentionRuntimeReadinessValidator(
         {
             await db.Database.CloseConnectionAsync();
         }
+    }
+
+    private async Task<(Version Version, string Text)> ReadServerVersionAsync(
+        DbConnection connection,
+        CancellationToken ct
+    )
+    {
+        await using var command = new SqlParams().CreateCommand(
+            connection,
+            db.Database.CurrentTransaction?.GetDbTransaction(),
+            "SELECT pg_catalog.current_setting('server_version_num')::integer, pg_catalog.current_setting('server_version')"
+        );
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        await reader.ReadAsync(ct);
+        // server_version_num is major * 10000 + minor from PostgreSQL 10 on.
+        var number = reader.GetInt32(0);
+        return (new Version(number / 10000, number % 10000), reader.GetString(1));
     }
 
     /// <summary>

@@ -35,11 +35,19 @@ Both methods are optional. The interface supplies no-op defaults.
   through the sweep's `DbContext` see the row as it's about to be mutated, along with any
   related rows. A write through that context fails the handler (`sqlstate:25006`), and so
   does any database error, without harming the rest of the batch: the savepoint is always
-  rolled back. So does returning with unsaved changes on that context (an `Add` or a changed
-  entity never saved, recorded as `reason=on-before-unsaved-changes`). Whatever a handler
+  rolled back. So does returning with unsaved changes on that context (an `Add`, a changed
+  entity or key, or a navigation change never saved, recorded as
+  `reason=on-before-unsaved-changes`). Cohort checks with an explicit `DetectChanges`, so a
+  context with automatic change detection turned off is checked too. Whatever a handler
   leaves in the change tracker, a failed `SaveChanges` included, is discarded, so it can't be
-  saved later, for example by your own `SaveChangesAsync` after a
-  [caller-transaction erasure](/guides/erasure#erasing-inside-your-own-transaction). A
+  saved later. On a context Cohort owns the tracker is cleared after each row. In a
+  [caller-transaction erasure](/guides/erasure#erasing-inside-your-own-transaction) it's
+  your context, so Cohort undoes only the handler's part: entities the handler added or
+  loaded are detached, and entities you tracked get their original values back and stay
+  tracked. If Cohort can't show the undo is complete (changes are still detected, or a
+  navigation of an entity you track still holds one the handler added), it clears your
+  context's change tracker and fails the whole erasure with an `InvalidOperationException`,
+  not just the entity, so your own `SaveChangesAsync` and commit can't carry the change. A
   cancellation the handler raises itself, such as an `HttpClient` timeout, is a failure like
   any other; only the run's own token stops the run. External side effects still belong in `OnAfterAsync`: they survive a rollback,
   they run while the batch holds its row locks, and they can run for a row that's then

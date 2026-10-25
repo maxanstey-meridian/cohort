@@ -264,8 +264,11 @@ What changes compared with an ordinary erasure:
   synchronous `Commit()` blocks while observers are told, each for up to
   `AuditObservers:Timeout` per event.
 - **Row handlers run after the commit.** `OnBeforeAsync` runs inside your transaction, in a
-  read-only savepoint, and anything it leaves in your context's change tracker is discarded
-  (see [row handlers](/guides/row-handlers)).
+  read-only savepoint. Anything it leaves in your context's change tracker is undone:
+  entities it added or loaded are detached, and entities you track get their original
+  values back. If Cohort can't undo it completely, it clears your change tracker and the
+  erasure throws an `InvalidOperationException`; roll back, or reload what you need before
+  saving (see [row handlers](/guides/row-handlers)).
   `OnAfterAsync` work is queued in the same transaction, so the dispatcher only sees it once
   you commit, and a rollback discards it.
 - **Your deferred constraints stay deferred.** Cohort doesn't change your transaction's

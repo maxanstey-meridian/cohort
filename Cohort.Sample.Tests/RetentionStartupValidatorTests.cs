@@ -69,6 +69,23 @@ public sealed class RetentionStartupValidatorTests
         );
     }
 
+    [Fact]
+    public async Task ValidateAsync_Reports_A_Rule_Provider_Timing_Out_As_A_Configuration_Error()
+    {
+        var options = new DbContextOptionsBuilder<TimingOutCapabilitiesDbContext>()
+            .UseNpgsqlMetadataModel($"startup-validator-timing-out-capabilities-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new TimingOutCapabilitiesDbContext(options);
+
+        // An HttpClient timeout is a TaskCanceledException, but startup was not cancelled.
+        var act = async () => await CreateValidator(db, new TimingOutCategoryRepository()).ValidateAsync();
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle().Which.Should().Be(
+            $"Retention category 'timing-out' for entity {typeof(TimingOutCapabilitiesRecord).FullName} failed capability resolution: Simulated rule store timeout."
+        );
+    }
+
     private static InMemoryCategoryRepository IdentityCategoryRepository() =>
         new(new Dictionary<string, ITestRetentionRule> { ["identity"] = ExemptResolver });
 
@@ -1225,6 +1242,32 @@ public sealed class RetentionStartupValidatorTests
                 entity.HasKey(record => record.Id);
             });
         }
+    }
+
+    private sealed class TimingOutCategoryRepository : ITestRetentionRuleProvider
+    {
+        public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct) =>
+            throw new TaskCanceledException("Simulated rule store timeout.");
+    }
+
+    private sealed class TimingOutCapabilitiesDbContext(
+        DbContextOptions<TimingOutCapabilitiesDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.ConfigureCohortTables();
+            modelBuilder.Entity<TimingOutCapabilitiesRecord>().HasKey(record => record.Id);
+        }
+    }
+
+    [Retain("timing-out", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-0000000000e2")]
+    private sealed class TimingOutCapabilitiesRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
     }
 
     private sealed class BlankErasureKindDbContext(

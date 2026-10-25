@@ -71,15 +71,24 @@ unprotected without an error.
   rather than failing the commit.
 - `OnBeforeAsync` runs in a read-only savepoint that is always rolled back. A database error
   in a handler skips only its row instead of failing the batch, and a handler that writes
-  through the sweep's `DbContext` now fails (`sqlstate:25006`). Anything a handler leaves in
-  the change tracker, a failed `SaveChanges` included, is discarded, and unsaved changes fail
-  its row (`reason=on-before-unsaved-changes`), so a caller-transaction erasure's next save
-  can't commit them.
+  through the sweep's `DbContext` now fails (`sqlstate:25006`). A handler that returns with
+  unsaved changes (an `Add`, a changed entity or key, a navigation change, a failed
+  `SaveChanges`) fails its row (`reason=on-before-unsaved-changes`), even with automatic
+  change detection off. Cohort then clears its own context's change tracker. On a
+  caller-transaction erasure's context it detaches what the handler added or loaded and
+  restores what the caller tracked. If it can't undo the change completely, it clears the
+  caller's change tracker and the erasure throws `InvalidOperationException`, so the caller's
+  next save can't commit it.
+- `ErasureTransaction.Caller` and `IRetentionDeletion` detect changes before refusing a
+  context with unsaved changes, so an edit made with automatic change detection off is
+  refused too.
 - A handler's or rule provider's own cancellation (an `HttpClient` timeout, say) fails only
   its row or entity; only the run's own cancellation stops the run.
 - A dry-run erasure doesn't settle `PartiallyFailed` for rows it predicts would be left; read
   `Complete`. Rows a foreign key keeps from a purge get one Warning per entity naming the keys.
-- Readiness refuses an anonymise its column can never take: a column or retained table the
+- Readiness refuses a retained entity whose table or record-id column the database doesn't
+  have, whatever its strategy: every run would fail.
+- Readiness refuses an anonymise its column can never take: an anonymised column the
   database no longer has; a model store type the column type can't be assigned to without an
   explicit cast (any method, `Null` included); a literal or empty string, after its value
   converter, that the model's type or the column type rejects (length, type or domain CHECK),

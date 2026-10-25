@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Collections.Concurrent;
 using System.Data.Common;
 using System.Reflection;
@@ -6,6 +7,7 @@ using Cohort.Domain;
 using Cohort.Infrastructure.Holds;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.ChangeTracking;
 using Microsoft.Extensions.Logging;
 
 using Npgsql;
@@ -334,7 +336,7 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
                     scope.Tenant.Id,
                     execution.At
                 );
-                var result = await InvokeOnBeforeReadOnlyAsync(conn, transaction, handlers, entry.EntityType, row, before, ct);
+                var result = await InvokeOnBeforeReadOnlyAsync(conn, transaction, handlers, entry.EntityType, row, before, execution.OnCallersContext, ct);
                 if (!result.Succeeded)
                 {
                     var skippedId = await RecordIdSql.CanonicalizeAsync(
@@ -436,10 +438,8 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
     /// the batch, and a write fails (SQLSTATE 25006) instead of committing with it. Rolling
     /// back also restores read-write mode and releases anything the handler locked.
     /// Read-only can't reach the change tracker, so whatever a handler left tracked there
-    /// (an unsaved Add, or the entries of a save that failed) is discarded: in a
-    /// caller-transaction erasure the context is the caller's, and its next save would
-    /// commit it. Cohort loads rows untracked and a caller's context has no unsaved changes
-    /// on entry, so every change discarded is the handler's.
+    /// (an unsaved Add, the entries of a save that failed, or entities it loaded) is
+    /// discarded afterwards: see <see cref="DiscardTrackedChanges"/>.
     /// </summary>
     private async Task<OnBeforeInvocationResult> InvokeOnBeforeReadOnlyAsync(
         DbConnection conn,
@@ -448,9 +448,15 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
         Type entityType,
         object row,
         RetentionBeforeContext before,
+        bool onCallersContext,
         CancellationToken ct
     )
     {
+        // The caller's context had no unsaved changes on entry, so what it tracks now is what
+        // the discard restores; anything tracked after the handlers is theirs.
+        var trackedBefore = onCallersContext
+            ? db.ChangeTracker.Entries().Select(entry => entry.Entity).ToHashSet(ReferenceEqualityComparer.Instance)
+            : null;
         await transaction.SaveAsync(OnBeforeSavepoint, CancellationToken.None);
         OnBeforeInvocationResult result;
         try
@@ -464,9 +470,9 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
         }
         catch
         {
-            DiscardTrackedChanges();
             // Cancelled, or Cohort's own statement failed: the batch is abandoned with the
-            // original exception, so a failed rollback mustn't replace it.
+            // original exception, so neither a failed rollback nor a failed discard may
+            // replace it.
             try
             {
                 await transaction.RollbackAsync(OnBeforeSavepoint, CancellationToken.None);
@@ -476,39 +482,139 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
                 // The batch transaction is discarded either way.
             }
 
+            try
+            {
+                DiscardTrackedChanges(trackedBefore);
+            }
+            catch (Exception)
+            {
+                // The tracker was cleared if it couldn't be restored.
+            }
+
             throw;
         }
 
         await transaction.RollbackAsync(OnBeforeSavepoint, CancellationToken.None);
-        DiscardTrackedChanges();
+        DiscardTrackedChanges(trackedBefore);
         return result;
     }
 
     /// <summary>
-    /// Puts the change tracker back as OnBefore found it: added entries are detached and
-    /// changed or deleted ones get their original values back, so entities the context's
-    /// owner already tracked stay tracked.
+    /// Leaves the change tracker as OnBefore found it. Cohort loads rows untracked, so on
+    /// its own context (<paramref name="trackedBefore"/> null) there is nothing to keep and
+    /// the tracker is cleared. On the caller's context, entities the handlers began
+    /// tracking (added or loaded) are detached, and those the caller tracked get their
+    /// original values back and stay tracked. When that can't be proven complete (changes
+    /// are still detected, an entity the caller didn't track is tracked again, a navigation
+    /// still holds an untracked entity, or restoring throws), the tracker is cleared and
+    /// the erasure fails with <see cref="OnBeforeChangesNotUndoneException"/>.
     /// </summary>
-    private void DiscardTrackedChanges()
+    private void DiscardTrackedChanges(IReadOnlySet<object>? trackedBefore)
     {
-        if (!db.ChangeTracker.HasChanges())
+        if (trackedBefore is null)
         {
+            db.ChangeTracker.Clear();
             return;
         }
 
-        foreach (var entry in db.ChangeTracker.Entries().ToArray())
+        bool restored;
+        try
         {
-            switch (entry.State)
+            restored = TryRestoreTrackedChanges(trackedBefore);
+        }
+        catch (Exception)
+        {
+            restored = false;
+        }
+
+        if (!restored)
+        {
+            db.ChangeTracker.Clear();
+            throw new OnBeforeChangesNotUndoneException();
+        }
+    }
+
+    private bool TryRestoreTrackedChanges(IReadOnlySet<object> trackedBefore)
+    {
+        var tracker = db.ChangeTracker;
+        var autoDetectChanges = tracker.AutoDetectChangesEnabled;
+        // Detection would throw on the very change being undone, such as a modified key.
+        tracker.AutoDetectChangesEnabled = false;
+        try
+        {
+            foreach (var entry in tracker.Entries().ToArray())
             {
-                case EntityState.Added:
+                if (!trackedBefore.Contains(entry.Entity))
+                {
                     entry.State = EntityState.Detached;
-                    break;
-                case EntityState.Modified or EntityState.Deleted:
-                    entry.CurrentValues.SetValues(entry.OriginalValues);
-                    entry.State = EntityState.Unchanged;
-                    break;
+                    continue;
+                }
+
+                // Unchanged too: a change detection never got to mark is still on the entity.
+                RestoreKeys(entry);
+                entry.CurrentValues.SetValues(entry.OriginalValues);
+                entry.State = EntityState.Unchanged;
             }
         }
+        finally
+        {
+            tracker.AutoDetectChangesEnabled = autoDetectChanges;
+        }
+
+        return !RetentionHandlerSupport.HasUnsavedChanges(db)
+            && tracker.Entries().All(entry => trackedBefore.Contains(entry.Entity))
+            && !ReachesUntrackedEntity();
+    }
+
+    /// <summary>
+    /// EF refuses to set a tracked entity's key, even back to its original value, but the
+    /// entity's own member can be. A key with no writable member throws, which clears the
+    /// tracker and fails the erasure.
+    /// </summary>
+    private static void RestoreKeys(EntityEntry entry)
+    {
+        foreach (var key in entry.Metadata.GetProperties().Where(property => property.IsKey() && !property.IsShadowProperty()))
+        {
+            var original = entry.OriginalValues[key];
+            if (key.GetKeyValueComparer().Equals(entry.CurrentValues[key], original))
+            {
+                continue;
+            }
+
+            if (key.PropertyInfo is { CanWrite: true } member)
+            {
+                member.SetValue(entry.Entity, original);
+            }
+            else
+            {
+                (key.FieldInfo ?? throw new InvalidOperationException($"Key {key.Name} has no writable member.")).SetValue(entry.Entity, original);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Whether a tracked entity's navigation still holds an entity the tracker doesn't
+    /// track, which the caller's next attach of the graph would pick up.
+    /// </summary>
+    private bool ReachesUntrackedEntity()
+    {
+        var entries = db.ChangeTracker.Entries().ToArray();
+        var tracked = entries.Select(entry => entry.Entity).ToHashSet(ReferenceEqualityComparer.Instance);
+        foreach (var navigation in entries.SelectMany(entry => entry.Navigations))
+        {
+            var targets = navigation.CurrentValue switch
+            {
+                null => [],
+                IEnumerable collection when navigation.Metadata.IsCollection => collection.Cast<object>(),
+                var single => [single],
+            };
+            if (targets.Any(target => !tracked.Contains(target)))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool IsIntegrityViolation(DbException exception) =>

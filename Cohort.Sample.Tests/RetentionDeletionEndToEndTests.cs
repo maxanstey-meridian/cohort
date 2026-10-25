@@ -430,6 +430,37 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task ExecuteAsync_Refuses_An_Undetected_Edit_When_Automatic_Change_Detection_Is_Off()
+    {
+        var tenantId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        var editedId = Guid.NewGuid();
+        var callbackRan = false;
+        await SeedNotesAsync(tenantId, noteId, editedId);
+
+        var act = () => Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            var edited = await db.Notes.SingleAsync(note => note.Id == editedId);
+            db.ChangeTracker.AutoDetectChangesEnabled = false;
+            edited.Body = "edited, not saved";
+            await services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [new RetentionTarget(RetentionEntityIdentity.For<Note>(), noteId.ToString(), tenantId)],
+                _ =>
+                {
+                    callbackRan = true;
+                    return Task.CompletedTask;
+                }
+            );
+        });
+
+        await act.Should().ThrowAsync<InvalidOperationException>().WithMessage("*no unsaved changes*");
+        callbackRan.Should().BeFalse();
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
+    }
+
+    [Fact]
     public async Task A_Preexisting_Orphaned_Hold_Does_Not_Block_An_Unrelated_Deletion()
     {
         var tenantId = Guid.NewGuid();

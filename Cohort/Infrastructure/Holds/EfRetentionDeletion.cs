@@ -47,7 +47,9 @@ internal sealed class EfRetentionDeletion(
 
         // Pending changes would be saved inside the hold-checked transaction without being
         // checked, or leak out unsaved. They belong to the host, so refuse rather than discard
-        // them.
+        // them. Detected explicitly: HasChanges alone misses an edit when the host turned
+        // automatic change detection off.
+        db.ChangeTracker.DetectChanges();
         if (db.ChangeTracker.HasChanges())
         {
             throw new InvalidOperationException(
@@ -122,6 +124,7 @@ internal sealed class EfRetentionDeletion(
         try
         {
             await deletion(ct);
+            db.ChangeTracker.DetectChanges();
             if (db.ChangeTracker.HasChanges())
             {
                 throw new InvalidOperationException(

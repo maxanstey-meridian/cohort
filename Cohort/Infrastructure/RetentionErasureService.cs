@@ -80,6 +80,8 @@ internal sealed class RetentionErasureService(
             ?? throw new InvalidOperationException(
                 "ErasureTransaction.Caller needs an open transaction on the scoped DbContext."
             );
+        // Explicit, so a context with automatic change detection turned off is checked too.
+        db.ChangeTracker.DetectChanges();
         if (db.ChangeTracker.HasChanges())
         {
             throw new InvalidOperationException(

@@ -194,8 +194,10 @@ internal sealed class RetentionRun(
                 }
 
                 // Only the run's own cancellation stops the run; any other is this entity's
-                // failure.
-                if (ex is OperationCanceledException && ct.IsCancellationRequested)
+                // failure. So is a handler's change Cohort couldn't undo on the caller's
+                // context: an entity failure would leave the caller free to commit.
+                if (ex is OperationCanceledException && ct.IsCancellationRequested
+                    || ex is OnBeforeChangesNotUndoneException)
                 {
                     throw;
                 }
@@ -431,7 +433,7 @@ internal sealed class RetentionRun(
                     scope,
                     db.Database.GetDbConnection(),
                     (batchTransaction ?? db.Database.CurrentTransaction!).GetDbTransaction(),
-                    new SweepMutationContext(SweepId, eventAt, batchSize, blocked),
+                    new SweepMutationContext(SweepId, eventAt, batchSize, blocked, OnCallersContext: callerCommit is not null),
                     ct
                 );
                 if (

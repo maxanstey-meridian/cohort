@@ -683,19 +683,25 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         );
     }
 
+    // The UPDATE casts the value to the model's store type, then PostgreSQL assigns it to the
+    // column, so the column needs an assignment path from the model's type. text to uuid has no
+    // pg_cast row and uuid isn't a string type, so even a valid uuid literal, or a Null, fails
+    // every run. integer to boolean has a pg_cast row, but it is explicit-only. An array assigns
+    // only through its elements, and text to uuid fails there too.
     [Theory]
-    [InlineData("anonymise_uuid_literal_records", typeof(AnonymiseUuidLiteralRecord))]
-    [InlineData("anonymise_null_records", typeof(AnonymiseNullRecord))]
+    [InlineData("anonymise_uuid_literal_records", typeof(AnonymiseUuidLiteralRecord), "uuid", "text")]
+    [InlineData("anonymise_null_records", typeof(AnonymiseNullRecord), "uuid", "text")]
+    [InlineData("anonymise_null_integer_records", typeof(AnonymiseNullIntegerRecord), "boolean", "integer")]
+    [InlineData("anonymise_null_text_array_records", typeof(AnonymiseNullTextArrayRecord), "uuid[]", "text[]")]
     public async Task Readiness_refuses_a_column_the_models_store_type_cannot_be_assigned_to(
         string table,
-        Type entityType
+        Type entityType,
+        string columnType,
+        string modelType
     )
     {
-        // The UPDATE casts the value to the model's store type (text), then PostgreSQL assigns it
-        // to the column. text to uuid is an explicit-only cast, so even a valid uuid literal, or
-        // a Null, fails every run.
         await using var database = await AnonymiseTargetDatabaseAsync(
-            $"""ALTER TABLE public.{table} ALTER COLUMN "Label" TYPE uuid USING NULL"""
+            $"""ALTER TABLE public.{table} ALTER COLUMN "Label" TYPE {columnType} USING NULL"""
         );
         await using var provider = BuildAnonymiseTargetProvider(database.ConnectionString);
 
@@ -704,21 +710,31 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         errors.Should().ContainSingle(error =>
             error.Contains(entityType.FullName!, StringComparison.Ordinal)
             && error.Contains("member Label", StringComparison.Ordinal)
-            && error.Contains("model store type text can't be assigned to its column type uuid", StringComparison.Ordinal)
+            && error.Contains(
+                $"model store type {modelType} can't be assigned to its column type {columnType} ",
+                StringComparison.Ordinal
+            )
         );
     }
 
-    [Fact]
-    public async Task Readiness_accepts_a_column_the_models_store_type_can_be_assigned_to()
+    // text assigns to varchar, and to a domain over varchar, through pg_cast's implicit row; the
+    // array assigns through its elements; uuid reaches text, which has no pg_cast row from it,
+    // through text I/O, as any type reaches a string type.
+    [Theory]
+    [InlineData(
+        """
+        CREATE DOMAIN short_label AS character varying(40);
+        ALTER TABLE public.anonymise_uuid_literal_records ALTER COLUMN "Label" TYPE short_label;
+        ALTER TABLE public.anonymise_null_records ALTER COLUMN "Label" TYPE character varying(40);
+        """
+    )]
+    [InlineData(
+        """ALTER TABLE public.anonymise_null_text_array_records ALTER COLUMN "Label" TYPE character varying(40)[]"""
+    )]
+    [InlineData("""ALTER TABLE public.anonymise_null_uuid_records ALTER COLUMN "Label" TYPE text""")]
+    public async Task Readiness_accepts_a_column_the_models_store_type_can_be_assigned_to(string ddl)
     {
-        // text assigns to varchar, and to a domain over varchar, without an explicit cast.
-        await using var database = await AnonymiseTargetDatabaseAsync(
-            """
-            CREATE DOMAIN short_label AS character varying(40);
-            ALTER TABLE public.anonymise_uuid_literal_records ALTER COLUMN "Label" TYPE short_label;
-            ALTER TABLE public.anonymise_null_records ALTER COLUMN "Label" TYPE character varying(40);
-            """
-        );
+        await using var database = await AnonymiseTargetDatabaseAsync(ddl);
         await using var provider = BuildAnonymiseTargetProvider(database.ConnectionString);
 
         var result = await provider.GetRequiredService<IRetentionSweep>().ExecuteAsync(
@@ -1200,6 +1216,9 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             modelBuilder.Entity<AnonymiseNullRecord>().ToTable("anonymise_null_records");
             modelBuilder.Entity<AnonymiseUuidLiteralRecord>().ToTable("anonymise_uuid_literal_records");
             modelBuilder.Entity<AnonymiseStaticFactoryRecord>().ToTable("anonymise_static_factory_records");
+            modelBuilder.Entity<AnonymiseNullIntegerRecord>().ToTable("anonymise_null_integer_records");
+            modelBuilder.Entity<AnonymiseNullUuidRecord>().ToTable("anonymise_null_uuid_records");
+            modelBuilder.Entity<AnonymiseNullTextArrayRecord>().ToTable("anonymise_null_text_array_records");
             modelBuilder
                 .Entity<AnonymiseConvertedRecord>()
                 .ToTable("anonymise_converted_records")
@@ -1328,6 +1347,50 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
 
         [Anonymise(AnonymiseMethod.Null)]
         public string? Label { get; set; }
+
+        public DateTimeOffset? AnonymisedAt { get; set; }
+    }
+
+    // Null-anonymised members whose model store types (integer, uuid, text[]) aren't text, so
+    // the assignability check meets other pg_cast rows, text I/O and the array branch.
+    [Retain("anonymise-target", nameof(CreatedAt))]
+    [RetentionEntityId("a7c3e9f1-4b2d-4e86-9a15-0d6f8b2c4e73")]
+    [RetentionTenantless]
+    private sealed class AnonymiseNullIntegerRecord
+    {
+        public Guid Id { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
+
+        [Anonymise(AnonymiseMethod.Null)]
+        public int? Label { get; set; }
+
+        public DateTimeOffset? AnonymisedAt { get; set; }
+    }
+
+    [Retain("anonymise-target", nameof(CreatedAt))]
+    [RetentionEntityId("f2b8d4a6-3c1e-4f97-b6d0-9e5a7c3f1b28")]
+    [RetentionTenantless]
+    private sealed class AnonymiseNullUuidRecord
+    {
+        public Guid Id { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
+
+        [Anonymise(AnonymiseMethod.Null)]
+        public Guid? Label { get; set; }
+
+        public DateTimeOffset? AnonymisedAt { get; set; }
+    }
+
+    [Retain("anonymise-target", nameof(CreatedAt))]
+    [RetentionEntityId("4e9a1c7d-8b3f-4d62-a0e5-6f2c9b8d1a54")]
+    [RetentionTenantless]
+    private sealed class AnonymiseNullTextArrayRecord
+    {
+        public Guid Id { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
+
+        [Anonymise(AnonymiseMethod.Null)]
+        public string[]? Label { get; set; }
 
         public DateTimeOffset? AnonymisedAt { get; set; }
     }

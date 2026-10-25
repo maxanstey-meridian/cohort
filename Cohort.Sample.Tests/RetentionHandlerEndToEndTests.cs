@@ -4,9 +4,11 @@ using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
 using Cohort.Infrastructure;
+using Cohort.Infrastructure.Migrations;
 using Cohort.Sample.Entities;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
 using Npgsql;
@@ -922,11 +924,16 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     }
 
     [Theory]
-    [InlineData(DatabaseTouchingNoteHandler.StagingBody, "^reason=on-before-unsaved-changes$")]
-    [InlineData(DatabaseTouchingNoteHandler.FailedSaveBody, "^type=Npgsql\\.PostgresException;code=sqlstate:25006;diagnosticId=[0-9a-f]{32}$")]
+    [InlineData(DatabaseTouchingNoteHandler.StagingBody, "^reason=on-before-unsaved-changes$", true)]
+    [InlineData(DatabaseTouchingNoteHandler.FailedSaveBody, "^type=Npgsql\\.PostgresException;code=sqlstate:25006;diagnosticId=[0-9a-f]{32}$", true)]
+    // Change detection itself throws on a changed key: still the handler's unsaved change.
+    [InlineData(DatabaseTouchingNoteHandler.KeyChangingBody, "^reason=on-before-unsaved-changes$", true)]
+    // With automatic detection off, only an explicit DetectChanges sees the handler's edit.
+    [InlineData(DatabaseTouchingNoteHandler.EditingBody, "^reason=on-before-unsaved-changes$", false)]
     public async Task A_Caller_Transaction_Erasure_Discards_What_An_OnBefore_Left_On_The_Callers_Context(
         string body,
-        string expectedError
+        string expectedError,
+        bool autoDetectChanges
     )
     {
         var tenantId = Guid.NewGuid();
@@ -967,6 +974,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         var result = await handlerHost.RunWithServicesAsync(async services =>
         {
             var db = services.GetRequiredService<SampleDbContext>();
+            db.ChangeTracker.AutoDetectChangesEnabled = autoDetectChanges;
             await using var transaction = await db.Database.BeginTransactionAsync();
             var erased = await services.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
                 RetentionErasureRequest.Tenanted(
@@ -978,6 +986,7 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             );
 
             // The caller's own save in its transaction must not carry the handler's change.
+            db.ChangeTracker.AutoDetectChangesEnabled = true;
             db.ChangeTracker.HasChanges().Should().BeFalse();
             await db.SaveChangesAsync();
             await transaction.CommitAsync();
@@ -995,6 +1004,83 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         (await verify.Notes.AnyAsync(note => note.Id == stagingNoteId)).Should().BeTrue();
         (await verify.Notes.SingleAsync(note => note.Id == bystanderNoteId)).Body.Should().Be("bystander");
         (await verify.Notes.AnyAsync(note => note.Body == DatabaseTouchingNoteHandler.StagedBody)).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task A_Caller_Transaction_Erasure_Fails_When_An_OnBefore_Leaves_A_Navigation_Change_On_The_Callers_Context()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
+        await using var services = BuildTrackedGraphServices(database.ConnectionString);
+        var tenantId = Guid.NewGuid();
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        await SeedTrackedGraphAsync(
+            services,
+            tenantId,
+            subjectId,
+            (TrackedGraphHandler.AddingBody, asOf.AddDays(-2)),
+            ("healthy", asOf.AddDays(-1))
+        );
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<TrackedGraphDbContext>();
+            // The caller tracks the folder; the handler adds to its collection navigation.
+            await db.Folders.SingleAsync();
+            await using var transaction = await db.Database.BeginTransactionAsync();
+
+            var erasure = () => scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(
+                    new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                    new ErasureScope("person", subjectId),
+                    asOf,
+                    transaction: ErasureTransaction.Caller
+                )
+            );
+
+            (await erasure.Should().ThrowAsync<InvalidOperationException>())
+                .Which.Message.Should().StartWith("An OnBefore handler left changes on the caller's DbContext that Cohort could not undo");
+            db.ChangeTracker.HasChanges().Should().BeFalse();
+            await db.SaveChangesAsync();
+            await transaction.CommitAsync();
+        }
+
+        await using var verifyScope = services.CreateAsyncScope();
+        var verify = verifyScope.ServiceProvider.GetRequiredService<TrackedGraphDbContext>();
+        (await verify.Comments.CountAsync()).Should().Be(0);
+        (await verify.Records.CountAsync()).Should().Be(2);
+    }
+
+    [Fact]
+    public async Task An_Owned_Sweep_Fails_Only_The_Row_Whose_OnBefore_Left_A_Navigation_Change()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
+        await using var services = BuildTrackedGraphServices(database.ConnectionString);
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        await SeedTrackedGraphAsync(
+            services,
+            tenantId,
+            subjectId: null,
+            (TrackedGraphHandler.AddingBody, asOf.AddDays(-300)),
+            ("healthy-1", asOf.AddDays(-200)),
+            ("healthy-2", asOf.AddDays(-100))
+        );
+
+        var result = await services.GetRequiredService<IRetentionSweep>().ExecuteAsync(
+            RetentionSweepRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), asOf)
+        );
+
+        result.EntityFailures.Should().ContainSingle()
+            .Which.Should().Be($"reason=rows-skipped;entityType={typeof(TrackedGraphRecord).FullName};count=1");
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(TrackedGraphRecord))
+            .Which.Should().Match<EntitySweepCount>(count => count.Affected == 2 && count.SkippedCount == 1);
+
+        await using var verifyScope = services.CreateAsyncScope();
+        var verify = verifyScope.ServiceProvider.GetRequiredService<TrackedGraphDbContext>();
+        (await verify.Comments.CountAsync()).Should().Be(0);
+        (await verify.Records.Select(record => record.Body).ToListAsync())
+            .Should().BeEquivalentTo([TrackedGraphHandler.AddingBody]);
     }
 
     [Fact]
@@ -2581,6 +2667,127 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         int SkippedCount = 0
     );
 
+    private static ServiceProvider BuildTrackedGraphServices(string connectionString)
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
+        services.AddLogging();
+        services.AddDbContext<TrackedGraphDbContext>(options => options.UseNpgsql(connectionString));
+        services.AddSingleton<IRetentionRuleProvider>(
+            new StaticCategoryRepository(
+                new Dictionary<string, ITestRetentionRule>
+                {
+                    ["tracked-graph"] = new StaticTestRetentionRule(
+                        new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)
+                    ),
+                }
+            )
+        );
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
+        services.AddCohort<TrackedGraphDbContext>();
+        services.AddRowHandler<TrackedGraphRecord, TrackedGraphHandler>();
+        return services.BuildServiceProvider(validateScopes: true);
+    }
+
+    private static async Task SeedTrackedGraphAsync(
+        ServiceProvider services,
+        Guid tenantId,
+        Guid? subjectId,
+        params (string Body, DateTimeOffset CreatedAt)[] records
+    )
+    {
+        await using var scope = services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<TrackedGraphDbContext>();
+        await db.Database.EnsureCreatedAsync();
+        db.Folders.Add(new TrackedGraphFolder { Id = Guid.NewGuid() });
+        db.Records.AddRange(
+            records.Select(record => new TrackedGraphRecord
+            {
+                Id = Guid.NewGuid(),
+                TenantId = tenantId,
+                SubjectId = subjectId,
+                CreatedAt = record.CreatedAt,
+                Body = record.Body,
+            })
+        );
+        await db.SaveChangesAsync();
+    }
+
+    private sealed class TrackedGraphDbContext(DbContextOptions<TrackedGraphDbContext> options)
+        : DbContext(options)
+    {
+        public DbSet<TrackedGraphRecord> Records => Set<TrackedGraphRecord>();
+        public DbSet<TrackedGraphFolder> Folders => Set<TrackedGraphFolder>();
+        public DbSet<TrackedGraphComment> Comments => Set<TrackedGraphComment>();
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<TrackedGraphRecord>(entity =>
+            {
+                entity.ToTable("tracked_graph_records");
+                entity.HasKey(record => record.Id);
+            });
+            modelBuilder.Entity<TrackedGraphFolder>(entity =>
+            {
+                entity.ToTable("tracked_graph_folders");
+                entity.HasKey(folder => folder.Id);
+                entity.HasMany(folder => folder.Comments).WithOne().HasForeignKey(comment => comment.FolderId);
+            });
+            modelBuilder.Entity<TrackedGraphComment>(entity =>
+            {
+                entity.ToTable("tracked_graph_comments");
+                entity.HasKey(comment => comment.Id);
+            });
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    [Retain("tracked-graph", nameof(CreatedAt))]
+    [RetentionEntityId("6d0f3a52-9a8e-4d1b-8f3c-2b7e5a1c9d40")]
+    private sealed class TrackedGraphRecord
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+
+        [ErasureSubject("person")]
+        public Guid? SubjectId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+        public string Body { get; init; } = "";
+    }
+
+    /// <summary>Unretained, so only a handler's change can touch it.</summary>
+    private sealed class TrackedGraphFolder
+    {
+        public Guid Id { get; init; }
+        public List<TrackedGraphComment> Comments { get; init; } = [];
+    }
+
+    private sealed class TrackedGraphComment
+    {
+        public Guid Id { get; init; }
+        public Guid FolderId { get; init; }
+    }
+
+    /// <summary>
+    /// Adds a comment to the folder's collection navigation without saving: an entry Cohort
+    /// can detach, but the folder's navigation still holds it.
+    /// </summary>
+    private sealed class TrackedGraphHandler(TrackedGraphDbContext db) : IRetentionHandler<TrackedGraphRecord>
+    {
+        public const string AddingBody = "add-comment-before-delete";
+
+        public async Task OnBeforeAsync(TrackedGraphRecord row, RetentionBeforeContext ctx, CancellationToken ct)
+        {
+            if (row.Body == AddingBody)
+            {
+                var folder = await db.Folders.SingleAsync(ct);
+                folder.Comments.Add(new TrackedGraphComment { Id = Guid.NewGuid() });
+            }
+
+            ctx.Snapshot["body"] = row.Body;
+        }
+    }
+
     private sealed class StaticCategoryRepository(
         IReadOnlyDictionary<string, ITestRetentionRule> resolvers
     ) : ITestRetentionRuleProvider
@@ -2944,6 +3151,8 @@ file sealed class DatabaseTouchingNoteHandler(SampleDbContext db, WriteTarget ta
     public const string ReadingBody = "read-before-delete";
     public const string StagingBody = "stage-before-delete";
     public const string FailedSaveBody = "save-before-delete";
+    public const string KeyChangingBody = "change-key-before-delete";
+    public const string EditingBody = "edit-before-delete";
     public const string StagedBody = "staged-by-handler";
 
     public async Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
@@ -2973,6 +3182,13 @@ file sealed class DatabaseTouchingNoteHandler(SampleDbContext db, WriteTarget ta
                 // The save fails read-only (25006) and leaves its entry Modified.
                 (await db.Notes.SingleAsync(note => note.Id == target.NoteId, ct)).Body = "overwritten-by-handler";
                 await db.SaveChangesAsync(ct);
+                break;
+            case KeyChangingBody:
+                (await db.Notes.SingleAsync(note => note.Id == target.NoteId, ct)).Id = Guid.NewGuid();
+                break;
+            case EditingBody:
+                // Tracked but never saved, like StagingBody, on an entity the context already tracks.
+                (await db.Notes.SingleAsync(note => note.Id == target.NoteId, ct)).Body = "overwritten-by-handler";
                 break;
         }
 

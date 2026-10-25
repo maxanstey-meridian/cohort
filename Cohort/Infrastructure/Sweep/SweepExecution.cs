@@ -30,12 +30,15 @@ internal sealed record SweepExecutionResult(
 /// <summary>
 /// One batch of a real run. <c>ExcludedRecordIds</c> are rows earlier batches of the run
 /// found blocked, left out of discovery so they aren't tried again in the same run.
+/// <c>OnCallersContext</c> says the run's DbContext is the caller's (a caller-transaction
+/// erasure), not one Cohort owns.
 /// </summary>
 internal sealed record SweepMutationContext(
     Guid SweepId,
     DateTimeOffset At,
     int? BatchSize = null,
-    IReadOnlyCollection<string>? ExcludedRecordIds = null
+    IReadOnlyCollection<string>? ExcludedRecordIds = null,
+    bool OnCallersContext = false
 );
 
 internal sealed record ErasureSubjectPredicate

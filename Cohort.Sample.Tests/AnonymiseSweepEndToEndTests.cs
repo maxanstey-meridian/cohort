@@ -434,6 +434,50 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task A_PerRow_Factory_Timing_Out_Fails_Only_Its_Entity_Not_The_Sweep()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
+        await using var services = BuildFactoryBackedSweepServiceProvider(database.ConnectionString);
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var setBasedId = Guid.NewGuid();
+        var perRowId = Guid.NewGuid();
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<FactoryBackedSweepDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.SetBasedFactorySweepRecords.Add(
+                new SetBasedFactorySweepRecord { Id = setBasedId, TenantId = tenantId, CreatedAt = asOf.AddDays(-90), ExternalId = Guid.NewGuid(), DisplayName = "set-based" }
+            );
+            db.PerRowFactorySweepRecords.Add(
+                new PerRowFactorySweepRecord { Id = perRowId, TenantId = tenantId, CreatedAt = asOf.AddDays(-90), ExternalId = "alpha", DisplayName = "per-row", Notes = "kept" }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        // An HttpClient timeout is a TaskCanceledException, but the sweep was not cancelled.
+        services.GetRequiredService<PerRowSequenceFactory>().TimesOut = true;
+        var result = await services.GetRequiredService<IRetentionSweep>().ExecuteAsync(
+            RetentionSweepRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), asOf)
+        );
+
+        result.EntityFailures.Should().ContainSingle()
+            .Which.Should().StartWith("type=System.Threading.Tasks.TaskCanceledException;");
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(SetBasedFactorySweepRecord))
+            .Which.Affected.Should().Be(1);
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<FactoryBackedSweepDbContext>();
+            (await db.SetBasedFactorySweepRecords.SingleAsync()).ExternalId.Should().Be(SetBasedGuidFactory.ScrubbedValue);
+            (await db.PerRowFactorySweepRecords.SingleAsync()).ExternalId.Should().Be("alpha");
+            ((SweepRunStatus)await db.Database
+                .SqlQuery<int>($"""SELECT "Status" AS "Value" FROM "sweep_run" WHERE "SweepId" = {result.SweepId}""")
+                .SingleAsync()).Should().Be(SweepRunStatus.PartiallyFailed);
+        }
+    }
+
+    [Fact]
     public async Task Sweep_Path_Converts_Provider_Values_Back_To_Clr_Values_Before_Building_OriginalValue_Context()
     {
         await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
@@ -1031,10 +1075,16 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         public AnonymiseFactoryExecutionMode ExecutionMode =>
             AnonymiseFactoryExecutionMode.PerRow;
         public List<AnonymiseValueContext> Contexts { get; } = [];
+        public bool TimesOut { get; set; }
         private int sequence = 0;
 
         public object? Create(AnonymiseValueContext context)
         {
+            if (TimesOut)
+            {
+                throw new TaskCanceledException("Simulated value service timeout.");
+            }
+
             Contexts.Add(context);
             sequence++;
             return $"per-row-{sequence}";

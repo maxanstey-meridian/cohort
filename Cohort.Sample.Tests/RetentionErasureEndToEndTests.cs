@@ -696,6 +696,47 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task A_Rule_Provider_Timing_Out_Fails_Only_Its_Entity_Not_The_Erasure()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var noteId = Guid.NewGuid();
+        var softDeleteId = Guid.NewGuid();
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(new Note { Id = noteId, TenantId = tenant.Id, SubjectId = subjectId, CreatedAt = asOf.AddDays(-1), Body = "kept" });
+            db.SoftDeleteRecords.Add(new SoftDeleteRecord { Id = softDeleteId, TenantId = tenant.Id, SubjectId = subjectId, CreatedAt = asOf.AddDays(-1), Body = "erased" });
+            await db.SaveChangesAsync();
+        }
+
+        using var erasureHost = new CohortTestHost(
+            ConnectionString,
+            new StaticCategoryRepository(
+                new Dictionary<string, ITestRetentionRule>
+                {
+                    ["short-lived"] = new TimingOutResolver(new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge)),
+                    ["soft-delete"] = new StaticTestRetentionRule(new RetentionRule(new RetentionPeriod(Days: 30), Strategy.SoftDelete)),
+                }
+            )
+        );
+
+        // An HttpClient timeout is a TaskCanceledException, but the erasure was not cancelled.
+        var result = await erasureHost.RunErasureAsync(
+            tenant,
+            new ErasureScope("user", subjectId, allowSoftDeleteAsErasure: true),
+            asOf
+        );
+
+        result.EntityFailures.Should().ContainSingle()
+            .Which.Should().StartWith("type=System.Threading.Tasks.TaskCanceledException;");
+        (await LoadRunStatusAsync(result.SweepId)).Should().Be(SweepRunStatus.PartiallyFailed);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
+        (await verify.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteId)).IsDeleted.Should().BeTrue();
+    }
+
+    [Fact]
     public async Task Erasure_Refuses_A_Subject_Of_The_Wrong_Type_Before_Any_Run()
     {
         var tenantId = Guid.NewGuid();
@@ -2091,6 +2132,19 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                 db.ChangeTracker.Clear();
             }
 
+            // With automatic detection off, only an explicit DetectChanges sees the edit.
+            await using (var transaction = await db.Database.BeginTransactionAsync())
+            {
+                db.ChangeTracker.AutoDetectChangesEnabled = false;
+                (await db.Notes.SingleAsync(note => note.Id == markerId)).Body = "unsaved";
+                var withUndetectedChanges = () => erasure.ExecuteAsync(request);
+                (await withUndetectedChanges.Should().ThrowAsync<InvalidOperationException>()).Which.Message.Should().Be(
+                    "ErasureTransaction.Caller needs a DbContext with no unsaved changes; save or discard them before erasing."
+                );
+                db.ChangeTracker.Clear();
+                db.ChangeTracker.AutoDetectChangesEnabled = true;
+            }
+
             await using (var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.RepeatableRead))
             {
                 var underSnapshot = () => erasure.ExecuteAsync(request);
@@ -2940,6 +2994,14 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         services.AddCohort<TContext>();
         configureServices?.Invoke(services);
         return services.BuildServiceProvider(validateScopes: true);
+    }
+
+    private sealed class TimingOutResolver(RetentionRule rule) : ITestRetentionRule
+    {
+        public Task<RetentionRule> ResolveAsync(RetentionResolutionContext ctx, CancellationToken ct) =>
+            throw new TaskCanceledException("Simulated rule store timeout.");
+
+        public RetentionRule? TryResolveAtStartup() => rule;
     }
 
     private sealed class StaticCategoryRepository(

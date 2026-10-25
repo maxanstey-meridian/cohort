@@ -57,13 +57,21 @@ internal sealed class RetentionRun(
         {
             // No run lock: Started stays invisible to recovery until the caller commits, and
             // by then the run has settled. A session lock would also have to be released
-            // inside a transaction that may already be aborted.
+            // inside a transaction that may already be aborted. The ledger table is resolved
+            // now, so the commit-time check touches no model metadata.
+            var sweepRun = PostgreSqlIdentifier.Format(CohortStoreTables.FromModel(db.Model).SweepRun);
             callerCommit.AfterCommit(
                 db.Database.CurrentTransaction!,
-                IsStillWrittenAsync,
+                transaction => IsStillWrittenAsync(transaction, sweepRun),
                 NotifyDeferredAsync,
                 () => logger.LogInformation(
                     "Cohort {Operation} {SweepId} rolled back with the caller's transaction or one of its savepoints; no ledger row of the attempt remains, and nothing it changed was kept.",
+                    operation,
+                    SweepId
+                ),
+                exception => logger.LogWarning(
+                    exception,
+                    "Cohort could not confirm, before the caller's transaction committed, that {Operation} {SweepId} was still part of it; its observers are told of it if the transaction commits.",
                     operation,
                     SweepId
                 )
@@ -151,7 +159,9 @@ internal sealed class RetentionRun(
             var deferredMark = deferredEvents.Count;
             if (callerTransaction is not null)
             {
-                await callerTransaction.SaveAsync(EntitySavepoint, ct);
+                // Not cancellable: a cancellation here would abort the caller's transaction
+                // before the savepoint that recovers it exists.
+                await callerTransaction.SaveAsync(EntitySavepoint, CancellationToken.None);
             }
 
             try
@@ -163,7 +173,9 @@ internal sealed class RetentionRun(
                 );
                 if (callerTransaction is not null)
                 {
-                    await callerTransaction.ReleaseAsync(EntitySavepoint, ct);
+                    // Not cancellable: a cancelled RELEASE that took effect would leave the
+                    // catch rolling back to a savepoint that no longer exists.
+                    await callerTransaction.ReleaseAsync(EntitySavepoint, CancellationToken.None);
                 }
             }
             catch (Exception ex)
@@ -417,15 +429,14 @@ internal sealed class RetentionRun(
     /// Asked inside the caller's transaction just before it commits: whether the run's ledger
     /// row is still there, or a rollback to a savepoint taken before the run removed it.
     /// </summary>
-    private async Task<bool> IsStillWrittenAsync(DbTransaction transaction, CancellationToken ct)
+    private async Task<bool> IsStillWrittenAsync(DbTransaction transaction, string sweepRun)
     {
-        var sweepRun = PostgreSqlIdentifier.Format(CohortStoreTables.FromModel(db.Model).SweepRun);
         await using var command = new SqlParams { ["sweepId"] = SweepId }.CreateCommand(
             transaction.Connection!,
             transaction,
             $"SELECT EXISTS (SELECT 1 FROM {sweepRun} WHERE \"SweepId\" = @sweepId)"
         );
-        return await command.ExecuteScalarAsync(ct) is true;
+        return await command.ExecuteScalarAsync(CancellationToken.None) is true;
     }
 
     private async Task NotifyDeferredAsync()

@@ -188,11 +188,12 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
     {
         // The deletion's "active holds whose row is missing" check casts each hold's stored text
         // to its entity's key type. A deletion that removes no held row must pass every cast; one
-        // that removes the numeric row held as "1.00" (requested as "1") must be refused.
+        // that removes the numeric row held as "1.00" (requested as "1"), or the citext row held
+        // as "abc" (stored as "ABC"), must be refused.
         await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
         var asOf = new DateTimeOffset(2026, 7, 11, 12, 0, 0, TimeSpan.Zero);
         await using var provider = BuildSpelledServiceProvider(database.ConnectionString);
-        var (numericHoldId, _) = await SeedSpelledRecordsAsync(provider, asOf);
+        var (numericHoldId, citextHoldId) = await SeedSpelledRecordsAsync(provider, asOf);
         var unheldTarget = new RetentionTarget(RetentionEntityIdentity.For<NumericKeyedRecord>(), "2", null);
 
         await using (var scope = provider.CreateAsyncScope())
@@ -204,6 +205,17 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
             );
 
             await refused.Should().ThrowAsync<InvalidOperationException>().WithMessage($"*{numericHoldId}*");
+        }
+
+        await using (var scope = provider.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<SpelledRecordIdDbContext>();
+            var refused = () => scope.ServiceProvider.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [unheldTarget],
+                ct => db.Set<CitextKeyedRecord>().Where(record => record.Id == "ABC").ExecuteDeleteAsync(ct)
+            );
+
+            await refused.Should().ThrowAsync<InvalidOperationException>().WithMessage($"*{citextHoldId}*");
         }
 
         await using (var scope = provider.CreateAsyncScope())
@@ -224,6 +236,10 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
             SELECT string_agg("Id"::text, ',' ORDER BY "Id") FROM "numeric_keyed_record"
             """;
         (await command.ExecuteScalarAsync()).Should().Be("1.00");
+        command.CommandText = """
+            SELECT count(*) FROM "citext_keyed_record"
+            """;
+        (await command.ExecuteScalarAsync()).Should().Be(1L);
     }
 
     private static ServiceProvider BuildSpelledServiceProvider(string connectionString)

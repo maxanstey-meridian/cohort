@@ -148,6 +148,10 @@ passes either holds policy, while `INSERT`, `UPDATE` and `DELETE` only have `hol
 `USING` also checks new rows. Use the schema you passed to `ConfigureCohortTables` in place of
 `public`.
 
+Every tenant can therefore read every hold on a tenantless row, `Reason` included, and
+`ListActiveAsync` in a tenant scope returns them. Keep tenant-identifying detail out of those
+holds.
+
 `NULLIF` matters: once a session has set a custom setting, clearing or resetting it leaves an
 empty string rather than `NULL`, and `''::uuid` is an error. Remember `ENABLE` and, if the
 connecting role owns the tables, `FORCE ROW LEVEL SECURITY` on each table.
@@ -155,3 +159,18 @@ connecting role owns the tables, `FORCE ROW LEVEL SECURITY` on each table.
 Policies only bite if Cohort's work runs as the right tenant. See
 [Tenant Isolation](/guides/tenant-isolation) for the hook that tells your host whose work each
 Cohort scope does, and for the grants the tenant role needs.
+
+## Upgrading to 0.11.0
+
+::: warning Breaking change
+0.11.0 refuses to run while an active hold names an entity identity the model no longer
+registers, and allows one Cohort table set per EF model.
+
+- Before upgrading, look for active holds under identities your model no longer declares, and
+  re-point or end them as [Changed entity identities](#changed-entity-identities) shows.
+  Readiness names each one and its count of holds.
+- Give each EF model that maps Cohort's tables its own schema with
+  `ConfigureCohortTables(schema)`.
+- Hosts with row-level security: let tenant scopes read `NULL`-tenant holds, as the
+  [example policies](#row-level-security) do.
+:::

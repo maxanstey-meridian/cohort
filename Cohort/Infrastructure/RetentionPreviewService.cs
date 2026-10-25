@@ -29,15 +29,12 @@ internal sealed class RetentionPreviewService(
         ArgumentNullException.ThrowIfNull(request);
 
         var tenant = request.RunTenant;
-        Func<RetentionEntry, bool> includeEntry = request is RetentionPreviewRequest.TenantlessRequest
-            ? entry => entry.Tenant is null
-            : entry => entry.Tenant is not null;
+        var entities = SweepEntityScopes.For(tenant);
 
         await readinessValidator.ValidateAsync(ct);
-        // A preview changes nothing, so any requested time is allowed, later ones included.
-        var now = request.At ?? await DatabaseClock.NowAsync(db, ct);
-
-        var startedAt = request.At is null ? now : await DatabaseClock.NowAsync(db, ct);
+        // A preview changes nothing, so it resolves its time as a dry run: any requested
+        // time is allowed, later ones included.
+        var (now, startedAt) = await DatabaseClock.ResolveRunTimeAsync(db, request.At, dryRun: true, ct);
         var counts = new List<EntitySweepCount>();
         var timeZone = settings.TimeZone;
         var connection = db.Database.GetDbConnection();
@@ -47,7 +44,7 @@ internal sealed class RetentionPreviewService(
             foreach (
                 var entry in registry
                     .Scan()
-                    .Values.Where(includeEntry)
+                    .Values.Where(entry => entities.Includes(entry))
                     .OrderBy(entry => entry.EntityType.FullName, StringComparer.Ordinal)
             )
             {

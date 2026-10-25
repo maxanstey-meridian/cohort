@@ -105,6 +105,8 @@ await erasure.ExecuteAsync(
 - Tenantless holds (`TenantId` null) protect its rows.
 - To erase a user everywhere, make one tenanted request per tenant plus one tenantless
   request, the same shape as the scheduled worker.
+- It always runs in its own transaction: `RetentionErasureRequest.Tenantless` takes no
+  `transaction` argument, so it can't join yours.
 
 The run's audit row records the kind (`sweep_run.ErasureSubjectKind`, and
 `SweepEvent.Started.ErasureSubjectKind` for observers). It never records the subject itself.
@@ -184,6 +186,7 @@ if (result.EntityFailures.Count > 0)
 await transaction.CommitAsync(ct);
 ```
 
+Only a tenanted request can join your transaction; a tenantless one always runs in its own.
 Resolve `IRetentionErasureService` from the same scope as that `DbContext`; the service is
 scoped for this reason. The erasure needs:
 
@@ -217,8 +220,12 @@ What changes compared with an ordinary erasure:
   short.
 - **Observers hear about it after the commit.** Audit observers are told of every event of
   the run, `Started` to `Completed`, only once your commit has succeeded, and never if you
-  roll back. Commit through EF so Cohort sees it. `CommitAsync` is the supported path: a
-  synchronous `Commit()` blocks while observers are told, each for up to
+  roll back or the commit fails. Commit through EF so Cohort sees it. Just before the
+  commit, Cohort checks inside your transaction, under its own savepoint
+  (`cohort_commit_check`), that the run's `sweep_run` row is still there; the check can't
+  fail or cancel your commit. If the check itself fails, Cohort logs a Warning that it could
+  not confirm the run and tells observers once the commit succeeds. `CommitAsync` is the
+  supported path: a synchronous `Commit()` blocks while observers are told, each for up to
   `AuditObservers:Timeout` per event.
 - **Row handlers run after the commit.** `OnBeforeAsync` runs inside your transaction.
   `OnAfterAsync` work is queued in the same transaction, so the dispatcher only sees it once
@@ -244,11 +251,13 @@ changes nothing else.
 - Subject columns on `[RetentionTenantless]` entities are erased only by a tenantless
   request, `RetentionErasureRequest.Tenantless(scope)`. A tenanted request no longer reaches
   them, and a kind only tenantless entities declare is refused for it.
-- A tenantless request can't use `ErasureTransaction.Caller`, and is refused.
+- A tenantless request always runs in its own transaction: `RetentionErasureRequest.Tenantless`
+  takes no `transaction` argument.
 - `RetentionErasureRequest.At` is optional and defaults to the database clock. A real
   erasure refuses a later time before any run is recorded; a dry run accepts any time.
 - Every timestamp the run records or reports (`sweep_run`, summaries, row details, observer
-  events, `ErasureResult`) comes from the database clock.
+  events, `ErasureResult`) comes from the database clock. `DeletedAt`/`AnonymisedAt` markers
+  keep the run's time.
 :::
 
 ## Upgrading to 0.9.0

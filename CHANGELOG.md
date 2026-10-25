@@ -23,8 +23,8 @@ unprotected without an error.
 - An erasure can join the caller's open READ COMMITTED transaction
   (`ErasureTransaction.Caller`): the erasure and its ledger commit or roll back with the
   caller's changes, a rollback (including to a savepoint taken before the erasure) leaves no
-  ledger row, and observers run only after commit. A tenantless request can't join the
-  caller's transaction. `AddCohort` adds a transaction interceptor to the context's options.
+  ledger row, and observers run only after commit. A tenantless request always runs in its
+  own transaction. `AddCohort` adds a transaction interceptor to the context's options.
 - Sweeps and erasures use the database clock unless given a time, and refuse a later time for a
   run that changes rows. `RetentionSweepRequest.At` and `RetentionErasureRequest.At` are
   nullable; `SweepAsync(tenant, now)` becomes `SweepAsync(tenant)`, and
@@ -49,7 +49,9 @@ unprotected without an error.
   instead of relying on the driver.
 
 Upgrade: [Running Retention](https://maxanstey-meridian.github.io/cohort/guides/running-retention#upgrading-to-0-11-0),
-[Right-to-Erasure](https://maxanstey-meridian.github.io/cohort/guides/erasure#upgrading-to-0-11-0)
+[Right-to-Erasure](https://maxanstey-meridian.github.io/cohort/guides/erasure#upgrading-to-0-11-0),
+[Legal Holds](https://maxanstey-meridian.github.io/cohort/guides/legal-holds#upgrading-to-0-11-0),
+[Schema](https://maxanstey-meridian.github.io/cohort/reference/schema#upgrading-to-0-11-0)
 and [Tenant Isolation](https://maxanstey-meridian.github.io/cohort/guides/tenant-isolation).
 
 ## 0.10.0 (2026-10-22, breaking)

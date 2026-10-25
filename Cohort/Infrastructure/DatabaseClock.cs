@@ -41,11 +41,13 @@ internal static class DatabaseClock
     }
 
     /// <summary>
-    /// Resolves the run's "today": the requested time, or the database clock when none was
-    /// given. A run that changes rows refuses a time later than the database clock, because
-    /// it would act before rows reach their cutoff. Called before any run exists.
+    /// Resolves the run's "now" (the requested time, or the database clock when none was
+    /// given) and its start, which is always the database clock, from one read of that
+    /// clock. A run that changes rows refuses a "now" later than the database clock, because
+    /// it would act before rows reach their cutoff; a dry run allows any time. Called before
+    /// any run exists.
     /// </summary>
-    internal static async Task<DateTimeOffset> ResolveRunTimeAsync(
+    internal static async Task<(DateTimeOffset Now, DateTimeOffset StartedAt)> ResolveRunTimeAsync(
         DbContext db,
         DateTimeOffset? requested,
         bool dryRun,
@@ -64,6 +66,6 @@ internal static class DatabaseClock
             );
         }
 
-        return now;
+        return (now, databaseNow);
     }
 }

@@ -24,6 +24,15 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
     // or rollback) never runs on a later transaction that reuses the object.
     private readonly ConditionalWeakTable<DbTransaction, Deferred> pending = new();
 
+    // The Action strings EF's RelationalTransaction passes to TransactionFailed for a failed
+    // Commit or Rollback; its savepoint operations pass others ("CreateSavepoint", ...).
+    private const string CommitAction = "Commit";
+    private const string RollbackAction = "Rollback";
+
+    // Taken around the commit check, so a check that fails can't abort the caller's
+    // transaction and turn its COMMIT into a silent rollback.
+    private const string CheckSavepoint = "cohort_commit_check";
+
     /// <summary>Whether this interceptor is part of <paramref name="db"/>'s options.</summary>
     internal bool IsRegisteredOn(DbContext db) =>
         db.GetService<IDbContextOptions>()
@@ -37,13 +46,15 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
     /// survived: a rollback to a savepoint taken before them leaves the transaction
     /// committable without them. EF tells interceptors of a savepoint rollback but not which
     /// savepoint, and a raw <c>ROLLBACK TO SAVEPOINT</c> isn't seen at all, so the rows are
-    /// the only reliable answer.
+    /// the only reliable answer. The check runs under its own savepoint and is not
+    /// cancellable; when it fails the work is kept and <paramref name="unconfirmed"/> is told.
     /// </summary>
     internal void AfterCommit(
         IDbContextTransaction transaction,
-        Func<DbTransaction, CancellationToken, Task<bool>> stillWritten,
+        Func<DbTransaction, Task<bool>> stillWritten,
         Func<Task> committed,
-        Action dropped
+        Action dropped,
+        Action<Exception> unconfirmed
     )
     {
         var dbTransaction = transaction.GetDbTransaction();
@@ -55,7 +66,7 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
                 pending.AddOrUpdate(dbTransaction, deferred);
             }
 
-            deferred.Work.Add(new DeferredWork(stillWritten, committed, dropped));
+            deferred.Work.Add(new DeferredWork(stillWritten, committed, dropped, unconfirmed));
         }
     }
 
@@ -67,10 +78,12 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
         InterceptionResult result
     )
     {
-        DropUnwrittenAsync(transaction, eventData.TransactionId, CancellationToken.None).GetAwaiter().GetResult();
+        DropUnwrittenAsync(transaction, eventData.TransactionId).GetAwaiter().GetResult();
         return result;
     }
 
+    // The commit's token is deliberately not passed on: a cancelled check would still have
+    // to be rolled back, and the commit itself decides whether the caller's work survives.
     public override async ValueTask<InterceptionResult> TransactionCommittingAsync(
         DbTransaction transaction,
         TransactionEventData eventData,
@@ -78,7 +91,7 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
         CancellationToken cancellationToken = default
     )
     {
-        await DropUnwrittenAsync(transaction, eventData.TransactionId, cancellationToken);
+        await DropUnwrittenAsync(transaction, eventData.TransactionId);
         return result;
     }
 
@@ -128,9 +141,9 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
     }
 
     private static bool EndsTransaction(TransactionErrorEventData eventData) =>
-        eventData.Action is "Commit" or "Rollback";
+        eventData.Action is CommitAction or RollbackAction;
 
-    private async Task DropUnwrittenAsync(DbTransaction transaction, Guid transactionId, CancellationToken ct)
+    private async Task DropUnwrittenAsync(DbTransaction transaction, Guid transactionId)
     {
         List<DeferredWork> work;
         lock (pending)
@@ -145,20 +158,7 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
 
         foreach (var item in work)
         {
-            bool written;
-            // The caller's commit must not fail because of Cohort's check; an unanswered
-            // check drops the work, since it can't be shown to have committed.
-            try
-            {
-                written = await item.StillWritten(transaction, ct);
-            }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "Cohort could not check whether work deferred until a caller's transaction committed was still part of it.");
-                written = false;
-            }
-
-            if (!written)
+            if (!await IsStillWrittenAsync(transaction, item))
             {
                 lock (pending)
                 {
@@ -170,6 +170,62 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
 
                 Report(item);
             }
+        }
+    }
+
+    /// <summary>
+    /// Runs <paramref name="item"/>'s check under <see cref="CheckSavepoint"/>, so the
+    /// caller's commit neither fails nor silently rolls back because of it. A transaction
+    /// that can't take the savepoint is already aborted and will not commit, so its work is
+    /// dropped. A check that fails after the savepoint can't say whether the work's rows
+    /// survived; the work is kept, since its observers are best effort and the ledger the
+    /// transaction commits is the record.
+    /// </summary>
+    private async Task<bool> IsStillWrittenAsync(DbTransaction transaction, DeferredWork item)
+    {
+        try
+        {
+            await transaction.SaveAsync(CheckSavepoint, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Cohort could not check whether work deferred until a caller's transaction committed was still part of it; the transaction cannot commit, so the work is dropped.");
+            return false;
+        }
+
+        try
+        {
+            var written = await item.StillWritten(transaction);
+            await transaction.ReleaseAsync(CheckSavepoint, CancellationToken.None);
+            return written;
+        }
+        catch (Exception checkException)
+        {
+            try
+            {
+                await transaction.RollbackAsync(CheckSavepoint, CancellationToken.None);
+                await transaction.ReleaseAsync(CheckSavepoint, CancellationToken.None);
+            }
+            catch (Exception rollbackException)
+            {
+                logger.LogError(rollbackException, "Cohort could not undo its failed check inside a caller's transaction; the transaction cannot commit, so the deferred work is dropped.");
+                return false;
+            }
+
+            Unconfirmed(item, checkException);
+            return true;
+        }
+    }
+
+    private void Unconfirmed(DeferredWork work, Exception exception)
+    {
+        try
+        {
+            work.Unconfirmed(exception);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Cohort could not report work it could not confirm was part of a caller's transaction.");
         }
     }
 
@@ -230,13 +286,15 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
 
     // A class, not a record: work is removed by identity.
     private sealed class DeferredWork(
-        Func<DbTransaction, CancellationToken, Task<bool>> stillWritten,
+        Func<DbTransaction, Task<bool>> stillWritten,
         Func<Task> committed,
-        Action dropped
+        Action dropped,
+        Action<Exception> unconfirmed
     )
     {
-        public Func<DbTransaction, CancellationToken, Task<bool>> StillWritten { get; } = stillWritten;
+        public Func<DbTransaction, Task<bool>> StillWritten { get; } = stillWritten;
         public Func<Task> Committed { get; } = committed;
         public Action Dropped { get; } = dropped;
+        public Action<Exception> Unconfirmed { get; } = unconfirmed;
     }
 }

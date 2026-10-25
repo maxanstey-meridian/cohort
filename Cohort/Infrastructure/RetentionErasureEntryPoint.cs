@@ -14,7 +14,7 @@ namespace Cohort.Infrastructure;
 /// </summary>
 internal sealed class RetentionErasureEntryPoint(
     IServiceScopeFactory scopeFactory,
-    RetentionErasureService callerScopeErasure
+    IServiceProvider callerServices
 ) : IRetentionErasureService
 {
     public async Task<ErasureResult> ExecuteAsync(
@@ -26,7 +26,10 @@ internal sealed class RetentionErasureEntryPoint(
 
         if (request.Transaction == ErasureTransaction.Caller)
         {
-            return await callerScopeErasure.ExecuteAsync(request, ct);
+            // Only the Caller branch may touch the caller's scope.
+            return await callerServices
+                .GetRequiredService<RetentionErasureService>()
+                .ExecuteAsync(request, ct);
         }
 
         await using var executionScope = await scopeFactory.CreateEnteredScopeAsync(

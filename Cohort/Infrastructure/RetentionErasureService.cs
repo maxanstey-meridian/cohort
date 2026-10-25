@@ -34,9 +34,7 @@ internal sealed class RetentionErasureService(
     {
         ArgumentNullException.ThrowIfNull(request);
         var tenant = request.RunTenant;
-        var entities = request is RetentionErasureRequest.TenantlessRequest
-            ? SweepEntityScope.TenantlessOnly
-            : SweepEntityScope.TenantedOnly;
+        var entities = SweepEntityScopes.For(tenant);
         var scope = request.Scope;
         var callerCommit = request.Transaction == ErasureTransaction.Caller
             ? await ValidateCallerTransactionAsync(ct)
@@ -44,9 +42,7 @@ internal sealed class RetentionErasureService(
 
         await readinessValidator.ValidateAsync(ct);
         ValidateSubject(scope, entities);
-        var now = await DatabaseClock.ResolveRunTimeAsync(db, request.At, scope.DryRun, ct);
-        // Every time the run records is the database's; without a requested time, "now" is.
-        var startedAt = request.At is null ? now : await DatabaseClock.NowAsync(db, ct);
+        var (now, startedAt) = await DatabaseClock.ResolveRunTimeAsync(db, request.At, scope.DryRun, ct);
 
         var run = new RetentionRun(
             db,

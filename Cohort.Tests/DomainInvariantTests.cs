@@ -90,26 +90,17 @@ public sealed class DomainInvariantTests
     public void An_Erasure_Request_Needs_A_Defined_Transaction_Mode_And_Keeps_Its_Time_In_Utc()
     {
         var scope = new ErasureScope("user", Guid.NewGuid());
-        var undefined = () => RetentionErasureRequest.Tenantless(scope, transaction: (ErasureTransaction)7);
+        var undefined = () => RetentionErasureRequest.Tenanted(
+            new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
+            scope,
+            transaction: (ErasureTransaction)7
+        );
         var at = new DateTimeOffset(2026, 4, 12, 13, 0, 0, TimeSpan.FromHours(1));
 
         undefined.Should().Throw<ArgumentOutOfRangeException>().WithParameterName("transaction");
         RetentionErasureRequest.Tenantless(scope, at).At.Should().Be(at).And.Subject!.Value.Offset.Should().Be(TimeSpan.Zero);
         RetentionErasureRequest.Tenantless(scope).At.Should().BeNull();
         RetentionSweepRequest.Tenantless().At.Should().BeNull();
-    }
-
-    [Fact]
-    public void A_Tenantless_Erasure_Cannot_Join_The_Callers_Transaction()
-    {
-        var caller = () => RetentionErasureRequest.Tenantless(
-            new ErasureScope("user", Guid.NewGuid()),
-            transaction: ErasureTransaction.Caller
-        );
-
-        caller.Should().Throw<ArgumentException>()
-            .WithParameterName("transaction")
-            .WithMessage("A tenantless erasure can't join the caller's transaction*");
     }
 
     [Fact]

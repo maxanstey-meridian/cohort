@@ -320,13 +320,27 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         {
             ApplicationName = "cohort-readiness",
         };
-        spelledDifferently.Host = spelledDifferently.Host == "localhost" ? "127.0.0.1" : "localhost";
+        spelledDifferently.Host = AlternateSpelling(spelledDifferently.Host!);
         await using var provider = BuildSystemRoutedProvider(
             database.ConnectionString,
             spelledDifferently.ConnectionString
         );
 
         await InvokePreviewAsync(provider);
+    }
+
+    // A host name becomes its IPv4 address and a loopback address becomes "localhost"; any
+    // other address keeps its spelling, and the ApplicationName still makes the strings differ.
+    private static string AlternateSpelling(string host)
+    {
+        if (System.Net.IPAddress.TryParse(host, out var address))
+        {
+            return System.Net.IPAddress.IsLoopback(address) ? "localhost" : host;
+        }
+
+        return System.Net.Dns.GetHostAddresses(host)
+            .First(candidate => candidate.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+            .ToString();
     }
 
     [Fact]

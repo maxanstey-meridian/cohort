@@ -116,3 +116,18 @@ row in place, so Cohort can't see it.
 make every change through that context. Cohort can't see writes made through another
 context or connection: they commit on their own, outside the transaction. The operation owns
 the transaction, so call it when the context has no transaction open.
+
+## Upgrading to 0.11.0
+
+::: warning Breaking change
+0.11.0 judges holds on the database clock and checks what a deletion actually removed.
+
+- `ListActiveAsync` and `HasActiveHoldAsync` lose `asOf`: they answer for now on the database
+  clock. Drop the argument.
+- `RetentionHoldRequest` refuses an `expiresAt` that is not after `createdAt`, and
+  `CreateAsync` refuses one the database clock has already reached. Seed past holds in tests
+  with SQL instead.
+- `IRetentionDeletion` refuses a context with unsaved changes, a callback that returns without
+  saving, and a callback that deletes any held row, listed or not. Save or discard pending
+  changes before calling it, and save inside the callback.
+:::

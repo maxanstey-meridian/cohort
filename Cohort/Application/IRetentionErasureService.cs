@@ -88,11 +88,8 @@ public abstract record RetentionErasureRequest
     /// <see cref="ErasureTransaction.Owned"/>: tenantless rows are erased under Cohort's own
     /// <c>System(TenantlessPass)</c> execution scope, never under one the caller entered.
     /// </summary>
-    public static RetentionErasureRequest Tenantless(
-        ErasureScope scope,
-        DateTimeOffset? at = null,
-        ErasureTransaction transaction = ErasureTransaction.Owned
-    ) => new TenantlessRequest(scope, at, transaction);
+    public static RetentionErasureRequest Tenantless(ErasureScope scope, DateTimeOffset? at = null) =>
+        new TenantlessRequest(scope, at);
 
     public sealed record TenantedRequest : RetentionErasureRequest
     {
@@ -115,23 +112,8 @@ public abstract record RetentionErasureRequest
 
     public sealed record TenantlessRequest : RetentionErasureRequest
     {
-        internal TenantlessRequest(
-            ErasureScope scope,
-            DateTimeOffset? at,
-            ErasureTransaction transaction
-        )
-            : base(scope, at, transaction)
-        {
-            // A Caller erasure runs under whatever execution scope the host entered, which
-            // for a tenantless request would be the wrong one (a tenant's, or none).
-            if (transaction == ErasureTransaction.Caller)
-            {
-                throw new ArgumentException(
-                    "A tenantless erasure can't join the caller's transaction: tenantless rows are erased only under Cohort's own System(TenantlessPass) execution scope. Use ErasureTransaction.Owned.",
-                    nameof(transaction)
-                );
-            }
-        }
+        internal TenantlessRequest(ErasureScope scope, DateTimeOffset? at)
+            : base(scope, at, ErasureTransaction.Owned) { }
 
         internal override TenantContext RunTenant => TenantContext.Tenantless;
     }

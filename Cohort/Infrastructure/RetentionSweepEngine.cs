@@ -41,9 +41,7 @@ internal sealed class RetentionSweepEngine(
     )
     {
         await readinessValidator.ValidateAsync(ct);
-        var now = await DatabaseClock.ResolveRunTimeAsync(db, at, dryRun, ct);
-        // Every time the run records is the database's; without a requested time, "now" is.
-        var startedAt = at is null ? now : await DatabaseClock.NowAsync(db, ct);
+        var (now, startedAt) = await DatabaseClock.ResolveRunTimeAsync(db, at, dryRun, ct);
 
         var run = new RetentionRun(
             db,
@@ -112,8 +110,16 @@ internal enum SweepEntityScope
     TenantlessOnly,
 }
 
-internal static class SweepEntityScopeExtensions
+internal static class SweepEntityScopes
 {
+    /// <summary>
+    /// The entities a run under <paramref name="tenant"/> covers: tenantless ones for
+    /// <see cref="TenantContext.Tenantless"/>, tenanted ones otherwise. Mirrors
+    /// <see cref="RetentionExecutionScopes.For(TenantContext)"/>.
+    /// </summary>
+    internal static SweepEntityScope For(TenantContext tenant) =>
+        tenant.Id == Guid.Empty ? SweepEntityScope.TenantlessOnly : SweepEntityScope.TenantedOnly;
+
     /// <summary>Whether <paramref name="entry"/> is one of the entities the scope covers.</summary>
     internal static bool Includes(this SweepEntityScope scope, RetentionEntry entry) =>
         scope == SweepEntityScope.TenantedOnly ? entry.Tenant is not null : entry.Tenant is null;

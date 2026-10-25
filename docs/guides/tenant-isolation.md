@@ -44,6 +44,7 @@ RetentionExecutionContext.System(RetentionSystemWork Work)
 |---|---|
 | `IRetentionSweep`, `IRetentionPreview` | `Tenant` for a tenanted request, `System(TenantlessPass)` for a tenantless one |
 | `IRetentionErasureService` | `Tenant` for a tenanted request, `System(TenantlessPass)` for a tenantless one. Not called for `ErasureTransaction.Caller`: that erasure runs in your scope, which you already set up |
+| Each batch's `OnBeforeAsync` handlers, in their own scope on the run's connection, `Caller` erasures included | `Tenant` of the run, or `System(TenantlessPass)` for a tenantless one |
 | Scheduled worker iteration: its lock, occurrence ledger and tenant source | `System(WorkerCoordination)` |
 | Each scheduled pass, in its own scope | `Tenant`, or `System(TenantlessPass)` for the tenantless pass |
 | Row-handler dispatch: claim, settle, recovery and payload scrub | `System(RowDispatch)` |
@@ -84,8 +85,8 @@ tenant".
   context wholly replaces the outer one for its work: set it, don't merge it. Restore anything
   you change outside the scope's own services when the work returns, as a `using` block or
   `try`/`finally` does; an `AsyncLocal` set in the hook is restored for you.
-- **Tenanted work only runs as `Tenant`.** `OnBeforeAsync` runs inside its tenant's sweep
-  scope. Each `OnAfterAsync` delivery gets its own scope, run as the row's tenant, and the
+- **Tenanted work only runs as `Tenant`.** Each batch's `OnBeforeAsync` handlers get their
+  own scope, run as the batch's tenant, and are resolved inside that work. Each `OnAfterAsync` delivery gets its own scope, run as the row's tenant, and the
   handler is resolved inside that work. No host code runs under `System` against tenanted rows. Handlers
   for tenantless entities run under `System(TenantlessPass)`, against rows no tenant owns.
 - **Savepoints sit inside your isolation.** Cohort only creates savepoints after its

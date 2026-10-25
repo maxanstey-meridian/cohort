@@ -125,7 +125,9 @@ Ordinary `Period` never delays erasure. Legal minimums, holds and Exempt rules d
 - A row another table still references through a `RESTRICT` or `NO ACTION` foreign key can't
   be purged, and a row any other integrity constraint refuses (a check, a unique index, a
   constraint trigger) can't be changed. Both count as blocked. Delete or re-point the
-  referencing rows, then erase again.
+  referencing rows, then erase again. A full batch in which every row is refused fails the
+  entity, since the cause is then the rule or the schema, unless the refusals are
+  foreign-key refusals or differ between rows.
 - Active holds always block erasure.
 
 Each `EntitySweepCount` in the result says what the erasure left of the subject, and why. The
@@ -264,11 +266,10 @@ What changes compared with an ordinary erasure:
   synchronous `Commit()` blocks while observers are told, each for up to
   `AuditObservers:Timeout` per event.
 - **Row handlers run after the commit.** `OnBeforeAsync` runs inside your transaction, in a
-  read-only savepoint. Anything it leaves in your context's change tracker is undone:
-  entities it added or loaded are detached, and entities you track get their original
-  values back. If Cohort can't undo it completely, it clears your change tracker and the
-  erasure throws an `InvalidOperationException`; roll back, or reload what you need before
-  saving (see [row handlers](/guides/row-handlers)).
+  read-only savepoint, but never on your `DbContext`: handlers get their own scope and
+  context, on your connection and transaction, and whatever they track is discarded after
+  each row. Your context's change tracker is never touched. Their other scoped services
+  are fresh instances, not yours (see [row handlers](/guides/row-handlers)).
   `OnAfterAsync` work is queued in the same transaction, so the dispatcher only sees it once
   you commit, and a rollback discards it.
 - **Your deferred constraints stay deferred.** Cohort doesn't change your transaction's
@@ -277,8 +278,9 @@ What changes compared with an ordinary erasure:
 - **Your change tracker isn't refreshed.** The erasure changes rows with SQL, so entities
   your context already tracks keep their old values. Load and change your own rows before
   erasing, or call `ChangeTracker.Clear()` after.
-- **Your execution scope isn't called.** The erasure runs in your scope, under whatever
-  tenant isolation you already applied to it. See [Tenant Isolation](/guides/tenant-isolation).
+- **Your execution scope is called only for handlers.** The erasure runs in your scope,
+  under whatever tenant isolation you already applied to it. Each batch with row handlers
+  gets its own scope, run as the request's tenant, on your already-open connection. See [Tenant Isolation](/guides/tenant-isolation).
 
 A dry run with `Caller` is allowed. It writes its audit rows into your transaction and
 changes nothing else.

@@ -372,6 +372,40 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Callback_Returning_With_An_Undetected_Edit_Is_Refused_And_Rolled_Back()
+    {
+        var tenantId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        var editedId = Guid.NewGuid();
+        await SeedNotesAsync(tenantId, noteId, editedId);
+
+        var savedLater = await Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            var act = () => services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [new RetentionTarget(RetentionEntityIdentity.For<Note>(), noteId.ToString(), tenantId)],
+                async ct =>
+                {
+                    await db.Notes.Where(note => note.Id == noteId).ExecuteDeleteAsync(ct);
+                    var edited = await db.Notes.SingleAsync(note => note.Id == editedId, ct);
+                    // Only an explicit DetectChanges sees this edit.
+                    db.ChangeTracker.AutoDetectChangesEnabled = false;
+                    edited.Body = "edited, not saved";
+                }
+            );
+
+            await act.Should().ThrowAsync<InvalidOperationException>().WithMessage("*returned with unsaved changes*");
+            db.ChangeTracker.AutoDetectChangesEnabled = true;
+            return await db.SaveChangesAsync();
+        });
+
+        savedLater.Should().Be(0);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
+        (await verify.Notes.SingleAsync(note => note.Id == editedId)).Body.Should().Be("deletion target");
+    }
+
+    [Fact]
     public async Task Callback_Throwing_With_Unsaved_Changes_Leaves_Nothing_To_Save_Later()
     {
         var tenantId = Guid.NewGuid();

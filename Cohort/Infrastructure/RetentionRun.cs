@@ -11,6 +11,8 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Logging;
 
+using Npgsql;
+
 namespace Cohort.Infrastructure;
 
 /// <summary>
@@ -194,10 +196,8 @@ internal sealed class RetentionRun(
                 }
 
                 // Only the run's own cancellation stops the run; any other is this entity's
-                // failure. So is a handler's change Cohort couldn't undo on the caller's
-                // context: an entity failure would leave the caller free to commit.
-                if (ex is OperationCanceledException && ct.IsCancellationRequested
-                    || ex is OnBeforeChangesNotUndoneException)
+                // failure.
+                if (ex is OperationCanceledException && ct.IsCancellationRequested)
                 {
                     throw;
                 }
@@ -374,13 +374,36 @@ internal sealed class RetentionRun(
     }
 
     /// <summary>
+    /// The refusal to fail the entity with, when every refusal in a fully blocked batch points
+    /// at the schema: one SQLSTATE and constraint for all of them, and not a foreign key.
+    /// Foreign-key refusals (23503, 23001) depend on which children each row has, and mixed
+    /// refusals mean row-level causes, so those rows are only blocked and the run moves on.
+    /// </summary>
+    private static DbException? SchemaWideRefusal(IReadOnlyList<DbException> failures)
+    {
+        if (failures.Count == 0)
+        {
+            return null;
+        }
+
+        var key = BlockedRows.RefusalKey(failures[0]);
+        if (key.SqlState is PostgresErrorCodes.ForeignKeyViolation or PostgresErrorCodes.RestrictViolation)
+        {
+            return null;
+        }
+
+        return failures.All(failure => BlockedRows.RefusalKey(failure) == key) ? failures[0] : null;
+    }
+
+    /// <summary>
     /// Mutates in batches, each selecting, locking and changing at most one batch of rows in
     /// its own transaction, so a large backlog retires incrementally and a failure loses only
     /// the current batch. In the caller's transaction the batches still bound each statement,
     /// but none commits on its own: the entity's savepoint and the caller's commit decide.
     /// Rows a constraint refuses are blocked and left out of later batches; a full batch in
-    /// which every row is refused fails the entity, since the cause is then the rule or the
-    /// schema rather than the rows, and bisecting the rest of the table would find the same.
+    /// which every row is refused by the same non-foreign-key constraint fails the entity,
+    /// since the cause is then the rule or the schema rather than the rows, and bisecting the
+    /// rest of the table would find the same.
     /// </summary>
     private async Task<(long Affected, long Skipped, IReadOnlyCollection<string> Blocked)> ExecuteBatchesAsync(
         SweepStrategy strategy,
@@ -433,13 +456,13 @@ internal sealed class RetentionRun(
                     scope,
                     db.Database.GetDbConnection(),
                     (batchTransaction ?? db.Database.CurrentTransaction!).GetDbTransaction(),
-                    new SweepMutationContext(SweepId, eventAt, batchSize, blocked, OnCallersContext: callerCommit is not null),
+                    new SweepMutationContext(SweepId, eventAt, batchSize, blocked),
                     ct
                 );
                 if (
                     execution.CandidateCount == batchSize
                     && execution.BlockedRecordIds.Count == execution.CandidateCount
-                    && execution.BlockFailure is { } refusal
+                    && SchemaWideRefusal(execution.BlockedFailures) is { } refusal
                 )
                 {
                     ExceptionDispatchInfo.Throw(refusal);

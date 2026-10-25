@@ -27,9 +27,10 @@ namespace Cohort.Application;
 /// never rolled back by one.
 /// </para>
 /// <para>
-/// Tenanted work only ever runs as <see cref="RetentionExecutionContext.Tenant"/>: row
-/// handlers' <c>OnBeforeAsync</c> runs in its tenant's sweep scope and every
-/// <c>OnAfterAsync</c> delivery gets its own scope run as the row's tenant. No host code
+/// Tenanted work only ever runs as <see cref="RetentionExecutionContext.Tenant"/>: each
+/// batch's row handlers get their own scope for <c>OnBeforeAsync</c>, run as the batch's
+/// tenant on the run's connection, and every <c>OnAfterAsync</c> delivery gets its own scope
+/// run as the row's tenant. No host code
 /// runs under <see cref="RetentionExecutionContext.System"/> against tenanted host rows.
 /// </para>
 /// <para>

@@ -467,6 +467,108 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
         (await ScalarAsync<long>(database.ConnectionString, "SELECT last_value FROM guard_attempts")).Should().Be(3);
     }
 
+    [Fact]
+    public async Task A_Full_Batch_Refused_By_Foreign_Keys_The_Reference_Check_Cannot_See_Is_Blocked_Not_Failed()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
+        await using var services = BuildServiceProvider(database.ConnectionString, batchSize: 2);
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var ids = Enumerable.Range(0, 5).Select(_ => Guid.NewGuid()).ToArray();
+
+        await SeedParentsAsync(services, tenantId, asOf, ids);
+        // Each parent has a CASCADE child the reference check ignores, and each child a
+        // grandchild that refuses the cascade: RESTRICT (23001) for some, NO ACTION (23503)
+        // for the rest. Every row of every batch is refused, but row by row, not by the schema.
+        await ExecuteAsync(
+            database.ConnectionString,
+            $"""
+            CREATE TABLE hidden_fk_children (
+                "Id" uuid PRIMARY KEY,
+                "ParentId" uuid NOT NULL REFERENCES restrictive_fk_parents ("Id") ON DELETE CASCADE
+            );
+            CREATE TABLE hidden_fk_restrict_grandchildren (
+                "Id" uuid PRIMARY KEY,
+                "ChildId" uuid NOT NULL REFERENCES hidden_fk_children ("Id") ON DELETE RESTRICT
+            );
+            CREATE TABLE hidden_fk_no_action_grandchildren (
+                "Id" uuid PRIMARY KEY,
+                "ChildId" uuid NOT NULL REFERENCES hidden_fk_children ("Id")
+            );
+            INSERT INTO hidden_fk_children ("Id", "ParentId")
+                SELECT gen_random_uuid(), "Id" FROM restrictive_fk_parents;
+            INSERT INTO hidden_fk_restrict_grandchildren ("Id", "ChildId")
+                SELECT gen_random_uuid(), "Id" FROM hidden_fk_children WHERE "ParentId" IN ('{ids[0]}', '{ids[2]}', '{ids[4]}');
+            INSERT INTO hidden_fk_no_action_grandchildren ("Id", "ChildId")
+                SELECT gen_random_uuid(), "Id" FROM hidden_fk_children WHERE "ParentId" IN ('{ids[1]}', '{ids[3]}');
+            """
+        );
+
+        for (var run = 0; run < 2; run++)
+        {
+            // The second run starts from the same oldest rows: it must get past them again.
+            var result = await SweepAsync(services, tenantId, asOf);
+
+            result.EntityFailures.Should().BeEmpty();
+            result.Counts.Should().ContainSingle(count => count.EntityType == typeof(ARestrictiveParent))
+                .Which.Should().Match<EntitySweepCount>(count =>
+                    count.Affected == 0 && count.BlockedCount == 5 && count.DeferredCount == 0);
+            (await LoadRunStatusAsync(database.ConnectionString, result.SweepId)).Should().Be(SweepRunStatus.Succeeded);
+            (await LoadSummaryAsync(database.ConnectionString, result.SweepId, typeof(ARestrictiveParent)))
+                .Should().Be(new SummaryCounts(Affected: 0, Deferred: 0, Blocked: 5));
+        }
+
+        (await LoadParentIdsAsync(services)).Should().Equal(ids);
+    }
+
+    [Fact]
+    public async Task A_Full_Batch_Refused_By_Different_Constraints_Is_Blocked_Not_Failed()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
+        await using var services = BuildServiceProvider(database.ConnectionString, batchSize: 2);
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var ids = new[] { Guid.NewGuid(), Guid.NewGuid() };
+
+        await SeedParentsAsync(services, tenantId, asOf, ids);
+        // Two refusals for two reasons: a trigger (23514) on one row, and a NO ACTION foreign
+        // key behind a CASCADE child, which the reference check can't see, on the other.
+        await ExecuteAsync(
+            database.ConnectionString,
+            $"""
+            CREATE FUNCTION guard_one_parent() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF OLD."Id" = '{ids[0]}' THEN
+                    RAISE EXCEPTION 'parent is guarded' USING ERRCODE = '23514', CONSTRAINT = 'restrictive_fk_parent_guard';
+                END IF;
+                RETURN OLD;
+            END $$;
+            CREATE TRIGGER guard_one_parent BEFORE DELETE ON restrictive_fk_parents
+                FOR EACH ROW EXECUTE FUNCTION guard_one_parent();
+            CREATE TABLE hidden_fk_children (
+                "Id" uuid PRIMARY KEY,
+                "ParentId" uuid NOT NULL REFERENCES restrictive_fk_parents ("Id") ON DELETE CASCADE
+            );
+            CREATE TABLE hidden_fk_no_action_grandchildren (
+                "Id" uuid PRIMARY KEY,
+                "ChildId" uuid NOT NULL REFERENCES hidden_fk_children ("Id")
+            );
+            INSERT INTO hidden_fk_children ("Id", "ParentId") VALUES (gen_random_uuid(), '{ids[1]}');
+            INSERT INTO hidden_fk_no_action_grandchildren ("Id", "ChildId")
+                SELECT gen_random_uuid(), "Id" FROM hidden_fk_children;
+            """
+        );
+
+        var result = await SweepAsync(services, tenantId, asOf);
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(ARestrictiveParent))
+            .Which.Should().Match<EntitySweepCount>(count =>
+                count.Affected == 0 && count.BlockedCount == 2 && count.DeferredCount == 0);
+        (await LoadRunStatusAsync(database.ConnectionString, result.SweepId)).Should().Be(SweepRunStatus.Succeeded);
+        (await LoadParentIdsAsync(services)).Should().Equal(ids);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

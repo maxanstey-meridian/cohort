@@ -31,23 +31,23 @@ builder.Services.AddRowHandler<Attachment, DeleteAttachmentBlob>(
 Both methods are optional. The interface supplies no-op defaults.
 
 - **`OnBeforeAsync`** runs in a read-only savepoint inside the sweep transaction, before the
-  row is mutated. Use it to capture what you'll need later into `ctx.Snapshot`. Database reads
-  through the sweep's `DbContext` see the row as it's about to be mutated, along with any
-  related rows. A write through that context fails the handler (`sqlstate:25006`), and so
-  does any database error, without harming the rest of the batch: the savepoint is always
-  rolled back. So does returning with unsaved changes on that context (an `Add`, a changed
-  entity or key, or a navigation change never saved, recorded as
-  `reason=on-before-unsaved-changes`). Cohort checks with an explicit `DetectChanges`, so a
-  context with automatic change detection turned off is checked too. Whatever a handler
-  leaves in the change tracker, a failed `SaveChanges` included, is discarded, so it can't be
-  saved later. On a context Cohort owns the tracker is cleared after each row. In a
-  [caller-transaction erasure](/guides/erasure#erasing-inside-your-own-transaction) it's
-  your context, so Cohort undoes only the handler's part: entities the handler added or
-  loaded are detached, and entities you tracked get their original values back and stay
-  tracked. If Cohort can't show the undo is complete (changes are still detected, or a
-  navigation of an entity you track still holds one the handler added), it clears your
-  context's change tracker and fails the whole erasure with an `InvalidOperationException`,
-  not just the entity, so your own `SaveChangesAsync` and commit can't carry the change. A
+  row is mutated. Use it to capture what you'll need later into `ctx.Snapshot`. Handlers are
+  resolved from a DI scope Cohort creates for each batch, run as the batch's tenant, and the
+  `DbContext` they inject there is on the sweep's own connection and transaction. Their
+  reads see the row as it's about to be mutated, along with any related rows, inside your
+  transaction in a [caller-transaction erasure](/guides/erasure#erasing-inside-your-own-transaction).
+  A write through that context fails the handler (`sqlstate:25006`), and so does any
+  database error, without harming the rest of the batch: the savepoint is always rolled
+  back. So does returning with unsaved changes on that context (an `Add`, a changed entity
+  or key, or a navigation change never saved, recorded as `reason=on-before-unsaved-changes`).
+  Cohort checks with an explicit `DetectChanges`, so a context with automatic change
+  detection turned off is checked too. Whatever a handler leaves tracked, a failed
+  `SaveChanges` included, is discarded after each row. The context that runs the sweep, your
+  own in a caller-transaction erasure, is never given to a handler, so nothing a handler
+  tracks reaches it. The handler's other scoped services come from that scope too: they're
+  fresh instances, not the ones in the scope that started the run, so per-request state such
+  as a scoped "current user" isn't there. State your
+  [execution scope](/guides/tenant-isolation) sets up, or an `AsyncLocal` flow, still is. A
   cancellation the handler raises itself, such as an `HttpClient` timeout, is a failure like
   any other; only the run's own token stops the run. External side effects still belong in `OnAfterAsync`: they survive a rollback,
   they run while the batch holds its row locks, and they can run for a row that's then
@@ -80,8 +80,8 @@ All of these are [configurable](/reference/configuration).
 
 Each delivery runs in its own DI scope, run as the row's tenant
 (`System(TenantlessPass)` for tenantless rows); the handler is resolved and run inside that
-work, and `OnBeforeAsync` runs in its tenant's sweep scope. So a host's tenant isolation applies to
-handler code too. See [Tenant Isolation](/guides/tenant-isolation).
+work. `OnBeforeAsync` runs the same way, in a scope per batch run as the batch's tenant. So a
+host's tenant isolation applies to handler code too. See [Tenant Isolation](/guides/tenant-isolation).
 
 ### Claim timeout
 

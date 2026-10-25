@@ -13,37 +13,47 @@ namespace Cohort.Infrastructure.Sweep;
 
 internal static class RetentionHandlerSupport
 {
+    /// <summary>
+    /// Whether any handler is registered for <paramref name="entityType"/>, read from the
+    /// registrations alone so no handler is constructed to find out.
+    /// </summary>
+    public static bool HasHandlers(IEnumerable<IRetentionHandlerRegistration> registrations, Type entityType) =>
+        registrations.Any(registration => registration.EntityType == entityType);
+
+    /// <summary>
+    /// The handlers registered with <c>AddRowHandler</c> for <paramref name="entityType"/>,
+    /// in priority order. A handler registered only as a service, with no registration, is
+    /// not a row handler: <see cref="HasHandlers"/> never sees it.
+    /// </summary>
     public static IReadOnlyList<ResolvedRetentionHandler> ResolveHandlers(
         IServiceProvider services,
         Type entityType
     )
     {
-        var handlerInterface = typeof(IRetentionHandler<>).MakeGenericType(entityType);
-        var enumerableType = typeof(IEnumerable<>).MakeGenericType(handlerInterface);
-        var registeredHandlers = services.GetService(enumerableType) as IEnumerable;
-        if (registeredHandlers is null)
+        var registrations = services
+            .GetServices<IRetentionHandlerRegistration>()
+            .Where(registration => registration.EntityType == entityType)
+            .ToDictionary(registration => registration.HandlerType);
+        if (registrations.Count == 0)
         {
             return [];
         }
 
-        var metadata = services
-            .GetService<IEnumerable<IRetentionHandlerRegistration>>()
-            ?.Where(registration => registration.EntityType == entityType)
-            .ToDictionary(registration => registration.HandlerType, registration => registration);
-
+        var handlerInterface = typeof(IRetentionHandler<>).MakeGenericType(entityType);
+        var registeredHandlers = (IEnumerable)services.GetRequiredService(
+            typeof(IEnumerable<>).MakeGenericType(handlerInterface)
+        );
         return registeredHandlers
             .Cast<object>()
+            .Where(handler => registrations.ContainsKey(handler.GetType()))
             .Select(handler =>
             {
-                var registration =
-                    metadata is not null && metadata.TryGetValue(handler.GetType(), out var matched)
-                        ? matched
-                        : null;
+                var registration = registrations[handler.GetType()];
                 return new ResolvedRetentionHandler(
                     handler,
                     handlerInterface,
-                    registration?.DispatchPhase ?? RowHandlerDispatchPhase.Immediate,
-                    registration?.Identity
+                    registration.DispatchPhase,
+                    registration.Identity
                 );
             })
             .OrderBy(handler => RowHandlerPriority.Get(handler.HandlerType))
@@ -54,9 +64,9 @@ internal static class RetentionHandlerSupport
     /// <summary>
     /// Runs every handler's OnBefore and captures the snapshot after each one, so a value
     /// that cannot round-trip to OnAfter fails the handler that left it, before the row
-    /// is mutated. A handler that leaves unsaved changes on <paramref name="db"/> fails too:
-    /// they would otherwise be saved with whatever the context's owner saves next, which in
-    /// a caller-transaction erasure commits with it.
+    /// is mutated. A handler that leaves unsaved changes on <paramref name="db"/>, the
+    /// handlers' own context, fails too: Cohort discards them, so the handler's work would
+    /// silently not happen.
     /// </summary>
     public static async Task<OnBeforeInvocationResult> InvokeOnBeforeAsync(
         DbContext db,
@@ -342,14 +352,10 @@ internal sealed class ResolvedRetentionHandler(
 }
 
 /// <summary>
-/// An OnBefore handler left changes on the caller's DbContext in a caller-transaction
-/// erasure that Cohort couldn't undo. It fails the whole erasure rather than one entity:
-/// a partially failed result would leave the caller free to commit.
+/// One batch's OnBefore handlers and the context they were resolved with: a scope of their
+/// own whose context is on the run's connection and transaction, never the run's context.
 /// </summary>
-internal sealed class OnBeforeChangesNotUndoneException()
-    : InvalidOperationException(
-        "An OnBefore handler left changes on the caller's DbContext that Cohort could not undo, so Cohort cleared its change tracker and failed the erasure. Entities the context tracked are no longer tracked; discard it, or reload what you need, before saving."
-    );
+internal sealed record RetentionHandlerScope(DbContext Db, IReadOnlyList<ResolvedRetentionHandler> Handlers);
 
 internal sealed record OnBeforeInvocationResult(
     ResolvedRetentionHandler? FailedHandler,
@@ -359,8 +365,8 @@ internal sealed record OnBeforeInvocationResult(
 )
 {
     /// <summary>
-    /// The plain reason recorded for a handler that returned with unsaved changes on the
-    /// run's DbContext. Cohort-defined, so it carries no handler or row data.
+    /// The plain reason recorded for a handler that returned with unsaved changes on its
+    /// DbContext. Cohort-defined, so it carries no handler or row data.
     /// </summary>
     public const string UnsavedChangesReason = "on-before-unsaved-changes";
 

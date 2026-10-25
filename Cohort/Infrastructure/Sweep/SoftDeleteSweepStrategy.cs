@@ -1,3 +1,4 @@
+using Cohort.Application;
 using Cohort.Domain;
 
 using Microsoft.EntityFrameworkCore;
@@ -8,9 +9,10 @@ namespace Cohort.Infrastructure.Sweep;
 
 internal sealed class SoftDeleteSweepStrategy(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
-    IServiceProvider services,
+    IEnumerable<IRetentionHandlerRegistration> handlerRegistrations,
+    IServiceScopeFactory scopeFactory,
     ILogger<SoftDeleteSweepStrategy> logger
-) : SweepStrategy(db, services, logger)
+) : SweepStrategy(db, handlerRegistrations, scopeFactory, logger)
 {
     public override Strategy HandlesStrategy => Strategy.SoftDelete;
 

@@ -56,7 +56,9 @@ unprotected without an error.
   count on `EntitySweepCount` is now a required constructor argument. `ErasureResult.Complete`
   is true only when nothing of the subject is left.
 - `sweep_run_entity_summary` gains `RetainedCount`, `DeferredCount` and `BlockedCount`
-  (`bigint NOT NULL`). Hosts add a migration; readiness refuses to run until it's applied.
+  (`bigint NOT NULL`). Hosts add a migration that backfills them with 0 and then drops the
+  defaults, so a 0.10 host refuses to start against it instead of recording 0 for counts it
+  never measured; readiness refuses to run until it's applied.
 - A run whose `OnBeforeAsync` skipped rows settles `PartiallyFailed`, with a `rows-skipped`
   reason in `Error` and `EntityFailures`. An erasure that left rows deferred or blocked settles
   `PartiallyFailed` with `rows-missed` or `rows-blocked`. A sweep whose rows another
@@ -66,19 +68,26 @@ unprotected without an error.
   still referenced through a `RESTRICT` or `NO ACTION` foreign key (read from `pg_catalog`,
   so database-only keys count). Any other integrity-constraint rejection (SQLSTATE class 23)
   blocks only that row: Cohort splits the batch under savepoints, the rest commits, and a
-  Warning names the constraint. A full batch in which every row is refused fails the entity.
+  Warning names the constraint. A full batch in which every row is refused by the same
+  non-foreign-key constraint fails the entity; rows foreign keys refuse, or a mix of
+  constraints, are blocked and the run moves on.
   Batches Cohort owns check constraints immediately, so a deferred constraint blocks its row
   rather than failing the commit.
 - `OnBeforeAsync` runs in a read-only savepoint that is always rolled back. A database error
   in a handler skips only its row instead of failing the batch, and a handler that writes
-  through the sweep's `DbContext` now fails (`sqlstate:25006`). A handler that returns with
-  unsaved changes (an `Add`, a changed entity or key, a navigation change, a failed
-  `SaveChanges`) fails its row (`reason=on-before-unsaved-changes`), even with automatic
-  change detection off. Cohort then clears its own context's change tracker. On a
-  caller-transaction erasure's context it detaches what the handler added or loaded and
-  restores what the caller tracked. If it can't undo the change completely, it clears the
-  caller's change tracker and the erasure throws `InvalidOperationException`, so the caller's
-  next save can't commit it.
+  through its `DbContext` now fails (`sqlstate:25006`). Handlers get a `DbContext` of their
+  own, from a DI scope Cohort creates for each batch that has handlers, on the run's
+  connection and transaction; whatever they track is discarded after each row, and the
+  context running the sweep (your own in a caller-transaction erasure) is never given to a
+  handler. A handler that returns with unsaved changes (an `Add`, a changed entity or key, a
+  navigation change, a failed `SaveChanges`) fails its row
+  (`reason=on-before-unsaved-changes`), even with automatic change detection off.
+- In a caller-transaction erasure, a handler's other scoped services are fresh instances
+  from the handler scope, not the caller's, so caller-scoped state such as a scoped "current
+  user" isn't there; what your `IRetentionExecutionScope` sets up, or an `AsyncLocal`, still
+  flows. The execution scope now also runs for each such batch.
+- A row handler runs only when registered with `AddRowHandler`; a bare
+  `IRetentionHandler<T>` service registration is ignored.
 - `ErasureTransaction.Caller` and `IRetentionDeletion` detect changes before refusing a
   context with unsaved changes, so an edit made with automatic change detection off is
   refused too.

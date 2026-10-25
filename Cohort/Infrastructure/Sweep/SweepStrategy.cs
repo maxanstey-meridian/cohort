@@ -1,13 +1,14 @@
-using System.Collections;
 using System.Collections.Concurrent;
 using System.Data.Common;
 using System.Reflection;
 
+using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure.Holds;
 
 using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.ChangeTracking;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
 using Npgsql;
@@ -28,7 +29,12 @@ namespace Cohort.Infrastructure.Sweep;
 /// is bisected under savepoints to find it, and on the row-by-row path each row's change
 /// has its own savepoint.
 /// </summary>
-internal abstract class SweepStrategy(DbContext db, IServiceProvider services, ILogger logger)
+internal abstract class SweepStrategy(
+    DbContext db,
+    IEnumerable<IRetentionHandlerRegistration> handlerRegistrations,
+    IServiceScopeFactory scopeFactory,
+    ILogger logger
+)
 {
     private const string MutationSavepoint = "cohort_mutation";
     private const string OnBeforeSavepoint = "cohort_on_before";
@@ -176,7 +182,7 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
         SweepScope scope,
         DbConnection conn,
         DbTransaction transaction,
-        SweepMutationContext? execution,
+        SweepMutationContext execution,
         CancellationToken ct
     )
     {
@@ -188,12 +194,75 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
             return new SweepExecutionResult([], 0);
         }
 
-        var entry = scope.Entry;
         var mutation = CreateMutation(scope);
-        var handlers = execution is null
-            ? []
-            : RetentionHandlerSupport.ResolveHandlers(services, entry.EntityType);
-        if (handlers.Count == 0 && !mutation.RowByRow)
+        if (!RetentionHandlerSupport.HasHandlers(handlerRegistrations, scope.Entry.EntityType))
+        {
+            return await MutateAsync(scope, conn, transaction, candidates, mutation, onBefore: null, execution, ct);
+        }
+
+        // Handlers never see the run's own context, which in a caller-transaction erasure is
+        // the caller's: they get a scope of their own per batch, whose context joins the run's
+        // connection and transaction before any handler is constructed.
+        return await scopeFactory.RunInScopeAsync(
+            RetentionExecutionScopes.For(scope.Tenant),
+            async handlerServices =>
+            {
+                var handlerDb = handlerServices.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext);
+                handlerDb.Database.SetDbConnection(conn, contextOwnsConnection: false);
+                try
+                {
+                    await handlerDb.Database.UseTransactionAsync(transaction, ct);
+                    var onBefore = new RetentionHandlerScope(
+                        handlerDb,
+                        RetentionHandlerSupport.ResolveHandlers(handlerServices, scope.Entry.EntityType)
+                    );
+                    return await MutateAsync(scope, conn, transaction, candidates, mutation, onBefore, execution, ct);
+                }
+                finally
+                {
+                    await handlerDb.Database.UseTransactionAsync(null, CancellationToken.None);
+                    RestoreConfiguredConnection(handlerDb);
+                }
+            },
+            ct
+        );
+    }
+
+    /// <summary>
+    /// Puts back the connection <paramref name="handlerDb"/>'s options configure. EF doesn't
+    /// reset a connection the context doesn't own when a pooled context goes back to its
+    /// pool, so without this the next lease would get the run's connection. Without a
+    /// configured connection or connection string (a data source), the provider creates
+    /// the next one itself.
+    /// </summary>
+    private static void RestoreConfiguredConnection(DbContext handlerDb)
+    {
+        var configured = RelationalOptionsExtension.Extract(handlerDb.GetService<IDbContextOptions>());
+        if (configured.Connection is not null)
+        {
+            handlerDb.Database.SetDbConnection(configured.Connection, configured.IsConnectionOwned);
+            return;
+        }
+
+        handlerDb.Database.SetDbConnection(null);
+        if (configured.ConnectionString is not null)
+        {
+            handlerDb.Database.SetConnectionString(configured.ConnectionString);
+        }
+    }
+
+    private async Task<SweepExecutionResult> MutateAsync(
+        SweepScope scope,
+        DbConnection conn,
+        DbTransaction transaction,
+        IReadOnlyList<string> candidates,
+        SweepMutation mutation,
+        RetentionHandlerScope? onBefore,
+        SweepMutationContext execution,
+        CancellationToken ct
+    )
+    {
+        if (onBefore is null && !mutation.RowByRow)
         {
             var affected = new List<string>();
             var blocked = new BlockedRows();
@@ -204,18 +273,18 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
                 candidates.Count - affected.Count - blocked.RecordIds.Count,
                 CandidateCount: candidates.Count,
                 BlockedRecordIds: blocked.RecordIds,
-                BlockFailure: blocked.FirstFailure
+                BlockedFailures: blocked.Failures
             );
         }
 
         var rowByRow = RowByRowMethods.GetOrAdd(
-            entry.EntityType,
+            scope.Entry.EntityType,
             static entityType => RowByRowMethod.MakeGenericMethod(entityType)
         );
         return await (Task<SweepExecutionResult>)
             rowByRow.Invoke(
                 this,
-                [scope, conn, transaction, candidates, mutation, handlers, execution, ct]
+                [scope, conn, transaction, candidates, mutation, onBefore, execution, ct]
             )!;
     }
 
@@ -285,8 +354,8 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
         DbTransaction transaction,
         IReadOnlyList<string> candidates,
         SweepMutation mutation,
-        IReadOnlyList<ResolvedRetentionHandler> handlers,
-        SweepMutationContext? execution,
+        RetentionHandlerScope? onBefore,
+        SweepMutationContext execution,
         CancellationToken ct
     )
         where TEntity : class
@@ -327,16 +396,16 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
             var recordKey = recordIdConverter?.ConvertToProvider(recordIdValue) ?? recordIdValue;
 
             string? capturedPayload = null;
-            if (handlers.Count > 0)
+            if (onBefore is not null)
             {
                 var before = new RetentionBeforeContext(
-                    execution!.SweepId,
+                    execution.SweepId,
                     entry.Category,
                     scope.Rule.Strategy,
                     scope.Tenant.Id,
                     execution.At
                 );
-                var result = await InvokeOnBeforeReadOnlyAsync(conn, transaction, handlers, entry.EntityType, row, before, execution.OnCallersContext, ct);
+                var result = await InvokeOnBeforeReadOnlyAsync(conn, transaction, onBefore, entry.EntityType, row, before, ct);
                 if (!result.Succeeded)
                 {
                     var skippedId = await RecordIdSql.CanonicalizeAsync(
@@ -405,13 +474,13 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
                 await RetentionHandlerSupport.PersistCapturedRowAsync(
                     conn,
                     transaction,
-                    execution!,
+                    execution,
                     entry,
                     scope.Rule.Strategy,
                     scope.Tenant.Id,
                     recordId,
                     capturedPayload,
-                    handlers,
+                    onBefore!.Handlers,
                     ct
                 );
             }
@@ -422,199 +491,70 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
         return new SweepExecutionResult(
             affected,
             heldCount,
-            RowDetailsPersisted: handlers.Count > 0,
+            RowDetailsPersisted: onBefore is not null,
             SkippedCount: skipped.Count,
             CandidateCount: candidates.Count,
             SkippedRecordIds: skipped,
             BlockedRecordIds: blocked.RecordIds,
-            BlockFailure: blocked.FirstFailure
+            BlockedFailures: blocked.Failures
         );
     }
 
     /// <summary>
     /// Runs the OnBefore handlers inside a read-only savepoint that is always rolled back.
-    /// Handlers that inject the host's DbContext share the sweep's connection and
-    /// transaction: a database error in one leaves the transaction usable for the rest of
-    /// the batch, and a write fails (SQLSTATE 25006) instead of committing with it. Rolling
-    /// back also restores read-write mode and releases anything the handler locked.
-    /// Read-only can't reach the change tracker, so whatever a handler left tracked there
-    /// (an unsaved Add, the entries of a save that failed, or entities it loaded) is
-    /// discarded afterwards: see <see cref="DiscardTrackedChanges"/>.
+    /// The handlers' context shares the sweep's connection and transaction: a database error
+    /// in one leaves the transaction usable for the rest of the batch, and a write fails
+    /// (SQLSTATE 25006) instead of committing with it. Rolling back also restores read-write
+    /// mode and releases anything the handler locked. Read-only can't reach the change
+    /// tracker, so whatever the handlers left tracked on their context is discarded after
+    /// every row.
     /// </summary>
-    private async Task<OnBeforeInvocationResult> InvokeOnBeforeReadOnlyAsync(
+    private static async Task<OnBeforeInvocationResult> InvokeOnBeforeReadOnlyAsync(
         DbConnection conn,
         DbTransaction transaction,
-        IReadOnlyList<ResolvedRetentionHandler> handlers,
+        RetentionHandlerScope onBefore,
         Type entityType,
         object row,
         RetentionBeforeContext before,
-        bool onCallersContext,
         CancellationToken ct
     )
     {
-        // The caller's context had no unsaved changes on entry, so what it tracks now is what
-        // the discard restores; anything tracked after the handlers is theirs.
-        var trackedBefore = onCallersContext
-            ? db.ChangeTracker.Entries().Select(entry => entry.Entity).ToHashSet(ReferenceEqualityComparer.Instance)
-            : null;
         await transaction.SaveAsync(OnBeforeSavepoint, CancellationToken.None);
-        OnBeforeInvocationResult result;
         try
         {
-            await using (var readOnly = new SqlParams().CreateCommand(conn, transaction, "SET LOCAL transaction_read_only = on"))
-            {
-                await readOnly.ExecuteNonQueryAsync(ct);
-            }
-
-            result = await RetentionHandlerSupport.InvokeOnBeforeAsync(db, handlers, entityType, row, before, ct);
-        }
-        catch
-        {
-            // Cancelled, or Cohort's own statement failed: the batch is abandoned with the
-            // original exception, so neither a failed rollback nor a failed discard may
-            // replace it.
+            OnBeforeInvocationResult result;
             try
             {
-                await transaction.RollbackAsync(OnBeforeSavepoint, CancellationToken.None);
-            }
-            catch (Exception)
-            {
-                // The batch transaction is discarded either way.
-            }
-
-            try
-            {
-                DiscardTrackedChanges(trackedBefore);
-            }
-            catch (Exception)
-            {
-                // The tracker was cleared if it couldn't be restored.
-            }
-
-            throw;
-        }
-
-        await transaction.RollbackAsync(OnBeforeSavepoint, CancellationToken.None);
-        DiscardTrackedChanges(trackedBefore);
-        return result;
-    }
-
-    /// <summary>
-    /// Leaves the change tracker as OnBefore found it. Cohort loads rows untracked, so on
-    /// its own context (<paramref name="trackedBefore"/> null) there is nothing to keep and
-    /// the tracker is cleared. On the caller's context, entities the handlers began
-    /// tracking (added or loaded) are detached, and those the caller tracked get their
-    /// original values back and stay tracked. When that can't be proven complete (changes
-    /// are still detected, an entity the caller didn't track is tracked again, a navigation
-    /// still holds an untracked entity, or restoring throws), the tracker is cleared and
-    /// the erasure fails with <see cref="OnBeforeChangesNotUndoneException"/>.
-    /// </summary>
-    private void DiscardTrackedChanges(IReadOnlySet<object>? trackedBefore)
-    {
-        if (trackedBefore is null)
-        {
-            db.ChangeTracker.Clear();
-            return;
-        }
-
-        bool restored;
-        try
-        {
-            restored = TryRestoreTrackedChanges(trackedBefore);
-        }
-        catch (Exception)
-        {
-            restored = false;
-        }
-
-        if (!restored)
-        {
-            db.ChangeTracker.Clear();
-            throw new OnBeforeChangesNotUndoneException();
-        }
-    }
-
-    private bool TryRestoreTrackedChanges(IReadOnlySet<object> trackedBefore)
-    {
-        var tracker = db.ChangeTracker;
-        var autoDetectChanges = tracker.AutoDetectChangesEnabled;
-        // Detection would throw on the very change being undone, such as a modified key.
-        tracker.AutoDetectChangesEnabled = false;
-        try
-        {
-            foreach (var entry in tracker.Entries().ToArray())
-            {
-                if (!trackedBefore.Contains(entry.Entity))
+                await using (var readOnly = new SqlParams().CreateCommand(conn, transaction, "SET LOCAL transaction_read_only = on"))
                 {
-                    entry.State = EntityState.Detached;
-                    continue;
+                    await readOnly.ExecuteNonQueryAsync(ct);
                 }
 
-                // Unchanged too: a change detection never got to mark is still on the entity.
-                RestoreKeys(entry);
-                entry.CurrentValues.SetValues(entry.OriginalValues);
-                entry.State = EntityState.Unchanged;
+                result = await RetentionHandlerSupport.InvokeOnBeforeAsync(onBefore.Db, onBefore.Handlers, entityType, row, before, ct);
             }
+            catch
+            {
+                // Cancelled, or Cohort's own statement failed: the batch is abandoned with the
+                // original exception, so a failed rollback may not replace it.
+                try
+                {
+                    await transaction.RollbackAsync(OnBeforeSavepoint, CancellationToken.None);
+                }
+                catch (Exception)
+                {
+                    // The batch transaction is discarded either way.
+                }
+
+                throw;
+            }
+
+            await transaction.RollbackAsync(OnBeforeSavepoint, CancellationToken.None);
+            return result;
         }
         finally
         {
-            tracker.AutoDetectChangesEnabled = autoDetectChanges;
+            onBefore.Db.ChangeTracker.Clear();
         }
-
-        return !RetentionHandlerSupport.HasUnsavedChanges(db)
-            && tracker.Entries().All(entry => trackedBefore.Contains(entry.Entity))
-            && !ReachesUntrackedEntity();
-    }
-
-    /// <summary>
-    /// EF refuses to set a tracked entity's key, even back to its original value, but the
-    /// entity's own member can be. A key with no writable member throws, which clears the
-    /// tracker and fails the erasure.
-    /// </summary>
-    private static void RestoreKeys(EntityEntry entry)
-    {
-        foreach (var key in entry.Metadata.GetProperties().Where(property => property.IsKey() && !property.IsShadowProperty()))
-        {
-            var original = entry.OriginalValues[key];
-            if (key.GetKeyValueComparer().Equals(entry.CurrentValues[key], original))
-            {
-                continue;
-            }
-
-            if (key.PropertyInfo is { CanWrite: true } member)
-            {
-                member.SetValue(entry.Entity, original);
-            }
-            else
-            {
-                (key.FieldInfo ?? throw new InvalidOperationException($"Key {key.Name} has no writable member.")).SetValue(entry.Entity, original);
-            }
-        }
-    }
-
-    /// <summary>
-    /// Whether a tracked entity's navigation still holds an entity the tracker doesn't
-    /// track, which the caller's next attach of the graph would pick up.
-    /// </summary>
-    private bool ReachesUntrackedEntity()
-    {
-        var entries = db.ChangeTracker.Entries().ToArray();
-        var tracked = entries.Select(entry => entry.Entity).ToHashSet(ReferenceEqualityComparer.Instance);
-        foreach (var navigation in entries.SelectMany(entry => entry.Navigations))
-        {
-            var targets = navigation.CurrentValue switch
-            {
-                null => [],
-                IEnumerable collection when navigation.Metadata.IsCollection => collection.Cast<object>(),
-                var single => [single],
-            };
-            if (targets.Any(target => !tracked.Contains(target)))
-            {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     private static bool IsIntegrityViolation(DbException exception) =>
@@ -626,7 +566,7 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
     /// </summary>
     private void LogBlocked(SweepScope scope, SweepMutationContext? execution, BlockedRows blocked)
     {
-        foreach (var group in blocked.Failures.GroupBy(failure => (failure.SqlState, Constraint: (failure as PostgresException)?.ConstraintName)))
+        foreach (var group in blocked.Failures.GroupBy(BlockedRows.RefusalKey))
         {
             var first = group.First();
             var diagnostic = RetentionFailureDiagnostic.Create(first);
@@ -636,7 +576,7 @@ internal abstract class SweepStrategy(DbContext db, IServiceProvider services, I
                 execution?.SweepId,
                 group.Count(),
                 scope.Entry.EntityType.FullName,
-                group.Key.Constraint ?? "(unnamed)",
+                group.Key.ConstraintName ?? "(unnamed)",
                 group.Key.SqlState,
                 diagnostic.DiagnosticIdText
             );
@@ -914,7 +854,12 @@ internal sealed class BlockedRows
 
     public IReadOnlyList<DbException> Failures => failures;
 
-    public DbException? FirstFailure => failures.Count == 0 ? null : failures[0];
+    /// <summary>
+    /// What refused a row: its SQLSTATE and the constraint named, if any. The warning groups
+    /// by it, and the engine's circuit breaker compares it across a batch.
+    /// </summary>
+    public static (string? SqlState, string? ConstraintName) RefusalKey(DbException failure) =>
+        (failure.SqlState, (failure as PostgresException)?.ConstraintName);
 
     public void Add(string recordId, DbException failure)
     {

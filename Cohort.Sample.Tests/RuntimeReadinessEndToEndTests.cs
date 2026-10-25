@@ -194,6 +194,48 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
 
         var result = await host.RunSweepAsync(tenant, now);
         result.EntityFailures.Should().BeEmpty();
+
+        // The migration backfills with 0 and then drops the defaults, so a 0.10 instance,
+        // whose summary insert leaves the three counts out, fails instead of recording 0 for
+        // counts it never measured; 0.10's readiness refuses such columns for the same reason.
+        await using (var db = new SampleDbContext(options))
+        {
+            await db.Database.OpenConnectionAsync();
+            var connection = db.Database.GetDbConnection();
+            await using (var defaults = connection.CreateCommand())
+            {
+                defaults.CommandText =
+                    """
+                    SELECT count(*) FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = 'sweep_run_entity_summary'
+                      AND column_name IN ('RetainedCount', 'DeferredCount', 'BlockedCount')
+                      AND column_default IS NULL AND is_nullable = 'NO'
+                    """;
+                ((long)(await defaults.ExecuteScalarAsync())!).Should().Be(3);
+            }
+
+            await using (var summaries = connection.CreateCommand())
+            {
+                summaries.CommandText = "SELECT count(*) FROM public.sweep_run_entity_summary";
+                ((long)(await summaries.ExecuteScalarAsync())!).Should().BePositive();
+            }
+
+            await using var legacyInsert = connection.CreateCommand();
+            legacyInsert.CommandText =
+                """
+                INSERT INTO public.sweep_run_entity_summary
+                    ("SweepId", "RetentionEntityId", "Category", "TenantId", "Strategy", "Affected", "At",
+                     "EntityType", "HeldCount", "NullAnchorCount", "ResolvedDays", "ResolvedMonths",
+                     "RuleReason", "RuleSource", "SkippedCount")
+                SELECT "SweepId", "RetentionEntityId", 'written-by-0.10', "TenantId", "Strategy", "Affected", "At",
+                       "EntityType", "HeldCount", "NullAnchorCount", "ResolvedDays", "ResolvedMonths",
+                       "RuleReason", "RuleSource", "SkippedCount"
+                FROM public.sweep_run_entity_summary
+                LIMIT 1
+                """;
+            var insert = () => legacyInsert.ExecuteNonQueryAsync();
+            (await insert.Should().ThrowAsync<PostgresException>()).Which.SqlState.Should().Be("23502");
+        }
     }
 
     [Fact]

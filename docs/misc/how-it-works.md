@@ -51,7 +51,9 @@ Along the way:
   left out up front because a foreign key still references them get one Warning per entity
   naming the keys that can block it. A full
   batch in which every row is refused fails the entity instead, since the cause is then the
-  rule or the schema.
+  rule or the schema, unless the refusals are foreign-key refusals (`23503`, `23001`: they
+  depend on each row's children) or differ between rows. Those rows are only blocked, and
+  the run moves on to the next batch.
 - `HeldCount` and `BlockedCount` are measured directly: rows past the cutoff with an active
   hold, and rows still referenced through a blocking foreign key, plus the rows a constraint
   refused during the run. Neither is inferred from candidate arithmetic. A sweep's blocked

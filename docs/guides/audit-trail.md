@@ -134,11 +134,19 @@ The ledger grows forever unless you opt in to [history pruning](/guides/history-
 `sweep_run_entity_summary` gains three required `bigint` columns: `RetainedCount`,
 `DeferredCount` and `BlockedCount`. Add a migration: `dotnet ef migrations add` picks them up
 from your model, and readiness refuses to run until it's applied. EF scaffolds each as
-`AddColumn<long>(…, nullable: false, defaultValue: 0L)`, which fills existing summaries with 0;
-keep it as scaffolded.
+`AddColumn<long>(…, nullable: false, defaultValue: 0L)`, which fills existing summaries with 0.
+Keep that, then drop the defaults at the end of `Up`:
 
-Apply the migration before starting 0.11.0, and don't mix versions across a rolling deploy:
-a summary a 0.10 host writes would record 0 for counts it never measured.
+```csharp
+migrationBuilder.Sql(
+    """ALTER TABLE "public"."sweep_run_entity_summary" ALTER COLUMN "RetainedCount" DROP DEFAULT, ALTER COLUMN "DeferredCount" DROP DEFAULT, ALTER COLUMN "BlockedCount" DROP DEFAULT""");
+```
+
+Use your Cohort schema if it isn't `public`. Without the defaults, a 0.10 host refuses to
+start against the migrated database, and one already running fails its next run, rather than
+writing summaries that record 0 for counts it never measured. Summaries written before the
+upgrade keep 0 in all three: those counts weren't measured, so read them as unknown for runs
+that started before you upgraded.
 
 A run whose row handlers skipped rows now settles `PartiallyFailed` instead of `Succeeded`,
 with a `rows-skipped` reason, so alerts on run status will see these runs.

@@ -1,3 +1,5 @@
+using System.Data.Common;
+
 namespace Cohort.Infrastructure.Sweep;
 
 internal sealed record SweepExecutionResult(
@@ -8,7 +10,7 @@ internal sealed record SweepExecutionResult(
     int CandidateCount = 0,
     IReadOnlyList<string>? SkippedRecordIds = null,
     IReadOnlyList<string>? BlockedRecordIds = null,
-    Exception? BlockFailure = null
+    IReadOnlyList<DbException>? BlockedFailures = null
 )
 {
     /// <summary>
@@ -21,24 +23,27 @@ internal sealed record SweepExecutionResult(
 
     /// <summary>
     /// Record ids an integrity constraint (SQLSTATE class 23) refused to let the strategy
-    /// change; <see cref="BlockFailure"/> is the first refusal. Not persisted: the engine
-    /// counts them and excludes them from later batches of the same run.
+    /// change. Not persisted: the engine counts them and excludes them from later batches of
+    /// the same run.
     /// </summary>
     public IReadOnlyList<string> BlockedRecordIds { get; init; } = BlockedRecordIds ?? [];
+
+    /// <summary>
+    /// The refusal behind each of <see cref="BlockedRecordIds"/>, in the same order: the
+    /// engine reads them to tell a schema-wide refusal from row-level ones.
+    /// </summary>
+    public IReadOnlyList<DbException> BlockedFailures { get; init; } = BlockedFailures ?? [];
 }
 
 /// <summary>
 /// One batch of a real run. <c>ExcludedRecordIds</c> are rows earlier batches of the run
 /// found blocked, left out of discovery so they aren't tried again in the same run.
-/// <c>OnCallersContext</c> says the run's DbContext is the caller's (a caller-transaction
-/// erasure), not one Cohort owns.
 /// </summary>
 internal sealed record SweepMutationContext(
     Guid SweepId,
     DateTimeOffset At,
     int? BatchSize = null,
-    IReadOnlyCollection<string>? ExcludedRecordIds = null,
-    bool OnCallersContext = false
+    IReadOnlyCollection<string>? ExcludedRecordIds = null
 );
 
 internal sealed record ErasureSubjectPredicate

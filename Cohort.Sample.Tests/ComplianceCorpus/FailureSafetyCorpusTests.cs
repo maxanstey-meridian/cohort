@@ -132,9 +132,9 @@ public sealed class FailureSafetyCorpusTests(PostgresFixture fixture) : Integrat
             },
             configureServices: services =>
             {
-                services.AddSingleton<IRetentionHandler<Note>>(
-                    new PersonalDataFailingHandler(personalDataSentinel)
-                );
+                services
+                    .AddSingleton(new PersonalDataSentinel(personalDataSentinel))
+                    .AddRowHandler<Note, PersonalDataFailingHandler>();
                 services.AddSingleton<ILoggerProvider>(logs);
             }
         );
@@ -378,11 +378,13 @@ public sealed class FailureSafetyCorpusTests(PostgresFixture fixture) : Integrat
         IReadOnlyDictionary<string, object?> Properties
     );
 
-    private sealed class PersonalDataFailingHandler(string personalDataSentinel)
+    private sealed record PersonalDataSentinel(string Value);
+
+    private sealed class PersonalDataFailingHandler(PersonalDataSentinel sentinel)
         : IRetentionHandler<Note>
     {
         public Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct) =>
-            throw new InvalidOperationException(personalDataSentinel);
+            throw new InvalidOperationException(sentinel.Value);
     }
 
     private async Task ExecuteAsync(string sql)

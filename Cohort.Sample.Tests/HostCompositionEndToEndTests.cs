@@ -96,15 +96,23 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
     }
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task Caller_Erasure_Observers_Run_Once_After_Commit_However_The_Host_Registers_Its_Context(bool pooled)
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task Caller_Erasure_Observers_Run_Once_After_Commit_However_The_Host_Registers_Its_Context(
+        bool pooled,
+        bool dataSource
+    )
     {
         // The host registers its context after AddCohort, with its own transaction
-        // interceptor; Cohort's commit interceptor is added alongside it, once.
+        // interceptor; Cohort's commit interceptor is added alongside it, once. A handler's
+        // context (pooled or not) carries the interceptor too, joins the caller's connection
+        // and transaction, never commits, and goes back without the caller's connection.
         await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
         var hostInterceptor = new CommitCountingInterceptor();
         var observer = new EventNameObserver();
+        var probe = new HandlerConnectionProbe();
+        await using var npgsqlDataSource = Npgsql.NpgsqlDataSource.Create(database.ConnectionString);
         var services = new ServiceCollection();
         services.AddLogging();
         services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
@@ -113,11 +121,14 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
         );
         services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddSingleton<IRetentionAuditObserver>(observer);
+        services.AddSingleton(probe);
         services.AddCohort<CallerErasureDbContext>();
+        services.AddRowHandler<CallerErasureRecord, ConnectionProbingHandler>();
         if (pooled)
         {
             services.AddDbContextPool<CallerErasureDbContext>(options =>
-                options.UseNpgsql(database.ConnectionString).AddInterceptors(hostInterceptor)
+                (dataSource ? options.UseNpgsql(npgsqlDataSource) : options.UseNpgsql(database.ConnectionString))
+                    .AddInterceptors(hostInterceptor)
             );
         }
         else
@@ -138,13 +149,17 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
             await db.SaveChangesAsync();
         }
 
+        System.Data.Common.DbConnection callerConnection;
+        CallerErasureDbContext callerContext;
         await using (var scope = provider.CreateAsyncScope())
         {
-            var db = scope.ServiceProvider.GetRequiredService<CallerErasureDbContext>();
+            var db = callerContext = scope.ServiceProvider.GetRequiredService<CallerErasureDbContext>();
+            callerConnection = db.Database.GetDbConnection();
             await using var transaction = await db.Database.BeginTransactionAsync();
-            await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+            var result = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
                 RetentionErasureRequest.Tenanted(tenant, new ErasureScope("user", subject), transaction: ErasureTransaction.Caller)
             );
+            result.Counts.Should().ContainSingle().Which.Affected.Should().Be(1);
             observer.Names.Should().BeEmpty();
             await transaction.CommitAsync();
         }
@@ -153,6 +168,29 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
         observer.Names.Should().ContainSingle(name => name == "Started");
         observer.Names.Should().ContainSingle(name => name == "Completed");
         observer.Names.Last().Should().Be("Completed");
+        probe.Connections.Should().ContainSingle().Which.Should().BeSameAs(callerConnection);
+        probe.Contexts.Should().ContainSingle().Which.Should().NotBeSameAs(callerContext);
+
+        // Two leases at once, so a pool hands back both the caller's context and the handler's.
+        // The caller's keeps its own connection; the handler's must not keep the caller's.
+        await using var first = provider.CreateAsyncScope();
+        await using var second = provider.CreateAsyncScope();
+        CallerErasureDbContext[] later =
+        [
+            first.ServiceProvider.GetRequiredService<CallerErasureDbContext>(),
+            second.ServiceProvider.GetRequiredService<CallerErasureDbContext>(),
+        ];
+        var handlerContext = probe.Contexts.Single();
+        later.Contains(handlerContext).Should().Be(pooled);
+        foreach (var context in later)
+        {
+            if (!ReferenceEquals(context, callerContext))
+            {
+                context.Database.GetDbConnection().Should().NotBeSameAs(callerConnection);
+            }
+
+            (await context.Records.CountAsync()).Should().Be(0);
+        }
     }
 
     [Fact]
@@ -393,6 +431,25 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
         {
             Interlocked.Increment(ref commits);
             return Task.CompletedTask;
+        }
+    }
+
+    private sealed class HandlerConnectionProbe
+    {
+        public List<System.Data.Common.DbConnection> Connections { get; } = [];
+
+        public List<object> Contexts { get; } = [];
+    }
+
+    /// <summary>Reads the row through its own context and records which connection that used.</summary>
+    private sealed class ConnectionProbingHandler(CallerErasureDbContext db, HandlerConnectionProbe probe)
+        : IRetentionHandler<CallerErasureRecord>
+    {
+        public async Task OnBeforeAsync(CallerErasureRecord row, RetentionBeforeContext ctx, CancellationToken ct)
+        {
+            (await db.Records.AsNoTracking().AnyAsync(record => record.Id == row.Id, ct)).Should().BeTrue();
+            probe.Connections.Add(db.Database.GetDbConnection());
+            probe.Contexts.Add(db);
         }
     }
 

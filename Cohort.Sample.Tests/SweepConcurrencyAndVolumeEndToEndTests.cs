@@ -2,7 +2,9 @@ using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
 using Cohort.Sample.Entities;
+
 using Microsoft.EntityFrameworkCore;
+
 using Npgsql;
 
 namespace Cohort.Sample.Tests;
@@ -28,12 +30,12 @@ public sealed class SweepConcurrencyAndVolumeEndToEndTests(PostgresFixture fixtu
         {
             db.Notes.AddRange(
                 expiredIds.Select((id, index) => new Note
-                    {
-                        Id = id,
-                        TenantId = tenantId,
-                        CreatedAt = asOf.AddDays(index == 0 ? -121 : -120),
-                        Body = $"concurrent-expired-{index}",
-                    })
+                {
+                    Id = id,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(index == 0 ? -121 : -120),
+                    Body = $"concurrent-expired-{index}",
+                })
             );
             db.Notes.Add(
                 new Note

@@ -1,6 +1,7 @@
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Sample.Entities;
+
 using Microsoft.Extensions.Logging;
 
 namespace Cohort.Sample;

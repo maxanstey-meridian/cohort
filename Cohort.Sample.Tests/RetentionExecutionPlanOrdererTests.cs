@@ -1,6 +1,7 @@
 using Cohort.Application;
 using Cohort.Infrastructure;
 using Cohort.Infrastructure.Migrations;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 

@@ -1,5 +1,6 @@
 using Cohort.Application;
 using Cohort.Domain;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;

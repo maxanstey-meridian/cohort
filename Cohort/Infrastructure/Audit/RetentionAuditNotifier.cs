@@ -1,4 +1,5 @@
 using Cohort.Application;
+
 using Microsoft.Extensions.Logging;
 
 namespace Cohort.Infrastructure.Audit;

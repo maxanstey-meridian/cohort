@@ -1,7 +1,9 @@
 using System.Reflection;
 using System.Text.RegularExpressions;
+
 using Cohort.Application;
 using Cohort.Domain;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -66,196 +68,196 @@ internal sealed partial class RetentionStartupValidator(
                 return;
             }
 
-        ModelValidation.ErasureSubjects.Clear();
-        ModelValidation.ErasureSubjectKinds.Clear();
-        var validatedCapabilities = new Dictionary<string, RetentionCategoryCapabilities>(
-            StringComparer.Ordinal
-        );
-        var errors = registeredAnonymiseFactoryTypeCounts
-            .Where(pair => pair.Value > 1)
-            .OrderBy(pair => pair.Key.FullName, StringComparer.Ordinal)
-            .Select(pair =>
-                $"{nameof(IAnonymiseValueFactory)} concrete runtime type {pair.Key.FullName} is registered {pair.Value} times in DI; exactly one registration per concrete runtime type is allowed."
-            )
-            .ToList();
-        var retentionEntityIdOwners = new Dictionary<Guid, Type>();
-        var retainedEntries = new List<RetentionEntry>();
+            ModelValidation.ErasureSubjects.Clear();
+            ModelValidation.ErasureSubjectKinds.Clear();
+            var validatedCapabilities = new Dictionary<string, RetentionCategoryCapabilities>(
+                StringComparer.Ordinal
+            );
+            var errors = registeredAnonymiseFactoryTypeCounts
+                .Where(pair => pair.Value > 1)
+                .OrderBy(pair => pair.Key.FullName, StringComparer.Ordinal)
+                .Select(pair =>
+                    $"{nameof(IAnonymiseValueFactory)} concrete runtime type {pair.Key.FullName} is registered {pair.Value} times in DI; exactly one registration per concrete runtime type is allowed."
+                )
+                .ToList();
+            var retentionEntityIdOwners = new Dictionary<Guid, Type>();
+            var retainedEntries = new List<RetentionEntry>();
 
-        foreach (var entityType in db.Model.GetEntityTypes())
-        {
-            if (entityType.ClrType == typeof(Dictionary<string, object>))
+            foreach (var entityType in db.Model.GetEntityTypes())
             {
-                continue;
-            }
-
-            var clrType = entityType.ClrType;
-            var retain = clrType.GetCustomAttribute<RetainAttribute>(inherit: false);
-            var exempt = clrType.GetCustomAttribute<ExemptFromRetentionAttribute>(inherit: false);
-
-            if (retain is not null && exempt is not null)
-            {
-                errors.Add(
-                    $"Entity {clrType.FullName} must declare exactly one of [Retain] or [ExemptFromRetention], not both."
-                );
-                continue;
-            }
-
-            if (retain is null)
-            {
-                continue;
-            }
-
-            if (entityType.BaseType is not null || entityType.GetDirectlyDerivedTypes().Any())
-            {
-                errors.Add(
-                    $"[Retain] on {clrType.FullName}: entity participates in an EF inheritance hierarchy (TPH/TPT/TPC). Sweep SQL targets the mapped table without a type discriminator, so rows of sibling or derived types would be swept too. Retention on inheritance-mapped entities is not supported."
-                );
-                continue;
-            }
-
-            if (!ValidateRelationalMappingShape(entityType, errors))
-            {
-                continue;
-            }
-
-            ValidateMarkerAttributeUniqueness(clrType, errors);
-
-            RetentionEntry entry;
-            try
-            {
-                entry =
-                    entryBuilder.TryBuild(entityType)
-                    ?? throw new InvalidOperationException(
-                        $"[Retain] on {clrType.FullName}: retention entry could not be built."
-                    );
-            }
-            catch (InvalidOperationException ex)
-            {
-                errors.Add(ex.Message);
-                continue;
-            }
-
-            ValidateTenantConvention(entityType, entry, errors);
-            retainedEntries.Add(entry);
-            ValidateRecordIdConvention(entityType, entry, errors);
-            ValidateTimestampStoreTypes(entityType, entry, errors);
-            ValidateNoStructuralValueConverters(entityType, entry, errors);
-            if (retentionEntityIdOwners.TryGetValue(entry.RetentionEntityId, out var existingEntityType))
-            {
-                errors.Add(
-                    $"[RetentionEntityId] on {clrType.FullName}: identity '{entry.RetentionEntityId}' is already used by retained entity {existingEntityType.FullName}; identities must be unique in the DbContext model."
-                );
-            }
-            else
-            {
-                retentionEntityIdOwners.Add(entry.RetentionEntityId, clrType);
-            }
-
-            RetentionCategoryCapabilities? capabilities = null;
-            if (!validatedCapabilities.TryGetValue(entry.Category, out capabilities))
-            {
-                try
+                if (entityType.ClrType == typeof(Dictionary<string, object>))
                 {
-                    capabilities = ruleProvider.GetCapabilities(entry.Category);
+                    continue;
                 }
-                catch (Exception ex)
+
+                var clrType = entityType.ClrType;
+                var retain = clrType.GetCustomAttribute<RetainAttribute>(inherit: false);
+                var exempt = clrType.GetCustomAttribute<ExemptFromRetentionAttribute>(inherit: false);
+
+                if (retain is not null && exempt is not null)
                 {
                     errors.Add(
-                        $"Retention category '{entry.Category}' for entity {clrType.FullName} failed capability resolution: {ex.Message}"
+                        $"Entity {clrType.FullName} must declare exactly one of [Retain] or [ExemptFromRetention], not both."
                     );
                     continue;
                 }
-            }
 
-            if (capabilities is null)
-            {
-                errors.Add(
-                    $"Retention category '{entry.Category}' for entity {clrType.FullName} could not be resolved."
-                );
-                continue;
-            }
-
-            validatedCapabilities.TryAdd(entry.Category, capabilities);
-
-            try
-            {
-                ModelValidation.ErasureSubjects[entry.EntityType] =
-                    erasureSubjectMetadataResolver.Resolve(entry);
-
-                if (capabilities.Strategies.Contains(Strategy.Purge))
+                if (retain is null)
                 {
-                    ValidateCascadeDeletePaths(entityType, errors);
+                    continue;
                 }
 
-                if (capabilities.Strategies.Contains(Strategy.SoftDelete))
+                if (entityType.BaseType is not null || entityType.GetDirectlyDerivedTypes().Any())
                 {
-                    ValidateSoftDeleteConvention(
-                        entry,
-                        errors,
-                        $"Soft-delete convention on {clrType.FullName}:"
+                    errors.Add(
+                        $"[Retain] on {clrType.FullName}: entity participates in an EF inheritance hierarchy (TPH/TPT/TPC). Sweep SQL targets the mapped table without a type discriminator, so rows of sibling or derived types would be swept too. Retention on inheritance-mapped entities is not supported."
+                    );
+                    continue;
+                }
+
+                if (!ValidateRelationalMappingShape(entityType, errors))
+                {
+                    continue;
+                }
+
+                ValidateMarkerAttributeUniqueness(clrType, errors);
+
+                RetentionEntry entry;
+                try
+                {
+                    entry =
+                        entryBuilder.TryBuild(entityType)
+                        ?? throw new InvalidOperationException(
+                            $"[Retain] on {clrType.FullName}: retention entry could not be built."
+                        );
+                }
+                catch (InvalidOperationException ex)
+                {
+                    errors.Add(ex.Message);
+                    continue;
+                }
+
+                ValidateTenantConvention(entityType, entry, errors);
+                retainedEntries.Add(entry);
+                ValidateRecordIdConvention(entityType, entry, errors);
+                ValidateTimestampStoreTypes(entityType, entry, errors);
+                ValidateNoStructuralValueConverters(entityType, entry, errors);
+                if (retentionEntityIdOwners.TryGetValue(entry.RetentionEntityId, out var existingEntityType))
+                {
+                    errors.Add(
+                        $"[RetentionEntityId] on {clrType.FullName}: identity '{entry.RetentionEntityId}' is already used by retained entity {existingEntityType.FullName}; identities must be unique in the DbContext model."
                     );
                 }
-
-                if (capabilities.Strategies.Contains(Strategy.Anonymise))
+                else
                 {
-                    if (entry.AnonymiseFields.Any(field => field is AnonymiseFactoryField))
+                    retentionEntityIdOwners.Add(entry.RetentionEntityId, clrType);
+                }
+
+                RetentionCategoryCapabilities? capabilities = null;
+                if (!validatedCapabilities.TryGetValue(entry.Category, out capabilities))
+                {
+                    try
                     {
-                        ValidateFactoryBackedAnonymiseSupport(
+                        capabilities = ruleProvider.GetCapabilities(entry.Category);
+                    }
+                    catch (Exception ex)
+                    {
+                        errors.Add(
+                            $"Retention category '{entry.Category}' for entity {clrType.FullName} failed capability resolution: {ex.Message}"
+                        );
+                        continue;
+                    }
+                }
+
+                if (capabilities is null)
+                {
+                    errors.Add(
+                        $"Retention category '{entry.Category}' for entity {clrType.FullName} could not be resolved."
+                    );
+                    continue;
+                }
+
+                validatedCapabilities.TryAdd(entry.Category, capabilities);
+
+                try
+                {
+                    ModelValidation.ErasureSubjects[entry.EntityType] =
+                        erasureSubjectMetadataResolver.Resolve(entry);
+
+                    if (capabilities.Strategies.Contains(Strategy.Purge))
+                    {
+                        ValidateCascadeDeletePaths(entityType, errors);
+                    }
+
+                    if (capabilities.Strategies.Contains(Strategy.SoftDelete))
+                    {
+                        ValidateSoftDeleteConvention(
+                            entry,
+                            errors,
+                            $"Soft-delete convention on {clrType.FullName}:"
+                        );
+                    }
+
+                    if (capabilities.Strategies.Contains(Strategy.Anonymise))
+                    {
+                        if (entry.AnonymiseFields.Any(field => field is AnonymiseFactoryField))
+                        {
+                            ValidateFactoryBackedAnonymiseSupport(
+                                entry,
+                                errors,
+                                $"Anonymise convention on {clrType.FullName}:"
+                            );
+                        }
+
+                        ValidateAnonymiseConvention(
+                            entityType,
                             entry,
                             errors,
                             $"Anonymise convention on {clrType.FullName}:"
                         );
-                    }
 
-                    ValidateAnonymiseConvention(
-                        entityType,
-                        entry,
-                        errors,
-                        $"Anonymise convention on {clrType.FullName}:"
-                    );
-
-                    if (entry.AnonymisedAt is null)
-                    {
-                        errors.Add(
-                            $"Anonymise convention on {clrType.FullName}: retained Anonymise categories require a nullable DateTimeOffset marker property (named AnonymisedAt by convention, or marked with [RetentionAnonymisedAt]). NULL marks rows not yet anonymised; without it anonymisation re-scrubs every expired row on every sweep."
-                        );
+                        if (entry.AnonymisedAt is null)
+                        {
+                            errors.Add(
+                                $"Anonymise convention on {clrType.FullName}: retained Anonymise categories require a nullable DateTimeOffset marker property (named AnonymisedAt by convention, or marked with [RetentionAnonymisedAt]). NULL marks rows not yet anonymised; without it anonymisation re-scrubs every expired row on every sweep."
+                            );
+                        }
                     }
                 }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    errors.Add(
+                        $"Retention category '{entry.Category}' for entity {clrType.FullName} failed startup validation: {ex.Message}"
+                    );
+                }
             }
-            catch (OperationCanceledException)
+
+            ValidateErasureSubjectKinds(errors);
+
+            try
             {
-                throw;
+                RetentionExecutionPlanOrderer.Order(db, retainedEntries, entry => entry);
             }
-            catch (Exception ex)
+            catch (RetentionConfigurationException ex)
             {
-                errors.Add(
-                    $"Retention category '{entry.Category}' for entity {clrType.FullName} failed startup validation: {ex.Message}"
-                );
+                errors.AddRange(ex.Errors);
             }
-        }
 
-        ValidateErasureSubjectKinds(errors);
+            if (errors.Count > 0)
+            {
+                throw new RetentionConfigurationException(errors);
+            }
 
-        try
-        {
-            RetentionExecutionPlanOrderer.Order(db, retainedEntries, entry => entry);
-        }
-        catch (RetentionConfigurationException ex)
-        {
-            errors.AddRange(ex.Errors);
-        }
-
-        if (errors.Count > 0)
-        {
-            throw new RetentionConfigurationException(errors);
-        }
-
-        ModelValidation.Capabilities.Clear();
-        foreach (var capability in validatedCapabilities)
-        {
-            ModelValidation.Capabilities.Add(capability.Key, capability.Value);
-        }
-        ModelValidation.Validated = true;
+            ModelValidation.Capabilities.Clear();
+            foreach (var capability in validatedCapabilities)
+            {
+                ModelValidation.Capabilities.Add(capability.Key, capability.Value);
+            }
+            ModelValidation.Validated = true;
         }
         finally
         {

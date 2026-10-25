@@ -1,11 +1,14 @@
 using System.Collections.Concurrent;
-using Cohort.Domain;
+
 using Cohort.Application;
+using Cohort.Domain;
 using Cohort.Hosting;
 using Cohort.Sample.Entities;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+
 using Npgsql;
 
 namespace Cohort.Sample.Tests.ComplianceCorpus;

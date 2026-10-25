@@ -1,5 +1,6 @@
 using Cohort.Domain;
 using Cohort.Sample.Entities;
+
 using Microsoft.EntityFrameworkCore;
 
 namespace Cohort.Sample.Tests.ComplianceCorpus;

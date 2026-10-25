@@ -1,4 +1,5 @@
 using Cohort.Infrastructure.Migrations;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata;
 

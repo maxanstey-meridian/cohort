@@ -1,17 +1,21 @@
 using System.Diagnostics;
 using System.Threading.Channels;
+
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
 using Cohort.Infrastructure;
 using Cohort.Infrastructure.Migrations;
 using Cohort.Sample.Entities;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+
 using Npgsql;
+
 using Xunit.Sdk;
 
 namespace Cohort.Sample.Tests;

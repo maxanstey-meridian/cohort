@@ -1,8 +1,10 @@
 using System.Collections.Concurrent;
 using System.Data.Common;
 using System.Reflection;
+
 using Cohort.Domain;
 using Cohort.Infrastructure.Holds;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 

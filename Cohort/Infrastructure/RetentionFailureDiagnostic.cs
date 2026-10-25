@@ -1,5 +1,5 @@
-using System.Globalization;
 using System.Data.Common;
+using System.Globalization;
 
 namespace Cohort.Infrastructure;
 

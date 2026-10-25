@@ -1,7 +1,9 @@
 using System.Collections.Frozen;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+
 using Cohort.Domain;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata;
 

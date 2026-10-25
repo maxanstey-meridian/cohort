@@ -1,4 +1,5 @@
 using Cronos;
+
 using Microsoft.Extensions.Options;
 
 namespace Cohort.Hosting;

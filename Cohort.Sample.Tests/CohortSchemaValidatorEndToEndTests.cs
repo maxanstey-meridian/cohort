@@ -1,9 +1,12 @@
 using System.Collections.Concurrent;
+
 using Cohort.Application;
 using Cohort.Infrastructure;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+
 using Npgsql;
 
 namespace Cohort.Sample.Tests;

@@ -1,5 +1,6 @@
 using Cohort.Application;
 using Cohort.Hosting;
+
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Tests;

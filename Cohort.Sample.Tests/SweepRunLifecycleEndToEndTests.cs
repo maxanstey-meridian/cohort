@@ -1,8 +1,10 @@
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+
 using Npgsql;
 
 namespace Cohort.Sample.Tests;

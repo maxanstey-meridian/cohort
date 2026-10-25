@@ -1,7 +1,9 @@
 using Cohort.Sample.Entities;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
+
 using Npgsql;
 
 namespace Cohort.Sample.Tests;

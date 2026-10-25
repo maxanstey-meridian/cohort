@@ -1,4 +1,5 @@
 using Cohort.Infrastructure;
+
 using Microsoft.Extensions.Options;
 
 namespace Cohort.Hosting;

@@ -3,6 +3,7 @@ using Cohort.Domain;
 using Cohort.Infrastructure;
 using Cohort.Infrastructure.Migrations;
 using Cohort.Sample.Entities;
+
 using Microsoft.EntityFrameworkCore;
 
 namespace Cohort.Sample.Tests;

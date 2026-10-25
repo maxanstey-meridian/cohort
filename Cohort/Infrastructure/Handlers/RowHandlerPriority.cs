@@ -1,4 +1,5 @@
 using System.Reflection;
+
 using Cohort.Domain;
 
 namespace Cohort.Infrastructure;

@@ -1,4 +1,5 @@
 using Cohort.Infrastructure.Migrations;
+
 using Microsoft.EntityFrameworkCore;
 
 namespace Cohort.Sample.Tests;

@@ -1,8 +1,10 @@
 using System.Collections;
 using System.Data.Common;
+
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure.Handlers;
+
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 

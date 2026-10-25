@@ -1,5 +1,6 @@
 using Cohort.Infrastructure.Migrations;
 using Cohort.Sample.Entities;
+
 using Microsoft.EntityFrameworkCore;
 
 namespace Cohort.Sample;

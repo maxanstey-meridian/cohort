@@ -1,5 +1,7 @@
 using Cohort.Infrastructure;
+
 using Microsoft.Extensions.Logging.Abstractions;
+
 using Npgsql;
 
 namespace Cohort.Sample.Tests;

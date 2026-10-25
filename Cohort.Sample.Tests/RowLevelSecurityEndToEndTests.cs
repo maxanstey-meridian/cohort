@@ -20,11 +20,12 @@ namespace Cohort.Sample.Tests;
 // ─── End-to-end test (copied from PurgeSweepStrategyTests) ──────────────────
 //
 // Real PostgreSQL row-level security over a host table, a tenantless table and Cohort's five
-// tables, applied the way a host would: an EF connection interceptor reads whose work the
-// DbContext is doing and sets the role and tenant when the connection opens. The host's
-// IRetentionExecutionScope tells the DbContext. The connecting user is a superuser, so the
-// System context (RESET ROLE) is the only way past the policies; a scope Cohort never entered
-// runs as the tenant role with no tenant and sees nothing.
+// tables, applied the way a host would: an EF connection interceptor reads whose work is
+// being done and sets the role and tenant when the connection opens. The host's
+// IRetentionExecutionScope sets it in an AsyncLocal around the work (a caller's own scope sets
+// it on the DbContext). The connecting user is a superuser, so the System context (RESET ROLE)
+// is the only way past the policies; a connection opened outside any run work gets the tenant
+// role with no tenant and sees nothing.
 // ────────────────────────────────────────────────────────────────────────────
 
 [Collection("Integration")]
@@ -32,6 +33,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
 {
     private const string TenantRole = "cohort_rls_tenant";
     private static readonly Guid LogEntityId = Guid.Parse("6d1c2a9b-58e4-4f0a-b1d7-3c9e8f2a4b60");
+    private static readonly Guid NoteEntityId = Guid.Parse("0b6f3c8e-2f43-4d55-9a57-6a3d0f1c7e21");
     private static readonly DateTimeOffset AsOf = new(2026, 4, 11, 12, 0, 0, TimeSpan.Zero);
 
     private static readonly RetentionExecutionContext WorkerCoordination =
@@ -70,7 +72,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
 
         await GetWorker(host).RunIterationAsync(DateTimeOffset.UtcNow.AddSeconds(-1), dryRun: false, CancellationToken.None);
 
-        entries.Entered.Should().Equal(
+        entries.Ran.Should().Equal(
             WorkerCoordination,
             Readiness,
             new RetentionExecutionContext.Tenant(tenantA),
@@ -87,7 +89,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task Policies_Bite_When_No_Scope_Is_Entered()
+    public async Task Policies_Bite_Outside_Any_Scopes_Work()
     {
         // Guard for every test here: an unisolated host under these policies runs every scope
         // as the tenant role with no tenant, which sees and changes nothing.
@@ -155,7 +157,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
         }
 
         // The first port's readiness checks holds across tenants in its own System scope, once.
-        entries.Entered.Should().Equal(
+        entries.Ran.Should().Equal(
             new RetentionExecutionContext.Tenant(tenantA),
             Readiness,
             TenantlessPass,
@@ -170,9 +172,9 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task Direct_Sweep_Entered_As_Another_Tenant_Cannot_Touch_The_Requested_Tenants_Rows()
+    public async Task Direct_Sweep_Run_As_Another_Tenant_Cannot_Touch_The_Requested_Tenants_Rows()
     {
-        // The hook, not Cohort's own tenant filter, is what scopes the work: entering the
+        // The hook, not Cohort's own tenant filter, is what scopes the work: running it as the
         // wrong tenant leaves the requested tenant's rows out of reach.
         await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
         var tenantA = Guid.NewGuid();
@@ -183,7 +185,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
         using var host = BuildHost(
             database.ConnectionString,
             services => services.AddScoped<IRetentionExecutionScope>(sp =>
-                new WrongTenantExecutionScope(sp.GetRequiredService<RlsDbContext>(), entries, tenantB)
+                new WrongTenantExecutionScope(entries, tenantB)
             )
         );
 
@@ -191,7 +193,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
 
         (await sweep.Should().ThrowAsync<PostgresException>())
             .Which.SqlState.Should().Be(PostgresErrorCodes.InsufficientPrivilege);
-        entries.Entered.Should().Equal(new RetentionExecutionContext.Tenant(tenantA), Readiness);
+        entries.Ran.Should().Equal(new RetentionExecutionContext.Tenant(tenantA), Readiness);
         (await LoadNoteBodiesAsync(database.ConnectionString)).Should().Equal("a-expired");
         (await LoadRunsAsync(database.ConnectionString)).Should().BeEmpty();
     }
@@ -248,8 +250,8 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
         (await LoadRunsAsync(database.ConnectionString)).Should().BeEquivalentTo([
             new RunRow(tenantA, SweepRunStatus.Succeeded),
         ]);
-        // The caller's scope carries its own tenant: Cohort never entered it as anything.
-        entries.Entered.Should().NotContain(context => context is RetentionExecutionContext.Tenant);
+        // The caller's scope carries its own tenant: Cohort never ran its work through the hook.
+        entries.Ran.Should().NotContain(context => context is RetentionExecutionContext.Tenant);
     }
 
     [Fact]
@@ -303,7 +305,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             new SessionObservation("after:b-expired", tenantB.ToString(), TenantRole),
             new SessionObservation("after:log-expired", "", owner),
         ]);
-        entries.Entered.Where(context => context is RetentionExecutionContext.Tenant || context == TenantlessPass)
+        entries.Ran.Where(context => context is RetentionExecutionContext.Tenant || context == TenantlessPass)
             .Should()
             .BeEquivalentTo(
                 [
@@ -313,7 +315,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
                 ],
                 options => options.ComparingRecordsByValue()
             );
-        entries.Entered.Should().Contain(RowDispatch);
+        entries.Ran.Should().Contain(RowDispatch);
     }
 
     [Fact]
@@ -339,8 +341,8 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
         var pruned = await host.Services.GetRequiredService<RetentionHistoryPruner>().PruneAsync();
 
         pruned.Runs.Should().Be(2);
-        entries.Entered.Take(2).Should().Equal(HistoryPruning, Readiness);
-        entries.Entered.Skip(2).Should().NotBeEmpty().And.OnlyContain(context => context == HistoryPruning);
+        entries.Ran.Take(2).Should().Equal(HistoryPruning, Readiness);
+        entries.Ran.Skip(2).Should().NotBeEmpty().And.OnlyContain(context => context == HistoryPruning);
         (await LoadRunsAsync(database.ConnectionString)).Should().BeEmpty();
     }
 
@@ -362,7 +364,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
         await host.StartAsync();
         await host.StopAsync();
 
-        entries.Entered.First().Should().Be(Readiness);
+        entries.Ran.First().Should().Be(Readiness);
     }
 
     [Fact]
@@ -401,7 +403,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
 
         (await sweep.Should().ThrowAsync<RetentionConfigurationException>())
             .Which.Errors.Should().ContainSingle(error => error.Contains($"'{oldIdentity}'", StringComparison.Ordinal));
-        entries.Entered.Should().Equal(new RetentionExecutionContext.Tenant(tenantA), Readiness);
+        entries.Ran.Should().Equal(new RetentionExecutionContext.Tenant(tenantA), Readiness);
         (await LoadNoteBodiesAsync(database.ConnectionString)).Should().Equal("a-expired");
         (await LoadRunsAsync(database.ConnectionString)).Should().BeEmpty();
     }
@@ -440,6 +442,51 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             .Should().BeTrue();
         (await holds.ListActiveAsync(CancellationToken.None)).Select(hold => hold.HoldId).Should().Equal(holdId);
         (await LoadLogPayloadsAsync(database.ConnectionString)).Should().Equal("log-held");
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Deletion_Reaching_A_Tenantless_Row_Is_Refused_When_The_Holds_Policy_Hides_Tenantless_Holds(
+        bool targetIsTenanted
+    )
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        var tenantA = Guid.NewGuid();
+        var note = Note(tenantA, "a-note");
+        var held = Log("log-held");
+        var unheld = Log("log-unheld");
+        await CreateSchemaWithPoliciesAsync(database.ConnectionString, tenantsReadTenantlessHolds: false);
+        await SeedAsync(database.ConnectionString, [note], [held, unheld]);
+        await SeedTenantlessHoldAsync(database.ConnectionString, held.Id);
+        using var host = BuildHost(
+            database.ConnectionString,
+            services =>
+            {
+                services.AddSingleton(new EntryLog());
+                services.AddScoped<IRetentionExecutionScope, RecordingExecutionScope>();
+            }
+        );
+        await using var scope = host.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<RlsDbContext>();
+        db.Access = new RetentionExecutionContext.Tenant(tenantA);
+
+        // The listed target is unheld; the callback also removes the held tenantless row.
+        RetentionTarget target = targetIsTenanted
+            ? new RetentionTarget(NoteEntityId, note.Id.ToString(), tenantA)
+            : new RetentionTarget(LogEntityId, unheld.Id.ToString(), tenantId: null);
+        var delete = () => scope.ServiceProvider.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+            [target],
+            async ct =>
+            {
+                await db.Notes.ExecuteDeleteAsync(ct);
+                await db.Logs.ExecuteDeleteAsync(ct);
+            }
+        );
+
+        await delete.Should().ThrowAsync<RetentionConfigurationException>().WithMessage("*cannot see 1 active hold*");
+        (await LoadLogPayloadsAsync(database.ConnectionString)).Should().BeEquivalentTo("log-held", "log-unheld");
+        (await LoadNoteBodiesAsync(database.ConnectionString)).Should().Equal("a-note");
     }
 
     [Fact]
@@ -547,7 +594,10 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
     /// The item 21 policies from docs/reference/schema.md, plus the host's own tables. The
     /// tenant role gets table privileges and nothing else: no sequence grants.
     /// </summary>
-    private static async Task CreateSchemaWithPoliciesAsync(string connectionString)
+    private static async Task CreateSchemaWithPoliciesAsync(
+        string connectionString,
+        bool tenantsReadTenantlessHolds = true
+    )
     {
         await using var db = CreateOwnerContext(connectionString);
         await db.Database.EnsureCreatedAsync();
@@ -604,6 +654,15 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
                 ));
             """
         );
+        if (!tenantsReadTenantlessHolds)
+        {
+            await db.Database.ExecuteSqlRawAsync(
+                """
+                ALTER POLICY holds_read ON public.retention_holds
+                    USING ("TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid)
+                """
+            );
+        }
     }
 
     private static async Task SeedAsync(string connectionString, IEnumerable<RlsNote> notes, IEnumerable<RlsLog> logs)
@@ -727,13 +786,13 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
 
     private sealed class EntryLog
     {
-        private readonly ConcurrentQueue<RetentionExecutionContext> entered = new();
+        private readonly ConcurrentQueue<RetentionExecutionContext> ran = new();
 
-        public IReadOnlyList<RetentionExecutionContext> Entered => [.. entered];
+        public IReadOnlyList<RetentionExecutionContext> Ran => [.. ran];
 
-        public void Add(RetentionExecutionContext context) => entered.Enqueue(context);
+        public void Add(RetentionExecutionContext context) => ran.Enqueue(context);
 
-        public void Clear() => entered.Clear();
+        public void Clear() => ran.Clear();
     }
 
     private sealed class HandlerObservations
@@ -745,27 +804,45 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
         public void Add(SessionObservation observation) => seen.Enqueue(observation);
     }
 
-    /// <summary>The host's hook: tells its DbContext whose work the scope does.</summary>
-    private sealed class RecordingExecutionScope(RlsDbContext db, EntryLog entries) : IRetentionExecutionScope
+    /// <summary>
+    /// The host's hook keeps whose work this is in an AsyncLocal set around the work, as a host
+    /// using a Sluice flow or an ambient tenant would, so a connection Cohort opens outside the
+    /// work gets no access. A caller's own scope sets <see cref="RlsDbContext.Access"/> instead.
+    /// </summary>
+    private static readonly AsyncLocal<RetentionExecutionContext?> HostFlow = new();
+
+    private static async Task RunInFlowAsync(RetentionExecutionContext access, Func<Task> work)
     {
-        public Task RunAsync(RetentionExecutionContext context, Func<Task> work, CancellationToken ct)
+        var outer = HostFlow.Value;
+        HostFlow.Value = access;
+        try
         {
-            db.Access = context;
-            entries.Add(context);
-            return work();
+            await work();
+        }
+        finally
+        {
+            HostFlow.Value = outer;
         }
     }
 
-    private sealed class WrongTenantExecutionScope(RlsDbContext db, EntryLog entries, Guid wrongTenant)
-        : IRetentionExecutionScope
+    private sealed class RecordingExecutionScope(EntryLog entries) : IRetentionExecutionScope
     {
         public Task RunAsync(RetentionExecutionContext context, Func<Task> work, CancellationToken ct)
         {
             entries.Add(context);
-            db.Access = context is RetentionExecutionContext.Tenant
-                ? new RetentionExecutionContext.Tenant(wrongTenant)
-                : context;
-            return work();
+            return RunInFlowAsync(context, work);
+        }
+    }
+
+    private sealed class WrongTenantExecutionScope(EntryLog entries, Guid wrongTenant) : IRetentionExecutionScope
+    {
+        public Task RunAsync(RetentionExecutionContext context, Func<Task> work, CancellationToken ct)
+        {
+            entries.Add(context);
+            return RunInFlowAsync(
+                context is RetentionExecutionContext.Tenant ? new RetentionExecutionContext.Tenant(wrongTenant) : context,
+                work
+            );
         }
     }
 
@@ -797,7 +874,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
         private static DbCommand CreateCommand(DbConnection connection, ConnectionEndEventData eventData)
         {
             var command = connection.CreateCommand();
-            command.CommandText = ((RlsDbContext)eventData.Context!).Access switch
+            command.CommandText = (HostFlow.Value ?? ((RlsDbContext)eventData.Context!).Access) switch
             {
                 RetentionExecutionContext.Tenant tenant =>
                     $"SET ROLE {TenantRole}; SELECT set_config('app.tenant_id', '{tenant.TenantId}', false)",

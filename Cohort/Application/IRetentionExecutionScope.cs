@@ -20,9 +20,11 @@ namespace Cohort.Application;
 /// for different work. Some work runs inside another scope's work, so calls nest: each worker
 /// pass runs inside the worker's <see cref="RetentionSystemWork.WorkerCoordination"/> work, and
 /// readiness's <see cref="RetentionSystemWork.Readiness"/> check can run inside any operation.
-/// Restore whatever you set when the work returns. Cohort creates its own savepoints only after
-/// its transactions start, so isolation applied when a connection opens or a transaction
-/// begins sits outside every Cohort savepoint and is never rolled back by one.
+/// An inner call's context wholly replaces the outer one for its work: set it, don't merge it.
+/// Restore anything you change outside the scope's own services when the work returns.
+/// Cohort creates its own savepoints only after its transactions start, so isolation applied
+/// when a connection opens or a transaction begins sits outside every Cohort savepoint and is
+/// never rolled back by one.
 /// </para>
 /// <para>
 /// Tenanted work only ever runs as <see cref="RetentionExecutionContext.Tenant"/>: row

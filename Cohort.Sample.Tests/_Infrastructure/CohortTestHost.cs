@@ -22,22 +22,22 @@ public sealed class CohortTestHost(
     Action<IServiceCollection>? configureServices = null
 ) : IDisposable
 {
-    private readonly DbContextOptions<SampleDbContext> _options =
+    private readonly DbContextOptions<SampleDbContext> options =
         new DbContextOptionsBuilder<SampleDbContext>().UseNpgsql(connectionString).Options;
-    private readonly ServiceProvider _services = BuildServices(
+    private readonly ServiceProvider services = BuildServices(
         connectionString,
         ruleProvider,
         configurationOverrides,
         configureServices
     );
 
-    public SampleDbContext CreateDbContext() => new(_options);
+    public SampleDbContext CreateDbContext() => new(options);
 
     internal async Task<IReadOnlyDictionary<Type, RetentionEntry>> ValidateAndScanAsync(
         CancellationToken ct = default
     )
     {
-        await using var scope = _services.CreateAsyncScope();
+        await using var scope = services.CreateAsyncScope();
         await scope.ServiceProvider.GetRequiredService<RetentionStartupValidator>().ValidateAsync(ct);
         return scope.ServiceProvider.GetRequiredService<RetentionRegistry>().Scan();
     }
@@ -49,7 +49,7 @@ public sealed class CohortTestHost(
         CancellationToken ct = default
     )
     {
-        await using var scope = _services.CreateAsyncScope();
+        await using var scope = services.CreateAsyncScope();
         var sweep = scope.ServiceProvider.GetRequiredService<IRetentionSweep>();
         return await sweep.ExecuteAsync(RetentionSweepRequest.Tenanted(tenant, now), ct);
     }
@@ -61,7 +61,7 @@ public sealed class CohortTestHost(
         CancellationToken ct = default
     )
     {
-        await using var scope = _services.CreateAsyncScope();
+        await using var scope = services.CreateAsyncScope();
         var preview = scope.ServiceProvider.GetRequiredService<IRetentionPreview>();
         return await preview.PreviewAsync(tenant, now, ct);
     }
@@ -81,7 +81,7 @@ public sealed class CohortTestHost(
         CancellationToken ct = default
     )
     {
-        await using var scopeServices = _services.CreateAsyncScope();
+        await using var scopeServices = services.CreateAsyncScope();
         var erasure = scopeServices.ServiceProvider.GetRequiredService<IRetentionErasureService>();
         return await erasure.ExecuteAsync(request, ct);
     }
@@ -90,19 +90,19 @@ public sealed class CohortTestHost(
         Func<IServiceProvider, Task<TResult>> action
     )
     {
-        await using var scope = _services.CreateAsyncScope();
+        await using var scope = services.CreateAsyncScope();
         return await action(scope.ServiceProvider);
     }
 
     public async Task RunWithServicesAsync(Func<IServiceProvider, Task> action)
     {
-        await using var scope = _services.CreateAsyncScope();
+        await using var scope = services.CreateAsyncScope();
         await action(scope.ServiceProvider);
     }
 
     public void Dispose()
     {
-        _services.Dispose();
+        services.Dispose();
     }
 
     private static ServiceProvider BuildServices(

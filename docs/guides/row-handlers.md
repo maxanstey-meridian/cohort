@@ -56,8 +56,8 @@ row's handlers in order. A failed attempt retries with exponential backoff from
 All of these are [configurable](/reference/configuration).
 
 Each delivery runs in its own DI scope, run as the row's tenant
-(`System(TenantlessPass)` for tenantless rows) before the handler is resolved, and
-`OnBeforeAsync` runs in its tenant's sweep scope. So a host's tenant isolation applies to
+(`System(TenantlessPass)` for tenantless rows); the handler is resolved and run inside that
+work, and `OnBeforeAsync` runs in its tenant's sweep scope. So a host's tenant isolation applies to
 handler code too. See [Tenant Isolation](/guides/tenant-isolation).
 
 ### Claim timeout

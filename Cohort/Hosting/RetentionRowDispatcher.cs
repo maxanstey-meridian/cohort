@@ -777,15 +777,15 @@ internal sealed class RetentionRowDispatcher(
         );
     }
 
-    private Task WithDbAsync(Func<DbContext, Task> action, CancellationToken ct) =>
-        WithDbAsync(
-            async db =>
-            {
-                await action(db);
-                return true;
-            },
+    private Task WithDbAsync(Func<DbContext, Task> action, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        return scopeFactory.RunInScopeAsync(
+            RowDispatch,
+            services => action(services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext)),
             ct
         );
+    }
 
     private static QuotedTables Table(DbContext db) => new(CohortStoreTables.FromModel(db.Model));
 

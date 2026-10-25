@@ -1,22 +1,25 @@
 using Microsoft.EntityFrameworkCore;
+
 using Npgsql;
+
 using Respawn;
+
 using Testcontainers.PostgreSql;
 
 namespace Cohort.Sample.Tests;
 
 public sealed class PostgresFixture : IAsyncLifetime
 {
-    private readonly PostgreSqlContainer _container = new PostgreSqlBuilder()
+    private readonly PostgreSqlContainer container = new PostgreSqlBuilder()
         .WithImage("postgres:16-alpine")
         .Build();
 
-    public string ConnectionString => _container.GetConnectionString();
+    public string ConnectionString => container.GetConnectionString();
     public Respawner Respawner { get; private set; } = default!;
 
     public async Task InitializeAsync()
     {
-        await _container.StartAsync();
+        await container.StartAsync();
 
         var options = new DbContextOptionsBuilder<SampleDbContext>()
             .UseNpgsql(ConnectionString)
@@ -40,6 +43,6 @@ public sealed class PostgresFixture : IAsyncLifetime
 
     public async Task DisposeAsync()
     {
-        await _container.DisposeAsync();
+        await container.DisposeAsync();
     }
 }

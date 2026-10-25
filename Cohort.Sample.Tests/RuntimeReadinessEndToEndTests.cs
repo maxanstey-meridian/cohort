@@ -375,10 +375,10 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             await using var transaction = await db.Database.BeginTransactionAsync();
 
             await holds.ListActiveAsync(CancellationToken.None);
-            executionScope.Entered.Should().ContainSingle(context => context == readiness);
+            executionScope.Ran.Should().ContainSingle(context => context == readiness);
 
             await holds.ListActiveAsync(CancellationToken.None);
-            executionScope.Entered.Should().ContainSingle(context => context == readiness);
+            executionScope.Ran.Should().ContainSingle(context => context == readiness);
         });
     }
 
@@ -427,7 +427,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         return database;
     }
 
-    // Every scope reaches callerConnectionString until it is entered as System work, which the
+    // Every scope reaches callerConnectionString until its work runs as System work, which the
     // host routes to systemConnectionString.
     private static ServiceProvider BuildSystemRoutedProvider(
         string callerConnectionString,
@@ -459,13 +459,13 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
 
     private sealed class RecordingExecutionScope : IRetentionExecutionScope
     {
-        private readonly ConcurrentQueue<RetentionExecutionContext> entered = new();
+        private readonly ConcurrentQueue<RetentionExecutionContext> ran = new();
 
-        public IReadOnlyCollection<RetentionExecutionContext> Entered => entered;
+        public IReadOnlyCollection<RetentionExecutionContext> Ran => ran;
 
         public Task RunAsync(RetentionExecutionContext context, Func<Task> work, CancellationToken ct)
         {
-            entered.Enqueue(context);
+            ran.Enqueue(context);
             return work();
         }
     }

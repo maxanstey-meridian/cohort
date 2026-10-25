@@ -40,6 +40,14 @@ internal static class RetentionHoldSql
             """;
     }
 
+    internal static string BuildActiveTenantlessHoldIds(RelationalObjectName holdsTable) =>
+        $"""
+        SELECT hold."HoldId"
+        FROM {PostgreSqlIdentifier.Format(holdsTable)} AS hold
+        WHERE hold."TenantId" IS NULL
+          AND {ActivePredicate("hold")}
+        """;
+
     internal static string BuildActiveHoldExclusion(
         RelationalObjectName holdsTable,
         string targetAlias,

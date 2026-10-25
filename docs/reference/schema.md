@@ -121,9 +121,11 @@ them is a breaking change, recorded in the changelog like any other change to th
 Cohort only touches `Guid.Empty` rows in system scopes, so tenant policies shouldn't match
 them. `NULL` holds are different: tenant scopes read them but never write them. A host that
 calls `IRetentionDeletion` or `IRetentionHoldsRepository` in a tenant's scope on a tenantless
-row must see that row's holds, or the row looks unheld and its deletion goes ahead. So the
-holds policies let a tenant read `NULL` holds and write only its own; create and remove holds
-on tenantless rows in a system scope. Example policies, with the tenant in a custom setting:
+row must see that row's holds, or the row looks unheld. `IRetentionDeletion` checks: in a
+model with any tenantless entity, it refuses with `RetentionConfigurationException`, deleting
+nothing, when its scope can't see an active `NULL` hold that `System(Readiness)` sees. So the holds policies
+let a tenant read `NULL` holds and write only its own; create and remove holds on tenantless
+rows in a system scope. Example policies, with the tenant in a custom setting:
 
 ```sql
 CREATE POLICY tenant_isolation ON public.sweep_run

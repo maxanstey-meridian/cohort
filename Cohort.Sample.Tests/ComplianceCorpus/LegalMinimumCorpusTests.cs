@@ -323,12 +323,12 @@ public sealed class LegalMinimumCorpusTests(PostgresFixture fixture) : Integrati
 
     private sealed class ContextualRuleProvider : IRetentionRuleProvider
     {
-        private readonly SampleRetentionRuleProvider _inner = new();
+        private readonly SampleRetentionRuleProvider inner = new();
 
         public List<RetentionResolutionContext> ObservedContexts { get; } = [];
 
         public RetentionCategoryCapabilities? GetCapabilities(string category) =>
-            _inner.GetCapabilities(category);
+            inner.GetCapabilities(category);
 
         public Task<RetentionRule?> ResolveAsync(
             RetentionResolutionContext context,
@@ -338,7 +338,7 @@ public sealed class LegalMinimumCorpusTests(PostgresFixture fixture) : Integrati
             ObservedContexts.Add(context);
             if (context.Category != "short-lived")
             {
-                return _inner.ResolveAsync(context, ct);
+                return inner.ResolveAsync(context, ct);
             }
 
             context.Tenant.Tags.TryGetValue("profile", out var profile);

@@ -51,9 +51,10 @@ RetentionExecutionContext.System(RetentionSystemWork Work)
 | History pruning | `System(HistoryPruning)` |
 | Startup readiness | `System(Readiness)` |
 | Readiness's cross-tenant hold check, whichever operation runs readiness first | `System(Readiness)` |
+| `IRetentionDeletion`'s check that your scope sees every hold on a tenantless row, in a model with tenantless entities | `System(Readiness)` |
 
 The first operation can be any of the above, `IRetentionHoldsRepository`,
-`IRetentionDeletion` or a `Caller` erasure. Apart from that readiness scope,
+`IRetentionDeletion` or a `Caller` erasure. Apart from those `System(Readiness)` scopes,
 `IRetentionHoldsRepository` and `IRetentionDeletion` create no scope of their own. They run in
 your scope, under whatever isolation you already applied to it.
 
@@ -79,8 +80,10 @@ tenant".
 - **One context per scope.** Cohort runs each scope's work once and never changes its
   context. Different work gets a new scope.
 - **Calls nest.** Each scheduled pass runs inside the worker's `WorkerCoordination` work, and
-  readiness's `System(Readiness)` check can run inside any operation's work. Restore whatever
-  you set when the work returns, as a `using` block or `try`/`finally` does.
+  readiness's `System(Readiness)` check can run inside any operation's work. An inner call's
+  context wholly replaces the outer one for its work: set it, don't merge it. Restore anything
+  you change outside the scope's own services when the work returns, as a `using` block or
+  `try`/`finally` does; an `AsyncLocal` set in the hook is restored for you.
 - **Tenanted work only runs as `Tenant`.** `OnBeforeAsync` runs inside its tenant's sweep
   scope. Each `OnAfterAsync` delivery gets its own scope, run as the row's tenant, and the
   handler is resolved inside that work. No host code runs under `System` against tenanted rows. Handlers

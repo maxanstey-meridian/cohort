@@ -13,7 +13,8 @@ internal sealed class EfRetentionDeletion(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
     RetentionRegistry registry,
     RetentionTargetResolver targetResolver,
-    RetentionRuntimeReadinessValidator readinessValidator
+    RetentionRuntimeReadinessValidator readinessValidator,
+    IServiceScopeFactory scopeFactory
 ) : IRetentionDeletion
 {
     private readonly CohortStoreTables tables = CohortStoreTables.FromModel(db.Model);
@@ -98,6 +99,13 @@ internal sealed class EfRetentionDeletion(
             ct
         );
 
+        // Any target's callback can reach a tenantless row (a cascade, raw SQL), so the check
+        // follows the model, not the targets.
+        if (registry.Scan().Values.Any(entry => entry.Tenant is null))
+        {
+            await EnsureTenantlessHoldsVisibleAsync(dbTransaction, ct);
+        }
+
         foreach (var target in resolvedTargets)
         {
             if (await HasActiveHoldAsync(target, dbTransaction, ct))
@@ -144,6 +152,75 @@ internal sealed class EfRetentionDeletion(
         }
 
         return RetentionDeletionOutcome.Executed;
+    }
+
+    /// <summary>
+    /// The hold checks see only the holds the caller's scope can read. A tenant scope whose
+    /// holds policy hides NULL-tenant holds would pass a held tenantless row as unheld, so the
+    /// caller must see every active tenantless hold that system work sees.
+    /// </summary>
+    private async Task EnsureTenantlessHoldsVisibleAsync(DbTransaction transaction, CancellationToken ct)
+    {
+        var hidden = await ReadSystemTenantlessHoldsAsync(ct);
+        if (hidden.Count == 0)
+        {
+            return;
+        }
+
+        hidden.ExceptWith(await ReadActiveTenantlessHoldsAsync(db, transaction, ct));
+        if (hidden.Count == 0)
+        {
+            return;
+        }
+
+        // A hold that ended between the two reads was not hidden; one still active now was.
+        hidden.IntersectWith(await ReadSystemTenantlessHoldsAsync(ct));
+        if (hidden.Count > 0)
+        {
+            throw new RetentionConfigurationException([
+                $"Retention deletion's scope cannot see {hidden.Count} active hold(s) on tenantless rows that Cohort's System(Readiness) work can, so it cannot tell whether a tenantless row it deletes is held. The holds table's row-level security must let every scope read holds whose \"TenantId\" is NULL. Nothing was deleted.",
+            ]);
+        }
+    }
+
+    private Task<HashSet<Guid>> ReadSystemTenantlessHoldsAsync(CancellationToken ct) =>
+        scopeFactory.RunInScopeAsync(
+            new RetentionExecutionContext.System(RetentionSystemWork.Readiness),
+            async services =>
+            {
+                var systemDb = services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext);
+                await systemDb.Database.OpenConnectionAsync(ct);
+                try
+                {
+                    return await ReadActiveTenantlessHoldsAsync(systemDb, null, ct);
+                }
+                finally
+                {
+                    await systemDb.Database.CloseConnectionAsync();
+                }
+            },
+            ct
+        );
+
+    private async Task<HashSet<Guid>> ReadActiveTenantlessHoldsAsync(
+        DbContext context,
+        DbTransaction? transaction,
+        CancellationToken ct
+    )
+    {
+        await using var command = new SqlParams().CreateCommand(
+            context.Database.GetDbConnection(),
+            transaction,
+            RetentionHoldSql.BuildActiveTenantlessHoldIds(tables.RetentionHolds)
+        );
+        var holdIds = new HashSet<Guid>();
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            holdIds.Add(reader.GetGuid(0));
+        }
+
+        return holdIds;
     }
 
     private async Task<HashSet<Guid>> ReadActiveHoldsWithoutRowAsync(

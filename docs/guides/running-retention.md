@@ -68,8 +68,7 @@ have open on it. See
   decorators can be singletons. An erasure decorator is scoped, because the service it wraps
   is.
 - Each fresh scope runs its work through your `IRetentionExecutionScope` as the request's tenant
-  (`System(TenantlessPass)` for tenantless rows and requests) before it touches the database.
-  See [Tenant Isolation](/guides/tenant-isolation).
+  (`System(TenantlessPass)` for tenantless rows and requests). See [Tenant Isolation](/guides/tenant-isolation).
 - Caller times (`now`, `createdAt`, `expiresAt`, `removedAt`, ...) can carry any offset.
   Cohort normalises them to UTC at the boundary.
 

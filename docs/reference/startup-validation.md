@@ -6,8 +6,8 @@ entity and the problem.
 
 ## Required services
 
-- An `IRetentionExecutionScope` is registered. Cohort calls it before any database work in
-  each scope it creates, so a host's tenant isolation covers Cohort's own work. Hosts without
+- An `IRetentionExecutionScope` is registered. Cohort runs each scope's work through it, so a
+  host's tenant isolation covers Cohort's own work. Hosts without
   tenant isolation register `RetentionExecutionScope.Unisolated`. Without either, the host
   fails to start, and a host that skips startup validation fails on its first Cohort call. See
   [Tenant Isolation](/guides/tenant-isolation).

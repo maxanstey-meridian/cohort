@@ -17,7 +17,8 @@ unprotected without an error.
   isolation when a connection opens: Cohort runs some statements outside EF's command pipeline.
 - `schema.md` documents Cohort's tenant columns and sentinels (`Guid.Empty` runs, `NULL`
   holds) as a schema contract for host row-level-security policies. Tenant scopes must be
-  able to read `NULL`-tenant holds, or a held tenantless row looks unheld.
+  able to read `NULL`-tenant holds; `IRetentionDeletion` refuses to run in a scope that can't
+  see an active one `System(Readiness)` sees.
 - `IRetentionErasureService` is scoped and takes a `RetentionErasureRequest`
   (`Tenanted`/`Tenantless`); `EraseAsync(tenant, scope, ct)` no longer takes `now`. Subject
   columns on `[RetentionTenantless]` entities are erased by a tenantless request instead of

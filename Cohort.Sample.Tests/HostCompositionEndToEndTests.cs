@@ -170,6 +170,7 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
         await SeedCallerErasureRecordAsync(provider, tenant.Id, subject);
 
         await provider.GetRequiredService<IRetentionSweep>().ExecuteAsync(RetentionSweepRequest.Tenanted(tenant));
+        var seenBySweep = rules.Seen.Count;
         await using (var scope = provider.CreateAsyncScope())
         {
             await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
@@ -177,9 +178,11 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
             );
         }
 
-        rules.Seen.Should().HaveCountGreaterThanOrEqualTo(2)
-            .And.OnlyContain(context => context == new RetentionExecutionContext.Tenant(tenant.Id));
-        FlowingExecutionScope.Current.Value.Should().BeNull();
+        seenBySweep.Should().BePositive();
+        rules.Seen.Count.Should().BeGreaterThan(seenBySweep);
+        // Readiness's nested System(Readiness) work runs before the rule is resolved; the hook
+        // never restores, so the tenant seen afterwards is Cohort restoring the outer flow.
+        rules.Seen.Should().OnlyContain(context => context == new RetentionExecutionContext.Tenant(tenant.Id));
     }
 
     [Theory]
@@ -282,23 +285,18 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
         await db.SaveChangesAsync();
     }
 
-    /// <summary>A host that keeps whose work this is in an AsyncLocal, set around the work.</summary>
+    /// <summary>
+    /// A host that keeps whose work this is in an AsyncLocal set before the work, and leaves
+    /// restoring it to Cohort, as the docs promise it may.
+    /// </summary>
     private sealed class FlowingExecutionScope : IRetentionExecutionScope
     {
         public static readonly AsyncLocal<RetentionExecutionContext?> Current = new();
 
-        public async Task RunAsync(RetentionExecutionContext context, Func<Task> work, CancellationToken ct)
+        public Task RunAsync(RetentionExecutionContext context, Func<Task> work, CancellationToken ct)
         {
-            var outer = Current.Value;
             Current.Value = context;
-            try
-            {
-                await work();
-            }
-            finally
-            {
-                Current.Value = outer;
-            }
+            return work();
         }
     }
 

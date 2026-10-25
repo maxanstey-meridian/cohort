@@ -51,9 +51,11 @@ Along the way:
   left out up front because a foreign key still references them get one Warning per entity
   naming the keys that can block it. A full
   batch in which every row is refused fails the entity instead, since the cause is then the
-  rule or the schema, unless the refusals are foreign-key refusals (`23503`, `23001`: they
-  depend on each row's children) or differ between rows. Those rows are only blocked, and
-  the run moves on to the next batch.
+  rule or the schema, unless the refusals differ between rows or are a foreign key refusing a
+  purge (`23503`: a reference from another row, which depends on each row's children). Those
+  rows are only blocked, and the run moves on to the next batch. A foreign key refusing the
+  value an anonymise writes, such as a static factory's key that no row has, still fails the
+  entity: the value is the rule's.
 - `HeldCount` and `BlockedCount` are measured directly: rows past the cutoff with an active
   hold, and rows still referenced through a blocking foreign key, plus the rows a constraint
   refused during the run. Neither is inferred from candidate arithmetic. A sweep's blocked

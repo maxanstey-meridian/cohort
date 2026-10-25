@@ -1,5 +1,6 @@
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Hosting;
 using Cohort.Sample.Entities;
 
 using Microsoft.Extensions.Configuration;
@@ -63,6 +64,82 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
                 && error.Contains("Anonymise", StringComparison.Ordinal)
             );
     }
+
+    // Only AddRowHandler makes a row handler: a handler service it didn't register would
+    // never run while its rows are still mutated, so startup refuses it, and so does a
+    // sweep's own readiness check on a host that was never started. Nothing is constructed
+    // to find out: the handler's constructor throws.
+    [Theory]
+    [InlineData("type")]
+    [InlineData("instance")]
+    [InlineData("factory")]
+    [InlineData("duplicate")]
+    public async Task Validation_Refuses_A_Handler_Service_Not_Registered_With_AddRowHandler(string registration)
+    {
+        var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder();
+        builder.Configuration.AddInMemoryCollection(
+            new Dictionary<string, string?>
+            {
+                [$"{SampleOptions.SectionName}:{nameof(SampleOptions.ConnectionString)}"] =
+                    connectionString,
+            }
+        );
+        builder.Services.AddSampleRetentionServices();
+        switch (registration)
+        {
+            case "type":
+                builder.Services.AddScoped<IRetentionHandler<Note>, UnconstructableNoteHandler>();
+                break;
+            case "instance":
+                builder.Services.AddSingleton<IRetentionHandler<Note>>(new InstanceNoteHandler());
+                break;
+            case "factory":
+                builder.Services.AddScoped<IRetentionHandler<Note>>(_ => new UnconstructableNoteHandler());
+                break;
+            case "duplicate":
+                builder.Services.AddRowHandler<Note, UnconstructableNoteHandler>();
+                builder.Services.AddSingleton<IRetentionHandler<Note>, UnconstructableNoteHandler>();
+                break;
+        }
+
+        using var host = builder.Build();
+
+        var start = () => host.StartAsync();
+        var sweep = () =>
+            host.Services.GetRequiredService<IRetentionSweep>()
+                .ExecuteAsync(RetentionSweepRequest.Tenantless(dryRun: true));
+
+        foreach (var act in new[] { start, sweep })
+        {
+            var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+            exception
+                .Which.Errors.Should()
+                .ContainSingle(error =>
+                    error.Contains(registration == "factory"
+                            ? $"IRetentionHandler<{typeof(Note).FullName}>"
+                            : registration == "instance"
+                                ? typeof(InstanceNoteHandler).FullName!
+                                : typeof(UnconstructableNoteHandler).FullName!,
+                        StringComparison.Ordinal)
+                    && error.Contains("AddRowHandler", StringComparison.Ordinal)
+                );
+        }
+
+        UnconstructableNoteHandler.Constructed.Should().BeFalse();
+    }
+
+    private sealed class UnconstructableNoteHandler : IRetentionHandler<Note>
+    {
+        public static bool Constructed { get; private set; }
+
+        public UnconstructableNoteHandler()
+        {
+            Constructed = true;
+            throw new InvalidOperationException("Startup must not construct a row handler.");
+        }
+    }
+
+    private sealed class InstanceNoteHandler : IRetentionHandler<Note>;
 
     private sealed class MultiStrategyRuleProvider : IRetentionRuleProvider
     {

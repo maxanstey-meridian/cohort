@@ -142,7 +142,8 @@ migrationBuilder.Sql(
     """ALTER TABLE "public"."sweep_run_entity_summary" ALTER COLUMN "RetainedCount" DROP DEFAULT, ALTER COLUMN "DeferredCount" DROP DEFAULT, ALTER COLUMN "BlockedCount" DROP DEFAULT""");
 ```
 
-Use your Cohort schema if it isn't `public`. Without the defaults, a 0.10 host refuses to
+Use the schema you passed to `ConfigureCohortTables` if it isn't `public`; each EF model's
+migration drops the defaults in its own schema. Without the defaults, a 0.10 host refuses to
 start against the migrated database, and one already running fails its next run, rather than
 writing summaries that record 0 for counts it never measured. Summaries written before the
 upgrade keep 0 in all three: those counts weren't measured, so read them as unknown for runs

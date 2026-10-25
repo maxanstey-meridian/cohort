@@ -94,6 +94,9 @@ public static class ServiceCollectionExtensions
         services.TryAddScoped<RetentionRegistry>();
         services.TryAddScoped<ErasureSubjectMetadataResolver>();
         services.TryAddSingleton<RetentionValidationState>();
+        // The collection itself, read when Cohort validates: AddRowHandler and the host's
+        // own handler registrations may come after AddCohort.
+        services.AddSingleton(new RetentionHandlerServiceRegistrations(services));
         services.TryAddScoped<RetentionStartupValidator>();
         services.TryAddScoped<CohortSchemaValidator>();
         services.TryAddSingleton<RetentionRuntimeReadinessState>();

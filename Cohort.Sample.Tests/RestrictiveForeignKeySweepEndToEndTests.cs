@@ -467,8 +467,11 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
         (await ScalarAsync<long>(database.ConnectionString, "SELECT last_value FROM guard_attempts")).Should().Be(3);
     }
 
-    [Fact]
-    public async Task A_Full_Batch_Refused_By_Foreign_Keys_The_Reference_Check_Cannot_See_Is_Blocked_Not_Failed()
+    [Theory]
+    [InlineData("restrict")]
+    [InlineData("no-action")]
+    [InlineData("cycle")]
+    public async Task A_Full_Batch_Refused_By_One_Foreign_Key_The_Reference_Check_Cannot_See_Is_Blocked_Not_Failed(string reference)
     {
         await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
         await using var services = BuildServiceProvider(database.ConnectionString, batchSize: 2);
@@ -477,31 +480,41 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
         var ids = Enumerable.Range(0, 5).Select(_ => Guid.NewGuid()).ToArray();
 
         await SeedParentsAsync(services, tenantId, asOf, ids);
-        // Each parent has a CASCADE child the reference check ignores, and each child a
-        // grandchild that refuses the cascade: RESTRICT (23001) for some, NO ACTION (23503)
-        // for the rest. Every row of every batch is refused, but row by row, not by the schema.
+        // Every row of every batch is refused by the same foreign key (SQLSTATE 23503, which
+        // PostgreSQL raises for RESTRICT and NO ACTION alike), but each row because of what
+        // references it, not because of the schema. The model doesn't declare the key, so the
+        // reference check can't defer the rows.
         await ExecuteAsync(
             database.ConnectionString,
-            $"""
-            CREATE TABLE hidden_fk_children (
-                "Id" uuid PRIMARY KEY,
-                "ParentId" uuid NOT NULL REFERENCES restrictive_fk_parents ("Id") ON DELETE CASCADE
-            );
-            CREATE TABLE hidden_fk_restrict_grandchildren (
-                "Id" uuid PRIMARY KEY,
-                "ChildId" uuid NOT NULL REFERENCES hidden_fk_children ("Id") ON DELETE RESTRICT
-            );
-            CREATE TABLE hidden_fk_no_action_grandchildren (
-                "Id" uuid PRIMARY KEY,
-                "ChildId" uuid NOT NULL REFERENCES hidden_fk_children ("Id")
-            );
-            INSERT INTO hidden_fk_children ("Id", "ParentId")
-                SELECT gen_random_uuid(), "Id" FROM restrictive_fk_parents;
-            INSERT INTO hidden_fk_restrict_grandchildren ("Id", "ChildId")
-                SELECT gen_random_uuid(), "Id" FROM hidden_fk_children WHERE "ParentId" IN ('{ids[0]}', '{ids[2]}', '{ids[4]}');
-            INSERT INTO hidden_fk_no_action_grandchildren ("Id", "ChildId")
-                SELECT gen_random_uuid(), "Id" FROM hidden_fk_children WHERE "ParentId" IN ('{ids[1]}', '{ids[3]}');
-            """
+            reference == "cycle"
+                // The CASCADE child is referenced back from a newer row of the target table, not
+                // yet due: the refusal names the target table itself, though Purge wrote nothing.
+                ? $"""
+                  CREATE TABLE hidden_fk_children (
+                      "Id" uuid PRIMARY KEY,
+                      "ParentId" uuid NOT NULL REFERENCES restrictive_fk_parents ("Id") ON DELETE CASCADE
+                  );
+                  INSERT INTO hidden_fk_children ("Id", "ParentId")
+                      SELECT gen_random_uuid(), "Id" FROM restrictive_fk_parents;
+                  ALTER TABLE restrictive_fk_parents ADD COLUMN "ChildId" uuid REFERENCES hidden_fk_children ("Id");
+                  INSERT INTO restrictive_fk_parents ("Id", "TenantId", "CreatedAt", "ChildId")
+                      SELECT gen_random_uuid(), '{tenantId}', '{asOf:O}', "Id" FROM hidden_fk_children;
+                  """
+                // A CASCADE child the reference check ignores, which a grandchild references.
+                : $"""
+                  CREATE TABLE hidden_fk_children (
+                      "Id" uuid PRIMARY KEY,
+                      "ParentId" uuid NOT NULL REFERENCES restrictive_fk_parents ("Id") ON DELETE CASCADE
+                  );
+                  CREATE TABLE hidden_fk_grandchildren (
+                      "Id" uuid PRIMARY KEY,
+                      "ChildId" uuid NOT NULL REFERENCES hidden_fk_children ("Id"){(reference == "restrict" ? " ON DELETE RESTRICT" : "")}
+                  );
+                  INSERT INTO hidden_fk_children ("Id", "ParentId")
+                      SELECT gen_random_uuid(), "Id" FROM restrictive_fk_parents;
+                  INSERT INTO hidden_fk_grandchildren ("Id", "ChildId")
+                      SELECT gen_random_uuid(), "Id" FROM hidden_fk_children;
+                  """
         );
 
         for (var run = 0; run < 2; run++)
@@ -518,11 +531,13 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
                 .Should().Be(new SummaryCounts(Affected: 0, Deferred: 0, Blocked: 5));
         }
 
-        (await LoadParentIdsAsync(services)).Should().Equal(ids);
+        (await LoadParentIdsAsync(services)).Take(ids.Length).Should().Equal(ids);
     }
 
-    [Fact]
-    public async Task A_Full_Batch_Refused_By_Different_Constraints_Is_Blocked_Not_Failed()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_Full_Batch_Refused_By_Different_Constraints_Is_Blocked_Not_Failed(bool sameSqlState)
     {
         await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
         await using var services = BuildServiceProvider(database.ConnectionString, batchSize: 2);
@@ -531,8 +546,9 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
         var ids = new[] { Guid.NewGuid(), Guid.NewGuid() };
 
         await SeedParentsAsync(services, tenantId, asOf, ids);
-        // Two refusals for two reasons: a trigger (23514) on one row, and a NO ACTION foreign
-        // key behind a CASCADE child, which the reference check can't see, on the other.
+        // Two refusals by two constraints: a trigger (23514) on one row, and on the other
+        // either a second trigger under another name (also 23514) or a NO ACTION foreign key
+        // behind a CASCADE child, which the reference check can't see (23503).
         await ExecuteAsync(
             database.ConnectionString,
             $"""
@@ -540,6 +556,9 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
             BEGIN
                 IF OLD."Id" = '{ids[0]}' THEN
                     RAISE EXCEPTION 'parent is guarded' USING ERRCODE = '23514', CONSTRAINT = 'restrictive_fk_parent_guard';
+                END IF;
+                IF {(sameSqlState ? "TRUE" : "FALSE")} AND OLD."Id" = '{ids[1]}' THEN
+                    RAISE EXCEPTION 'parent is guarded' USING ERRCODE = '23514', CONSTRAINT = 'restrictive_fk_parent_other_guard';
                 END IF;
                 RETURN OLD;
             END $$;
@@ -567,6 +586,66 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
                 count.Affected == 0 && count.BlockedCount == 2 && count.DeferredCount == 0);
         (await LoadRunStatusAsync(database.ConnectionString, result.SweepId)).Should().Be(SweepRunStatus.Succeeded);
         (await LoadParentIdsAsync(services)).Should().Equal(ids);
+    }
+
+    [Fact]
+    public async Task A_Full_Batch_Refused_By_The_Key_An_Anonymise_Writes_Fails_The_Entity_Once()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
+        await using var services = BuildOutboundServiceProvider(database.ConnectionString);
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var ownerId = Guid.NewGuid();
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<OutboundForeignKeyDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.Owners.Add(new OutboundOwner { Id = ownerId });
+            for (var index = 0; index < 5; index++)
+            {
+                db.Rows.Add(new OutboundAnonymisedRow
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-300 + index),
+                    OwnerId = ownerId,
+                });
+            }
+            await db.SaveChangesAsync();
+        }
+        // The factory's key names no owner, so the table's own foreign key refuses the value
+        // Cohort writes, for every row alike: the rule is wrong, not the rows. The sequence
+        // counts attempts, since nextval survives the rollback of the statement that called it.
+        await ExecuteAsync(
+            database.ConnectionString,
+            """
+            CREATE SEQUENCE anonymise_attempts;
+            CREATE FUNCTION count_anonymise() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                PERFORM nextval('anonymise_attempts');
+                RETURN NEW;
+            END $$;
+            CREATE TRIGGER count_anonymise BEFORE UPDATE ON outbound_fk_rows
+                FOR EACH STATEMENT EXECUTE FUNCTION count_anonymise();
+            """
+        );
+
+        RetentionSweepResult result;
+        await using (var scope = services.CreateAsyncScope())
+        {
+            result = await scope.ServiceProvider
+                .GetRequiredService<IRetentionSweep>()
+                .ExecuteAsync(RetentionSweepRequest.Tenanted(new TenantContext(tenantId, "uk", new Dictionary<string, string>()), asOf));
+        }
+
+        result.EntityFailures.Should().ContainSingle()
+            .Which.Should().MatchRegex("^type=Npgsql\\.PostgresException;code=sqlstate:23503;diagnosticId=[0-9a-f]{32}$");
+        (await LoadRunStatusAsync(database.ConnectionString, result.SweepId)).Should().Be(SweepRunStatus.PartiallyFailed);
+        (await ScalarAsync<long>(database.ConnectionString, "SELECT count(*) FROM outbound_fk_rows WHERE \"AnonymisedAt\" IS NULL"))
+            .Should().Be(5);
+        // One batch: the whole batch, then each half. No second batch is bisected.
+        (await ScalarAsync<long>(database.ConnectionString, "SELECT last_value FROM anonymise_attempts")).Should().Be(3);
     }
 
     [Theory]
@@ -798,6 +877,85 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
         services.AddCohort<RestrictiveForeignKeyDbContext>();
         configure?.Invoke(services);
         return services.BuildServiceProvider(validateScopes: true);
+    }
+
+    private static ServiceProvider BuildOutboundServiceProvider(string connectionString)
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton<IConfiguration>(
+            new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string?> { [$"{CohortOptions.SectionName}:SweepBatchSize"] = "2" })
+                .Build()
+        );
+        services.AddLogging();
+        services.AddDbContext<OutboundForeignKeyDbContext>(options => options.UseNpgsql(connectionString));
+        services.AddSingleton<IRetentionRuleProvider>(new AnonymiseCategoryRepository());
+        services.AddSingleton<IAnonymiseValueFactory, MissingOwnerFactory>();
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
+        services.AddCohort<OutboundForeignKeyDbContext>();
+        return services.BuildServiceProvider(validateScopes: true);
+    }
+
+    private sealed class AnonymiseCategoryRepository : ITestRetentionRuleProvider
+    {
+        private static readonly ITestRetentionRule Resolver = new StaticTestRetentionRule(
+            new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise)
+        );
+
+        public Task<ITestRetentionRule?> GetAsync(string category, CancellationToken ct) =>
+            Task.FromResult(category == "outbound-fk" ? Resolver : null);
+    }
+
+    /// <summary>A static factory whose key names no owner.</summary>
+    private sealed class MissingOwnerFactory : IAnonymiseValueFactory
+    {
+        public object? Create(AnonymiseValueContext context) => Guid.Parse("22222222-2222-2222-2222-222222222222");
+    }
+
+    private sealed class OutboundForeignKeyDbContext(DbContextOptions<OutboundForeignKeyDbContext> options)
+        : DbContext(options)
+    {
+        public DbSet<OutboundOwner> Owners => Set<OutboundOwner>();
+        public DbSet<OutboundAnonymisedRow> Rows => Set<OutboundAnonymisedRow>();
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<OutboundOwner>(entity =>
+            {
+                entity.ToTable("outbound_fk_owners");
+                entity.HasKey(owner => owner.Id);
+            });
+            modelBuilder.Entity<OutboundAnonymisedRow>(entity =>
+            {
+                entity.ToTable("outbound_fk_rows");
+                entity.HasKey(row => row.Id);
+                entity
+                    .HasOne<OutboundOwner>()
+                    .WithMany()
+                    .HasForeignKey(row => row.OwnerId)
+                    .OnDelete(DeleteBehavior.Restrict);
+            });
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    private sealed class OutboundOwner
+    {
+        public Guid Id { get; init; }
+    }
+
+    [Retain("outbound-fk", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0002-000000000004")]
+    private sealed class OutboundAnonymisedRow
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+
+        [AnonymiseWith(typeof(MissingOwnerFactory))]
+        public Guid OwnerId { get; init; }
+
+        public DateTimeOffset? AnonymisedAt { get; init; }
     }
 
     private sealed class PurgeCategoryRepository : ITestRetentionRuleProvider

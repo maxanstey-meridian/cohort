@@ -18,8 +18,10 @@ namespace Cohort.Application;
 /// <para>
 /// A scope's context never changes: Cohort runs each scope's work once and creates a new scope
 /// for different work. Some work runs inside another scope's work, so calls nest: each worker
-/// pass runs inside the worker's <see cref="RetentionSystemWork.WorkerCoordination"/> work, and
-/// readiness's <see cref="RetentionSystemWork.Readiness"/> check can run inside any operation.
+/// pass runs inside the worker's <see cref="RetentionSystemWork.WorkerCoordination"/> work,
+/// readiness's <see cref="RetentionSystemWork.Readiness"/> check can run inside any operation,
+/// and each batch with row handlers runs its own scope, for the run's tenant, inside the
+/// sweep's or erasure's work (inside your own scope for a caller-transaction erasure).
 /// An inner call's context wholly replaces the outer one for its work: set it, don't merge it.
 /// Restore anything you change outside the scope's own services when the work returns.
 /// Cohort creates its own savepoints only after its transactions start, so isolation applied
@@ -36,7 +38,9 @@ namespace Cohort.Application;
 /// <para>
 /// Cohort runs some statements through ADO.NET directly on the scope's DbContext connection,
 /// outside EF's command pipeline. Apply isolation when the connection opens (an EF
-/// <c>DbConnectionInterceptor</c>), not per EF command.
+/// <c>DbConnectionInterceptor</c>), not per EF command. A row-handler scope's context is
+/// pointed at the run's connection, which already carries its isolation; Cohort closes a
+/// connection the hook opened on it first.
 /// </para>
 /// </remarks>
 public interface IRetentionExecutionScope

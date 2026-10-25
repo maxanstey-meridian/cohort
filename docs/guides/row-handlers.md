@@ -28,6 +28,11 @@ builder.Services.AddRowHandler<Attachment, DeleteAttachmentBlob>(
     identity: Guid.Parse("0b6f5e43-3d0e-4c2b-9a51-6f7f2a8c1e90"));
 ```
 
+`AddRowHandler` is the only way to register a handler. Cohort constructs it from each batch's
+DI scope, so it can't be an instance or a factory. Startup refuses an `IRetentionHandler<T>`
+service that `AddRowHandler` didn't register, or one registered twice, and names the handler
+type. On a host that was never started, every Cohort operation refuses it instead.
+
 Both methods are optional. The interface supplies no-op defaults.
 
 - **`OnBeforeAsync`** runs in a read-only savepoint inside the sweep transaction, before the

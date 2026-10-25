@@ -172,6 +172,18 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         {
             await db.Database.GetService<IMigrator>()
                 .MigrateAsync("20261022095727_StoreResolvedPeriodAsMonthsAndDays");
+            // A summary a 0.10 host wrote before the upgrade.
+            await db.Database.ExecuteSqlRawAsync(
+                """
+                INSERT INTO public.sweep_run ("SweepId", "DryRun", "StartedAt", "SettledAt", "Status", "TenantId", "TriggerKind")
+                VALUES ('00000000-0000-0000-0000-0000000010a0', false, now(), now(), 1, gen_random_uuid(), 0);
+                INSERT INTO public.sweep_run_entity_summary
+                    ("SweepId", "RetentionEntityId", "Category", "TenantId", "Strategy", "Affected", "At",
+                     "EntityType", "HeldCount", "NullAnchorCount", "ResolvedDays", "ResolvedMonths", "SkippedCount")
+                VALUES ('00000000-0000-0000-0000-0000000010a0', gen_random_uuid(), 'written-before-upgrade',
+                        gen_random_uuid(), 0, 4, now(), 'Note', 1, 0, 0, 12, 0);
+                """
+            );
         }
 
         using var host = new CohortTestHost(database.ConnectionString);
@@ -214,10 +226,15 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
                 ((long)(await defaults.ExecuteScalarAsync())!).Should().Be(3);
             }
 
-            await using (var summaries = connection.CreateCommand())
+            // The pre-upgrade summary was backfilled with 0: unknown, since 0.10 never measured it.
+            await using (var backfilled = connection.CreateCommand())
             {
-                summaries.CommandText = "SELECT count(*) FROM public.sweep_run_entity_summary";
-                ((long)(await summaries.ExecuteScalarAsync())!).Should().BePositive();
+                backfilled.CommandText =
+                    """
+                    SELECT "RetainedCount" + "DeferredCount" + "BlockedCount"
+                    FROM public.sweep_run_entity_summary WHERE "Category" = 'written-before-upgrade'
+                    """;
+                ((long)(await backfilled.ExecuteScalarAsync())!).Should().Be(0);
             }
 
             await using var legacyInsert = connection.CreateCommand();

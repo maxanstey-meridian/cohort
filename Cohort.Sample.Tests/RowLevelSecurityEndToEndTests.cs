@@ -250,8 +250,64 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
         (await LoadRunsAsync(database.ConnectionString)).Should().BeEquivalentTo([
             new RunRow(tenantA, SweepRunStatus.Succeeded),
         ]);
-        // The caller's scope carries its own tenant: Cohort never ran its work through the hook.
+        // The caller's scope carries its own tenant: without handlers, Cohort never ran its work
+        // through the hook.
         entries.Ran.Should().NotContain(context => context is RetentionExecutionContext.Tenant);
+    }
+
+    [Fact]
+    public async Task Caller_Transaction_Erasure_Runs_Each_Handled_Batch_Through_The_Hook_On_The_Callers_Connection()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        var tenantA = Guid.NewGuid();
+        var subject = Guid.NewGuid();
+        await CreateSchemaWithPoliciesAsync(database.ConnectionString);
+        await SeedAsync(
+            database.ConnectionString,
+            [Note(tenantA, "a-subject", AsOf.AddDays(-1), subject), Note(tenantA, "a-other", AsOf.AddDays(-1))],
+            []
+        );
+        var entries = new EntryLog();
+        var observations = new HandlerObservations();
+        using var host = BuildHost(
+            database.ConnectionString,
+            services =>
+            {
+                services.AddSingleton(entries);
+                services.AddSingleton(observations);
+                services.AddScoped<IRetentionExecutionScope, RecordingExecutionScope>();
+                services.AddRowHandler<RlsNote, SessionObservingNoteHandler>();
+            }
+        );
+
+        await using (var scope = host.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<RlsDbContext>();
+            db.Access = new RetentionExecutionContext.Tenant(tenantA);
+            await using var transaction = await db.Database.BeginTransactionAsync();
+            // Only the caller's connection, inside its transaction, carries this.
+            await db.Database.ExecuteSqlRawAsync("SELECT set_config('app.request', 'caller-request', true)");
+            var result = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(
+                    Tenant(tenantA),
+                    new ErasureScope("person", subject),
+                    AsOf,
+                    ErasureTransaction.Caller
+                )
+            );
+            await transaction.CommitAsync();
+            result.Counts.Should().ContainSingle(count => count.EntityType == typeof(RlsNote)).Which.Affected.Should().Be(1);
+        }
+
+        // One handled batch, run through the hook as the request's tenant, and the handler's
+        // own context read inside the caller's transaction, under its role and tenant.
+        entries.Ran.Where(context => context is RetentionExecutionContext.Tenant)
+            .Should()
+            .Equal(new RetentionExecutionContext.Tenant(tenantA));
+        observations.Seen.Should().Equal(
+            new SessionObservation("before:a-subject", tenantA.ToString(), TenantRole, "caller-request")
+        );
+        (await LoadNoteBodiesAsync(database.ConnectionString)).Should().Equal("a-other");
     }
 
     [Fact]
@@ -782,7 +838,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
 
     private sealed record RunRow(Guid TenantId, SweepRunStatus Status);
 
-    private sealed record SessionObservation(string Label, string TenantSetting, string CurrentUser);
+    private sealed record SessionObservation(string Label, string TenantSetting, string CurrentUser, string Request = "");
 
     private sealed class EntryLog
     {
@@ -933,11 +989,11 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
     {
         var session = await db.Database
             .SqlQueryRaw<string>(
-                """SELECT coalesce(current_setting('app.tenant_id', true), '') || '|' || current_user AS "Value" """
+                """SELECT coalesce(current_setting('app.tenant_id', true), '') || '|' || current_user || '|' || coalesce(current_setting('app.request', true), '') AS "Value" """
             )
             .SingleAsync(ct);
         var parts = session.Split('|');
-        return new SessionObservation(label, parts[0], parts[1]);
+        return new SessionObservation(label, parts[0], parts[1], parts[2]);
     }
 
     private sealed class RlsDbContext(DbContextOptions<RlsDbContext> options) : DbContext(options)

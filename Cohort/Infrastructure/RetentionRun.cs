@@ -375,11 +375,14 @@ internal sealed class RetentionRun(
 
     /// <summary>
     /// The refusal to fail the entity with, when every refusal in a fully blocked batch points
-    /// at the schema: one SQLSTATE and constraint for all of them, and not a foreign key.
-    /// Foreign-key refusals (23503, 23001) depend on which children each row has, and mixed
-    /// refusals mean row-level causes, so those rows are only blocked and the run moves on.
+    /// at the schema or the rule: one SQLSTATE and constraint for all of them, and not a
+    /// deleted row still referenced. A foreign key refusing a delete (23503, which PostgreSQL
+    /// raises for RESTRICT and NO ACTION alike, directly or through a cascade) depends on each
+    /// row's children, and mixed refusals mean row-level causes, so those rows are only blocked
+    /// and the run moves on. An update never changes a referenced key (readiness refuses
+    /// anonymising one), so a foreign key refusing it refuses the value the rule writes.
     /// </summary>
-    private static DbException? SchemaWideRefusal(IReadOnlyList<DbException> failures)
+    private static DbException? SchemaWideRefusal(Strategy strategy, IReadOnlyList<DbException> failures)
     {
         if (failures.Count == 0)
         {
@@ -387,7 +390,7 @@ internal sealed class RetentionRun(
         }
 
         var key = BlockedRows.RefusalKey(failures[0]);
-        if (key.SqlState is PostgresErrorCodes.ForeignKeyViolation or PostgresErrorCodes.RestrictViolation)
+        if (key.SqlState == PostgresErrorCodes.ForeignKeyViolation && strategy == Strategy.Purge)
         {
             return null;
         }
@@ -401,9 +404,9 @@ internal sealed class RetentionRun(
     /// the current batch. In the caller's transaction the batches still bound each statement,
     /// but none commits on its own: the entity's savepoint and the caller's commit decide.
     /// Rows a constraint refuses are blocked and left out of later batches; a full batch in
-    /// which every row is refused by the same non-foreign-key constraint fails the entity,
-    /// since the cause is then the rule or the schema rather than the rows, and bisecting the
-    /// rest of the table would find the same.
+    /// which every row is refused by the same constraint, other than a foreign key refusing a
+    /// delete, fails the entity, since the cause is then the rule or the schema rather than
+    /// the rows, and bisecting the rest of the table would find the same.
     /// </summary>
     private async Task<(long Affected, long Skipped, IReadOnlyCollection<string> Blocked)> ExecuteBatchesAsync(
         SweepStrategy strategy,
@@ -462,7 +465,7 @@ internal sealed class RetentionRun(
                 if (
                     execution.CandidateCount == batchSize
                     && execution.BlockedRecordIds.Count == execution.CandidateCount
-                    && SchemaWideRefusal(execution.BlockedFailures) is { } refusal
+                    && SchemaWideRefusal(rule.Strategy, execution.BlockedFailures) is { } refusal
                 )
                 {
                     ExceptionDispatchInfo.Throw(refusal);

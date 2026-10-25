@@ -208,6 +208,10 @@ internal abstract class SweepStrategy(
             async handlerServices =>
             {
                 var handlerDb = handlerServices.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext);
+                // A hook may have opened the context to isolate it. The run's connection
+                // already carries the same tenant's isolation, and an open connection can't
+                // be swapped.
+                await handlerDb.Database.CloseConnectionAsync();
                 handlerDb.Database.SetDbConnection(conn, contextOwnsConnection: false);
                 try
                 {
@@ -564,7 +568,7 @@ internal abstract class SweepStrategy(
     /// One warning per refusing constraint, naming it and its SQLSTATE but no row: the
     /// constraint is schema metadata, the record ids are not logged.
     /// </summary>
-    private void LogBlocked(SweepScope scope, SweepMutationContext? execution, BlockedRows blocked)
+    private void LogBlocked(SweepScope scope, SweepMutationContext execution, BlockedRows blocked)
     {
         foreach (var group in blocked.Failures.GroupBy(BlockedRows.RefusalKey))
         {
@@ -573,7 +577,7 @@ internal abstract class SweepStrategy(
             logger.LogWarning(
                 first,
                 "Cohort run {SweepId} left {Count} row(s) of entity {EntityType} unchanged: constraint {ConstraintName} refused them (sqlstate {SqlState}). They count as blocked and are retried by the next run. Diagnostic {DiagnosticId}.",
-                execution?.SweepId,
+                execution.SweepId,
                 group.Count(),
                 scope.Entry.EntityType.FullName,
                 group.Key.ConstraintName ?? "(unnamed)",
@@ -594,17 +598,16 @@ internal abstract class SweepStrategy(
         SweepScope scope,
         DbConnection conn,
         DbTransaction transaction,
-        SweepMutationContext? execution,
+        SweepMutationContext execution,
         CancellationToken ct
     )
     {
         var entry = scope.Entry;
         var locked = new List<string>();
         var attempted = new List<string>();
-        var target = execution?.BatchSize ?? int.MaxValue;
-        while (locked.Count < target)
+        while (locked.Count < execution.BatchSize)
         {
-            int? limit = execution?.BatchSize is null ? null : target - locked.Count;
+            var limit = execution.BatchSize - locked.Count;
             var discovered = await DiscoverAsync(scope, conn, transaction, execution, attempted, limit, ct);
             if (discovered.Count == 0)
             {
@@ -634,7 +637,7 @@ internal abstract class SweepStrategy(
             );
             locked.AddRange(await ReadRecordIdsAsync(command, ct));
             attempted.AddRange(discovered);
-            if (limit is null || discovered.Count < limit)
+            if (discovered.Count < limit)
             {
                 break;
             }
@@ -647,28 +650,20 @@ internal abstract class SweepStrategy(
         SweepScope scope,
         DbConnection conn,
         DbTransaction transaction,
-        SweepMutationContext? execution,
+        SweepMutationContext execution,
         IReadOnlyList<string> attempted,
-        int? limit,
+        int limit,
         CancellationToken ct
     )
     {
         var entry = scope.Entry;
-        var parameters = new SqlParams();
+        var parameters = new SqlParams { ["batchSize"] = limit };
         var exclusions = NotAnyRecordIdSql(
             entry,
             "attemptedRecordIds",
-            [.. attempted, .. execution?.ExcludedRecordIds ?? []],
+            [.. attempted, .. execution.ExcludedRecordIds],
             parameters
-        );
-        if (execution is not null)
-        {
-            exclusions += NotRecordedByRunSql(scope, execution.SweepId, parameters);
-        }
-        if (limit is not null)
-        {
-            parameters["batchSize"] = limit.Value;
-        }
+        ) + NotRecordedByRunSql(scope, execution.SweepId, parameters);
 
         await using var command = parameters.CreateCommand(
             conn,
@@ -678,7 +673,7 @@ internal abstract class SweepStrategy(
             FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
             WHERE {DueSql(scope, parameters)}{exclusions}
             ORDER BY {OrderBySql(entry)}
-            {(limit is null ? "" : "LIMIT @batchSize")}
+            LIMIT @batchSize
             """
         );
         return await ReadRecordIdsAsync(command, ct);

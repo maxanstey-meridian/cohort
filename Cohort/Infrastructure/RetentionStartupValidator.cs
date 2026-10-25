@@ -3,6 +3,7 @@ using System.Text.RegularExpressions;
 
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Infrastructure.Sweep;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -15,7 +16,8 @@ internal sealed partial class RetentionStartupValidator(
     RetentionEntryBuilder entryBuilder,
     IEnumerable<IAnonymiseValueFactory> anonymiseValueFactories,
     RetentionValidationState validationState,
-    ErasureSubjectMetadataResolver erasureSubjectMetadataResolver
+    ErasureSubjectMetadataResolver erasureSubjectMetadataResolver,
+    RetentionHandlerServiceRegistrations handlerServices
 )
 {
     // Instance field, not static: NullabilityInfoContext is documented as not thread-safe,
@@ -80,6 +82,7 @@ internal sealed partial class RetentionStartupValidator(
                     $"{nameof(IAnonymiseValueFactory)} concrete runtime type {pair.Key.FullName} is registered {pair.Value} times in DI; exactly one registration per concrete runtime type is allowed."
                 )
                 .ToList();
+            errors.AddRange(handlerServices.FindInvalidHandlerServices());
             var retentionEntityIdOwners = new Dictionary<Guid, Type>();
             var retainedEntries = new List<RetentionEntry>();
 

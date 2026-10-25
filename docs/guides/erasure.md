@@ -126,8 +126,9 @@ Ordinary `Period` never delays erasure. Legal minimums, holds and Exempt rules d
   be purged, and a row any other integrity constraint refuses (a check, a unique index, a
   constraint trigger) can't be changed. Both count as blocked. Delete or re-point the
   referencing rows, then erase again. A full batch in which every row is refused fails the
-  entity, since the cause is then the rule or the schema, unless the refusals are
-  foreign-key refusals or differ between rows.
+  entity, since the cause is then the rule or the schema, unless the refusals differ between
+  rows or are a foreign key refusing a purge. A foreign key refusing the value an anonymise
+  writes is the rule's, so it still fails the entity.
 - Active holds always block erasure.
 
 Each `EntitySweepCount` in the result says what the erasure left of the subject, and why. The

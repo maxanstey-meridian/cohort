@@ -22,8 +22,9 @@ internal static class RetentionHandlerSupport
 
     /// <summary>
     /// The handlers registered with <c>AddRowHandler</c> for <paramref name="entityType"/>,
-    /// in priority order. A handler registered only as a service, with no registration, is
-    /// not a row handler: <see cref="HasHandlers"/> never sees it.
+    /// in priority order. Validation refuses a handler service <c>AddRowHandler</c> didn't
+    /// register (<see cref="RetentionHandlerServiceRegistrations"/>), so every handler
+    /// resolved here has its registration.
     /// </summary>
     public static IReadOnlyList<ResolvedRetentionHandler> ResolveHandlers(
         IServiceProvider services,
@@ -45,7 +46,6 @@ internal static class RetentionHandlerSupport
         );
         return registeredHandlers
             .Cast<object>()
-            .Where(handler => registrations.ContainsKey(handler.GetType()))
             .Select(handler =>
             {
                 var registration = registrations[handler.GetType()];
@@ -317,6 +317,64 @@ internal static class RetentionHandlerSupport
             """
         );
         await command.ExecuteNonQueryAsync(ct);
+    }
+}
+
+/// <summary>
+/// The host's service registrations, read when Cohort validates its configuration. Only
+/// <c>AddRowHandler</c> makes a row handler: an <see cref="IRetentionHandler{TEntity}"/>
+/// service it didn't register would never run while its rows are still mutated, and one
+/// registered twice would run twice per row. Read from the descriptors alone, so no
+/// handler is constructed to find out. The collection is complete by the time the
+/// provider that resolves this exists.
+/// </summary>
+internal sealed class RetentionHandlerServiceRegistrations(IServiceCollection services)
+{
+    public IReadOnlyList<string> FindInvalidHandlerServices()
+    {
+        var registrations = services
+            .Where(descriptor => descriptor.ServiceType == typeof(IRetentionHandlerRegistration) && !descriptor.IsKeyedService)
+            .Select(descriptor => descriptor.ImplementationInstance)
+            .OfType<IRetentionHandlerRegistration>()
+            .ToArray();
+        var errors = new List<string>();
+        var registeredServices = new List<(Type Entity, Type Handler)>();
+        foreach (var descriptor in services.Where(descriptor =>
+                     descriptor.ServiceType.IsGenericType
+                     && descriptor.ServiceType.GetGenericTypeDefinition() == typeof(IRetentionHandler<>)))
+        {
+            var entity = descriptor.ServiceType.IsGenericTypeDefinition ? null : descriptor.ServiceType.GenericTypeArguments[0];
+            var handler = descriptor.IsKeyedService
+                ? null
+                : descriptor.ImplementationType ?? descriptor.ImplementationInstance?.GetType();
+            if (entity is not null && handler is not null
+                && registrations.Any(registration => registration.EntityType == entity && registration.HandlerType == handler))
+            {
+                registeredServices.Add((entity, handler));
+                continue;
+            }
+
+            var service = entity is null ? "IRetentionHandler<>" : $"IRetentionHandler<{entity.FullName}>";
+            var registered = descriptor switch
+            {
+                { IsKeyedService: true } => $"A keyed {service} service",
+                { ImplementationFactory: not null } => $"A factory-registered {service} service",
+                _ => $"Row handler {handler!.FullName}, registered as {service},",
+            };
+            errors.Add(
+                $"{registered} isn't registered with AddRowHandler, so it would never run while its rows are still swept or erased. "
+                    + $"Register it with services.AddRowHandler<TEntity, THandler>() instead, which lets DI construct it in each batch's scope; a row handler can't be an instance, a factory or keyed."
+            );
+        }
+
+        foreach (var duplicate in registeredServices.GroupBy(pair => pair).Where(group => group.Count() > 1))
+        {
+            errors.Add(
+                $"Row handler {duplicate.Key.Handler.FullName} is registered {duplicate.Count()} times as IRetentionHandler<{duplicate.Key.Entity.FullName}>, so it would run {duplicate.Count()} times per row. Register it once, with AddRowHandler."
+            );
+        }
+
+        return errors;
     }
 }
 

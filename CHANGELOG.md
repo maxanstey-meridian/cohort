@@ -56,8 +56,8 @@ unprotected without an error.
   count on `EntitySweepCount` is now a required constructor argument. `ErasureResult.Complete`
   is true only when nothing of the subject is left.
 - `sweep_run_entity_summary` gains `RetainedCount`, `DeferredCount` and `BlockedCount`
-  (`bigint NOT NULL`). Hosts add a migration that backfills them with 0 and then drops the
-  defaults, so a 0.10 host refuses to start against it instead of recording 0 for counts it
+  (`bigint NOT NULL`). Hosts add a migration and hand-add a step that drops the defaults EF's
+  scaffold backfills with, so a 0.10 host refuses to start against it instead of recording 0 for counts it
   never measured; readiness refuses to run until it's applied.
 - A run whose `OnBeforeAsync` skipped rows settles `PartiallyFailed`, with a `rows-skipped`
   reason in `Error` and `EntityFailures`. An erasure that left rows deferred or blocked settles
@@ -70,7 +70,8 @@ unprotected without an error.
   blocks only that row: Cohort splits the batch under savepoints, the rest commits, and a
   Warning names the constraint. A full batch in which every row is refused by the same
   non-foreign-key constraint fails the entity; rows foreign keys refuse, or a mix of
-  constraints, are blocked and the run moves on.
+  constraints, are blocked and the run moves on, unless the key refuses the value an
+  anonymise writes (a static factory's missing key, say), which fails the entity.
   Batches Cohort owns check constraints immediately, so a deferred constraint blocks its row
   rather than failing the commit.
 - `OnBeforeAsync` runs in a read-only savepoint that is always rolled back. A database error
@@ -86,8 +87,9 @@ unprotected without an error.
   from the handler scope, not the caller's, so caller-scoped state such as a scoped "current
   user" isn't there; what your `IRetentionExecutionScope` sets up, or an `AsyncLocal`, still
   flows. The execution scope now also runs for each such batch.
-- A row handler runs only when registered with `AddRowHandler`; a bare
-  `IRetentionHandler<T>` service registration is ignored.
+- Registering an `IRetentionHandler<T>` without `AddRowHandler` (by type, instance, factory or
+  key), or registering one handler twice, fails startup and names the handler; on a host that
+  was never started, every Cohort operation refuses it.
 - `ErasureTransaction.Caller` and `IRetentionDeletion` detect changes before refusing a
   context with unsaved changes, so an edit made with automatic change detection off is
   refused too.

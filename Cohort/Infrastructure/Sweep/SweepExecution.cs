@@ -42,8 +42,8 @@ internal sealed record SweepExecutionResult(
 internal sealed record SweepMutationContext(
     Guid SweepId,
     DateTimeOffset At,
-    int? BatchSize = null,
-    IReadOnlyCollection<string>? ExcludedRecordIds = null
+    int BatchSize,
+    IReadOnlyCollection<string> ExcludedRecordIds
 );
 
 internal sealed record ErasureSubjectPredicate

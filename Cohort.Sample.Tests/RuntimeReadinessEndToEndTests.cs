@@ -256,6 +256,34 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Direct_sweep_refuses_a_default_left_on_a_count_column()
+    {
+        // An upgrade migration that kept EF's backfill default: a 0.10 host would then record 0
+        // for counts it never measured instead of failing.
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await using (var connection = new NpgsqlConnection(database.ConnectionString))
+        {
+            await connection.OpenAsync();
+            await using var command = new NpgsqlCommand(
+                """ALTER TABLE public.sweep_run_entity_summary ALTER COLUMN "BlockedCount" SET DEFAULT 0""",
+                connection
+            );
+            await command.ExecuteNonQueryAsync();
+        }
+
+        using var host = new CohortTestHost(database.ConnectionString);
+
+        var act = () => host.RunSweepAsync(new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()));
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle(error =>
+            error.Contains("DROP DEFAULT", StringComparison.Ordinal)
+            && error.Contains("\"BlockedCount\"", StringComparison.Ordinal)
+            && !error.Contains("RetainedCount", StringComparison.Ordinal)
+        );
+    }
+
+    [Fact]
     public async Task Direct_sweep_refuses_a_required_column_cohort_does_not_write_and_accepts_ones_the_database_fills()
     {
         await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);

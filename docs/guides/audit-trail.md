@@ -143,8 +143,10 @@ migrationBuilder.Sql(
 ```
 
 Use the schema you passed to `ConfigureCohortTables` if it isn't `public`; each EF model's
-migration drops the defaults in its own schema. Without the defaults, a 0.10 host refuses to
-start against the migrated database, and one already running fails its next run, rather than
+migration drops the defaults in its own schema. Readiness refuses to run while any of the
+three still has a default, so a migration that missed this step is caught. Without the
+defaults, a 0.10 host refuses to start against the migrated database, and one already
+running fails its next run, rather than
 writing summaries that record 0 for counts it never measured. Summaries written before the
 upgrade keep 0 in all three: those counts weren't measured, so read them as unknown for runs
 that started before you upgraded.

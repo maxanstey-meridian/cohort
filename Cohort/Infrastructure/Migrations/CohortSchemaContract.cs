@@ -99,9 +99,11 @@ internal static class CohortSchemaContract
                 Column<long>("HeldCount", "bigint", "int8"),
                 Column<long>("SkippedCount", "bigint", "int8"),
                 Column<long>("NullAnchorCount", "bigint", "int8"),
-                Column<long>("RetainedCount", "bigint", "int8"),
-                Column<long>("DeferredCount", "bigint", "int8"),
-                Column<long>("BlockedCount", "bigint", "int8"),
+                // No default: a 0.10 host doesn't write these, and must fail rather than record
+                // a default for counts it never measured.
+                Column<long>("RetainedCount", "bigint", "int8", noDefault: true),
+                Column<long>("DeferredCount", "bigint", "int8", noDefault: true),
+                Column<long>("BlockedCount", "bigint", "int8", noDefault: true),
                 Column<string?>("RuleSource", "text", nullable: true),
                 Column<string?>("RuleReason", "text", nullable: true),
             ],
@@ -197,8 +199,9 @@ internal static class CohortSchemaContract
         string storeType,
         string? catalogType = null,
         bool nullable = false,
-        bool generated = false
-    ) => new(name, typeof(T), storeType, catalogType ?? storeType, nullable, generated);
+        bool generated = false,
+        bool noDefault = false
+    ) => new(name, typeof(T), storeType, catalogType ?? storeType, nullable, generated, noDefault);
 
     internal sealed record TableRequirement(
         string Role,
@@ -223,7 +226,8 @@ internal static class CohortSchemaContract
         string StoreType,
         string CatalogType,
         bool Nullable,
-        bool Generated
+        bool Generated,
+        bool NoDefault
     );
 
     internal sealed record IndexRequirement(

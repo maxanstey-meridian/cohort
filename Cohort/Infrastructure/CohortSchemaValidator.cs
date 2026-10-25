@@ -46,6 +46,7 @@ internal sealed class CohortSchemaValidator(
             var missing = new List<string>();
             var missingRecommended = new List<string>();
             var unwritten = new List<string>();
+            var defaulted = new List<string>();
 
             foreach (var table in CohortSchemaContract.Tables)
             {
@@ -72,6 +73,13 @@ internal sealed class CohortSchemaValidator(
                     {
                         missing.Add(
                             $"column capability '{table.Role}.{PostgreSqlIdentifier.Quote(column.Name)} {column.CatalogType} {(column.Nullable ? "NULL" : "NOT NULL")}{(column.Generated ? " GENERATED" : "")}' on table '{PostgreSqlIdentifier.Format(mappedTable)}'"
+                        );
+                    }
+
+                    if (column.NoDefault && actual.FilledByDatabase)
+                    {
+                        defaulted.Add(
+                            $"ALTER TABLE {PostgreSqlIdentifier.Format(mappedTable)} ALTER COLUMN {PostgreSqlIdentifier.Quote(column.Name)} DROP DEFAULT"
                         );
                     }
                 }
@@ -193,6 +201,12 @@ internal sealed class CohortSchemaValidator(
             {
                 errors.Add(
                     $"Cohort tables have required columns Cohort does not write, so every Cohort insert into them would fail: {string.Join(", ", unwritten)}. Remove them from the host model and database (0.10.0 replaced ResolvedPeriod with ResolvedMonths and ResolvedDays), make them nullable, or give them a database default."
+                );
+            }
+            if (defaulted.Count != 0)
+            {
+                errors.Add(
+                    $"Cohort tables give a database default to columns an older Cohort leaves out of its inserts, so a host still on that version would record the default instead of failing. Drop the defaults, the step its upgrade adds to the migration EF scaffolds: {string.Join("; ", defaulted)}."
                 );
             }
             if (errors.Count != 0)

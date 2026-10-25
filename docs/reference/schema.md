@@ -45,7 +45,9 @@ Cohort validates the installed schema but never creates or upgrades it at runtim
 requires the columns, keys, unique indexes (not deferrable) and named `CHECK` constraints
 Cohort relies on. It also refuses an extra `NOT NULL` column on a Cohort table that has no
 default and isn't an identity or generated column: Cohort's inserts leave it out, so every
-insert would fail.
+insert would fail. And it refuses a default on `sweep_run_entity_summary`'s `RetainedCount`,
+`DeferredCount` and `BlockedCount`, which an older Cohort leaves out of its inserts: with a
+default, that version would record it instead of failing.
 
 A missing performance-only index is logged as a warning rather than failing. Any index on
 the same key columns counts, unique or not.
@@ -177,6 +179,7 @@ registers, and when two EF models share one set of Cohort tables.
   [example policies](#row-level-security) do.
 - Add a migration: `sweep_run_entity_summary` gains `RetainedCount`, `DeferredCount` and
   `BlockedCount` (`bigint NOT NULL`, no default once the migration has backfilled them).
-  Readiness refuses to run until it's applied. See
+  Readiness refuses to run until it's applied, and while any of the three still has a
+  default. See
   [Audit Trail](/guides/audit-trail#upgrading-to-0-11-0).
 :::

@@ -58,7 +58,8 @@ unprotected without an error.
 - `sweep_run_entity_summary` gains `RetainedCount`, `DeferredCount` and `BlockedCount`
   (`bigint NOT NULL`). Hosts add a migration and hand-add a step that drops the defaults EF's
   scaffold backfills with, so a 0.10 host refuses to start against it instead of recording 0 for counts it
-  never measured; readiness refuses to run until it's applied.
+  never measured; readiness refuses to run until it's applied, and while any of the three
+  still has a default.
 - A run whose `OnBeforeAsync` skipped rows settles `PartiallyFailed`, with a `rows-skipped`
   reason in `Error` and `EntityFailures`. An erasure that left rows deferred or blocked settles
   `PartiallyFailed` with `rows-missed` or `rows-blocked`. A sweep whose rows another

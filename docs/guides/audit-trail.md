@@ -17,7 +17,7 @@ A run commits its `Started` row before any mutation. A terminal event then sets 
 the ledger records comes from the database clock.
 
 `PartiallyFailed` means the run finished but left work it should have done: an entity failed,
-a row handler's `OnBeforeAsync` skipped rows, or an erasure left rows deferred or blocked.
+a row handler's `OnBeforeAsync` or an entity's dependents step skipped rows, or an erasure left rows deferred or blocked.
 `Error` then lists one line per cause, the same lines as the result's `EntityFailures`; rows
 left behind read `reason=rows-skipped;entityType=…;count=n` (`rows-missed`, `rows-blocked` for
 an erasure). A sweep's deferred and blocked rows don't count, since its next run retries
@@ -33,7 +33,8 @@ Summary rows carry:
 - strategy
 - affected count
 - held count
-- skipped count: rows left unchanged because a row handler's `OnBeforeAsync` failed
+- skipped count: rows left unchanged because a row handler's `OnBeforeAsync` or its
+  dependents step failed
 - null-anchor count
 - retained count, erasure only: the subject's rows the rule keeps, younger than the legal
   minimum or under an `Exempt` rule

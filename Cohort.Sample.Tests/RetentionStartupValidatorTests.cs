@@ -8,6 +8,7 @@ using Cohort.Sample.Entities;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Cohort.Sample.Tests;
 
@@ -703,6 +704,8 @@ public sealed class RetentionStartupValidatorTests
     [InlineData("singleton-first", "isn't registered with AddRetentionDependents alone")]
     [InlineData("factory", "isn't registered with AddRetentionDependents alone")]
     [InlineData("duplicate", "is registered 2 times")]
+    [InlineData("step-service-removed", "service was removed or replaced")]
+    [InlineData("handler-service-removed", "service was removed or replaced")]
     public async Task ValidateAsync_Refuses_Row_Work_That_Would_Never_Run(string registration, string? refusal)
     {
         var options = new DbContextOptionsBuilder<DependentsDbContext>()
@@ -744,6 +747,15 @@ public sealed class RetentionStartupValidatorTests
                 services.AddRetentionDependents<DependentsParent, ParentDependentsStep>();
                 services.AddScoped<IRetentionDependents<DependentsParent>, ParentDependentsStep>();
                 break;
+            // Removed after the registration method ran: the registration stays behind.
+            case "step-service-removed":
+                services.AddRetentionDependents<DependentsParent, ParentDependentsStep>();
+                services.RemoveAll<IRetentionDependents<DependentsParent>>();
+                break;
+            case "handler-service-removed":
+                services.AddRowHandler<DependentsParent, ParentRecordHandler>();
+                services.RemoveAll<IRetentionHandler<DependentsParent>>();
+                break;
         }
 
         var act = async () => await CreateValidator(db, repository, services).ValidateAsync();
@@ -754,9 +766,12 @@ public sealed class RetentionStartupValidatorTests
             return;
         }
 
-        var named = registration.StartsWith("unretained", StringComparison.Ordinal)
-            ? typeof(UnretainedDependentsRecord).FullName!
-            : $"IRetentionDependents<{typeof(DependentsParent).FullName}>";
+        var named = registration switch
+        {
+            _ when registration.StartsWith("unretained", StringComparison.Ordinal) => typeof(UnretainedDependentsRecord).FullName!,
+            "handler-service-removed" => $"IRetentionHandler<{typeof(DependentsParent).FullName}>",
+            _ => $"IRetentionDependents<{typeof(DependentsParent).FullName}>",
+        };
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle(error =>
             error.Contains(named, StringComparison.Ordinal)
@@ -1469,6 +1484,9 @@ public sealed class RetentionStartupValidatorTests
         public Task RetireAsync(DependentsParent row, RetentionDependentsContext ctx, CancellationToken ct) =>
             Task.CompletedTask;
     }
+
+    [RowHandlerId("2e1d5c1b-fc88-4328-b378-eaec2b3368ac")]
+    private sealed class ParentRecordHandler : IRetentionHandler<DependentsParent>;
 
     [RowHandlerId("3cc7fcf6-67a2-46a0-bb34-c15400ac07c1")]
     private sealed class UnretainedRecordHandler : IRetentionHandler<UnretainedDependentsRecord>;

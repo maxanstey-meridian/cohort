@@ -15,6 +15,7 @@ internal sealed class RetentionPreviewService(
     IRetentionRuleProvider ruleProvider,
     RetentionRuntimeReadinessValidator readinessValidator,
     IEnumerable<SweepStrategy> sweepStrategies,
+    IEnumerable<IRetentionDependentsRegistration> dependentsRegistrations,
     IRetentionExecutionSettings settings
 )
 {
@@ -65,7 +66,7 @@ internal sealed class RetentionPreviewService(
             var attached = await ReferencingForeignKeySql.AttachAsync(
                 connection,
                 plan,
-                strategies[Strategy.Purge].HasDependents,
+                entry => dependentsRegistrations.HasStep(entry.EntityType),
                 ct
             );
             foreach (var scope in attached)

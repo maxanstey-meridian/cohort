@@ -104,8 +104,9 @@ Cohort checks the callback's work before it commits:
 - The callback must save its changes. Returning with unsaved changes throws and rolls back.
 - If any row with an active hold disappears inside the transaction, `ExecuteAsync` throws
   and rolls back, naming the hold IDs. That covers rows the callback didn't list, EF
-  cascades, database `ON DELETE CASCADE` and raw SQL. A hold whose row was already gone
-  before the callback ran doesn't count.
+  cascades, database `ON DELETE CASCADE` and raw SQL, and a row whose hold the callback ends
+  before deleting it. A hold whose row was already gone before the callback ran doesn't count,
+  and neither does a hold that merely expires or is released while the callback runs.
 - After a refusal or failure once the callback has run, the context's change tracker is
   cleared, so a later `SaveChanges` can't apply the callback's changes outside the hold check.
 
@@ -128,6 +129,7 @@ the transaction, so call it when the context has no transaction open.
   `CreateAsync` refuses one the database clock has already reached. Seed past holds in tests
   with SQL instead.
 - `IRetentionDeletion` refuses a context with unsaved changes, a callback that returns without
-  saving, and a callback that deletes any held row, listed or not. Save or discard pending
+  saving, and a callback that deletes any held row, listed or not, even one whose hold it
+  ends first. Save or discard pending
   changes before calling it, and save inside the callback.
 :::

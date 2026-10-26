@@ -80,6 +80,8 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     [InlineData("duplicate")]
     [InlineData("singleton-first")]
     [InlineData("instance-first")]
+    [InlineData("factory-first")]
+    [InlineData("service-removed")]
     [InlineData("keyed")]
     [InlineData("open-generic")]
     public async Task Validation_Refuses_A_Handler_Service_Not_Registered_With_AddRowHandler(string registration)
@@ -117,6 +119,15 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
                 builder.Services.AddSingleton<IRetentionHandler<Note>>(new InstanceNoteHandler());
                 builder.Services.AddRowHandler<Note, InstanceNoteHandler>();
                 break;
+            case "factory-first":
+                builder.Services.AddScoped<IRetentionHandler<Note>, UnconstructableNoteHandler>(_ => new UnconstructableNoteHandler());
+                builder.Services.AddRowHandler<Note, UnconstructableNoteHandler>();
+                break;
+            // Removed after AddRowHandler ran: its registration stays behind.
+            case "service-removed":
+                builder.Services.AddRowHandler<Note, UnconstructableNoteHandler>();
+                builder.Services.RemoveAll<IRetentionHandler<Note>>();
+                break;
             case "keyed":
                 builder.Services.AddKeyedScoped<IRetentionHandler<Note>, UnconstructableNoteHandler>("k");
                 break;
@@ -134,7 +145,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
 
         var named = registration switch
         {
-            "factory" or "keyed" => $"IRetentionHandler<{typeof(Note).FullName}>",
+            "factory" or "factory-first" or "keyed" => $"IRetentionHandler<{typeof(Note).FullName}>",
             "open-generic" => "IRetentionHandler<>",
             "instance" or "instance-first" => typeof(InstanceNoteHandler).FullName!,
             _ => typeof(UnconstructableNoteHandler).FullName!,
@@ -181,6 +192,8 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     [InlineData("factory")]
     [InlineData("duplicate")]
     [InlineData("singleton-first")]
+    [InlineData("factory-first")]
+    [InlineData("service-removed")]
     [InlineData("keyed")]
     [InlineData("open-generic")]
     public async Task Validation_Refuses_A_Dependents_Step_Not_Registered_With_AddRetentionDependents(string registration)
@@ -213,6 +226,14 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
                 builder.Services.AddSingleton<IRetentionDependents<Note>, UnconstructableNoteStep>();
                 builder.Services.AddRetentionDependents<Note, UnconstructableNoteStep>();
                 break;
+            case "factory-first":
+                builder.Services.AddScoped<IRetentionDependents<Note>, UnconstructableNoteStep>(_ => new UnconstructableNoteStep());
+                builder.Services.AddRetentionDependents<Note, UnconstructableNoteStep>();
+                break;
+            case "service-removed":
+                builder.Services.AddRetentionDependents<Note, UnconstructableNoteStep>();
+                builder.Services.RemoveAll<IRetentionDependents<Note>>();
+                break;
             case "keyed":
                 builder.Services.AddKeyedScoped<IRetentionDependents<Note>, UnconstructableNoteStep>("k");
                 break;
@@ -230,7 +251,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
 
         var named = registration switch
         {
-            "factory" or "keyed" => $"IRetentionDependents<{typeof(Note).FullName}>",
+            "factory" or "factory-first" or "keyed" => $"IRetentionDependents<{typeof(Note).FullName}>",
             "open-generic" => "IRetentionDependents<>",
             "instance" => typeof(InstanceNoteStep).FullName!,
             _ => typeof(UnconstructableNoteStep).FullName!,
@@ -264,6 +285,36 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
             .Which.Errors.Should().ContainSingle(error =>
                 error.Contains(typeof(StrayNoteStep).FullName!, StringComparison.Ordinal)
                 && error.Contains("AddRetentionDependents", StringComparison.Ordinal)
+            );
+    }
+
+    // Startup refuses both shapes (a removed service, and a duplicate), so only a provider
+    // the IServiceCollection scan never validated (another container) reaches them here.
+    [Theory]
+    [InlineData("removed", 0)]
+    [InlineData("several", 2)]
+    public void Resolving_A_Registered_Step_Without_Exactly_One_Service_Refuses_It(string registration, int resolved)
+    {
+        var services = new ServiceCollection();
+        services.AddRetentionDependents<Note, InstanceNoteStep>();
+        if (registration == "removed")
+        {
+            services.RemoveAll<IRetentionDependents<Note>>();
+        }
+        else
+        {
+            services.AddScoped<IRetentionDependents<Note>, InstanceNoteStep>();
+        }
+
+        using var provider = services.BuildServiceProvider();
+        using var scope = provider.CreateScope();
+
+        var act = () => RetentionHandlerSupport.ResolveDependents(scope.ServiceProvider, typeof(Note));
+
+        act.Should().Throw<RetentionConfigurationException>()
+            .Which.Errors.Should().ContainSingle(error =>
+                error.Contains(typeof(InstanceNoteStep).FullName!, StringComparison.Ordinal)
+                && error.Contains($"resolves {resolved} IRetentionDependents", StringComparison.Ordinal)
             );
     }
 

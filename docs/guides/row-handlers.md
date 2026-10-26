@@ -134,8 +134,11 @@ builder.Services.AddRetentionDependents<Case, RetireCaseDependents>();
 - **Order.** For each row: every `OnBeforeAsync` captures first, so captures see the database
   before anything is retired; then the step; then Cohort's own change to the row. The step
   runs read-write on the batch scope's `DbContext`, the one handlers get, on the run's
-  connection and transaction and as the batch's tenant. An entity with a step is always
-  changed row by row, never in one bulk statement.
+  connection and transaction and as the batch's tenant. Write only through that injected
+  context, never another context or connection: those write outside the batch's transaction,
+  so their writes commit even when the row is blocked or skipped, the hold check can't see
+  them, and a delete of a row that references the swept row waits forever on the sweep's own
+  lock on it. An entity with a step is always changed row by row, never in one bulk statement.
 - **One savepoint.** The step and the row's change share a savepoint. If a constraint then
   refuses the change, for example because the row is still referenced, the rollback undoes
   the step too and the row counts as blocked (`BlockedCount`), so dependents never go without
@@ -150,7 +153,9 @@ builder.Services.AddRetentionDependents<Case, RetireCaseDependents>();
   run's own token stops the run. A step queues no work, so there is nothing to requeue: the
   next run tries the row again.
 - **Holds.** Any change to, or removal of, a row under an active hold fails the step, whatever
-  the row's entity. An `UPDATE` that writes the same value counts as a change. Cohort compares
+  the row's entity, even if the step ends the hold first. An `UPDATE` that writes the same
+  value counts as a change; a hold that merely expires or is released while the step runs
+  doesn't fail it. Cohort compares
   every visible held row's physical version before and after the step, so the check is
   fail-safe rather than exact: a hold created anywhere the batch can see while the step runs,
   or another session's committed update to a held row, also fails it, and the next run retries

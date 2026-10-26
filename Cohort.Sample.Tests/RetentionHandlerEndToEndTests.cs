@@ -1597,9 +1597,6 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                 "after-soft:erase-soft-delete:1",
                 "after-contact:subject@example.com:1",
             ]);
-        sink.AfterCalls.Should()
-            .NotContain(call => call.Contains("exempt", StringComparison.Ordinal));
-
         var completedStatuses = await LoadHandlerStatusesAsync(result.SweepId);
         completedStatuses.Should().HaveCount(3);
         completedStatuses.All(status => status.State == SucceededState).Should().BeTrue();

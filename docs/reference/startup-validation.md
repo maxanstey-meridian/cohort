@@ -27,16 +27,19 @@ entity and the problem.
 
 - Every [row handler](/guides/row-handlers) carries a `[RowHandlerId]` holding a non-empty
   UUID, and no two handler classes share an id, whatever their entities. `AddRowHandler`
-  refuses a missing, malformed or shared id when it's called, naming the handler. One class
-  registered for two entities keeps its one id.
+  refuses a missing, malformed or shared id when it's called, naming the handler, and an id a
+  dependents step class uses (unless that class is the dependents step of the same entity).
+  One class registered for two entities keeps its one id.
 - Every `IRetentionHandler<T>` service is registered once, through `AddRowHandler`, as
-  scoped. A handler registered any other way is refused and named.
+  scoped. A handler registered any other way is refused and named, and so is one whose
+  service was removed or replaced after `AddRowHandler` added it: it would never run.
 - Every [dependents step](/guides/row-handlers#retiring-a-rows-dependents) carries a
   `[RowHandlerId]` in the same id space: `AddRetentionDependents` refuses a missing or
   malformed id, an id another step or handler class uses (unless that class is the row handler
   of the same entity), and a second step for an entity.
 - Every `IRetentionDependents<T>` service is registered once, through
-  `AddRetentionDependents`, as scoped. A step registered any other way is refused and named.
+  `AddRetentionDependents`, as scoped. A step registered any other way is refused and named,
+  and so is one whose service was removed or replaced after `AddRetentionDependents` added it.
 - A row handler or dependents step registered for an entity that isn't a `[Retain]` entity in
   the `DbContext` model is refused and named: it would never run.
 - On a host that was never started, every Cohort operation refuses these too.

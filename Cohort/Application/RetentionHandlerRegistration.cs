@@ -56,4 +56,11 @@ internal static class RetentionDependentsRegistrations
         this IEnumerable<IRetentionDependentsRegistration> registrations,
         Type entityType
     ) => registrations.SingleOrDefault(registration => registration.EntityType == entityType);
+
+    /// <summary>
+    /// Whether <paramref name="entityType"/> has a dependents step, read from the
+    /// registrations alone so no step is constructed to find out.
+    /// </summary>
+    public static bool HasStep(this IEnumerable<IRetentionDependentsRegistration> registrations, Type entityType) =>
+        registrations.StepFor(entityType) is not null;
 }

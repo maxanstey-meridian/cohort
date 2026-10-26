@@ -405,43 +405,39 @@ internal sealed class RetentionHandlerServiceRegistrations(IServiceCollection se
 
     /// <summary>
     /// Every row handler or dependents step service the host registered some other way than
-    /// with <c>AddRowHandler</c> or <c>AddRetentionDependents</c>, or more than once.
+    /// with <c>AddRowHandler</c> or <c>AddRetentionDependents</c>, or more than once, and every
+    /// registration whose service was later removed or replaced.
     /// </summary>
-    public IReadOnlyList<string> FindInvalidHandlerServices()
-    {
-        var handlers = Registrations();
-        var steps = DependentsRegistrations();
-        return
-        [
-            .. FindInvalidServices(
-                typeof(IRetentionHandler<>),
-                "Row handler",
-                (entity, implementation) => handlers.Any(registration =>
-                    registration.EntityType == entity && registration.HandlerType == implementation),
-                NotRegisteredError,
-                "AddRowHandler"
-            ),
-            .. FindInvalidServices(
-                typeof(IRetentionDependents<>),
-                "Dependents step",
-                (entity, implementation) => steps.Any(registration =>
-                    registration.EntityType == entity && registration.StepType == implementation),
-                DependentsNotRegisteredError,
-                "AddRetentionDependents"
-            ),
-        ];
-    }
+    public IReadOnlyList<string> FindInvalidHandlerServices() =>
+    [
+        .. FindInvalidServices(
+            typeof(IRetentionHandler<>),
+            "Row handler",
+            Registrations().Select(registration => (registration.EntityType, registration.HandlerType)).ToHashSet(),
+            NotRegisteredError,
+            "AddRowHandler<TEntity, THandler>"
+        ),
+        .. FindInvalidServices(
+            typeof(IRetentionDependents<>),
+            "Dependents step",
+            DependentsRegistrations().Select(registration => (registration.EntityType, registration.StepType)).ToHashSet(),
+            DependentsNotRegisteredError,
+            "AddRetentionDependents<TEntity, TStep>"
+        ),
+    ];
 
     private IEnumerable<string> FindInvalidServices(
         Type serviceDefinition,
         string role,
-        Func<Type, Type, bool> isRegistered,
+        HashSet<(Type Entity, Type Implementation)> registrations,
         Func<string, string> notRegisteredError,
         string registrationMethod
     )
     {
         var serviceName = serviceDefinition.Name[..serviceDefinition.Name.IndexOf('`')];
+        var method = registrationMethod[..registrationMethod.IndexOf('<')];
         var registeredServices = new List<(Type Entity, Type Implementation)>();
+        var refusedServices = new HashSet<(Type Entity, Type Implementation)>();
         foreach (var descriptor in services.Where(descriptor =>
                      descriptor.ServiceType.IsGenericType
                      && descriptor.ServiceType.GetGenericTypeDefinition() == serviceDefinition))
@@ -459,7 +455,7 @@ internal sealed class RetentionHandlerServiceRegistrations(IServiceCollection se
                 { ImplementationInstance: { } instance } => $"An instance of {instance.GetType().FullName}, registered as {service},",
                 { Lifetime: not ServiceLifetime.Scoped } =>
                     $"{role} {descriptor.ImplementationType!.FullName}, registered as a {descriptor.Lifetime.ToString().ToLowerInvariant()} {service},",
-                _ when entity is not null && isRegistered(entity, descriptor.ImplementationType!) => null,
+                _ when entity is not null && registrations.Contains((entity, descriptor.ImplementationType!)) => null,
                 _ => $"{role} {descriptor.ImplementationType!.FullName}, registered as {service},",
             };
             if (registered is null)
@@ -468,13 +464,37 @@ internal sealed class RetentionHandlerServiceRegistrations(IServiceCollection se
                 continue;
             }
 
+            // The implementation type TryAddEnumerable itself compares: a factory's is its
+            // delegate's return type.
+            if (entity is not null
+                && (descriptor.ImplementationType
+                    ?? descriptor.ImplementationInstance?.GetType()
+                    ?? descriptor.ImplementationFactory?.GetType().GenericTypeArguments[^1]) is { } implementation)
+            {
+                refusedServices.Add((entity, implementation));
+            }
+
             yield return notRegisteredError(registered);
         }
 
         foreach (var duplicate in registeredServices.GroupBy(pair => pair).Where(group => group.Count() > 1))
         {
             yield return
-                $"{role} {duplicate.Key.Implementation.FullName} is registered {duplicate.Count()} times as {serviceName}<{duplicate.Key.Entity.FullName}>, so it would run {duplicate.Count()} times per row. Register it once, with {registrationMethod}.";
+                $"{role} {duplicate.Key.Implementation.FullName} is registered {duplicate.Count()} times as {serviceName}<{duplicate.Key.Entity.FullName}>, so it would run {duplicate.Count()} times per row. Register it once, with {method}.";
+        }
+
+        // A service removed or replaced after the registration method ran leaves its
+        // registration behind, so its rows would be mutated without it. One refused above in
+        // the wrong shape is already reported.
+        foreach (var (entity, implementation) in registrations
+                     .Except(registeredServices)
+                     .Except(refusedServices)
+                     .OrderBy(pair => pair.Implementation.FullName, StringComparer.Ordinal)
+                     .ThenBy(pair => pair.Entity.FullName, StringComparer.Ordinal))
+        {
+            yield return
+                $"{role} {implementation.FullName} is registered for {entity.FullName} with {method}, but its scoped {serviceName}<{entity.FullName}> service was removed or replaced, so it wouldn't run in each batch's scope, or at all while its rows are still swept or erased. "
+                + $"Register it only with services.{registrationMethod}() and leave the service it adds in place.";
         }
     }
 
@@ -553,16 +573,11 @@ internal sealed record RetentionHandlerScope(
 /// <summary>
 /// What failed a row before its mutation: an OnBefore handler or the dependents step, the
 /// identity its dead-lettered status is recorded under, and either the exception or a
-/// Cohort-defined reason, which carries no handler or row data.
+/// Cohort-defined reason, which carries no handler or row data. Exactly one of the two is
+/// set, so it is built only through <see cref="FromException(ResolvedRetentionHandler, Exception)"/>
+/// or <see cref="FromReason(ResolvedRetentionHandler, string)"/> and their step overloads.
 /// </summary>
-internal sealed record BeforeMutationFailure(
-    string Role,
-    Type FailedType,
-    string Identity,
-    RowHandlerDispatchPhase DispatchPhase,
-    Exception? Failure,
-    string? Reason
-)
+internal sealed record BeforeMutationFailure
 {
     /// <summary>The step returned with unsaved changes on its DbContext.</summary>
     public const string DependentsUnsavedChangesReason = "dependents-unsaved-changes";
@@ -573,9 +588,50 @@ internal sealed record BeforeMutationFailure(
     /// <summary>The step took its own row out of the mutation's scope.</summary>
     public const string DependentsChangedRowReason = "dependents-changed-row";
 
-    public static BeforeMutationFailure Step(ResolvedRetentionDependents step, Exception? failure, string? reason = null) =>
-        // A step queues nothing, so its status has no dispatch of its own; Immediate is the default.
-        new("dependents step", step.StepType, step.Identity, RowHandlerDispatchPhase.Immediate, failure, reason);
+    private const string HandlerRole = "row handler";
+    private const string StepRole = "dependents step";
+
+    private BeforeMutationFailure(
+        string role,
+        Type failedType,
+        string identity,
+        RowHandlerDispatchPhase dispatchPhase,
+        Exception? failure,
+        string? reason
+    )
+    {
+        Role = role;
+        FailedType = failedType;
+        Identity = identity;
+        DispatchPhase = dispatchPhase;
+        Failure = failure;
+        Reason = reason;
+    }
+
+    public string Role { get; }
+
+    public Type FailedType { get; }
+
+    public string Identity { get; }
+
+    public RowHandlerDispatchPhase DispatchPhase { get; }
+
+    public Exception? Failure { get; }
+
+    public string? Reason { get; }
+
+    public static BeforeMutationFailure FromException(ResolvedRetentionHandler handler, Exception failure) =>
+        new(HandlerRole, handler.HandlerType, handler.HandlerIdentity, handler.DispatchPhase, failure, null);
+
+    public static BeforeMutationFailure FromReason(ResolvedRetentionHandler handler, string reason) =>
+        new(HandlerRole, handler.HandlerType, handler.HandlerIdentity, handler.DispatchPhase, null, reason);
+
+    // A step queues nothing, so its status has no dispatch of its own; Immediate is the default.
+    public static BeforeMutationFailure FromException(ResolvedRetentionDependents step, Exception failure) =>
+        new(StepRole, step.StepType, step.Identity, RowHandlerDispatchPhase.Immediate, failure, null);
+
+    public static BeforeMutationFailure FromReason(ResolvedRetentionDependents step, string reason) =>
+        new(StepRole, step.StepType, step.Identity, RowHandlerDispatchPhase.Immediate, null, reason);
 }
 
 internal sealed record OnBeforeInvocationResult(
@@ -601,13 +657,8 @@ internal sealed record OnBeforeInvocationResult(
 
     public BeforeMutationFailure ToFailure() =>
         FailedHandler is { } handler
-            ? new BeforeMutationFailure(
-                "row handler",
-                handler.HandlerType,
-                handler.HandlerIdentity,
-                handler.DispatchPhase,
-                Failure,
-                FailureReason
-            )
+            ? Failure is not null
+                ? BeforeMutationFailure.FromException(handler, Failure)
+                : BeforeMutationFailure.FromReason(handler, FailureReason!)
             : throw new InvalidOperationException("Only a failed OnBefore leaves a row unmutated.");
 }

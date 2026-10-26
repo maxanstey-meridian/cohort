@@ -48,7 +48,7 @@ Along the way:
 - Each batch continues after the last row the previous batch reached, in the order rows are
   selected (anchor, then record ID), so a row is tried again only if its anchor moves past
   the run's position, and a batch costs the same however many rows came before it. Rows
-  skipped by a failing `OnBeforeAsync` are dead-lettered once and left for the next run, so
+  skipped by a failing `OnBeforeAsync` or dependents step are dead-lettered once and left for the next run, so
   a failing row can't spin the batch loop or block the eligible rows behind it. Skipped rows
   make the run `PartiallyFailed`, with a `rows-skipped` reason in `Error` and
   `EntityFailures`.

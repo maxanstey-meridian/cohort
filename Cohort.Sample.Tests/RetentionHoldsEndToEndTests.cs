@@ -488,6 +488,10 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
         DeleteHeldRow,
         RewriteUnheldRow,
         HoldCreatedDuringWork,
+        EndHoldThenRewriteHeldRow,
+        EndHoldThenDeleteHeldRow,
+        EndHoldOnly,
+        RewriteHeldRowThenRollBackToSavepoint,
     }
 
     [Theory]
@@ -495,6 +499,10 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
     [InlineData(HeldRowWork.DeleteHeldRow, true, true)]
     [InlineData(HeldRowWork.RewriteUnheldRow, false, false)]
     [InlineData(HeldRowWork.HoldCreatedDuringWork, true, false)]
+    [InlineData(HeldRowWork.EndHoldThenRewriteHeldRow, true, false)]
+    [InlineData(HeldRowWork.EndHoldThenDeleteHeldRow, true, true)]
+    [InlineData(HeldRowWork.EndHoldOnly, false, false)]
+    [InlineData(HeldRowWork.RewriteHeldRowThenRollBackToSavepoint, false, false)]
     public async Task Hold_Guard_Flags_Held_Rows_The_Work_Changed_Or_Removed_And_Holds_That_Appeared(
         HeldRowWork work,
         bool stepViolation,
@@ -512,11 +520,7 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
         var (changed, removed) = await Host.RunWithServicesAsync(async services =>
         {
             var db = services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext);
-            var guard = new RetentionHoldGuard(
-                db,
-                services.GetRequiredService<RetentionRegistry>(),
-                services.GetRequiredService<IServiceScopeFactory>()
-            );
+            var guard = services.GetRequiredService<RetentionHoldGuard>();
             await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted);
             var connection = db.Database.GetDbConnection();
             var dbTransaction = transaction.GetDbTransaction();
@@ -525,7 +529,8 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
             switch (work)
             {
                 case HeldRowWork.RewriteHeldRowUnchanged:
-                    // Writes the same value: still a new row version, so still a change to a held row.
+                    // Writes the same value: still a new row version, so still a change to a
+                    // held row.
                     await db.Database.ExecuteSqlAsync($"UPDATE notes SET \"Body\" = \"Body\" WHERE \"Id\" = {heldId}");
                     break;
                 case HeldRowWork.DeleteHeldRow:
@@ -537,6 +542,25 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
                 case HeldRowWork.HoldCreatedDuringWork:
                     // Committed by another session while the work's transaction is open.
                     await CreateHoldAsync(new RetentionHoldRequest(lateHoldId, RetentionEntityIdentity.For<Note>(), unheldId.ToString(), tenantId, "late", DateTimeOffset.UtcNow));
+                    break;
+                case HeldRowWork.EndHoldThenRewriteHeldRow:
+                    // The work ends the hold itself, then acts on the row it covered.
+                    await db.Database.ExecuteSqlAsync($"UPDATE retention_holds SET \"RemovedAt\" = statement_timestamp() WHERE \"HoldId\" = {holdId}");
+                    await db.Database.ExecuteSqlAsync($"UPDATE notes SET \"Body\" = 'rewritten' WHERE \"Id\" = {heldId}");
+                    break;
+                case HeldRowWork.EndHoldThenDeleteHeldRow:
+                    await db.Database.ExecuteSqlAsync($"UPDATE retention_holds SET \"RemovedAt\" = statement_timestamp() WHERE \"HoldId\" = {holdId}");
+                    await db.Database.ExecuteSqlAsync($"DELETE FROM notes WHERE \"Id\" = {heldId}");
+                    break;
+                case HeldRowWork.EndHoldOnly:
+                    // As an expiry or another session's release would: the row is left alone.
+                    await db.Database.ExecuteSqlAsync($"UPDATE retention_holds SET \"RemovedAt\" = statement_timestamp() WHERE \"HoldId\" = {holdId}");
+                    break;
+                case HeldRowWork.RewriteHeldRowThenRollBackToSavepoint:
+                    // The old row version comes back at its own ctid and xmin: nothing changed.
+                    await db.Database.ExecuteSqlRawAsync("SAVEPOINT work");
+                    await db.Database.ExecuteSqlAsync($"UPDATE notes SET \"Body\" = 'rewritten' WHERE \"Id\" = {heldId}");
+                    await db.Database.ExecuteSqlRawAsync("ROLLBACK TO SAVEPOINT work");
                     break;
             }
 

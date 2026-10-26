@@ -202,13 +202,14 @@ internal sealed class RetentionRun(
     public async Task RunEntitiesAsync(
         IReadOnlyList<SweepScope> plan,
         IReadOnlyDictionary<Strategy, SweepStrategy> strategies,
+        IEnumerable<IRetentionDependentsRegistration> dependentsRegistrations,
         CancellationToken ct
     )
     {
         plan = await ReferencingForeignKeySql.AttachAsync(
             db.Database.GetDbConnection(),
             plan,
-            strategies[Strategy.Purge].HasDependents,
+            entry => dependentsRegistrations.HasStep(entry.EntityType),
             ct
         );
         foreach (var scope in RetentionExecutionPlanOrderer.Order(db, plan, scope => scope.Entry, logger))

@@ -133,9 +133,11 @@ unprotected without an error.
   flows. The execution scope now also runs for each such batch.
 - Registering an `IRetentionHandler<T>` that `AddRowHandler` didn't (by type without it; as
   a singleton, transient or instance, even before `AddRowHandler`; by factory, key or open
-  generic `IRetentionHandler<>`), or registering one handler twice, fails startup and names the handler; on
-  a host that was never started, every Cohort operation refuses it. An open-generic handler
-  that used to run for every entity is refused: register it per entity.
+  generic `IRetentionHandler<>`), registering one handler twice, or removing or replacing the
+  service `AddRowHandler` added (`RemoveAll`, `Replace`), fails startup and names the handler;
+  on a host that was never started, every Cohort operation refuses it. A dependents step and
+  `AddRetentionDependents` get the same checks. An open-generic handler that used to run for
+  every entity is refused: register it per entity.
 - `IRetentionDependents<TEntity>`, registered with `AddRetentionDependents<TEntity, TStep>()`
   (one per entity), retires what depends on a row (deletes or blanks it) in the row's own
   transaction, after every `OnBeforeAsync` and before Cohort's change to the row, under the

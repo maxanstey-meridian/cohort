@@ -16,6 +16,7 @@ internal sealed class RetentionSweepEngine(
     RetentionRuntimeReadinessValidator readinessValidator,
     EfRetentionAuditWriter auditWriter,
     IEnumerable<SweepStrategy> sweepStrategies,
+    IEnumerable<IRetentionDependentsRegistration> dependentsRegistrations,
     IRetentionExecutionSettings options,
     RetentionAuditNotifier auditNotifier,
     ILogger<RetentionSweepEngine> logger
@@ -104,7 +105,7 @@ internal sealed class RetentionSweepEngine(
         var (now, startedAt) = await DatabaseClock.ResolveRunTimeAsync(db, at, dryRun, ct);
         var run = CreateRun(new SweepEvent.Started(Guid.NewGuid(), startedAt, trigger, dryRun, tenant.Id), passLockKey);
         await run.ExecuteAsync(
-            async () => await run.RunEntitiesAsync(await BuildExecutionPlanAsync(tenant, now, scope, run, ct), strategies, ct),
+            async () => await run.RunEntitiesAsync(await BuildExecutionPlanAsync(tenant, now, scope, run, ct), strategies, dependentsRegistrations, ct),
             ct
         );
         return run.CreateSweepResult();

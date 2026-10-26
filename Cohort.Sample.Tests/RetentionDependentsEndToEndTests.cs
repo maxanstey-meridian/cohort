@@ -57,6 +57,9 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
         (await CountAsync(database.ConnectionString, "dependents_parents")).Should().Be(0);
         (await CountAsync(database.ConnectionString, "dependents_plain_children")).Should().Be(0);
         script.Calls.Should().Be(2);
+        // Per-row audit: the engine writes one detail per mutated row when no handler does.
+        (await LoadRowDetailsAsync(database.ConnectionString, result.SweepId)).Select(detail => detail.RecordId)
+            .Should().BeEquivalentTo([referencedId.ToString(), plainId.ToString()]);
     }
 
     [Fact]
@@ -94,12 +97,15 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
     {
         Throws,
         DatabaseError,
+        SwallowedDatabaseError,
         UnsavedChanges,
     }
 
     [Theory]
     [InlineData(StepFailure.Throws, "^type=System\\.InvalidOperationException;code=hresult:0x[0-9A-F]{8};diagnosticId=[0-9a-f]{32}$")]
     [InlineData(StepFailure.DatabaseError, "^type=Npgsql\\.PostgresException;code=sqlstate:22012;diagnosticId=[0-9a-f]{32}$")]
+    // Caught and returned from: the transaction is left aborted, so the guard's own read fails.
+    [InlineData(StepFailure.SwallowedDatabaseError, "^type=Npgsql\\.PostgresException;code=sqlstate:25P02;diagnosticId=[0-9a-f]{32}$")]
     [InlineData(StepFailure.UnsavedChanges, "^reason=dependents-unsaved-changes$")]
     public async Task A_Step_That_Throws_Skips_Only_Its_Row(StepFailure failure, string expectedError)
     {
@@ -122,6 +128,16 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
                         throw new InvalidOperationException("the step failed");
                     case StepFailure.DatabaseError:
                         await db.Database.ExecuteSqlRawAsync("SELECT 1/0", ct);
+                        break;
+                    case StepFailure.SwallowedDatabaseError:
+                        try
+                        {
+                            await db.Database.ExecuteSqlRawAsync("SELECT 1/0", ct);
+                        }
+                        catch (PostgresException)
+                        {
+                        }
+
                         break;
                     case StepFailure.UnsavedChanges:
                         db.PlainChildren.Add(PlainChild(row.Id));
@@ -158,6 +174,9 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
         status.LastError.Should().MatchRegex(expectedError);
         (await LoadIdsAsync(database.ConnectionString, "dependents_parents")).Should().Equal(failingId);
         (await LoadParentIdsOfPlainChildrenAsync(database.ConnectionString)).Should().Equal(failingId);
+        // One detail per row: the skip's own for the failing row, the engine's for the others.
+        (await LoadRowDetailsAsync(database.ConnectionString, result.SweepId)).Select(detail => detail.RecordId)
+            .Should().BeEquivalentTo(ids.Select(id => id.ToString()));
     }
 
     [Fact]
@@ -281,12 +300,13 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
         {
             var holdDb = holdScope.ServiceProvider.GetRequiredService<DependentsDbContext>();
             await using var holdTransaction = await holdDb.Database.BeginTransactionAsync();
+            var holdBackendId = ((NpgsqlConnection)holdDb.Database.GetDbConnection()).ProcessID;
             await holdScope.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>().CreateAsync(
                 new RetentionHoldRequest(Guid.NewGuid(), AuditEventEntityId, eventId.ToString(), tenantId, "litigation", DateTimeOffset.UtcNow.AddMinutes(-1)),
                 CancellationToken.None
             );
             gate.SetResult();
-            await WaitForLockWaitAsync(database.ConnectionString, "dependents_audit_events");
+            await WaitForBlockedStepAsync(database.ConnectionString, holdBackendId);
             await holdTransaction.CommitAsync();
         }
 
@@ -319,7 +339,6 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
         var result = await SweepAsync(services, tenantId);
 
         AssertSkippedWithReason(result, typeof(AAnonymisedParent), affected: 0);
-        result.Counts.Single(count => count.EntityType == typeof(AAnonymisedParent)).HeldCount.Should().Be(0);
         (await LoadStepStatusesAsync(database.ConnectionString, result.SweepId)).Should().ContainSingle()
             .Which.LastError.Should().Be("reason=dependents-changed-row");
         // The step's own change was rolled back with it.
@@ -441,6 +460,10 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
         });
 
         var result = await SweepAsync(services, tenantId);
+        // The handlers' detail is the row's only one, and carries their payload until delivered.
+        var detail = (await LoadRowDetailsAsync(database.ConnectionString, result.SweepId)).Should().ContainSingle().Subject;
+        detail.RecordId.Should().Be(parentId.ToString());
+        detail.CapturedPayload.Should().NotBeNull();
         var flush = await services.GetRequiredService<IRetentionRowDispatcher>().FlushAsync();
 
         result.EntityFailures.Should().BeEmpty();
@@ -514,20 +537,28 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
     }
 
     /// <summary>
-    /// Waits until a session is blocked on a lock while updating <paramref name="table"/>: a
-    /// condition, polled, rather than a timed sleep.
+    /// Waits until the step's UPDATE of the audit events is blocked by the hold's transaction
+    /// (<paramref name="blockerBackendId"/>): a condition, polled, rather than a timed sleep.
     /// </summary>
-    private static async Task WaitForLockWaitAsync(string connectionString, string table)
+    private static async Task WaitForBlockedStepAsync(string connectionString, int blockerBackendId)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         while (true)
         {
-            var waiting = await ScalarAsync<long>(
+            var blocked = await ScalarAsync<bool>(
                 connectionString,
-                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE @table",
-                ("table", $"%{table}%")
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_stat_activity waiter
+                    WHERE @blockerBackendId = ANY(pg_blocking_pids(waiter.pid))
+                      AND waiter.query LIKE '%dependents_audit_events%'
+                      AND waiter.query LIKE '%UPDATE%'
+                )
+                """,
+                ("blockerBackendId", blockerBackendId)
             );
-            if (waiting > 0)
+            if (blocked)
             {
                 return;
             }
@@ -574,6 +605,17 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
                 (SweepRowHandlerDispatchState)reader.GetInt32(2),
                 reader.IsDBNull(3) ? null : reader.GetString(3)
             ),
+            ("sweepId", sweepId)
+        );
+
+    private static async Task<List<(string RecordId, string? CapturedPayload)>> LoadRowDetailsAsync(
+        string connectionString,
+        Guid sweepId
+    ) =>
+        await QueryAsync(
+            connectionString,
+            "SELECT \"RecordId\", \"CapturedPayload\" FROM \"sweep_run_row_detail\" WHERE \"SweepId\" = @sweepId",
+            reader => (reader.GetString(0), reader.IsDBNull(1) ? null : reader.GetString(1)),
             ("sweepId", sweepId)
         );
 
@@ -725,7 +767,8 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
         public Task<RetentionRule?> ResolveAsync(RetentionResolutionContext context, CancellationToken ct) =>
             Task.FromResult<RetentionRule?>(context.Category switch
             {
-                "dependents-purge" => new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge),
+                // Per-row audit, so the tests pin who writes each mutated row's detail.
+                "dependents-purge" => new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge, AuditRowDetail: AuditRowDetail.PerRow),
                 "dependents-kept" => new RetentionRule(new RetentionPeriod(Days: 3650), Strategy.Purge),
                 "dependents-anonymise" => new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise),
                 "dependents-audit" => new RetentionRule(new RetentionPeriod(Days: 3650), Strategy.Anonymise),

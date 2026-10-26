@@ -70,15 +70,27 @@ internal sealed class RetentionHoldGuard(
     /// Every active hold the scope can see, with the physical version of its row (NULL when the
     /// row is gone). Take it before the work, in the transaction the work runs in.
     /// </summary>
-    internal async Task<HeldRowVersions> ReadHeldRowVersionsAsync(
+    internal Task<HeldRowVersions> ReadHeldRowVersionsAsync(
         DbConnection connection,
         DbTransaction transaction,
+        CancellationToken ct
+    ) => ReadVersionsAsync(connection, transaction, [], ct);
+
+    /// <summary>
+    /// The read after the work: the active holds, plus the baseline's holds whether or not they
+    /// are still active, so a hold that ended during the work is judged by its row.
+    /// </summary>
+    private async Task<HeldRowVersions> ReadVersionsAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        IReadOnlyCollection<Guid> baselineHoldIds,
         CancellationToken ct
     )
     {
         var (sql, parameters) = RetentionHoldSql.BuildActiveHeldRowVersions(
             tables.RetentionHolds,
-            registry.Scan().Values.ToList()
+            registry.Scan().Values.ToList(),
+            baselineHoldIds
         );
         await using var command = parameters.CreateCommand(connection, transaction, sql);
         var versions = new Dictionary<Guid, string?>();
@@ -95,26 +107,35 @@ internal sealed class RetentionHoldGuard(
 
     /// <summary>
     /// The dependents step's rule: holds whose row the work changed or removed (a non-NULL
-    /// version that differs or became NULL), plus holds that appeared during the work, whose
-    /// rows it may have changed after the hold committed. Sorted; empty when nothing was touched.
+    /// version that differs or became NULL), whether or not the hold is still active, so ending
+    /// a hold first doesn't hide a change to its row; plus holds that appeared during the work,
+    /// whose rows it may have changed after the hold committed. Sorted; empty when nothing was
+    /// touched.
     /// </summary>
     internal async Task<IReadOnlyList<Guid>> ReadChangedHeldRowsAsync(
         HeldRowVersions baseline,
         DbConnection connection,
         DbTransaction transaction,
         CancellationToken ct
-    ) => HeldRowVersions.Changed(baseline, await ReadHeldRowVersionsAsync(connection, transaction, ct));
+    ) => HeldRowVersions.Changed(
+        baseline,
+        await ReadVersionsAsync(connection, transaction, baseline.ByHold.Keys.ToArray(), ct)
+    );
 
     /// <summary>
     /// <see cref="IRetentionDeletion"/>'s rule: holds whose row is gone now but was not gone
-    /// before the work. Holds already orphaned before it are not its doing. Sorted.
+    /// before the work, whether or not the hold is still active, so ending a hold first doesn't
+    /// hide the deletion of its row. Holds already orphaned before it are not its doing. Sorted.
     /// </summary>
     internal async Task<IReadOnlyList<Guid>> ReadRemovedHeldRowsAsync(
         HeldRowVersions baseline,
         DbConnection connection,
         DbTransaction transaction,
         CancellationToken ct
-    ) => HeldRowVersions.Removed(baseline, await ReadHeldRowVersionsAsync(connection, transaction, ct));
+    ) => HeldRowVersions.Removed(
+        baseline,
+        await ReadVersionsAsync(connection, transaction, baseline.ByHold.Keys.ToArray(), ct)
+    );
 
     private Task<HashSet<Guid>> ReadSystemTenantlessHoldsAsync(CancellationToken ct) =>
         scopeFactory.RunInScopeAsync(
@@ -158,27 +179,40 @@ internal sealed class RetentionHoldGuard(
 }
 
 /// <summary>
-/// Active hold ids with the physical version (<c>tableoid/ctid</c>) of the row each covers, or
+/// Hold ids with the physical version (<c>tableoid/ctid/xmin</c>) of the row each covers, or
 /// NULL when the row is gone. Only meaningful diffed against another read in the same
-/// transaction.
+/// transaction. The read after the work includes the baseline's holds whether or not they are
+/// still active, so a baseline hold missing from it was deleted outright; both rules flag that,
+/// since what it covered can no longer be compared.
 /// </summary>
-internal sealed class HeldRowVersions(IReadOnlyDictionary<Guid, string?> versions)
+internal sealed record HeldRowVersions(IReadOnlyDictionary<Guid, string?> ByHold)
 {
-    private readonly IReadOnlyDictionary<Guid, string?> byHold = versions;
-
+    /// <summary>
+    /// Holds whose row changed or went (a non-NULL version that differs or became NULL), holds
+    /// that appeared, and baseline holds deleted outright.
+    /// </summary>
     internal static IReadOnlyList<Guid> Changed(HeldRowVersions before, HeldRowVersions after) =>
-        after.byHold
-            .Where(hold => !before.byHold.TryGetValue(hold.Key, out var version)
+        after.ByHold
+            .Where(hold => !before.ByHold.TryGetValue(hold.Key, out var version)
                 || (version is not null && version != hold.Value))
             .Select(hold => hold.Key)
+            .Concat(DeletedOutright(before, after))
             .Order()
             .ToArray();
 
+    /// <summary>
+    /// Holds whose row is gone now but was not before (an appeared hold included), and baseline
+    /// holds deleted outright.
+    /// </summary>
     internal static IReadOnlyList<Guid> Removed(HeldRowVersions before, HeldRowVersions after) =>
-        after.byHold
+        after.ByHold
             .Where(hold => hold.Value is null
-                && !(before.byHold.TryGetValue(hold.Key, out var version) && version is null))
+                && !(before.ByHold.TryGetValue(hold.Key, out var version) && version is null))
             .Select(hold => hold.Key)
+            .Concat(DeletedOutright(before, after))
             .Order()
             .ToArray();
+
+    private static IEnumerable<Guid> DeletedOutright(HeldRowVersions before, HeldRowVersions after) =>
+        before.ByHold.Keys.Where(holdId => !after.ByHold.ContainsKey(holdId));
 }

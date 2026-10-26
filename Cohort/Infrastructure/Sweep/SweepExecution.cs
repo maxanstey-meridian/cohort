@@ -4,7 +4,6 @@ namespace Cohort.Infrastructure.Sweep;
 
 internal sealed record SweepExecutionResult(
     IReadOnlyList<string> AffectedRecordIds,
-    int HeldCount,
     bool RowDetailsPersisted = false,
     int SkippedCount = 0,
     int CandidateCount = 0,

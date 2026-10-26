@@ -54,12 +54,6 @@ internal abstract class SweepStrategy(
     /// <summary>Rejects entries this strategy cannot act on.</summary>
     protected virtual void Validate(RetentionEntry entry) { }
 
-    /// <summary>
-    /// Whether <paramref name="entry"/>'s entity has a dependents step, read from the
-    /// registrations alone so no step is constructed to find out.
-    /// </summary>
-    public bool HasDependents(RetentionEntry entry) => dependentsRegistrations.StepFor(entry.EntityType) is not null;
-
     public async Task<long> CountAsync(
         SweepScope scope,
         SweepCount count,
@@ -117,11 +111,12 @@ internal abstract class SweepStrategy(
 
     /// <summary>
     /// Rows still due once run <paramref name="sweepId"/> has finished its batches for the
-    /// entity that the run did not record (as skipped by a failing OnBefore) or find
-    /// <paramref name="blocked"/>: locked by another transaction when discovery passed them,
-    /// or come into scope mid-run behind the run's position. Measured once after the loop
-    /// rather than per batch, and sends the blocked ids once. Referenced rows aren't due, so
-    /// blocked rows are never counted twice.
+    /// entity, leaving out the rows the run already accounted for: a row skipped by a failing
+    /// OnBefore handler or dependents step, through the row detail its skip wrote, and a row a
+    /// constraint refused, through <paramref name="blocked"/>. What remains was locked by
+    /// another transaction when discovery passed it, or came into scope mid-run behind the
+    /// run's position. Measured once after the loop rather than per batch, and sends the
+    /// blocked ids once, so no row is counted both deferred and blocked.
     /// </summary>
     public async Task<long> CountDeferredAsync(
         SweepScope scope,
@@ -192,7 +187,7 @@ internal abstract class SweepStrategy(
 
         var (candidates, reached) = await LockCandidatesAsync(scope, conn, transaction, execution, ct);
         var result = candidates.Count == 0
-            ? new SweepExecutionResult([], 0)
+            ? new SweepExecutionResult([])
             : await MutateCandidatesAsync(scope, conn, transaction, candidates, execution, ct);
         return result with { Reached = reached };
     }
@@ -208,7 +203,7 @@ internal abstract class SweepStrategy(
     {
         var mutation = CreateMutation(scope);
         var hasHandlers = RetentionHandlerSupport.HasHandlers(handlerRegistrations, scope.Entry.EntityType);
-        if (!hasHandlers && !HasDependents(scope.Entry))
+        if (!hasHandlers && !dependentsRegistrations.HasStep(scope.Entry.EntityType))
         {
             return await MutateAsync(scope, conn, transaction, candidates, mutation, handlerScope: null, execution, ct);
         }
@@ -299,7 +294,6 @@ internal abstract class SweepStrategy(
             LogBlocked(scope, execution, blocked);
             return new SweepExecutionResult(
                 affected,
-                candidates.Count - affected.Count - blocked.RecordIds.Count,
                 CandidateCount: candidates.Count,
                 BlockedRecordIds: blocked.RecordIds,
                 BlockedFailures: blocked.Failures
@@ -362,7 +356,7 @@ internal abstract class SweepStrategy(
         }
         catch (DbException ex) when (IsIntegrityViolation(ex))
         {
-            await transaction.RollbackAsync(MutationSavepoint, CancellationToken.None);
+            await RollBackSavepointAsync(transaction, MutationSavepoint);
             refusal = ex;
         }
 
@@ -416,7 +410,6 @@ internal abstract class SweepStrategy(
         var affected = new List<string>();
         var skipped = 0;
         var blocked = new BlockedRows();
-        var heldCount = candidates.Count - rows.Count;
         foreach (var row in rows)
         {
             var recordIdValue =
@@ -485,7 +478,7 @@ internal abstract class SweepStrategy(
                 );
                 if (stepFailure is not null)
                 {
-                    await transaction.RollbackAsync(MutationSavepoint, CancellationToken.None);
+                    await RollBackSavepointAsync(transaction, MutationSavepoint);
                     skipped++;
                     await PersistSkippedAsync(scope, conn, transaction, execution, recordKey, stepFailure, ct);
                     continue;
@@ -501,7 +494,7 @@ internal abstract class SweepStrategy(
             {
                 // Refused by a constraint: nothing changed, the step is undone with it, and no
                 // OnAfter work is queued.
-                await transaction.RollbackAsync(MutationSavepoint, CancellationToken.None);
+                await RollBackSavepointAsync(transaction, MutationSavepoint);
                 blocked.Add(await RecordIdSql.CanonicalizeAsync(conn, transaction, entry.RecordId, recordKey, ct), ex);
                 continue;
             }
@@ -510,8 +503,8 @@ internal abstract class SweepStrategy(
             {
                 // No row back. The rollback undoes the step, so if the row matches the
                 // statement's own WHERE again, the step had taken it out of scope; otherwise a
-                // hold landed after the row was loaded.
-                await transaction.RollbackAsync(MutationSavepoint, CancellationToken.None);
+                // hold landed after the row was loaded, and the engine counts it as held.
+                await RollBackSavepointAsync(transaction, MutationSavepoint);
                 if (step is not null && await IsStillDueAsync(scope, conn, transaction, recordKey, ct))
                 {
                     skipped++;
@@ -521,13 +514,11 @@ internal abstract class SweepStrategy(
                         transaction,
                         execution,
                         recordKey,
-                        BeforeMutationFailure.Step(step, null, BeforeMutationFailure.DependentsChangedRowReason),
+                        BeforeMutationFailure.FromReason(step, BeforeMutationFailure.DependentsChangedRowReason),
                         ct
                     );
-                    continue;
                 }
 
-                heldCount++;
                 continue;
             }
 
@@ -553,7 +544,6 @@ internal abstract class SweepStrategy(
         LogBlocked(scope, execution, blocked);
         return new SweepExecutionResult(
             affected,
-            heldCount,
             // Only handlers write a row detail for each mutated row; a step alone leaves the
             // run's own row-detail audit to the engine.
             RowDetailsPersisted: onBefore is not null,
@@ -623,12 +613,12 @@ internal abstract class SweepStrategy(
             }
             catch (Exception ex)
             {
-                return BeforeMutationFailure.Step(step, ex);
+                return BeforeMutationFailure.FromException(step, ex);
             }
 
             if (RetentionHandlerSupport.HasUnsavedChanges(stepDb))
             {
-                return BeforeMutationFailure.Step(step, null, BeforeMutationFailure.DependentsUnsavedChangesReason);
+                return BeforeMutationFailure.FromReason(step, BeforeMutationFailure.DependentsUnsavedChangesReason);
             }
 
             IReadOnlyList<Guid> changedHolds;
@@ -640,7 +630,7 @@ internal abstract class SweepStrategy(
             {
                 // A step that swallowed its own database error leaves the transaction aborted;
                 // the rollback to the savepoint recovers it, and the row is the step's failure.
-                return BeforeMutationFailure.Step(step, ex);
+                return BeforeMutationFailure.FromException(step, ex);
             }
 
             if (changedHolds.Count > 0)
@@ -651,7 +641,7 @@ internal abstract class SweepStrategy(
                     step.StepType.FullName,
                     string.Join(", ", changedHolds)
                 );
-                return BeforeMutationFailure.Step(step, null, BeforeMutationFailure.DependentsChangedHeldRowReason);
+                return BeforeMutationFailure.FromReason(step, BeforeMutationFailure.DependentsChangedHeldRowReason);
             }
 
             return null;
@@ -740,13 +730,24 @@ internal abstract class SweepStrategy(
                 throw;
             }
 
-            await transaction.RollbackAsync(OnBeforeSavepoint, CancellationToken.None);
+            await RollBackSavepointAsync(transaction, OnBeforeSavepoint);
             return result;
         }
         finally
         {
             onBefore.Db.ChangeTracker.Clear();
         }
+    }
+
+    /// <summary>
+    /// ROLLBACK TO keeps the savepoint open, so release it too: otherwise each later row's
+    /// savepoint nests one level deeper for the rest of the batch. Ignores cancellation, like
+    /// every Cohort savepoint: a cancelled rollback would leave the batch aborted.
+    /// </summary>
+    private static async Task RollBackSavepointAsync(DbTransaction transaction, string savepoint)
+    {
+        await transaction.RollbackAsync(savepoint, CancellationToken.None);
+        await transaction.ReleaseAsync(savepoint, CancellationToken.None);
     }
 
     private static bool IsIntegrityViolation(DbException exception) =>

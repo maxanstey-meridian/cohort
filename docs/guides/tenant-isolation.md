@@ -44,7 +44,7 @@ RetentionExecutionContext.System(RetentionSystemWork Work)
 |---|---|
 | `IRetentionSweep`, `IRetentionPreview` | `Tenant` for a tenanted request, `System(TenantlessPass)` for a tenantless one |
 | `IRetentionErasureService` | `Tenant` for a tenanted request, `System(TenantlessPass)` for a tenantless one. Not called for the erasure itself with `ErasureTransaction.Caller`: that erasure runs in your scope, which you already set up (its row-handler batches, below, still are) |
-| Each batch's `OnBeforeAsync` handlers, in their own scope on the run's connection, `Caller` erasures included | `Tenant` of the run, or `System(TenantlessPass)` for a tenantless one |
+| Each batch's `OnBeforeAsync` handlers and dependents step, in their own scope on the run's connection and transaction, `Caller` erasures included | `Tenant` of the run, or `System(TenantlessPass)` for a tenantless one |
 | Scheduled worker iteration: its lock, occurrence ledger, tenant source and tenant coverage check (which reads the tenant column of every retained tenanted table, across tenants) | `System(WorkerCoordination)` |
 | A refused scheduled pass (a tenant missing from the source or returned with conflicting contexts), recorded as a `Failed` run | `Tenant` of the refused tenant |
 | Each scheduled pass, in its own scope | `Tenant`, or `System(TenantlessPass)` for the tenantless pass |
@@ -53,7 +53,7 @@ RetentionExecutionContext.System(RetentionSystemWork Work)
 | History pruning | `System(HistoryPruning)` |
 | Startup readiness | `System(Readiness)` |
 | Readiness's cross-tenant hold check, whichever operation runs readiness first | `System(Readiness)` |
-| `IRetentionDeletion`'s, and each batch with a dependents step's, check that its scope sees every hold on a tenantless row, in a model with tenantless entities | `System(Readiness)` |
+| The check, by `IRetentionDeletion` and by each batch with a dependents step, that its scope sees every hold on a tenantless row, in a model with tenantless entities | `System(Readiness)` |
 
 The first operation can be any of the above, `IRetentionHoldsRepository`,
 `IRetentionDeletion` or a `Caller` erasure. Apart from those `System(Readiness)` scopes,
@@ -83,18 +83,19 @@ tenant".
   context. Different work gets a new scope.
 - **Calls nest.** Each scheduled pass runs inside the worker's `WorkerCoordination` work,
   readiness's `System(Readiness)` check can run inside any operation's work, and each batch
-  with row handlers runs its own scope, for the run's tenant, inside the sweep's or erasure's
+  with row handlers or a dependents step runs its own scope, for the run's tenant, inside the sweep's or erasure's
   work (inside your own scope for a `Caller` erasure). Each `OnAfterAsync` delivery runs its
   own scope, for the row's tenant, inside the dispatcher's `System(RowDispatch)` work for its
   batch, which holds the batch's delivery locks. An inner call's
   context wholly replaces the outer one for its work: set it, don't merge it. Restore anything
   you change outside the scope's own services when the work returns, as a `using` block or
   `try`/`finally` does; an `AsyncLocal` set in the hook is restored for you.
-- **Tenanted work only runs as `Tenant`.** Each batch's `OnBeforeAsync` handlers get their
-  own scope, run as the batch's tenant, and are resolved inside that work. Each `OnAfterAsync` delivery gets its own scope, run as the row's tenant, and the
+- **Tenanted work only runs as `Tenant`.** Each batch's `OnBeforeAsync` handlers and
+  dependents step get their own scope, run as the batch's tenant, and are resolved inside that
+  work. Each `OnAfterAsync` delivery gets its own scope, run as the row's tenant, and the
   handler is resolved inside that work. No host code runs under `System` against tenanted rows. Handlers
-  for tenantless entities run under `System(TenantlessPass)`, against rows no tenant owns.
-- **A row-handler scope's context uses the run's connection.** If your hook opened the
+  and steps for tenantless entities run under `System(TenantlessPass)`, against rows no tenant owns.
+- **A row-handler or dependents scope's context uses the run's connection.** If your hook opened the
   scope's context, Cohort closes that connection and points the context at the run's, which
   your hook already isolated for the same tenant (or your own, for `ErasureTransaction.Caller`).
   Isolation you apply when a connection opens covers both.
@@ -181,8 +182,8 @@ transaction-pooling PgBouncer they would leak between clients, and Cohort's sess
 locks would not hold either. Npgsql resets session state when a connection returns to its
 pool.
 
-Each scope uses its own connection, except a batch's row-handler scope, which uses the
-run's. The worker holds its coordination connection for the
+Each scope uses its own connection, except a batch's row-handler and dependents scope, which
+uses the run's connection and transaction. The worker holds its coordination connection for the
 whole iteration and opens another for each pass, and the first readiness check can take one
 more in its own `System(Readiness)` scope. A pool of one connection hangs the worker; leave
 headroom.

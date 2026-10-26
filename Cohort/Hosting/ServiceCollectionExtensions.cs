@@ -157,7 +157,7 @@ public static class ServiceCollectionExtensions
             "Every row handler needs a permanent UUID: queued work is persisted under it."
         );
 
-        var existingRegistrations = RegistrationInstances<IRetentionHandlerRegistration>(services);
+        var existingRegistrations = new RetentionHandlerServiceRegistrations(services).Registrations();
 
         // TryAddEnumerable would silently keep the first registration of this pair, so
         // a repeat call with a different phase must fail loudly instead of appearing to
@@ -188,7 +188,7 @@ public static class ServiceCollectionExtensions
         }
 
         // One id space with dependents steps, whose failures are recorded under the same id.
-        var stepClash = RegistrationInstances<IRetentionDependentsRegistration>(services)
+        var stepClash = new RetentionHandlerServiceRegistrations(services).DependentsRegistrations()
             .FirstOrDefault(registration =>
                 registration.Identity == identity
                 && !IsSameClassAndEntity(registration.StepType, registration.EntityType, typeof(THandler), typeof(TEntity))
@@ -230,7 +230,7 @@ public static class ServiceCollectionExtensions
             "Every dependents step needs a permanent UUID: its failures are recorded under it."
         );
 
-        var existingSteps = RegistrationInstances<IRetentionDependentsRegistration>(services);
+        var existingSteps = new RetentionHandlerServiceRegistrations(services).DependentsRegistrations();
         var entityStep = existingSteps.FirstOrDefault(registration => registration.EntityType == typeof(TEntity));
         if (entityStep is not null && entityStep.StepType != typeof(TStep))
         {
@@ -250,7 +250,7 @@ public static class ServiceCollectionExtensions
             );
         }
 
-        var handlerClash = RegistrationInstances<IRetentionHandlerRegistration>(services)
+        var handlerClash = new RetentionHandlerServiceRegistrations(services).Registrations()
             .FirstOrDefault(registration =>
                 registration.Identity == identity
                 && !IsSameClassAndEntity(registration.HandlerType, registration.EntityType, typeof(TStep), typeof(TEntity))
@@ -294,13 +294,6 @@ public static class ServiceCollectionExtensions
                 $"{role} {type.FullName} has no [RowHandlerId(\"<uuid>\")] attribute. {why}"
             );
     }
-
-    private static TRegistration[] RegistrationInstances<TRegistration>(IServiceCollection services) =>
-        services
-            .Where(descriptor => descriptor.ServiceType == typeof(TRegistration))
-            .Select(descriptor => descriptor.ImplementationInstance)
-            .OfType<TRegistration>()
-            .ToArray();
 
     private static bool IsSameClassAndEntity(Type registeredClass, Type registeredEntity, Type newClass, Type newEntity) =>
         registeredClass == newClass && registeredEntity == newEntity;

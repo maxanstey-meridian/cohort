@@ -19,6 +19,7 @@ internal sealed class RetentionErasureService(
     EfRetentionAuditWriter auditWriter,
     RetentionAuditNotifier auditNotifier,
     IEnumerable<SweepStrategy> sweepStrategies,
+    IEnumerable<IRetentionDependentsRegistration> dependentsRegistrations,
     IRetentionExecutionSettings options,
     CohortCommitInterceptor commitInterceptor,
     ILogger<RetentionErasureService> logger
@@ -62,7 +63,7 @@ internal sealed class RetentionErasureService(
         );
         // Built before the run exists: a request refused by policy leaves no attempted run.
         var plan = await BuildExecutionPlanAsync(tenant, entities, scope, now, run, ct);
-        await run.ExecuteAsync(() => run.RunEntitiesAsync(plan, strategies, ct), ct);
+        await run.ExecuteAsync(() => run.RunEntitiesAsync(plan, strategies, dependentsRegistrations, ct), ct);
         return run.CreateErasureResult(scope);
     }
 

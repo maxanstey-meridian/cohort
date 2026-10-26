@@ -22,8 +22,6 @@ internal sealed class RetentionHoldGuard(
     IServiceScopeFactory scopeFactory
 )
 {
-    private readonly CohortStoreTables tables = CohortStoreTables.FromModel(db.Model);
-
     /// <summary>
     /// The hold checks see only the holds the caller's scope can read. A tenant scope whose
     /// holds policy hides NULL-tenant holds would pass a held tenantless row as unheld, so when
@@ -88,7 +86,7 @@ internal sealed class RetentionHoldGuard(
     )
     {
         var (sql, parameters) = RetentionHoldSql.BuildActiveHeldRowVersions(
-            tables.RetentionHolds,
+            CohortStoreTables.FromModel(db.Model).RetentionHolds,
             registry.Scan().Values.ToList(),
             baselineHoldIds
         );
@@ -165,7 +163,7 @@ internal sealed class RetentionHoldGuard(
         await using var command = new SqlParams().CreateCommand(
             connection,
             transaction,
-            RetentionHoldSql.BuildActiveTenantlessHoldIds(tables.RetentionHolds)
+            RetentionHoldSql.BuildActiveTenantlessHoldIds(CohortStoreTables.FromModel(db.Model).RetentionHolds)
         );
         var holdIds = new HashSet<Guid>();
         await using var reader = await command.ExecuteReaderAsync(ct);

@@ -42,16 +42,17 @@ Along the way:
 
 - One entity's failure is recorded on the run (`PartiallyFailed` plus `Error`, and in
   `EntityFailures` on the result), and the run carries on with the remaining entities.
-- Rows skipped by a failing `OnBeforeAsync` are excluded from the run's remaining batches.
-  They're dead-lettered once and left for the next run, so a failing row can't spin the batch
-  loop or block the eligible rows behind it. A batch that makes no progress at all stops the
-  loop for that entity. Skipped rows make the run `PartiallyFailed`, with a `rows-skipped`
-  reason in `Error` and `EntityFailures`.
+- Each batch continues after the last row the previous batch reached, in the order rows are
+  selected (anchor, then record ID), so no row is tried twice in a run and a batch costs the
+  same however many rows came before it. Rows skipped by a failing `OnBeforeAsync` are
+  dead-lettered once and left for the next run, so a failing row can't spin the batch loop
+  or block the eligible rows behind it. Skipped rows make the run `PartiallyFailed`, with a
+  `rows-skipped` reason in `Error` and `EntityFailures`.
 - A row an integrity constraint refuses (any SQLSTATE class 23 error: a foreign key, a check,
   a unique index, a constraint trigger) is blocked, not fatal. The batch's statement is
   bisected under savepoints until the refused rows are found, or on the row-by-row path each
-  row's change has its own savepoint. The rest of the batch commits, blocked rows are left out
-  of the run's remaining batches, and a Warning names the constraint (never the row). Rows
+  row's change has its own savepoint. The rest of the batch commits, the run moves on past the
+  blocked rows, and a Warning names the constraint (never the row). Rows
   left out up front because a foreign key still references them get one Warning per entity
   naming the keys that can block it. A full
   batch in which every row is refused fails the entity instead, since the cause is then the
@@ -66,10 +67,10 @@ Along the way:
   rows leave it `Succeeded`, like held rows, and the next run tries them again; an erasure
   with blocked rows settles `PartiallyFailed` with a `rows-blocked` reason.
 - Once an entity's batches are done, the rows still due that the run neither changed nor
-  skipped are counted once, in `DeferredCount`: rows another transaction had locked (a sweep
-  skips them), rows the loop stopped before reaching, and rows that came into scope
-  mid-run. A sweep's next run retires them, so they leave it `Succeeded`; an erasure that
-  missed rows settles `PartiallyFailed` with a `rows-missed` reason.
+  skipped are counted once, in `DeferredCount`: rows another transaction had locked when the
+  run reached them (a sweep skips them and doesn't come back to them in the same run), and
+  rows that came into scope mid-run behind the run. A sweep's next run retires them, so they
+  leave it `Succeeded`; an erasure that missed rows settles `PartiallyFailed` with a `rows-missed` reason.
 - An erasure also reports what its rule keeps in `RetainedCount` (rows younger than the
   legal minimum, or every row under an `Exempt` rule), and `ErasureResult.Complete` says
   whether anything of the subject was left. See

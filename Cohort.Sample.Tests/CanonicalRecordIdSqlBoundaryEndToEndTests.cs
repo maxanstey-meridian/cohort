@@ -247,6 +247,63 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
         (await command.ExecuteScalarAsync()).Should().Be(1L);
     }
 
+    [Fact]
+    public async Task A_Sweep_In_Small_Batches_Reaches_Every_Row_Whatever_Its_Key_And_Anchor_Types()
+    {
+        // Each batch continues after the last (anchor, record-id text) the run reached. Numeric
+        // ids sort differently as text ("10" before "2"), citext compares case-insensitively,
+        // and anchors (a DateTime and a DateTimeOffset, both timestamptz) must be compared as
+        // themselves, not through text in the session's time zone (here far from UTC). A cursor
+        // that disagreed with discovery's order would skip rows and leave them deferred.
+        await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
+        var connectionString = new NpgsqlConnectionStringBuilder(database.ConnectionString) { Timezone = "Pacific/Kiritimati" }
+            .ConnectionString;
+        var asOf = new DateTimeOffset(2026, 7, 11, 12, 0, 0, TimeSpan.Zero);
+        var services = new ServiceCollection();
+        services.AddSingleton<IConfiguration>(
+            new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string?> { [$"{CohortOptions.SectionName}:SweepBatchSize"] = "2" })
+                .Build()
+        );
+        services.AddLogging();
+        services.AddDbContext<KeysetDbContext>(options => options.UseNpgsql(connectionString));
+        services.AddSingleton<IRetentionRuleProvider>(new CategoryRepository(Strategy.Purge));
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
+        services.AddCohort<KeysetDbContext>();
+        await using var provider = services.BuildServiceProvider(validateScopes: true);
+
+        // Three anchors, a few hours apart, each shared by several rows.
+        var anchors = Enumerable.Range(0, 3)
+            .Select(index => asOf.UtcDateTime.AddDays(-60).AddHours(index * 5).AddTicks(index * 10))
+            .ToArray();
+        await using (var scope = provider.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<KeysetDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            for (var index = 0; index < 12; index++)
+            {
+                db.Add(new KeysetNumericRecord { Id = index + 1, CreatedAt = anchors[index % 3] });
+                db.Add(new KeysetCitextRecord { Id = $"{(char)((index % 2 == 0 ? 'a' : 'A') + index)}{index}", CreatedOn = new DateTimeOffset(anchors[index % 3]) });
+            }
+            await db.SaveChangesAsync();
+        }
+
+        var result = await provider.GetRequiredService<IRetentionSweep>().ExecuteAsync(
+            RetentionSweepRequest.Tenantless(asOf)
+        );
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().HaveCount(2)
+            .And.OnlyContain(count => count.Affected == 12 && count.DeferredCount == 0 && count.BlockedCount == 0);
+        await using var verify = new NpgsqlConnection(database.ConnectionString);
+        await verify.OpenAsync();
+        await using var command = verify.CreateCommand();
+        command.CommandText = """
+            SELECT (SELECT count(*) FROM "keyset_numeric_record") + (SELECT count(*) FROM "keyset_citext_record")
+            """;
+        (await command.ExecuteScalarAsync()).Should().Be(0L);
+    }
+
     private static ServiceProvider BuildSpelledServiceProvider(string connectionString)
     {
         var services = new ServiceCollection();
@@ -401,5 +458,44 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
     {
         public string Id { get; init; } = "";
         public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    private sealed class KeysetDbContext(DbContextOptions<KeysetDbContext> options) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.HasPostgresExtension("citext");
+            modelBuilder.Entity<KeysetNumericRecord>(entity =>
+            {
+                entity.ToTable("keyset_numeric_record");
+                entity.Property(record => record.Id).HasColumnType("numeric").ValueGeneratedNever();
+            });
+            modelBuilder.Entity<KeysetCitextRecord>(entity =>
+            {
+                entity.ToTable("keyset_citext_record");
+                entity.Property(record => record.Id).HasColumnType("citext");
+                // timestamptz(3): Npgsql names the type with its precision.
+                entity.Property(record => record.CreatedOn).HasPrecision(3);
+            });
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    [Retain("canonical-record-id", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0004-000000000004")]
+    [RetentionTenantless]
+    private sealed class KeysetNumericRecord
+    {
+        public decimal Id { get; init; }
+        public DateTime CreatedAt { get; init; }
+    }
+
+    [Retain("canonical-record-id", nameof(CreatedOn))]
+    [RetentionEntityId("00000000-0000-0000-0004-000000000005")]
+    [RetentionTenantless]
+    private sealed class KeysetCitextRecord
+    {
+        public string Id { get; init; } = "";
+        public DateTimeOffset CreatedOn { get; init; }
     }
 }

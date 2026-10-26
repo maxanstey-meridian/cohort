@@ -453,10 +453,12 @@ internal sealed class RetentionRun(
     /// its own transaction, so a large backlog retires incrementally and a failure loses only
     /// the current batch. In the caller's transaction the batches still bound each statement,
     /// but none commits on its own: the entity's savepoint and the caller's commit decide.
-    /// Rows a constraint refuses are blocked and left out of later batches; a full batch in
-    /// which every row is refused by the same constraint, other than a foreign key refusing a
-    /// delete, fails the entity, since the cause is then the rule or the schema rather than
-    /// the rows, and bisecting the rest of the table would find the same.
+    /// Each batch continues after the last row the previous one reached, so no row is tried
+    /// twice in a run and each batch's discovery costs one batch however many rows came
+    /// before. Rows a constraint refuses are blocked and counted once the loop is done; a
+    /// full batch in which every row is refused by the same constraint, other than a foreign
+    /// key refusing a delete, fails the entity, since the cause is then the rule or the
+    /// schema rather than the rows, and bisecting the rest of the table would find the same.
     /// </summary>
     private async Task<(long Affected, long Skipped, IReadOnlyCollection<string> Blocked)> ExecuteBatchesAsync(
         SweepStrategy strategy,
@@ -471,7 +473,9 @@ internal sealed class RetentionRun(
             (entry.AuditRowDetail == AuditRowDetail.Inherit ? rule.AuditRowDetail : entry.AuditRowDetail)
             == AuditRowDetail.PerRow;
         long affected = 0, skipped = 0;
+        // Only for the counts after the loop, which send it once; discovery never does.
         var blocked = new HashSet<string>(StringComparer.Ordinal);
+        SweepCursor? reached = null;
         DateTimeOffset? nextBatchAt = entityAt;
 
         while (true)
@@ -509,7 +513,7 @@ internal sealed class RetentionRun(
                     scope,
                     db.Database.GetDbConnection(),
                     (batchTransaction ?? db.Database.CurrentTransaction!).GetDbTransaction(),
-                    new SweepMutationContext(SweepId, eventAt, batchSize, blocked),
+                    new SweepMutationContext(SweepId, eventAt, batchSize, reached),
                     ct
                 );
                 if (
@@ -569,15 +573,12 @@ internal sealed class RetentionRun(
             affected += execution.AffectedRecordIds.Count;
             skipped += execution.SkippedCount;
             blocked.UnionWith(execution.BlockedRecordIds);
+            reached = execution.Reached;
             ReplaceCount(new EntitySweepCount(entry.EntityType, entry.Category, scope.Tenant.Id, rule.Strategy, affected, 0, skipped, 0, 0, 0, blocked.Count));
 
-            // A short batch means the scope is exhausted. A full batch that neither mutated,
-            // skipped nor blocked anything would reselect the same rows forever; the
-            // remainder is left for the next run.
-            if (
-                execution.CandidateCount < batchSize
-                || (execution.AffectedRecordIds.Count == 0 && execution.SkippedRecordIds.Count == 0 && execution.BlockedRecordIds.Count == 0)
-            )
+            // A short batch means discovery found no more rows. A full one moved the position
+            // forward past every row it locked, so the loop always ends.
+            if (execution.CandidateCount < batchSize)
             {
                 return (affected, skipped, blocked);
             }

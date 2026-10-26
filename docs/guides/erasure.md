@@ -140,7 +140,7 @@ counts don't overlap:
 | `NullAnchorCount` | their anchor is null, so a legal-minimum cutoff never matches them |
 | `RetainedCount` | the rule keeps them: younger than the legal minimum, or every row under an `Exempt` rule |
 | `SkippedCount` | a row handler's `OnBeforeAsync` failed, so the row was left unchanged |
-| `DeferredCount` | they were still due when the run finished with the entity, but it never reached them (they came into scope mid-run, or the batch loop stopped) |
+| `DeferredCount` | they were still due when the run finished with the entity, but it didn't change them: another transaction had them locked when the run reached them, or they came into scope mid-run |
 | `BlockedCount` | a database constraint stopped Cohort changing them |
 
 `ErasureResult.Complete` reads them for you. It is `true` only when no entity failed and every

@@ -85,6 +85,14 @@ Work queued under an id no registered handler carries is dead-lettered with
 `entity id … is not registered; restore its [RetentionEntityId] and requeue`. Either keeps its
 snapshot, so once the handler or the id is back, [requeue it](#requeuing-dead-lettered-work).
 
+Upgrading from 0.10, a handler that passed `identity` to `AddRowHandler` keeps its queued work
+by carrying the same UUID in `[RowHandlerId]`. A class registered for several entities with a
+different `identity` each now carries one id, so the other identities' work would be
+orphaned: split it into one class per entity, each with its old UUID, or re-key the other
+identities' rows to the class's id (the `UPDATE` in the 0.11.0 changelog entry). Work queued
+under a type name, by a handler registered without `identity`, must be drained on 0.10 or
+re-keyed the same way.
+
 When an entity has several handlers, they run in `[RowHandlerPriority(n)]` order, lowest
 first. Handlers without the attribute run last, ordered by type name.
 

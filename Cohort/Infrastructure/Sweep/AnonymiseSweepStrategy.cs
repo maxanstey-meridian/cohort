@@ -27,12 +27,12 @@ internal sealed class AnonymiseSweepStrategy(
         }
 
         // The startup validator only enforces the marker for rules it can resolve at boot.
-        // A runtime-resolved Anonymise rule on an entity without it would reselect the same
-        // rows every batch, because the mutation never shrinks the candidate filter.
+        // A runtime-resolved Anonymise rule on an entity without it would anonymise the same
+        // rows again on every run, because the mutation never takes them out of scope.
         if (entry.AnonymisedAt is null)
         {
             throw new InvalidOperationException(
-                $"Retention entry for {entry.EntityType.FullName} resolves to the Anonymise strategy but has no AnonymisedAt marker (a nullable DateTimeOffset named AnonymisedAt by convention, or marked with [RetentionAnonymisedAt]). Without it anonymisation cannot tell scrubbed rows from pending ones and batched anonymisation would never terminate."
+                $"Retention entry for {entry.EntityType.FullName} resolves to the Anonymise strategy but has no AnonymisedAt marker (a nullable DateTimeOffset named AnonymisedAt by convention, or marked with [RetentionAnonymisedAt]). Without it anonymisation cannot tell scrubbed rows from pending ones and would anonymise the same rows again on every run."
             );
         }
     }

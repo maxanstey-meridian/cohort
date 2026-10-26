@@ -110,10 +110,9 @@ internal abstract class SweepStrategy(
     /// <summary>
     /// Rows still due once run <paramref name="sweepId"/> has finished its batches for the
     /// entity that the run did not record (as skipped by a failing OnBefore) or find
-    /// <paramref name="blocked"/>: locked by another transaction, not reached before the loop
-    /// stopped, or come into scope mid-run. Measured once after the loop rather than per
-    /// batch, because a row that stays locked is rediscovered by every batch. Referenced
-    /// rows aren't due, so blocked rows are never counted twice.
+    /// <paramref name="blocked"/>: locked by another transaction when discovery passed them,
+    /// or come into scope mid-run behind the run's position. Measured once after the loop
+    /// rather than per batch, and sends the blocked ids once. Referenced rows aren't due, so blocked rows are never counted twice.
     /// </summary>
     public async Task<long> CountDeferredAsync(
         SweepScope scope,
@@ -182,12 +181,22 @@ internal abstract class SweepStrategy(
     {
         EnsureHandles(scope);
 
-        var candidates = await LockCandidatesAsync(scope, conn, transaction, execution, ct);
-        if (candidates.Count == 0)
-        {
-            return new SweepExecutionResult([], 0);
-        }
+        var (candidates, reached) = await LockCandidatesAsync(scope, conn, transaction, execution, ct);
+        var result = candidates.Count == 0
+            ? new SweepExecutionResult([], 0)
+            : await MutateCandidatesAsync(scope, conn, transaction, candidates, execution, ct);
+        return result with { Reached = reached };
+    }
 
+    private async Task<SweepExecutionResult> MutateCandidatesAsync(
+        SweepScope scope,
+        DbConnection conn,
+        DbTransaction transaction,
+        IReadOnlyList<string> candidates,
+        SweepMutationContext execution,
+        CancellationToken ct
+    )
+    {
         var mutation = CreateMutation(scope);
         if (!RetentionHandlerSupport.HasHandlers(handlerRegistrations, scope.Entry.EntityType))
         {
@@ -381,7 +390,7 @@ internal abstract class SweepStrategy(
         var recordIdConverter = recordIdProperty.GetTypeMapping().Converter;
 
         var affected = new List<string>();
-        var skipped = new List<string>();
+        var skipped = 0;
         var blocked = new BlockedRows();
         var heldCount = candidates.Count - rows.Count;
         foreach (var row in rows)
@@ -413,7 +422,7 @@ internal abstract class SweepStrategy(
                         recordKey,
                         ct
                     );
-                    skipped.Add(skippedId);
+                    skipped++;
                     await RetentionHandlerSupport.PersistBeforeFailureAsync(
                         conn,
                         transaction,
@@ -490,9 +499,8 @@ internal abstract class SweepStrategy(
             affected,
             heldCount,
             RowDetailsPersisted: onBefore is not null,
-            SkippedCount: skipped.Count,
+            SkippedCount: skipped,
             CandidateCount: candidates.Count,
-            SkippedRecordIds: skipped,
             BlockedRecordIds: blocked.RecordIds,
             BlockedFailures: blocked.Failures
         );
@@ -582,13 +590,15 @@ internal abstract class SweepStrategy(
     }
 
     /// <summary>
-    /// Selects up to one batch of candidates and locks them: the entity lock serialises
-    /// against hold creation, the row lock against other runs. Held rows are excluded up
-    /// front so they are neither locked nor reselected by every batch; rows an earlier
-    /// batch of this run already recorded (e.g. skipped by a failing OnBefore) are excluded
-    /// too, since they stay eligible and would otherwise be re-failed forever.
+    /// Selects up to one batch of candidates after the row the run's previous batch reached,
+    /// and locks them: the entity lock serialises against hold creation, the row lock against
+    /// other runs. Held rows are excluded up front so they are neither locked nor reselected.
+    /// A discovered row that fails the lock re-check (locked by another run, or no longer
+    /// due) is passed over, and discovery continues after it until the batch is full or no
+    /// row is left: a sweep leaves a locked row for its next run, which counts it as deferred.
+    /// Returns the locked rows and where the next batch continues.
     /// </summary>
-    private async Task<IReadOnlyList<string>> LockCandidatesAsync(
+    private async Task<(IReadOnlyList<string> Locked, SweepCursor? Reached)> LockCandidatesAsync(
         SweepScope scope,
         DbConnection conn,
         DbTransaction transaction,
@@ -598,16 +608,17 @@ internal abstract class SweepStrategy(
     {
         var entry = scope.Entry;
         var locked = new List<string>();
-        var attempted = new List<string>();
+        var reached = execution.After;
         while (locked.Count < execution.BatchSize)
         {
             var limit = execution.BatchSize - locked.Count;
-            var discovered = await DiscoverAsync(scope, conn, transaction, execution, attempted, limit, ct);
+            var (discovered, last) = await DiscoverAsync(scope, conn, transaction, execution.SweepId, reached, limit, ct);
             if (discovered.Count == 0)
             {
                 break;
             }
 
+            reached = last;
             await RetentionEntityLockSql.AcquireAsync(
                 conn,
                 transaction,
@@ -630,47 +641,86 @@ internal abstract class SweepStrategy(
                 """
             );
             locked.AddRange(await ReadRecordIdsAsync(command, ct));
-            attempted.AddRange(discovered);
             if (discovered.Count < limit)
             {
                 break;
             }
         }
 
-        return locked;
+        return (locked, reached);
     }
 
-    private async Task<List<string>> DiscoverAsync(
+    /// <summary>
+    /// Up to <paramref name="limit"/> due rows after <paramref name="after"/> in discovery's
+    /// order, and the last of them. A keyset rather than an exclusion list, after the
+    /// dispatcher's expired-claim recovery on (<c>ClaimedAt</c>, <c>Id</c>): each statement
+    /// costs one batch however many rows the run has already passed over.
+    /// </summary>
+    private async Task<(List<string> RecordIds, SweepCursor? Last)> DiscoverAsync(
         SweepScope scope,
         DbConnection conn,
         DbTransaction transaction,
-        SweepMutationContext execution,
-        IReadOnlyList<string> attempted,
+        Guid sweepId,
+        SweepCursor? after,
         int limit,
         CancellationToken ct
     )
     {
         var entry = scope.Entry;
         var parameters = new SqlParams { ["batchSize"] = limit };
-        var exclusions = NotAnyRecordIdSql(
-            entry,
-            "attemptedRecordIds",
-            [.. attempted, .. execution.ExcludedRecordIds],
-            parameters
-        ) + NotRecordedByRunSql(scope, execution.SweepId, parameters);
+        var where = DueSql(scope, parameters)
+            + AfterCursorSql(scope, after, parameters)
+            + NotRecordedByRunSql(scope, sweepId, parameters);
 
         await using var command = parameters.CreateCommand(
             conn,
             transaction,
             $"""
-            SELECT {RecordIdSql.TextExpression("target", entry.RecordId)}
+            SELECT {RecordIdSql.TextExpression("target", entry.RecordId)}, target.{PostgreSqlIdentifier.Quote(entry.AnchorColumn)}
             FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
-            WHERE {DueSql(scope, parameters)}{exclusions}
+            WHERE {where}
             ORDER BY {OrderBySql(entry)}
             LIMIT @batchSize
             """
         );
-        return await ReadRecordIdsAsync(command, ct);
+        var recordIds = new List<string>();
+        SweepCursor? last = null;
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            var recordId = reader.GetString(0);
+            recordIds.Add(recordId);
+            last = new SweepCursor(reader.IsDBNull(1) ? null : reader.GetFieldValue<DateTimeOffset>(1), recordId);
+        }
+
+        return (recordIds, last);
+    }
+
+    /// <summary>
+    /// Rows after <paramref name="after"/> in <see cref="OrderBySql"/>'s order, compared on
+    /// the same expressions: the anchor as a timestamptz, then the record id's text. Ascending order puts NULL anchors
+    /// last and a row comparison with NULL is never true, so they are spelt out; only an
+    /// erasure without a legal minimum has them in scope.
+    /// </summary>
+    private static string AfterCursorSql(SweepScope scope, SweepCursor? after, SqlParams parameters)
+    {
+        if (after is null)
+        {
+            return "";
+        }
+
+        var entry = scope.Entry;
+        var anchor = $"target.{PostgreSqlIdentifier.Quote(entry.AnchorColumn)}";
+        var recordId = RecordIdSql.TextExpression("target", entry.RecordId);
+        parameters["cursorRecordId"] = after.RecordId;
+        if (after.Anchor is null)
+        {
+            return $"\n  AND {anchor} IS NULL AND {recordId} > @cursorRecordId";
+        }
+
+        parameters["cursorAnchor"] = after.Anchor;
+        var nullAnchors = scope.Cutoff is null ? $" OR {anchor} IS NULL" : "";
+        return $"\n  AND (({anchor}, {recordId}) > (@cursorAnchor, @cursorRecordId){nullAnchors})";
     }
 
     /// <summary>
@@ -702,8 +752,9 @@ internal abstract class SweepStrategy(
 
     /// <summary>
     /// Excludes rows run <paramref name="sweepId"/> already recorded for this entity, such as
-    /// rows a failing OnBefore skipped: they stay eligible, so reselecting them would re-fail
-    /// them forever, and counting them as deferred would count them twice.
+    /// rows a failing OnBefore skipped: they stay eligible, so counting them as deferred would
+    /// count them twice. Discovery's keyset already passes them, but a row whose anchor moved
+    /// later after it was recorded would be met again, and its row detail recorded twice.
     /// </summary>
     private string NotRecordedByRunSql(SweepScope scope, Guid sweepId, SqlParams parameters)
     {

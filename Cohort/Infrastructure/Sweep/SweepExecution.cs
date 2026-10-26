@@ -8,23 +8,14 @@ internal sealed record SweepExecutionResult(
     bool RowDetailsPersisted = false,
     int SkippedCount = 0,
     int CandidateCount = 0,
-    IReadOnlyList<string>? SkippedRecordIds = null,
     IReadOnlyList<string>? BlockedRecordIds = null,
     IReadOnlyList<DbException>? BlockedFailures = null
 )
 {
     /// <summary>
-    /// Record ids the strategy selected but deliberately did not mutate (e.g. rows whose
-    /// OnBefore handler failed). The engine excludes them from later batches of the same
-    /// run: a skipped row stays eligible, so reselecting it would re-fail it forever and
-    /// re-insert its audit row detail under the same sweep id.
-    /// </summary>
-    public IReadOnlyList<string> SkippedRecordIds { get; init; } = SkippedRecordIds ?? [];
-
-    /// <summary>
     /// Record ids an integrity constraint (SQLSTATE class 23) refused to let the strategy
-    /// change. Not persisted: the engine counts them and excludes them from later batches of
-    /// the same run.
+    /// change. Not persisted: the engine counts them, and later batches of the run continue
+    /// past them (<see cref="Reached"/>).
     /// </summary>
     public IReadOnlyList<string> BlockedRecordIds { get; init; } = BlockedRecordIds ?? [];
 
@@ -33,18 +24,33 @@ internal sealed record SweepExecutionResult(
     /// engine reads them to tell a schema-wide refusal from row-level ones.
     /// </summary>
     public IReadOnlyList<DbException> BlockedFailures { get; init; } = BlockedFailures ?? [];
+
+    /// <summary>
+    /// Where the run's next batch for the entity continues: the last row this batch's
+    /// discovery reached, or where it started when it found none.
+    /// </summary>
+    public SweepCursor? Reached { get; init; }
 }
 
 /// <summary>
-/// One batch of a real run. <c>ExcludedRecordIds</c> are rows earlier batches of the run
-/// found blocked, left out of discovery so they aren't tried again in the same run.
+/// One batch of a real run. Discovery continues after <paramref name="After"/>, the row the
+/// run's previous batch for the entity reached (from the start when null).
 /// </summary>
 internal sealed record SweepMutationContext(
     Guid SweepId,
     DateTimeOffset At,
     int BatchSize,
-    IReadOnlyCollection<string> ExcludedRecordIds
+    SweepCursor? After
 );
+
+/// <summary>
+/// A position in discovery's order (anchor ascending with NULLs last, then record-id text).
+/// Every row before it was tried once by the run: changed, skipped, blocked, or found locked
+/// and left for the next run. The anchor is bound as a timestamptz, like the cutoff, so the
+/// comparison never goes through text. Null when the row's anchor is NULL, which only an
+/// erasure without a legal minimum reaches.
+/// </summary>
+internal sealed record SweepCursor(DateTimeOffset? Anchor, string RecordId);
 
 internal sealed record ErasureSubjectPredicate
 {

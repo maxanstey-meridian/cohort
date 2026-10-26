@@ -111,6 +111,11 @@ unprotected without an error.
   anonymise writes (a static factory's missing key, say), which fails the entity.
   Batches Cohort owns check constraints immediately, so a deferred constraint blocks its row
   rather than failing the commit.
+- A run that finds many rows blocked no longer slows down quadratically. Each batch now carries
+  on from the last row the previous one reached instead of re-sending every row the run had
+  blocked so far, which cost a run with a million blocked rows about 4 GB of ids. A row another
+  transaction has locked when the run reaches it is now left for the next run (counted in
+  `DeferredCount`) rather than tried again by a later batch of the same run.
 - `OnBeforeAsync` runs in a read-only savepoint that is always rolled back. A database error
   in a handler skips only its row instead of failing the batch, and a handler that writes
   through its `DbContext` now fails (`sqlstate:25006`). Handlers get a `DbContext` of their
@@ -150,7 +155,10 @@ unprotected without an error.
   `IRetentionRowDispatcher.RequeueDeadLetteredAsync(handlerId: <uuid>)` delivers it. 0.10
   cleared a row's snapshot once all its handlers had finished, so work 0.10 dead-lettered
   can't be requeued. A handler that already passed `identity` keeps its work by putting the
-  same UUID in its attribute.
+  same UUID in its attribute. A class 0.10 registered for several entities with a different
+  `identity` each now carries one id, so the other identities' work is orphaned: split the
+  class into one per entity, each with its old UUID, or re-key the other identities' rows to
+  the class's id with the `UPDATE` above.
 - Dead-lettered `OnAfterAsync` work keeps its snapshot until
   `RowHandlerDispatch:PayloadRetention`, and the new
   `IRetentionRowDispatcher.RequeueDeadLetteredAsync(sweepId, handlerId)` requeues it: every

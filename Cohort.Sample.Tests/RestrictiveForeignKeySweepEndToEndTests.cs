@@ -534,6 +534,66 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
         (await LoadParentIdsAsync(services)).Take(ids.Length).Should().Equal(ids);
     }
 
+    [Fact]
+    public async Task Discovery_Sends_At_Most_A_Batch_Of_Record_Ids_However_Many_Rows_The_Run_Has_Blocked()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
+        var commands = new RecordingCommandLog();
+        await using var services = BuildServiceProvider(database.ConnectionString, batchSize: 2, commandLog: commands);
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var anchor = asOf.AddDays(-300);
+        var ids = Enumerable.Range(0, 10).Select(_ => Guid.NewGuid()).ToArray();
+        var blockedIds = ids[..8];
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<RestrictiveForeignKeyDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            // One shared anchor: discovery's order falls entirely to the record id.
+            db.Parents.AddRange(ids.Select(id => Parent(id, tenantId, anchor)));
+            await db.SaveChangesAsync();
+        }
+        // Eight rows held by a NO ACTION grandchild behind a CASCADE child the reference check
+        // can't see, so each is refused when tried: four full batches of blocked rows.
+        await ExecuteAsync(
+            database.ConnectionString,
+            $"""
+            CREATE TABLE hidden_fk_children (
+                "Id" uuid PRIMARY KEY,
+                "ParentId" uuid NOT NULL REFERENCES restrictive_fk_parents ("Id") ON DELETE CASCADE
+            );
+            CREATE TABLE hidden_fk_grandchildren (
+                "Id" uuid PRIMARY KEY,
+                "ChildId" uuid NOT NULL REFERENCES hidden_fk_children ("Id")
+            );
+            INSERT INTO hidden_fk_children ("Id", "ParentId")
+                SELECT gen_random_uuid(), "Id" FROM restrictive_fk_parents
+                WHERE "Id" = ANY(ARRAY[{string.Join(", ", blockedIds.Select(id => $"'{id}'::uuid"))}]);
+            INSERT INTO hidden_fk_grandchildren ("Id", "ChildId")
+                SELECT gen_random_uuid(), "Id" FROM hidden_fk_children;
+            """
+        );
+
+        var result = await SweepAsync(services, tenantId, asOf);
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(ARestrictiveParent))
+            .Which.Should().Match<EntitySweepCount>(count =>
+                count.Affected == 2 && count.BlockedCount == 8 && count.DeferredCount == 0);
+        (await LoadSummaryAsync(database.ConnectionString, result.SweepId, typeof(ARestrictiveParent)))
+            .Should().Be(new SummaryCounts(Affected: 2, Deferred: 0, Blocked: 8));
+        (await LoadParentIdsAsync(services)).Should().BeEquivalentTo(blockedIds);
+        // Each batch's discovery carries at most a batch's worth of record ids, not every row
+        // the run has blocked so far.
+        var discoveries = commands.Commands
+            .Where(command => command.Text.Contains("FROM \"public\".\"restrictive_fk_parents\"", StringComparison.Ordinal)
+                && command.Text.Contains("LIMIT $", StringComparison.Ordinal))
+            .ToList();
+        discoveries.Should().HaveCountGreaterThanOrEqualTo(5);
+        discoveries.Should().OnlyContain(command => command.ArrayElements <= 2);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -703,7 +763,80 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
         (await LoadParentIdsAsync(services)).Should().Equal(referencedId);
     }
 
-    private static ARestrictiveParent Parent(Guid id, Guid tenantId, DateTimeOffset createdAt, Guid? subjectId = null) =>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Erasure_In_Single_Row_Batches_Continues_Past_A_Blocked_Row_Among_Null_Anchors(bool callerTransaction)
+    {
+        // Without a legal minimum an erasure has no cutoff, so rows with a NULL anchor are in
+        // scope; discovery's order puts them last. Each one-row batch continues after the row
+        // the last one reached, past the blocked one, through the NULLs.
+        await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
+        await using var services = BuildServiceProvider(database.ConnectionString, batchSize: 1);
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subjectId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var datedId = Guid.NewGuid();
+        var nullIds = Enumerable.Range(0, 4).Select(_ => Guid.NewGuid()).OrderBy(id => id.ToString(), StringComparer.Ordinal).ToArray();
+        var blockedId = nullIds[1];
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<RestrictiveForeignKeyDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.Parents.Add(Parent(datedId, tenant.Id, asOf.AddDays(-1), subjectId));
+            db.Parents.AddRange(nullIds.Select(id => Parent(id, tenant.Id, null, subjectId)));
+            await db.SaveChangesAsync();
+        }
+        await ExecuteAsync(
+            database.ConnectionString,
+            $"""
+            CREATE TABLE hidden_fk_children (
+                "Id" uuid PRIMARY KEY,
+                "ParentId" uuid NOT NULL REFERENCES restrictive_fk_parents ("Id") ON DELETE CASCADE
+            );
+            CREATE TABLE hidden_fk_grandchildren (
+                "Id" uuid PRIMARY KEY,
+                "ChildId" uuid NOT NULL REFERENCES hidden_fk_children ("Id")
+            );
+            INSERT INTO hidden_fk_children ("Id", "ParentId") VALUES (gen_random_uuid(), '{blockedId}');
+            INSERT INTO hidden_fk_grandchildren ("Id", "ChildId") SELECT gen_random_uuid(), "Id" FROM hidden_fk_children;
+            """
+        );
+
+        ErasureResult result;
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var erasure = scope.ServiceProvider.GetRequiredService<IRetentionErasureService>();
+            if (callerTransaction)
+            {
+                var db = scope.ServiceProvider.GetRequiredService<RestrictiveForeignKeyDbContext>();
+                await using var transaction = await db.Database.BeginTransactionAsync();
+                result = await erasure.ExecuteAsync(
+                    RetentionErasureRequest.Tenanted(tenant, new ErasureScope("person", subjectId), asOf, ErasureTransaction.Caller)
+                );
+                await transaction.CommitAsync();
+            }
+            else
+            {
+                result = await erasure.ExecuteAsync(
+                    RetentionErasureRequest.Tenanted(tenant, new ErasureScope("person", subjectId), asOf)
+                );
+            }
+        }
+
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(ARestrictiveParent))
+            .Which.Should().Match<EntitySweepCount>(count =>
+                count.Affected == 4 && count.BlockedCount == 1 && count.DeferredCount == 0 && count.NullAnchorCount == 0);
+        result.EntityFailures.Should().ContainSingle().Which.Should().Be(
+            "reason=rows-blocked;entityType=Cohort.Sample.Tests.RestrictiveForeignKeySweepEndToEndTests+ARestrictiveParent;count=1"
+        );
+        (await LoadSummaryAsync(database.ConnectionString, result.SweepId, typeof(ARestrictiveParent)))
+            .Should().Be(new SummaryCounts(Affected: 4, Deferred: 0, Blocked: 1));
+        (await LoadParentIdsAsync(services)).Should().Equal(blockedId);
+    }
+
+    private static ARestrictiveParent Parent(Guid id, Guid tenantId, DateTimeOffset? createdAt, Guid? subjectId = null) =>
         new()
         {
             Id = id,
@@ -853,10 +986,66 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
         }
     }
 
+    private sealed record LoggedCommand(string Text, int ArrayElements);
+
+    /// <summary>
+    /// Every command Npgsql executes on the test's data source, with how many elements its
+    /// array parameters carry between them. Cohort runs its sweep SQL on the raw connection,
+    /// outside EF's command pipeline, so an EF interceptor wouldn't see it; Npgsql's own
+    /// command log does, parameters included when parameter logging is on.
+    /// </summary>
+    private sealed class RecordingCommandLog : ILoggerProvider
+    {
+        private readonly ConcurrentQueue<LoggedCommand> commands = new();
+
+        public IReadOnlyList<LoggedCommand> Commands => commands.ToArray();
+
+        public ILogger CreateLogger(string categoryName) => new CommandLogger(commands);
+
+        public void Dispose() { }
+
+        private sealed class CommandLogger(ConcurrentQueue<LoggedCommand> commands) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state)
+                where TState : notnull => null;
+
+            public bool IsEnabled(LogLevel logLevel) => true;
+
+            public void Log<TState>(
+                LogLevel logLevel,
+                EventId eventId,
+                TState state,
+                Exception? exception,
+                Func<TState, Exception?, string> formatter
+            )
+            {
+                if (state is not IEnumerable<KeyValuePair<string, object?>> fields)
+                {
+                    return;
+                }
+
+                var values = fields.ToDictionary(field => field.Key, field => field.Value, StringComparer.Ordinal);
+                if (values.GetValueOrDefault("CommandText") is string text && values.GetValueOrDefault("Parameters") is object[] parameters)
+                {
+                    commands.Enqueue(new LoggedCommand(text, parameters.Sum(CountArrayElements)));
+                }
+            }
+
+            /// <summary>Npgsql logs an array parameter's value as "[a, b, c]".</summary>
+            private static int CountArrayElements(object? value) => value switch
+            {
+                "[]" => 0,
+                string array when array.StartsWith('[') && array.EndsWith(']') => array.Split(", ").Length,
+                _ => 0,
+            };
+        }
+    }
+
     private static ServiceProvider BuildServiceProvider(
         string connectionString,
         int? batchSize = null,
-        Action<IServiceCollection>? configure = null
+        Action<IServiceCollection>? configure = null,
+        RecordingCommandLog? commandLog = null
     )
     {
         var services = new ServiceCollection();
@@ -870,9 +1059,22 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
                 .Build()
         );
         services.AddLogging();
-        services.AddDbContext<RestrictiveForeignKeyDbContext>(options =>
-            options.UseNpgsql(connectionString)
-        );
+        if (commandLog is null)
+        {
+            services.AddDbContext<RestrictiveForeignKeyDbContext>(options =>
+                options.UseNpgsql(connectionString)
+            );
+        }
+        else
+        {
+            var dataSource = new NpgsqlDataSourceBuilder(connectionString)
+                .UseLoggerFactory(LoggerFactory.Create(logging => logging.AddProvider(commandLog)))
+                .EnableParameterLogging()
+                .Build();
+            // Registered so the provider disposes it.
+            services.AddSingleton(dataSource);
+            services.AddDbContext<RestrictiveForeignKeyDbContext>(options => options.UseNpgsql(dataSource));
+        }
         services.AddSingleton<IRetentionRuleProvider>(new PurgeCategoryRepository());
         services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<RestrictiveForeignKeyDbContext>();
@@ -1036,7 +1238,7 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
     {
         public Guid Id { get; init; }
         public Guid TenantId { get; init; }
-        public DateTimeOffset CreatedAt { get; init; }
+        public DateTimeOffset? CreatedAt { get; init; }
 
         [ErasureSubject("person")]
         public Guid? SubjectId { get; init; }

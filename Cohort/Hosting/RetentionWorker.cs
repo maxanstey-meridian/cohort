@@ -181,21 +181,33 @@ internal sealed class RetentionWorker(
     ) =>
         RunIterationAsync(
             async (db, token) =>
-            {
-                var databaseNow = await DatabaseClock.NowAsync(db, token);
-                var replicaNow = DateTimeOffset.UtcNow;
-                var occurrence = CohortScheduleParser.GetPreviousOccurrence(schedule, databaseNow);
-                var next = CohortScheduleParser.GetNextOccurrence(schedule, databaseNow);
-                return (
-                    occurrence is { } due && settled != new SettledOccurrence(due, dryRun) ? due : null,
-                    occurrence,
-                    // The same instant on the replica's clock, which is the one Task.Delay keeps.
-                    next is { } upcoming ? replicaNow + (upcoming - databaseNow) : null
-                );
-            },
+                PlanOccurrence(schedule, dryRun, settled, await DatabaseClock.NowAsync(db, token), DateTimeOffset.UtcNow),
             dryRun,
             ct
         );
+
+    /// <summary>
+    /// What one database-clock reading owes: the occurrence at or before it, unless that is
+    /// <paramref name="settled"/>, and when the next one falls on the replica's clock, the one
+    /// <c>Task.Delay</c> keeps. Runs are stamped by the database clock, so a replica whose own
+    /// clock runs ahead or behind still counts each run towards the occurrence it served.
+    /// </summary>
+    internal static (DateTimeOffset? Due, DateTimeOffset? Occurrence, DateTimeOffset? NextWake) PlanOccurrence(
+        string schedule,
+        bool dryRun,
+        SettledOccurrence? settled,
+        DateTimeOffset databaseNow,
+        DateTimeOffset replicaNow
+    )
+    {
+        var occurrence = CohortScheduleParser.GetPreviousOccurrence(schedule, databaseNow);
+        var next = CohortScheduleParser.GetNextOccurrence(schedule, databaseNow);
+        return (
+            occurrence is { } due && settled != new SettledOccurrence(due, dryRun) ? due : null,
+            occurrence,
+            next is { } upcoming ? replicaNow + (upcoming - databaseNow) : null
+        );
+    }
 
     /// <summary>Catches up <paramref name="occurrence"/> as given, whatever either clock says.</summary>
     internal async Task<OccurrenceOutcome> RunIterationAsync(
@@ -283,7 +295,6 @@ internal sealed class RetentionWorker(
         // Two replicas firing at the same cron instant must not both sweep: double mutations
         // are mostly benign, but doubled audit runs and doubled handler side effects are not.
         var workerLockKey = RetentionRunAdvisoryLock.WorkerKeyFor(CohortStoreTables.FromModel(db.Model).SweepRun);
-        var lockAcquired = false;
         Exception? primaryException = null;
         try
         {
@@ -293,7 +304,7 @@ internal sealed class RetentionWorker(
                 return new IterationResult(OccurrenceOutcome.Settled, occurrence, nextWake);
             }
 
-            lockAcquired = await RetentionRunAdvisoryLock.TryAcquireAsync(
+            var lockAcquired = await RetentionRunAdvisoryLock.TryAcquireAsync(
                 db.Database.GetDbConnection(),
                 workerLockKey,
                 ct
@@ -315,16 +326,12 @@ internal sealed class RetentionWorker(
         }
         finally
         {
+            // Every session lock goes, not just the worker key: a lock the server granted to a
+            // command that was then cancelled (the worker key, or a live-run probe) would
+            // otherwise return to the pool with this connection.
             await OperationalConnectionCleanup.RunAsync(
                 db.Database.GetDbConnection(),
-                lockAcquired
-                    ? cleanupToken =>
-                        RetentionRunAdvisoryLock.ReleaseAsync(
-                            db.Database.GetDbConnection(),
-                            workerLockKey,
-                            cleanupToken
-                        )
-                    : null,
+                cleanupToken => RetentionRunAdvisoryLock.ReleaseAllAsync(db.Database.GetDbConnection(), cleanupToken),
                 cleanupToken => db.Database.CloseConnectionAsync().WaitAsync(cleanupToken),
                 primaryException,
                 logger
@@ -357,6 +364,7 @@ internal sealed class RetentionWorker(
         var pending = plan.Where(pass => ledger.IsPending(pass.TenantId, maxAttempts)).ToArray();
         foreach (var pass in pending)
         {
+            await EnsureWorkerLockSessionAsync(db, ct);
             await RunPassAsync(pass, dryRun, ct);
         }
 
@@ -398,10 +406,23 @@ internal sealed class RetentionWorker(
                 return true;
             }
 
-            await RetentionRunAdvisoryLock.ReleaseAsync(connection, key, ct);
+            // Not the iteration's token: a cancelled release would keep the lock. The
+            // iteration's cleanup releases everything this session holds anyway.
+            await RetentionRunAdvisoryLock.ReleaseAsync(connection, key, CancellationToken.None);
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Fails the iteration once the session holding the worker lock is gone. Its passes run on
+    /// connections of their own, so a lost session (a timeout, a failover) would otherwise go
+    /// unseen while another replica takes the lock and plans the same passes.
+    /// </summary>
+    private static async Task EnsureWorkerLockSessionAsync(DbContext db, CancellationToken ct)
+    {
+        await using var command = new SqlParams().CreateCommand(db.Database.GetDbConnection(), null, "SELECT 1");
+        await command.ExecuteScalarAsync(ct);
     }
 
     /// <summary>

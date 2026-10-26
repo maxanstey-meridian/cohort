@@ -301,6 +301,54 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
     }
 
     [Fact]
+    public async Task A_Worker_That_Lost_Its_Lock_Session_Starts_No_Further_Pass()
+    {
+        // Once the worker lock's session is gone another replica can take the lock and plan
+        // the same passes, so the owner must not carry on into the next one.
+        await using var database = await UseTemporaryDatabaseAsync();
+        var first = CreateTenant();
+        var second = CreateTenant();
+        var observer = new FirstNoteProgressObserver();
+        using var host = BuildHost(
+            CreateSettings(ConnectionString, schedule: "0 0 0 1 1 *", dryRun: false, killSwitch: false),
+            first,
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
+                services.AddSingleton<IRetentionTenantSource>(new StaticTenantSource(first, second));
+                services.AddSingleton<IRetentionAuditObserver>(observer);
+            }
+        );
+        observer.OnFirstNoteProgress = () => TerminateWorkerLockSessionAsync().GetAwaiter().GetResult();
+        await SeedOldNoteAsync(first.Id, "lost-session-first");
+        await SeedOldNoteAsync(second.Id, "lost-session-second");
+        var occurrence = (await DatabaseNowAsync()).AddSeconds(-1);
+
+        var iterate = () => GetWorker(host).RunIterationAsync(occurrence, dryRun: false, CancellationToken.None);
+
+        await iterate.Should().ThrowAsync<Exception>();
+        (await NoteExistsAsync("lost-session-first")).Should().BeFalse();
+        (await NoteExistsAsync("lost-session-second")).Should().BeTrue();
+        (await CountScheduledRunsAsync(second.Id)).Should().Be(0);
+    }
+
+    private async Task TerminateWorkerLockSessionAsync()
+    {
+        var key = RetentionRunAdvisoryLock.WorkerKeyFor(new RelationalObjectName("public", "sweep_run"));
+        await using var connection = new NpgsqlConnection($"{ConnectionString};Pooling=false");
+        await connection.OpenAsync();
+        await using var terminate = connection.CreateCommand();
+        // A bigint advisory key is held as classid (high 32 bits) and objid (low 32 bits).
+        terminate.CommandText = """
+            SELECT pg_terminate_backend(pid) FROM pg_locks
+            WHERE locktype = 'advisory' AND granted AND objsubid = 1
+              AND classid::bigint = (@key >> 32) & 4294967295 AND objid::bigint = @key & 4294967295
+            """;
+        terminate.Parameters.AddWithValue("key", key);
+        (await terminate.ExecuteScalarAsync()).Should().Be(true);
+    }
+
+    [Fact]
     public async Task Installs_In_Different_Schemas_Of_One_Database_Sweep_Independently()
     {
         // Advisory locks are per database, not per schema: the public install's worker holding

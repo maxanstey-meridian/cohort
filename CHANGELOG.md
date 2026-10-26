@@ -56,15 +56,22 @@ unprotected without an error.
   cancelled run doesn't count). A missed occurrence, including on a fresh install, is swept
   when the host starts. Passes that succeeded never rerun. A `Failed` or `PartiallyFailed`
   run no longer claims its occurrence, and a crash between tenant passes no longer leaves
-  the later tenants unswept until the next occurrence. An occurrence is due once the
-  database clock reaches it, so a replica whose clock runs ahead no longer sweeps early and
-  then reruns passes its ledger can't see.
+  the later tenants unswept until the next occurrence. Occurrences are counted on the
+  database clock, the clock that stamps each run. A run still `Started` whose owner holds its
+  run lock keeps the occurrence busy, so a replica whose worker-lock session was lost isn't
+  joined by a second one running the same pass. History pruning keeps the scheduled runs of
+  the schedule's current occurrence, which the worker reads as its ledger.
 - The worker checks its tenant source against the data each occurrence. A tenant that owns
   retained rows but isn't returned by `IRetentionTenantSource`, or that the source returns
   with conflicting contexts, gets a `Failed` scheduled run (`code=cohort:tenant-not-in-source`
   or `code=cohort:conflicting-tenant-contexts`) instead of being skipped or swept under the
-  first context. Rows under a `Guid.Empty` tenant in a tenanted table log an error. The
-  empty-source and conflicting-context warnings are gone.
+  first context. A refused pass is retried like any failed one, so until the source returns
+  the tenant, each occurrence records up to `OccurrenceMaxAttempts` `Failed` runs for it,
+  `OccurrenceRetryDelay` apart, then logs the worker's "gave up" error. Rows under a
+  `Guid.Empty` tenant in a tenanted table log an error. The empty-source and
+  conflicting-context warnings are gone. Upgrade: make `IRetentionTenantSource` return every
+  tenant that owns rows in a retained tenanted table, or expect these `Failed` runs and the
+  alerts they raise.
 - The kill switch now cancels the scheduled pass in progress instead of letting it finish:
   its current batch rolls back, the run settles `Cancelled`, and the rest of the occurrence is
   skipped. Turning it off catches the occurrence up straight away. It also stops the
@@ -114,39 +121,57 @@ unprotected without an error.
   a host that was never started, every Cohort operation refuses it. An open-generic handler
   that used to run for every entity is refused: register it per entity.
 - Row handlers need `[RowHandlerId("uuid")]`, and `AddRowHandler` loses its `identity`
-  parameter: it refuses a handler without the attribute, or one whose id another handler of
-  the same entity carries. Queued work is persisted and delivered under that id, never the
-  class name, so renaming a handler no longer dead-letters its work; work under an id no
-  handler carries is dead-lettered as `handler id … is not registered; re-register it and
-  requeue`. Upgrade step: work a 0.10 host queued under a type name (any handler registered
-  without `identity`) must be drained or re-keyed. Either run `FlushAsync` on 0.10 until the
-  queue is settled, or run
-  `UPDATE <schema>.sweep_row_handler_status SET "HandlerType" = '<uuid>' WHERE "HandlerType" = '<persisted type name>' AND "State" IN (0, 1, 3);`
-  for each such handler: re-keyed pending work then runs as usual. Work a 0.11 dispatcher
-  already dead-lettered as unregistered keeps its snapshot, so after the same `UPDATE`,
-  `IRetentionRowDispatcher.RequeueDeadLetteredAsync(handlerId: <uuid>)` delivers it. Work
-  0.10 dead-lettered has usually lost its snapshot and can't be requeued. A handler that
-  already passed `identity` keeps its work by putting the same UUID in its attribute.
+  parameter: it refuses a handler without the attribute, with a malformed one, or with an id
+  another handler class already carries, whatever its entity. Queued work is persisted and
+  delivered under that id, never the class name, so renaming a handler no longer dead-letters
+  its work; work under an id no handler carries is dead-lettered as `handler id … is not
+  registered; re-register it and requeue`, and work under a `[RetentionEntityId]` the model no
+  longer declares dead-letters at once as `entity id … is not registered; restore its
+  [RetentionEntityId] and requeue` instead of using up its retries. Upgrade step: work a 0.10
+  host queued under a type name (any handler registered without `identity`) must be drained or
+  re-keyed. Either run `FlushAsync` on 0.10 until the queue is settled, or re-key it. First
+  find the old keys:
+  `SELECT DISTINCT "HandlerType" FROM <schema>.sweep_row_handler_status WHERE "State" IN (0, 1, 3) AND "HandlerType" !~ '^[0-9a-f]{8}-[0-9a-f]{4}-';`
+  (a 0.11 dispatcher that already met such work also names the old key in its `LastError`,
+  `handler id <old key> is not registered`). Then, for each, run
+  `UPDATE <schema>.sweep_row_handler_status SET "HandlerType" = CAST('<uuid>' AS uuid)::text WHERE "HandlerType" = '<old key>' AND "State" IN (0, 1, 3);`
+  with the handler's `[RowHandlerId]` as `<uuid>`, in any case or format: re-keyed pending
+  work then runs as usual. Work a 0.11 dispatcher already dead-lettered as unregistered keeps
+  its snapshot, so after the same `UPDATE`,
+  `IRetentionRowDispatcher.RequeueDeadLetteredAsync(handlerId: <uuid>)` delivers it. 0.10
+  cleared a row's snapshot once all its handlers had finished, so work 0.10 dead-lettered
+  can't be requeued. A handler that already passed `identity` keeps its work by putting the
+  same UUID in its attribute.
 - Dead-lettered `OnAfterAsync` work keeps its snapshot until
   `RowHandlerDispatch:PayloadRetention`, and the new
   `IRetentionRowDispatcher.RequeueDeadLetteredAsync(sweepId, handlerId)` requeues it: every
-  dead-lettered handler of each matching row, so they still run in order, for one more
-  delivery each, with `Attempt` carried on. Each dead-letter logs an Error.
+  dead-lettered handler of each matching row, so they still run in order. A requeue resumes
+  each handler's remaining attempts, or gives one more delivery to a handler that used them
+  all, with `Attempt` carried on. Each dead-letter logs an Error.
   `RowDispatcherFlushResult` gains a third positional value, `DeadLetteredRequeueable`, the
   dead-lettered work that can still be requeued. History pruning keeps a run until none of
   its rows holds a snapshot.
 - `FlushAsync` honours retry backoff: it runs what's due now, so one flush spends one attempt
-  per row instead of retrying back-to-back until the work dead-letters. Re-flush until
-  `Settled` where you relied on the old behaviour. Retries back off to a new
-  `RowHandlerDispatch:MaxBackoff`, and the defaults change: `BaseBackoff` 5 seconds (was 1),
-  `MaxBackoff` 1 hour, `MaxAttempts` 25 (was 10), about 15 hours of retries. Startup refuses
-  a `PayloadRetention` shorter than a handler's retry schedule (every backoff wait plus
-  `MaxAttempts` times `ClaimTimeout`), since the scrub would end work still retrying.
+  per row instead of retrying back-to-back until the work dead-letters. Looping on it until
+  `Settled` now spins through every backoff wait; where you relied on the old behaviour, wait
+  out the backoff, or in tests set a short `BaseBackoff` and `MaxBackoff`, or set
+  `MaxAttempts` to 1. Retries back off to a new `RowHandlerDispatch:MaxBackoff`, and the defaults change:
+  `BaseBackoff` 5 seconds (was 1), `MaxBackoff` 1 hour, `MaxAttempts` 25 (was 10), up to about
+  17.5 hours of retries counting each attempt's `ClaimTimeout`. Startup and every options
+  reload refuse a `PayloadRetention` shorter than a handler's retry schedule (every backoff
+  wait plus `MaxAttempts` times `ClaimTimeout`), and, with handlers registered, shorter than
+  the most handlers on one entity times that schedule plus `MaxAttempts` times
+  `PollInterval`, since a row's handlers run one after another. The scrub can still end
+  `AfterSweepSettled` work waiting for a slow run, and work the kill switch has paused.
 - A row-handler delivery whose claim expires is reclaimed only once its dispatcher's session
   has gone: the dispatcher holds a session advisory lock for each delivery, so a handler that
   ignores cancellation no longer overlaps its own retry or its row's next handler. Session
   advisory locks need direct connections or session-mode pooling, not transaction-mode
-  pooling, and each draining dispatcher holds one extra connection per batch.
+  pooling, and each draining dispatcher holds one extra connection per batch. Readiness
+  refuses a Cohort `DbContext` whose Npgsql connection has `Multiplexing` on, which would take
+  each lock on one server session and release it on another. Expired claims are recovered
+  page by page, so handlers still running past their claim can't hide a crashed dispatcher's
+  claims.
 - `ErasureTransaction.Caller` and `IRetentionDeletion` detect changes before refusing a
   context with unsaved changes, so an edit made with automatic change detection off is
   refused too.

@@ -8,7 +8,9 @@ namespace Cohort.Infrastructure;
 /// <summary>
 /// Session-level PostgreSQL advisory locks that mark a live run, worker or row-handler
 /// delivery. They live as long as the session that took them, so they need direct connections
-/// or session-mode pooling: a transaction-mode pooler hands the session to someone else.
+/// or session-mode pooling: a transaction-mode pooler hands the session to someone else, and
+/// Npgsql multiplexing runs each command outside a transaction on whichever session is free
+/// (readiness refuses a multiplexed connection).
 /// </summary>
 internal static class RetentionRunAdvisoryLock
 {

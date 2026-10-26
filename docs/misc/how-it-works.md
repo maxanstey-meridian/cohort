@@ -79,7 +79,7 @@ the run's lock, so a live run is never recovered.
 
 A scheduled run that crashed, or a scheduled pass that never started because its process died
 first, doesn't claim its occurrence: the worker reruns that pass, whether the run is still
-`Started` or already recovered as `Failed`, until it succeeds or uses up
+`Started` (once its lock is free, so its owner is gone) or already recovered as `Failed`, until it succeeds or uses up
 `OccurrenceMaxAttempts`. Passes of the occurrence that already succeeded don't rerun. See
 [Occurrences](/guides/running-retention#occurrences).
 

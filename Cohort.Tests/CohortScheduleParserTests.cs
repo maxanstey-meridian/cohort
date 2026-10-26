@@ -23,6 +23,11 @@ public sealed class CohortScheduleParserTests
     // Leap day: four years back, and eight across 2100, which is not a leap year.
     [InlineData("0 0 29 2 *", "2027-10-25T12:00:00+00:00", "2024-02-29T00:00:00+00:00")]
     [InlineData("0 0 29 2 *", "2104-02-28T12:00:00+00:00", "2096-02-29T00:00:00+00:00")]
+    // Dense but seasonal: every second in January, asked in December (millions of occurrences
+    // in the window that finds one).
+    [InlineData("* * * * 1 *", "2026-12-15T08:00:00+00:00", "2026-01-31T23:59:59+00:00")]
+    // Halved down to the minute that holds an occurrence off the minute boundary.
+    [InlineData("17 3 * * * *", "2026-10-25T12:02:00+00:00", "2026-10-25T11:03:17+00:00")]
     public void Previous_Occurrence_Is_The_Latest_At_Or_Before_Now(string schedule, string now, string expected)
     {
         CohortScheduleParser

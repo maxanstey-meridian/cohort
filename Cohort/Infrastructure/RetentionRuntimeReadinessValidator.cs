@@ -10,6 +10,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
 
+using Npgsql;
 
 namespace Cohort.Infrastructure;
 
@@ -32,6 +33,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
     public async Task ValidateAsync(CancellationToken ct = default)
     {
         ValidateProvider();
+        ValidateSessionLocks();
         var readiness = state.For(CreateKey());
         if (readiness.Validated)
         {
@@ -761,6 +763,25 @@ internal sealed class RetentionRuntimeReadinessValidator(
     {
         var connection = db.Database.GetDbConnection();
         return new RetentionRuntimeReadinessKey(db.Model, connection.DataSource, connection.Database);
+    }
+
+    /// <summary>
+    /// The worker, each run and each row-handler delivery hold PostgreSQL session advisory
+    /// locks. Under Npgsql multiplexing a connection is bound to a server session only inside a
+    /// transaction, so a lock taken outside one stays on whichever session ran it while the
+    /// unlock runs on another and finds nothing to release. Checked on every call, not cached:
+    /// the readiness key doesn't carry connection settings. A wrapped DbConnection (a profiler,
+    /// say) can't be inspected, so it is the host's to configure.
+    /// </summary>
+    private void ValidateSessionLocks()
+    {
+        if (db.Database.GetDbConnection() is NpgsqlConnection connection
+            && new NpgsqlConnectionStringBuilder(connection.ConnectionString).Multiplexing)
+        {
+            throw new RetentionConfigurationException([
+                "Cohort can't run on an Npgsql connection with Multiplexing enabled: its worker, runs and row-handler deliveries hold PostgreSQL session advisory locks, and a multiplexed connection only keeps one server session inside a transaction, so those locks would be taken on one session and released on another. Give Cohort's DbContext a connection string without Multiplexing=true.",
+            ]);
+        }
     }
 
     private void ValidateProvider()

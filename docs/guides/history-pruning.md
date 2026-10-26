@@ -47,4 +47,7 @@ they report.
   `FOR UPDATE SKIP LOCKED`, so replicas prune different batches.
 - A failed pass is logged and retried an hour later.
 - `KillSwitch` stops pruning after the batch in progress.
+- With a `Schedule` set, scheduled runs started at or after its most recent occurrence (on the
+  database clock) are kept whatever their age: they're the worker's record of what that
+  occurrence still owes, and pruning them would rerun passes that already succeeded.
 - Pruning is otherwise independent of `Schedule` and `DryRun`.

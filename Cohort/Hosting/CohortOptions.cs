@@ -6,6 +6,11 @@ public sealed class CohortOptions
 {
     public const string SectionName = "Cohort";
 
+    /// <summary>
+    /// The scheduled worker's cron expression (5 fields, or 6 with seconds), in UTC. Null
+    /// leaves the worker idle. Occurrences are counted on the database clock, the clock that
+    /// stamps every run.
+    /// </summary>
     public string? Schedule { get; init; }
 
     /// <summary>
@@ -31,7 +36,7 @@ public sealed class CohortOptions
 
     /// <summary>
     /// How many runs one pass of an occurrence gets before the worker gives up on it until
-    /// the next occurrence. Runs the kill switch cancelled don't count. 1 to 100.
+    /// the next occurrence. Cancelled runs (the kill switch or a shutdown) don't count. 1 to 100.
     /// </summary>
     public int OccurrenceMaxAttempts { get; init; } = 3;
 

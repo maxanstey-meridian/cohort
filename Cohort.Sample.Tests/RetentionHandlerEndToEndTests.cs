@@ -2441,15 +2441,19 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task Kill_Switch_Stops_The_Background_Poller_But_Not_An_Explicit_Flush()
+    public async Task Kill_Switch_Stops_The_Background_Poller_But_Not_An_Explicit_Flush_Or_The_Payload_Scrub()
     {
-        var tenantId = Guid.NewGuid();
+        var pausedTenantId = Guid.NewGuid();
+        var expiredTenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
         var sink = new HandlerExecutionSink();
         await using (var db = Host.CreateDbContext())
         {
             db.Notes.Add(
-                new Note { Id = Guid.NewGuid(), TenantId = tenantId, CreatedAt = asOf.AddDays(-120), Body = "paused" }
+                new Note { Id = Guid.NewGuid(), TenantId = pausedTenantId, CreatedAt = asOf.AddDays(-120), Body = "paused" }
+            );
+            db.Notes.Add(
+                new Note { Id = Guid.NewGuid(), TenantId = expiredTenantId, CreatedAt = asOf.AddDays(-120), Body = "expired" }
             );
             await db.SaveChangesAsync();
         }
@@ -2459,7 +2463,185 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             configurationOverrides: new Dictionary<string, string?>
             {
                 [$"{CohortOptions.SectionName}:KillSwitch"] = "true",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:PayloadRetention"] = "01:00:00",
+                // A retry schedule must fit inside PayloadRetention.
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxAttempts"] = "1",
             },
+            configureServices: services =>
+            {
+                services.AddSingleton(sink);
+                services.AddRowHandler<Note, DispatchRecordingNoteHandler>();
+            }
+        );
+        var paused = await handlerHost.RunSweepAsync(
+            new TenantContext(pausedTenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+        var expired = await handlerHost.RunSweepAsync(
+            new TenantContext(expiredTenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+        await BackdateRowDetailsAsync(expired.SweepId, DateTimeOffset.UtcNow.AddHours(-2));
+
+        await handlerHost.RunWithServicesAsync(serviceProvider =>
+            serviceProvider.GetRequiredService<RetentionRowDispatcher>().PollAsync(CancellationToken.None)
+        );
+
+        sink.AfterCalls.Should().BeEmpty();
+        (await LoadHandlerStatusesAsync(paused.SweepId)).Single().State.Should().Be(PendingState);
+        // The switch pauses delivery, never the personal-data backstop.
+        (await CountRemainingCapturedPayloadsAsync(expired.SweepId)).Should().Be(0);
+        (await CountRemainingCapturedPayloadsAsync(paused.SweepId)).Should().Be(1);
+
+        await handlerHost.RunWithServicesAsync(serviceProvider =>
+            serviceProvider.GetRequiredService<IRetentionRowDispatcher>().FlushAsync()
+        );
+
+        sink.AfterCalls.Should().Equal("after:paused:1");
+        (await LoadHandlerStatusesAsync(expired.SweepId)).Single().LastError.Should().Contain("payload-retention backstop");
+    }
+
+    [Fact]
+    public async Task Kill_Switch_Turned_On_Mid_Drain_Stops_The_Poller_After_Its_Current_Batch()
+    {
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var gate = new DispatchBlockGate();
+        var sink = new HandlerExecutionSink();
+        await using (var db = Host.CreateDbContext())
+        {
+            foreach (var body in new[] { "first", "second" })
+            {
+                db.Notes.Add(
+                    new Note { Id = Guid.NewGuid(), TenantId = tenantId, CreatedAt = asOf.AddDays(-120), Body = body }
+                );
+            }
+
+            await db.SaveChangesAsync();
+        }
+
+        // Reloadable, so the switch can be flipped while a delivery runs.
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(
+                new Dictionary<string, string?>
+                {
+                    [$"{SampleOptions.SectionName}:{nameof(SampleOptions.ConnectionString)}"] = GetConnectionString(),
+                    // One row per batch, so the second row needs a second batch.
+                    [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxParallelism"] = "1",
+                }
+            )
+            .Build();
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
+            {
+                services.AddSingleton<IConfiguration>(configuration);
+                services.AddSingleton(gate);
+                services.AddSingleton(sink);
+                services.AddRowHandler<Note, BlockingDispatchNoteHandler>();
+            }
+        );
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+
+        var poll = handlerHost.RunWithServicesAsync(serviceProvider =>
+            serviceProvider.GetRequiredService<RetentionRowDispatcher>().PollAsync(CancellationToken.None)
+        );
+        await gate.WaitUntilBlockedAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        configuration[$"{CohortOptions.SectionName}:KillSwitch"] = "true";
+        configuration.Reload();
+        gate.Release();
+        await poll.WaitAsync(TimeSpan.FromSeconds(10));
+
+        sink.AfterCalls.Should().ContainSingle();
+        (await LoadHandlerStatusesAsync(result.SweepId))
+            .Select(status => status.State)
+            .Should()
+            .BeEquivalentTo([SucceededState, PendingState]);
+    }
+
+    [Fact]
+    public async Task FlushAsync_Recovers_A_Crashed_Claim_Queued_Behind_Claims_Whose_Owners_Still_Run_Them()
+    {
+        // Claims whose owners still run them are never reclaimed, so they stay the oldest
+        // expired claims. Recovery pages past them to the crashed dispatcher's claim.
+        var heldTenantId = Guid.NewGuid();
+        var crashedTenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var sink = new HandlerExecutionSink();
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note { Id = Guid.NewGuid(), TenantId = heldTenantId, CreatedAt = asOf.AddDays(-120), Body = "held" }
+            );
+            db.Notes.Add(
+                new Note { Id = Guid.NewGuid(), TenantId = crashedTenantId, CreatedAt = asOf.AddDays(-120), Body = "crashed" }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:BatchSize"] = "1",
+            },
+            configureServices: services =>
+            {
+                services.AddSingleton(sink);
+                services.AddRowHandler<Note, DispatchRecordingNoteHandler>();
+            }
+        );
+        var held = await handlerHost.RunSweepAsync(
+            new TenantContext(heldTenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+        var crashed = await handlerHost.RunSweepAsync(
+            new TenantContext(crashedTenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+        await AbandonClaimAsync(held.SweepId, 1, DateTimeOffset.UtcNow.AddMinutes(-10));
+        await AbandonClaimAsync(crashed.SweepId, 1, DateTimeOffset.UtcNow.AddMinutes(-6));
+
+        // The held claim's owner is alive: it holds the delivery lock on its own session.
+        await using var owner = new NpgsqlConnection(GetConnectionString());
+        await owner.OpenAsync();
+        var heldKey = RetentionRunAdvisoryLock.RowHandlerKeyFor(
+            new RelationalObjectName("public", "sweep_row_handler_status"),
+            (await LoadHandlerStatusIdsAsync(held.SweepId)).Single()
+        );
+        await RetentionRunAdvisoryLock.AcquireAsync(owner, heldKey, CancellationToken.None);
+
+        await handlerHost.RunWithServicesAsync(serviceProvider =>
+            serviceProvider.GetRequiredService<IRetentionRowDispatcher>().FlushAsync()
+        );
+
+        sink.AfterCalls.Should().Equal("after:crashed:2");
+        (await LoadHandlerStatusesAsync(held.SweepId)).Single().State.Should().Be(InFlightState);
+        (await LoadHandlerStatusesAsync(crashed.SweepId)).Single().State.Should().Be(SucceededState);
+        await RetentionRunAdvisoryLock.ReleaseAsync(owner, heldKey, CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task FlushAsync_Keeps_Work_For_An_Unregistered_Entity_Id_So_A_Requeue_Delivers_It_Once_It_Is_Back()
+    {
+        // Retrying can't heal work whose entity id the model no longer registers, so it
+        // dead-letters at once and keeps its snapshot instead of burning its retries.
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var sink = new HandlerExecutionSink();
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note { Id = Guid.NewGuid(), TenantId = tenantId, CreatedAt = asOf.AddDays(-120), Body = "unknown-entity" }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
             configureServices: services =>
             {
                 services.AddSingleton(sink);
@@ -2470,19 +2652,93 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
             asOf
         );
+        var noteEntityId = typeof(Note).GetCustomAttribute<RetentionEntityIdAttribute>()!.Id;
+        var unknownEntityId = Guid.NewGuid();
+        await SetRowDetailEntityIdAsync(result.SweepId, unknownEntityId);
 
-        await handlerHost.RunWithServicesAsync(serviceProvider =>
-            serviceProvider.GetRequiredService<RetentionRowDispatcher>().PollAsync(CancellationToken.None)
-        );
+        (await handlerHost.RunWithServicesAsync(serviceProvider =>
+            serviceProvider.GetRequiredService<IRetentionRowDispatcher>().FlushAsync()
+        )).DeadLetteredRequeueable.Should().Be(1);
 
         sink.AfterCalls.Should().BeEmpty();
-        (await LoadHandlerStatusesAsync(result.SweepId)).Single().State.Should().Be(PendingState);
+        var orphaned = (await LoadHandlerStatusesAsync(result.SweepId)).Single();
+        orphaned.State.Should().Be(DeadLetteredState);
+        orphaned.Attempt.Should().Be(1);
+        orphaned.LastError.Should().Be(
+            $"entity id {unknownEntityId} is not registered; restore its [RetentionEntityId] and requeue"
+        );
 
+        await SetRowDetailEntityIdAsync(result.SweepId, noteEntityId);
+        await handlerHost.RunWithServicesAsync(async serviceProvider =>
+        {
+            var dispatcher = serviceProvider.GetRequiredService<IRetentionRowDispatcher>();
+            (await dispatcher.RequeueDeadLetteredAsync()).Should().Be(1);
+            await dispatcher.FlushAsync();
+        });
+
+        sink.AfterCalls.Should().Equal("after:unknown-entity:2");
+        (await LoadHandlerStatusesAsync(result.SweepId)).Single().State.Should().Be(SucceededState);
+    }
+
+    [Fact]
+    public async Task The_Documented_Upgrade_Rekey_Delivers_Work_Queued_Under_A_Type_Name()
+    {
+        // 0.10 persisted work under the handler's type name. The CHANGELOG's upgrade step
+        // finds those keys, then re-keys them to the [RowHandlerId], whatever case or format
+        // the host copies the UUID in.
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var sink = new HandlerExecutionSink();
+        const string legacyKey = "Cohort.Sample.NoteSweptLogger, Cohort.Sample";
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.Add(
+                new Note { Id = Guid.NewGuid(), TenantId = tenantId, CreatedAt = asOf.AddDays(-120), Body = "legacy" }
+            );
+            await db.SaveChangesAsync();
+        }
+
+        using var handlerHost = new CohortTestHost(
+            GetConnectionString(),
+            configureServices: services =>
+            {
+                services.AddSingleton(sink);
+                services.AddRowHandler<Note, NoteHandlerBeforeRename>();
+            }
+        );
+        var result = await handlerHost.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf
+        );
+        await ExecuteAsync(
+            $"""UPDATE "sweep_row_handler_status" SET "HandlerType" = '{legacyKey}'"""
+        );
+
+        // Step 1, verbatim: find the keys that aren't UUIDs.
+        await using (var connection = new NpgsqlConnection(GetConnectionString()))
+        {
+            await connection.OpenAsync();
+            await using var find = connection.CreateCommand();
+            find.CommandText = """
+                SELECT DISTINCT "HandlerType" FROM public.sweep_row_handler_status WHERE "State" IN (0, 1, 3) AND "HandlerType" !~ '^[0-9a-f]{8}-[0-9a-f]{4}-';
+                """;
+            (await find.ExecuteScalarAsync()).Should().Be(legacyKey);
+        }
+
+        // Step 2, verbatim, with the UUID copied in upper case.
+        await ExecuteAsync(
+            $"""
+            UPDATE public.sweep_row_handler_status SET "HandlerType" = CAST('{NoteHandlerBeforeRename.Id.ToUpperInvariant()}' AS uuid)::text WHERE "HandlerType" = '{legacyKey}' AND "State" IN (0, 1, 3);
+            """
+        );
         await handlerHost.RunWithServicesAsync(serviceProvider =>
             serviceProvider.GetRequiredService<IRetentionRowDispatcher>().FlushAsync()
         );
 
-        sink.AfterCalls.Should().Equal("after:paused:1");
+        sink.AfterCalls.Should().Equal("original:legacy:1");
+        var status = (await LoadHandlerStatusesAsync(result.SweepId)).Single();
+        status.State.Should().Be(SucceededState);
+        status.HandlerType.Should().Be(NoteHandlerBeforeRename.Id);
     }
 
     [Theory]
@@ -3006,6 +3262,21 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
         (await command.ExecuteNonQueryAsync()).Should().BeGreaterThan(0);
     }
 
+    private async Task SetRowDetailEntityIdAsync(Guid sweepId, Guid retentionEntityId)
+    {
+        await using var connection = new NpgsqlConnection(GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE "sweep_run_row_detail"
+            SET "RetentionEntityId" = @retentionEntityId
+            WHERE "SweepId" = @sweepId
+            """;
+        command.Parameters.AddWithValue("retentionEntityId", retentionEntityId);
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        (await command.ExecuteNonQueryAsync()).Should().Be(1);
+    }
+
     private async Task BackdateClaimAsync(Guid sweepId, DateTimeOffset claimedAt)
     {
         await using var connection = new NpgsqlConnection(GetConnectionString());
@@ -3475,7 +3746,6 @@ file sealed class DispatchAttemptTracker
 {
     private readonly object gate = new();
     private readonly Dictionary<string, int> attempts = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, DateTimeOffset> lastFailures = new(StringComparer.Ordinal);
 
     public int Increment(string recordId)
     {
@@ -3492,22 +3762,6 @@ file sealed class DispatchAttemptTracker
         lock (gate)
         {
             return attempts.TryGetValue(recordId, out var attempt) ? attempt : 0;
-        }
-    }
-
-    public void RecordFailure(string recordId, DateTimeOffset at)
-    {
-        lock (gate)
-        {
-            lastFailures[recordId] = at;
-        }
-    }
-
-    public DateTimeOffset? LoadLastFailure(string recordId)
-    {
-        lock (gate)
-        {
-            return lastFailures.TryGetValue(recordId, out var failureAt) ? failureAt : null;
         }
     }
 }
@@ -4010,7 +4264,6 @@ file sealed class AlwaysFailingDispatchNoteHandler(DispatchAttemptTracker tracke
     public Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
     {
         tracker.Increment(ctx.RecordId);
-        tracker.RecordFailure(ctx.RecordId, DateTimeOffset.UtcNow);
         throw new InvalidOperationException("Simulated permanent after-dispatch failure.");
     }
 }

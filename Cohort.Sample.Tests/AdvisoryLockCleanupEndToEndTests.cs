@@ -69,6 +69,50 @@ public sealed class AdvisoryLockCleanupEndToEndTests(PostgresFixture fixture)
         await RetentionRunAdvisoryLock.ReleaseAsync(other, key, CancellationToken.None);
     }
 
+    [Fact]
+    public async Task A_Failed_Release_All_On_A_Lease_Connection_Does_Not_Return_Its_Delivery_Locks_To_The_Pool()
+    {
+        // The row dispatcher's batch cleanup: the lease connection took each claimed row's
+        // delivery lock inside the claim transaction and releases them all when the batch ends.
+        var connectionString = new NpgsqlConnectionStringBuilder(fixture.ConnectionString)
+        {
+            ApplicationName = $"cohort-lease-cleanup-{Guid.NewGuid():N}",
+        }.ConnectionString;
+        var statusTable = new RelationalObjectName("public", "sweep_row_handler_status");
+        long[] keys =
+        [
+            RetentionRunAdvisoryLock.RowHandlerKeyFor(statusTable, Random.Shared.NextInt64(1, long.MaxValue)),
+            RetentionRunAdvisoryLock.RowHandlerKeyFor(statusTable, Random.Shared.NextInt64(1, long.MaxValue)),
+        ];
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using (var claim = await connection.BeginTransactionAsync())
+        {
+            await RetentionRunAdvisoryLock.AcquireAllAsync(connection, claim, keys, CancellationToken.None);
+            await claim.CommitAsync();
+        }
+
+        using var timedOut = new CancellationTokenSource();
+        await timedOut.CancelAsync();
+
+        await OperationalConnectionCleanup.RunAsync(
+            connection,
+            _ => RetentionRunAdvisoryLock.ReleaseAllAsync(connection, timedOut.Token),
+            _ => connection.CloseAsync(),
+            null,
+            NullLogger.Instance
+        );
+
+        // Another session can take every key: the session that held them did not survive in the pool.
+        await using var other = new NpgsqlConnection(fixture.ConnectionString);
+        await other.OpenAsync();
+        foreach (var key in keys)
+        {
+            (await RetentionRunAdvisoryLock.TryAcquireAsync(other, key, CancellationToken.None)).Should().BeTrue();
+            await RetentionRunAdvisoryLock.ReleaseAsync(other, key, CancellationToken.None);
+        }
+    }
+
     private sealed class PrimaryOperationException : Exception;
 
     private sealed class CloseFailureException : Exception;

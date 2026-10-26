@@ -259,7 +259,9 @@ internal static class CohortScheduleParser
     /// The latest occurrence at or before <paramref name="nowUtc"/>, or null when there is none
     /// in the last eight years (the longest gap a cron can leave is 29 February across a
     /// century). Cronos only looks forward, so this walks back in doubling windows, each
-    /// enumerating only the part the previous window didn't cover.
+    /// covering only the part the previous window didn't, and halves the first window that
+    /// holds an occurrence down to a minute before enumerating it: a dense but seasonal cron
+    /// (every second in January, asked in December) costs a few dozen lookups, not millions.
     /// </summary>
     internal static DateTimeOffset? GetPreviousOccurrence(string schedule, DateTimeOffset nowUtc)
     {
@@ -271,15 +273,9 @@ internal static class CohortScheduleParser
         {
             var reach = window < MaximumLookback ? window : MaximumLookback;
             var from = now - EarliestUtc < reach ? EarliestUtc : now - reach;
-            DateTime? latest = null;
-            foreach (var occurrence in expression.GetOccurrences(from, covered, fromInclusive: true, toInclusive))
+            if (Occurs(expression, from, covered, fromInclusive: true, toInclusive))
             {
-                latest = occurrence;
-            }
-
-            if (latest is { } found)
-            {
-                return new DateTimeOffset(DateTime.SpecifyKind(found, DateTimeKind.Utc));
+                return LatestIn(expression, from, covered, toInclusive);
             }
 
             if (reach == MaximumLookback)
@@ -293,4 +289,29 @@ internal static class CohortScheduleParser
 
         return null;
     }
+
+    /// <summary>The latest occurrence in [from, to], which holds at least one.</summary>
+    private static DateTimeOffset LatestIn(CronExpression expression, DateTime from, DateTime to, bool toInclusive)
+    {
+        while (to - from > TimeSpan.FromMinutes(1))
+        {
+            var middle = from + ((to - from) / 2);
+            if (Occurs(expression, middle, to, fromInclusive: false, toInclusive))
+            {
+                from = middle;
+            }
+            else
+            {
+                to = middle;
+                toInclusive = true;
+            }
+        }
+
+        var latest = expression.GetOccurrences(from, to, fromInclusive: true, toInclusive).Last();
+        return new DateTimeOffset(DateTime.SpecifyKind(latest, DateTimeKind.Utc));
+    }
+
+    private static bool Occurs(CronExpression expression, DateTime from, DateTime to, bool fromInclusive, bool toInclusive) =>
+        expression.GetNextOccurrence(from, TimeZoneInfo.Utc, fromInclusive) is { } next
+        && (toInclusive ? next <= to : next < to);
 }

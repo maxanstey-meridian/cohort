@@ -209,7 +209,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             }
         );
         await SeedOldNoteAsync(tenant.Id, "once-per-occurrence");
-        var occurrence = DateTimeOffset.UtcNow.AddSeconds(-1);
+        var occurrence = (await DatabaseNowAsync()).AddSeconds(-1);
 
         await GetWorker(first).RunIterationAsync(occurrence, dryRun: false, CancellationToken.None);
         (await GetWorker(second).RunIterationAsync(occurrence, dryRun: false, CancellationToken.None))
@@ -218,7 +218,8 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         (await CountScheduledRunsAsync(tenant.Id)).Should().Be(1);
         (await NoteExistsAsync("once-per-occurrence")).Should().BeFalse();
 
-        var nextOccurrence = DateTimeOffset.UtcNow;
+        // Read after the first run, so the second occurrence is past every run of the first.
+        var nextOccurrence = await DatabaseNowAsync();
         await GetWorker(second).RunIterationAsync(nextOccurrence, dryRun: false, CancellationToken.None);
 
         (await CountScheduledRunsAsync(tenant.Id)).Should().Be(2);
@@ -234,7 +235,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             services => services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>()
         );
         await SeedOldNoteAsync(tenant.Id, "crashed-replica");
-        var occurrence = DateTimeOffset.UtcNow.AddSeconds(-1);
+        var occurrence = (await DatabaseNowAsync()).AddSeconds(-1);
 
         // The replica that fired first died after committing Started: its worker lock went
         // with its session, and nothing will ever settle the run.
@@ -262,6 +263,44 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
     }
 
     [Fact]
+    public async Task A_Started_Run_Whose_Owner_Is_Still_Running_Keeps_The_Occurrence_Busy()
+    {
+        // The owner's worker lock went with a lost session (a timeout, a failover) while its
+        // pass carried on, on a connection of its own that still holds the run lock.
+        await using var database = await UseTemporaryDatabaseAsync();
+        var tenant = CreateTenant();
+        using var host = BuildHost(
+            CreateSettings(ConnectionString, schedule: "0 0 0 1 1 *", dryRun: false, killSwitch: false),
+            tenant,
+            services => services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>()
+        );
+        await SeedOldNoteAsync(tenant.Id, "live-owner");
+        var occurrence = (await DatabaseNowAsync()).AddSeconds(-1);
+        var liveRun = await InsertScheduledRunAsync(tenant.Id, occurrence.AddMilliseconds(10), SweepRunStatus.Started);
+        var worker = GetWorker(host);
+
+        // Unpooled, so closing it ends the session.
+        await using (var owner = new NpgsqlConnection($"{ConnectionString};Pooling=false"))
+        {
+            await owner.OpenAsync();
+            await using var acquire = owner.CreateCommand();
+            acquire.CommandText = "SELECT pg_advisory_lock(@key)";
+            acquire.Parameters.AddWithValue("key", RetentionRunAdvisoryLock.KeyFor(liveRun));
+            await acquire.ExecuteScalarAsync();
+
+            (await worker.RunIterationAsync(occurrence, dryRun: false, CancellationToken.None))
+                .Should().Be(OccurrenceOutcome.LockBusy);
+            (await NoteExistsAsync("live-owner")).Should().BeTrue();
+            (await CountScheduledRunsAsync(tenant.Id)).Should().Be(1);
+        }
+
+        // The owner's session is gone, and its lock with it: the run lost its owner.
+        (await worker.RunIterationAsync(occurrence, dryRun: false, CancellationToken.None))
+            .Should().Be(OccurrenceOutcome.Settled);
+        (await NoteExistsAsync("live-owner")).Should().BeFalse();
+    }
+
+    [Fact]
     public async Task Installs_In_Different_Schemas_Of_One_Database_Sweep_Independently()
     {
         // Advisory locks are per database, not per schema: the public install's worker holding
@@ -286,7 +325,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
                 await db.SaveChangesAsync();
             }
 
-            var occurrence = DateTimeOffset.UtcNow.AddSeconds(-1);
+            var occurrence = (await DatabaseNowAsync()).AddSeconds(-1);
             var publicIteration = GetWorker(publicInstall).RunIterationAsync(occurrence, dryRun: false, CancellationToken.None);
             await blockingRules.Entered.WaitAsync(TimeSpan.FromSeconds(10));
             try
@@ -334,7 +373,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             }
         );
         await SeedOldNoteAsync(tenant.Id, "dry-run-replica");
-        var occurrence = DateTimeOffset.UtcNow.AddSeconds(-1);
+        var occurrence = (await DatabaseNowAsync()).AddSeconds(-1);
 
         await GetWorker(host).RunIterationAsync(occurrence, dryRun: true, CancellationToken.None);
         (await NoteExistsAsync("dry-run-replica")).Should().BeTrue();
@@ -446,25 +485,62 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
     }
 
     [Fact]
-    public async Task An_Occurrence_The_Database_Clock_Has_Not_Reached_Is_Not_Swept_Yet()
+    public async Task The_Schedule_Is_Counted_On_The_Database_Clock()
     {
+        // Runs are stamped by the database clock, so the occurrence they count towards is
+        // picked on it too: a replica's own clock, ahead or behind, never decides what is due.
         await using var database = await UseTemporaryDatabaseAsync();
         var tenant = CreateTenant();
+        const string schedule = "* * * * * *";
         using var host = BuildHost(
-            CreateSettings(ConnectionString, schedule: "0 0 0 1 1 *", dryRun: false, killSwitch: false),
+            CreateSettings(ConnectionString, schedule: schedule, dryRun: false, killSwitch: false),
             tenant,
             services => services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>()
         );
-        await SeedOldNoteAsync(tenant.Id, "early-replica");
-        // A replica whose clock runs an hour ahead of the database's: its runs would start
-        // before the occurrence on the database clock and never count towards it.
-        var occurrence = DateTimeOffset.UtcNow.AddHours(1);
+        await SeedOldNoteAsync(tenant.Id, "database-clock");
+        var worker = GetWorker(host);
 
-        var outcome = await GetWorker(host).RunIterationAsync(occurrence, dryRun: false, CancellationToken.None);
+        var before = await DatabaseNowAsync();
+        var iteration = await worker.RunScheduledIterationAsync(schedule, dryRun: false, settled: null, CancellationToken.None);
+        var after = await DatabaseNowAsync();
 
-        outcome.Should().Be(OccurrenceOutcome.NotDue);
-        (await NoteExistsAsync("early-replica")).Should().BeTrue();
-        (await CountScheduledRunsAsync(tenant.Id)).Should().Be(0);
+        iteration.Outcome.Should().Be(OccurrenceOutcome.Settled);
+        iteration.Occurrence.Should().NotBeNull();
+        iteration.Occurrence!.Value.Should().BeOnOrAfter(CohortScheduleParser.GetPreviousOccurrence(schedule, before)!.Value);
+        iteration.Occurrence.Value.Should().BeOnOrBefore(CohortScheduleParser.GetPreviousOccurrence(schedule, after)!.Value);
+        iteration.NextWake.Should().NotBeNull();
+        (await NoteExistsAsync("database-clock")).Should().BeFalse();
+        var run = (await LoadScheduledRunsAsync(tenant.Id)).Should().ContainSingle().Subject;
+        run.Status.Should().Be(SweepRunStatus.Succeeded);
+        run.StartedAt.Should().BeOnOrAfter(iteration.Occurrence.Value);
+
+        // An occurrence already settled is let be without touching the worker lock: with
+        // another replica holding it, only an unsettled occurrence finds it busy.
+        const string yearly = "0 0 0 1 1 *";
+        var settledYear = CohortScheduleParser.GetPreviousOccurrence(yearly, await DatabaseNowAsync())!.Value;
+        await using var lockConnection = new NpgsqlConnection(ConnectionString);
+        await lockConnection.OpenAsync();
+        await using (var acquire = lockConnection.CreateCommand())
+        {
+            acquire.CommandText = "SELECT pg_advisory_lock(@key)";
+            acquire.Parameters.AddWithValue(
+                "key",
+                RetentionRunAdvisoryLock.WorkerKeyFor(new RelationalObjectName("public", "sweep_run"))
+            );
+            await acquire.ExecuteScalarAsync();
+        }
+
+        var alreadySettled = await worker.RunScheduledIterationAsync(
+            yearly,
+            dryRun: false,
+            settled: new RetentionWorker.SettledOccurrence(settledYear, DryRun: false),
+            CancellationToken.None
+        );
+        var unsettled = await worker.RunScheduledIterationAsync(yearly, dryRun: false, settled: null, CancellationToken.None);
+
+        alreadySettled.Should().Be(new IterationResult(OccurrenceOutcome.Settled, settledYear, alreadySettled.NextWake));
+        unsettled.Outcome.Should().Be(OccurrenceOutcome.LockBusy);
+        unsettled.Occurrence.Should().Be(settledYear);
     }
 
     [Fact]
@@ -486,7 +562,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         // already succeeded for this occurrence, so it must not run again.
         await SeedOldNoteAsync(finished.Id, "finished-pass");
         await SeedOldNoteAsync(neverStarted.Id, "never-started-pass");
-        var occurrence = DateTimeOffset.UtcNow.AddSeconds(-1);
+        var occurrence = (await DatabaseNowAsync()).AddSeconds(-1);
         await InsertScheduledRunAsync(finished.Id, occurrence.AddMilliseconds(10), SweepRunStatus.Succeeded);
 
         var outcome = await GetWorker(host).RunIterationAsync(occurrence, dryRun: false, CancellationToken.None);
@@ -509,7 +585,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             services => services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>()
         );
         await SeedOldNoteAsync(tenant.Id, "recovered-run");
-        var occurrence = DateTimeOffset.UtcNow.AddSeconds(-1);
+        var occurrence = (await DatabaseNowAsync()).AddSeconds(-1);
         // The row dispatcher settles a Started run whose owner died as Failed.
         await InsertScheduledRunAsync(tenant.Id, occurrence.AddMilliseconds(10), SweepRunStatus.Failed);
 
@@ -534,7 +610,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             services => services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>()
         );
         await SeedOldNoteAsync(tenant.Id, "exhausted-pass");
-        var occurrence = DateTimeOffset.UtcNow.AddSeconds(-1);
+        var occurrence = (await DatabaseNowAsync()).AddSeconds(-1);
         await InsertScheduledRunAsync(tenant.Id, occurrence.AddMilliseconds(10), SweepRunStatus.Failed);
         await InsertScheduledRunAsync(tenant.Id, occurrence.AddMilliseconds(20), SweepRunStatus.PartiallyFailed);
 
@@ -557,7 +633,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             services => services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>()
         );
         await SeedOldNoteAsync(tenant.Id, "cancelled-attempts");
-        var occurrence = DateTimeOffset.UtcNow.AddSeconds(-1);
+        var occurrence = (await DatabaseNowAsync()).AddSeconds(-1);
         await InsertScheduledRunAsync(tenant.Id, occurrence.AddMilliseconds(10), SweepRunStatus.Failed);
         await InsertScheduledRunAsync(tenant.Id, occurrence.AddMilliseconds(20), SweepRunStatus.Cancelled);
         await InsertScheduledRunAsync(tenant.Id, occurrence.AddMilliseconds(30), SweepRunStatus.Cancelled);
@@ -579,7 +655,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             services => services.AddSingleton<IRetentionRuleProvider>(new TenantFailingRuleProvider(tenant.Id))
         );
         await SeedOldNoteAsync(tenant.Id, "pending-pass");
-        var occurrence = DateTimeOffset.UtcNow.AddSeconds(-1);
+        var occurrence = (await DatabaseNowAsync()).AddSeconds(-1);
         var worker = GetWorker(host);
 
         (await worker.RunIterationAsync(occurrence, dryRun: false, CancellationToken.None))
@@ -617,7 +693,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         await SeedOldNoteAsync(missing.Id, "missing-tenant");
 
         var outcome = await GetWorker(host).RunIterationAsync(
-            DateTimeOffset.UtcNow.AddSeconds(-1),
+            (await DatabaseNowAsync()).AddSeconds(-1),
             dryRun: false,
             CancellationToken.None
         );
@@ -658,7 +734,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         await SeedOldNoteAsync(second.Id, "empty-source-second");
         await SeedOldTenantlessLogAsync("empty-source-tenantless");
 
-        await GetWorker(host).RunIterationAsync(DateTimeOffset.UtcNow.AddSeconds(-1), dryRun: false, CancellationToken.None);
+        await GetWorker(host).RunIterationAsync((await DatabaseNowAsync()).AddSeconds(-1), dryRun: false, CancellationToken.None);
 
         foreach (var tenant in new[] { first, second })
         {
@@ -688,7 +764,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         await SeedOldTenantlessLogAsync("tenantless-only");
 
         var outcome = await GetWorker(host).RunIterationAsync(
-            DateTimeOffset.UtcNow.AddSeconds(-1),
+            (await DatabaseNowAsync()).AddSeconds(-1),
             dryRun: false,
             CancellationToken.None
         );
@@ -720,7 +796,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         await SeedOldNoteAsync(conflicted.Id, "conflicted-tenant");
         await SeedOldNoteAsync(healthy.Id, "healthy-tenant");
 
-        await GetWorker(host).RunIterationAsync(DateTimeOffset.UtcNow.AddSeconds(-1), dryRun: false, CancellationToken.None);
+        await GetWorker(host).RunIterationAsync((await DatabaseNowAsync()).AddSeconds(-1), dryRun: false, CancellationToken.None);
 
         // Jurisdiction and tags feed rule resolution: an ambiguous input is never guessed.
         (await NoteExistsAsync("conflicted-tenant")).Should().BeTrue();
@@ -749,7 +825,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             }
         );
         await SeedOldNoteAsync(tenant.Id, "fixed-source");
-        var occurrence = DateTimeOffset.UtcNow.AddSeconds(-1);
+        var occurrence = (await DatabaseNowAsync()).AddSeconds(-1);
         var worker = GetWorker(host);
 
         (await worker.RunIterationAsync(occurrence, dryRun: false, CancellationToken.None))
@@ -787,7 +863,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         await SeedOldTenantlessLogAsync("empty-tenant-tenantless");
 
         var outcome = await GetWorker(host).RunIterationAsync(
-            DateTimeOffset.UtcNow.AddSeconds(-1),
+            (await DatabaseNowAsync()).AddSeconds(-1),
             dryRun: false,
             CancellationToken.None
         );
@@ -831,12 +907,12 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         await SeedOldTenantlessLogAsync("kill-switch-tenantless");
 
         var outcome = await GetWorker(host).RunIterationAsync(
-            DateTimeOffset.UtcNow.AddSeconds(-1),
+            (await DatabaseNowAsync()).AddSeconds(-1),
             dryRun: false,
             CancellationToken.None
         );
 
-        outcome.Should().Be(OccurrenceOutcome.Pending);
+        outcome.Should().Be(OccurrenceOutcome.Stopped);
         var remaining = new List<bool>();
         foreach (var body in new[] { "kill-switch-1", "kill-switch-2", "kill-switch-3" })
         {
@@ -855,16 +931,26 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
     {
         await using var database = await UseTemporaryDatabaseAsync();
         var tenant = CreateTenant();
+        var log = new WorkerLogProvider();
         using var host = BuildHost(
             CreateSettings(ConnectionString, schedule: "0 0 0 1 1 *", dryRun: false, killSwitch: true),
             tenant,
-            services => services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>()
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
+                services.AddSingleton<ILoggerProvider>(log);
+            }
         );
         await SeedOldNoteAsync(tenant.Id, "kill-switch-off");
 
         await host.Host.StartAsync();
-        await Task.Delay(TimeSpan.FromMilliseconds(500));
+        // The loop's turn that saw the switch, and swept nothing.
+        await WaitUntilAsync(
+            () => Task.FromResult(log.Entries.Any(entry => entry.Message.Contains("paused: the kill switch is on"))),
+            TimeSpan.FromSeconds(8)
+        );
         (await NoteExistsAsync("kill-switch-off")).Should().BeTrue();
+        (await LoadScheduledRunsAsync(tenant.Id)).Should().BeEmpty();
         host.Reload(killSwitch: false, dryRun: false);
         // Wait for the run to settle, not just for the note to go: stopping the host between
         // the two would cancel the run's remaining entities.
@@ -906,11 +992,16 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             TimeSpan.FromSeconds(8)
         );
         host.Reload(killSwitch: false, dryRun: false);
+        // Wait for the rerun to settle, not just for the notes to go: stopping the host between
+        // the two would cancel the run's remaining entities.
         await WaitUntilAsync(
-            async () => !await NoteExistsAsync("rerun-after-kill-1") && !await NoteExistsAsync("rerun-after-kill-2"),
+            async () => (await LoadScheduledRunsAsync(tenant.Id)).Any(run => run.Status == SweepRunStatus.Succeeded),
             TimeSpan.FromSeconds(8)
         );
         await host.Host.StopAsync();
+
+        (await NoteExistsAsync("rerun-after-kill-1")).Should().BeFalse();
+        (await NoteExistsAsync("rerun-after-kill-2")).Should().BeFalse();
 
         (await LoadScheduledRunsAsync(tenant.Id)).Select(run => run.Status).Should().Equal(
             SweepRunStatus.Cancelled,
@@ -969,6 +1060,19 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
 
     private static RetentionWorker GetWorker(WorkerTestHost host) =>
         host.Host.Services.GetServices<IHostedService>().OfType<RetentionWorker>().Single();
+
+    /// <summary>
+    /// The database clock, which stamps every run: occurrences derived from it compare with
+    /// run times whatever the test host's own clock says.
+    /// </summary>
+    private async Task<DateTimeOffset> DatabaseNowAsync()
+    {
+        await using var connection = new NpgsqlConnection(ConnectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT statement_timestamp()";
+        return new DateTimeOffset((DateTime)(await command.ExecuteScalarAsync())!);
+    }
 
     private async Task<long> CountScheduledRunsAsync(Guid tenantId)
     {
@@ -1029,8 +1133,9 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         return database;
     }
 
-    private async Task InsertScheduledRunAsync(Guid tenantId, DateTimeOffset startedAt, SweepRunStatus status, bool dryRun = false)
+    private async Task<Guid> InsertScheduledRunAsync(Guid tenantId, DateTimeOffset startedAt, SweepRunStatus status, bool dryRun = false)
     {
+        var sweepId = Guid.NewGuid();
         await using var connection = new NpgsqlConnection(ConnectionString);
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
@@ -1038,13 +1143,14 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             INSERT INTO "sweep_run" ("SweepId", "StartedAt", "Status", "TriggerKind", "DryRun", "TenantId", "SettledAt")
             VALUES (@sweepId, @startedAt, @status, @scheduled, @dryRun, @tenantId, CASE WHEN @status = 0 THEN NULL ELSE @startedAt END)
             """;
-        command.Parameters.AddWithValue("sweepId", Guid.NewGuid());
+        command.Parameters.AddWithValue("sweepId", sweepId);
         command.Parameters.AddWithValue("startedAt", startedAt);
         command.Parameters.AddWithValue("status", (int)status);
         command.Parameters.AddWithValue("scheduled", (int)SweepTriggerKind.Scheduled);
         command.Parameters.AddWithValue("dryRun", dryRun);
         command.Parameters.AddWithValue("tenantId", tenantId);
         await command.ExecuteNonQueryAsync();
+        return sweepId;
     }
 
     private async Task<IReadOnlyList<(Guid TenantId, SweepRunStatus Status)>> LoadAllRunsAsync()

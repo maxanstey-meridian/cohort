@@ -112,8 +112,8 @@ internal sealed class RetentionRowDispatcher(
         // ordering only waits on pending or in-flight siblings, so requeuing a later handler
         // alone would let it run ahead of an earlier one. Locking the row details serialises
         // this with the payload scrub, and READ COMMITTED rechecks the snapshot after the lock.
-        // Attempt is kept: each requeue buys one more delivery, and ctx.Attempt > 1 still
-        // tells the handler the work may already be done.
+        // Attempt is kept: a handler resumes its remaining attempts, or gets one more delivery
+        // if it used them all, and ctx.Attempt > 1 still tells it the work may already be done.
         var requeued = await WithDbAsync(
             db =>
             {
@@ -363,7 +363,9 @@ internal sealed class RetentionRowDispatcher(
     /// run the handler twice at once, or let the row's next handler start before it ends.
     /// A reclaimed claim with attempts left goes back to the queue, and the next claim counts
     /// the attempt; one that used its last attempt is dead-lettered, with the row's later
-    /// handlers.
+    /// handlers. Expired claims are paged by (<c>ClaimedAt</c>, <c>Id</c>) until a page comes
+    /// back short, so claims still held by running handlers, which stay the oldest, can't
+    /// hide a crashed dispatcher's claims behind them.
     /// </summary>
     private Task RecoverExpiredClaimsAsync(CancellationToken ct)
     {
@@ -374,46 +376,59 @@ internal sealed class RetentionRowDispatcher(
             async db =>
             {
                 var tables = Table(db);
-                var expired = await db.Database
-                    .SqlQueryRaw<ExpiredClaim>(
-                        $$"""
-                        SELECT
-                            status."Id" AS "StatusId",
-                            status."SweepRunRowDetailId" AS "RowDetailId",
-                            status."Attempt",
-                            status."ClaimToken",
-                            detail."SweepId"
-                        FROM {{tables.SweepRowHandlerStatus}} AS status
-                        INNER JOIN {{tables.SweepRunRowDetail}} AS detail
-                            ON detail."Id" = status."SweepRunRowDetailId"
-                        WHERE status."State" = {0} AND status."ClaimedAt" <= {1}
-                        ORDER BY status."ClaimedAt", status."Id"
-                        LIMIT {2}
-                        """,
-                        InFlight,
-                        leaseCutoff,
-                        dispatch.BatchSize
-                    )
-                    .ToListAsync(ct);
-                if (expired.Count == 0)
-                {
-                    return;
-                }
-
                 var statusTable = CohortStoreTables.FromModel(db.Model).SweepRowHandlerStatus;
-                await db.Database.OpenConnectionAsync(ct);
-                try
+                ExpiredClaim? last = null;
+                List<ExpiredClaim> page;
+                do
                 {
-                    var connection = db.Database.GetDbConnection();
-                    foreach (var claim in expired)
+                    page = await db.Database
+                        .SqlQueryRaw<ExpiredClaim>(
+                            $$"""
+                            SELECT
+                                status."Id" AS "StatusId",
+                                status."SweepRunRowDetailId" AS "RowDetailId",
+                                status."Attempt",
+                                status."ClaimToken",
+                                status."ClaimedAt",
+                                detail."SweepId"
+                            FROM {{tables.SweepRowHandlerStatus}} AS status
+                            INNER JOIN {{tables.SweepRunRowDetail}} AS detail
+                                ON detail."Id" = status."SweepRunRowDetailId"
+                            WHERE status."State" = {0} AND status."ClaimedAt" <= {1}
+                              AND ({3} OR (status."ClaimedAt", status."Id") > ({4}, {5}))
+                            ORDER BY status."ClaimedAt", status."Id"
+                            LIMIT {2}
+                            """,
+                            InFlight,
+                            leaseCutoff,
+                            dispatch.BatchSize,
+                            last is null,
+                            last?.ClaimedAt ?? leaseCutoff,
+                            last?.StatusId ?? 0L
+                        )
+                        .ToListAsync(ct);
+                    if (page.Count == 0)
                     {
-                        await ReclaimAsync(db, connection, statusTable, claim, dispatch, ct);
+                        return;
                     }
+
+                    await db.Database.OpenConnectionAsync(ct);
+                    try
+                    {
+                        var connection = db.Database.GetDbConnection();
+                        foreach (var claim in page)
+                        {
+                            await ReclaimAsync(db, connection, statusTable, claim, dispatch, ct);
+                        }
+                    }
+                    finally
+                    {
+                        await db.Database.CloseConnectionAsync();
+                    }
+
+                    last = page[^1];
                 }
-                finally
-                {
-                    await db.Database.CloseConnectionAsync();
-                }
+                while (page.Count == dispatch.BatchSize);
             },
             ct
         );
@@ -500,7 +515,7 @@ internal sealed class RetentionRowDispatcher(
 
             if (deadLettered)
             {
-                LogDeadLettered(claim.StatusId, claim.SweepId, ExhaustedClaimReason);
+                LogDeadLettered(claim.StatusId, claim.SweepId, ExhaustedClaimReason, snapshotKept: true);
             }
         }
         finally
@@ -748,6 +763,7 @@ internal sealed class RetentionRowDispatcher(
                 () => MarkDeadLetteredAsync(
                     claimed,
                     "Captured row snapshot was scrubbed by the payload-retention backstop (RowHandlerDispatch:PayloadRetention) before this handler ran; the work can no longer complete. Increase PayloadRetention or drain handler work sooner.",
+                    snapshotKept: false,
                     ct
                 )
             );
@@ -770,10 +786,24 @@ internal sealed class RetentionRowDispatcher(
                 RetentionExecutionScopes.ForTenant(claimed.TenantId),
                 async services =>
                 {
-                    var entityType = ResolveEntityType(
-                        claimed,
-                        services.GetRequiredService<RetentionRegistry>()
-                    );
+                    var entityType = services.GetRequiredService<RetentionRegistry>()
+                        .Scan()
+                        .Values
+                        .FirstOrDefault(entry => entry.RetentionEntityId == claimed.RetentionEntityId)
+                        ?.EntityType;
+                    if (entityType is null)
+                    {
+                        // Retrying cannot heal an unregistered entity id either: the entity
+                        // lost its [Retain] or its [RetentionEntityId] changed. The snapshot
+                        // stays, so the work can be requeued once the id is back.
+                        return () => MarkDeadLetteredAsync(
+                            claimed,
+                            $"entity id {claimed.RetentionEntityId} is not registered; restore its [RetentionEntityId] and requeue",
+                            snapshotKept: true,
+                            ct
+                        );
+                    }
+
                     var handlers = RetentionHandlerSupport.ResolveHandlers(services, entityType);
                     var handler = handlers.FirstOrDefault(candidate =>
                         string.Equals(candidate.HandlerIdentity, claimed.HandlerType, StringComparison.Ordinal)
@@ -781,17 +811,14 @@ internal sealed class RetentionRowDispatcher(
                     if (handler is null)
                     {
                         // Retrying cannot heal an unregistered handler id: the handler was
-                        // removed, or its [RowHandlerId] changed.
-                        return async () =>
-                        {
-                            // The snapshot stays, so the work can be requeued once the
-                            // handler is back.
-                            await MarkDeadLetteredAsync(
-                                claimed,
-                                $"handler id {claimed.HandlerType} is not registered; re-register it and requeue",
-                                ct
-                            );
-                        };
+                        // removed, or its [RowHandlerId] changed. The snapshot stays, so the
+                        // work can be requeued once the handler is back.
+                        return () => MarkDeadLetteredAsync(
+                            claimed,
+                            $"handler id {claimed.HandlerType} is not registered; re-register it and requeue",
+                            snapshotKept: true,
+                            ct
+                        );
                     }
                     else
                     {
@@ -882,7 +909,7 @@ internal sealed class RetentionRowDispatcher(
     {
         if (claimed.Attempt >= dispatch.MaxAttempts)
         {
-            await MarkDeadLetteredAsync(claimed, lastError, ct);
+            await MarkDeadLetteredAsync(claimed, lastError, snapshotKept: true, ct);
             return;
         }
 
@@ -907,7 +934,12 @@ internal sealed class RetentionRowDispatcher(
     /// handlers for one row run in order, so later ones can never run. The row's snapshot
     /// stays until <c>PayloadRetention</c>, so the work can be requeued.
     /// </summary>
-    private Task MarkDeadLetteredAsync(ClaimedHandlerRow claimed, string lastError, CancellationToken ct)
+    private Task MarkDeadLetteredAsync(
+        ClaimedHandlerRow claimed,
+        string lastError,
+        bool snapshotKept,
+        CancellationToken ct
+    )
     {
         var now = DateTimeOffset.UtcNow;
         return WithDbAsync(
@@ -930,7 +962,7 @@ internal sealed class RetentionRowDispatcher(
 
                 await DeadLetterDependentsAsync(db, claimed.RowDetailId, claimed.StatusId, now, ct);
                 await transaction.CommitAsync(ct);
-                LogDeadLettered(claimed.StatusId, claimed.SweepId, lastError);
+                LogDeadLettered(claimed.StatusId, claimed.SweepId, lastError, snapshotKept);
             },
             ct
         );
@@ -955,13 +987,27 @@ internal sealed class RetentionRowDispatcher(
 
     // An Error, because hosts that only run the background poller have no other signal that
     // work stopped retrying. LastError is a sanitized diagnostic or a Cohort-defined reason.
-    private void LogDeadLettered(long statusId, Guid sweepId, string lastError) =>
+    // A snapshot the scrub already cleared can't be requeued, so that log doesn't offer it.
+    private void LogDeadLettered(long statusId, Guid sweepId, string lastError, bool snapshotKept)
+    {
+        if (snapshotKept)
+        {
+            logger.LogError(
+                "Cohort dead-lettered row handler status {StatusId} for sweep {SweepId}: {LastError} While its snapshot is retained (RowHandlerDispatch:PayloadRetention), IRetentionRowDispatcher.RequeueDeadLetteredAsync runs it again.",
+                statusId,
+                sweepId,
+                lastError
+            );
+            return;
+        }
+
         logger.LogError(
-            "Cohort dead-lettered row handler status {StatusId} for sweep {SweepId}: {LastError} While its snapshot is retained (RowHandlerDispatch:PayloadRetention), IRetentionRowDispatcher.RequeueDeadLetteredAsync runs it again.",
+            "Cohort dead-lettered row handler status {StatusId} for sweep {SweepId}: {LastError} Its snapshot is gone, so it can't be requeued.",
             statusId,
             sweepId,
             lastError
         );
+    }
 
     // Values: {0} state, {1} completed-at, {2} last error.
     private const string DeadLetterAssignments =
@@ -1052,16 +1098,6 @@ internal sealed class RetentionRowDispatcher(
 
     private static QuotedTables Table(DbContext db) => new(CohortStoreTables.FromModel(db.Model));
 
-    private static Type ResolveEntityType(ClaimedHandlerRow claimed, RetentionRegistry registry)
-    {
-        return registry.Scan().Values
-                .FirstOrDefault(entry => entry.RetentionEntityId == claimed.RetentionEntityId)
-                ?.EntityType
-            ?? throw new InvalidOperationException(
-                $"Could not resolve retention handler entity type '{claimed.EntityType}': it is not a registered retained entity in the current model."
-            );
-    }
-
     // MakeGenericType/GetMethod would otherwise run on every dispatched row; the entity
     // set is small and fixed, so the closed types are cached for the process lifetime.
     private static readonly ConcurrentDictionary<Type, (Type ContextType, MethodInfo OnAfter)> DispatchReflection = new();
@@ -1150,6 +1186,21 @@ internal sealed class RetentionRowDispatcher(
     }
 
     /// <summary>
+    /// The longest a row's queued work can stay retrying when the row has
+    /// <paramref name="handlerCount"/> handlers: they run one after another, each through its
+    /// whole <see cref="RetryScheduleSpan"/>, and each attempt can be picked up a
+    /// <c>PollInterval</c> late. Saturates at <see cref="TimeSpan.MaxValue"/>. Call it only
+    /// with options the validator's bounds already accept.
+    /// </summary>
+    internal static TimeSpan RowRetryScheduleSpan(RowHandlerDispatchOptions dispatch, int handlerCount)
+    {
+        var perHandler = (Int128)RetryScheduleSpan(dispatch).Ticks
+            + (Int128)dispatch.PollInterval.Ticks * dispatch.MaxAttempts;
+        var total = perHandler * handlerCount;
+        return total >= TimeSpan.MaxValue.Ticks ? TimeSpan.MaxValue : TimeSpan.FromTicks((long)total);
+    }
+
+    /// <summary>
     /// The batch's lease connection, shared by its deliveries to release their own locks. A
     /// connection runs one command at a time, so releases take turns.
     /// </summary>
@@ -1215,6 +1266,7 @@ internal sealed class RetentionRowDispatcher(
         public long RowDetailId { get; init; }
         public int Attempt { get; init; }
         public Guid ClaimToken { get; init; }
+        public DateTimeOffset ClaimedAt { get; init; }
         public Guid SweepId { get; init; }
     }
 

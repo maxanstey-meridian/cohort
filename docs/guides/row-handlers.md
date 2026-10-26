@@ -76,11 +76,14 @@ Both methods are optional. The interface supplies no-op defaults.
   This is where side effects belong.
 
 Every handler carries `[RowHandlerId("uuid")]`, a permanent UUID that its queued work is
-persisted and delivered under. `AddRowHandler` refuses a handler without one, or one whose id
-another handler of the same entity already uses. Renaming or moving the class is safe; changing
-the id isn't. Work queued under an id no registered handler carries is dead-lettered with
-`handler id … is not registered; re-register it and requeue`. It keeps its snapshot, so once
-the handler is back, [requeue it](#requeuing-dead-lettered-work).
+persisted and delivered under. `AddRowHandler` refuses a handler without one, with a malformed
+one, or with one another handler class already uses, whatever its entity (a requeue by handler
+id would otherwise reach both). Renaming or moving the class is safe; changing the id isn't.
+Work queued under an id no registered handler carries is dead-lettered with
+`handler id … is not registered; re-register it and requeue`, and work for an entity whose
+`[RetentionEntityId]` the model no longer declares with
+`entity id … is not registered; restore its [RetentionEntityId] and requeue`. Either keeps its
+snapshot, so once the handler or the id is back, [requeue it](#requeuing-dead-lettered-work).
 
 When an entity has several handlers, they run in `[RowHandlerPriority(n)]` order, lowest
 first. Handlers without the attribute run last, ordered by type name.
@@ -93,7 +96,7 @@ greater than 1, the work might already have been done.
 The dispatcher polls the queue, runs up to `MaxParallelism` rows at once, and keeps each
 row's handlers in order. A failed attempt retries with exponential backoff: 5 seconds
 (`BaseBackoff`), doubling up to 1 hour (`MaxBackoff`). After `MaxAttempts`, 25 by default or
-about 15 hours of retries, the work is dead-lettered with a sanitized `LastError`, and the
+up to about 17.5 hours of retries, the work is dead-lettered with a sanitized `LastError`, and the
 row's later handlers with it. Each dead-letter logs an Error. The work keeps its snapshot, so
 you can [requeue it](#requeuing-dead-lettered-work). All of these are
 [configurable](/reference/configuration). The kill switch stops the background poller after
@@ -116,12 +119,17 @@ Each delivery holds its claim for `RowHandlerDispatch:ClaimTimeout`, five minute
   held: it keeps the row, and the row's later handlers wait, until it returns. Each pass logs
   a Warning naming it. Honour the token.
 - Work left `InFlight` by a crash is reclaimed once the timeout passes and the crashed
-  dispatcher's session has gone, and the reclaim counts as an attempt.
+  dispatcher's session has gone, and the reclaim counts as an attempt. A process that exits
+  closes its session at once, but if the host dies outright (power loss, a VM gone) the server
+  holds the idle session until its TCP keepalive gives up, about 2 hours with Linux defaults.
+  Set the server's `tcp_keepalives_idle`, `tcp_keepalives_interval` and `tcp_keepalives_count`
+  to shorten that; the same applies to recovering a crashed run.
 - If the dispatcher's database session is lost while the handler still runs (a failover, an
   idle-session timeout), the lock goes with it, and the work can be reclaimed and run again.
   No lock can rule that out; fence downstream writes on `ctx.Attempt` if it matters.
 - Session advisory locks need direct connections or session-mode pooling, not
-  transaction-mode pooling. Each draining dispatcher holds one extra connection per batch.
+  transaction-mode pooling or Npgsql `Multiplexing`, which readiness refuses. Each draining
+  dispatcher holds one extra connection per batch.
 - A delivery whose claim was reclaimed can't settle the row. Its outcome is discarded and the
   newer delivery settles it.
 - If recording a delivery's outcome fails, for example on a transient database error, the
@@ -146,7 +154,9 @@ poller. It's handy in tests and one-shot jobs. It honours retry backoff: a faile
 waits out its backoff, so a flush during an outage spends one attempt per row, not the whole
 budget. The result reports what's left: `PendingRemaining` (waiting out a backoff, a run that
 hasn't settled, or a sibling), `InFlightRemaining` (held by a running delivery) and
-`DeadLetteredRequeueable`. Flush again until `Settled` if you need everything delivered.
+`DeadLetteredRequeueable`. Because a flush runs only what's due, looping on it until `Settled`
+spins through every backoff wait. To reach a final state, wait out the backoff, or in tests set
+a short `BaseBackoff` and `MaxBackoff`, or `MaxAttempts` of 1.
 
 ### Requeuing dead-lettered work
 
@@ -161,9 +171,9 @@ await dispatcher.RequeueDeadLetteredAsync(handlerId: Guid.Parse("0b6f5e43-…"))
 
 - Every dead-lettered handler of each matching row is requeued, so the row's handlers still
   run in order. Filtering on a later handler requeues the earlier one it was waiting on too.
-- A requeue gives each handler one more delivery. `Attempt` carries on, so `ctx.Attempt`
-  still tells the handler the work may already be done, and another failure dead-letters it
-  again.
+- A requeue resumes each handler's remaining attempts, or gives one more delivery to a
+  handler that used them all. `Attempt` carries on, so `ctx.Attempt` still tells the handler
+  the work may already be done.
 - Work whose snapshot the backstop scrub already cleared can't be requeued.
   `FlushAsync`'s `DeadLetteredRequeueable` counts only work that can.
 - The kill switch doesn't stop a requeue; the requeued work runs on the next flush, or once
@@ -178,8 +188,13 @@ can:
   Dead-lettered work keeps its snapshot until `PayloadRetention`, so it can be requeued, and
   history pruning keeps the run until then.
 - A backstop scrub clears anything older than `RowHandlerDispatch:PayloadRetention`, 30 days
-  by default. Startup refuses a `PayloadRetention` shorter than a handler's retry schedule,
-  so the scrub never ends work that is still retrying. It still runs while the kill switch
+  by default, counted from the row's mutation. Startup, and every options reload, refuses a
+  `PayloadRetention` shorter than one handler's retry schedule, and, with handlers
+  registered, shorter than the entity with the most handlers needs for all of them to run
+  their schedules one after another, each attempt up to a `PollInterval` late (see
+  [Configuration](/reference/configuration#row-handler-dispatch)). The scrub can still end
+  work held up outside that schedule: `AfterSweepSettled` work waiting for a run that takes
+  long to settle, and work paused by the kill switch. It still runs while the kill switch
   is on. Queued work whose snapshot the backstop scrubbed can never complete, so it
   dead-letters immediately, naming the scrub as the reason, instead of burning its retries.
 - Dead-letter `LastError` stores a [sanitized diagnostic](/guides/audit-trail#failure-diagnostics):

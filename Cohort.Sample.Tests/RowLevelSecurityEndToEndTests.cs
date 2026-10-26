@@ -70,7 +70,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             }
         );
 
-        await GetWorker(host).RunIterationAsync(DateTimeOffset.UtcNow.AddSeconds(-1), dryRun: false, CancellationToken.None);
+        await GetWorker(host).RunIterationAsync((await DatabaseNowAsync(database.ConnectionString)).AddSeconds(-1), dryRun: false, CancellationToken.None);
 
         entries.Ran.Should().Equal(
             WorkerCoordination,
@@ -109,7 +109,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             }
         );
 
-        await GetWorker(host).RunIterationAsync(DateTimeOffset.UtcNow.AddSeconds(-1), dryRun: false, CancellationToken.None);
+        await GetWorker(host).RunIterationAsync((await DatabaseNowAsync(database.ConnectionString)).AddSeconds(-1), dryRun: false, CancellationToken.None);
 
         entries.Ran.Should().Contain(new RetentionExecutionContext.Tenant(tenantB));
         (await LoadNoteBodiesAsync(database.ConnectionString)).Should().Equal("b-expired");
@@ -138,7 +138,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             }
         );
 
-        await GetWorker(host).RunIterationAsync(DateTimeOffset.UtcNow.AddSeconds(-1), dryRun: false, CancellationToken.None);
+        await GetWorker(host).RunIterationAsync((await DatabaseNowAsync(database.ConnectionString)).AddSeconds(-1), dryRun: false, CancellationToken.None);
 
         (await LoadNoteBodiesAsync(database.ConnectionString)).Should().Equal("a-expired");
         (await LoadLogPayloadsAsync(database.ConnectionString)).Should().Equal("log-expired");
@@ -659,6 +659,16 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
 
     private static RetentionWorker GetWorker(IHost host) =>
         host.Services.GetServices<IHostedService>().OfType<RetentionWorker>().Single();
+
+    /// <summary>The database clock, which stamps every run, so an occurrence taken from it compares with them.</summary>
+    private static async Task<DateTimeOffset> DatabaseNowAsync(string connectionString)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT statement_timestamp()";
+        return new DateTimeOffset((DateTime)(await command.ExecuteScalarAsync())!);
+    }
 
     private static TenantContext Tenant(Guid id) => new(id, "uk", new Dictionary<string, string>());
 

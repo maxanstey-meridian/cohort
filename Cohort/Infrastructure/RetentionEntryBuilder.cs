@@ -82,9 +82,22 @@ internal sealed class RetentionEntryBuilder(CohortConventions conventions)
                 $"[Retain] on {clrType.FullName}: anchor member '{retain.AnchorMember}' has no mapped table column."
             );
 
+        RetentionEntityIdAttribute? entityIdAttribute;
+        try
+        {
+            entityIdAttribute = clrType.GetCustomAttribute<RetentionEntityIdAttribute>(inherit: false);
+        }
+        catch (Exception ex) when (ex is ArgumentException or TargetInvocationException or CustomAttributeFormatException)
+        {
+            throw new InvalidOperationException(
+                $"[Retain] on {clrType.FullName}: [RetentionEntityId] is invalid; it must be a stable non-empty UUID.",
+                ex
+            );
+        }
+
         return new RetentionEntry(
             clrType,
-            clrType.GetCustomAttribute<RetentionEntityIdAttribute>(inherit: false)?.Id
+            entityIdAttribute?.Id
                 ?? throw new InvalidOperationException(
                     $"[Retain] on {clrType.FullName}: retained entities must declare [RetentionEntityId(\"uuid\")] with a stable non-empty UUID."
                 ),

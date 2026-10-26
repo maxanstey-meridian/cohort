@@ -6,6 +6,7 @@ namespace Cohort.Infrastructure;
 internal sealed record RetentionFailureDiagnostic
 {
     private const int MaximumExceptionTypeLength = 512;
+    private const string RefusalType = "Cohort.Refusal";
 
     private RetentionFailureDiagnostic(Guid diagnosticId, string exceptionType, string machineCode)
     {
@@ -32,16 +33,18 @@ internal sealed record RetentionFailureDiagnostic
         );
     }
 
+    /// <summary>
+    /// A failure Cohort declared rather than caught: there is no exception, so the type is
+    /// <see cref="RefusalType"/> and the code is Cohort's own.
+    /// </summary>
+    public static RetentionFailureDiagnostic Refused(string machineCode) =>
+        new(Guid.NewGuid(), RefusalType, machineCode);
+
     public override string ToString() =>
         $"type={ExceptionType};code={MachineCode};diagnosticId={DiagnosticIdText}";
 
     private static string GetMachineCode(Exception exception)
     {
-        if (exception is RetentionPassRefusedException refused)
-        {
-            return refused.MachineCode;
-        }
-
         if (
             exception is DbException { SqlState.Length: 5 } databaseException
             && databaseException.SqlState.All(character =>

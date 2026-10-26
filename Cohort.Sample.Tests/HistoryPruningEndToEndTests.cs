@@ -68,6 +68,41 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Prune_Keeps_The_Scheduled_Runs_Of_The_Current_Occurrence()
+    {
+        // The worker's ledger for the occurrence it is catching up: pruning it would rerun
+        // passes that already succeeded and give exhausted ones fresh attempts.
+        var occurrenceDay = Now.UtcDateTime.Date.AddDays(-10);
+        var occurrence = new DateTimeOffset(occurrenceDay, TimeSpan.Zero);
+        var schedule = $"0 0 {occurrenceDay.Day} {occurrenceDay.Month} *";
+        var succeededInOccurrence = await SeedRunAsync(
+            SweepRunStatus.Succeeded, occurrence.AddHours(2), startedAt: occurrence.AddHours(1), trigger: SweepTriggerKind.Scheduled
+        );
+        var failedInOccurrence = await SeedRunAsync(
+            SweepRunStatus.Failed, occurrence.AddHours(4), startedAt: occurrence.AddHours(3), trigger: SweepTriggerKind.Scheduled
+        );
+        var scheduledBeforeIt = await SeedRunAsync(
+            SweepRunStatus.Succeeded, occurrence.AddHours(-1), trigger: SweepTriggerKind.Scheduled
+        );
+        var manualInOccurrence = await SeedRunAsync(SweepRunStatus.Succeeded, occurrence.AddHours(2));
+
+        using (var scheduled = CreateHost(succeededRunRetention: "1.00:00:00", failedRunRetention: "1.00:00:00", schedule: schedule))
+        {
+            (await PruneAsync(scheduled)).Runs.Should().Be(2);
+        }
+        (await LoadRunIdsAsync()).Should().BeEquivalentTo([succeededInOccurrence, failedInOccurrence]);
+        (await CountDependentRowsAsync(scheduledBeforeIt)).Should().Be(0);
+        (await CountDependentRowsAsync(manualInOccurrence)).Should().Be(0);
+
+        // Without a schedule there is no occurrence to keep.
+        using (var unscheduled = CreateHost(succeededRunRetention: "1.00:00:00", failedRunRetention: "1.00:00:00"))
+        {
+            (await PruneAsync(unscheduled)).Runs.Should().Be(2);
+        }
+        (await LoadRunIdsAsync()).Should().BeEmpty();
+    }
+
+    [Fact]
     public async Task Prune_Keeps_A_Real_Run_Until_Its_Handler_Work_Has_Succeeded()
     {
         var tenantId = Guid.NewGuid();
@@ -371,12 +406,14 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
         string? failedRunRetention = null,
         string? inactiveHoldRetention = null,
         bool killSwitch = false,
-        Action<IServiceCollection>? configureServices = null
+        Action<IServiceCollection>? configureServices = null,
+        string? schedule = null
     )
     {
         var settings = new Dictionary<string, string?>
         {
             [$"{CohortOptions.SectionName}:KillSwitch"] = killSwitch.ToString(),
+            [$"{CohortOptions.SectionName}:Schedule"] = schedule,
         };
         if (succeededRunRetention is not null)
         {
@@ -412,7 +449,8 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
         DateTimeOffset? settledAt,
         SweepRowHandlerDispatchState? handlerState = null,
         DateTimeOffset? startedAt = null,
-        string? capturedPayload = null
+        string? capturedPayload = null,
+        SweepTriggerKind trigger = SweepTriggerKind.Manual
     )
     {
         var sweepId = Guid.NewGuid();
@@ -456,7 +494,7 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
         {
             Value = (object?)settledAt ?? DBNull.Value,
         });
-        command.Parameters.AddWithValue("trigger", (int)SweepTriggerKind.Manual);
+        command.Parameters.AddWithValue("trigger", (int)trigger);
         command.Parameters.AddWithValue("tenantId", tenantId);
         command.Parameters.AddWithValue("entityId", Note.RetentionIdentity);
         command.Parameters.AddWithValue("recordId", Guid.NewGuid().ToString());

@@ -85,6 +85,47 @@ internal sealed class RetentionRun(
             return;
         }
 
+        await RunLockedAsync(() => RunAndSettleAsync(body, ct), ct);
+    }
+
+    /// <summary>
+    /// Records a run Cohort refused before it touched anything, as a declared outcome rather
+    /// than a caught one: takes the run lock, commits Started, then settles Failed with
+    /// <paramref name="machineCode"/>, a Cohort-defined code safe to persist.
+    /// <paramref name="reason"/> may name the tenant, so it goes to the logs only, under the
+    /// run's diagnostic ID. Owned runs only: nothing is refused inside a caller's transaction.
+    /// </summary>
+    public async Task ExecuteRefusalAsync(string machineCode, string reason, CancellationToken ct)
+    {
+        if (callerCommit is not null)
+        {
+            throw new InvalidOperationException("A refused run is never part of the caller's transaction.");
+        }
+
+        await RunLockedAsync(
+            async () =>
+            {
+                await WriteDurableAsync(started, CancellationToken.None);
+                var diagnostic = RetentionFailureDiagnostic.Refused(machineCode);
+                logger.LogError(
+                    "Cohort {Operation} {SweepId} was refused and settles Failed: {Reason} Diagnostic {DiagnosticId}.",
+                    operation,
+                    SweepId,
+                    reason,
+                    diagnostic.DiagnosticIdText
+                );
+                await SettleAsync(at => new SweepEvent.Failed(SweepId, at, diagnostic.ToString(), at - started.At, AffectedTotal));
+            },
+            ct
+        );
+    }
+
+    /// <summary>
+    /// Runs <paramref name="work"/> holding the run lock on an open connection. The lock is
+    /// taken before Started commits, so recovery never sees a Started run without a live owner.
+    /// </summary>
+    private async Task RunLockedAsync(Func<Task> work, CancellationToken ct)
+    {
         await db.Database.OpenConnectionAsync(ct);
         var connection = db.Database.GetDbConnection();
         var locked = false;
@@ -93,7 +134,7 @@ internal sealed class RetentionRun(
         {
             await RetentionRunAdvisoryLock.AcquireAsync(connection, RetentionRunAdvisoryLock.KeyFor(SweepId), ct);
             locked = true;
-            await RunAndSettleAsync(body, ct);
+            await work();
         }
         catch (Exception ex)
         {

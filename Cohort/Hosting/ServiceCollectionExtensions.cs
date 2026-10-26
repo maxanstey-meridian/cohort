@@ -51,6 +51,9 @@ public static class ServiceCollectionExtensions
         services.TryAddEnumerable(
             ServiceDescriptor.Singleton<IValidateOptions<CohortOptions>, CohortOptionsValidator>()
         );
+        services.TryAddEnumerable(
+            ServiceDescriptor.Singleton<IValidateOptions<CohortOptions>, RowHandlerRetryScheduleValidator>()
+        );
 
         services.TryAddSingleton(sp =>
             new RetentionEntryBuilder(sp.GetRequiredService<IOptions<CohortOptions>>().Value.Conventions)
@@ -147,8 +150,21 @@ public static class ServiceCollectionExtensions
             );
         }
 
+        RowHandlerIdAttribute? idAttribute;
+        try
+        {
+            idAttribute = typeof(THandler).GetCustomAttribute<RowHandlerIdAttribute>(inherit: false);
+        }
+        catch (Exception ex) when (ex is ArgumentException or TargetInvocationException or CustomAttributeFormatException)
+        {
+            throw new InvalidOperationException(
+                $"Row handler {typeof(THandler).FullName} has an invalid [RowHandlerId]: it must be a non-empty UUID.",
+                ex
+            );
+        }
+
         var identity =
-            typeof(THandler).GetCustomAttribute<RowHandlerIdAttribute>(inherit: false)?.Id
+            idAttribute?.Id
             ?? throw new InvalidOperationException(
                 $"Row handler {typeof(THandler).FullName} has no [RowHandlerId(\"<uuid>\")] attribute. Every row handler needs a permanent UUID: queued work is persisted under it."
             );
@@ -173,17 +189,17 @@ public static class ServiceCollectionExtensions
             );
         }
 
-        // Two handlers persisting queued work under the same identity would have their
-        // rows dispatched interchangeably to whichever resolves first.
+        // The id names one handler class, whatever its entity: two classes sharing it would
+        // have their work dispatched interchangeably, and a requeue by handler id would reach
+        // both. One class registered for two entities keeps its single id.
         var identityClash = existingRegistrations.FirstOrDefault(registration =>
-            registration.EntityType == typeof(TEntity)
-            && registration.HandlerType != typeof(THandler)
+            registration.HandlerType != typeof(THandler)
             && registration.Identity == identity
         );
         if (identityClash is not null)
         {
             throw new InvalidOperationException(
-                $"Row handler id {identity} for entity {typeof(TEntity).FullName} is already used by {identityClash.HandlerType.FullName}; give {typeof(THandler).FullName} its own [RowHandlerId] so queued work dispatches to the handler that persisted it."
+                $"Row handler id {identity} is already used by {identityClash.HandlerType.FullName}; give {typeof(THandler).FullName} its own [RowHandlerId] so queued work, and a requeue by handler id, reach only the handler that persisted it."
             );
         }
 

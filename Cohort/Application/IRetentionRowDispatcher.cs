@@ -8,19 +8,21 @@ public interface IRetentionRowDispatcher
     /// an outage spends one attempt per row, not the whole retry budget. Work the call cannot
     /// dispatch is left untouched and reported on the result: rows waiting out their
     /// backoff, rows claimed by a dispatcher that is still running them, and
-    /// AfterSweepSettled rows whose sweep run has not settled. Callers that need full
-    /// settlement should re-flush until <see cref="RowDispatcherFlushResult.Settled"/> is
-    /// true. Not affected by the kill switch, which stops only the background poller.
+    /// AfterSweepSettled rows whose sweep run has not settled. A flush runs only work that is
+    /// due, so looping on it until <see cref="RowDispatcherFlushResult.Settled"/> spins through
+    /// every backoff wait; a caller that needs a final state waits out the backoff, or, in
+    /// tests, sets a short <c>BaseBackoff</c> and <c>MaxBackoff</c> or <c>MaxAttempts</c> of 1.
+    /// Not affected by the kill switch, which stops only the background poller.
     /// </summary>
     public Task<RowDispatcherFlushResult> FlushAsync(CancellationToken ct = default);
 
     /// <summary>
     /// Requeues dead-lettered handler work whose captured snapshot is still retained (it is
     /// kept until <c>RowHandlerDispatch:PayloadRetention</c>). Every dead-lettered handler of
-    /// each matching row is requeued, so the row's handlers still run in order. Each
-    /// requeued handler gets one more delivery: its <c>Attempt</c> count carries on, so
-    /// <c>ctx.Attempt</c> still tells it the work may already be done, and a failure
-    /// dead-letters it again. Not affected by the kill switch.
+    /// each matching row is requeued, so the row's handlers still run in order. A requeue
+    /// resumes each handler's remaining attempts, or gives one more delivery to a handler that
+    /// used them all: its <c>Attempt</c> count carries on, so <c>ctx.Attempt</c> still tells it
+    /// the work may already be done. Not affected by the kill switch.
     /// </summary>
     /// <param name="sweepId">Only rows from this run, or every run when null.</param>
     /// <param name="handlerId">

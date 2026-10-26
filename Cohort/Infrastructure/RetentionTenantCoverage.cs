@@ -32,8 +32,8 @@ internal static class RetentionTenantCoverage
                 continue;
             }
 
-            // A loose index scan: one probe per distinct tenant, cheap with an index led by
-            // the tenant column and a sequential scan without one.
+            // One pass over the table, whatever its indexes: the source's tenants are filtered
+            // out as rows are read, and only the tenants left are aggregated.
             var table = PostgreSqlIdentifier.Format(entry.Table);
             var column = PostgreSqlIdentifier.Quote(tenant.TenantColumn);
             await using var command = new SqlParams
@@ -43,16 +43,8 @@ internal static class RetentionTenantCoverage
                 connection,
                 null,
                 $"""
-                WITH RECURSIVE tenants(id) AS (
-                    (SELECT target.{column} FROM {table} AS target ORDER BY 1 LIMIT 1)
-                    UNION ALL
-                    SELECT (
-                        SELECT target.{column} FROM {table} AS target
-                        WHERE target.{column} > tenants.id ORDER BY 1 LIMIT 1
-                    )
-                    FROM tenants WHERE tenants.id IS NOT NULL
-                )
-                SELECT id FROM tenants WHERE id IS NOT NULL AND NOT (id = ANY(@sourceTenantIds))
+                SELECT DISTINCT target.{column} FROM {table} AS target
+                WHERE target.{column} IS NOT NULL AND NOT (target.{column} = ANY(@sourceTenantIds))
                 """
             );
             await using var reader = await command.ExecuteReaderAsync(ct);
@@ -75,39 +67,3 @@ internal static class RetentionTenantCoverage
 }
 
 internal sealed record TenantCoverageGaps(IReadOnlyList<Guid> MissingTenantIds, IReadOnlyList<Type> EntitiesWithEmptyTenant);
-
-/// <summary>Why the worker refused a tenant's pass instead of sweeping it.</summary>
-internal enum RetentionPassRefusal
-{
-    /// <summary>The tenant owns retained rows, but the tenant source didn't return it.</summary>
-    NotInTenantSource,
-
-    /// <summary>The tenant source returned the tenant more than once, with different contexts.</summary>
-    ConflictingTenantContexts,
-}
-
-/// <summary>
-/// Settles a refused pass's run as Failed. Its machine code is Cohort-defined and safe to
-/// persist; the message, which names the tenant, stays in the logs.
-/// </summary>
-internal sealed class RetentionPassRefusedException(Guid tenantId, RetentionPassRefusal refusal)
-    : Exception(Describe(tenantId, refusal))
-{
-    public RetentionPassRefusal Refusal { get; } = refusal;
-
-    public string MachineCode => Refusal switch
-    {
-        RetentionPassRefusal.NotInTenantSource => "cohort:tenant-not-in-source",
-        RetentionPassRefusal.ConflictingTenantContexts => "cohort:conflicting-tenant-contexts",
-        _ => throw new ArgumentOutOfRangeException(nameof(Refusal)),
-    };
-
-    private static string Describe(Guid tenantId, RetentionPassRefusal refusal) => refusal switch
-    {
-        RetentionPassRefusal.NotInTenantSource =>
-            $"Tenant {tenantId} owns rows in retained tables, but IRetentionTenantSource did not return it. Cohort won't sweep a tenant without its jurisdiction and tags; add it to the tenant source.",
-        RetentionPassRefusal.ConflictingTenantContexts =>
-            $"IRetentionTenantSource returned tenant {tenantId} more than once with different contexts. Cohort won't guess which jurisdiction and tags apply; return one context per tenant.",
-        _ => throw new ArgumentOutOfRangeException(nameof(refusal)),
-    };
-}

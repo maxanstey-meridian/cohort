@@ -338,13 +338,22 @@ internal static class RetentionHandlerSupport
 /// </summary>
 internal sealed class RetentionHandlerServiceRegistrations(IServiceCollection services)
 {
+    /// <summary>
+    /// The entity with the most row handlers, and how many: a row's handlers run one after
+    /// another, so its queued work can take that many retry schedules. Null without handlers.
+    /// </summary>
+    public (Type Entity, int Count)? MostHandlersOnOneEntity() =>
+        Registrations()
+            .GroupBy(registration => registration.EntityType)
+            .Select(group => (Entity: group.Key, Count: group.Select(registration => registration.HandlerType).Distinct().Count()))
+            .OrderByDescending(entity => entity.Count)
+            .ThenBy(entity => entity.Entity.FullName, StringComparer.Ordinal)
+            .Cast<(Type Entity, int Count)?>()
+            .FirstOrDefault();
+
     public IReadOnlyList<string> FindInvalidHandlerServices()
     {
-        var registrations = services
-            .Where(descriptor => descriptor.ServiceType == typeof(IRetentionHandlerRegistration) && !descriptor.IsKeyedService)
-            .Select(descriptor => descriptor.ImplementationInstance)
-            .OfType<IRetentionHandlerRegistration>()
-            .ToArray();
+        var registrations = Registrations();
         var errors = new List<string>();
         var registeredServices = new List<(Type Entity, Type Handler)>();
         foreach (var descriptor in services.Where(descriptor =>
@@ -386,6 +395,13 @@ internal sealed class RetentionHandlerServiceRegistrations(IServiceCollection se
 
         return errors;
     }
+
+    private IRetentionHandlerRegistration[] Registrations() =>
+        services
+            .Where(descriptor => descriptor.ServiceType == typeof(IRetentionHandlerRegistration) && !descriptor.IsKeyedService)
+            .Select(descriptor => descriptor.ImplementationInstance)
+            .OfType<IRetentionHandlerRegistration>()
+            .ToArray();
 
     public static string NotRegisteredError(string registered) =>
         $"{registered} isn't registered with AddRowHandler alone, so it wouldn't run in each batch's scope, or at all while its rows are still swept or erased. "

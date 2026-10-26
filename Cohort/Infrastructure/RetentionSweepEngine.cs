@@ -70,7 +70,7 @@ internal sealed class RetentionSweepEngine(
         CancellationToken ct
     )
     {
-        var (_, startedAt) = await DatabaseClock.ResolveRunTimeAsync(db, null, dryRun, ct);
+        var startedAt = await DatabaseClock.NowAsync(db, ct);
         var run = new RetentionRun(
             db,
             auditWriter,
@@ -79,14 +79,7 @@ internal sealed class RetentionSweepEngine(
             new SweepEvent.Started(Guid.NewGuid(), startedAt, SweepTriggerKind.Scheduled, dryRun, tenantId),
             options.SweepBatchSize
         );
-        try
-        {
-            await run.ExecuteAsync(() => throw new RetentionPassRefusedException(tenantId, refusal), ct);
-        }
-        catch (RetentionPassRefusedException)
-        {
-            // Settled Failed and logged by the run; the refusal itself is the expected outcome.
-        }
+        await run.ExecuteRefusalAsync(refusal.MachineCode(), refusal.Describe(tenantId), ct);
     }
 
     private async Task<IReadOnlyList<SweepScope>> BuildExecutionPlanAsync(

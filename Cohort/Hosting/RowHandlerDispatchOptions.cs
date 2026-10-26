@@ -7,8 +7,10 @@ public sealed class RowHandlerDispatchOptions
     public int BatchSize { get; init; } = 50;
 
     /// <summary>
-    /// Deliveries a handler gets before its work is dead-lettered. With the default backoff,
-    /// 25 attempts span about 15 hours. A requeue of dead-lettered work gives one more.
+    /// Deliveries a handler gets before its work is dead-lettered. With the defaults, 25
+    /// attempts take up to about 17.5 hours: every backoff wait plus every attempt running its
+    /// whole <see cref="ClaimTimeout"/>. A requeue resumes the attempts a handler has left, or
+    /// gives one more delivery to a handler that used them all.
     /// </summary>
     public int MaxAttempts { get; init; } = 25;
 
@@ -42,12 +44,16 @@ public sealed class RowHandlerDispatchOptions
     public TimeSpan SweepSettleTimeout { get; init; } = TimeSpan.FromHours(1);
 
     /// <summary>
-    /// Backstop retention for captured row snapshots. CapturedPayload can contain
-    /// pre-anonymisation personal data; it is cleared as soon as every handler for the
-    /// row succeeds. Dead-lettered work keeps its snapshot so it can be requeued, and any
-    /// snapshot older than this is scrubbed. Must be at least 1 hour, and longer than a
-    /// handler's whole retry schedule (every backoff wait plus every attempt's
-    /// <see cref="ClaimTimeout"/>), so the scrub never ends work that is still retrying.
+    /// Backstop retention for captured row snapshots, counted from the row's mutation.
+    /// CapturedPayload can contain pre-anonymisation personal data; it is cleared as soon as
+    /// every handler for the row succeeds. Dead-lettered work keeps its snapshot so it can be
+    /// requeued, and any snapshot older than this is scrubbed. Must be at least 1 hour and
+    /// longer than one handler's retry schedule (every backoff wait plus every attempt's
+    /// <see cref="ClaimTimeout"/>). With row handlers registered it must also be longer than
+    /// N times (that schedule plus <see cref="MaxAttempts"/> times <see cref="PollInterval"/>),
+    /// N being the most handlers on one entity, since a row's handlers run one after another. Work
+    /// the scrub can still end: AfterSweepSettled work whose run takes long to settle, and
+    /// work held up while the kill switch pauses the poller.
     /// </summary>
     public TimeSpan PayloadRetention { get; init; } = TimeSpan.FromDays(30);
 }

@@ -64,6 +64,30 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         );
     }
 
+    // Under multiplexing a connection holds one server session only inside a transaction, so
+    // Cohort's session advisory locks would be taken on one session and released on another.
+    [Theory]
+    [InlineData(PublicDatabaseOperation.Sweep)]
+    [InlineData(PublicDatabaseOperation.Preview)]
+    [InlineData(PublicDatabaseOperation.Erasure)]
+    [InlineData(PublicDatabaseOperation.CreateHold)]
+    [InlineData(PublicDatabaseOperation.FlushDispatcher)]
+    public async Task Direct_public_database_operations_refuse_a_multiplexed_connection(
+        PublicDatabaseOperation operation
+    )
+    {
+        var multiplexed = new NpgsqlConnectionStringBuilder(fixture.ConnectionString) { Multiplexing = true };
+        using var host = new CohortTestHost(multiplexed.ConnectionString);
+
+        var act = () => InvokeAsync(host, operation, CancellationToken.None);
+
+        (await act.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                error.Contains("Multiplexing", StringComparison.Ordinal)
+                && error.Contains("session advisory locks", StringComparison.Ordinal)
+            );
+    }
+
     [Fact]
     public async Task Direct_sweep_retries_after_schema_repair_and_caches_successful_readiness()
     {

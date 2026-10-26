@@ -120,8 +120,8 @@ envelope rather than the exception text. It contains:
 - a random diagnostic ID
 
 Cohort's own machine-safe reasons may be stored as plain text instead. Two of them are
-`Failed` scheduled runs the worker records for a tenant it refused to sweep, with
-`code=cohort:…` in the envelope:
+`Failed` scheduled runs the worker records for a tenant it refused to sweep. No exception is
+involved, so the envelope reads `type=Cohort.Refusal;code=cohort:…`:
 
 | Code | Means |
 |---|---|

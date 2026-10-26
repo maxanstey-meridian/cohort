@@ -126,10 +126,12 @@ retained tenanted table:
 - No tenant pass can sweep rows whose tenant column holds `Guid.Empty`. The worker logs an
   error naming the entity at each occurrence; give those rows their real tenant.
 - These runs reach audit observers as `Started` then `Failed`, like any failed run, so your
-  existing alerting sees them. They're retried like any failed pass (see below), so fixing the
-  source mid-occurrence gets the tenant swept.
-- The check is a loose index scan of the tenant column. Give each retained tenanted table an
-  index led by its tenant column, or the check reads the whole table.
+  existing alerting sees them. They're retried like any failed pass (see below): until the
+  source returns the tenant, each occurrence gives it up to `OccurrenceMaxAttempts` `Failed`
+  runs, `OccurrenceRetryDelay` apart, and then the worker's "gave up" error. Fixing the source
+  mid-occurrence gets the tenant swept at the next retry.
+- The check reads each retained tenanted table once per iteration, in one scan whatever its
+  indexes, and keeps only the tenants the source didn't return.
 
 ### Occurrences
 
@@ -146,9 +148,13 @@ occurrence at or before now. It reads what that occurrence still owes from `swee
   succeeding. Runs the kill switch or a shutdown cancelled don't count. The worker logs an
   error naming the occurrence and the tenants, and leaves them to the next occurrence.
 - Every other pass is **pending**: it has no run yet, a `Failed` or `PartiallyFailed` run, or
-  a run still `Started` whose owner died with the worker lock.
+  a run still `Started` whose owner died, which the worker tells by the run's lock being free.
+- A run still `Started` whose owner is alive (it still holds the run's lock, though the worker
+  lock went with a lost session) keeps the occurrence busy: the worker checks again after the
+  delay rather than run the same pass beside it.
 - The worker runs only the pending passes, in plan order. Passes that succeeded never rerun,
-  so their row handlers don't fire twice.
+  so their row handlers don't fire twice. [History pruning](/guides/history-pruning) keeps the
+  current occurrence's scheduled runs, so this holds with a short retention too.
 - While any pass is pending, the worker retries after `OccurrenceRetryDelay` (default 15
   minutes), or at the next occurrence if that comes sooner and supersedes it.
 
@@ -164,9 +170,9 @@ So no occurrence is lost:
 Replicas of one install coordinate through a Postgres advisory lock keyed on the install's
 schema-qualified `sweep_run` table, and every scheduled run is written under it. A replica
 that finds the lock taken checks again after the delay, by which time the passes are usually
-complete. Installs in different schemas of one database sweep independently. An occurrence is
-due once the database's clock reaches it, the clock that stamps each run's `StartedAt`, so a
-replica whose clock runs ahead waits for the database instead of sweeping early.
+complete. Installs in different schemas of one database sweep independently. Occurrences are
+counted on the database clock, the clock that stamps each run's `StartedAt`, so a replica's
+own clock never decides which occurrence is due.
 
 ### Dry run and the kill switch
 

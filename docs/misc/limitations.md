@@ -12,6 +12,7 @@ These are the deliberate limits of Cohort, so you don't discover them in product
   row-handler delivery hold PostgreSQL session advisory locks, so they need direct connections
   or session-mode pooling. A transaction-mode pooler (PgBouncer's `pool_mode = transaction`)
   hands the session to someone else between transactions, and the locks stop meaning anything.
+  Npgsql `Multiplexing=true` does the same inside one process, so readiness refuses it.
 - **You own the schema.** Cohort never creates or migrates its tables at runtime. See
   [Schema & Migrations](/reference/schema).
 
@@ -50,11 +51,6 @@ These are the deliberate limits of Cohort, so you don't discover them in product
   again. Fence downstream writes on `ctx.Attempt` if that matters to you.
 - Audit observers are best effort, with no durable outbox. Integrations that must not miss an
   event should read the ledger tables or use CDC.
-
-## Scheduling
-
-- Replicas compare occurrence times from their own clocks with the database's run times, so
-  keep replica and database clocks in sync.
 
 ## Out of scope
 

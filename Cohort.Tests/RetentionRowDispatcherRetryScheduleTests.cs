@@ -73,4 +73,45 @@ public sealed class RetentionRowDispatcherRetryScheduleTests
 
         span.Should().Be(TimeSpan.FromSeconds(expectedSpanSeconds));
     }
+
+    [Theory]
+    // One handler at the defaults: the retry schedule plus 25 polls of 10 s.
+    [InlineData(1, 25, 5, 3600, 300, 10, 5115 + (14 * 3600) + (25 * 300) + (25 * 10))]
+    // A row's handlers run one after another.
+    [InlineData(3, 2, 60, 60, 30, 5, 3 * (60 + (2 * 30) + (2 * 5)))]
+    public void RowRetryScheduleSpan_Adds_Each_Handlers_Schedule_And_Poll_Delays(
+        int handlerCount,
+        int maxAttempts,
+        int baseBackoffSeconds,
+        int maxBackoffSeconds,
+        int claimTimeoutSeconds,
+        int pollIntervalSeconds,
+        int expectedSpanSeconds
+    )
+    {
+        var span = RetentionRowDispatcher.RowRetryScheduleSpan(
+            new RowHandlerDispatchOptions
+            {
+                MaxAttempts = maxAttempts,
+                BaseBackoff = TimeSpan.FromSeconds(baseBackoffSeconds),
+                MaxBackoff = TimeSpan.FromSeconds(maxBackoffSeconds),
+                ClaimTimeout = TimeSpan.FromSeconds(claimTimeoutSeconds),
+                PollInterval = TimeSpan.FromSeconds(pollIntervalSeconds),
+            },
+            handlerCount
+        );
+
+        span.Should().Be(TimeSpan.FromSeconds(expectedSpanSeconds));
+    }
+
+    [Fact]
+    public void RowRetryScheduleSpan_Saturates_A_Huge_PollInterval()
+    {
+        var span = RetentionRowDispatcher.RowRetryScheduleSpan(
+            new RowHandlerDispatchOptions { PollInterval = TimeSpan.MaxValue },
+            256
+        );
+
+        span.Should().Be(TimeSpan.MaxValue);
+    }
 }

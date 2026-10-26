@@ -15,7 +15,7 @@ entity and the problem.
 ## Annotations and identity
 
 - Every retained entity has a `[RetentionEntityId]`. Missing, empty, malformed and duplicate
-  identities are rejected.
+  identities are rejected, naming the entity.
 - An entity can't be both `[Retain]` and `[ExemptFromRetention]`.
 - Each convention marker attribute (`[RetentionRecordId]`, `[RetentionTenant]`,
   `[RetentionSoftDelete]`, `[RetentionDeletedAt]`, `[RetentionAnonymisedAt]`) appears on at
@@ -26,8 +26,9 @@ entity and the problem.
 ## Row handlers
 
 - Every [row handler](/guides/row-handlers) carries a `[RowHandlerId]` holding a non-empty
-  UUID, and no two handlers of one entity share an id. `AddRowHandler` refuses either problem
-  when it's called, naming the handler.
+  UUID, and no two handler classes share an id, whatever their entities. `AddRowHandler`
+  refuses a missing, malformed or shared id when it's called, naming the handler. One class
+  registered for two entities keeps its one id.
 - Every `IRetentionHandler<T>` service is registered once, through `AddRowHandler`, as
   scoped. A handler registered any other way is refused and named.
 
@@ -100,11 +101,16 @@ columns or rows belong to it. So these are rejected:
 
 ## Database
 
-- The connection is PostgreSQL, version 16 or later.
+- The connection is PostgreSQL, version 16 or later, and Cohort's `DbContext` doesn't use
+  Npgsql `Multiplexing`, which would break the session advisory locks Cohort holds. See
+  [Limitations](/misc/limitations#database).
 - The installed Cohort schema has the required columns, keys, unique indexes and `CHECK`
   constraints, and no required column Cohort doesn't write. See
   [Readiness](/reference/schema#readiness).
 - No active hold names a `[RetentionEntityId]` that no retained entity in the model declares
   any more. Such a hold would never match its row again, so the row would lose its protection
   without an error. See [Changed entity identities](/reference/schema#changed-entity-identities).
-- [Options](/reference/configuration) are in range.
+- [Options](/reference/configuration) are in range. With row handlers registered,
+  `RowHandlerDispatch:PayloadRetention` is longer than the retry schedule of the entity with
+  the most handlers (see [Configuration](/reference/configuration#row-handler-dispatch)), on
+  start and on every reload.

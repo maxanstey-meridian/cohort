@@ -21,7 +21,8 @@ namespace Cohort.Hosting;
 /// or <see cref="HistoryPruningOptions.FailedRunRetention"/>, and holds that stopped protecting
 /// longer ago than <see cref="HistoryPruningOptions.InactiveHoldRetention"/>. A run is never
 /// pruned while any of its handler work is pending or in flight, or while any of its rows still
-/// holds a captured snapshot (requeueable dead-lettered work), and nothing is pruned while
+/// holds a captured snapshot (requeueable dead-lettered work), nor while it is a scheduled run of
+/// the schedule's current occurrence (the worker's ledger for it), and nothing is pruned while
 /// <see cref="CohortOptions.KillSwitch"/> is on. Each batch commits on its own and claims with
 /// <c>SKIP LOCKED</c>, so replicas prune disjoint batches.
 /// </summary>
@@ -92,9 +93,17 @@ internal sealed class RetentionHistoryPruner(
             return new RetentionHistoryPruneResult(0, 0);
         }
 
-        await scopeFactory.RunInScopeAsync(
+        var currentOccurrence = await scopeFactory.RunInScopeAsync(
             HistoryPruning,
-            services => services.GetRequiredService<RetentionRuntimeReadinessValidator>().ValidateAsync(ct),
+            async services =>
+            {
+                await services.GetRequiredService<RetentionRuntimeReadinessValidator>().ValidateAsync(ct);
+                return await CurrentOccurrenceAsync(
+                    services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext),
+                    options.Current.Schedule,
+                    ct
+                );
+            },
             ct
         );
 
@@ -110,7 +119,7 @@ internal sealed class RetentionHistoryPruner(
             do
             {
                 ct.ThrowIfCancellationRequested();
-                deleted = await PruneRunBatchAsync(succeededCutoff, failedCutoff, ct);
+                deleted = await PruneRunBatchAsync(succeededCutoff, failedCutoff, currentOccurrence, ct);
                 runs += deleted;
             }
             while (deleted == BatchSize && !options.Current.KillSwitch);
@@ -149,6 +158,7 @@ internal sealed class RetentionHistoryPruner(
     private Task<int> PruneRunBatchAsync(
         DateTimeOffset? succeededCutoff,
         DateTimeOffset? failedCutoff,
+        DateTimeOffset? currentOccurrence,
         CancellationToken ct
     ) =>
         scopeFactory.RunInScopeAsync(
@@ -157,15 +167,30 @@ internal sealed class RetentionHistoryPruner(
                 services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext),
                 succeededCutoff,
                 failedCutoff,
+                currentOccurrence,
                 ct
             ),
             ct
         );
 
+    /// <summary>
+    /// The latest occurrence of <paramref name="schedule"/> at or before the database clock,
+    /// the occurrence the worker is catching up; null without a schedule.
+    /// </summary>
+    private static async Task<DateTimeOffset?> CurrentOccurrenceAsync(
+        DbContext db,
+        string? schedule,
+        CancellationToken ct
+    ) =>
+        string.IsNullOrWhiteSpace(schedule)
+            ? null
+            : CohortScheduleParser.GetPreviousOccurrence(schedule, await DatabaseClock.NowAsync(db, ct));
+
     private static async Task<int> PruneRunBatchAsync(
         DbContext db,
         DateTimeOffset? succeededCutoff,
         DateTimeOffset? failedCutoff,
+        DateTimeOffset? currentOccurrence,
         CancellationToken ct
     )
     {
@@ -183,6 +208,8 @@ internal sealed class RetentionHistoryPruner(
             HandlerInFlight,
             HandlerDeadLettered,
             BatchSize,
+            (int)SweepTriggerKind.Scheduled,
+            (object?)currentOccurrence ?? DBNull.Value,
         ];
 
         await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
@@ -227,11 +254,15 @@ internal sealed class RetentionHistoryPruner(
     /// <summary>
     /// Settled-run eligibility. Positional parameters: {0} Started, {1} Succeeded,
     /// {2} PartiallyFailed, {3} Failed, {4} Cancelled, {5} succeeded cutoff, {6} failed
-    /// cutoff, {7} handler Pending, {8} handler InFlight, {9} handler DeadLettered. A null
-    /// cutoff makes its comparison null, so that class of run is never eligible. A run whose
-    /// row details still hold a snapshot is never eligible either: dead-lettered work keeps its
-    /// snapshot until <c>RowHandlerDispatch:PayloadRetention</c> so it can be requeued, and a
-    /// requeue never changes the snapshot, so this can't race one.
+    /// cutoff, {7} handler Pending, {8} handler InFlight, {9} handler DeadLettered, {11}
+    /// Scheduled, {12} the schedule's current occurrence. A null cutoff makes its comparison
+    /// null, so that class of run is never eligible. A run whose row details still hold a
+    /// snapshot is never eligible either: dead-lettered work keeps its snapshot until
+    /// <c>RowHandlerDispatch:PayloadRetention</c> so it can be requeued. That can't race a
+    /// requeue, because a requeue selects only rows that still hold a snapshot and this
+    /// predicate only runs that hold none: the two sets are disjoint. A scheduled run started
+    /// at or after the current occurrence is the worker's ledger for it, so pruning it would
+    /// rerun passes that already succeeded and give exhausted ones fresh attempts.
     /// </summary>
     private static string EligibleRunPredicate(QuotedTables tables)
     {
@@ -261,6 +292,11 @@ internal sealed class RetentionHistoryPruner(
                   AND NOT EXISTS (
                       SELECT 1 FROM {{tables.SweepRunRowDetail}} AS retained
                       WHERE retained."SweepId" = run."SweepId" AND retained."CapturedPayload" IS NOT NULL
+                  )
+                  AND (
+                      CAST({12} AS timestamptz) IS NULL
+                      OR run."TriggerKind" <> {11}
+                      OR run."StartedAt" < CAST({12} AS timestamptz)
                   )
             """;
     }

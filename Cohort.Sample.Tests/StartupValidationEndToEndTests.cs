@@ -1,12 +1,15 @@
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
+using Cohort.Infrastructure;
 using Cohort.Infrastructure.Sweep;
 using Cohort.Sample.Entities;
 
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Options;
 
 namespace Cohort.Sample.Tests;
 
@@ -169,6 +172,85 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
                 && error.Contains("AddRowHandler", StringComparison.Ordinal)
             );
     }
+
+    // The scrub clock starts when a row is mutated and a row's handlers run one after another,
+    // so PayloadRetention has to cover every handler's retry schedule on the busiest entity.
+    // Each schedule here is 30 minutes and 10 seconds: one 30-minute claim plus one poll.
+    [Theory]
+    [InlineData(1, true)]
+    [InlineData(2, false)]
+    public void Options_Refuse_A_PayloadRetention_The_Row_Handlers_Of_One_Entity_Outlast(
+        int handlerCount,
+        bool accepted
+    )
+    {
+        var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder();
+        builder.Configuration.AddInMemoryCollection(
+            new Dictionary<string, string?>
+            {
+                [$"{SampleOptions.SectionName}:{nameof(SampleOptions.ConnectionString)}"] = connectionString,
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:PayloadRetention"] = "01:00:00",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxAttempts"] = "1",
+                [$"{CohortOptions.SectionName}:RowHandlerDispatch:ClaimTimeout"] = "00:30:00",
+            }
+        );
+        builder.Services.AddSampleRetentionServices();
+        builder.Services.AddRowHandler<Note, InstanceNoteHandler>();
+        if (handlerCount == 2)
+        {
+            builder.Services.AddRowHandler<Note, SecondNoteHandler>();
+        }
+
+        using var host = builder.Build();
+
+        var options = () => host.Services.GetRequiredService<IOptions<CohortOptions>>().Value;
+
+        if (accepted)
+        {
+            options.Should().NotThrow();
+            return;
+        }
+
+        options.Should().Throw<OptionsValidationException>()
+            .Which.Failures.Should().ContainSingle(failure =>
+                failure.Contains("PayloadRetention", StringComparison.Ordinal)
+                && failure.Contains(typeof(Note).FullName!, StringComparison.Ordinal)
+                && failure.Contains("2 row handlers", StringComparison.Ordinal)
+            );
+    }
+
+    [Fact]
+    public void Startup_Names_A_Retained_Entity_Whose_RetentionEntityId_Is_Malformed()
+    {
+        var options = new DbContextOptionsBuilder<MalformedEntityIdDbContext>()
+            .UseNpgsqlMetadataModel($"malformed-entity-id-{Guid.NewGuid()}")
+            .Options;
+        using var db = new MalformedEntityIdDbContext(options);
+
+        var build = () => new RetentionEntryBuilder(new CohortConventions())
+            .TryBuild(db.Model.FindEntityType(typeof(MalformedEntityIdRecord))!);
+
+        build.Should().Throw<InvalidOperationException>()
+            .WithMessage($"*{typeof(MalformedEntityIdRecord).FullName}*[RetentionEntityId] is invalid*non-empty UUID*");
+    }
+
+    private sealed class MalformedEntityIdDbContext(DbContextOptions<MalformedEntityIdDbContext> options)
+        : DbContext(options)
+    {
+        public DbSet<MalformedEntityIdRecord> Records => Set<MalformedEntityIdRecord>();
+    }
+
+    [Retain("short-lived", nameof(CreatedAt))]
+    [RetentionEntityId("not-a-uuid")]
+    private sealed class MalformedEntityIdRecord
+    {
+        public Guid Id { get; set; }
+
+        public DateTimeOffset CreatedAt { get; set; }
+    }
+
+    [RowHandlerId("3a4e2f9b-7c61-4d08-b5e2-91f0c6d7a843")]
+    private sealed class SecondNoteHandler : IRetentionHandler<Note>;
 
     [RowHandlerId("c70b90fd-ebbb-4631-8ce9-6f11d4bf7081")]
     private sealed class UnconstructableNoteHandler : IRetentionHandler<Note>

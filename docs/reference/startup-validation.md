@@ -83,7 +83,9 @@ columns or rows belong to it. So these are rejected:
   [Identities](/reference/schema#identities).
 - Each retained table and its record-ID column exist in the database, and the table is an
   ordinary or partitioned table: not a view, materialized view or foreign table, since Cohort
-  addresses each row by its physical position (`ctid`).
+  changes rows in place, addressing each by its physical position (`ctid`): a view has no
+  `ctid`, a materialized view's rows can't be updated or deleted, and a foreign table's `ctid`
+  doesn't reliably identify its rows.
 - Each anonymised column can take what Cohort writes to it, checked against the database
   catalog: the column exists and the model's store type can be assigned to its type without
   an explicit cast; an `EmptyString` or `FixedLiteral` value, after the value converter, is

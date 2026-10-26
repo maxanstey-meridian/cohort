@@ -941,14 +941,14 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     }
 
     [Theory]
-    [InlineData("VIEW", "a view")]
-    [InlineData("MATERIALIZED VIEW", "a materialized view")]
+    [InlineData("VIEW", "a view, which")]
+    [InlineData("MATERIALIZED VIEW", "a materialized view, whose")]
     public async Task Readiness_refuses_a_retained_entity_mapped_to_a_relation_that_is_not_a_table(
         string relation,
         string kind
     )
     {
-        // Rows are addressed by ctid, which only a table has: a view would fail every run.
+        // Cohort changes rows in place by ctid: a view has none, a materialized view can't be changed.
         await using var database = await AnonymiseTargetDatabaseAsync(
             $"""
             ALTER TABLE public.anonymise_literal_records RENAME TO anonymise_literal_records_base;
@@ -962,7 +962,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
 
         errors.Should().ContainSingle(error =>
             error.Contains(typeof(AnonymiseLiteralRecord).FullName!, StringComparison.Ordinal)
-            && error.Contains($"\"public\".\"anonymise_literal_records\" is {kind}, not a table", StringComparison.Ordinal)
+            && error.Contains($"\"public\".\"anonymise_literal_records\" is {kind} ", StringComparison.Ordinal)
         );
     }
 

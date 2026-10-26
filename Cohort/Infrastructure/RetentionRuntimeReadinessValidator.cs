@@ -51,7 +51,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
             await ValidateServerVersionAsync(ct);
             await startupValidator.ValidateAsync(ct);
             await schemaValidator.ValidateAsync(ct);
-            await ValidateRecordIdColumnTypesAsync(ct);
+            await ValidateRetainedTablesAsync(ct);
             await ValidateAnonymiseTargetsAsync(ct);
             await ValidateReferencedMarkerColumnsAsync(ct);
             // The hold check runs on its own connection, outside the caller's transaction, so its
@@ -75,19 +75,14 @@ internal sealed class RetentionRuntimeReadinessValidator(
     }
 
     /// <summary>
-    /// Cohort stores a record id as its column's text form. The model's store type name cannot
-    /// show a domain, and the startup check only knows type names, so resolve each record-id
-    /// column's catalog type through domains, arrays and ranges to the types it is built on.
-    /// A retained table or record-id column the database no longer has fails every run, so it is
-    /// refused here too.
+    /// Each retained table must exist as an ordinary or partitioned table, since Cohort changes
+    /// its rows in place and addresses each by its physical position (ctid), and its record-id
+    /// column must exist. Cohort stores a record id as its column's text form; the model's store
+    /// type name cannot show a domain, and the startup check only knows type names, so each
+    /// record-id column's catalog type is resolved through domains, arrays and ranges to the
+    /// types it is built on, which must not depend on session settings.
     /// </summary>
-    /// <summary>
-    /// Each retained table must exist as an ordinary or partitioned table, since sweeps, the
-    /// hold checks and IRetentionDeletion address rows by their physical position (ctid), which
-    /// a view, materialized view or foreign table lacks; and its record-id column must exist,
-    /// built on a type whose text form doesn't depend on session settings.
-    /// </summary>
-    private async Task ValidateRecordIdColumnTypesAsync(CancellationToken ct)
+    private async Task ValidateRetainedTablesAsync(CancellationToken ct)
     {
         var entries = registry.Scan().Values.ToArray();
         if (entries.Length == 0)
@@ -167,7 +162,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
                     if (!reader.IsDBNull(3))
                     {
                         errors.Add(
-                            $"Retained entity {entry.EntityType.FullName}: {PostgreSqlIdentifier.Format(entry.Table)} is {RelationKindName(reader.GetChar(3))}, not a table. Cohort addresses each row by its physical position (ctid), which only a table has, so every run, hold check and IRetentionDeletion call would fail. Map the entity to the table it lives in."
+                            $"Retained entity {entry.EntityType.FullName}: {PostgreSqlIdentifier.Format(entry.Table)} is {NotATable(reader.GetChar(3))}, so Cohort can't retain its rows. Map the entity to the table it lives in."
                         );
                         continue;
                     }
@@ -205,13 +200,13 @@ internal sealed class RetentionRuntimeReadinessValidator(
         }
     }
 
-    private static string RelationKindName(char kind) =>
+    private static string NotATable(char kind) =>
         kind switch
         {
-            'v' => "a view",
-            'm' => "a materialized view",
-            'f' => "a foreign table",
-            _ => $"a relation of kind '{kind}'",
+            'v' => "a view, which has no physical row positions (ctid) for Cohort to address its rows by",
+            'm' => "a materialized view, whose rows can't be updated or deleted",
+            'f' => "a foreign table, whose row positions (ctid) and versions (xmin) are whatever its foreign-data wrapper supplies, if anything, so they don't reliably identify its rows",
+            _ => $"a relation of kind '{kind}', not a table",
         };
 
     /// <summary>

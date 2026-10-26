@@ -29,6 +29,7 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
 {
     private const string StepId = "4a454132-b95e-4435-8616-5f52789c5420";
     private const string AnonymisedStepId = "3ee2fa4e-4d4f-4e6b-bd27-f6aefdb8e40f";
+    private const string SharedId = "7c0d6b2e-5f8a-4e1d-9b3c-2a6f4e8d1c05";
     private static readonly DateTimeOffset AsOf = new(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
 
     [Fact]
@@ -474,6 +475,48 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
         (await CountAsync(database.ConnectionString, "dependents_plain_children")).Should().Be(0);
     }
 
+    [Fact]
+    public async Task Requeuing_A_Shared_Id_Revives_Its_Handler_Work_And_Leaves_Its_Step_Failure_Dead_Lettered()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
+        var script = new StepScript { Anonymised = (_, _, _) => throw new InvalidOperationException("the step failed") };
+        await using var services = BuildServiceProvider(
+            database.ConnectionString,
+            script,
+            anonymisedStep: false,
+            configure: services =>
+            {
+                services.AddRowHandler<ADependentsParent, SharedIdWork>();
+                services.AddRetentionDependents<AAnonymisedParent, SharedIdWork>();
+            }
+        );
+        var tenantId = Guid.NewGuid();
+        var parentId = Guid.NewGuid();
+        var anonymisedId = Guid.NewGuid();
+
+        await SeedAsync(services, db =>
+        {
+            db.Parents.Add(Parent(parentId, tenantId, AsOf.AddDays(-200)));
+            db.AnonymisedParents.Add(AnonymisedParent(anonymisedId, tenantId, AsOf.AddDays(-200)));
+        });
+
+        var result = await SweepAsync(services, tenantId);
+        var dispatcher = services.GetRequiredService<IRetentionRowDispatcher>();
+        await dispatcher.FlushAsync();
+        (await LoadStepStatusesAsync(database.ConnectionString, result.SweepId))
+            .Should().OnlyContain(status => status.HandlerType == SharedId && status.State == SweepRowHandlerDispatchState.DeadLettered)
+            .And.HaveCount(2);
+
+        // A step failure has nothing to deliver, so only the handler's work comes back.
+        (await dispatcher.RequeueDeadLetteredAsync(handlerId: Guid.Parse(SharedId))).Should().Be(1);
+
+        var statuses = await LoadStepStatusesAsync(database.ConnectionString, result.SweepId);
+        statuses.Should().ContainSingle(status => status.RecordId == parentId.ToString())
+            .Which.State.Should().Be(SweepRowHandlerDispatchState.Pending);
+        statuses.Should().ContainSingle(status => status.RecordId == anonymisedId.ToString())
+            .Which.State.Should().Be(SweepRowHandlerDispatchState.DeadLettered);
+    }
+
     private static readonly Guid AuditEventEntityId = Guid.Parse("00000000-0000-0000-0003-000000000005");
     private static readonly Guid RetainedChildEntityId = Guid.Parse("00000000-0000-0000-0003-000000000003");
 
@@ -666,6 +709,7 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
     private static ServiceProvider BuildServiceProvider(
         string connectionString,
         StepScript script,
+        bool anonymisedStep = true,
         Action<IServiceCollection>? configure = null
     )
     {
@@ -684,7 +728,11 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
         services.AddSingleton(script);
         services.AddCohort<DependentsDbContext>();
         services.AddRetentionDependents<ADependentsParent, ParentStep>();
-        services.AddRetentionDependents<AAnonymisedParent, AnonymisedParentStep>();
+        if (anonymisedStep)
+        {
+            services.AddRetentionDependents<AAnonymisedParent, AnonymisedParentStep>();
+        }
+
         configure?.Invoke(services);
         return services.BuildServiceProvider(validateScopes: true);
     }
@@ -752,6 +800,23 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
             }
 
             return Task.CompletedTask;
+        }
+    }
+
+    /// <summary>One class, one id: the handler of one entity and the step of another.</summary>
+    [RowHandlerId(SharedId)]
+    private sealed class SharedIdWork(DependentsDbContext db, StepScript script)
+        : IRetentionHandler<ADependentsParent>, IRetentionDependents<AAnonymisedParent>
+    {
+        public Task OnBeforeAsync(ADependentsParent row, RetentionBeforeContext ctx, CancellationToken ct) => Task.CompletedTask;
+
+        public Task OnAfterAsync(RetentionAfterContext<ADependentsParent> ctx, CancellationToken ct) =>
+            throw new InvalidOperationException("the handler failed");
+
+        public Task RetireAsync(AAnonymisedParent row, RetentionDependentsContext ctx, CancellationToken ct)
+        {
+            script.Called(db);
+            return script.Anonymised(row, db, ct);
         }
     }
 

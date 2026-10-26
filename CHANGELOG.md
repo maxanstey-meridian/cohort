@@ -222,8 +222,9 @@ unprotected without an error.
   `Complete`. Rows a foreign key keeps from a purge get one Warning per entity naming the keys.
 - Readiness refuses a retained entity whose table or record-id column the database doesn't
   have, whatever its strategy: every run would fail. It also refuses one mapped to a view,
-  materialized view or foreign table: sweeps, hold checks and `IRetentionDeletion` address
-  rows by `ctid`, which only a table has.
+  materialized view or foreign table: Cohort changes rows in place, addressing each by its
+  physical position (`ctid`), and a view has no `ctid`, a materialized view's rows can't be
+  updated or deleted, and a foreign table's `ctid` doesn't reliably identify its rows.
 - Readiness refuses an anonymise its column can never take: an anonymised column the
   database no longer has; a model store type the column type can't be assigned to without an
   explicit cast (any method, `Null` included); a literal or empty string, after its value

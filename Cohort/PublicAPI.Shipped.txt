@@ -11,18 +11,14 @@ Cohort.Application.IRetentionAuditObserver.OnCommittedAsync(Cohort.Application.S
 Cohort.Application.IRetentionDeletion
 Cohort.Application.IRetentionDeletion.ExecuteAsync(System.Collections.Generic.IReadOnlyCollection<Cohort.Application.RetentionTarget!>! targets, System.Func<System.Threading.CancellationToken, System.Threading.Tasks.Task!>! deletion, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Cohort.Application.RetentionDeletionOutcome>!
 Cohort.Application.IRetentionErasureService
-Cohort.Application.IRetentionErasureService.EraseAsync(Cohort.Domain.TenantContext! tenant, Cohort.Domain.ErasureScope! scope, System.DateTimeOffset now, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Cohort.Domain.ErasureResult!>!
 Cohort.Application.IRetentionHandler<TEntity>
 Cohort.Application.IRetentionHandler<TEntity>.OnAfterAsync(Cohort.Domain.RetentionAfterContext<TEntity>! ctx, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task!
 Cohort.Application.IRetentionHandler<TEntity>.OnBeforeAsync(TEntity row, Cohort.Domain.RetentionBeforeContext! ctx, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task!
 Cohort.Application.IRetentionHoldsRepository
 Cohort.Application.IRetentionHoldsRepository.CreateAsync(Cohort.Domain.RetentionHoldRequest! request, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task!
-Cohort.Application.IRetentionHoldsRepository.HasActiveHoldAsync(System.Guid retentionEntityId, string! recordId, System.Guid? tenantId, System.DateTimeOffset asOf, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task<bool>!
-Cohort.Application.IRetentionHoldsRepository.ListActiveAsync(System.DateTimeOffset asOf, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task<System.Collections.Generic.IReadOnlyList<Cohort.Domain.RetentionHold!>!>!
 Cohort.Application.IRetentionHoldsRepository.RemoveAsync(System.Guid holdId, System.DateTimeOffset removedAt, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task!
 Cohort.Application.IRetentionPreview
 Cohort.Application.IRetentionPreview.ExecuteAsync(Cohort.Application.RetentionPreviewRequest! request, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Cohort.Domain.RetentionSweepResult!>!
-Cohort.Application.IRetentionPreview.PreviewAsync(Cohort.Domain.TenantContext! tenant, System.DateTimeOffset now, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Cohort.Domain.RetentionSweepResult!>!
 Cohort.Application.IRetentionRowDispatcher
 Cohort.Application.IRetentionRowDispatcher.FlushAsync(System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Cohort.Application.RowDispatcherFlushResult!>!
 Cohort.Application.IRetentionRuleProvider
@@ -30,8 +26,6 @@ Cohort.Application.IRetentionRuleProvider.GetCapabilities(string! category) -> C
 Cohort.Application.IRetentionRuleProvider.ResolveAsync(Cohort.Domain.RetentionResolutionContext! context, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task<Cohort.Domain.RetentionRule?>!
 Cohort.Application.IRetentionSweep
 Cohort.Application.IRetentionSweep.ExecuteAsync(Cohort.Application.RetentionSweepRequest! request, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Cohort.Domain.RetentionSweepResult!>!
-Cohort.Application.IRetentionSweep.SweepAsync(Cohort.Domain.TenantContext! tenant, System.DateTimeOffset now, Cohort.Application.SweepTriggerKind trigger, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Cohort.Domain.RetentionSweepResult!>!
-Cohort.Application.IRetentionSweep.SweepAsync(Cohort.Domain.TenantContext! tenant, System.DateTimeOffset now, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Cohort.Domain.RetentionSweepResult!>!
 Cohort.Application.IRetentionTenantSource
 Cohort.Application.IRetentionTenantSource.GetTenantsAsync(System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task<System.Collections.Generic.IReadOnlyList<Cohort.Domain.TenantContext!>!>!
 Cohort.Application.RetentionConfigurationException
@@ -41,7 +35,6 @@ Cohort.Application.RetentionDeletionOutcome
 Cohort.Application.RetentionDeletionOutcome.Executed = 0 -> Cohort.Application.RetentionDeletionOutcome
 Cohort.Application.RetentionDeletionOutcome.Protected = 1 -> Cohort.Application.RetentionDeletionOutcome
 Cohort.Application.RetentionPreviewRequest
-Cohort.Application.RetentionPreviewRequest.At.get -> System.DateTimeOffset
 Cohort.Application.RetentionPreviewRequest.RetentionPreviewRequest(Cohort.Application.RetentionPreviewRequest! original) -> void
 Cohort.Application.RetentionPreviewRequest.TenantedRequest
 Cohort.Application.RetentionPreviewRequest.TenantedRequest.Equals(Cohort.Application.RetentionPreviewRequest.TenantedRequest? other) -> bool
@@ -49,7 +42,6 @@ Cohort.Application.RetentionPreviewRequest.TenantedRequest.Tenant.get -> Cohort.
 Cohort.Application.RetentionPreviewRequest.TenantlessRequest
 Cohort.Application.RetentionPreviewRequest.TenantlessRequest.Equals(Cohort.Application.RetentionPreviewRequest.TenantlessRequest? other) -> bool
 Cohort.Application.RetentionSweepRequest
-Cohort.Application.RetentionSweepRequest.At.get -> System.DateTimeOffset
 Cohort.Application.RetentionSweepRequest.DryRun.get -> bool
 Cohort.Application.RetentionSweepRequest.RetentionSweepRequest(Cohort.Application.RetentionSweepRequest! original) -> void
 Cohort.Application.RetentionSweepRequest.TenantedRequest
@@ -57,7 +49,6 @@ Cohort.Application.RetentionSweepRequest.TenantedRequest.Equals(Cohort.Applicati
 Cohort.Application.RetentionSweepRequest.TenantedRequest.Tenant.get -> Cohort.Domain.TenantContext!
 Cohort.Application.RetentionSweepRequest.TenantlessRequest
 Cohort.Application.RetentionSweepRequest.TenantlessRequest.Equals(Cohort.Application.RetentionSweepRequest.TenantlessRequest? other) -> bool
-Cohort.Application.RetentionSweepRequest.Trigger.get -> Cohort.Application.SweepTriggerKind
 Cohort.Application.RetentionTarget
 Cohort.Application.RetentionTarget.RecordId.get -> string!
 Cohort.Application.RetentionTarget.RetentionEntityId.get -> System.Guid
@@ -65,13 +56,11 @@ Cohort.Application.RetentionTarget.RetentionTarget(System.Guid retentionEntityId
 Cohort.Application.RetentionTarget.TenantId.get -> System.Guid?
 Cohort.Application.RowDispatcherFlushResult
 Cohort.Application.RowDispatcherFlushResult.<Clone>$() -> Cohort.Application.RowDispatcherFlushResult!
-Cohort.Application.RowDispatcherFlushResult.Deconstruct(out long InFlightRemaining, out long PendingRemaining) -> void
 Cohort.Application.RowDispatcherFlushResult.Equals(Cohort.Application.RowDispatcherFlushResult? other) -> bool
 Cohort.Application.RowDispatcherFlushResult.InFlightRemaining.get -> long
 Cohort.Application.RowDispatcherFlushResult.InFlightRemaining.init -> void
 Cohort.Application.RowDispatcherFlushResult.PendingRemaining.get -> long
 Cohort.Application.RowDispatcherFlushResult.PendingRemaining.init -> void
-Cohort.Application.RowDispatcherFlushResult.RowDispatcherFlushResult(long InFlightRemaining, long PendingRemaining) -> void
 Cohort.Application.RowDispatcherFlushResult.Settled.get -> bool
 Cohort.Application.RowHandlerDispatchPhase
 Cohort.Application.RowHandlerDispatchPhase.AfterSweepSettled = 1 -> Cohort.Application.RowHandlerDispatchPhase
@@ -92,7 +81,6 @@ Cohort.Application.SweepEvent.Completed.TotalAffected.get -> long
 Cohort.Application.SweepEvent.EntityProgress
 Cohort.Application.SweepEvent.EntityProgress.Affected.get -> long
 Cohort.Application.SweepEvent.EntityProgress.Category.get -> string!
-Cohort.Application.SweepEvent.EntityProgress.EntityProgress(System.Guid SweepId, System.DateTimeOffset At, System.Type! EntityType, System.Guid RetentionEntityId, string! Category, System.Guid TenantId, Cohort.Domain.Strategy Strategy, Cohort.Domain.RetentionPeriod! ResolvedPeriod, long Affected, long SkippedCount, Cohort.Domain.RetentionRuleProvenance? Provenance = null) -> void
 Cohort.Application.SweepEvent.EntityProgress.EntityType.get -> System.Type!
 Cohort.Application.SweepEvent.EntityProgress.Equals(Cohort.Application.SweepEvent.EntityProgress? other) -> bool
 Cohort.Application.SweepEvent.EntityProgress.Provenance.get -> Cohort.Domain.RetentionRuleProvenance?
@@ -104,7 +92,6 @@ Cohort.Application.SweepEvent.EntityProgress.TenantId.get -> System.Guid
 Cohort.Application.SweepEvent.EntitySummary
 Cohort.Application.SweepEvent.EntitySummary.Affected.get -> long
 Cohort.Application.SweepEvent.EntitySummary.Category.get -> string!
-Cohort.Application.SweepEvent.EntitySummary.EntitySummary(System.Guid SweepId, System.DateTimeOffset At, System.Type! EntityType, System.Guid RetentionEntityId, string! Category, System.Guid TenantId, Cohort.Domain.Strategy Strategy, Cohort.Domain.RetentionPeriod! ResolvedPeriod, long Affected, long HeldCount, long SkippedCount = 0, long NullAnchorCount = 0, Cohort.Domain.RetentionRuleProvenance? Provenance = null) -> void
 Cohort.Application.SweepEvent.EntitySummary.EntityType.get -> System.Type!
 Cohort.Application.SweepEvent.EntitySummary.Equals(Cohort.Application.SweepEvent.EntitySummary? other) -> bool
 Cohort.Application.SweepEvent.EntitySummary.HeldCount.get -> long
@@ -203,8 +190,6 @@ Cohort.Domain.EntitySweepCount.Affected.get -> long
 Cohort.Domain.EntitySweepCount.Affected.init -> void
 Cohort.Domain.EntitySweepCount.Category.get -> string!
 Cohort.Domain.EntitySweepCount.Category.init -> void
-Cohort.Domain.EntitySweepCount.Deconstruct(out System.Type! EntityType, out string! Category, out System.Guid TenantId, out Cohort.Domain.Strategy Strategy, out long Affected, out long HeldCount, out long SkippedCount, out long NullAnchorCount) -> void
-Cohort.Domain.EntitySweepCount.EntitySweepCount(System.Type! EntityType, string! Category, System.Guid TenantId, Cohort.Domain.Strategy Strategy, long Affected, long HeldCount = 0, long SkippedCount = 0, long NullAnchorCount = 0) -> void
 Cohort.Domain.EntitySweepCount.EntityType.get -> System.Type!
 Cohort.Domain.EntitySweepCount.EntityType.init -> void
 Cohort.Domain.EntitySweepCount.Equals(Cohort.Domain.EntitySweepCount? other) -> bool
@@ -562,18 +547,14 @@ override sealed Cohort.Application.SweepEvent.Failed.Equals(Cohort.Application.S
 override sealed Cohort.Application.SweepEvent.PartiallyFailed.Equals(Cohort.Application.SweepEvent? other) -> bool
 override sealed Cohort.Application.SweepEvent.RowDetail.Equals(Cohort.Application.SweepEvent? other) -> bool
 override sealed Cohort.Application.SweepEvent.Started.Equals(Cohort.Application.SweepEvent? other) -> bool
-static Cohort.Application.RetentionPreviewRequest.Tenanted(Cohort.Domain.TenantContext! tenant, System.DateTimeOffset at) -> Cohort.Application.RetentionPreviewRequest!
 static Cohort.Application.RetentionPreviewRequest.TenantedRequest.operator !=(Cohort.Application.RetentionPreviewRequest.TenantedRequest? left, Cohort.Application.RetentionPreviewRequest.TenantedRequest? right) -> bool
 static Cohort.Application.RetentionPreviewRequest.TenantedRequest.operator ==(Cohort.Application.RetentionPreviewRequest.TenantedRequest? left, Cohort.Application.RetentionPreviewRequest.TenantedRequest? right) -> bool
-static Cohort.Application.RetentionPreviewRequest.Tenantless(System.DateTimeOffset at) -> Cohort.Application.RetentionPreviewRequest!
 static Cohort.Application.RetentionPreviewRequest.TenantlessRequest.operator !=(Cohort.Application.RetentionPreviewRequest.TenantlessRequest? left, Cohort.Application.RetentionPreviewRequest.TenantlessRequest? right) -> bool
 static Cohort.Application.RetentionPreviewRequest.TenantlessRequest.operator ==(Cohort.Application.RetentionPreviewRequest.TenantlessRequest? left, Cohort.Application.RetentionPreviewRequest.TenantlessRequest? right) -> bool
 static Cohort.Application.RetentionPreviewRequest.operator !=(Cohort.Application.RetentionPreviewRequest? left, Cohort.Application.RetentionPreviewRequest? right) -> bool
 static Cohort.Application.RetentionPreviewRequest.operator ==(Cohort.Application.RetentionPreviewRequest? left, Cohort.Application.RetentionPreviewRequest? right) -> bool
-static Cohort.Application.RetentionSweepRequest.Tenanted(Cohort.Domain.TenantContext! tenant, System.DateTimeOffset at, Cohort.Application.SweepTriggerKind trigger = Cohort.Application.SweepTriggerKind.Manual, bool dryRun = false) -> Cohort.Application.RetentionSweepRequest!
 static Cohort.Application.RetentionSweepRequest.TenantedRequest.operator !=(Cohort.Application.RetentionSweepRequest.TenantedRequest? left, Cohort.Application.RetentionSweepRequest.TenantedRequest? right) -> bool
 static Cohort.Application.RetentionSweepRequest.TenantedRequest.operator ==(Cohort.Application.RetentionSweepRequest.TenantedRequest? left, Cohort.Application.RetentionSweepRequest.TenantedRequest? right) -> bool
-static Cohort.Application.RetentionSweepRequest.Tenantless(System.DateTimeOffset at, Cohort.Application.SweepTriggerKind trigger = Cohort.Application.SweepTriggerKind.Manual, bool dryRun = false) -> Cohort.Application.RetentionSweepRequest!
 static Cohort.Application.RetentionSweepRequest.TenantlessRequest.operator !=(Cohort.Application.RetentionSweepRequest.TenantlessRequest? left, Cohort.Application.RetentionSweepRequest.TenantlessRequest? right) -> bool
 static Cohort.Application.RetentionSweepRequest.TenantlessRequest.operator ==(Cohort.Application.RetentionSweepRequest.TenantlessRequest? left, Cohort.Application.RetentionSweepRequest.TenantlessRequest? right) -> bool
 static Cohort.Application.RetentionSweepRequest.operator !=(Cohort.Application.RetentionSweepRequest? left, Cohort.Application.RetentionSweepRequest? right) -> bool
@@ -625,7 +606,6 @@ static Cohort.Domain.RetentionSweepResult.operator ==(Cohort.Domain.RetentionSwe
 static Cohort.Domain.TenantContext.operator !=(Cohort.Domain.TenantContext? left, Cohort.Domain.TenantContext? right) -> bool
 static Cohort.Domain.TenantContext.operator ==(Cohort.Domain.TenantContext? left, Cohort.Domain.TenantContext? right) -> bool
 static Cohort.Hosting.ServiceCollectionExtensions.AddCohort<TContext>(this Microsoft.Extensions.DependencyInjection.IServiceCollection! services) -> Microsoft.Extensions.DependencyInjection.IServiceCollection!
-static Cohort.Hosting.ServiceCollectionExtensions.AddRowHandler<TEntity, THandler>(this Microsoft.Extensions.DependencyInjection.IServiceCollection! services, Cohort.Application.RowHandlerDispatchPhase dispatchPhase = Cohort.Application.RowHandlerDispatchPhase.Immediate, System.Guid? identity = null) -> Microsoft.Extensions.DependencyInjection.IServiceCollection!
 static Cohort.Infrastructure.Migrations.CohortModelBuilder.ConfigureCohortTables(this Microsoft.EntityFrameworkCore.ModelBuilder! modelBuilder) -> Microsoft.EntityFrameworkCore.ModelBuilder!
 static Cohort.Infrastructure.Migrations.CohortModelBuilder.ConfigureCohortTables(this Microsoft.EntityFrameworkCore.ModelBuilder! modelBuilder, string! schema) -> Microsoft.EntityFrameworkCore.ModelBuilder!
 virtual Cohort.Application.RetentionPreviewRequest.EqualityContract.get -> System.Type!
@@ -637,3 +617,136 @@ virtual Cohort.Application.RetentionSweepRequest.PrintMembers(System.Text.String
 virtual Cohort.Application.SweepEvent.EqualityContract.get -> System.Type!
 virtual Cohort.Application.SweepEvent.Equals(Cohort.Application.SweepEvent? other) -> bool
 virtual Cohort.Application.SweepEvent.PrintMembers(System.Text.StringBuilder! builder) -> bool
+Cohort.Application.ErasureTransaction
+Cohort.Application.ErasureTransaction.Caller = 1 -> Cohort.Application.ErasureTransaction
+Cohort.Application.ErasureTransaction.Owned = 0 -> Cohort.Application.ErasureTransaction
+Cohort.Application.IRetentionDependents<TEntity>
+Cohort.Application.IRetentionDependents<TEntity>.RetireAsync(TEntity row, Cohort.Domain.RetentionDependentsContext! ctx, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task!
+Cohort.Application.IRetentionErasureService.EraseAsync(Cohort.Domain.TenantContext! tenant, Cohort.Domain.ErasureScope! scope, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Cohort.Domain.ErasureResult!>!
+Cohort.Application.IRetentionErasureService.ExecuteAsync(Cohort.Application.RetentionErasureRequest! request, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Cohort.Domain.ErasureResult!>!
+Cohort.Application.IRetentionExecutionScope
+Cohort.Application.IRetentionExecutionScope.RunAsync(Cohort.Application.RetentionExecutionContext! context, System.Func<System.Threading.Tasks.Task!>! work, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task!
+Cohort.Application.IRetentionHoldsRepository.HasActiveHoldAsync(System.Guid retentionEntityId, string! recordId, System.Guid? tenantId, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task<bool>!
+Cohort.Application.IRetentionHoldsRepository.ListActiveAsync(System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task<System.Collections.Generic.IReadOnlyList<Cohort.Domain.RetentionHold!>!>!
+Cohort.Application.IRetentionPreview.PreviewAsync(Cohort.Domain.TenantContext! tenant, System.DateTimeOffset? at = null, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Cohort.Domain.RetentionSweepResult!>!
+Cohort.Application.IRetentionRowDispatcher.RequeueDeadLetteredAsync(System.Guid? sweepId = null, System.Guid? handlerId = null, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<long>!
+Cohort.Application.IRetentionSweep.SweepAsync(Cohort.Domain.TenantContext! tenant, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Cohort.Domain.RetentionSweepResult!>!
+Cohort.Application.RetentionErasureRequest
+Cohort.Application.RetentionErasureRequest.At.get -> System.DateTimeOffset?
+Cohort.Application.RetentionErasureRequest.RetentionErasureRequest(Cohort.Application.RetentionErasureRequest! original) -> void
+Cohort.Application.RetentionErasureRequest.Scope.get -> Cohort.Domain.ErasureScope!
+Cohort.Application.RetentionErasureRequest.TenantedRequest
+Cohort.Application.RetentionErasureRequest.TenantedRequest.Equals(Cohort.Application.RetentionErasureRequest.TenantedRequest? other) -> bool
+Cohort.Application.RetentionErasureRequest.TenantedRequest.Tenant.get -> Cohort.Domain.TenantContext!
+Cohort.Application.RetentionErasureRequest.TenantlessRequest
+Cohort.Application.RetentionErasureRequest.TenantlessRequest.Equals(Cohort.Application.RetentionErasureRequest.TenantlessRequest? other) -> bool
+Cohort.Application.RetentionErasureRequest.Transaction.get -> Cohort.Application.ErasureTransaction
+Cohort.Application.RetentionExecutionContext
+Cohort.Application.RetentionExecutionContext.RetentionExecutionContext(Cohort.Application.RetentionExecutionContext! original) -> void
+Cohort.Application.RetentionExecutionContext.System
+Cohort.Application.RetentionExecutionContext.System.Equals(Cohort.Application.RetentionExecutionContext.System? other) -> bool
+Cohort.Application.RetentionExecutionContext.System.System(Cohort.Application.RetentionSystemWork work) -> void
+Cohort.Application.RetentionExecutionContext.System.Work.get -> Cohort.Application.RetentionSystemWork
+Cohort.Application.RetentionExecutionContext.Tenant
+Cohort.Application.RetentionExecutionContext.Tenant.Equals(Cohort.Application.RetentionExecutionContext.Tenant? other) -> bool
+Cohort.Application.RetentionExecutionContext.Tenant.Tenant(System.Guid tenantId) -> void
+Cohort.Application.RetentionExecutionContext.Tenant.TenantId.get -> System.Guid
+Cohort.Application.RetentionPreviewRequest.At.get -> System.DateTimeOffset?
+Cohort.Application.RetentionSweepRequest.At.get -> System.DateTimeOffset?
+Cohort.Application.RetentionSystemWork
+Cohort.Application.RetentionSystemWork.HistoryPruning = 4 -> Cohort.Application.RetentionSystemWork
+Cohort.Application.RetentionSystemWork.Readiness = 0 -> Cohort.Application.RetentionSystemWork
+Cohort.Application.RetentionSystemWork.RowDispatch = 3 -> Cohort.Application.RetentionSystemWork
+Cohort.Application.RetentionSystemWork.TenantlessPass = 2 -> Cohort.Application.RetentionSystemWork
+Cohort.Application.RetentionSystemWork.WorkerCoordination = 1 -> Cohort.Application.RetentionSystemWork
+Cohort.Application.RowDispatcherFlushResult.DeadLetteredRequeueable.get -> long
+Cohort.Application.RowDispatcherFlushResult.DeadLetteredRequeueable.init -> void
+Cohort.Application.RowDispatcherFlushResult.Deconstruct(out long InFlightRemaining, out long PendingRemaining, out long DeadLetteredRequeueable) -> void
+Cohort.Application.RowDispatcherFlushResult.RowDispatcherFlushResult(long InFlightRemaining, long PendingRemaining, long DeadLetteredRequeueable) -> void
+Cohort.Application.SweepEvent.EntityProgress.BlockedCount.get -> long
+Cohort.Application.SweepEvent.EntityProgress.EntityProgress(System.Guid SweepId, System.DateTimeOffset At, System.Type! EntityType, System.Guid RetentionEntityId, string! Category, System.Guid TenantId, Cohort.Domain.Strategy Strategy, Cohort.Domain.RetentionPeriod! ResolvedPeriod, long Affected, long SkippedCount, long BlockedCount, Cohort.Domain.RetentionRuleProvenance? Provenance = null) -> void
+Cohort.Application.SweepEvent.EntitySummary.BlockedCount.get -> long
+Cohort.Application.SweepEvent.EntitySummary.DeferredCount.get -> long
+Cohort.Application.SweepEvent.EntitySummary.EntitySummary(System.Guid SweepId, System.DateTimeOffset At, System.Type! EntityType, System.Guid RetentionEntityId, string! Category, System.Guid TenantId, Cohort.Domain.Strategy Strategy, Cohort.Domain.RetentionPeriod! ResolvedPeriod, long Affected, long HeldCount, long SkippedCount, long NullAnchorCount, long RetainedCount, long DeferredCount, long BlockedCount, Cohort.Domain.RetentionRuleProvenance? Provenance = null) -> void
+Cohort.Application.SweepEvent.EntitySummary.RetainedCount.get -> long
+Cohort.Domain.EntitySweepCount.BlockedCount.get -> long
+Cohort.Domain.EntitySweepCount.BlockedCount.init -> void
+Cohort.Domain.EntitySweepCount.Deconstruct(out System.Type! EntityType, out string! Category, out System.Guid TenantId, out Cohort.Domain.Strategy Strategy, out long Affected, out long HeldCount, out long SkippedCount, out long NullAnchorCount, out long RetainedCount, out long DeferredCount, out long BlockedCount) -> void
+Cohort.Domain.EntitySweepCount.DeferredCount.get -> long
+Cohort.Domain.EntitySweepCount.DeferredCount.init -> void
+Cohort.Domain.EntitySweepCount.EntitySweepCount(System.Type! EntityType, string! Category, System.Guid TenantId, Cohort.Domain.Strategy Strategy, long Affected, long HeldCount, long SkippedCount, long NullAnchorCount, long RetainedCount, long DeferredCount, long BlockedCount) -> void
+Cohort.Domain.EntitySweepCount.RetainedCount.get -> long
+Cohort.Domain.EntitySweepCount.RetainedCount.init -> void
+Cohort.Domain.ErasureResult.Complete.get -> bool
+Cohort.Domain.RetentionDependentsContext
+Cohort.Domain.RetentionDependentsContext.At.get -> System.DateTimeOffset
+Cohort.Domain.RetentionDependentsContext.Category.get -> string!
+Cohort.Domain.RetentionDependentsContext.RetentionDependentsContext(System.Guid sweepId, string! category, Cohort.Domain.Strategy strategy, System.Guid tenantId, System.DateTimeOffset at) -> void
+Cohort.Domain.RetentionDependentsContext.Strategy.get -> Cohort.Domain.Strategy
+Cohort.Domain.RetentionDependentsContext.SweepId.get -> System.Guid
+Cohort.Domain.RetentionDependentsContext.TenantId.get -> System.Guid
+Cohort.Domain.RowHandlerIdAttribute
+Cohort.Domain.RowHandlerIdAttribute.Id.get -> System.Guid
+Cohort.Domain.RowHandlerIdAttribute.RowHandlerIdAttribute(string! id) -> void
+Cohort.Hosting.CohortOptions.OccurrenceMaxAttempts.get -> int
+Cohort.Hosting.CohortOptions.OccurrenceMaxAttempts.init -> void
+Cohort.Hosting.CohortOptions.OccurrenceRetryDelay.get -> System.TimeSpan
+Cohort.Hosting.CohortOptions.OccurrenceRetryDelay.init -> void
+Cohort.Hosting.RetentionExecutionScope
+Cohort.Hosting.RowHandlerDispatchOptions.MaxBackoff.get -> System.TimeSpan
+Cohort.Hosting.RowHandlerDispatchOptions.MaxBackoff.init -> void
+abstract Cohort.Application.RetentionErasureRequest.<Clone>$() -> Cohort.Application.RetentionErasureRequest!
+abstract Cohort.Application.RetentionExecutionContext.<Clone>$() -> Cohort.Application.RetentionExecutionContext!
+override Cohort.Application.RetentionErasureRequest.Equals(object? obj) -> bool
+override Cohort.Application.RetentionErasureRequest.GetHashCode() -> int
+override Cohort.Application.RetentionErasureRequest.TenantedRequest.<Clone>$() -> Cohort.Application.RetentionErasureRequest.TenantedRequest!
+override Cohort.Application.RetentionErasureRequest.TenantedRequest.Equals(object? obj) -> bool
+override Cohort.Application.RetentionErasureRequest.TenantedRequest.GetHashCode() -> int
+override Cohort.Application.RetentionErasureRequest.TenantedRequest.ToString() -> string!
+override Cohort.Application.RetentionErasureRequest.TenantlessRequest.<Clone>$() -> Cohort.Application.RetentionErasureRequest.TenantlessRequest!
+override Cohort.Application.RetentionErasureRequest.TenantlessRequest.Equals(object? obj) -> bool
+override Cohort.Application.RetentionErasureRequest.TenantlessRequest.GetHashCode() -> int
+override Cohort.Application.RetentionErasureRequest.TenantlessRequest.ToString() -> string!
+override Cohort.Application.RetentionErasureRequest.ToString() -> string!
+override Cohort.Application.RetentionExecutionContext.Equals(object? obj) -> bool
+override Cohort.Application.RetentionExecutionContext.GetHashCode() -> int
+override Cohort.Application.RetentionExecutionContext.System.<Clone>$() -> Cohort.Application.RetentionExecutionContext.System!
+override Cohort.Application.RetentionExecutionContext.System.Equals(object? obj) -> bool
+override Cohort.Application.RetentionExecutionContext.System.GetHashCode() -> int
+override Cohort.Application.RetentionExecutionContext.System.ToString() -> string!
+override Cohort.Application.RetentionExecutionContext.Tenant.<Clone>$() -> Cohort.Application.RetentionExecutionContext.Tenant!
+override Cohort.Application.RetentionExecutionContext.Tenant.Equals(object? obj) -> bool
+override Cohort.Application.RetentionExecutionContext.Tenant.GetHashCode() -> int
+override Cohort.Application.RetentionExecutionContext.Tenant.ToString() -> string!
+override Cohort.Application.RetentionExecutionContext.ToString() -> string!
+override sealed Cohort.Application.RetentionErasureRequest.TenantedRequest.Equals(Cohort.Application.RetentionErasureRequest? other) -> bool
+override sealed Cohort.Application.RetentionErasureRequest.TenantlessRequest.Equals(Cohort.Application.RetentionErasureRequest? other) -> bool
+override sealed Cohort.Application.RetentionExecutionContext.System.Equals(Cohort.Application.RetentionExecutionContext? other) -> bool
+override sealed Cohort.Application.RetentionExecutionContext.Tenant.Equals(Cohort.Application.RetentionExecutionContext? other) -> bool
+static Cohort.Application.RetentionErasureRequest.Tenanted(Cohort.Domain.TenantContext! tenant, Cohort.Domain.ErasureScope! scope, System.DateTimeOffset? at = null, Cohort.Application.ErasureTransaction transaction = Cohort.Application.ErasureTransaction.Owned) -> Cohort.Application.RetentionErasureRequest!
+static Cohort.Application.RetentionErasureRequest.TenantedRequest.operator !=(Cohort.Application.RetentionErasureRequest.TenantedRequest? left, Cohort.Application.RetentionErasureRequest.TenantedRequest? right) -> bool
+static Cohort.Application.RetentionErasureRequest.TenantedRequest.operator ==(Cohort.Application.RetentionErasureRequest.TenantedRequest? left, Cohort.Application.RetentionErasureRequest.TenantedRequest? right) -> bool
+static Cohort.Application.RetentionErasureRequest.Tenantless(Cohort.Domain.ErasureScope! scope, System.DateTimeOffset? at = null) -> Cohort.Application.RetentionErasureRequest!
+static Cohort.Application.RetentionErasureRequest.TenantlessRequest.operator !=(Cohort.Application.RetentionErasureRequest.TenantlessRequest? left, Cohort.Application.RetentionErasureRequest.TenantlessRequest? right) -> bool
+static Cohort.Application.RetentionErasureRequest.TenantlessRequest.operator ==(Cohort.Application.RetentionErasureRequest.TenantlessRequest? left, Cohort.Application.RetentionErasureRequest.TenantlessRequest? right) -> bool
+static Cohort.Application.RetentionErasureRequest.operator !=(Cohort.Application.RetentionErasureRequest? left, Cohort.Application.RetentionErasureRequest? right) -> bool
+static Cohort.Application.RetentionErasureRequest.operator ==(Cohort.Application.RetentionErasureRequest? left, Cohort.Application.RetentionErasureRequest? right) -> bool
+static Cohort.Application.RetentionExecutionContext.System.operator !=(Cohort.Application.RetentionExecutionContext.System? left, Cohort.Application.RetentionExecutionContext.System? right) -> bool
+static Cohort.Application.RetentionExecutionContext.System.operator ==(Cohort.Application.RetentionExecutionContext.System? left, Cohort.Application.RetentionExecutionContext.System? right) -> bool
+static Cohort.Application.RetentionExecutionContext.Tenant.operator !=(Cohort.Application.RetentionExecutionContext.Tenant? left, Cohort.Application.RetentionExecutionContext.Tenant? right) -> bool
+static Cohort.Application.RetentionExecutionContext.Tenant.operator ==(Cohort.Application.RetentionExecutionContext.Tenant? left, Cohort.Application.RetentionExecutionContext.Tenant? right) -> bool
+static Cohort.Application.RetentionExecutionContext.operator !=(Cohort.Application.RetentionExecutionContext? left, Cohort.Application.RetentionExecutionContext? right) -> bool
+static Cohort.Application.RetentionExecutionContext.operator ==(Cohort.Application.RetentionExecutionContext? left, Cohort.Application.RetentionExecutionContext? right) -> bool
+static Cohort.Application.RetentionPreviewRequest.Tenanted(Cohort.Domain.TenantContext! tenant, System.DateTimeOffset? at = null) -> Cohort.Application.RetentionPreviewRequest!
+static Cohort.Application.RetentionPreviewRequest.Tenantless(System.DateTimeOffset? at = null) -> Cohort.Application.RetentionPreviewRequest!
+static Cohort.Application.RetentionSweepRequest.Tenanted(Cohort.Domain.TenantContext! tenant, System.DateTimeOffset? at = null, bool dryRun = false) -> Cohort.Application.RetentionSweepRequest!
+static Cohort.Application.RetentionSweepRequest.Tenantless(System.DateTimeOffset? at = null, bool dryRun = false) -> Cohort.Application.RetentionSweepRequest!
+static Cohort.Hosting.RetentionExecutionScope.Unisolated.get -> Cohort.Application.IRetentionExecutionScope!
+static Cohort.Hosting.ServiceCollectionExtensions.AddRetentionDependents<TEntity, TStep>(this Microsoft.Extensions.DependencyInjection.IServiceCollection! services) -> Microsoft.Extensions.DependencyInjection.IServiceCollection!
+static Cohort.Hosting.ServiceCollectionExtensions.AddRowHandler<TEntity, THandler>(this Microsoft.Extensions.DependencyInjection.IServiceCollection! services, Cohort.Application.RowHandlerDispatchPhase dispatchPhase = Cohort.Application.RowHandlerDispatchPhase.Immediate) -> Microsoft.Extensions.DependencyInjection.IServiceCollection!
+virtual Cohort.Application.RetentionErasureRequest.EqualityContract.get -> System.Type!
+virtual Cohort.Application.RetentionErasureRequest.Equals(Cohort.Application.RetentionErasureRequest? other) -> bool
+virtual Cohort.Application.RetentionErasureRequest.PrintMembers(System.Text.StringBuilder! builder) -> bool
+virtual Cohort.Application.RetentionExecutionContext.EqualityContract.get -> System.Type!
+virtual Cohort.Application.RetentionExecutionContext.Equals(Cohort.Application.RetentionExecutionContext? other) -> bool
+virtual Cohort.Application.RetentionExecutionContext.PrintMembers(System.Text.StringBuilder! builder) -> bool

@@ -2,7 +2,7 @@
 
 Breaking changes come with upgrade steps in the guide that covers them.
 
-## 0.11.0 (unreleased, breaking)
+## 0.11.0 (2026-10-26, breaking)
 
 Cohort tells the host whose work it is doing, and closes paths where rows were deleted or left
 unprotected without an error.

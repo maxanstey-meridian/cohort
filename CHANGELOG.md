@@ -62,10 +62,10 @@ unprotected without an error.
   database clock, the clock that stamps each run. Each scheduled pass holds a session advisory
   lock for its tenant and kind on its own connection, and re-reads the ledger under it before
   starting, so no pass runs twice or beside itself, even after a replica loses its worker-lock
-  session. `Started`, every batch and every per-entity summary that a sweep, dry run or
-  erasure commits on its own first check that the session still holds its locks, so a run
-  whose session was lost (and silently reopened) records nothing, or commits nothing more and
-  settles `Failed`. History pruning keeps the scheduled runs of the schedule's current
+  session. `Started`, every batch, every per-entity summary and the success (`Completed` or
+  `PartiallyFailed`) that a sweep, dry run or erasure commits on its own first check that the
+  session still holds its locks, so a run whose session was lost (and silently reopened)
+  records nothing, or commits nothing more and settles `Failed`. History pruning keeps the scheduled runs of the schedule's current
   occurrence, which the worker reads as its ledger. Upgrade: don't run an older worker beside
   this one; turn the kill switch on or scale to one replica during the rollout.
 - The worker checks its tenant source against the data each occurrence. A tenant that owns

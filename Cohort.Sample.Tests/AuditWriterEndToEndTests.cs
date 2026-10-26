@@ -200,6 +200,7 @@ public sealed class AuditWriterEndToEndTests(PostgresFixture fixture) : Integrat
                     (typeof(PerRowAuditedLog), "per-row-audit-override", Strategy.Exempt),
                     (typeof(TombstoneRecord), "tombstone-anonymise", Strategy.Exempt),
                     (typeof(NullableAnchorEvent), "nullable-anchor-purge", Strategy.Exempt),
+                    (typeof(SoftDeletedContact), "soft-delete-or-anonymise", Strategy.Exempt),
                 ]
             );
         summaries

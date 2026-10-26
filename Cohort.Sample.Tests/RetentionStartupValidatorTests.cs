@@ -193,6 +193,7 @@ public sealed class RetentionStartupValidatorTests
                     $"Retention category 'per-row-audit-override' for entity {typeof(PerRowAuditedLog).FullName} could not be resolved.",
                     $"Retention category 'tombstone-anonymise' for entity {typeof(TombstoneRecord).FullName} could not be resolved.",
                     $"Retention category 'nullable-anchor-purge' for entity {typeof(NullableAnchorEvent).FullName} could not be resolved.",
+                    $"Retention category 'soft-delete-or-anonymise' for entity {typeof(SoftDeletedContact).FullName} could not be resolved.",
                 ]
             );
         exception.Which.Message.Should().Contain("short-lived");
@@ -362,6 +363,7 @@ public sealed class RetentionStartupValidatorTests
                 ["tenantless-softdelete"] = ExemptResolver,
                 ["per-row-audit-override"] = ExemptResolver,
                 ["tombstone-anonymise"] = ExemptResolver,
+                ["soft-delete-or-anonymise"] = ExemptResolver,
             }
         );
 

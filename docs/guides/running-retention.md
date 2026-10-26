@@ -180,10 +180,10 @@ schema-qualified `sweep_run` table. The worker lock only keeps replicas from pla
 occurrence side by side: a replica that finds it taken checks again after the delay, by which
 time the passes are usually complete. What guarantees one run per pass is the pass lock, held
 on the connection the pass's run writes on, so it holds even when a replica loses its
-worker-lock session (a timeout, a failover) mid-occurrence. `Started`, every batch and every
-per-entity summary check that the session still holds its locks before they commit, so a pass
-whose session was lost, dry run or not, records nothing, or commits nothing more and settles
-`Failed`. Installs in different schemas of one database sweep independently. Occurrences are
+worker-lock session (a timeout, a failover) mid-occurrence. `Started`, every batch, every
+per-entity summary and the success (`Completed` or `PartiallyFailed`) check that the session
+still holds its locks before they commit, so a pass whose session was lost, dry run or not,
+records nothing, or commits nothing more and settles `Failed`. Installs in different schemas of one database sweep independently. Occurrences are
 counted on the database clock, the clock that stamps each run's `StartedAt`, so a replica's
 own clock never decides which occurrence is due.
 

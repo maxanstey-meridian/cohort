@@ -16,10 +16,11 @@ expressed in SQL.
 ## A run
 
 1. **Lock and start.** The run takes its own advisory lock, then commits a `Started` row in
-   `sweep_run`, with `SettledAt = NULL`, before any mutation. `Started`, each batch and each
-   per-entity summary check that the session still holds that lock (and a scheduled pass's
-   lock) before they commit, so a run whose session was lost and silently reopened, dry run or
-   not, records nothing, or commits nothing more and settles `Failed`.
+   `sweep_run`, with `SettledAt = NULL`, before any mutation. `Started`, each batch, each
+   per-entity summary and the success (`Completed` or `PartiallyFailed`) check that the
+   session still holds that lock (and a scheduled pass's lock) before they commit, so a run
+   whose session was lost and silently reopened, dry run or not, records nothing, or commits
+   nothing more and settles `Failed`.
 2. **Order.** Retained entities are processed in foreign-key order, dependents before their
    principals, so a retained child is purged before its retained parent.
 3. **Resolve.** For each entity, the category's rule is resolved for this tenant and time.

@@ -1,8 +1,12 @@
+using System.Collections.Concurrent;
+using System.Data.Common;
+
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 
 using Npgsql;
@@ -194,6 +198,81 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
             .And.NotContain(typeof(Cohort.Sample.Entities.SoftDeleteRecord).FullName);
         thrown.Should().NotBeNull();
         (await LoadRunStatusAsync(observer.SweepId)).Should().Be(SweepRunStatus.Failed);
+    }
+
+    [Fact]
+    public async Task A_Run_Whose_Session_Lost_Its_Locks_Before_Settling_Reports_No_Success()
+    {
+        // Every entity has committed under the run's locks; then the session stops holding
+        // them. EF would carry on, on a reopened session, and report success beside whichever
+        // owner took the locks. Dropping the locks just before the success is written stands in
+        // for that loss: the success must not commit, and the run settles Failed instead.
+        var tenantId = Guid.NewGuid();
+        var observer = new SettlementObserver();
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configureServices: services =>
+            {
+                services.AddSingleton<IRetentionAuditObserver>(observer);
+                services.ConfigureDbContext<Cohort.Sample.SampleDbContext>(options =>
+                    options.AddInterceptors(new DropLocksBeforeSuccessInterceptor())
+                );
+            }
+        );
+        await using (var db = host.CreateDbContext())
+        {
+            db.Notes.Add(new Cohort.Sample.Entities.Note { Id = Guid.NewGuid(), TenantId = tenantId, CreatedAt = DateTimeOffset.UtcNow.AddDays(-120), Body = "lost-before-settling" });
+            await db.SaveChangesAsync();
+        }
+
+        var thrown = await Record.ExceptionAsync(() => host.RunSweepAsync(new TenantContext(tenantId, "uk", new Dictionary<string, string>())));
+
+        thrown.Should().NotBeNull();
+        var sweepId = observer.Events.OfType<SweepEvent.Started>().Should().ContainSingle().Subject.SweepId;
+        (await LoadRunStatusAsync(sweepId)).Should().Be(SweepRunStatus.Failed);
+        observer.Events.Should().NotContain(evt => evt is SweepEvent.Completed || evt is SweepEvent.PartiallyFailed);
+        observer.Events.OfType<SweepEvent.Failed>().Should().ContainSingle();
+    }
+
+    private sealed class SettlementObserver : IRetentionAuditObserver
+    {
+        public ConcurrentQueue<SweepEvent> Events { get; } = new();
+
+        public Task OnCommittedAsync(SweepEvent evt, CancellationToken ct)
+        {
+            Events.Enqueue(evt);
+            return Task.CompletedTask;
+        }
+    }
+
+    /// <summary>
+    /// Releases every session lock just before a run's success is written, on the same session
+    /// and inside its transaction.
+    /// </summary>
+    private sealed class DropLocksBeforeSuccessInterceptor : DbCommandInterceptor
+    {
+        public override async ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<int> result,
+            CancellationToken cancellationToken = default
+        )
+        {
+            if (
+                command.CommandText.Contains("\"SettledAt\" = @settledAt", StringComparison.Ordinal)
+                && command.Parameters.Contains("status")
+                && command.Parameters["status"].Value is int status
+                && status is (int)SweepRunStatus.Succeeded or (int)SweepRunStatus.PartiallyFailed
+            )
+            {
+                await using var unlock = command.Connection!.CreateCommand();
+                unlock.Transaction = command.Transaction;
+                unlock.CommandText = "SELECT pg_catalog.pg_advisory_unlock_all()";
+                await unlock.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            return result;
+        }
     }
 
     /// <summary>

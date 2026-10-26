@@ -21,8 +21,8 @@ namespace Cohort.Infrastructure;
 /// With <paramref name="callerCommit"/> the run joins the transaction open on
 /// <paramref name="db"/> instead: it commits nothing, and observers hear of its events only
 /// once the caller commits. A scheduled pass passes the <paramref name="passLockKey"/> it holds
-/// on the same session. An owned run commits Started, each batch and each entity summary only
-/// while its session still holds the run lock and that key.
+/// on the same session. An owned run commits Started, each batch, each entity summary and its
+/// success only while its session still holds the run lock and that key.
 /// </summary>
 internal sealed class RetentionRun(
     DbContext db,
@@ -176,7 +176,8 @@ internal sealed class RetentionRun(
             ct.ThrowIfCancellationRequested();
             await SettleAsync(at => failures.Count > 0
                 ? new SweepEvent.PartiallyFailed(SweepId, at, at - started.At, AffectedTotal, TruncateError(string.Join("\n", failures)))
-                : new SweepEvent.Completed(SweepId, at, at - started.At, AffectedTotal));
+                : new SweepEvent.Completed(SweepId, at, at - started.At, AffectedTotal),
+                fenced: true);
         }
         catch (OperationCanceledException ex) when (startedPersisted && ct.IsCancellationRequested)
         {
@@ -629,12 +630,12 @@ internal sealed class RetentionRun(
     }
 
     /// <summary>
-    /// Writes Started or an entity summary, bounded by the settlement timeout when
+    /// Writes Started, an entity summary or a success, bounded by the settlement timeout when
     /// <paramref name="ct"/> can't cancel. An owned run commits it in its own short transaction,
     /// only while its session still holds the run's locks, as a batch does: a run whose session
     /// was lost commits nothing more, dry run or not. In the caller's transaction it is written
-    /// there and commits with the caller. Settlement doesn't come through here: a run that lost
-    /// its locks must still record that it failed.
+    /// there and commits with the caller. Failed and Cancelled don't come through here: a run
+    /// that lost its locks must still record that it stopped.
     /// </summary>
     private async Task WriteDurableAsync(SweepEvent evt, CancellationToken ct)
     {
@@ -693,15 +694,26 @@ internal sealed class RetentionRun(
     /// <summary>
     /// Writes the terminal event, stamped with the database's time like every other event of
     /// the run. Bounded by the settlement timeout rather than the run's token, so a cancelled
-    /// run still settles.
+    /// run still settles. A success is <paramref name="fenced"/> like every other owned commit,
+    /// so a run whose session was lost settles Failed instead of reporting success beside the
+    /// owner that took its locks; Failed and Cancelled are never fenced, so a run can always
+    /// record that it stopped.
     /// </summary>
-    private async Task SettleAsync(Func<DateTimeOffset, SweepEvent> terminal)
+    private async Task SettleAsync(Func<DateTimeOffset, SweepEvent> terminal, bool fenced = false)
     {
         using var timeout = new CancellationTokenSource(AuditSettlementTimeout);
         var at = await DatabaseClock.NowAsync(db, timeout.Token);
         var evt = terminal(at);
-        await auditWriter.WriteAsync(evt, timeout.Token);
-        await NotifyAsync(evt);
+        if (fenced)
+        {
+            await WriteDurableAsync(evt, timeout.Token);
+        }
+        else
+        {
+            await auditWriter.WriteAsync(evt, timeout.Token);
+            await NotifyAsync(evt);
+        }
+
         settledAt = at;
     }
 

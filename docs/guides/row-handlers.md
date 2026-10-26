@@ -7,6 +7,7 @@ row Cohort mutates.
 ## Writing a handler
 
 ```csharp
+[RowHandlerId("0b6f5e43-3d0e-4c2b-9a51-6f7f2a8c1e90")]
 public sealed class DeleteAttachmentBlob(BlobContainerClient blobs) : IRetentionHandler<Attachment>
 {
     public Task OnBeforeAsync(Attachment row, RetentionBeforeContext ctx, CancellationToken ct)
@@ -24,8 +25,7 @@ public sealed class DeleteAttachmentBlob(BlobContainerClient blobs) : IRetention
 ```
 
 ```csharp
-builder.Services.AddRowHandler<Attachment, DeleteAttachmentBlob>(
-    identity: Guid.Parse("0b6f5e43-3d0e-4c2b-9a51-6f7f2a8c1e90"));
+builder.Services.AddRowHandler<Attachment, DeleteAttachmentBlob>();
 ```
 
 `AddRowHandler` is the only way to register a handler. Cohort constructs it from each batch's
@@ -75,9 +75,12 @@ Both methods are optional. The interface supplies no-op defaults.
 - **`OnAfterAsync`** runs after commit, from a durable queue, with the snapshot you captured.
   This is where side effects belong.
 
-Give long-lived handlers a stable `identity`. Without one, queued work is keyed by the
-handler's CLR type name, and renaming the class dead-letters work still queued under the old
-name.
+Every handler carries `[RowHandlerId("uuid")]`, a permanent UUID that its queued work is
+persisted and delivered under. `AddRowHandler` refuses a handler without one, or one whose id
+another handler of the same entity already uses. Renaming or moving the class is safe; changing
+the id isn't. Work queued under an id no registered handler carries is dead-lettered with
+`handler id … is not registered; re-register it and requeue`. It keeps its snapshot, so once
+the handler is back, [requeue it](#requeuing-dead-lettered-work).
 
 When an entity has several handlers, they run in `[RowHandlerPriority(n)]` order, lowest
 first. Handlers without the attribute run last, ordered by type name.
@@ -88,9 +91,13 @@ first. Handlers without the attribute run last, ordered by type name.
 greater than 1, the work might already have been done.
 
 The dispatcher polls the queue, runs up to `MaxParallelism` rows at once, and keeps each
-row's handlers in order. A failed attempt retries with exponential backoff from
-`BaseBackoff`. After `MaxAttempts`, the work is dead-lettered with a sanitized `LastError`.
-All of these are [configurable](/reference/configuration).
+row's handlers in order. A failed attempt retries with exponential backoff: 5 seconds
+(`BaseBackoff`), doubling up to 1 hour (`MaxBackoff`). After `MaxAttempts`, 25 by default or
+about 15 hours of retries, the work is dead-lettered with a sanitized `LastError`, and the
+row's later handlers with it. Each dead-letter logs an Error. The work keeps its snapshot, so
+you can [requeue it](#requeuing-dead-lettered-work). All of these are
+[configurable](/reference/configuration). The kill switch stops the background poller after
+the batch it's running; `FlushAsync` and requeues still run.
 
 Each delivery runs in its own DI scope, run as the row's tenant
 (`System(TenantlessPass)` for tenantless rows); the handler is resolved and run inside that
@@ -104,10 +111,17 @@ Each delivery holds its claim for `RowHandlerDispatch:ClaimTimeout`, five minute
 - A handler must finish within nine tenths of the timeout. The rest covers claim latency and
   clock skew between hosts. At that point its cancellation token fires, and the delivery
   counts as a failed attempt.
-- A handler that ignores its token can overlap its own retry, and the row's next handler may
-  start before it finishes. Honour the token.
-- Work left `InFlight` by a crash is reclaimed once the timeout passes, and the reclaim counts
-  as an attempt.
+- While a delivery runs, its dispatcher holds a PostgreSQL session advisory lock for it. A
+  handler that ignores its token and outlives its claim isn't reclaimed while that lock is
+  held: it keeps the row, and the row's later handlers wait, until it returns. Each pass logs
+  a Warning naming it. Honour the token.
+- Work left `InFlight` by a crash is reclaimed once the timeout passes and the crashed
+  dispatcher's session has gone, and the reclaim counts as an attempt.
+- If the dispatcher's database session is lost while the handler still runs (a failover, an
+  idle-session timeout), the lock goes with it, and the work can be reclaimed and run again.
+  No lock can rule that out; fence downstream writes on `ctx.Attempt` if it matters.
+- Session advisory locks need direct connections or session-mode pooling, not
+  transaction-mode pooling. Each draining dispatcher holds one extra connection per batch.
 - A delivery whose claim was reclaimed can't settle the row. Its outcome is discarded and the
   newer delivery settles it.
 - If recording a delivery's outcome fails, for example on a transient database error, the
@@ -127,18 +141,46 @@ marked failed after `RowHandlerDispatch:SweepSettleTimeout`, which releases its 
 
 ### Draining in tests and jobs
 
-`IRetentionRowDispatcher.FlushAsync()` runs queued work to completion now, without waiting
-for the poller. It's handy in tests and one-shot jobs.
+`IRetentionRowDispatcher.FlushAsync()` runs the work that's due now, without waiting for the
+poller. It's handy in tests and one-shot jobs. It honours retry backoff: a failed attempt
+waits out its backoff, so a flush during an outage spends one attempt per row, not the whole
+budget. The result reports what's left: `PendingRemaining` (waiting out a backoff, a run that
+hasn't settled, or a sibling), `InFlightRemaining` (held by a running delivery) and
+`DeadLetteredRequeueable`. Flush again until `Settled` if you need everything delivered.
+
+### Requeuing dead-lettered work
+
+Dead-lettered work keeps its snapshot until `PayloadRetention`, so once you've fixed the
+cause (the downstream is back, or the handler is registered again) you can run it again:
+
+```csharp
+var requeued = await dispatcher.RequeueDeadLetteredAsync();                     // everything
+await dispatcher.RequeueDeadLetteredAsync(sweepId: run.SweepId);                // one run
+await dispatcher.RequeueDeadLetteredAsync(handlerId: Guid.Parse("0b6f5e43-…")); // one handler
+```
+
+- Every dead-lettered handler of each matching row is requeued, so the row's handlers still
+  run in order. Filtering on a later handler requeues the earlier one it was waiting on too.
+- A requeue gives each handler one more delivery. `Attempt` carries on, so `ctx.Attempt`
+  still tells the handler the work may already be done, and another failure dead-letters it
+  again.
+- Work whose snapshot the backstop scrub already cleared can't be requeued.
+  `FlushAsync`'s `DeadLetteredRequeueable` counts only work that can.
+- The kill switch doesn't stop a requeue; the requeued work runs on the next flush, or once
+  the poller is back on.
 
 ## Snapshots and personal data
 
 Snapshots can hold pre-anonymisation personal data, so Cohort keeps them as briefly as it
 can:
 
-- A row's `CapturedPayload` is cleared as soon as every handler for that row reaches a
-  terminal state.
+- A row's `CapturedPayload` is cleared as soon as every handler for that row succeeds.
+  Dead-lettered work keeps its snapshot until `PayloadRetention`, so it can be requeued, and
+  history pruning keeps the run until then.
 - A backstop scrub clears anything older than `RowHandlerDispatch:PayloadRetention`, 30 days
-  by default. Queued work whose snapshot the backstop scrubbed can never complete, so it
+  by default. Startup refuses a `PayloadRetention` shorter than a handler's retry schedule,
+  so the scrub never ends work that is still retrying. It still runs while the kill switch
+  is on. Queued work whose snapshot the backstop scrubbed can never complete, so it
   dead-letters immediately, naming the scrub as the reason, instead of burning its retries.
 - Dead-letter `LastError` stores a [sanitized diagnostic](/guides/audit-trail#failure-diagnostics):
   exception type, safe machine code when there is one, and a diagnostic ID. Never exception

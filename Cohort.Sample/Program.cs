@@ -12,9 +12,8 @@ using Microsoft.Extensions.Logging;
 var builder = Host.CreateApplicationBuilder(args);
 builder.Services.AddSampleRetentionServices();
 // Dogfoods durable after-commit delivery: the sweep queues one OnAfterAsync per deleted note.
-builder.Services.AddRowHandler<Note, NoteSweptLogger>(
-    identity: new Guid("6a1f4a8e-2f0d-4c55-9a51-0d6f0f7c2b11")
-);
+// NoteSweptLogger's [RowHandlerId] is the permanent id that queued work is persisted under.
+builder.Services.AddRowHandler<Note, NoteSweptLogger>();
 
 var host = builder.Build();
 

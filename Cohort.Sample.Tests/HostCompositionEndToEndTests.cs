@@ -498,6 +498,7 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
         }
     }
 
+    [RowHandlerId("b770a6b6-3a30-45c1-9718-59a8092975b5")]
     private sealed class ConnectionProbingHandler(CallerErasureDbContext db, HandlerConnectionProbe probe)
         : IRetentionHandler<CallerErasureRecord>
     {

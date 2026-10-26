@@ -14,7 +14,26 @@ public sealed class CohortOptions
     /// </summary>
     public bool DryRun { get; init; }
 
+    /// <summary>
+    /// Stops the scheduled worker: the pass in progress is cancelled (its current batch rolls
+    /// back and the run settles <c>Cancelled</c>), the rest of that occurrence is skipped, and
+    /// no occurrence starts while it is on. Turning it off catches up the most recent
+    /// occurrence straight away.
+    /// </summary>
     public bool KillSwitch { get; init; }
+
+    /// <summary>
+    /// How long the worker waits before retrying the unfinished passes of an occurrence (a
+    /// pass with no <c>Succeeded</c> run, or an iteration that failed outright). The next
+    /// occurrence supersedes it when that comes sooner. Greater than zero, at most 1 day.
+    /// </summary>
+    public TimeSpan OccurrenceRetryDelay { get; init; } = TimeSpan.FromMinutes(15);
+
+    /// <summary>
+    /// How many runs one pass of an occurrence gets before the worker gives up on it until
+    /// the next occurrence. Runs the kill switch cancelled don't count. 1 to 100.
+    /// </summary>
+    public int OccurrenceMaxAttempts { get; init; } = 3;
 
     /// <summary>
     /// The time zone id (IANA, for example <c>Europe/London</c>; Windows ids are accepted

@@ -9,6 +9,7 @@ namespace Cohort.Sample;
 /// <summary>
 /// Runs after the sweep that removed a note has committed, from the note's captured snapshot.
 /// </summary>
+[RowHandlerId("6a1f4a8e-2f0d-4c55-9a51-0d6f0f7c2b11")]
 public sealed class NoteSweptLogger(ILogger<NoteSweptLogger> logger) : IRetentionHandler<Note>
 {
     public Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)

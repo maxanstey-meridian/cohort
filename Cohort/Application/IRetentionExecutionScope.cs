@@ -21,7 +21,9 @@ namespace Cohort.Application;
 /// pass runs inside the worker's <see cref="RetentionSystemWork.WorkerCoordination"/> work,
 /// readiness's <see cref="RetentionSystemWork.Readiness"/> check can run inside any operation,
 /// and each batch with row handlers runs its own scope, for the run's tenant, inside the
-/// sweep's or erasure's work (inside your own scope for a caller-transaction erasure).
+/// sweep's or erasure's work (inside your own scope for a caller-transaction erasure), and each
+/// <c>OnAfterAsync</c> delivery runs its own scope, for the row's tenant, inside the
+/// dispatcher's <see cref="RetentionSystemWork.RowDispatch"/> work for its batch.
 /// An inner call's context wholly replaces the outer one for its work: set it, don't merge it.
 /// Restore anything you change outside the scope's own services when the work returns.
 /// Cohort creates its own savepoints only after its transactions start, so isolation applied
@@ -123,8 +125,8 @@ public enum RetentionSystemWork
     TenantlessPass = 2,
 
     /// <summary>
-    /// Row-handler bookkeeping across every tenant's queued work: claim, settle, recover and
-    /// scrub.
+    /// Row-handler bookkeeping across every tenant's queued work: claim, settle, recover,
+    /// requeue and scrub.
     /// </summary>
     RowDispatch = 3,
 

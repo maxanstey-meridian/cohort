@@ -58,6 +58,37 @@ internal sealed class RetentionSweepEngine(
         return run.CreateSweepResult();
     }
 
+    /// <summary>
+    /// Records a scheduled pass the worker refused as a run that settles Failed with the
+    /// refusal's machine code, so the ledger and audit observers show the tenant wasn't swept
+    /// and why. Nothing is resolved or mutated.
+    /// </summary>
+    public async Task RecordRefusedPassAsync(
+        Guid tenantId,
+        RetentionPassRefusal refusal,
+        bool dryRun,
+        CancellationToken ct
+    )
+    {
+        var (_, startedAt) = await DatabaseClock.ResolveRunTimeAsync(db, null, dryRun, ct);
+        var run = new RetentionRun(
+            db,
+            auditWriter,
+            auditNotifier,
+            logger,
+            new SweepEvent.Started(Guid.NewGuid(), startedAt, SweepTriggerKind.Scheduled, dryRun, tenantId),
+            options.SweepBatchSize
+        );
+        try
+        {
+            await run.ExecuteAsync(() => throw new RetentionPassRefusedException(tenantId, refusal), ct);
+        }
+        catch (RetentionPassRefusedException)
+        {
+            // Settled Failed and logged by the run; the refusal itself is the expected outcome.
+        }
+    }
+
     private async Task<IReadOnlyList<SweepScope>> BuildExecutionPlanAsync(
         TenantContext tenant,
         DateTimeOffset now,

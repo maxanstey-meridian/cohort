@@ -8,6 +8,10 @@ These are the deliberate limits of Cohort, so you don't discover them in product
   and advisory locks. There's no SQL Server or SQLite support, and none is planned.
 - **PostgreSQL 16 or later.** Startup checks anonymised columns with `pg_input_is_valid`,
   which PostgreSQL 16 added; an older server is refused.
+- **Session advisory locks need a session of their own.** The worker, each run and each
+  row-handler delivery hold PostgreSQL session advisory locks, so they need direct connections
+  or session-mode pooling. A transaction-mode pooler (PgBouncer's `pool_mode = transaction`)
+  hands the session to someone else between transactions, and the locks stop meaning anything.
 - **You own the schema.** Cohort never creates or migrates its tables at runtime. See
   [Schema & Migrations](/reference/schema).
 
@@ -40,14 +44,17 @@ These are the deliberate limits of Cohort, so you don't discover them in product
 ## Delivery
 
 - Row-handler `OnAfterAsync` is at-least-once, not exactly-once. Handlers must be idempotent.
-- A handler that ignores its cancellation token can overlap its own retry.
+- A handler that ignores its cancellation token holds its row, and the row's later handlers,
+  until it returns. If its dispatcher's database session is lost while it runs (a failover,
+  or an idle-session timeout), the lock goes with it and the work can be reclaimed and run
+  again. Fence downstream writes on `ctx.Attempt` if that matters to you.
 - Audit observers are best effort, with no durable outbox. Integrations that must not miss an
   event should read the ledger tables or use CDC.
 
 ## Scheduling
 
-- Missed cron occurrences are skipped, not caught up.
-- Replicas compare occurrence times using their own clocks, so keep them in sync.
+- Replicas compare occurrence times from their own clocks with the database's run times, so
+  keep replica and database clocks in sync.
 
 ## Out of scope
 

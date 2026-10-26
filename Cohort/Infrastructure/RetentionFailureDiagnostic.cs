@@ -37,6 +37,11 @@ internal sealed record RetentionFailureDiagnostic
 
     private static string GetMachineCode(Exception exception)
     {
+        if (exception is RetentionPassRefusedException refused)
+        {
+            return refused.MachineCode;
+        }
+
         if (
             exception is DbException { SqlState.Length: 5 } databaseException
             && databaseException.SqlState.All(character =>

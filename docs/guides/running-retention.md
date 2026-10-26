@@ -108,41 +108,77 @@ public sealed class AllTenants(AppDbContext db) : IRetentionTenantSource
 ```
 
 - Tenant passes run one after another, in the order the source returned them.
-- Duplicate tenant IDs run once. If duplicates disagree on jurisdiction or tags, Cohort logs a
-  warning and uses the first.
+- Duplicate tenant IDs with the same jurisdiction and tags run once.
 - One tenant's failure is logged and the remaining tenants still run.
 - After the tenant passes, one tenantless pass sweeps any tenantless entities.
 
+Each occurrence the worker also checks the source against the data, with one query per
+retained tenanted table:
+
+- A tenant that owns retained rows but isn't returned by the source isn't swept. Without its
+  jurisdiction and tags Cohort could apply a shorter rule. It gets a `Failed` scheduled run
+  with `code=cohort:tenant-not-in-source` instead.
+- A tenant the source returns more than once with different jurisdictions or tags isn't swept
+  either, because Cohort won't guess which context applies. It gets a `Failed` scheduled run
+  with `code=cohort:conflicting-tenant-contexts`, and the other tenants still run.
+- An empty source is fine when there's no tenanted data. With tenanted data, each tenant that
+  owns rows gets a `Failed` run as above.
+- No tenant pass can sweep rows whose tenant column holds `Guid.Empty`. The worker logs an
+  error naming the entity at each occurrence; give those rows their real tenant.
+- These runs reach audit observers as `Started` then `Failed`, like any failed run, so your
+  existing alerting sees them. They're retried like any failed pass (see below), so fixing the
+  source mid-occurrence gets the tenant swept.
+- The check is a loose index scan of the tenant column. Give each retained tenanted table an
+  index led by its tenant column, or the check reads the whole table.
+
 ### Occurrences
 
-Each cron occurrence runs once, even across replicas:
+The worker treats each cron occurrence as an obligation, not an instant. A sweep covers
+everything due at any earlier occurrence, so the worker only ever catches up the most recent
+occurrence at or before now. It reads what that occurrence still owes from `sweep_run`:
 
-- Replicas of one install coordinate through a Postgres advisory lock keyed on the install's
-  schema-qualified `sweep_run` table. Installs in different schemas of one database sweep
-  independently.
-- Under the lock, a worker skips an occurrence that already has a `Scheduled` run of the same
-  kind (dry or real) started at or after it. A dry-run replica never stands in for the real
-  sweep.
-- The exception is an interrupted run. A run still `Started` lost its owner, because the lock
-  went with its session, and a `Cancelled` run was stopped. Either way the occurrence is
-  swept again, including passes that had already finished.
-- A run that settled `Failed` or `PartiallyFailed` still claims its occurrence. Its failures
-  are retried at the next one.
-- Occurrence times are compared against other replicas' clocks, so keep replica clocks in
-  sync.
+- An occurrence owes one **pass** per tenant in the source, one per refused tenant, and the
+  tenantless pass. A pass is keyed by its tenant ID (`Guid.Empty` for the tenantless pass).
+- A pass is **complete** once it has a `Scheduled` run of the same kind (dry or real) that
+  `Succeeded`, started at or after the occurrence. A dry-run replica never stands in for the
+  real sweep.
+- A pass is **exhausted** once it has had `OccurrenceMaxAttempts` runs (default 3) without
+  succeeding. Runs the kill switch or a shutdown cancelled don't count. The worker logs an
+  error naming the occurrence and the tenants, and leaves them to the next occurrence.
+- Every other pass is **pending**: it has no run yet, a `Failed` or `PartiallyFailed` run, or
+  a run still `Started` whose owner died with the worker lock.
+- The worker runs only the pending passes, in plan order. Passes that succeeded never rerun,
+  so their row handlers don't fire twice.
+- While any pass is pending, the worker retries after `OccurrenceRetryDelay` (default 15
+  minutes), or at the next occurrence if that comes sooner and supersedes it.
 
-Missed occurrences are skipped, not caught up. The next occurrence is always computed from
-the current time. A failed iteration, such as a database outage or a runtime
-misconfiguration, is logged and the worker tries again at the next occurrence. It never stops
-the host.
+So no occurrence is lost:
+
+- A host that was down at the occurrence, or a fresh install, sweeps it on start.
+- A failed iteration, such as a database outage or a runtime misconfiguration, is logged and
+  retried after the delay. It writes no run, so it uses no attempt, and it never stops the
+  host.
+- A replica that died mid-occurrence leaves its unfinished passes pending, including ones it
+  never started. A run the row dispatcher recovered as `Failed` is pending too.
+
+Replicas of one install coordinate through a Postgres advisory lock keyed on the install's
+schema-qualified `sweep_run` table, and every scheduled run is written under it. A replica
+that finds the lock taken checks again after the delay, by which time the passes are usually
+complete. Installs in different schemas of one database sweep independently. An occurrence is
+due once the database's clock reaches it, the clock that stamps each run's `StartedAt`, so a
+replica whose clock runs ahead waits for the database instead of sweeping early.
 
 ### Dry run and the kill switch
 
 - `DryRun: true` makes **scheduled** sweeps count-only, audited runs. Only the worker reads
   it. Explicit requests carry their own `dryRun` flag and are honoured as written.
-- `KillSwitch: true` stops between tenant passes. The tenant in progress finishes, and the
-  remaining tenants and future occurrences are skipped. It also stops
-  [history pruning](/guides/history-pruning) after the batch in progress.
+- `KillSwitch: true` cancels the pass in progress: its current batch rolls back and the run
+  settles `Cancelled`. The rest of that occurrence and future occurrences are skipped. It also
+  stops [history pruning](/guides/history-pruning) after the batch in progress, and the
+  [row handler](/guides/row-handlers) dispatcher's background poller after the batch it's
+  running. `FlushAsync` and `RequeueDeadLetteredAsync` still run.
+- Turning `KillSwitch` off catches up the most recent occurrence straight away. The cancelled
+  run used no attempt.
 
 Both are read live from configuration, so flipping them doesn't need a restart.
 
@@ -164,6 +200,10 @@ you register.
   [Tenant Isolation](/guides/tenant-isolation).
 - Erasure changes are listed under
   [Right-to-Erasure](/guides/erasure#upgrading-to-0-11-0).
+- The worker catches up missed and unfinished occurrences, including on its first start, and
+  records a `Failed` scheduled run for each tenant your source misses or returns with
+  conflicting contexts. See [Occurrences](#occurrences) and [Tenants](#tenants).
+- `KillSwitch: true` now cancels the pass in progress instead of letting it finish.
 :::
 
 ## Before you start the host

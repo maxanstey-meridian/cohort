@@ -45,7 +45,8 @@ RetentionExecutionContext.System(RetentionSystemWork Work)
 | `IRetentionSweep`, `IRetentionPreview` | `Tenant` for a tenanted request, `System(TenantlessPass)` for a tenantless one |
 | `IRetentionErasureService` | `Tenant` for a tenanted request, `System(TenantlessPass)` for a tenantless one. Not called for the erasure itself with `ErasureTransaction.Caller`: that erasure runs in your scope, which you already set up (its row-handler batches, below, still are) |
 | Each batch's `OnBeforeAsync` handlers, in their own scope on the run's connection, `Caller` erasures included | `Tenant` of the run, or `System(TenantlessPass)` for a tenantless one |
-| Scheduled worker iteration: its lock, occurrence ledger and tenant source | `System(WorkerCoordination)` |
+| Scheduled worker iteration: its lock, occurrence ledger, tenant source and tenant coverage check (which reads the tenant column of every retained tenanted table, across tenants) | `System(WorkerCoordination)` |
+| A refused scheduled pass (a tenant missing from the source or returned with conflicting contexts), recorded as a `Failed` run | `Tenant` of the refused tenant |
 | Each scheduled pass, in its own scope | `Tenant`, or `System(TenantlessPass)` for the tenantless pass |
 | Row-handler dispatch: claim, settle, recovery and payload scrub | `System(RowDispatch)` |
 | Each `OnAfterAsync` delivery, in its own scope | `Tenant` of the row, or `System(TenantlessPass)` for a tenantless row |
@@ -66,9 +67,9 @@ System work deliberately spans tenants, or touches tables that have no tenant:
 | `RetentionSystemWork` | What it is |
 |---|---|
 | `Readiness` | Catalog checks, and integrity checks across every tenant |
-| `WorkerCoordination` | The worker's advisory lock, occurrence ledger and tenant source |
+| `WorkerCoordination` | The worker's advisory lock, occurrence ledger, tenant source and tenant coverage check |
 | `TenantlessPass` | Sweeps, previews, erasures and handler deliveries for `[RetentionTenantless]` entities |
-| `RowDispatch` | Claiming, settling, recovering and scrubbing every tenant's queued handler work |
+| `RowDispatch` | Claiming, settling, recovering, requeuing and scrubbing every tenant's queued handler work |
 | `HistoryPruning` | Pruning Cohort's run history and inactive holds |
 
 How you carry out `System` is up to you, as long as the scope can read and write across
@@ -83,7 +84,9 @@ tenant".
 - **Calls nest.** Each scheduled pass runs inside the worker's `WorkerCoordination` work,
   readiness's `System(Readiness)` check can run inside any operation's work, and each batch
   with row handlers runs its own scope, for the run's tenant, inside the sweep's or erasure's
-  work (inside your own scope for a `Caller` erasure). An inner call's
+  work (inside your own scope for a `Caller` erasure). Each `OnAfterAsync` delivery runs its
+  own scope, for the row's tenant, inside the dispatcher's `System(RowDispatch)` work for its
+  batch, which holds the batch's delivery locks. An inner call's
   context wholly replaces the outer one for its work: set it, don't merge it. Restore anything
   you change outside the scope's own services when the work returns, as a `using` block or
   `try`/`finally` does; an `AsyncLocal` set in the hook is restored for you.

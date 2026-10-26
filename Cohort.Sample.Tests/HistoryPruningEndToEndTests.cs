@@ -160,6 +160,40 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Prune_Keeps_A_Run_Whose_Dead_Lettered_Work_Still_Has_Its_Snapshot()
+    {
+        // Dead-lettered work keeps its snapshot so it can be requeued; pruning the run would
+        // cascade to that row detail and lose the work before PayloadRetention ends.
+        var requeueable = await SeedRunAsync(
+            SweepRunStatus.Succeeded,
+            Now.AddDays(-100),
+            SweepRowHandlerDispatchState.DeadLettered,
+            capturedPayload: "{}"
+        );
+
+        using (var host = CreateHost(succeededRunRetention: "90.00:00:00", failedRunRetention: "90.00:00:00"))
+        {
+            (await PruneAsync(host)).Runs.Should().Be(0);
+        }
+        (await LoadRunIdsAsync()).Should().BeEquivalentTo([requeueable]);
+
+        // Once the payload-retention scrub clears the snapshot, the run is pruned as usual.
+        await using (var connection = new NpgsqlConnection(ConnectionString))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = """UPDATE "sweep_run_row_detail" SET "CapturedPayload" = NULL""";
+            await command.ExecuteNonQueryAsync();
+        }
+
+        using (var host = CreateHost(succeededRunRetention: "90.00:00:00", failedRunRetention: "90.00:00:00"))
+        {
+            (await PruneAsync(host)).Runs.Should().Be(1);
+        }
+        (await LoadRunIdsAsync()).Should().BeEmpty();
+    }
+
+    [Fact]
     public async Task Prune_Deletes_Holds_That_Stopped_Protecting_Before_The_Cutoff()
     {
         await SeedHoldAsync(expiresAt: null, removedAt: Now.AddDays(-100));
@@ -377,7 +411,8 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
         SweepRunStatus status,
         DateTimeOffset? settledAt,
         SweepRowHandlerDispatchState? handlerState = null,
-        DateTimeOffset? startedAt = null
+        DateTimeOffset? startedAt = null,
+        string? capturedPayload = null
     )
     {
         var sweepId = Guid.NewGuid();
@@ -400,8 +435,8 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
 
             WITH detail AS (
                 INSERT INTO "sweep_run_row_detail"
-                    ("SweepId", "At", "EntityType", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId")
-                VALUES (@sweepId, @startedAt, 'Cohort.Sample.Entities.Note', @entityId, @recordId, 'short-lived', @strategy, @tenantId)
+                    ("SweepId", "At", "EntityType", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId", "CapturedPayload")
+                VALUES (@sweepId, @startedAt, 'Cohort.Sample.Entities.Note', @entityId, @recordId, 'short-lived', @strategy, @tenantId, @capturedPayload)
                 RETURNING "Id"
             )
             INSERT INTO "sweep_row_handler_status"
@@ -429,6 +464,10 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
         command.Parameters.Add(new NpgsqlParameter("handlerState", NpgsqlTypes.NpgsqlDbType.Integer)
         {
             Value = handlerState is null ? DBNull.Value : (int)handlerState.Value,
+        });
+        command.Parameters.Add(new NpgsqlParameter("capturedPayload", NpgsqlTypes.NpgsqlDbType.Text)
+        {
+            Value = (object?)capturedPayload ?? DBNull.Value,
         });
         command.Parameters.AddWithValue("inFlight", (int)SweepRowHandlerDispatchState.InFlight);
         command.Parameters.AddWithValue("succeeded", (int)SweepRowHandlerDispatchState.Succeeded);
@@ -548,4 +587,5 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
     }
 }
 
+[RowHandlerId("d6b29e21-05d6-49da-94d1-66f189929ce9")]
 file sealed class PruningNoteHandler : IRetentionHandler<Note>;

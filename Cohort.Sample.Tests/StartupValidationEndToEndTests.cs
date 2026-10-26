@@ -170,6 +170,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
             );
     }
 
+    [RowHandlerId("c70b90fd-ebbb-4631-8ce9-6f11d4bf7081")]
     private sealed class UnconstructableNoteHandler : IRetentionHandler<Note>
     {
         public static bool Constructed { get; private set; }
@@ -181,6 +182,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         }
     }
 
+    [RowHandlerId("d0f60a6d-922d-46c0-8100-c4a358f7802b")]
     private sealed class InstanceNoteHandler : IRetentionHandler<Note>;
 
     private sealed class StrayNoteHandler : IRetentionHandler<Note>;

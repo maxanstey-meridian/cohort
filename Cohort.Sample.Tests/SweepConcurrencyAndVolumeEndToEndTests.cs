@@ -625,5 +625,6 @@ public sealed class SweepConcurrencyAndVolumeEndToEndTests(PostgresFixture fixtu
         return entries.ToArray();
     }
 
+    [RowHandlerId("bff19ce7-59f5-4f29-b53c-9983f0f02d98")]
     private sealed class ConcurrentNoteHandler : IRetentionHandler<Note>;
 }

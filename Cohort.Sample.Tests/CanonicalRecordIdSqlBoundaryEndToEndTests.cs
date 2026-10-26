@@ -347,6 +347,7 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
         }
     }
 
+    [RowHandlerId("8c862b29-2d3a-4f4c-91ac-9d0d87373b92")]
     private sealed class CanonicalRecordIdHandler : IRetentionHandler<CanonicalRecordIdRecord>;
 
     [Retain("canonical-record-id", nameof(CreatedAt), AuditRowDetail = AuditRowDetail.PerRow)]

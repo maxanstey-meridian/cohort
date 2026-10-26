@@ -23,6 +23,14 @@ entity and the problem.
 - `[RetentionTenantless]` isn't combined with a tenant property. Otherwise the tenant property
   would win and the marker would be silently ignored.
 
+## Row handlers
+
+- Every [row handler](/guides/row-handlers) carries a `[RowHandlerId]` holding a non-empty
+  UUID, and no two handlers of one entity share an id. `AddRowHandler` refuses either problem
+  when it's called, naming the handler.
+- Every `IRetentionHandler<T>` service is registered once, through `AddRowHandler`, as
+  scoped. A handler registered any other way is refused and named.
+
 ## Rules and capabilities
 
 - The union of strategies each category declares in `GetCapabilities` is checked against every

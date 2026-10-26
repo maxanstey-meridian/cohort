@@ -28,6 +28,20 @@ internal sealed class CohortOptionsValidator : IValidateOptions<CohortOptions>
             }
         }
 
+        if (options.OccurrenceRetryDelay <= TimeSpan.Zero)
+        {
+            errors.Add("Cohort OccurrenceRetryDelay must be greater than zero.");
+        }
+        else if (options.OccurrenceRetryDelay > TimeSpan.FromDays(1))
+        {
+            errors.Add("Cohort OccurrenceRetryDelay must not exceed 1 day.");
+        }
+
+        if (options.OccurrenceMaxAttempts is < 1 or > 100)
+        {
+            errors.Add("Cohort OccurrenceMaxAttempts must be between 1 and 100.");
+        }
+
         if (string.IsNullOrWhiteSpace(options.TimeZone))
         {
             errors.Add("Cohort TimeZone cannot be blank.");
@@ -97,6 +111,7 @@ internal sealed class CohortOptionsValidator : IValidateOptions<CohortOptions>
             errors.Add("Cohort RowHandlerDispatch cannot be null.");
             return ValidateOptionsResult.Fail(errors);
         }
+        var errorsBeforeDispatch = errors.Count;
         if (dispatch.PollInterval <= TimeSpan.Zero)
         {
             errors.Add("Cohort RowHandlerDispatch PollInterval must be greater than zero.");
@@ -129,6 +144,14 @@ internal sealed class CohortOptionsValidator : IValidateOptions<CohortOptions>
         {
             errors.Add("Cohort RowHandlerDispatch BaseBackoff must be greater than zero.");
         }
+        if (dispatch.MaxBackoff < dispatch.BaseBackoff)
+        {
+            errors.Add("Cohort RowHandlerDispatch MaxBackoff must be at least BaseBackoff.");
+        }
+        else if (dispatch.MaxBackoff > TimeSpan.FromDays(1))
+        {
+            errors.Add("Cohort RowHandlerDispatch MaxBackoff must not exceed 1 day.");
+        }
         if (dispatch.ClaimTimeout < TimeSpan.FromSeconds(30))
         {
             errors.Add("Cohort RowHandlerDispatch ClaimTimeout must be at least 30 seconds.");
@@ -145,6 +168,18 @@ internal sealed class CohortOptionsValidator : IValidateOptions<CohortOptions>
         if (dispatch.PayloadRetention < TimeSpan.FromHours(1))
         {
             errors.Add("Cohort RowHandlerDispatch PayloadRetention must be at least 1 hour.");
+        }
+        else if (errors.Count == errorsBeforeDispatch)
+        {
+            // Past PayloadRetention the backstop scrubs the snapshot, so work still inside its
+            // retry schedule could never complete.
+            var span = RetentionRowDispatcher.RetryScheduleSpan(dispatch);
+            if (span >= dispatch.PayloadRetention)
+            {
+                errors.Add(
+                    $"Cohort RowHandlerDispatch PayloadRetention ({dispatch.PayloadRetention}) must be longer than a handler's retry schedule ({span}: every backoff wait for MaxAttempts attempts, capped at MaxBackoff, plus MaxAttempts times ClaimTimeout); otherwise the payload scrub ends work that is still retrying."
+                );
+            }
         }
 
         return errors.Count == 0
@@ -191,6 +226,9 @@ internal sealed class CohortOptionsValidator : IValidateOptions<CohortOptions>
 
 internal static class CohortScheduleParser
 {
+    private static readonly TimeSpan MaximumLookback = TimeSpan.FromDays(8 * 366);
+    private static readonly DateTime EarliestUtc = DateTime.SpecifyKind(DateTime.MinValue, DateTimeKind.Utc);
+
     internal static CronExpression Parse(string schedule)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(schedule);
@@ -215,5 +253,44 @@ internal static class CohortScheduleParser
         return nextUtc is null
             ? null
             : new DateTimeOffset(DateTime.SpecifyKind(nextUtc.Value, DateTimeKind.Utc));
+    }
+
+    /// <summary>
+    /// The latest occurrence at or before <paramref name="nowUtc"/>, or null when there is none
+    /// in the last eight years (the longest gap a cron can leave is 29 February across a
+    /// century). Cronos only looks forward, so this walks back in doubling windows, each
+    /// enumerating only the part the previous window didn't cover.
+    /// </summary>
+    internal static DateTimeOffset? GetPreviousOccurrence(string schedule, DateTimeOffset nowUtc)
+    {
+        var expression = Parse(schedule);
+        var now = nowUtc.UtcDateTime;
+        var covered = now;
+        var toInclusive = true;
+        for (var window = TimeSpan.FromMinutes(1); covered > EarliestUtc; window *= 2)
+        {
+            var reach = window < MaximumLookback ? window : MaximumLookback;
+            var from = now - EarliestUtc < reach ? EarliestUtc : now - reach;
+            DateTime? latest = null;
+            foreach (var occurrence in expression.GetOccurrences(from, covered, fromInclusive: true, toInclusive))
+            {
+                latest = occurrence;
+            }
+
+            if (latest is { } found)
+            {
+                return new DateTimeOffset(DateTime.SpecifyKind(found, DateTimeKind.Utc));
+            }
+
+            if (reach == MaximumLookback)
+            {
+                break;
+            }
+
+            covered = from;
+            toInclusive = false;
+        }
+
+        return null;
     }
 }

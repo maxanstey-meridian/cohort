@@ -30,7 +30,9 @@ startup.
 |---|---|---|
 | `Schedule` | `null` | Cron expression, evaluated in **UTC**. `null` disables the worker. |
 | `DryRun` | `false` | Run **scheduled** sweeps as count-only audited runs instead of mutating data. They keep the same run and entity audit trail, with `sweep_run.DryRun` set. Only the worker reads it: explicit requests carry their own flag (`RetentionSweepRequest.Tenanted(..., dryRun: true)`, `new ErasureScope(..., dryRun: true)`) and are honoured as written. |
-| `KillSwitch` | `false` | Stop between tenant passes: the tenant in progress finishes, and the remaining tenants and future occurrences are skipped. It also stops [history pruning](/guides/history-pruning) after the batch in progress. |
+| `KillSwitch` | `false` | Cancel the pass in progress (its current batch rolls back and the run settles `Cancelled`) and skip the remaining passes and future occurrences. Turning it off catches up the most recent occurrence straight away. It also stops [history pruning](/guides/history-pruning) after the batch in progress, and the [row handler](/guides/row-handlers) dispatcher's background poller after the batch it's running (`FlushAsync` and `RequeueDeadLetteredAsync` still run). |
+| `OccurrenceRetryDelay` | `00:15:00` | How long the worker waits before retrying an occurrence's unfinished passes, or the next occurrence if that comes sooner. See [Occurrences](/guides/running-retention#occurrences). Greater than zero, at most 1 day. |
+| `OccurrenceMaxAttempts` | `3` | Runs one pass of an occurrence gets before the worker leaves it to the next occurrence. Cancelled runs don't count. 1 to 100. |
 | `TimeZone` | `UTC` | Time zone id (IANA, such as `Europe/London`; Windows ids are accepted where ICU is available) whose calendar [retention periods](/guides/retention-rules#periods-are-calendar-periods) are counted in. Cohort counts each period back from today's date in this zone and keeps rows anchored on or after the day that lands on. Scheduled sweeps, explicit sweeps, preview and erasure all use it. Must be a zone the host knows (Linux images need tzdata). The schedule stays UTC. |
 | `SweepBatchSize` | `5000` | Maximum rows selected, locked and mutated per transaction. Each batch commits independently. At least 1. |
 | `AuditObservers:Timeout` | `00:00:05` | Maximum time Cohort waits for each observer to handle one committed event. Each observer has its own timeout. At most 1 hour. |
@@ -44,11 +46,12 @@ See [Running Retention](/guides/running-retention) for how the worker uses them.
 | `RowHandlerDispatch:PollInterval` | `00:00:10` | Delay between dispatcher polling passes. |
 | `RowHandlerDispatch:BatchSize` | `50` | Upper bound on queued handler statuses claimed per poll. The dispatcher claims at most `min(MaxParallelism, BatchSize)`, so every claim starts running at once. Valid range: 1 to 10000. |
 | `RowHandlerDispatch:MaxParallelism` | `4` | Maximum rows dispatched concurrently. Handlers for one row stay in order. Valid range: 1 to 256. |
-| `RowHandlerDispatch:MaxAttempts` | `10` | Maximum delivery attempts before dead-lettering. Valid range: 1 to 1000. |
-| `RowHandlerDispatch:BaseBackoff` | `00:00:01` | Base delay for exponential retry backoff. |
-| `RowHandlerDispatch:ClaimTimeout` | `00:05:00` | Lease on one delivery. The handler is cancelled at nine tenths of it, and in-flight work abandoned by a crash is reclaimed after it. Valid range: 30 seconds to 1 day. |
+| `RowHandlerDispatch:MaxAttempts` | `25` | Maximum delivery attempts before dead-lettering. With the default backoff, 25 attempts retry for about 15 hours. A [requeue](/guides/row-handlers#requeuing-dead-lettered-work) gives one more. Valid range: 1 to 1000. |
+| `RowHandlerDispatch:BaseBackoff` | `00:00:05` | Wait after the first failed attempt. Each later failure doubles it, up to `MaxBackoff`. |
+| `RowHandlerDispatch:MaxBackoff` | `01:00:00` | Longest wait between two attempts. Valid range: `BaseBackoff` to 1 day. |
+| `RowHandlerDispatch:ClaimTimeout` | `00:05:00` | Lease on one delivery. The handler is cancelled at nine tenths of it. In-flight work is reclaimed after it only once the dispatcher that claimed it has gone, as after a crash; a handler still running keeps its claim. Valid range: 30 seconds to 1 day. |
 | `RowHandlerDispatch:SweepSettleTimeout` | `01:00:00` | Age after which an unowned `Started` run is recovered as failed. At least 1 minute. |
-| `RowHandlerDispatch:PayloadRetention` | `30.00:00:00` | Backstop retention for captured row snapshots, which can contain personal data. At least 1 hour. |
+| `RowHandlerDispatch:PayloadRetention` | `30.00:00:00` | Backstop retention for captured row snapshots, which can contain personal data. Dead-lettered work keeps its snapshot until then, so it can be requeued. At least 1 hour, and longer than a handler's retry schedule: every backoff wait plus `MaxAttempts` times `ClaimTimeout` (about 17.5 hours with the defaults). |
 
 See [Row Handlers](/guides/row-handlers).
 

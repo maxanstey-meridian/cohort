@@ -1,3 +1,5 @@
+using System.Reflection;
+
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure;
@@ -125,16 +127,13 @@ public static class ServiceCollectionExtensions
     }
 
     /// <summary>
-    /// Registers a row handler. <paramref name="identity"/> is the stable identity that
-    /// queued handler work is persisted under; without it, the handler's CLR type name
-    /// is used, and renaming the class dead-letters any rows still queued under the old
-    /// name. Give long-lived handlers an explicit UUID so persisted work survives
-    /// refactors.
+    /// Registers a row handler. <typeparamref name="THandler"/> must carry
+    /// <see cref="RowHandlerIdAttribute"/>: queued handler work is persisted under that
+    /// UUID, so it survives renaming or moving the class.
     /// </summary>
     public static IServiceCollection AddRowHandler<TEntity, THandler>(
         this IServiceCollection services,
-        RowHandlerDispatchPhase dispatchPhase = RowHandlerDispatchPhase.Immediate,
-        Guid? identity = null
+        RowHandlerDispatchPhase dispatchPhase = RowHandlerDispatchPhase.Immediate
     )
         where THandler : class, IRetentionHandler<TEntity>
     {
@@ -148,6 +147,12 @@ public static class ServiceCollectionExtensions
             );
         }
 
+        var identity =
+            typeof(THandler).GetCustomAttribute<RowHandlerIdAttribute>(inherit: false)?.Id
+            ?? throw new InvalidOperationException(
+                $"Row handler {typeof(THandler).FullName} has no [RowHandlerId(\"<uuid>\")] attribute. Every row handler needs a permanent UUID: queued work is persisted under it."
+            );
+
         var existingRegistrations = services
             .Where(descriptor => descriptor.ServiceType == typeof(IRetentionHandlerRegistration))
             .Select(descriptor => descriptor.ImplementationInstance)
@@ -155,35 +160,30 @@ public static class ServiceCollectionExtensions
             .ToArray();
 
         // TryAddEnumerable would silently keep the first registration of this pair, so
-        // a repeat call with a different phase or identity must fail loudly instead of
-        // appearing to take effect. An identical repeat stays idempotent.
+        // a repeat call with a different phase must fail loudly instead of appearing to
+        // take effect. An identical repeat stays idempotent.
         var samePair = existingRegistrations.FirstOrDefault(registration =>
             registration.EntityType == typeof(TEntity)
             && registration.HandlerType == typeof(THandler)
         );
-        if (
-            samePair is not null
-            && (samePair.DispatchPhase != dispatchPhase || samePair.Identity != identity)
-        )
+        if (samePair is not null && samePair.DispatchPhase != dispatchPhase)
         {
             throw new InvalidOperationException(
-                $"Row handler {typeof(THandler).FullName} for entity {typeof(TEntity).FullName} is already registered with dispatch phase {samePair.DispatchPhase} and identity {samePair.Identity?.ToString() ?? "<none>"}; this call's values ({dispatchPhase}, {identity?.ToString() ?? "<none>"}) would be silently ignored. Register each handler pair once."
+                $"Row handler {typeof(THandler).FullName} for entity {typeof(TEntity).FullName} is already registered with dispatch phase {samePair.DispatchPhase}; this call's phase ({dispatchPhase}) would be silently ignored. Register each handler pair once."
             );
         }
 
         // Two handlers persisting queued work under the same identity would have their
         // rows dispatched interchangeably to whichever resolves first.
-        var identityClash = identity is not null
-            ? existingRegistrations.FirstOrDefault(registration =>
-                registration.EntityType == typeof(TEntity)
-                && registration.HandlerType != typeof(THandler)
-                && registration.Identity == identity
-            )
-            : null;
+        var identityClash = existingRegistrations.FirstOrDefault(registration =>
+            registration.EntityType == typeof(TEntity)
+            && registration.HandlerType != typeof(THandler)
+            && registration.Identity == identity
+        );
         if (identityClash is not null)
         {
             throw new InvalidOperationException(
-                $"Row handler identity {identity} for entity {typeof(TEntity).FullName} is already used by {identityClash.HandlerType.FullName}; identities must be unique per entity so queued work dispatches to the handler that persisted it."
+                $"Row handler id {identity} for entity {typeof(TEntity).FullName} is already used by {identityClash.HandlerType.FullName}; give {typeof(THandler).FullName} its own [RowHandlerId] so queued work dispatches to the handler that persisted it."
             );
         }
 

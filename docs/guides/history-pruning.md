@@ -28,8 +28,10 @@ A settled run is deleted, with its `sweep_run_entity_summary`, `sweep_run_row_de
   dead-lettered handler work, uses `FailedRunRetention`. That lets you keep failure evidence
   longer, or shorter, than routine history.
 
-A run is **never** deleted while any of its handler work is `Pending` or `InFlight`, however
-old it is. A run still `Started` is never deleted either; the dispatcher recovers abandoned
+A run is **never** deleted while any of its handler work is `Pending` or `InFlight`, or while
+any of its rows still holds a captured snapshot, however old it is. Dead-lettered work keeps
+its snapshot until `RowHandlerDispatch:PayloadRetention` so it can be
+[requeued](/guides/row-handlers#requeuing-dead-lettered-work), and pruning waits for it. A run still `Started` is never deleted either; the dispatcher recovers abandoned
 runs as failed first.
 
 ## Holds

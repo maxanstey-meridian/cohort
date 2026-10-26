@@ -843,6 +843,7 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
         }
     }
 
+    [RowHandlerId("64c313a9-a25a-4f7d-bb7c-aea7112c1edc")]
     private sealed class ParentCaptureHandler : IRetentionHandler<ARestrictiveParent>
     {
         public Task OnBeforeAsync(ARestrictiveParent row, RetentionBeforeContext ctx, CancellationToken ct)

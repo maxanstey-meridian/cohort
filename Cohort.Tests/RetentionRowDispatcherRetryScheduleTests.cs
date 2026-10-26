@@ -5,11 +5,18 @@ namespace Cohort.Tests;
 public sealed class RetentionRowDispatcherRetryScheduleTests
 {
     [Theory]
-    [InlineData(1, 1)]
-    [InlineData(2, 2)]
-    [InlineData(4, 8)]
-    public void CalculateNextAttemptAt_Applies_Exponential_Backoff(
+    [InlineData(1, 1, 3600, 1)]
+    [InlineData(2, 1, 3600, 2)]
+    [InlineData(4, 1, 3600, 8)]
+    [InlineData(10, 5, 3600, 2560)]
+    [InlineData(11, 5, 3600, 3600)]
+    [InlineData(12, 5, 3600, 3600)]
+    [InlineData(1000, 5, 3600, 3600)]
+    [InlineData(3, 5, 5, 5)]
+    public void CalculateNextAttemptAt_Doubles_The_Backoff_Up_To_MaxBackoff(
         int attempt,
+        int baseBackoffSeconds,
+        int maxBackoffSeconds,
         int expectedDelaySeconds
     )
     {
@@ -17,7 +24,8 @@ public sealed class RetentionRowDispatcherRetryScheduleTests
 
         var nextAttemptAt = RetentionRowDispatcher.CalculateNextAttemptAt(
             now,
-            TimeSpan.FromSeconds(1),
+            TimeSpan.FromSeconds(baseBackoffSeconds),
+            TimeSpan.FromSeconds(maxBackoffSeconds),
             attempt
         );
 
@@ -32,9 +40,37 @@ public sealed class RetentionRowDispatcherRetryScheduleTests
         var nextAttemptAt = RetentionRowDispatcher.CalculateNextAttemptAt(
             now,
             TimeSpan.MaxValue,
+            TimeSpan.MaxValue,
             int.MaxValue
         );
 
         nextAttemptAt.Should().Be(RetentionRowDispatcher.RetryScheduleUpperBound);
+    }
+
+    [Theory]
+    // Defaults: 5 s doubling to the 1 h cap over 24 waits (5 115 s + 14 h), plus 25 claim
+    // timeouts of 5 min.
+    [InlineData(25, 5, 3600, 300, 5115 + (14 * 3600) + (25 * 300))]
+    [InlineData(1, 5, 3600, 300, 300)]
+    [InlineData(3, 60, 90, 30, 60 + 90 + (3 * 30))]
+    public void RetryScheduleSpan_Adds_Every_Capped_Backoff_And_Every_Claim_Timeout(
+        int maxAttempts,
+        int baseBackoffSeconds,
+        int maxBackoffSeconds,
+        int claimTimeoutSeconds,
+        int expectedSpanSeconds
+    )
+    {
+        var span = RetentionRowDispatcher.RetryScheduleSpan(
+            new RowHandlerDispatchOptions
+            {
+                MaxAttempts = maxAttempts,
+                BaseBackoff = TimeSpan.FromSeconds(baseBackoffSeconds),
+                MaxBackoff = TimeSpan.FromSeconds(maxBackoffSeconds),
+                ClaimTimeout = TimeSpan.FromSeconds(claimTimeoutSeconds),
+            }
+        );
+
+        span.Should().Be(TimeSpan.FromSeconds(expectedSpanSeconds));
     }
 }

@@ -89,6 +89,38 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Worker_Finds_A_Tenant_Missing_From_The_Source_Across_Tenants_And_Records_It_As_That_Tenant()
+    {
+        // The coverage check runs as System(WorkerCoordination): as a tenant it would see only
+        // that tenant's rows and find nothing missing.
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        var tenantA = Guid.NewGuid();
+        var tenantB = Guid.NewGuid();
+        await CreateSchemaWithPoliciesAsync(database.ConnectionString);
+        await SeedAsync(database.ConnectionString, [Note(tenantA, "a-expired"), Note(tenantB, "b-expired")], []);
+        var entries = new EntryLog();
+        using var host = BuildHost(
+            database.ConnectionString,
+            services =>
+            {
+                services.AddSingleton(entries);
+                services.AddScoped<IRetentionExecutionScope, RecordingExecutionScope>();
+                services.AddScoped<IRetentionTenantSource>(_ => new FixedTenantSource([tenantA]));
+            }
+        );
+
+        await GetWorker(host).RunIterationAsync(DateTimeOffset.UtcNow.AddSeconds(-1), dryRun: false, CancellationToken.None);
+
+        entries.Ran.Should().Contain(new RetentionExecutionContext.Tenant(tenantB));
+        (await LoadNoteBodiesAsync(database.ConnectionString)).Should().Equal("b-expired");
+        (await LoadRunsAsync(database.ConnectionString)).Should().BeEquivalentTo([
+            new RunRow(tenantA, SweepRunStatus.Succeeded),
+            new RunRow(tenantB, SweepRunStatus.Failed),
+            new RunRow(Guid.Empty, SweepRunStatus.Succeeded),
+        ]);
+    }
+
+    [Fact]
     public async Task Policies_Bite_Outside_Any_Scopes_Work()
     {
         // Guard for every test here: an unisolated host under these policies runs every scope
@@ -959,6 +991,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             );
     }
 
+    [RowHandlerId("89766ecd-99b6-4622-822a-f0fe32322b8c")]
     private sealed class SessionObservingNoteHandler(RlsDbContext db, HandlerObservations observations)
         : IRetentionHandler<RlsNote>
     {
@@ -972,6 +1005,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             observations.Add(await ObserveAsync(db, $"after:{ctx.Snapshot["body"]}", ct));
     }
 
+    [RowHandlerId("95b8bc24-1b3e-439d-bb03-337c5e82a8cc")]
     private sealed class SessionObservingLogHandler(RlsDbContext db, HandlerObservations observations)
         : IRetentionHandler<RlsLog>
     {

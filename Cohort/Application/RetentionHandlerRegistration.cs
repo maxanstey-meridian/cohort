@@ -8,7 +8,7 @@ internal interface IRetentionHandlerRegistration
 
     internal RowHandlerDispatchPhase DispatchPhase { get; }
 
-    internal Guid? Identity { get; }
+    internal Guid Identity { get; }
 }
 
 // Closed over the entity/handler pair so each AddRowHandler call registers a distinct
@@ -17,7 +17,7 @@ internal interface IRetentionHandlerRegistration
 // phase of every AddRowHandler call after the first.
 internal sealed record RetentionHandlerRegistration<TEntity, THandler>(
     RowHandlerDispatchPhase DispatchPhase,
-    Guid? Identity = null
+    Guid Identity
 ) : IRetentionHandlerRegistration
     where THandler : IRetentionHandler<TEntity>
 {

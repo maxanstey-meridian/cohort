@@ -119,7 +119,16 @@ envelope rather than the exception text. It contains:
 - a safe machine code when there is one (for example a PostgreSQL SQLSTATE)
 - a random diagnostic ID
 
-Cohort's own machine-safe reasons may be stored as plain text instead.
+Cohort's own machine-safe reasons may be stored as plain text instead. Two of them are
+`Failed` scheduled runs the worker records for a tenant it refused to sweep, with
+`code=cohort:…` in the envelope:
+
+| Code | Means |
+|---|---|
+| `cohort:tenant-not-in-source` | The tenant owns retained rows, but `IRetentionTenantSource` didn't return it |
+| `cohort:conflicting-tenant-contexts` | The source returned the tenant more than once, with different jurisdictions or tags |
+
+Neither touched a row. See [Running Retention](/guides/running-retention#tenants).
 
 Only diagnostic `Error` and `LastError` text is sanitized. Exception messages, stack traces,
 SQL values and subject identifiers are kept out of it, but the deliberately identifying

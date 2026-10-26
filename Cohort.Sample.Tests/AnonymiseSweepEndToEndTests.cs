@@ -876,6 +876,7 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         public string Town { get; set; } = "";
     }
 
+    [RowHandlerId("8b7c6a83-876c-4d1e-bd18-0e91c5d19abe")]
     private sealed class CountingComplexAddressHandler : IRetentionHandler<ComplexAddressRecord>;
 
     private sealed class JsonbAnonymiseDbContext(DbContextOptions<JsonbAnonymiseDbContext> options)
@@ -1161,6 +1162,7 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
     }
 }
 
+[RowHandlerId("eafe3c16-ae23-4ba1-8caf-fd7ae5bfff75")]
 file sealed class SubjectRaceContactHandler : IRetentionHandler<AnonymisedContact>
 {
     public Task OnBeforeAsync(

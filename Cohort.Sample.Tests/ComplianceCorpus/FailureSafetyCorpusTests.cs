@@ -380,6 +380,7 @@ public sealed class FailureSafetyCorpusTests(PostgresFixture fixture) : Integrat
 
     private sealed record PersonalDataSentinel(string Value);
 
+    [RowHandlerId("26a89428-788a-4c19-9627-e8e55b07b106")]
     private sealed class PersonalDataFailingHandler(PersonalDataSentinel sentinel)
         : IRetentionHandler<Note>
     {

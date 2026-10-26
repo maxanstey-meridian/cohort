@@ -184,7 +184,7 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
             );
 
             (await services.GetRequiredService<IRetentionRowDispatcher>().FlushAsync())
-                .Should().Be(new RowDispatcherFlushResult(0, 0));
+                .Should().Be(new RowDispatcherFlushResult(0, 0, 0));
 
             await using var connection = new NpgsqlConnection(connectionString);
             await connection.OpenAsync();
@@ -819,9 +819,12 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
         );
     }
 
+    [RowHandlerId("9b02adec-1b04-45d2-a8cb-779a9cbfe865")]
     private sealed class QualifiedRecordHandler : IRetentionHandler<QualifiedRecord>;
+    [RowHandlerId("b21a48c6-aa34-4aa7-8ac2-0587d2f10780")]
     private sealed class QualifiedSoftDeleteRecordHandler
         : IRetentionHandler<QualifiedSoftDeleteRecord>;
+    [RowHandlerId("8bbc5be0-5752-40dd-9b9a-96d4aaa29cae")]
     private sealed class QualifiedAnonymiseRecordHandler
         : IRetentionHandler<QualifiedAnonymiseRecord>;
 

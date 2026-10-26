@@ -20,7 +20,8 @@ namespace Cohort.Hosting;
 /// details and handler statuses) past <see cref="HistoryPruningOptions.SucceededRunRetention"/>
 /// or <see cref="HistoryPruningOptions.FailedRunRetention"/>, and holds that stopped protecting
 /// longer ago than <see cref="HistoryPruningOptions.InactiveHoldRetention"/>. A run is never
-/// pruned while any of its handler work is pending or in flight, and nothing is pruned while
+/// pruned while any of its handler work is pending or in flight, or while any of its rows still
+/// holds a captured snapshot (requeueable dead-lettered work), and nothing is pruned while
 /// <see cref="CohortOptions.KillSwitch"/> is on. Each batch commits on its own and claims with
 /// <c>SKIP LOCKED</c>, so replicas prune disjoint batches.
 /// </summary>
@@ -227,7 +228,10 @@ internal sealed class RetentionHistoryPruner(
     /// Settled-run eligibility. Positional parameters: {0} Started, {1} Succeeded,
     /// {2} PartiallyFailed, {3} Failed, {4} Cancelled, {5} succeeded cutoff, {6} failed
     /// cutoff, {7} handler Pending, {8} handler InFlight, {9} handler DeadLettered. A null
-    /// cutoff makes its comparison null, so that class of run is never eligible.
+    /// cutoff makes its comparison null, so that class of run is never eligible. A run whose
+    /// row details still hold a snapshot is never eligible either: dead-lettered work keeps its
+    /// snapshot until <c>RowHandlerDispatch:PayloadRetention</c> so it can be requeued, and a
+    /// requeue never changes the snapshot, so this can't race one.
     /// </summary>
     private static string EligibleRunPredicate(QuotedTables tables)
     {
@@ -254,6 +258,10 @@ internal sealed class RetentionHistoryPruner(
                       )
                   )
                   AND NOT EXISTS (SELECT 1 {{handlerWork}} AND status."State" IN ({7}, {8}))
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {{tables.SweepRunRowDetail}} AS retained
+                      WHERE retained."SweepId" = run."SweepId" AND retained."CapturedPayload" IS NOT NULL
+                  )
             """;
     }
 

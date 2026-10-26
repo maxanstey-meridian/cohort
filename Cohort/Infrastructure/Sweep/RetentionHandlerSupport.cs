@@ -235,7 +235,7 @@ internal static class RetentionHandlerSupport
             lastError = $"reason={failed.FailureReason}";
             logger.LogError(
                 "Cohort row handler {HandlerType} failed before mutation for sweep {SweepId} and entity {EntityType} ({Reason}).",
-                failedHandler.HandlerTypeName,
+                failedHandler.HandlerType.FullName,
                 execution.SweepId,
                 entry.EntityType.FullName,
                 failed.FailureReason
@@ -396,23 +396,18 @@ internal sealed class ResolvedRetentionHandler(
     object instance,
     Type handlerInterface,
     RowHandlerDispatchPhase dispatchPhase,
-    Guid? identity = null
+    Guid identity
 )
 {
     public object Instance { get; } = instance;
 
     public Type HandlerType { get; } = instance.GetType();
 
-    public string HandlerTypeName { get; } =
-        RetentionTypeIdentity.GetPersistedName(instance.GetType());
-
     /// <summary>
-    /// What queued work is persisted and matched under: the registration's explicit
-    /// UUID when given, otherwise the CLR type name. Explicit identities survive class
-    /// renames; type-name identities do not.
+    /// What queued work is persisted and matched under: the handler's
+    /// <see cref="RowHandlerIdAttribute"/> UUID in "D" format, which survives class renames.
     /// </summary>
-    public string HandlerIdentity { get; } =
-        identity?.ToString("D") ?? RetentionTypeIdentity.GetPersistedName(instance.GetType());
+    public string HandlerIdentity { get; } = identity.ToString("D");
 
     public RowHandlerDispatchPhase DispatchPhase { get; } = dispatchPhase;
 

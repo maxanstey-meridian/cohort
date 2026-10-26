@@ -1,4 +1,5 @@
 using Cohort.Application;
+using Cohort.Domain;
 using Cohort.Hosting;
 
 using Microsoft.Extensions.DependencyInjection;
@@ -40,25 +41,46 @@ public sealed class AddRowHandlerRegistrationTests
     [Fact]
     public void AddRowHandler_Rejects_Two_Handlers_Sharing_An_Identity_For_The_Same_Entity()
     {
-        // Both handlers would persist queued work under the same HandlerIdentity, and
-        // dispatch would hand either's rows to whichever resolves first.
-        var identity = Guid.NewGuid();
+        // FirstHandler and AnotherFirstHandler carry the same [RowHandlerId]: both would
+        // persist queued work under it, and dispatch would hand either's rows to whichever
+        // resolves first.
         var services = new ServiceCollection();
-        services.AddRowHandler<FirstEntity, FirstHandler>(identity: identity);
+        services.AddRowHandler<FirstEntity, FirstHandler>();
 
-        var clash = () =>
-            services.AddRowHandler<FirstEntity, AnotherFirstHandler>(identity: identity);
+        var clash = () => services.AddRowHandler<FirstEntity, AnotherFirstHandler>();
 
-        clash.Should().Throw<InvalidOperationException>().WithMessage("*unique per entity*");
+        clash
+            .Should()
+            .Throw<InvalidOperationException>()
+            .WithMessage($"*{typeof(FirstHandler).FullName}*{typeof(AnotherFirstHandler).FullName}*own [RowHandlerId]*");
+    }
+
+    [Fact]
+    public void AddRowHandler_Refuses_A_Handler_Without_RowHandlerId()
+    {
+        var services = new ServiceCollection();
+
+        var register = () => services.AddRowHandler<FirstEntity, UnidentifiedHandler>();
+
+        register
+            .Should()
+            .Throw<InvalidOperationException>()
+            .WithMessage($"*{typeof(UnidentifiedHandler).FullName}*[RowHandlerId(*");
+        services.Should().BeEmpty();
     }
 
     private sealed class FirstEntity;
 
     private sealed class SecondEntity;
 
+    [RowHandlerId("761d9837-05be-4694-bc7d-0fac82e98e67")]
     private sealed class FirstHandler : IRetentionHandler<FirstEntity>;
 
+    [RowHandlerId("761d9837-05be-4694-bc7d-0fac82e98e67")]
     private sealed class AnotherFirstHandler : IRetentionHandler<FirstEntity>;
 
+    [RowHandlerId("bb3f5ec6-9a5a-4f2b-b251-712f862ad752")]
     private sealed class SecondHandler : IRetentionHandler<SecondEntity>;
+
+    private sealed class UnidentifiedHandler : IRetentionHandler<FirstEntity>;
 }

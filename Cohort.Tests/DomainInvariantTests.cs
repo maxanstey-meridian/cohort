@@ -70,6 +70,27 @@ public sealed class DomainInvariantTests
         scope.Should().Throw<ArgumentException>().WithParameterName("kind");
     }
 
+    [Theory]
+    [InlineData("")]
+    [InlineData("not-a-uuid")]
+    [InlineData("00000000-0000-0000-0000-000000000000")]
+    public void Persisted_Identity_Attributes_Need_A_Non_Empty_Uuid(string id)
+    {
+        var entityId = () => new RetentionEntityIdAttribute(id);
+        var handlerId = () => new RowHandlerIdAttribute(id);
+
+        entityId.Should().Throw<ArgumentException>().WithParameterName("id");
+        handlerId.Should().Throw<ArgumentException>().WithParameterName("id");
+    }
+
+    [Theory]
+    [InlineData("6a1f4a8e-2f0d-4c55-9a51-0d6f0f7c2b11")]
+    [InlineData("{6A1F4A8E-2F0D-4C55-9A51-0D6F0F7C2B11}")]
+    public void Row_Handler_Id_Parses_Any_Uuid_Format(string id)
+    {
+        new RowHandlerIdAttribute(id).Id.Should().Be(new Guid("6a1f4a8e-2f0d-4c55-9a51-0d6f0f7c2b11"));
+    }
+
     [Fact]
     public void A_Sweep_Request_Cannot_Be_An_Erasure()
     {

@@ -37,11 +37,6 @@ internal sealed class AnonymiseSweepStrategy(
         }
     }
 
-    // The AnonymisedAt marker keeps anonymisation idempotent: rows scrubbed by an earlier
-    // run fall out of scope instead of being re-anonymised forever.
-    protected override string EligibilitySql(RetentionEntry entry) =>
-        $"target.{PostgreSqlIdentifier.Quote(entry.AnonymisedAt!.AnonymisedAtColumn)} IS NULL";
-
     protected override SweepMutation CreateMutation(SweepScope scope)
     {
         var entry = scope.Entry;

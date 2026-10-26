@@ -17,7 +17,9 @@ namespace Cohort.Hosting;
 /// An occurrence is settled once every pass in its plan has a <c>Succeeded</c> run since it,
 /// or has used up <see cref="CohortOptions.OccurrenceMaxAttempts"/>; until then the worker
 /// retries the unfinished passes <see cref="CohortOptions.OccurrenceRetryDelay"/> apart.
-/// Every answer comes from the <c>sweep_run</c> ledger, read under the worker lock.
+/// Every answer comes from the <c>sweep_run</c> ledger: the worker lock keeps replicas from
+/// planning an occurrence side by side, and each pass re-reads its own ledger under its pass
+/// lock, which is what keeps it from running twice.
 /// </summary>
 internal sealed class RetentionWorker(
     IServiceScopeFactory scopeFactory,
@@ -327,8 +329,8 @@ internal sealed class RetentionWorker(
         finally
         {
             // Every session lock goes, not just the worker key: a lock the server granted to a
-            // command that was then cancelled (the worker key, or a live-run probe) would
-            // otherwise return to the pool with this connection.
+            // command that was then cancelled would otherwise return to the pool with this
+            // connection.
             await OperationalConnectionCleanup.RunAsync(
                 db.Database.GetDbConnection(),
                 cleanupToken => RetentionRunAdvisoryLock.ReleaseAllAsync(db.Database.GetDbConnection(), cleanupToken),
@@ -350,28 +352,37 @@ internal sealed class RetentionWorker(
         var maxAttempts = options.Current.OccurrenceMaxAttempts;
         var plan = await BuildPassPlanAsync(services, db, ct);
         var ledger = await LoadLedgerAsync(db, occurrence, dryRun, ct);
-        if (await AnyLiveRunAsync(db, ledger, ct))
+        var ran = new List<PlannedPass>();
+        var busy = false;
+        foreach (var pass in plan.Where(pass => ledger.IsPending(pass.TenantId, maxAttempts)))
         {
-            // The worker lock's session was lost (a timeout, a failover) while its owner's
-            // passes ran on their own connections. Running beside them would double their
-            // handler side effects, which is what the lock exists to prevent.
-            logger.LogInformation(
-                "Cohort worker skipped this occurrence: a run of it is still in progress elsewhere."
-            );
-            return OccurrenceOutcome.LockBusy;
-        }
+            // The pass lock, not the worker lock, keeps a pass from running twice: this
+            // replica's worker-lock session may have been lost (a timeout, a failover) while
+            // another took the lock and planned the same passes.
+            var scheduled = new ScheduledPass(pass.TenantId, occurrence, dryRun, maxAttempts);
+            var outcome = await RunPassAsync(pass, scheduled, ct);
+            if (outcome == ScheduledPassOutcome.Busy)
+            {
+                // Stop rather than run later passes first: tenantless runs after the tenants.
+                logger.LogInformation(
+                    "Cohort worker stopped this occurrence: another replica is running the pass for {Pass}.",
+                    Describe(pass)
+                );
+                busy = true;
+                break;
+            }
 
-        var pending = plan.Where(pass => ledger.IsPending(pass.TenantId, maxAttempts)).ToArray();
-        foreach (var pass in pending)
-        {
-            await EnsureWorkerLockSessionAsync(db, ct);
-            await RunPassAsync(pass, dryRun, ct);
+            // A pass another replica settled meanwhile is that replica's to report.
+            if (outcome == ScheduledPassOutcome.Ran)
+            {
+                ran.Add(pass);
+            }
         }
 
         // Read back rather than infer: a pass that failed before its run existed used no attempt.
         ledger = await LoadLedgerAsync(db, occurrence, dryRun, ct);
         // Only the passes this iteration ran: one exhausted earlier was reported then.
-        var exhausted = pending
+        var exhausted = ran
             .Where(pass => !ledger.IsCompleted(pass.TenantId) && !ledger.IsPending(pass.TenantId, maxAttempts))
             .Select(pass => pass.TenantId)
             .ToArray();
@@ -385,51 +396,21 @@ internal sealed class RetentionWorker(
             );
         }
 
+        if (busy)
+        {
+            return OccurrenceOutcome.LockBusy;
+        }
+
         return plan.Any(pass => ledger.IsPending(pass.TenantId, maxAttempts))
             ? OccurrenceOutcome.Pending
             : OccurrenceOutcome.Settled;
     }
 
     /// <summary>
-    /// Whether any run of the occurrence left <c>Started</c> still has its owner: the run lock
-    /// is held for as long as the run is, and goes with its session, so a lock this connection
-    /// can take marks a run whose owner died. The same test the dispatcher's recovery uses.
-    /// </summary>
-    private static async Task<bool> AnyLiveRunAsync(DbContext db, OccurrenceLedger ledger, CancellationToken ct)
-    {
-        var connection = db.Database.GetDbConnection();
-        foreach (var sweepId in ledger.StartedSweepIds)
-        {
-            var key = RetentionRunAdvisoryLock.KeyFor(sweepId);
-            if (!await RetentionRunAdvisoryLock.TryAcquireAsync(connection, key, ct))
-            {
-                return true;
-            }
-
-            // Not the iteration's token: a cancelled release would keep the lock. The
-            // iteration's cleanup releases everything this session holds anyway.
-            await RetentionRunAdvisoryLock.ReleaseAsync(connection, key, CancellationToken.None);
-        }
-
-        return false;
-    }
-
-    /// <summary>
-    /// Fails the iteration once the session holding the worker lock is gone. Its passes run on
-    /// connections of their own, so a lost session (a timeout, a failover) would otherwise go
-    /// unseen while another replica takes the lock and plans the same passes.
-    /// </summary>
-    private static async Task EnsureWorkerLockSessionAsync(DbContext db, CancellationToken ct)
-    {
-        await using var command = new SqlParams().CreateCommand(db.Database.GetDbConnection(), null, "SELECT 1");
-        await command.ExecuteScalarAsync(ct);
-    }
-
-    /// <summary>
     /// The passes one occurrence owes, in run order: each tenant from the source, then each
     /// refused tenant, then the tenantless pass. A tenant the source returned with conflicting
-    /// contexts, or one that owns retained rows the source didn't return, is refused rather
-    /// than swept under a guessed context. Tenantless tables hold one shared row set; sweeping
+    /// contexts, or one that owns retained rows a sweep could still act on that the source
+    /// didn't return, is refused rather than swept under a guessed context. Tenantless tables hold one shared row set; sweeping
     /// them inside the per-tenant loop retired nothing after the first pass but attributed the
     /// audit run (and resolved retention rules) under whichever tenant happened to come first.
     /// </summary>
@@ -450,6 +431,7 @@ internal sealed class RetentionWorker(
             var gaps = await RetentionTenantCoverage.FindGapsAsync(
                 db,
                 registry,
+                services.GetRequiredService<RetentionRuntimeReadinessValidator>().ValidatedCapabilities,
                 [.. tenants.Select(tenant => tenant.Id), .. conflicting],
                 ct
             );
@@ -474,93 +456,57 @@ internal sealed class RetentionWorker(
         return plan;
     }
 
-    private static async Task<OccurrenceLedger> LoadLedgerAsync(
+    private static Task<OccurrenceLedger> LoadLedgerAsync(
         DbContext db,
         DateTimeOffset occurrence,
         bool dryRun,
         CancellationToken ct
-    )
-    {
-        // A pass is keyed by its tenant (Guid.Empty for the tenantless pass), and only runs of
-        // the same kind count: a replica still configured to dry run must not stand in for the
-        // real sweep. A run still Started has lost its owner, unless the owner's worker lock
-        // went with a lost session while the run carried on: the caller tells the two apart by
-        // the run lock. Cancelled runs (the kill switch, or a shutdown) use no attempt.
-        var sweepRun = PostgreSqlIdentifier.Format(CohortStoreTables.FromModel(db.Model).SweepRun);
-        await using var command = new SqlParams
-        {
-            ["scheduled"] = (int)SweepTriggerKind.Scheduled,
-            ["occurrence"] = occurrence,
-            ["dryRun"] = dryRun,
-            ["started"] = (int)SweepRunStatus.Started,
-            ["succeeded"] = (int)SweepRunStatus.Succeeded,
-            ["cancelled"] = (int)SweepRunStatus.Cancelled,
-        }.CreateCommand(
+    ) =>
+        RetentionRunLedgerSql.LoadOccurrenceAsync(
             db.Database.GetDbConnection(),
-            null,
-            $"""
-            SELECT "TenantId",
-                   bool_or("Status" = @succeeded) AS completed,
-                   count(*) FILTER (WHERE "Status" <> @cancelled) AS attempts,
-                   array_agg("SweepId") FILTER (WHERE "Status" = @started) AS started
-            FROM {sweepRun}
-            WHERE "TriggerKind" = @scheduled AND "DryRun" = @dryRun AND "StartedAt" >= @occurrence
-            GROUP BY "TenantId"
-            """
+            CohortStoreTables.FromModel(db.Model).SweepRun,
+            occurrence,
+            dryRun,
+            tenantId: null,
+            ct
         );
-        var passes = new Dictionary<Guid, (bool Completed, long Attempts)>();
-        var started = new List<Guid>();
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
+
+    private Task<ScheduledPassOutcome> RunPassAsync(PlannedPass pass, ScheduledPass scheduled, CancellationToken ct) =>
+        pass switch
         {
-            passes[reader.GetGuid(0)] = (reader.GetBoolean(1), reader.GetInt64(2));
-            if (!reader.IsDBNull(3))
-            {
-                started.AddRange(reader.GetFieldValue<Guid[]>(3));
-            }
-        }
+            SweepPass sweep => RunSweepPassAsync(sweep, scheduled, ct),
+            RefusedPass refused => RecordRefusedPassAsync(refused, scheduled, ct),
+            _ => throw new ArgumentOutOfRangeException(nameof(pass)),
+        };
 
-        return new OccurrenceLedger(passes, started);
-    }
-
-    private async Task RunPassAsync(PlannedPass pass, bool dryRun, CancellationToken ct)
-    {
-        switch (pass)
-        {
-            case SweepPass sweep:
-                await RunSweepPassAsync(sweep, dryRun, ct);
-                break;
-            case RefusedPass refused:
-                await RecordRefusedPassAsync(refused, dryRun, ct);
-                break;
-        }
-    }
-
-    private async Task RunSweepPassAsync(SweepPass pass, bool dryRun, CancellationToken ct)
+    private async Task<ScheduledPassOutcome> RunSweepPassAsync(SweepPass pass, ScheduledPass scheduled, CancellationToken ct)
     {
         var tenant = pass.Tenant;
-        var mode = dryRun ? "dry run" : "sweep";
+        var mode = scheduled.DryRun ? "dry run" : "sweep";
         try
         {
-            var result = await scopeFactory.RunInScopeAsync(
+            var (outcome, result) = await scopeFactory.RunInScopeAsync(
                 RetentionExecutionScopes.For(tenant),
-                services => services.GetRequiredService<RetentionSweepEngine>().RunAsync(
+                services => services.GetRequiredService<RetentionSweepEngine>().RunScheduledPassAsync(
                     tenant,
-                    null,
-                    SweepTriggerKind.Scheduled,
                     pass.Scope,
-                    dryRun,
+                    scheduled,
                     ct
                 ),
                 ct
             );
 
-            logger.LogInformation(
-                "Cohort worker completed {Mode} for {Pass} with {EntityCount} entity counts.",
-                mode,
-                Describe(tenant),
-                result.Counts.Count
-            );
+            if (result is not null)
+            {
+                logger.LogInformation(
+                    "Cohort worker completed {Mode} for {Pass} with {EntityCount} entity counts.",
+                    mode,
+                    Describe(tenant),
+                    result.Counts.Count
+                );
+            }
+
+            return outcome;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -574,19 +520,21 @@ internal sealed class RetentionWorker(
                 mode,
                 Describe(tenant)
             );
+            // The failure is this pass's own: its run, if one started, is in the ledger.
+            return ScheduledPassOutcome.Ran;
         }
     }
 
-    private async Task RecordRefusedPassAsync(RefusedPass pass, bool dryRun, CancellationToken ct)
+    private async Task<ScheduledPassOutcome> RecordRefusedPassAsync(RefusedPass pass, ScheduledPass scheduled, CancellationToken ct)
     {
         try
         {
             // The run belongs to the tenant, so it is written as that tenant. The run logs the
             // refusal, with the tenant and what to do about it.
-            await scopeFactory.RunInScopeAsync(
+            return await scopeFactory.RunInScopeAsync(
                 RetentionExecutionScopes.ForTenant(pass.TenantId),
                 services => services.GetRequiredService<RetentionSweepEngine>()
-                    .RecordRefusedPassAsync(pass.TenantId, pass.Refusal, dryRun, ct),
+                    .RecordRefusedPassAsync(pass.Refusal, scheduled, ct),
                 ct
             );
         }
@@ -601,11 +549,15 @@ internal sealed class RetentionWorker(
                 "Cohort worker could not record the refused pass for tenant {TenantId}; continuing with remaining passes.",
                 pass.TenantId
             );
+            return ScheduledPassOutcome.Ran;
         }
     }
 
     private static string Describe(TenantContext tenant) =>
         tenant.IsTenantless ? "the tenantless pass" : $"tenant {tenant.Id}";
+
+    private static string Describe(PlannedPass pass) =>
+        pass is SweepPass sweep ? Describe(sweep.Tenant) : $"tenant {pass.TenantId}";
 
     /// <summary>
     /// The source's tenants once each, in source order, and the ids it returned with
@@ -685,21 +637,6 @@ internal sealed class RetentionWorker(
     private sealed record SweepPass(TenantContext Tenant, SweepEntityScope Scope) : PlannedPass(Tenant.Id);
 
     private sealed record RefusedPass(Guid TenantId, RetentionPassRefusal Refusal) : PlannedPass(TenantId);
-
-    private sealed class OccurrenceLedger(
-        IReadOnlyDictionary<Guid, (bool Completed, long Attempts)> passes,
-        IReadOnlyList<Guid> startedSweepIds
-    )
-    {
-        /// <summary>The occurrence's runs still <c>Started</c>, live or orphaned.</summary>
-        public IReadOnlyList<Guid> StartedSweepIds => startedSweepIds;
-
-        public bool IsCompleted(Guid tenantId) => passes.TryGetValue(tenantId, out var pass) && pass.Completed;
-
-        /// <summary>Neither succeeded nor out of attempts.</summary>
-        public bool IsPending(Guid tenantId, int maxAttempts) =>
-            !passes.TryGetValue(tenantId, out var pass) || (!pass.Completed && pass.Attempts < maxAttempts);
-    }
 }
 
 /// <summary>
@@ -719,7 +656,7 @@ internal enum OccurrenceOutcome
     Pending,
 
     /// <summary>
-    /// Another replica holds the worker lock, or a run of the occurrence is still live:
+    /// Another replica holds the worker lock or is running one of this occurrence's passes:
     /// check again after the retry delay.
     /// </summary>
     LockBusy,

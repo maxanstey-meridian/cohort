@@ -3,7 +3,7 @@ namespace Cohort.Infrastructure;
 /// <summary>Why the worker refused a tenant's pass instead of sweeping it.</summary>
 internal enum RetentionPassRefusal
 {
-    /// <summary>The tenant owns retained rows, but the tenant source didn't return it.</summary>
+    /// <summary>The tenant owns retained rows a sweep could still act on, but the tenant source didn't return it.</summary>
     NotInTenantSource,
 
     /// <summary>The tenant source returned the tenant more than once, with different contexts.</summary>
@@ -24,7 +24,7 @@ internal static class RetentionPassRefusals
     internal static string Describe(this RetentionPassRefusal refusal, Guid tenantId) => refusal switch
     {
         RetentionPassRefusal.NotInTenantSource =>
-            $"Tenant {tenantId} owns rows in retained tables, but IRetentionTenantSource did not return it. Cohort won't sweep a tenant without its jurisdiction and tags; add it to the tenant source.",
+            $"Tenant {tenantId} owns rows in retained tables that a sweep could still act on, but IRetentionTenantSource did not return it. Cohort won't sweep a tenant without its jurisdiction and tags; add it to the tenant source.",
         RetentionPassRefusal.ConflictingTenantContexts =>
             $"IRetentionTenantSource returned tenant {tenantId} more than once with different contexts. Cohort won't guess which jurisdiction and tags apply; return one context per tenant.",
         _ => throw new ArgumentOutOfRangeException(nameof(refusal)),

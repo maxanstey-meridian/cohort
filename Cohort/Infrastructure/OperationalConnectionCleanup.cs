@@ -61,6 +61,30 @@ internal static class OperationalConnectionCleanup
     }
 
     /// <summary>
+    /// Releases one session advisory lock the connection keeps using afterwards. A failed
+    /// release is logged and the session discarded once closed, never thrown.
+    /// </summary>
+    internal static async Task ReleaseLockAsync(
+        DbConnection connection,
+        long key,
+        string lockName,
+        object owner,
+        ILogger logger
+    )
+    {
+        try
+        {
+            using var cleanup = new CancellationTokenSource(CleanupTimeout);
+            await RetentionRunAdvisoryLock.ReleaseAsync(connection, key, cleanup.Token);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Cohort could not release the {LockName} lock for {LockOwner}.", lockName, owner);
+            DiscardWhenClosed(connection);
+        }
+    }
+
+    /// <summary>
     /// Npgsql resets a pooled session (DISCARD ALL releases advisory locks) only when the
     /// connection is next used, so a lock-holding session could sit idle in the pool and keep
     /// the lock. Clearing the pool closes this physical connection when it is returned; other

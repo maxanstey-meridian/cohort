@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Data.Common;
 using System.Diagnostics;
 using System.Globalization;
 using System.Threading.Channels;
@@ -11,6 +12,7 @@ using Cohort.Infrastructure.Migrations;
 using Cohort.Sample.Entities;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -265,8 +267,8 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
     [Fact]
     public async Task A_Started_Run_Whose_Owner_Is_Still_Running_Keeps_The_Occurrence_Busy()
     {
-        // The owner's worker lock went with a lost session (a timeout, a failover) while its
-        // pass carried on, on a connection of its own that still holds the run lock.
+        // A live owner holds its pass lock on the connection its run writes on, whatever became
+        // of its worker lock.
         await using var database = await UseTemporaryDatabaseAsync();
         var tenant = CreateTenant();
         using var host = BuildHost(
@@ -276,60 +278,204 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         );
         await SeedOldNoteAsync(tenant.Id, "live-owner");
         var occurrence = (await DatabaseNowAsync()).AddSeconds(-1);
-        var liveRun = await InsertScheduledRunAsync(tenant.Id, occurrence.AddMilliseconds(10), SweepRunStatus.Started);
+        await InsertScheduledRunAsync(tenant.Id, occurrence.AddMilliseconds(10), SweepRunStatus.Started);
         var worker = GetWorker(host);
 
-        // Unpooled, so closing it ends the session.
-        await using (var owner = new NpgsqlConnection($"{ConnectionString};Pooling=false"))
+        await using (await HoldPassLockAsync(tenant.Id, dryRun: false))
         {
-            await owner.OpenAsync();
-            await using var acquire = owner.CreateCommand();
-            acquire.CommandText = "SELECT pg_advisory_lock(@key)";
-            acquire.Parameters.AddWithValue("key", RetentionRunAdvisoryLock.KeyFor(liveRun));
-            await acquire.ExecuteScalarAsync();
-
             (await worker.RunIterationAsync(occurrence, dryRun: false, CancellationToken.None))
                 .Should().Be(OccurrenceOutcome.LockBusy);
             (await NoteExistsAsync("live-owner")).Should().BeTrue();
             (await CountScheduledRunsAsync(tenant.Id)).Should().Be(1);
         }
 
-        // The owner's session is gone, and its lock with it: the run lost its owner.
+        // The owner's session is gone, and its pass lock with it: the run lost its owner.
         (await worker.RunIterationAsync(occurrence, dryRun: false, CancellationToken.None))
             .Should().Be(OccurrenceOutcome.Settled);
         (await NoteExistsAsync("live-owner")).Should().BeFalse();
     }
 
     [Fact]
-    public async Task A_Worker_That_Lost_Its_Lock_Session_Starts_No_Further_Pass()
+    public async Task A_Started_Run_Whose_Owner_Holds_Only_Its_Run_Lock_Does_Not_Keep_The_Occurrence_Busy()
     {
-        // Once the worker lock's session is gone another replica can take the lock and plan
-        // the same passes, so the owner must not carry on into the next one.
+        // The pass lock, not the run lock, says a scheduled pass is live: an owner holding only
+        // a Started run's lock isn't running the pass.
         await using var database = await UseTemporaryDatabaseAsync();
-        var first = CreateTenant();
-        var second = CreateTenant();
-        var observer = new FirstNoteProgressObserver();
+        var tenant = CreateTenant();
         using var host = BuildHost(
             CreateSettings(ConnectionString, schedule: "0 0 0 1 1 *", dryRun: false, killSwitch: false),
-            first,
+            tenant,
+            services => services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>()
+        );
+        await SeedOldNoteAsync(tenant.Id, "run-lock-only");
+        var occurrence = (await DatabaseNowAsync()).AddSeconds(-1);
+        var startedRun = await InsertScheduledRunAsync(tenant.Id, occurrence.AddMilliseconds(10), SweepRunStatus.Started);
+
+        await using (await HoldAdvisoryLockAsync(RetentionRunAdvisoryLock.KeyFor(startedRun)))
+        {
+            (await GetWorker(host).RunIterationAsync(occurrence, dryRun: false, CancellationToken.None))
+                .Should().Be(OccurrenceOutcome.Settled);
+        }
+
+        (await NoteExistsAsync("run-lock-only")).Should().BeFalse();
+        (await CountScheduledRunsAsync(tenant.Id)).Should().Be(2);
+    }
+
+    [Fact]
+    public async Task Two_Replicas_Racing_For_One_Pass_After_A_Lost_Worker_Lock_Run_It_Once()
+    {
+        // Replica A planned the tenant's pass, then lost its worker-lock session before the
+        // pass started. Replica B takes the worker lock, plans the same pass and runs it.
+        await using var database = await UseTemporaryDatabaseAsync();
+        var tenant = CreateTenant();
+        var settings = CreateSettings(ConnectionString, schedule: "0 0 0 1 1 *", dryRun: false, killSwitch: false);
+        var gate = new PassGateScope(tenant.Id);
+        var firstObserver = new RecordingObserver();
+        var secondObserver = new RecordingObserver();
+        using var first = BuildHost(
+            settings,
+            tenant,
             services =>
             {
                 services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
-                services.AddSingleton<IRetentionTenantSource>(new StaticTenantSource(first, second));
-                services.AddSingleton<IRetentionAuditObserver>(observer);
+                services.AddSingleton<IRetentionAuditObserver>(firstObserver);
+                services.AddSingleton<IRetentionExecutionScope>(gate);
             }
         );
-        observer.OnFirstNoteProgress = () => TerminateWorkerLockSessionAsync().GetAwaiter().GetResult();
-        await SeedOldNoteAsync(first.Id, "lost-session-first");
-        await SeedOldNoteAsync(second.Id, "lost-session-second");
+        using var second = BuildHost(
+            settings,
+            tenant,
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
+                services.AddSingleton<IRetentionAuditObserver>(secondObserver);
+            }
+        );
+        await SeedOldNoteAsync(tenant.Id, "racing-replicas");
         var occurrence = (await DatabaseNowAsync()).AddSeconds(-1);
 
-        var iterate = () => GetWorker(host).RunIterationAsync(occurrence, dryRun: false, CancellationToken.None);
+        var firstIteration = GetWorker(first).RunIterationAsync(occurrence, dryRun: false, CancellationToken.None);
+        await gate.Entered.WaitAsync(TimeSpan.FromSeconds(10));
+        try
+        {
+            await TerminateWorkerLockSessionAsync();
+            (await GetWorker(second).RunIterationAsync(occurrence, dryRun: false, CancellationToken.None))
+                .Should().Be(OccurrenceOutcome.Settled);
+            (await NoteExistsAsync("racing-replicas")).Should().BeFalse();
+        }
+        finally
+        {
+            gate.Release();
+        }
 
-        await iterate.Should().ThrowAsync<Exception>();
-        (await NoteExistsAsync("lost-session-first")).Should().BeFalse();
-        (await NoteExistsAsync("lost-session-second")).Should().BeTrue();
-        (await CountScheduledRunsAsync(second.Id)).Should().Be(0);
+        // Its read-back runs on the lost coordination session.
+        await Record.ExceptionAsync(() => firstIteration.WaitAsync(TimeSpan.FromSeconds(10)));
+
+        (await LoadScheduledRunsAsync(tenant.Id)).Select(run => run.Status).Should().Equal(SweepRunStatus.Succeeded);
+        firstObserver.Events.Concat(secondObserver.Events)
+            .OfType<SweepEvent.Started>()
+            .Count(started => started.TenantId == tenant.Id)
+            .Should().Be(1);
+    }
+
+    [Theory]
+    [InlineData(HeldPass.TenantReal)]
+    [InlineData(HeldPass.TenantDry)]
+    [InlineData(HeldPass.TenantlessReal)]
+    [InlineData(HeldPass.MissingTenantReal)]
+    public async Task A_Held_Pass_Lock_Blocks_Only_Its_Own_Tenant_And_Kind(HeldPass held)
+    {
+        // Plan order: the source's tenants, then refused tenants, then the tenantless pass. A
+        // busy pass stops the iteration, so nothing after it runs.
+        await using var database = await UseTemporaryDatabaseAsync();
+        var tenant = CreateTenant();
+        var missing = CreateTenant();
+        using var host = BuildHost(
+            CreateSettings(ConnectionString, schedule: "0 0 0 1 1 *", dryRun: false, killSwitch: false),
+            tenant,
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
+                services.AddSingleton<IRetentionTenantSource>(new StaticTenantSource(tenant));
+            }
+        );
+        await SeedOldNoteAsync(tenant.Id, "held-pass-tenant");
+        await SeedOldNoteAsync(missing.Id, "held-pass-missing");
+        await SeedOldTenantlessLogAsync("held-pass-tenantless");
+        var occurrence = (await DatabaseNowAsync()).AddSeconds(-1);
+        var (lockedTenant, lockedDry) = held switch
+        {
+            HeldPass.TenantReal => (tenant.Id, false),
+            HeldPass.TenantDry => (tenant.Id, true),
+            HeldPass.TenantlessReal => (Guid.Empty, false),
+            _ => (missing.Id, false),
+        };
+
+        OccurrenceOutcome outcome;
+        await using (await HoldPassLockAsync(lockedTenant, lockedDry))
+        {
+            outcome = await GetWorker(host).RunIterationAsync(occurrence, dryRun: false, CancellationToken.None);
+        }
+
+        var tenantSwept = held != HeldPass.TenantReal;
+        var missingRefused = held is HeldPass.TenantDry or HeldPass.TenantlessReal;
+        var tenantlessSwept = held == HeldPass.TenantDry;
+        // The refused tenant leaves the occurrence pending when nothing was busy.
+        outcome.Should().Be(held == HeldPass.TenantDry ? OccurrenceOutcome.Pending : OccurrenceOutcome.LockBusy);
+        (await NoteExistsAsync("held-pass-tenant")).Should().Be(!tenantSwept);
+        (await CountScheduledRunsAsync(tenant.Id)).Should().Be(tenantSwept ? 1 : 0);
+        (await CountScheduledRunsAsync(missing.Id)).Should().Be(missingRefused ? 1 : 0);
+        (await TenantlessLogExistsAsync("held-pass-tenantless")).Should().Be(!tenantlessSwept);
+    }
+
+    public enum HeldPass
+    {
+        TenantReal,
+        TenantDry,
+        TenantlessReal,
+        MissingTenantReal,
+    }
+
+    [Fact]
+    public async Task A_Manual_Sweep_Runs_Beside_A_Held_Pass_Lock()
+    {
+        var tenant = CreateTenant();
+        using var host = BuildHost(
+            CreateSettings(ConnectionString, schedule: "0 0 0 1 1 *", dryRun: false, killSwitch: false),
+            tenant,
+            services => services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>()
+        );
+        await SeedOldNoteAsync(tenant.Id, "manual-beside-pass");
+
+        await using (await HoldPassLockAsync(tenant.Id, dryRun: false))
+        {
+            await host.Host.Services.GetRequiredService<IRetentionSweep>().SweepAsync(tenant);
+        }
+
+        (await NoteExistsAsync("manual-beside-pass")).Should().BeFalse();
+        var run = await LoadLatestRunAsync(tenant.Id);
+        run!.Value.Trigger.Should().Be(SweepTriggerKind.Manual);
+        run.Value.Status.Should().Be(SweepRunStatus.Succeeded);
+    }
+
+    /// <summary>
+    /// Holds a scheduled pass's lock the way a live owner does, on an unpooled connection, so
+    /// disposing it ends the session.
+    /// </summary>
+    private Task<NpgsqlConnection> HoldPassLockAsync(Guid tenantId, bool dryRun) =>
+        HoldAdvisoryLockAsync(
+            RetentionRunAdvisoryLock.ScheduledPassKeyFor(new RelationalObjectName("public", "sweep_run"), tenantId, dryRun)
+        );
+
+    private async Task<NpgsqlConnection> HoldAdvisoryLockAsync(long key)
+    {
+        var owner = new NpgsqlConnection($"{ConnectionString};Pooling=false");
+        await owner.OpenAsync();
+        await using var acquire = owner.CreateCommand();
+        acquire.CommandText = "SELECT pg_advisory_lock(@key)";
+        acquire.Parameters.AddWithValue("key", key);
+        await acquire.ExecuteScalarAsync();
+        return owner;
     }
 
     private async Task TerminateWorkerLockSessionAsync()
@@ -340,7 +486,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         await using var terminate = connection.CreateCommand();
         // A bigint advisory key is held as classid (high 32 bits) and objid (low 32 bits).
         terminate.CommandText = """
-            SELECT pg_terminate_backend(pid) FROM pg_locks
+            SELECT pg_terminate_backend(pid, 5000) FROM pg_locks
             WHERE locktype = 'advisory' AND granted AND objsubid = 1
               AND classid::bigint = (@key >> 32) & 4294967295 AND objid::bigint = @key & 4294967295
             """;
@@ -764,6 +910,67 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
     }
 
     [Fact]
+    public async Task A_Refused_Pass_Whose_Session_Lost_Its_Locks_Records_No_Run()
+    {
+        // EF reopens a lost session on its next use, and the new session holds neither the pass
+        // lock nor the run lock. Dropping the locks just before Started is written stands in for
+        // that: a refusal recorded there would use up an attempt another replica also spends.
+        await using var database = await UseTemporaryDatabaseAsync();
+        var listed = CreateTenant();
+        var missing = CreateTenant();
+        using var host = BuildHost(
+            CreateSettings(ConnectionString, schedule: "0 0 0 1 1 *", dryRun: false, killSwitch: false),
+            listed,
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
+                services.AddSingleton<IRetentionTenantSource>(new StaticTenantSource(listed));
+                services.ConfigureDbContext<SampleDbContext>(options =>
+                    options.AddInterceptors(new DropLocksBeforeStartedInterceptor(missing.Id))
+                );
+            }
+        );
+        await SeedOldNoteAsync(listed.Id, "listed-tenant");
+        await SeedOldNoteAsync(missing.Id, "missing-tenant");
+
+        var occurrence = (await DatabaseNowAsync()).AddSeconds(-1);
+        await Record.ExceptionAsync(() => GetWorker(host).RunIterationAsync(occurrence, dryRun: false, CancellationToken.None));
+
+        (await LoadScheduledRunsAsync(missing.Id)).Should().BeEmpty();
+        (await NoteExistsAsync("missing-tenant")).Should().BeTrue();
+    }
+
+    /// <summary>
+    /// Releases every session lock just before <paramref name="tenantId"/>'s Started row is
+    /// inserted, on the same session and inside its transaction.
+    /// </summary>
+    private sealed class DropLocksBeforeStartedInterceptor(Guid tenantId) : DbCommandInterceptor
+    {
+        public override async ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<int> result,
+            CancellationToken cancellationToken = default
+        )
+        {
+            if (
+                command.CommandText.Contains("\"StartedAt\", \"Status\"", StringComparison.Ordinal)
+                && command.Parameters.Contains("tenantId")
+                && command.Parameters["tenantId"].Value is Guid id
+                && id == tenantId
+            )
+            {
+                await using var unlock = command.Connection!.CreateCommand();
+                unlock.Transaction = command.Transaction;
+                unlock.CommandText = "SELECT pg_catalog.pg_advisory_unlock_all()";
+                await unlock.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            return result;
+        }
+    }
+
+    [Fact]
     public async Task An_Empty_Source_With_Tenanted_Data_Records_A_Failed_Run_Per_Tenant()
     {
         await using var database = await UseTemporaryDatabaseAsync();
@@ -929,6 +1136,204 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
             && entry.Message.Contains("empty tenant ID")
             && entry.Message.Contains(typeof(Note).FullName!)
         );
+    }
+
+    [Fact]
+    public async Task A_Missing_Tenant_Whose_Rows_Are_All_Retired_Is_Not_Refused()
+    {
+        // An offboarded customer whose rows are all soft-deleted or anonymised needs no
+        // context: no sweep can change them again, so it needs no place in the source.
+        await using var database = await UseTemporaryDatabaseAsync();
+        var listed = CreateTenant();
+        var missing = CreateTenant();
+        using var host = BuildHost(
+            CreateSettings(ConnectionString, schedule: "0 0 0 1 1 *", dryRun: false, killSwitch: false),
+            listed,
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
+                services.AddSingleton<IRetentionTenantSource>(new StaticTenantSource(listed));
+            }
+        );
+        await SeedOldNoteAsync(listed.Id, "retired-listed");
+        await SeedSoftDeleteRecordAsync(missing.Id, deleted: true);
+        await SeedAnonymisedContactAsync(missing.Id, anonymised: true);
+
+        var outcome = await GetWorker(host).RunIterationAsync(
+            (await DatabaseNowAsync()).AddSeconds(-1),
+            dryRun: false,
+            CancellationToken.None
+        );
+
+        outcome.Should().Be(OccurrenceOutcome.Settled);
+        (await LoadScheduledRunsAsync(missing.Id)).Should().BeEmpty();
+        (await NoteExistsAsync("retired-listed")).Should().BeFalse();
+    }
+
+    public enum LiveRowCase
+    {
+        SoftDeleteNotYetDue,
+        AnonymiseUnderActiveHold,
+        RetiredBesideLive,
+    }
+
+    [Theory]
+    [InlineData(LiveRowCase.SoftDeleteNotYetDue)]
+    [InlineData(LiveRowCase.AnonymiseUnderActiveHold)]
+    [InlineData(LiveRowCase.RetiredBesideLive)]
+    public async Task A_Missing_Tenant_Still_Owning_Rows_A_Sweep_Could_Change_Is_Refused(LiveRowCase liveRow)
+    {
+        // Held and not-yet-due rows still count: a sweep acts on them once the hold lapses or
+        // the anchor passes the cutoff, and only the tenant's own rule says when that is.
+        await using var database = await UseTemporaryDatabaseAsync();
+        var listed = CreateTenant();
+        var missing = CreateTenant();
+        using var host = BuildHost(
+            CreateSettings(ConnectionString, schedule: "0 0 0 1 1 *", dryRun: false, killSwitch: false),
+            listed,
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
+                services.AddSingleton<IRetentionTenantSource>(new StaticTenantSource(listed));
+            }
+        );
+        switch (liveRow)
+        {
+            case LiveRowCase.SoftDeleteNotYetDue:
+                await SeedSoftDeleteRecordAsync(missing.Id, deleted: false, createdAt: DateTimeOffset.UtcNow);
+                break;
+            case LiveRowCase.AnonymiseUnderActiveHold:
+                var heldId = await SeedAnonymisedContactAsync(missing.Id, anonymised: false);
+                await using (var scope = host.Host.Services.CreateAsyncScope())
+                {
+                    await scope.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>().CreateAsync(
+                        new RetentionHoldRequest(
+                            Guid.NewGuid(),
+                            RetentionEntityIdentity.For<AnonymisedContact>(),
+                            heldId.ToString(),
+                            missing.Id,
+                            "coverage-hold",
+                            (await DatabaseNowAsync()).AddDays(-1)
+                        ),
+                        CancellationToken.None
+                    );
+                }
+                break;
+            case LiveRowCase.RetiredBesideLive:
+                await SeedSoftDeleteRecordAsync(missing.Id, deleted: true);
+                await SeedSoftDeleteRecordAsync(missing.Id, deleted: false);
+                break;
+        }
+
+        var outcome = await GetWorker(host).RunIterationAsync(
+            (await DatabaseNowAsync()).AddSeconds(-1),
+            dryRun: false,
+            CancellationToken.None
+        );
+
+        outcome.Should().Be(OccurrenceOutcome.Pending);
+        var refused = (await LoadScheduledRunsAsync(missing.Id)).Should().ContainSingle().Subject;
+        refused.Status.Should().Be(SweepRunStatus.Failed);
+        refused.Error.Should().Contain("code=cohort:tenant-not-in-source");
+    }
+
+    [Fact]
+    public async Task A_Purge_Capable_Category_Counts_Rows_Already_Retired_By_Another_Strategy()
+    {
+        // Some tenant's rule may purge the category, so a soft-deleted row is still live data
+        // a sweep could act on, and only the missing tenant's own rule could say otherwise.
+        await using var database = await UseTemporaryDatabaseAsync();
+        var listed = CreateTenant();
+        var missing = CreateTenant();
+        using var host = BuildHost(
+            CreateSettings(ConnectionString, schedule: "0 0 0 1 1 *", dryRun: false, killSwitch: false),
+            listed,
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider>(new RedeclaringRuleProvider(
+                    "soft-delete",
+                    [Strategy.SoftDelete, Strategy.Purge],
+                    resolved: null
+                ));
+                services.AddSingleton<IRetentionTenantSource>(new StaticTenantSource(listed));
+            }
+        );
+        await SeedSoftDeleteRecordAsync(missing.Id, deleted: true);
+
+        var outcome = await GetWorker(host).RunIterationAsync(
+            (await DatabaseNowAsync()).AddSeconds(-1),
+            dryRun: false,
+            CancellationToken.None
+        );
+
+        outcome.Should().Be(OccurrenceOutcome.Pending);
+        (await LoadScheduledRunsAsync(missing.Id)).Should().ContainSingle()
+            .Which.Should().Match<(SweepRunStatus Status, DateTimeOffset StartedAt, string? Error)>(
+                run => run.Status == SweepRunStatus.Failed && run.Error!.Contains("code=cohort:tenant-not-in-source")
+            );
+    }
+
+    [Fact]
+    public async Task An_Exempt_Only_Category_Never_Counts()
+    {
+        await using var database = await UseTemporaryDatabaseAsync();
+        var listed = CreateTenant();
+        var missing = CreateTenant();
+        using var host = BuildHost(
+            CreateSettings(ConnectionString, schedule: "0 0 0 1 1 *", dryRun: false, killSwitch: false),
+            listed,
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider>(new RedeclaringRuleProvider(
+                    "short-lived",
+                    [Strategy.Exempt],
+                    resolved: new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Exempt)
+                ));
+                services.AddSingleton<IRetentionTenantSource>(new StaticTenantSource(listed));
+            }
+        );
+        await SeedOldNoteAsync(listed.Id, "exempt-listed");
+        await SeedOldNoteAsync(missing.Id, "exempt-missing");
+
+        var outcome = await GetWorker(host).RunIterationAsync(
+            (await DatabaseNowAsync()).AddSeconds(-1),
+            dryRun: false,
+            CancellationToken.None
+        );
+
+        outcome.Should().Be(OccurrenceOutcome.Settled);
+        (await LoadScheduledRunsAsync(missing.Id)).Should().BeEmpty();
+        (await NoteExistsAsync("exempt-listed")).Should().BeTrue();
+        (await NoteExistsAsync("exempt-missing")).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Retired_Rows_Under_An_Empty_Tenant_Id_Log_Nothing()
+    {
+        await using var database = await UseTemporaryDatabaseAsync();
+        var tenant = CreateTenant();
+        var log = new WorkerLogProvider();
+        using var host = BuildHost(
+            CreateSettings(ConnectionString, schedule: "0 0 0 1 1 *", dryRun: false, killSwitch: false),
+            tenant,
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
+                services.AddSingleton<ILoggerProvider>(log);
+            }
+        );
+        await SeedOldNoteAsync(tenant.Id, "retired-empty-real-tenant");
+        await SeedSoftDeleteRecordAsync(Guid.Empty, deleted: true);
+
+        var outcome = await GetWorker(host).RunIterationAsync(
+            (await DatabaseNowAsync()).AddSeconds(-1),
+            dryRun: false,
+            CancellationToken.None
+        );
+
+        outcome.Should().Be(OccurrenceOutcome.Settled);
+        (await NoteExistsAsync("retired-empty-real-tenant")).Should().BeFalse();
+        log.Entries.Should().NotContain(entry => entry.Message.Contains("empty tenant ID"));
     }
 
     [Fact]
@@ -1267,6 +1672,53 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         await db.SaveChangesAsync();
     }
 
+    /// <summary>An old row the soft-delete sweep would act on, or one it already retired.</summary>
+    private async Task SeedSoftDeleteRecordAsync(Guid tenantId, bool deleted, DateTimeOffset? createdAt = null)
+    {
+        var options = new DbContextOptionsBuilder<SampleDbContext>()
+            .UseNpgsql(ConnectionString)
+            .Options;
+
+        await using var db = new SampleDbContext(options);
+        db.SoftDeleteRecords.Add(
+            new SoftDeleteRecord
+            {
+                Id = Guid.NewGuid(),
+                TenantId = tenantId,
+                CreatedAt = createdAt ?? DateTimeOffset.UtcNow.AddDays(-120),
+                Body = deleted ? "retired" : "live",
+                IsDeleted = deleted,
+                DeletedAt = deleted ? DateTimeOffset.UtcNow.AddDays(-60) : null,
+            }
+        );
+        await db.SaveChangesAsync();
+    }
+
+    /// <summary>An old contact the anonymise sweep would act on, or one it already scrubbed.</summary>
+    private async Task<Guid> SeedAnonymisedContactAsync(Guid tenantId, bool anonymised)
+    {
+        var options = new DbContextOptionsBuilder<SampleDbContext>()
+            .UseNpgsql(ConnectionString)
+            .Options;
+
+        await using var db = new SampleDbContext(options);
+        var id = Guid.NewGuid();
+        db.AnonymisedContacts.Add(
+            new AnonymisedContact
+            {
+                Id = id,
+                TenantId = tenantId,
+                CreatedAt = DateTimeOffset.UtcNow.AddDays(-120),
+                EmailAddress = anonymised ? null : "contact@example.com",
+                GivenName = anonymised ? "" : "Ada",
+                Surname = anonymised ? "[redacted]" : "Lovelace",
+                AnonymisedAt = anonymised ? DateTimeOffset.UtcNow.AddDays(-60) : null,
+            }
+        );
+        await db.SaveChangesAsync();
+        return id;
+    }
+
     private async Task<bool> NoteExistsAsync(string body)
     {
         var options = new DbContextOptionsBuilder<SampleDbContext>()
@@ -1446,6 +1898,36 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         }
     }
 
+    /// <summary>
+    /// Holds the first scope run as <paramref name="tenantId"/> (a worker's pass scope) before
+    /// its work starts, until released; every other scope just runs its work.
+    /// </summary>
+    private sealed class PassGateScope(Guid tenantId) : IRetentionExecutionScope
+    {
+        private readonly TaskCompletionSource entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource released = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int gated;
+
+        public Task Entered => entered.Task;
+
+        public void Release() => released.TrySetResult();
+
+        public async Task RunAsync(RetentionExecutionContext context, Func<Task> work, CancellationToken ct)
+        {
+            if (
+                context is RetentionExecutionContext.Tenant tenant
+                && tenant.TenantId == tenantId
+                && Interlocked.Exchange(ref gated, 1) == 0
+            )
+            {
+                entered.TrySetResult();
+                await released.Task.WaitAsync(ct);
+            }
+
+            await work();
+        }
+    }
+
     private sealed class FirstNoteProgressObserver : IRetentionAuditObserver
     {
         private int fired;
@@ -1552,6 +2034,27 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
 
             return inner.ResolveAsync(context, ct);
         }
+    }
+
+    /// <summary>
+    /// The sample's rules, with <paramref name="category"/> declaring <paramref name="strategies"/>
+    /// instead, and resolving to <paramref name="resolved"/> when given.
+    /// </summary>
+    private sealed class RedeclaringRuleProvider(
+        string category,
+        IReadOnlyList<Strategy> strategies,
+        RetentionRule? resolved
+    ) : IRetentionRuleProvider
+    {
+        private readonly SampleRetentionRuleProvider inner = new();
+
+        public RetentionCategoryCapabilities? GetCapabilities(string requested) =>
+            requested == category ? new RetentionCategoryCapabilities(strategies) : inner.GetCapabilities(requested);
+
+        public Task<RetentionRule?> ResolveAsync(RetentionResolutionContext context, CancellationToken ct) =>
+            context.Category == category && resolved is not null
+                ? Task.FromResult<RetentionRule?>(resolved)
+                : inner.ResolveAsync(context, ct);
     }
 
     private sealed class WorkerTestHost(IHost host, IConfigurationRoot configuration) : IDisposable

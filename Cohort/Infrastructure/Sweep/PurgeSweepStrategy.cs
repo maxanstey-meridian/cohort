@@ -16,8 +16,6 @@ internal sealed class PurgeSweepStrategy(
 {
     public override Strategy HandlesStrategy => Strategy.Purge;
 
-    protected override string EligibilitySql(RetentionEntry entry) => "";
-
     protected override SweepMutation CreateMutation(SweepScope scope) =>
         new($"DELETE FROM {PostgreSqlIdentifier.Format(scope.Entry.Table)} AS target", static (_, _) => { });
 }

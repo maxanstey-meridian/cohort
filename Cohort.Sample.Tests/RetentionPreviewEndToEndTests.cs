@@ -207,7 +207,6 @@ public sealed class RetentionPreviewEndToEndTests(PostgresFixture fixture)
                 .RunAsync(
                     tenant,
                     asOf,
-                    SweepTriggerKind.Manual,
                     SweepEntityScope.TenantedOnly,
                     dryRun: true
                 );

@@ -20,7 +20,8 @@ namespace Cohort.Infrastructure;
 /// trail from Started to a terminal event, per-entity execution, and the result counts.
 /// With <paramref name="callerCommit"/> the run joins the transaction open on
 /// <paramref name="db"/> instead: it commits nothing, and observers hear of its events only
-/// once the caller commits.
+/// once the caller commits. A scheduled pass passes the <paramref name="passLockKey"/> it holds
+/// on the same session, which every batch also checks is still held before it commits.
 /// </summary>
 internal sealed class RetentionRun(
     DbContext db,
@@ -29,7 +30,8 @@ internal sealed class RetentionRun(
     ILogger logger,
     SweepEvent.Started started,
     int batchSize,
-    CohortCommitInterceptor? callerCommit = null
+    CohortCommitInterceptor? callerCommit = null,
+    long? passLockKey = null
 )
 {
     private const string EntitySavepoint = "cohort_entity";
@@ -46,6 +48,11 @@ internal sealed class RetentionRun(
     private DateTimeOffset? settledAt;
 
     public Guid SweepId => started.SweepId;
+
+    // The session locks an owned run's batches must still hold to commit.
+    private IReadOnlyCollection<long> HeldKeys => passLockKey is { } passKey
+        ? [RetentionRunAdvisoryLock.KeyFor(SweepId), passKey]
+        : [RetentionRunAdvisoryLock.KeyFor(SweepId)];
 
     /// <summary>
     /// Takes the run lock, commits Started, runs <paramref name="body"/>, then settles the
@@ -105,7 +112,7 @@ internal sealed class RetentionRun(
         await RunLockedAsync(
             async () =>
             {
-                await WriteDurableAsync(started, CancellationToken.None);
+                await WriteStartedAsync();
                 var diagnostic = RetentionFailureDiagnostic.Refused(machineCode);
                 logger.LogError(
                     "Cohort {Operation} {SweepId} was refused and settles Failed: {Reason} Diagnostic {DiagnosticId}.",
@@ -160,7 +167,7 @@ internal sealed class RetentionRun(
         {
             // In an owned run Started commits on its own, so a run that later fails still
             // leaves evidence. In the caller's transaction it commits or rolls back with the rest.
-            await WriteDurableAsync(started, CancellationToken.None);
+            await WriteStartedAsync();
             startedPersisted = true;
 
             await body();
@@ -236,9 +243,9 @@ internal sealed class RetentionRun(
                     deferredEvents.RemoveRange(deferredMark, deferredEvents.Count - deferredMark);
                 }
 
-                // Only the run's own cancellation stops the run; any other is this entity's
-                // failure.
-                if (ex is OperationCanceledException && ct.IsCancellationRequested)
+                // Only the run's own cancellation, or the loss of its locks, stops the run; any
+                // other is this entity's failure.
+                if ((ex is OperationCanceledException && ct.IsCancellationRequested) || ex is LockLostException)
                 {
                     throw;
                 }
@@ -547,6 +554,7 @@ internal sealed class RetentionRun(
 
                 if (batchTransaction is not null)
                 {
+                    await EnsureLocksHeldAsync(batchTransaction, ct);
                     await batchTransaction.CommitAsync(ct);
                 }
             }
@@ -589,6 +597,51 @@ internal sealed class RetentionRun(
         else
         {
             counts[index] = count;
+        }
+    }
+
+    /// <summary>
+    /// Commits Started. An owned run commits it only while its session still holds the run's
+    /// locks, so a pass whose session was lost after it re-read the ledger records nothing,
+    /// not even a refusal.
+    /// </summary>
+    private async Task WriteStartedAsync()
+    {
+        if (callerCommit is not null)
+        {
+            await WriteDurableAsync(started, CancellationToken.None);
+            return;
+        }
+
+        using var timeout = new CancellationTokenSource(AuditSettlementTimeout);
+        await using (var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, timeout.Token))
+        {
+            await auditWriter.WriteAsync(started, timeout.Token);
+            await EnsureLocksHeldAsync(transaction, timeout.Token);
+            await transaction.CommitAsync(timeout.Token);
+        }
+
+        await NotifyAsync(started);
+    }
+
+    /// <summary>
+    /// EF reopens a connection whose session was lost (a timeout, a failover) on its next use,
+    /// and the new session holds none of the run's locks: another owner may already be running
+    /// the same work. Checked in the transaction that is about to commit, so the check holds
+    /// until the commit does.
+    /// </summary>
+    private async Task EnsureLocksHeldAsync(IDbContextTransaction transaction, CancellationToken ct)
+    {
+        if (!await RetentionRunAdvisoryLock.HoldsAllAsync(
+                db.Database.GetDbConnection(),
+                transaction.GetDbTransaction(),
+                HeldKeys,
+                ct
+            ))
+        {
+            throw new LockLostException(
+                $"Cohort {operation} {SweepId} lost the session holding its lock, so it commits nothing more."
+            );
         }
     }
 
@@ -660,6 +713,9 @@ internal sealed class RetentionRun(
             logger.LogError(settlementException, "Cohort could not mark {Operation} {SweepId} as terminal.", operation, SweepId);
         }
     }
+
+    /// <summary>A batch found its session no longer holds the run's locks.</summary>
+    private sealed class LockLostException(string message) : InvalidOperationException(message);
 
     internal static string TruncateError(string value)
     {

@@ -21,8 +21,8 @@ namespace Cohort.Infrastructure.Sweep;
 
 /// <summary>
 /// The one SQL pipeline behind every strategy. A <see cref="SweepScope"/> says which rows
-/// are in play; the strategy says which of those it has not yet handled
-/// (<see cref="EligibilitySql"/>) and how it changes one (<see cref="CreateMutation"/>).
+/// are in play; <see cref="SweepEligibilitySql"/> says which of those the strategy has not
+/// yet handled, and the strategy says how it changes one (<see cref="CreateMutation"/>).
 /// Candidates are discovered, entity-locked and row-locked, then mutated in one statement,
 /// or row by row when handlers run or the new values depend on each row. A row an
 /// integrity constraint refuses is blocked rather than failing its batch: the bulk statement
@@ -46,12 +46,6 @@ internal abstract class SweepStrategy(
     private static readonly ConcurrentDictionary<Type, MethodInfo> RowByRowMethods = new();
 
     public abstract Strategy HandlesStrategy { get; }
-
-    /// <summary>
-    /// Predicate over <c>target</c> for rows this strategy has not already handled, or ""
-    /// when every row in scope qualifies.
-    /// </summary>
-    protected abstract string EligibilitySql(RetentionEntry entry);
 
     protected abstract SweepMutation CreateMutation(SweepScope scope);
 
@@ -762,7 +756,7 @@ internal abstract class SweepStrategy(
                 clauses.Add("FALSE");
                 break;
         }
-        if (EligibilitySql(entry) is { Length: > 0 } eligibility)
+        if (SweepEligibilitySql.Predicate(HandlesStrategy, entry) is { Length: > 0 } eligibility)
         {
             clauses.Add(eligibility);
         }

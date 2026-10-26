@@ -88,8 +88,8 @@ to call from a host that never ran Cohort's startup validation.
 ```
 
 `Schedule` is a cron expression evaluated in **UTC**. Leave it `null` and the worker stays
-idle. Sweeps the worker starts are audited as `Scheduled`, and direct `SweepAsync` calls are
-audited as `Manual`.
+idle. Sweeps the worker starts are audited as `Scheduled`, and explicit sweeps (`SweepAsync`
+or `ExecuteAsync`) are always audited as `Manual`.
 
 ### Tenants
 
@@ -115,15 +115,21 @@ public sealed class AllTenants(AppDbContext db) : IRetentionTenantSource
 Each occurrence the worker also checks the source against the data, with one query per
 retained tenanted table:
 
-- A tenant that owns retained rows but isn't returned by the source isn't swept. Without its
-  jurisdiction and tags Cohort could apply a shorter rule. It gets a `Failed` scheduled run
-  with `code=cohort:tenant-not-in-source` instead.
+- A tenant that owns rows a sweep could still act on, but isn't returned by the source, isn't
+  swept. Without its jurisdiction and tags Cohort could apply a shorter rule. It gets a
+  `Failed` scheduled run with `code=cohort:tenant-not-in-source` instead.
+- Rows count when any strategy their category declares could still act on them: every row if
+  the category may purge; otherwise rows not yet soft-deleted or not yet anonymised. Rows of a
+  category that declares only `Exempt` never count. Held rows and rows not yet due count,
+  because the tenant still owns them. A tenant whose remaining rows are all retired (an
+  offboarded customer, say) needs no place in the source.
 - A tenant the source returns more than once with different jurisdictions or tags isn't swept
   either, because Cohort won't guess which context applies. It gets a `Failed` scheduled run
   with `code=cohort:conflicting-tenant-contexts`, and the other tenants still run.
 - An empty source is fine when there's no tenanted data. With tenanted data, each tenant that
-  owns rows gets a `Failed` run as above.
-- No tenant pass can sweep rows whose tenant column holds `Guid.Empty`. The worker logs an
+  owns rows a sweep could still act on gets a `Failed` run as above.
+- No tenant pass can sweep rows a sweep could still act on whose tenant column holds
+  `Guid.Empty`. The worker logs an
   error naming the entity at each occurrence; give those rows their real tenant.
 - These runs reach audit observers as `Started` then `Failed`, like any failed run, so your
   existing alerting sees them. They're retried like any failed pass (see below): until the
@@ -131,7 +137,8 @@ retained tenanted table:
   runs, `OccurrenceRetryDelay` apart, and then the worker's "gave up" error. Fixing the source
   mid-occurrence gets the tenant swept at the next retry.
 - The check reads each retained tenanted table once per iteration, in one scan whatever its
-  indexes, and keeps only the tenants the source didn't return.
+  indexes, and keeps only the tenants the source didn't return and only rows a sweep could
+  still act on.
 
 ### Occurrences
 
@@ -148,10 +155,10 @@ occurrence at or before now. It reads what that occurrence still owes from `swee
   succeeding. Runs the kill switch or a shutdown cancelled don't count. The worker logs an
   error naming the occurrence and the tenants, and leaves them to the next occurrence.
 - Every other pass is **pending**: it has no run yet, a `Failed` or `PartiallyFailed` run, or
-  a run still `Started` whose owner died, which the worker tells by the run's lock being free.
-- A run still `Started` whose owner is alive (it still holds the run's lock, though the worker
-  lock went with a lost session) keeps the occurrence busy: the worker checks again after the
-  delay rather than run the same pass beside it.
+  a run still `Started` whose owner died, which the worker tells by the pass lock being free.
+- Each pass runs under its own advisory lock (install, tenant, dry or real), and re-reads its
+  ledger under it. A pass another replica is running makes the worker check again after the
+  delay; a pass that finished meanwhile isn't rerun.
 - The worker runs only the pending passes, in plan order. Passes that succeeded never rerun,
   so their row handlers don't fire twice. [History pruning](/guides/history-pruning) keeps the
   current occurrence's scheduled runs, so this holds with a short retention too.
@@ -167,10 +174,14 @@ So no occurrence is lost:
 - A replica that died mid-occurrence leaves its unfinished passes pending, including ones it
   never started. A run the row dispatcher recovered as `Failed` is pending too.
 
-Replicas of one install coordinate through a Postgres advisory lock keyed on the install's
-schema-qualified `sweep_run` table, and every scheduled run is written under it. A replica
-that finds the lock taken checks again after the delay, by which time the passes are usually
-complete. Installs in different schemas of one database sweep independently. Occurrences are
+Replicas of one install coordinate through Postgres advisory locks keyed on the install's
+schema-qualified `sweep_run` table. The worker lock only keeps replicas from planning an
+occurrence side by side: a replica that finds it taken checks again after the delay, by which
+time the passes are usually complete. What guarantees one run per pass is the pass lock, held
+on the connection the pass's run writes on, so it holds even when a replica loses its
+worker-lock session (a timeout, a failover) mid-occurrence. `Started` and every batch check that
+the session still holds its locks before they commit, so a pass whose session was lost records
+nothing, or commits nothing more and settles `Failed`. Installs in different schemas of one database sweep independently. Occurrences are
 counted on the database clock, the clock that stamps each run's `StartedAt`, so a replica's
 own clock never decides which occurrence is due.
 
@@ -196,7 +207,9 @@ you register.
 
 - `SweepAsync(tenant, now)` becomes `SweepAsync(tenant)`.
 - `SweepAsync(tenant, now, trigger)` is removed. Use
-  `ExecuteAsync(RetentionSweepRequest.Tenanted(tenant, trigger: ...))`.
+  `ExecuteAsync(RetentionSweepRequest.Tenanted(tenant))`.
+- `RetentionSweepRequest` has no `trigger`: explicit sweeps are always `Manual`, and only the
+  worker writes `Scheduled` runs.
 - `RetentionSweepRequest.At` is optional and defaults to the database clock. A real (non-dry)
   sweep refuses a later time; see [Which "today"](#which-today).
 - `RetentionPreviewRequest.At` and `PreviewAsync`'s time are optional and default to the
@@ -210,6 +223,9 @@ you register.
   records a `Failed` scheduled run for each tenant your source misses or returns with
   conflicting contexts. See [Occurrences](#occurrences) and [Tenants](#tenants).
 - `KillSwitch: true` now cancels the pass in progress instead of letting it finish.
+- Don't run an older worker beside this one: an older build doesn't take the pass lock, so
+  the two could run the same pass. Turn the kill switch on, or scale to one replica, while
+  the rollout runs.
 :::
 
 ## Before you start the host

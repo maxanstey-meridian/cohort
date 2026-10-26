@@ -26,9 +26,6 @@ internal sealed class SoftDeleteSweepStrategy(
         }
     }
 
-    protected override string EligibilitySql(RetentionEntry entry) =>
-        $"target.{PostgreSqlIdentifier.Quote(entry.SoftDelete!.IsDeletedColumn)} = FALSE";
-
     protected override SweepMutation CreateMutation(SweepScope scope)
     {
         var entry = scope.Entry;

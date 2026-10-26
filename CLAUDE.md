@@ -39,8 +39,10 @@ Cohort/                 — the library. No tests of its own.
 ├── Domain/             — pure types. Depends on NOTHING (not even EF Core).
 ├── Application/        — ports + orchestration. Depends on Domain only.
 ├── Infrastructure/     — EF defaults, raw SQL adapters. Depends on Application + Domain.
-│   ├── Sweep/          — SweepStrategy (one SQL pipeline for every strategy, driven by SweepScope), Purge/SoftDelete/AnonymiseSweepStrategy
+│   ├── Sweep/          — SweepStrategy (one SQL pipeline for every strategy, driven by SweepScope), Purge/SoftDelete/AnonymiseSweepStrategy, SweepEligibilitySql
 │   ├── Holds/          — EfRetentionHoldsRepository, RetentionHoldSql
+│   ├── Handlers/       — RowHandlerQueueSql (the row-handler queue's statements)
+│   ├── RetentionRunLedgerSql, HistoryPruningSql — the worker's ledger, abandoned-run recovery, history pruning
 │   ├── Audit/          — EfRetentionAuditWriter
 │   └── Migrations/     — CohortModelBuilder (ConfigureCohortTables extension)
 └── Hosting/            — CohortOptions, RetentionWorker, RetentionRowDispatcher, AddCohort<TContext>()
@@ -58,7 +60,7 @@ The dependency rule is enforced by `using` statements, not project boundaries. R
 - **`Domain/`** depends on nothing. If a type needs `using Microsoft.EntityFrameworkCore;`, it isn't Domain. Pure functions, attributes, value records.
 - **`Application/`** depends on Domain only. Defines ports as interfaces. Orchestrates. May reference `DbContext` as a port-shaped dependency (it's the host's "here is my model" contract), but never `DbSet<T>.FromSqlRaw`, never raw SQL, never Npgsql-specific types.
 - **`Infrastructure/`** depends on Application + Domain. Implements ports. Owns raw SQL, EF query expressions, provider-specific types. Contains sweep strategies, holds repository, audit writer, and model builder.
-- **`Hosting/`** depends on Application + Infrastructure. The DI entry point (`AddCohort<TContext>`), options, and the background services (the scheduled worker and the row-handler dispatcher). Consumer-facing. Every `BackgroundService` lives here; ArchUnitNET enforces it.
+- **`Hosting/`** depends on Application + Infrastructure. The DI entry point (`AddCohort<TContext>`), options, and the background services (the scheduled worker and the row-handler dispatcher). Consumer-facing. Every `BackgroundService` lives here; ArchUnitNET enforces it. Hosting runs no SQL of its own; `ArchitectureBoundaryTests.Hosting_Runs_No_Sql_Of_Its_Own` enforces it.
 
 **Layer placement test**: if a type has no dependency on a port, an external system's shape, or a framework — it's Domain. If it does — it's Application (defines/orchestrates the port) or Infrastructure (implements one).
 

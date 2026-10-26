@@ -42,10 +42,13 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
             "Cohort/Infrastructure/RetentionRunAdvisoryLock.cs",
             "Cohort/Infrastructure/RetentionRuntimeReadinessValidator.cs",
             "Cohort/Infrastructure/Sweep/SweepStrategy.cs",
-            "Cohort/Hosting/RetentionRowDispatcher.cs",
+            "Cohort/Infrastructure/Handlers/RowHandlerQueueSql.cs",
+            "Cohort/Infrastructure/RetentionRunLedgerSql.cs",
+            "Cohort/Infrastructure/HistoryPruningSql.cs",
+            "Cohort/Infrastructure/RetentionTenantCoverage.cs",
         ];
         var unqualified = new Regex(
-            @"(?<![\w.])(count|statement_timestamp|hashtextextended|unnest|pg_(?:advisory|try_advisory|get_expr)[a-z_]*)\s*\(",
+            @"(?<![\w.])(count|cardinality|bool_or|array_agg|statement_timestamp|hashtextextended|unnest|pg_(?:advisory|try_advisory|get_expr|backend_pid)[a-z_]*)\s*\(",
             RegexOptions.IgnoreCase | RegexOptions.CultureInvariant
         );
 

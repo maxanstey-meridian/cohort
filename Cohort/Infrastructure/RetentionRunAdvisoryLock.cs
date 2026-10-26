@@ -6,9 +6,9 @@ using System.Text;
 namespace Cohort.Infrastructure;
 
 /// <summary>
-/// Session-level PostgreSQL advisory locks that mark a live run, worker or row-handler
-/// delivery. They live as long as the session that took them, so they need direct connections
-/// or session-mode pooling: a transaction-mode pooler hands the session to someone else, and
+/// Session-level PostgreSQL advisory locks that mark a live run, worker, scheduled pass or
+/// row-handler delivery. They live as long as the session that took them, so they need direct
+/// connections or session-mode pooling: a transaction-mode pooler hands the session to someone else, and
 /// Npgsql multiplexing runs each command outside a transaction on whichever session is free
 /// (readiness refuses a multiplexed connection).
 /// </summary>
@@ -26,27 +26,26 @@ internal static class RetentionRunAdvisoryLock
     /// the key is derived from the install's schema-qualified <c>sweep_run</c> table: installs
     /// in different schemas sweep independently, replicas of one install share the key.
     /// </summary>
-    internal static long WorkerKeyFor(RelationalObjectName sweepRun)
-    {
-        Span<byte> hash = stackalloc byte[SHA256.HashSizeInBytes];
-        SHA256.HashData(Encoding.UTF8.GetBytes($"cohort-worker:{PostgreSqlIdentifier.Format(sweepRun)}"), hash);
-        return BinaryPrimitives.ReadInt64BigEndian(hash);
-    }
+    internal static long WorkerKeyFor(RelationalObjectName sweepRun) =>
+        HashKey($"cohort-worker:{PostgreSqlIdentifier.Format(sweepRun)}");
+
+    /// <summary>
+    /// The key a scheduled pass holds on its own connection from its ledger re-read to its
+    /// settlement: one per install (the schema-qualified <c>sweep_run</c> table, as for
+    /// <see cref="WorkerKeyFor"/>), tenant (<see cref="Guid.Empty"/> for the tenantless pass)
+    /// and kind, matching the ledger's identity of a pass. The occurrence is left out, so a
+    /// straggler still running one occurrence's pass also holds off the next one's.
+    /// </summary>
+    internal static long ScheduledPassKeyFor(RelationalObjectName sweepRun, Guid tenantId, bool dryRun) =>
+        HashKey($"cohort-scheduled-pass:{PostgreSqlIdentifier.Format(sweepRun)}:{tenantId:D}:{(dryRun ? "dry" : "real")}");
 
     /// <summary>
     /// The key a dispatcher holds while it runs one row-handler status. Status ids are only
     /// unique within one install's <c>sweep_row_handler_status</c> table, so the key is derived
     /// from the schema-qualified table as well, the same way as <see cref="WorkerKeyFor"/>.
     /// </summary>
-    internal static long RowHandlerKeyFor(RelationalObjectName statusTable, long statusId)
-    {
-        Span<byte> hash = stackalloc byte[SHA256.HashSizeInBytes];
-        SHA256.HashData(
-            Encoding.UTF8.GetBytes($"cohort-row-handler:{PostgreSqlIdentifier.Format(statusTable)}:{statusId}"),
-            hash
-        );
-        return BinaryPrimitives.ReadInt64BigEndian(hash);
-    }
+    internal static long RowHandlerKeyFor(RelationalObjectName statusTable, long statusId) =>
+        HashKey($"cohort-row-handler:{PostgreSqlIdentifier.Format(statusTable)}:{statusId}");
 
     internal static Task AcquireAsync(DbConnection connection, long key, CancellationToken ct) =>
         ExecuteAsync(connection, "SELECT pg_catalog.pg_advisory_lock(@key)", key, ct);
@@ -94,6 +93,42 @@ internal static class RetentionRunAdvisoryLock
             "SELECT pg_catalog.pg_advisory_unlock_all()"
         );
         await command.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>
+    /// Whether the connection's session holds every key. Asked inside a transaction just
+    /// before it commits, it is exact rather than check-then-act: a session keeps its session
+    /// locks until it unlocks them or ends, and ending aborts the transaction. A connection EF
+    /// silently reopened after its session was lost holds none of them.
+    /// </summary>
+    internal static async Task<bool> HoldsAllAsync(
+        DbConnection connection,
+        DbTransaction? transaction,
+        IReadOnlyCollection<long> keys,
+        CancellationToken ct
+    )
+    {
+        // A bigint advisory key is held as classid (high 32 bits) and objid (low 32 bits).
+        await using var command = new SqlParams { ["keys"] = keys.ToArray() }.CreateCommand(
+            connection,
+            transaction,
+            """
+            SELECT pg_catalog.count(*) = pg_catalog.cardinality(@keys)
+            FROM pg_catalog.pg_locks AS l
+            JOIN pg_catalog.unnest(@keys) AS k(key)
+              ON l.classid = ((k.key >> 32) & 4294967295)::oid AND l.objid = (k.key & 4294967295)::oid
+            WHERE l.locktype = 'advisory' AND l.objsubid = 1 AND l.granted
+              AND l.pid = pg_catalog.pg_backend_pid()
+            """
+        );
+        return await command.ExecuteScalarAsync(ct) is true;
+    }
+
+    private static long HashKey(string name)
+    {
+        Span<byte> hash = stackalloc byte[SHA256.HashSizeInBytes];
+        SHA256.HashData(Encoding.UTF8.GetBytes(name), hash);
+        return BinaryPrimitives.ReadInt64BigEndian(hash);
     }
 
     private static async Task<object?> ExecuteAsync(DbConnection connection, string sql, long key, CancellationToken ct)

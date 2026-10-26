@@ -25,32 +25,84 @@ internal sealed class RetentionSweepEngine(
         sweepStrategies.ToDictionary(strategy => strategy.HandlesStrategy);
 
     /// <summary>
-    /// Runs one audited sweep over the scope's entities. A dry run counts what a sweep would
-    /// change and writes the same audit trail without mutating anything: the audited
-    /// counterpart of <see cref="IRetentionPreview"/>, which writes no audit at all.
-    /// <paramref name="at"/> null sweeps as of the database clock; a real sweep refuses a
-    /// later time before any run exists.
+    /// Runs one audited, <see cref="SweepTriggerKind.Manual"/> sweep over the scope's entities.
+    /// A dry run counts what a sweep would change and writes the same audit trail without
+    /// mutating anything: the audited counterpart of <see cref="IRetentionPreview"/>, which
+    /// writes no audit at all. <paramref name="at"/> null sweeps as of the database clock; a
+    /// real sweep refuses a later time before any run exists.
     /// </summary>
     public async Task<RetentionSweepResult> RunAsync(
         TenantContext tenant,
         DateTimeOffset? at,
-        SweepTriggerKind trigger,
         SweepEntityScope scope,
         bool dryRun,
         CancellationToken ct = default
     )
     {
         await readinessValidator.ValidateAsync(ct);
-        var (now, startedAt) = await DatabaseClock.ResolveRunTimeAsync(db, at, dryRun, ct);
+        return await RunSweepAsync(tenant, at, SweepTriggerKind.Manual, scope, dryRun, passLockKey: null, ct);
+    }
 
-        var run = new RetentionRun(
-            db,
-            auditWriter,
-            auditNotifier,
-            logger,
-            new SweepEvent.Started(Guid.NewGuid(), startedAt, trigger, dryRun, tenant.Id),
-            options.SweepBatchSize
+    /// <summary>
+    /// Runs one scheduled pass under its pass lock, unless another replica holds it
+    /// (<see cref="ScheduledPassOutcome.Busy"/>) or the ledger, re-read under it, says the pass
+    /// succeeded or ran out of attempts meanwhile
+    /// (<see cref="ScheduledPassOutcome.AlreadySettled"/>).
+    /// The only way a <see cref="SweepTriggerKind.Scheduled"/> sweep is written.
+    /// </summary>
+    public async Task<(ScheduledPassOutcome Outcome, RetentionSweepResult? Result)> RunScheduledPassAsync(
+        TenantContext tenant,
+        SweepEntityScope scope,
+        ScheduledPass pass,
+        CancellationToken ct
+    )
+    {
+        RetentionSweepResult? result = null;
+        var outcome = await RunUnderPassLockAsync(
+            pass,
+            async passLockKey => result = await RunSweepAsync(tenant, null, SweepTriggerKind.Scheduled, scope, pass.DryRun, passLockKey, ct),
+            ct
         );
+        return (outcome, result);
+    }
+
+    /// <summary>
+    /// Records a scheduled pass the worker refused as a run that settles Failed with the
+    /// refusal's machine code, so the ledger and audit observers show the tenant wasn't swept
+    /// and why. Nothing is resolved or mutated. Guarded by the pass lock like a sweep pass, so
+    /// two replicas can't both record it and use up two attempts.
+    /// </summary>
+    public Task<ScheduledPassOutcome> RecordRefusedPassAsync(
+        RetentionPassRefusal refusal,
+        ScheduledPass pass,
+        CancellationToken ct
+    ) =>
+        RunUnderPassLockAsync(
+            pass,
+            async passLockKey =>
+            {
+                var startedAt = await DatabaseClock.NowAsync(db, ct);
+                var run = CreateRun(
+                    new SweepEvent.Started(Guid.NewGuid(), startedAt, SweepTriggerKind.Scheduled, pass.DryRun, pass.TenantId),
+                    passLockKey
+                );
+                await run.ExecuteRefusalAsync(refusal.MachineCode(), refusal.Describe(pass.TenantId), ct);
+            },
+            ct
+        );
+
+    private async Task<RetentionSweepResult> RunSweepAsync(
+        TenantContext tenant,
+        DateTimeOffset? at,
+        SweepTriggerKind trigger,
+        SweepEntityScope scope,
+        bool dryRun,
+        long? passLockKey,
+        CancellationToken ct
+    )
+    {
+        var (now, startedAt) = await DatabaseClock.ResolveRunTimeAsync(db, at, dryRun, ct);
+        var run = CreateRun(new SweepEvent.Started(Guid.NewGuid(), startedAt, trigger, dryRun, tenant.Id), passLockKey);
         await run.ExecuteAsync(
             async () => await run.RunEntitiesAsync(await BuildExecutionPlanAsync(tenant, now, scope, run, ct), strategies, ct),
             ct
@@ -58,28 +110,71 @@ internal sealed class RetentionSweepEngine(
         return run.CreateSweepResult();
     }
 
+    private RetentionRun CreateRun(SweepEvent.Started started, long? passLockKey) =>
+        new(db, auditWriter, auditNotifier, logger, started, options.SweepBatchSize, passLockKey: passLockKey);
+
     /// <summary>
-    /// Records a scheduled pass the worker refused as a run that settles Failed with the
-    /// refusal's machine code, so the ledger and audit observers show the tenant wasn't swept
-    /// and why. Nothing is resolved or mutated.
+    /// Holds the pass's lock on this scope's connection, the one its run writes on, and re-reads
+    /// the pass's ledger under it before <paramref name="run"/> starts. Every other replica's
+    /// run of the pass would hold the same lock, so a run the ledger still shows Started has
+    /// lost its owner, and a pass that settled while this replica waited isn't rerun. The lock
+    /// is only ever tried, never waited on, so it can't deadlock with the run or worker locks.
     /// </summary>
-    public async Task RecordRefusedPassAsync(
-        Guid tenantId,
-        RetentionPassRefusal refusal,
-        bool dryRun,
+    private async Task<ScheduledPassOutcome> RunUnderPassLockAsync(
+        ScheduledPass pass,
+        Func<long, Task> run,
         CancellationToken ct
     )
     {
-        var startedAt = await DatabaseClock.NowAsync(db, ct);
-        var run = new RetentionRun(
-            db,
-            auditWriter,
-            auditNotifier,
-            logger,
-            new SweepEvent.Started(Guid.NewGuid(), startedAt, SweepTriggerKind.Scheduled, dryRun, tenantId),
-            options.SweepBatchSize
-        );
-        await run.ExecuteRefusalAsync(refusal.MachineCode(), refusal.Describe(tenantId), ct);
+        // Readiness refuses a multiplexed connection, which can't hold a session lock.
+        await readinessValidator.ValidateAsync(ct);
+        var sweepRun = CohortStoreTables.FromModel(db.Model).SweepRun;
+        var passLockKey = RetentionRunAdvisoryLock.ScheduledPassKeyFor(sweepRun, pass.TenantId, pass.DryRun);
+        await db.Database.OpenConnectionAsync(ct);
+        var connection = db.Database.GetDbConnection();
+        var locked = false;
+        Exception? primaryException = null;
+        try
+        {
+            // Not cancellable: a try never waits, and a cancelled command the server granted
+            // would leave the lock unreleased on a pooled session.
+            locked = await RetentionRunAdvisoryLock.TryAcquireAsync(connection, passLockKey, CancellationToken.None);
+            if (!locked)
+            {
+                return ScheduledPassOutcome.Busy;
+            }
+
+            var ledger = await RetentionRunLedgerSql.LoadOccurrenceAsync(
+                connection,
+                sweepRun,
+                pass.Occurrence,
+                pass.DryRun,
+                pass.TenantId,
+                ct
+            );
+            if (!ledger.IsPending(pass.TenantId, pass.MaxAttempts))
+            {
+                return ScheduledPassOutcome.AlreadySettled;
+            }
+
+            await run(passLockKey);
+            return ScheduledPassOutcome.Ran;
+        }
+        catch (Exception ex)
+        {
+            primaryException = ex;
+            throw;
+        }
+        finally
+        {
+            await OperationalConnectionCleanup.RunAsync(
+                connection,
+                locked ? cleanupToken => RetentionRunAdvisoryLock.ReleaseAsync(connection, passLockKey, cleanupToken) : null,
+                _ => db.Database.CloseConnectionAsync(),
+                primaryException,
+                logger
+            );
+        }
     }
 
     private async Task<IReadOnlyList<SweepScope>> BuildExecutionPlanAsync(
@@ -122,6 +217,25 @@ internal sealed class RetentionSweepEngine(
 
         return plan;
     }
+}
+
+/// <summary>
+/// One scheduled pass of an occurrence: its tenant (<see cref="Guid.Empty"/> for the
+/// tenantless pass), its kind, and the attempts it may use.
+/// </summary>
+internal sealed record ScheduledPass(Guid TenantId, DateTimeOffset Occurrence, bool DryRun, int MaxAttempts);
+
+/// <summary>What became of a scheduled pass.</summary>
+internal enum ScheduledPassOutcome
+{
+    /// <summary>The pass ran (or recorded its refusal), whatever the run's status.</summary>
+    Ran,
+
+    /// <summary>The ledger, re-read under the pass lock, shows it succeeded or used up.</summary>
+    AlreadySettled,
+
+    /// <summary>Another replica holds the pass lock: it is running this pass.</summary>
+    Busy,
 }
 
 /// <summary>

@@ -92,22 +92,6 @@ public sealed class DomainInvariantTests
     }
 
     [Fact]
-    public void A_Sweep_Request_Cannot_Be_An_Erasure()
-    {
-        var tenanted = () =>
-            RetentionSweepRequest.Tenanted(
-                new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
-                DateTimeOffset.UnixEpoch,
-                SweepTriggerKind.Erasure
-            );
-        var tenantless = () =>
-            RetentionSweepRequest.Tenantless(DateTimeOffset.UnixEpoch, SweepTriggerKind.Erasure);
-
-        tenanted.Should().Throw<ArgumentException>().WithParameterName("trigger");
-        tenantless.Should().Throw<ArgumentException>().WithParameterName("trigger");
-    }
-
-    [Fact]
     public void An_Erasure_Request_Needs_A_Defined_Transaction_Mode_And_Keeps_Its_Time_In_Utc()
     {
         var scope = new ErasureScope("user", Guid.NewGuid());

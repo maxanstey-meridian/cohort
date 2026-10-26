@@ -89,8 +89,8 @@ static Cohort.Application.RetentionErasureRequest.TenantlessRequest.operator !=(
 static Cohort.Application.RetentionErasureRequest.TenantlessRequest.operator ==(Cohort.Application.RetentionErasureRequest.TenantlessRequest? left, Cohort.Application.RetentionErasureRequest.TenantlessRequest? right) -> bool
 static Cohort.Application.RetentionErasureRequest.operator !=(Cohort.Application.RetentionErasureRequest? left, Cohort.Application.RetentionErasureRequest? right) -> bool
 static Cohort.Application.RetentionErasureRequest.operator ==(Cohort.Application.RetentionErasureRequest? left, Cohort.Application.RetentionErasureRequest? right) -> bool
-static Cohort.Application.RetentionSweepRequest.Tenanted(Cohort.Domain.TenantContext! tenant, System.DateTimeOffset? at = null, Cohort.Application.SweepTriggerKind trigger = Cohort.Application.SweepTriggerKind.Manual, bool dryRun = false) -> Cohort.Application.RetentionSweepRequest!
-static Cohort.Application.RetentionSweepRequest.Tenantless(System.DateTimeOffset? at = null, Cohort.Application.SweepTriggerKind trigger = Cohort.Application.SweepTriggerKind.Manual, bool dryRun = false) -> Cohort.Application.RetentionSweepRequest!
+static Cohort.Application.RetentionSweepRequest.Tenanted(Cohort.Domain.TenantContext! tenant, System.DateTimeOffset? at = null, bool dryRun = false) -> Cohort.Application.RetentionSweepRequest!
+static Cohort.Application.RetentionSweepRequest.Tenantless(System.DateTimeOffset? at = null, bool dryRun = false) -> Cohort.Application.RetentionSweepRequest!
 virtual Cohort.Application.RetentionErasureRequest.EqualityContract.get -> System.Type!
 virtual Cohort.Application.RetentionErasureRequest.Equals(Cohort.Application.RetentionErasureRequest? other) -> bool
 virtual Cohort.Application.RetentionErasureRequest.PrintMembers(System.Text.StringBuilder! builder) -> bool
@@ -98,6 +98,7 @@ virtual Cohort.Application.RetentionErasureRequest.PrintMembers(System.Text.Stri
 *REMOVED*Cohort.Application.IRetentionSweep.SweepAsync(Cohort.Domain.TenantContext! tenant, System.DateTimeOffset now, Cohort.Application.SweepTriggerKind trigger, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Cohort.Domain.RetentionSweepResult!>!
 *REMOVED*Cohort.Application.IRetentionSweep.SweepAsync(Cohort.Domain.TenantContext! tenant, System.DateTimeOffset now, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Cohort.Domain.RetentionSweepResult!>!
 *REMOVED*Cohort.Application.RetentionSweepRequest.At.get -> System.DateTimeOffset
+*REMOVED*Cohort.Application.RetentionSweepRequest.Trigger.get -> Cohort.Application.SweepTriggerKind
 *REMOVED*static Cohort.Application.RetentionSweepRequest.Tenanted(Cohort.Domain.TenantContext! tenant, System.DateTimeOffset at, Cohort.Application.SweepTriggerKind trigger = Cohort.Application.SweepTriggerKind.Manual, bool dryRun = false) -> Cohort.Application.RetentionSweepRequest!
 *REMOVED*static Cohort.Application.RetentionSweepRequest.Tenantless(System.DateTimeOffset at, Cohort.Application.SweepTriggerKind trigger = Cohort.Application.SweepTriggerKind.Manual, bool dryRun = false) -> Cohort.Application.RetentionSweepRequest!
 *REMOVED*Cohort.Application.IRetentionPreview.PreviewAsync(Cohort.Domain.TenantContext! tenant, System.DateTimeOffset now, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Cohort.Domain.RetentionSweepResult!>!

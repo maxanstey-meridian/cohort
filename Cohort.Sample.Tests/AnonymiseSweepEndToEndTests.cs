@@ -368,7 +368,6 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
             result = await engine.RunAsync(
                 new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
                 asOf,
-                SweepTriggerKind.Manual,
                 SweepEntityScope.TenantedOnly,
                 dryRun: false
             );

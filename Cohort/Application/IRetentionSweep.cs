@@ -15,9 +15,9 @@ public interface IRetentionSweep
     );
 
     /// <summary>
-    /// Sweeps the tenant's tenanted entities as of the database clock, audited as
-    /// <see cref="SweepTriggerKind.Manual"/>. Pass a <see cref="RetentionSweepRequest"/> to
-    /// <see cref="ExecuteAsync"/> for a tenantless, dry or differently triggered run.
+    /// Sweeps the tenant's tenanted entities as of the database clock. Pass a
+    /// <see cref="RetentionSweepRequest"/> to <see cref="ExecuteAsync"/> for a tenantless or
+    /// dry run.
     /// </summary>
     public Task<RetentionSweepResult> SweepAsync(
         TenantContext tenant,
@@ -25,24 +25,17 @@ public interface IRetentionSweep
     ) => ExecuteAsync(RetentionSweepRequest.Tenanted(tenant), ct);
 }
 
+/// <summary>
+/// An explicit sweep, always audited as <see cref="SweepTriggerKind.Manual"/>. Only Cohort's
+/// scheduled worker writes <see cref="SweepTriggerKind.Scheduled"/> runs, each under the lock
+/// that keeps a scheduled pass from running twice.
+/// </summary>
 public abstract record RetentionSweepRequest
 {
-    private RetentionSweepRequest(
-        DateTimeOffset? at,
-        SweepTriggerKind trigger,
-        bool dryRun
-    )
+    private RetentionSweepRequest(DateTimeOffset? at, bool dryRun)
     {
         // Npgsql only writes UTC DateTimeOffsets to timestamptz.
         At = at?.ToUniversalTime();
-        // An erasure run names the kind of subject it erased, which a sweep has none of.
-        Trigger =
-            trigger == SweepTriggerKind.Erasure
-                ? throw new ArgumentException(
-                    "A sweep can't be an erasure run; erase a subject through IRetentionErasureService.",
-                    nameof(trigger)
-                )
-                : trigger;
         DryRun = dryRun;
     }
 
@@ -52,8 +45,6 @@ public abstract record RetentionSweepRequest
     /// </summary>
     public DateTimeOffset? At { get; }
 
-    public SweepTriggerKind Trigger { get; }
-
     public bool DryRun { get; }
 
     /// <summary>The tenant the run is scoped and audited under.</summary>
@@ -62,25 +53,18 @@ public abstract record RetentionSweepRequest
     public static RetentionSweepRequest Tenanted(
         TenantContext tenant,
         DateTimeOffset? at = null,
-        SweepTriggerKind trigger = SweepTriggerKind.Manual,
         bool dryRun = false
-    ) => new TenantedRequest(tenant, at, trigger, dryRun);
+    ) => new TenantedRequest(tenant, at, dryRun);
 
     public static RetentionSweepRequest Tenantless(
         DateTimeOffset? at = null,
-        SweepTriggerKind trigger = SweepTriggerKind.Manual,
         bool dryRun = false
-    ) => new TenantlessRequest(at, trigger, dryRun);
+    ) => new TenantlessRequest(at, dryRun);
 
     public sealed record TenantedRequest : RetentionSweepRequest
     {
-        internal TenantedRequest(
-            TenantContext tenant,
-            DateTimeOffset? at,
-            SweepTriggerKind trigger,
-            bool dryRun
-        )
-            : base(at, trigger, dryRun)
+        internal TenantedRequest(TenantContext tenant, DateTimeOffset? at, bool dryRun)
+            : base(at, dryRun)
         {
             ArgumentNullException.ThrowIfNull(tenant);
             Tenant = tenant;
@@ -93,12 +77,8 @@ public abstract record RetentionSweepRequest
 
     public sealed record TenantlessRequest : RetentionSweepRequest
     {
-        internal TenantlessRequest(
-            DateTimeOffset? at,
-            SweepTriggerKind trigger,
-            bool dryRun
-        )
-            : base(at, trigger, dryRun) { }
+        internal TenantlessRequest(DateTimeOffset? at, bool dryRun)
+            : base(at, dryRun) { }
 
         internal override TenantContext RunTenant => TenantContext.Tenantless;
     }

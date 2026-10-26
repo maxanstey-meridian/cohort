@@ -3,6 +3,8 @@ using System.Reflection.PortableExecutable;
 using System.Xml.Linq;
 
 using ArchUnitNET.Domain;
+using ArchUnitNET.Domain.Dependencies;
+using ArchUnitNET.Fluent.Conditions;
 using ArchUnitNET.Loader;
 using ArchUnitNET.xUnit;
 
@@ -33,7 +35,11 @@ public sealed class ArchitectureBoundaryTests
             // Loaded so AreAssignableTo(BackgroundService) can resolve the framework base type.
             typeof(BackgroundService).Assembly,
             // Loaded so the scope-creation rule can resolve the DI scope factory methods.
-            typeof(Microsoft.Extensions.DependencyInjection.IServiceScopeFactory).Assembly
+            typeof(Microsoft.Extensions.DependencyInjection.IServiceScopeFactory).Assembly,
+            // Loaded so the Hosting SQL rule can resolve EF's raw-SQL extensions and ADO.NET's
+            // command and transaction methods.
+            typeof(Microsoft.EntityFrameworkCore.RelationalDatabaseFacadeExtensions).Assembly,
+            typeof(System.Data.Common.DbCommand).Assembly
         )
         .Build();
 
@@ -139,6 +145,47 @@ public sealed class ArchitectureBoundaryTests
                     .HaveNameStartingWith("CreateAsyncScope")
                     .Or()
                     .HaveNameStartingWith("CreateScope")
+            )
+            .Check(Architecture);
+    }
+
+    // Infrastructure owns raw SQL and the transactions that group it; Hosting runs loops,
+    // scopes, options and logging, and reaches the database only through Infrastructure.
+    // Matched on the called member's name rather than with NotCallAny: a call to a generic
+    // method (SqlQueryRaw<T>, SqlQuery<T>, FromSqlRaw<T>) targets an instantiation that is not
+    // the loaded member, so NotCallAny never matches it.
+    [Fact]
+    public void Hosting_Runs_No_Sql_Of_Its_Own()
+    {
+        string[] sqlEntryPoints =
+        [
+            "ExecuteSql", // ExecuteSqlRaw(Async), ExecuteSql(Interpolated)(Async)
+            "SqlQuery", // SqlQueryRaw<T>, SqlQuery<T>
+            "FromSql",
+            "CreateCommand", // SqlParams.CreateCommand, DbConnection.CreateCommand
+            "ExecuteNonQuery",
+            "ExecuteScalar",
+            "ExecuteReader",
+            "BeginTransaction",
+        ];
+
+        Types()
+            .That()
+            .ResideInNamespaceMatching(Hosting)
+            .Should()
+            .FollowCustomCondition(
+                type =>
+                {
+                    var calls = type.Dependencies
+                        .OfType<MethodCallDependency>()
+                        .Select(call => call.TargetMember)
+                        .Where(member => sqlEntryPoints.Any(name => member.Name.StartsWith(name, StringComparison.Ordinal)))
+                        .Select(member => member.FullName)
+                        .Distinct()
+                        .ToArray();
+                    return new ConditionResult(type, calls.Length == 0, "calls " + string.Join(" and ", calls));
+                },
+                "run no SQL of their own"
             )
             .Check(Architecture);
     }

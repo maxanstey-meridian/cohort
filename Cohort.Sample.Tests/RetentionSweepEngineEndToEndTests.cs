@@ -111,7 +111,6 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
                 await engine.RunAsync(
                     tenant,
                     asOf,
-                    SweepTriggerKind.Manual,
                     SweepEntityScope.TenantedOnly,
                     dryRun: true
                 );
@@ -121,7 +120,6 @@ public sealed class RetentionSweepEngineEndToEndTests(PostgresFixture fixture)
                 await engine.RunAsync(
                     tenant,
                     asOf,
-                    SweepTriggerKind.Manual,
                     SweepEntityScope.TenantedOnly,
                     dryRun: false
                 );

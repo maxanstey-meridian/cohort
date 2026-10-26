@@ -18,7 +18,7 @@ internal sealed class ScopeOwnedRetentionSweep(IServiceScopeFactory scopeFactory
             RetentionExecutionScopes.For(request.RunTenant),
             services => services
                 .GetRequiredService<RetentionSweepEngine>()
-                .RunAsync(request.RunTenant, request.At, request.Trigger, SweepEntityScopes.For(request.RunTenant), request.DryRun, ct),
+                .RunAsync(request.RunTenant, request.At, SweepEntityScopes.For(request.RunTenant), request.DryRun, ct),
             ct
         );
     }

@@ -115,6 +115,84 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
         (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeFalse();
     }
 
+    [Fact]
+    public async Task A_Run_Whose_Session_Is_Lost_Commits_No_Further_Batch()
+    {
+        // The run's session (and the run lock it holds) dies between two batches. EF reopens a
+        // closed connection on its next use, so without a fence the run would carry on, on a
+        // session holding no lock, committing the next entity's rows.
+        var tenantId = Guid.NewGuid();
+        var createdAt = DateTimeOffset.UtcNow.AddDays(-120);
+        var observer = new FirstNoteBatchObserver(ConnectionString);
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configurationOverrides: new Dictionary<string, string?> { ["Cohort:SweepBatchSize"] = "1" },
+            configureServices: services => services.AddSingleton<IRetentionAuditObserver>(observer)
+        );
+        var softDeleteId = Guid.NewGuid();
+        await using (var db = host.CreateDbContext())
+        {
+            for (var i = 0; i < 3; i++)
+            {
+                db.Notes.Add(new Cohort.Sample.Entities.Note { Id = Guid.NewGuid(), TenantId = tenantId, CreatedAt = createdAt, Body = "lost-session" });
+            }
+
+            // Swept after Note: entities run in name order when no foreign key orders them.
+            db.SoftDeleteRecords.Add(new Cohort.Sample.Entities.SoftDeleteRecord { Id = softDeleteId, TenantId = tenantId, CreatedAt = createdAt, Body = "lost-session" });
+            await db.SaveChangesAsync();
+        }
+
+        var sweep = () => host.RunSweepAsync(new TenantContext(tenantId, "uk", new Dictionary<string, string>()));
+        var thrown = await Record.ExceptionAsync(sweep);
+
+        observer.Terminated.Should().BeTrue();
+        await using var verify = host.CreateDbContext();
+        (await verify.Notes.CountAsync(note => note.TenantId == tenantId)).Should().Be(2);
+        (await verify.SoftDeleteRecords.SingleAsync(record => record.Id == softDeleteId)).IsDeleted.Should().BeFalse();
+        // The run fails as a whole rather than moving on to its next entity.
+        thrown.Should().NotBeNull();
+        (await LoadRunStatusAsync(observer.SweepId)).Should().Be(SweepRunStatus.Failed);
+    }
+
+    /// <summary>
+    /// Ends the run's session once its first Note batch has committed: finds the backend
+    /// holding the run lock and waits for it to exit.
+    /// </summary>
+    private sealed class FirstNoteBatchObserver(string connectionString) : IRetentionAuditObserver
+    {
+        private int fired;
+
+        public bool Terminated { get; private set; }
+
+        public Guid SweepId { get; private set; }
+
+        public async Task OnCommittedAsync(SweepEvent evt, CancellationToken ct)
+        {
+            if (
+                evt is not SweepEvent.EntityProgress { Affected: > 0 } progress
+                || progress.EntityType != typeof(Cohort.Sample.Entities.Note)
+                || Interlocked.Exchange(ref fired, 1) != 0
+            )
+            {
+                return;
+            }
+
+            SweepId = evt.SweepId;
+            var key = RetentionRunAdvisoryLock.KeyFor(evt.SweepId);
+            await using var connection = new NpgsqlConnection($"{connectionString};Pooling=false");
+            await connection.OpenAsync(ct);
+            await using var terminate = connection.CreateCommand();
+            // A bigint advisory key is held as classid (high 32 bits) and objid (low 32 bits).
+            terminate.CommandText = """
+                SELECT pg_terminate_backend(pid, 5000) FROM pg_locks
+                WHERE locktype = 'advisory' AND granted AND objsubid = 1
+                  AND classid::bigint = (@key >> 32) & 4294967295 AND objid::bigint = @key & 4294967295
+                """;
+            terminate.Parameters.AddWithValue("key", key);
+            Terminated = await terminate.ExecuteScalarAsync(ct) is true;
+        }
+    }
+
     private sealed class StartedBlockingObserver : IRetentionAuditObserver
     {
         private readonly TaskCompletionSource delivered = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -163,7 +241,6 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
                     .RunAsync(
                         tenant,
                         asOf,
-                        SweepTriggerKind.Manual,
                         SweepEntityScope.TenantedOnly,
                         dryRun: true
                     )

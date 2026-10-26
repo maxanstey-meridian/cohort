@@ -31,7 +31,9 @@ unprotected without an error.
 - Sweeps and erasures use the database clock unless given a time, and refuse a later time for a
   run that changes rows. `RetentionSweepRequest.At` and `RetentionErasureRequest.At` are
   nullable; `SweepAsync(tenant, now)` becomes `SweepAsync(tenant)`, and
-  `SweepAsync(tenant, now, trigger)` is removed (use `ExecuteAsync` with a request). A run's
+  `SweepAsync(tenant, now, trigger)` is removed (use `ExecuteAsync` with a request).
+  `RetentionSweepRequest` loses `trigger`; explicit sweeps are always `Manual`, and only the
+  worker writes `Scheduled` runs. A run's
   event times and the `sweep_run`, summary and row-detail times come from the database clock
   too; `DeletedAt`/`AnonymisedAt` markers keep the run's time.
 - `RetentionPreviewRequest.At` and `PreviewAsync`'s time are optional and default to the database
@@ -57,20 +59,27 @@ unprotected without an error.
   when the host starts. Passes that succeeded never rerun. A `Failed` or `PartiallyFailed`
   run no longer claims its occurrence, and a crash between tenant passes no longer leaves
   the later tenants unswept until the next occurrence. Occurrences are counted on the
-  database clock, the clock that stamps each run. A run still `Started` whose owner holds its
-  run lock keeps the occurrence busy, so a replica whose worker-lock session was lost isn't
-  joined by a second one running the same pass. History pruning keeps the scheduled runs of
-  the schedule's current occurrence, which the worker reads as its ledger.
+  database clock, the clock that stamps each run. Each scheduled pass holds a session advisory
+  lock for its tenant and kind on its own connection, and re-reads the ledger under it before
+  starting, so no pass runs twice or beside itself, even after a replica loses its worker-lock
+  session. `Started` and every batch a sweep or erasure commits on its own first check that
+  the session still holds its locks, so a run whose session was lost (and silently reopened)
+  records nothing, or commits nothing more and settles `Failed`.
+  History pruning keeps the scheduled runs of the schedule's current occurrence, which the
+  worker reads as its ledger. Upgrade: don't run an older worker beside this one; turn the
+  kill switch on or scale to one replica during the rollout.
 - The worker checks its tenant source against the data each occurrence. A tenant that owns
-  retained rows but isn't returned by `IRetentionTenantSource`, or that the source returns
+  retained rows a sweep could still act on (any row of a category that may purge; otherwise a
+  row not yet soft-deleted or anonymised; held rows and rows not yet due count) but isn't
+  returned by `IRetentionTenantSource`, or that the source returns
   with conflicting contexts, gets a `Failed` scheduled run (`code=cohort:tenant-not-in-source`
   or `code=cohort:conflicting-tenant-contexts`) instead of being skipped or swept under the
   first context. A refused pass is retried like any failed one, so until the source returns
   the tenant, each occurrence records up to `OccurrenceMaxAttempts` `Failed` runs for it,
-  `OccurrenceRetryDelay` apart, then logs the worker's "gave up" error. Rows under a
-  `Guid.Empty` tenant in a tenanted table log an error. The empty-source and
+  `OccurrenceRetryDelay` apart, then logs the worker's "gave up" error. Rows a sweep could
+  still act on under a `Guid.Empty` tenant in a tenanted table log an error. The empty-source and
   conflicting-context warnings are gone. Upgrade: make `IRetentionTenantSource` return every
-  tenant that owns rows in a retained tenanted table, or expect these `Failed` runs and the
+  tenant that owns such rows, or expect these `Failed` runs and the
   alerts they raise.
 - The kill switch now cancels the scheduled pass in progress instead of letting it finish:
   its current batch rolls back, the run settles `Cancelled`, and the rest of the occurrence is
@@ -193,6 +202,8 @@ unprotected without an error.
   deleted-at or anonymised-at marker one references. A host whose anonymise
   failed on every run now fails at startup.
 - Cohort requires PostgreSQL 16 or later and refuses an older server with its own message.
+- The worker's occurrence ledger query qualifies its aggregates with `pg_catalog`, so a
+  schema on the search path can't shadow them.
 
 Upgrade: [Running Retention](https://maxanstey-meridian.github.io/cohort/guides/running-retention#upgrading-to-0-11-0),
 [Right-to-Erasure](https://maxanstey-meridian.github.io/cohort/guides/erasure#upgrading-to-0-11-0),

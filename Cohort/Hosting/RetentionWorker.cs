@@ -351,14 +351,16 @@ internal sealed class RetentionWorker(
     {
         var maxAttempts = options.Current.OccurrenceMaxAttempts;
         var plan = await BuildPassPlanAsync(services, db, ct);
-        var ledger = await LoadLedgerAsync(db, occurrence, dryRun, ct);
         var ran = new List<PlannedPass>();
         var busy = false;
-        foreach (var pass in plan.Where(pass => ledger.IsPending(pass.TenantId, maxAttempts)))
+        foreach (var pass in plan)
         {
             // The pass lock, not the worker lock, keeps a pass from running twice: this
             // replica's worker-lock session may have been lost (a timeout, a failover) while
-            // another took the lock and planned the same passes.
+            // another took the lock and planned the same passes. Every pass goes to the
+            // engine, settled or not: only its lock tells a pass whose last attempt is still
+            // running from one that ran out of attempts, and the engine re-reads the ledger
+            // under that lock.
             var scheduled = new ScheduledPass(pass.TenantId, occurrence, dryRun, maxAttempts);
             var outcome = await RunPassAsync(pass, scheduled, ct);
             if (outcome == ScheduledPassOutcome.Busy)
@@ -380,7 +382,7 @@ internal sealed class RetentionWorker(
         }
 
         // Read back rather than infer: a pass that failed before its run existed used no attempt.
-        ledger = await LoadLedgerAsync(db, occurrence, dryRun, ct);
+        var ledger = await LoadLedgerAsync(db, occurrence, dryRun, ct);
         // Only the passes this iteration ran: one exhausted earlier was reported then.
         var exhausted = ran
             .Where(pass => !ledger.IsCompleted(pass.TenantId) && !ledger.IsPending(pass.TenantId, maxAttempts))
@@ -410,9 +412,10 @@ internal sealed class RetentionWorker(
     /// The passes one occurrence owes, in run order: each tenant from the source, then each
     /// refused tenant, then the tenantless pass. A tenant the source returned with conflicting
     /// contexts, or one that owns retained rows a sweep could still act on that the source
-    /// didn't return, is refused rather than swept under a guessed context. Tenantless tables hold one shared row set; sweeping
-    /// them inside the per-tenant loop retired nothing after the first pass but attributed the
-    /// audit run (and resolved retention rules) under whichever tenant happened to come first.
+    /// didn't return, is refused rather than swept under a guessed context. Tenantless tables
+    /// hold one shared row set; sweeping them inside the per-tenant loop retired nothing after
+    /// the first pass but attributed the audit run (and resolved retention rules) under
+    /// whichever tenant happened to come first.
     /// </summary>
     private async Task<IReadOnlyList<PlannedPass>> BuildPassPlanAsync(
         IServiceProvider services,
@@ -438,7 +441,7 @@ internal sealed class RetentionWorker(
             if (gaps.EntitiesWithEmptyTenant.Count > 0)
             {
                 logger.LogError(
-                    "Cohort worker found rows with an empty tenant ID (Guid.Empty) in the tenanted tables of {EntityTypes}. No tenant pass can sweep them; give them the tenant they belong to.",
+                    "Cohort worker found rows a sweep could still act on with an empty tenant ID (Guid.Empty) in the tenanted tables of {EntityTypes}. No tenant pass can sweep them; give them the tenant they belong to.",
                     string.Join(", ", gaps.EntitiesWithEmptyTenant.Select(type => type.FullName))
                 );
             }

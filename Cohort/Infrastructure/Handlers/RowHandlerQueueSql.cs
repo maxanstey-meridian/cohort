@@ -1,5 +1,4 @@
 using System.Data;
-using System.Data.Common;
 
 using Cohort.Application;
 using Cohort.Domain;
@@ -198,22 +197,21 @@ internal static class RowHandlerQueueSql
 
     /// <summary>
     /// Reclaims one expired claim in one transaction. Locks the status row (skipping one a
-    /// claim or another recovery holds), then tries the delivery lock on
-    /// <paramref name="connection"/>, the context's open connection. Neither waits, so recovery
-    /// can't deadlock with a claim, which takes the row lock first and then waits on the
-    /// delivery lock. A claim with attempts left goes back to the queue; one on its last
-    /// attempt is dead-lettered with the row's later handlers. The delivery lock is released
-    /// before this returns.
+    /// claim or another recovery holds), then tries the delivery lock on the context's
+    /// connection, which the caller has opened. Neither waits, so recovery can't deadlock with
+    /// a claim, which takes the row lock first and then waits on the delivery lock. A claim
+    /// with attempts left goes back to the queue; one on its last attempt is dead-lettered
+    /// with the row's later handlers. The delivery lock is released before this returns.
     /// </summary>
     internal static async Task<ReclaimOutcome> TryReclaimAsync(
         DbContext db,
-        DbConnection connection,
         ExpiredClaim claim,
         int maxAttempts,
         ILogger logger,
         CancellationToken ct
     )
     {
+        var connection = db.Database.GetDbConnection();
         var now = DateTimeOffset.UtcNow;
         var statusTable = CohortStoreTables.FromModel(db.Model).SweepRowHandlerStatus;
         var key = RetentionRunAdvisoryLock.RowHandlerKeyFor(statusTable, claim.StatusId);
@@ -528,7 +526,9 @@ internal static class RowHandlerQueueSql
     }
 }
 
-/// <summary>What <see cref="RowHandlerQueueSql.TryReclaimAsync"/> did with an expired claim.</summary>
+/// <summary>
+/// What <see cref="RowHandlerQueueSql.TryReclaimAsync"/> did with an expired claim.
+/// </summary>
 internal enum ReclaimOutcome
 {
     /// <summary>

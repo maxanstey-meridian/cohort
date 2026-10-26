@@ -12,6 +12,12 @@ public sealed class SampleRetentionRuleProvider : IRetentionRuleProvider
             ["blob-cleanup"] = new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge),
             ["soft-delete"] = new RetentionRule(new RetentionPeriod(Days: 30), Strategy.SoftDelete),
             ["anonymise"] = new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise),
+            // Resolves to soft delete here, but declares anonymise too: another tenant's rule
+            // may scrub the same rows, so both markers decide which rows are retired.
+            ["soft-delete-or-anonymise"] = new RetentionRule(
+                new RetentionPeriod(Days: 30),
+                Strategy.SoftDelete
+            ),
             ["tombstone-anonymise"] = new RetentionRule(
                 new RetentionPeriod(Days: 30),
                 Strategy.Anonymise
@@ -34,8 +40,19 @@ public sealed class SampleRetentionRuleProvider : IRetentionRuleProvider
             ),
         };
 
+    private static readonly IReadOnlyDictionary<string, Strategy[]> DeclaredStrategies =
+        new Dictionary<string, Strategy[]>
+        {
+            ["soft-delete-or-anonymise"] = [Strategy.SoftDelete, Strategy.Anonymise],
+        };
+
     public RetentionCategoryCapabilities? GetCapabilities(string category)
     {
+        if (DeclaredStrategies.TryGetValue(category, out var declared))
+        {
+            return new RetentionCategoryCapabilities(declared);
+        }
+
         return Rules.TryGetValue(category, out var rule)
             ? new RetentionCategoryCapabilities([rule.Strategy])
             : null;

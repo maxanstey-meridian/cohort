@@ -296,6 +296,35 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
     }
 
     [Fact]
+    public async Task A_Live_Last_Attempt_Keeps_The_Occurrence_Busy_And_Runs_No_Later_Pass()
+    {
+        // The ledger counts the live run as the pass's last attempt, as it would a finished
+        // one: only the pass lock tells them apart. The tenantless pass runs after the tenants,
+        // so it waits for the owner.
+        await using var database = await UseTemporaryDatabaseAsync();
+        var tenant = CreateTenant();
+        using var host = BuildHost(
+            CreateSettings(ConnectionString, schedule: "0 0 0 1 1 *", dryRun: false, killSwitch: false, maxAttempts: 1),
+            tenant,
+            services => services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>()
+        );
+        await SeedOldNoteAsync(tenant.Id, "live-last-attempt");
+        await SeedOldTenantlessLogAsync("live-last-attempt-tenantless");
+        var occurrence = (await DatabaseNowAsync()).AddSeconds(-1);
+        await InsertScheduledRunAsync(tenant.Id, occurrence.AddMilliseconds(10), SweepRunStatus.Started);
+
+        await using (await HoldPassLockAsync(tenant.Id, dryRun: false))
+        {
+            (await GetWorker(host).RunIterationAsync(occurrence, dryRun: false, CancellationToken.None))
+                .Should().Be(OccurrenceOutcome.LockBusy);
+        }
+
+        (await TenantlessLogExistsAsync("live-last-attempt-tenantless")).Should().BeTrue();
+        (await NoteExistsAsync("live-last-attempt")).Should().BeTrue();
+        (await CountScheduledRunsAsync(tenant.Id)).Should().Be(1);
+    }
+
+    [Fact]
     public async Task A_Started_Run_Whose_Owner_Holds_Only_Its_Run_Lock_Does_Not_Keep_The_Occurrence_Busy()
     {
         // The pass lock, not the run lock, says a scheduled pass is live: an owner holding only
@@ -1274,6 +1303,65 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
     }
 
     [Fact]
+    public async Task A_Category_Declaring_SoftDelete_And_Anonymise_Counts_A_Soft_Deleted_Row_Not_Yet_Anonymised()
+    {
+        // Some tenant's rule may anonymise the category, so a soft-deleted row that still
+        // holds its personal data is live, whatever the listed tenants' rule resolves to.
+        await using var database = await UseTemporaryDatabaseAsync();
+        var listed = CreateTenant();
+        var missing = CreateTenant();
+        using var host = BuildHost(
+            CreateSettings(ConnectionString, schedule: "0 0 0 1 1 *", dryRun: false, killSwitch: false),
+            listed,
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
+                services.AddSingleton<IRetentionTenantSource>(new StaticTenantSource(listed));
+            }
+        );
+        await SeedSoftDeletedContactAsync(missing.Id, deleted: true, anonymised: false);
+
+        var outcome = await GetWorker(host).RunIterationAsync(
+            (await DatabaseNowAsync()).AddSeconds(-1),
+            dryRun: false,
+            CancellationToken.None
+        );
+
+        outcome.Should().Be(OccurrenceOutcome.Pending);
+        var refused = (await LoadScheduledRunsAsync(missing.Id)).Should().ContainSingle().Subject;
+        refused.Status.Should().Be(SweepRunStatus.Failed);
+        refused.Error.Should().Contain("code=cohort:tenant-not-in-source");
+    }
+
+    [Fact]
+    public async Task A_Category_Declaring_SoftDelete_And_Anonymise_Ignores_A_Row_Both_Have_Retired()
+    {
+        // Soft-deleted and scrubbed: neither declared strategy can change the row again.
+        await using var database = await UseTemporaryDatabaseAsync();
+        var listed = CreateTenant();
+        var missing = CreateTenant();
+        using var host = BuildHost(
+            CreateSettings(ConnectionString, schedule: "0 0 0 1 1 *", dryRun: false, killSwitch: false),
+            listed,
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
+                services.AddSingleton<IRetentionTenantSource>(new StaticTenantSource(listed));
+            }
+        );
+        await SeedSoftDeletedContactAsync(missing.Id, deleted: true, anonymised: true);
+
+        var outcome = await GetWorker(host).RunIterationAsync(
+            (await DatabaseNowAsync()).AddSeconds(-1),
+            dryRun: false,
+            CancellationToken.None
+        );
+
+        outcome.Should().Be(OccurrenceOutcome.Settled);
+        (await LoadScheduledRunsAsync(missing.Id)).Should().BeEmpty();
+    }
+
+    [Fact]
     public async Task An_Exempt_Only_Category_Never_Counts()
     {
         await using var database = await UseTemporaryDatabaseAsync();
@@ -1694,7 +1782,9 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         await db.SaveChangesAsync();
     }
 
-    /// <summary>An old contact the anonymise sweep would act on, or one it already scrubbed.</summary>
+    /// <summary>
+    /// An old contact the anonymise sweep would act on, or one it already scrubbed.
+    /// </summary>
     private async Task<Guid> SeedAnonymisedContactAsync(Guid tenantId, bool anonymised)
     {
         var options = new DbContextOptionsBuilder<SampleDbContext>()
@@ -1717,6 +1807,31 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         );
         await db.SaveChangesAsync();
         return id;
+    }
+
+    /// <summary>
+    /// An old contact in the category that may resolve to soft delete or anonymise.
+    /// </summary>
+    private async Task SeedSoftDeletedContactAsync(Guid tenantId, bool deleted, bool anonymised)
+    {
+        var options = new DbContextOptionsBuilder<SampleDbContext>()
+            .UseNpgsql(ConnectionString)
+            .Options;
+
+        await using var db = new SampleDbContext(options);
+        db.SoftDeletedContacts.Add(
+            new SoftDeletedContact
+            {
+                Id = Guid.NewGuid(),
+                TenantId = tenantId,
+                CreatedAt = DateTimeOffset.UtcNow.AddDays(-120),
+                EmailAddress = anonymised ? null : "contact@example.com",
+                IsDeleted = deleted,
+                DeletedAt = deleted ? DateTimeOffset.UtcNow.AddDays(-60) : null,
+                AnonymisedAt = anonymised ? DateTimeOffset.UtcNow.AddDays(-60) : null,
+            }
+        );
+        await db.SaveChangesAsync();
     }
 
     private async Task<bool> NoteExistsAsync(string body)

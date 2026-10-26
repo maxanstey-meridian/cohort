@@ -8,7 +8,7 @@ using Microsoft.EntityFrameworkCore;
 namespace Cohort.Infrastructure;
 
 // The only interpolations in this file's raw SQL are Cohort's own table names, quoted from
-// the EF model, and the shared eligibility predicate; every value is a positional parameter.
+// the EF model; every value is a positional parameter.
 #pragma warning disable EF1002
 
 /// <summary>

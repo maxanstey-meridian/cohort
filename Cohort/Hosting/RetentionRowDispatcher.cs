@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using System.Data;
 using System.Data.Common;
 using System.Reflection;
 
@@ -215,10 +214,9 @@ internal sealed class RetentionRowDispatcher(
                     await db.Database.OpenConnectionAsync(ct);
                     try
                     {
-                        var connection = db.Database.GetDbConnection();
                         foreach (var claim in page)
                         {
-                            await ReclaimAsync(db, connection, claim, dispatch, ct);
+                            await ReclaimAsync(db, claim, dispatch, ct);
                         }
                     }
                     finally
@@ -236,13 +234,12 @@ internal sealed class RetentionRowDispatcher(
 
     private async Task ReclaimAsync(
         DbContext db,
-        DbConnection connection,
         ExpiredClaim claim,
         RowHandlerDispatchOptions dispatch,
         CancellationToken ct
     )
     {
-        switch (await RowHandlerQueueSql.TryReclaimAsync(db, connection, claim, dispatch.MaxAttempts, logger, ct))
+        switch (await RowHandlerQueueSql.TryReclaimAsync(db, claim, dispatch.MaxAttempts, logger, ct))
         {
             case ReclaimOutcome.OwnerStillRunning:
                 logger.LogWarning(

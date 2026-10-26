@@ -112,6 +112,7 @@ public sealed class RegistryScanTests
                     typeof(BlobBackedFile),
                     typeof(SoftDeleteRecord),
                     typeof(AnonymisedContact),
+                    typeof(SoftDeletedContact),
                     typeof(TenantlessLog),
                     typeof(ExternalNumberedLog),
                     typeof(TenantlessSoftDelete),

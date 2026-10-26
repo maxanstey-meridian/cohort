@@ -63,6 +63,7 @@ public sealed class AdvisoryLockCleanupEndToEndTests(PostgresFixture fixture)
         );
 
         // Another session can take the lock: the session that held it did not survive in the pool.
+        await WaitForSessionsToEndAsync(connectionString);
         await using var other = new NpgsqlConnection(fixture.ConnectionString);
         await other.OpenAsync();
         (await RetentionRunAdvisoryLock.TryAcquireAsync(other, key, CancellationToken.None)).Should().BeTrue();
@@ -104,12 +105,41 @@ public sealed class AdvisoryLockCleanupEndToEndTests(PostgresFixture fixture)
         );
 
         // Another session can take every key: the session that held them did not survive in the pool.
+        await WaitForSessionsToEndAsync(connectionString);
         await using var other = new NpgsqlConnection(fixture.ConnectionString);
         await other.OpenAsync();
         foreach (var key in keys)
         {
             (await RetentionRunAdvisoryLock.TryAcquireAsync(other, key, CancellationToken.None)).Should().BeTrue();
             await RetentionRunAdvisoryLock.ReleaseAsync(other, key, CancellationToken.None);
+        }
+    }
+
+    /// <summary>
+    /// Waits for every backend of <paramref name="connectionString"/>'s application name to exit.
+    /// A discarded session's locks are freed only once its backend has gone, which can lag the
+    /// client closing it; a session the pool kept never goes, so the wait times out.
+    /// </summary>
+    private async Task WaitForSessionsToEndAsync(string connectionString)
+    {
+        var applicationName = new NpgsqlConnectionStringBuilder(connectionString).ApplicationName;
+        await using var probe = new NpgsqlConnection(fixture.ConnectionString);
+        await probe.OpenAsync();
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (true)
+        {
+            await using var command = new NpgsqlCommand(
+                "SELECT pg_catalog.count(*) FROM pg_catalog.pg_stat_activity WHERE application_name = @name",
+                probe
+            );
+            command.Parameters.AddWithValue("name", applicationName!);
+            if ((long)(await command.ExecuteScalarAsync())! == 0)
+            {
+                return;
+            }
+
+            DateTime.UtcNow.Should().BeBefore(deadline, "the discarded session should have ended");
+            await Task.Delay(20);
         }
     }
 

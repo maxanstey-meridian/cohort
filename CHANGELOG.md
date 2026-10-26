@@ -62,25 +62,25 @@ unprotected without an error.
   database clock, the clock that stamps each run. Each scheduled pass holds a session advisory
   lock for its tenant and kind on its own connection, and re-reads the ledger under it before
   starting, so no pass runs twice or beside itself, even after a replica loses its worker-lock
-  session. `Started` and every batch a sweep or erasure commits on its own first check that
-  the session still holds its locks, so a run whose session was lost (and silently reopened)
-  records nothing, or commits nothing more and settles `Failed`.
-  History pruning keeps the scheduled runs of the schedule's current occurrence, which the
-  worker reads as its ledger. Upgrade: don't run an older worker beside this one; turn the
-  kill switch on or scale to one replica during the rollout.
+  session. `Started`, every batch and every per-entity summary that a sweep, dry run or
+  erasure commits on its own first check that the session still holds its locks, so a run
+  whose session was lost (and silently reopened) records nothing, or commits nothing more and
+  settles `Failed`. History pruning keeps the scheduled runs of the schedule's current
+  occurrence, which the worker reads as its ledger. Upgrade: don't run an older worker beside
+  this one; turn the kill switch on or scale to one replica during the rollout.
 - The worker checks its tenant source against the data each occurrence. A tenant that owns
   retained rows a sweep could still act on (any row of a category that may purge; otherwise a
-  row not yet soft-deleted or anonymised; held rows and rows not yet due count) but isn't
-  returned by `IRetentionTenantSource`, or that the source returns
-  with conflicting contexts, gets a `Failed` scheduled run (`code=cohort:tenant-not-in-source`
-  or `code=cohort:conflicting-tenant-contexts`) instead of being skipped or swept under the
-  first context. A refused pass is retried like any failed one, so until the source returns
-  the tenant, each occurrence records up to `OccurrenceMaxAttempts` `Failed` runs for it,
+  row not yet soft-deleted or not yet anonymised; held rows and rows not yet due count, and
+  rows of a category that declares only `Exempt` never do) but isn't returned by
+  `IRetentionTenantSource`, or that the source returns with conflicting contexts, gets a
+  `Failed` scheduled run (`code=cohort:tenant-not-in-source` or
+  `code=cohort:conflicting-tenant-contexts`) instead of being skipped or swept under the first
+  context. A refused pass is retried like any failed one, so until the source returns the
+  tenant, each occurrence records up to `OccurrenceMaxAttempts` `Failed` runs for it,
   `OccurrenceRetryDelay` apart, then logs the worker's "gave up" error. Rows a sweep could
-  still act on under a `Guid.Empty` tenant in a tenanted table log an error. The empty-source and
-  conflicting-context warnings are gone. Upgrade: make `IRetentionTenantSource` return every
-  tenant that owns such rows, or expect these `Failed` runs and the
-  alerts they raise.
+  still act on under a `Guid.Empty` tenant in a tenanted table log an error. The empty-source
+  and conflicting-context warnings are gone. Upgrade: make `IRetentionTenantSource` return
+  every tenant that owns such rows, or expect these `Failed` runs and the alerts they raise.
 - The kill switch now cancels the scheduled pass in progress instead of letting it finish:
   its current batch rolls back, the run settles `Cancelled`, and the rest of the occurrence is
   skipped. Turning it off catches the occurrence up straight away. It also stops the

@@ -123,7 +123,7 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
         // session holding no lock, committing the next entity's rows.
         var tenantId = Guid.NewGuid();
         var createdAt = DateTimeOffset.UtcNow.AddDays(-120);
-        var observer = new FirstNoteBatchObserver(ConnectionString);
+        var observer = SessionKillingObserver.FirstNoteBatch(ConnectionString);
         using var host = new CohortTestHost(
             ConnectionString,
             configurationOverrides: new Dictionary<string, string?> { ["Cohort:SweepBatchSize"] = "1" },
@@ -154,11 +154,54 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
         (await LoadRunStatusAsync(observer.SweepId)).Should().Be(SweepRunStatus.Failed);
     }
 
+    [Fact]
+    public async Task A_Dry_Run_Whose_Session_Is_Lost_Commits_No_Further_Summary()
+    {
+        // A dry run has no batches to fence. Its session (and the run lock it holds) dies once
+        // the Note summary has committed; EF reopens the connection on its next use, so
+        // without a fence on each summary the run would carry on beside whichever owner took
+        // its locks, recording the next entity's prediction.
+        var tenantId = Guid.NewGuid();
+        var createdAt = DateTimeOffset.UtcNow.AddDays(-120);
+        var observer = SessionKillingObserver.NoteSummary(ConnectionString);
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configureServices: services => services.AddSingleton<IRetentionAuditObserver>(observer)
+        );
+        await using (var db = host.CreateDbContext())
+        {
+            db.Notes.Add(new Cohort.Sample.Entities.Note { Id = Guid.NewGuid(), TenantId = tenantId, CreatedAt = createdAt, Body = "lost-session-dry" });
+            // Summarised after Note: entities run in name order when no foreign key orders them.
+            db.SoftDeleteRecords.Add(new Cohort.Sample.Entities.SoftDeleteRecord { Id = Guid.NewGuid(), TenantId = tenantId, CreatedAt = createdAt, Body = "lost-session-dry" });
+            await db.SaveChangesAsync();
+        }
+
+        var dryRun = () => host.RunWithServicesAsync(services =>
+            services
+                .GetRequiredService<RetentionSweepEngine>()
+                .RunAsync(
+                    new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+                    DateTimeOffset.UtcNow,
+                    SweepEntityScope.TenantedOnly,
+                    dryRun: true
+                )
+        );
+        var thrown = await Record.ExceptionAsync(dryRun);
+
+        observer.Terminated.Should().BeTrue();
+        (await LoadSummarisedEntityTypesAsync(observer.SweepId))
+            .Should().Contain(typeof(Cohort.Sample.Entities.Note).FullName)
+            .And.NotContain(typeof(Cohort.Sample.Entities.SoftDeleteRecord).FullName);
+        thrown.Should().NotBeNull();
+        (await LoadRunStatusAsync(observer.SweepId)).Should().Be(SweepRunStatus.Failed);
+    }
+
     /// <summary>
-    /// Ends the run's session once its first Note batch has committed: finds the backend
-    /// holding the run lock and waits for it to exit.
+    /// Ends the run's session once the first event <paramref name="fireOn"/> matches has
+    /// committed: finds the backend holding the run lock and waits for it to exit.
     /// </summary>
-    private sealed class FirstNoteBatchObserver(string connectionString) : IRetentionAuditObserver
+    private sealed class SessionKillingObserver(string connectionString, Func<SweepEvent, bool> fireOn)
+        : IRetentionAuditObserver
     {
         private int fired;
 
@@ -166,13 +209,25 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
 
         public Guid SweepId { get; private set; }
 
+        /// <summary>Fires once the run's first Note batch that changed rows has committed.</summary>
+        public static SessionKillingObserver FirstNoteBatch(string connectionString) =>
+            new(
+                connectionString,
+                evt => evt is SweepEvent.EntityProgress { Affected: > 0 } progress
+                    && progress.EntityType == typeof(Cohort.Sample.Entities.Note)
+            );
+
+        /// <summary>Fires once the run's Note summary has committed.</summary>
+        public static SessionKillingObserver NoteSummary(string connectionString) =>
+            new(
+                connectionString,
+                evt => evt is SweepEvent.EntitySummary summary
+                    && summary.EntityType == typeof(Cohort.Sample.Entities.Note)
+            );
+
         public async Task OnCommittedAsync(SweepEvent evt, CancellationToken ct)
         {
-            if (
-                evt is not SweepEvent.EntityProgress { Affected: > 0 } progress
-                || progress.EntityType != typeof(Cohort.Sample.Entities.Note)
-                || Interlocked.Exchange(ref fired, 1) != 0
-            )
+            if (!fireOn(evt) || Interlocked.Exchange(ref fired, 1) != 0)
             {
                 return;
             }
@@ -284,6 +339,24 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
         command.Parameters.AddWithValue("startedAt", DateTimeOffset.UtcNow.AddDays(-1));
         command.Parameters.AddWithValue("sweepId", sweepId);
         await command.ExecuteNonQueryAsync();
+    }
+
+    private async Task<IReadOnlyList<string>> LoadSummarisedEntityTypesAsync(Guid sweepId)
+    {
+        await using var connection = new NpgsqlConnection(ConnectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            "SELECT \"EntityType\" FROM \"sweep_run_entity_summary\" WHERE \"SweepId\" = @sweepId";
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        var types = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            types.Add(reader.GetString(0));
+        }
+
+        return types;
     }
 
     private async Task<SweepRunStatus> LoadRunStatusAsync(Guid sweepId)

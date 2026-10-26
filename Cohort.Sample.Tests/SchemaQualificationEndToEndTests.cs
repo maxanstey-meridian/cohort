@@ -34,19 +34,16 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
                 ?? throw new InvalidOperationException("Could not locate the Cohort solution root.");
         }
 
-        string[] files =
-        [
-            "Cohort/Infrastructure/CohortSchemaValidator.cs",
-            "Cohort/Infrastructure/Holds/RetentionHoldSql.cs",
-            "Cohort/Infrastructure/Holds/RetentionEntityLockSql.cs",
-            "Cohort/Infrastructure/RetentionRunAdvisoryLock.cs",
-            "Cohort/Infrastructure/RetentionRuntimeReadinessValidator.cs",
-            "Cohort/Infrastructure/Sweep/SweepStrategy.cs",
-            "Cohort/Infrastructure/Handlers/RowHandlerQueueSql.cs",
-            "Cohort/Infrastructure/RetentionRunLedgerSql.cs",
-            "Cohort/Infrastructure/HistoryPruningSql.cs",
-            "Cohort/Infrastructure/RetentionTenantCoverage.cs",
-        ];
+        // Every Infrastructure file, so a new SQL adapter can't slip past a hand-kept list.
+        // DatabaseClock.cs is excluded because its prose (a comment and an error message) names
+        // statement_timestamp() unqualified; its one SQL fragment is pg_catalog-qualified.
+        var infrastructure = Path.Combine(root.FullName, "Cohort", "Infrastructure");
+        var files = Directory.EnumerateFiles(infrastructure, "*.cs", SearchOption.AllDirectories)
+            .Select(file => Path.GetRelativePath(root.FullName, file).Replace('\\', '/'))
+            .Where(file => file != "Cohort/Infrastructure/DatabaseClock.cs")
+            .Order()
+            .ToArray();
+        files.Should().Contain("Cohort/Infrastructure/Sweep/SweepStrategy.cs");
         var unqualified = new Regex(
             @"(?<![\w.])(count|cardinality|bool_or|array_agg|statement_timestamp|hashtextextended|unnest|pg_(?:advisory|try_advisory|get_expr|backend_pid)[a-z_]*)\s*\(",
             RegexOptions.IgnoreCase | RegexOptions.CultureInvariant

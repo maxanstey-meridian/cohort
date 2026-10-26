@@ -358,6 +358,35 @@ namespace Cohort.Sample.Migrations
                     b.ToTable("soft_delete_records", (string)null);
                 });
 
+            modelBuilder.Entity("Cohort.Sample.Entities.SoftDeletedContact", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTimeOffset?>("AnonymisedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset?>("DeletedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("EmailAddress")
+                        .HasColumnType("text");
+
+                    b.Property<bool>("IsDeleted")
+                        .HasColumnType("boolean");
+
+                    b.Property<Guid>("TenantId")
+                        .HasColumnType("uuid");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("soft_deleted_contacts", (string)null);
+                });
+
             modelBuilder.Entity("Cohort.Sample.Entities.TenantlessLog", b =>
                 {
                     b.Property<Guid>("Id")

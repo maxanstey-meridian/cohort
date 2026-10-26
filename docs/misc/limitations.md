@@ -9,10 +9,11 @@ These are the deliberate limits of Cohort, so you don't discover them in product
 - **PostgreSQL 16 or later.** Startup checks anonymised columns with `pg_input_is_valid`,
   which PostgreSQL 16 added; an older server is refused.
 - **Session advisory locks need a session of their own.** The worker, each scheduled pass,
-  each run and each row-handler delivery hold PostgreSQL session advisory locks, so they need direct connections
-  or session-mode pooling. A transaction-mode pooler (PgBouncer's `pool_mode = transaction`)
-  hands the session to someone else between transactions, and the locks stop meaning anything.
-  Npgsql `Multiplexing=true` does the same inside one process, so readiness refuses it.
+  each run and each row-handler delivery hold PostgreSQL session advisory locks, so they need
+  direct connections or session-mode pooling. A transaction-mode pooler (PgBouncer's
+  `pool_mode = transaction`) hands the session to someone else between transactions, and the
+  locks stop meaning anything. Npgsql `Multiplexing=true` does the same inside one process, so
+  readiness refuses it.
 - **You own the schema.** Cohort never creates or migrates its tables at runtime. See
   [Schema & Migrations](/reference/schema).
 

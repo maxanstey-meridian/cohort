@@ -134,9 +134,7 @@ internal sealed class RetentionHistoryPruner(
     }
 
     /// <summary>
-    /// Claims a batch of eligible runs under <c>FOR UPDATE SKIP LOCKED</c>, then deletes their
-    /// row details (handler statuses cascade), entity summaries and the runs themselves in one
-    /// transaction.
+    /// One batch of settled runs; see <see cref="HistoryPruningSql.PruneRunBatchAsync"/>.
     /// </summary>
     private Task<int> PruneRunBatchAsync(
         DateTimeOffset? succeededCutoff,
@@ -171,9 +169,7 @@ internal sealed class RetentionHistoryPruner(
             : CohortScheduleParser.GetPreviousOccurrence(schedule, await DatabaseClock.NowAsync(db, ct));
 
     /// <summary>
-    /// Deletes a batch of holds whose earlier of <c>RemovedAt</c> and <c>ExpiresAt</c> is
-    /// before the cutoff. The eligibility test reads only the hold's own columns, so the
-    /// lock re-evaluates it against the latest committed version of each claimed row.
+    /// One batch of inactive holds; see <see cref="HistoryPruningSql.PruneHoldBatchAsync"/>.
     /// </summary>
     private Task<int> PruneHoldBatchAsync(DateTimeOffset cutoff, CancellationToken ct) =>
         scopeFactory.RunInScopeAsync(

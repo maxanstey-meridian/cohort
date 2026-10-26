@@ -21,7 +21,8 @@ namespace Cohort.Infrastructure;
 /// With <paramref name="callerCommit"/> the run joins the transaction open on
 /// <paramref name="db"/> instead: it commits nothing, and observers hear of its events only
 /// once the caller commits. A scheduled pass passes the <paramref name="passLockKey"/> it holds
-/// on the same session, which every batch also checks is still held before it commits.
+/// on the same session. An owned run commits Started, each batch and each entity summary only
+/// while its session still holds the run lock and that key.
 /// </summary>
 internal sealed class RetentionRun(
     DbContext db,
@@ -601,28 +602,10 @@ internal sealed class RetentionRun(
     }
 
     /// <summary>
-    /// Commits Started. An owned run commits it only while its session still holds the run's
-    /// locks, so a pass whose session was lost after it re-read the ledger records nothing,
-    /// not even a refusal.
+    /// Commits Started. A pass whose session was lost after it re-read the ledger records
+    /// nothing, not even a refusal.
     /// </summary>
-    private async Task WriteStartedAsync()
-    {
-        if (callerCommit is not null)
-        {
-            await WriteDurableAsync(started, CancellationToken.None);
-            return;
-        }
-
-        using var timeout = new CancellationTokenSource(AuditSettlementTimeout);
-        await using (var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, timeout.Token))
-        {
-            await auditWriter.WriteAsync(started, timeout.Token);
-            await EnsureLocksHeldAsync(transaction, timeout.Token);
-            await transaction.CommitAsync(timeout.Token);
-        }
-
-        await NotifyAsync(started);
-    }
+    private Task WriteStartedAsync() => WriteDurableAsync(started, CancellationToken.None);
 
     /// <summary>
     /// EF reopens a connection whose session was lost (a timeout, a failover) on its next use,
@@ -645,10 +628,30 @@ internal sealed class RetentionRun(
         }
     }
 
+    /// <summary>
+    /// Writes Started or an entity summary, bounded by the settlement timeout when
+    /// <paramref name="ct"/> can't cancel. An owned run commits it in its own short transaction,
+    /// only while its session still holds the run's locks, as a batch does: a run whose session
+    /// was lost commits nothing more, dry run or not. In the caller's transaction it is written
+    /// there and commits with the caller. Settlement doesn't come through here: a run that lost
+    /// its locks must still record that it failed.
+    /// </summary>
     private async Task WriteDurableAsync(SweepEvent evt, CancellationToken ct)
     {
         using var timeout = ct.CanBeCanceled ? null : new CancellationTokenSource(AuditSettlementTimeout);
-        await auditWriter.WriteAsync(evt, timeout?.Token ?? ct);
+        var token = timeout?.Token ?? ct;
+        if (callerCommit is not null)
+        {
+            await auditWriter.WriteAsync(evt, token);
+        }
+        else
+        {
+            await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, token);
+            await auditWriter.WriteAsync(evt, token);
+            await EnsureLocksHeldAsync(transaction, token);
+            await transaction.CommitAsync(token);
+        }
+
         await NotifyAsync(evt);
     }
 
@@ -714,7 +717,7 @@ internal sealed class RetentionRun(
         }
     }
 
-    /// <summary>A batch found its session no longer holds the run's locks.</summary>
+    /// <summary>A commit found its session no longer holds the run's locks.</summary>
     private sealed class LockLostException(string message) : InvalidOperationException(message);
 
     internal static string TruncateError(string value)

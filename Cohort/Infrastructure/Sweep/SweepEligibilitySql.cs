@@ -10,55 +10,37 @@ namespace Cohort.Infrastructure.Sweep;
 internal static class SweepEligibilitySql
 {
     /// <summary>
-    /// The rows <paramref name="strategy"/> could still act on, over alias <c>target</c>:
-    /// "" for every row, <c>FALSE</c> for none.
+    /// The rows <paramref name="strategy"/> could still act on, over alias <c>target</c>
+    /// ("" for every row). The marker a strategy needs is guaranteed by startup validation and
+    /// by the strategy's own <c>Validate</c>, both of which run first.
     /// </summary>
     internal static string Predicate(Strategy strategy, RetentionEntry entry) => strategy switch
     {
         Strategy.Purge => "",
         Strategy.SoftDelete =>
-            $"target.{PostgreSqlIdentifier.Quote(RequireSoftDelete(entry).IsDeletedColumn)} = FALSE",
+            $"target.{PostgreSqlIdentifier.Quote(entry.SoftDelete!.IsDeletedColumn)} = FALSE",
         // The AnonymisedAt marker keeps anonymisation idempotent: rows scrubbed by an earlier
         // run fall out of scope instead of being re-anonymised forever.
         Strategy.Anonymise =>
-            $"target.{PostgreSqlIdentifier.Quote(RequireAnonymisedAt(entry).AnonymisedAtColumn)} IS NULL",
-        Strategy.Exempt => "FALSE",
+            $"target.{PostgreSqlIdentifier.Quote(entry.AnonymisedAt!.AnonymisedAtColumn)} IS NULL",
         _ => throw new ArgumentOutOfRangeException(nameof(strategy), strategy, null),
     };
 
     /// <summary>
-    /// The rows any of <paramref name="strategies"/> could still act on: "" when one acts on
-    /// every row, null when none acts on any (skip the table), otherwise the ORed predicates.
+    /// The rows any of <paramref name="strategies"/> could still act on: "" when Purge is among
+    /// them, null when none acts on any row (only Exempt, so skip the table), otherwise the
+    /// ORed predicates of the rest.
     /// </summary>
     internal static string? AnyPredicate(IEnumerable<Strategy> strategies, RetentionEntry entry)
     {
-        var predicates = new List<string>();
-        foreach (var strategy in strategies.Distinct().Order())
+        var acting = strategies.Distinct().Where(strategy => strategy != Strategy.Exempt).Order().ToList();
+        if (acting.Contains(Strategy.Purge))
         {
-            switch (Predicate(strategy, entry))
-            {
-                case "":
-                    return "";
-                case "FALSE":
-                    break;
-                case var predicate:
-                    predicates.Add($"({predicate})");
-                    break;
-            }
+            return "";
         }
 
-        return predicates.Count == 0 ? null : string.Join(" OR ", predicates);
+        return acting.Count == 0
+            ? null
+            : string.Join(" OR ", acting.Select(strategy => $"({Predicate(strategy, entry)})"));
     }
-
-    private static SoftDeleteConvention RequireSoftDelete(RetentionEntry entry) =>
-        entry.SoftDelete
-        ?? throw new InvalidOperationException(
-            $"Retention entry for {entry.EntityType.FullName} must expose soft-delete metadata for soft-delete operations."
-        );
-
-    private static AnonymisedAtConvention RequireAnonymisedAt(RetentionEntry entry) =>
-        entry.AnonymisedAt
-        ?? throw new InvalidOperationException(
-            $"Retention entry for {entry.EntityType.FullName} has no AnonymisedAt marker, so anonymisation cannot tell scrubbed rows from pending ones."
-        );
 }

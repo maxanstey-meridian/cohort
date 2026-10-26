@@ -35,11 +35,7 @@ public sealed class ArchitectureBoundaryTests
             // Loaded so AreAssignableTo(BackgroundService) can resolve the framework base type.
             typeof(BackgroundService).Assembly,
             // Loaded so the scope-creation rule can resolve the DI scope factory methods.
-            typeof(Microsoft.Extensions.DependencyInjection.IServiceScopeFactory).Assembly,
-            // Loaded so the Hosting SQL rule can resolve EF's raw-SQL extensions and ADO.NET's
-            // command and transaction methods.
-            typeof(Microsoft.EntityFrameworkCore.RelationalDatabaseFacadeExtensions).Assembly,
-            typeof(System.Data.Common.DbCommand).Assembly
+            typeof(Microsoft.Extensions.DependencyInjection.IServiceScopeFactory).Assembly
         )
         .Build();
 
@@ -167,6 +163,9 @@ public sealed class ArchitectureBoundaryTests
             "ExecuteScalar",
             "ExecuteReader",
             "BeginTransaction",
+            "ExecuteUpdate", // ExecuteUpdate(Async)
+            "ExecuteDelete", // ExecuteDelete(Async)
+            "SaveChanges", // SaveChanges(Async)
         ];
 
         Types()

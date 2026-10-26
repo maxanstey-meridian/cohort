@@ -128,9 +128,9 @@ retained tenanted table:
   with `code=cohort:conflicting-tenant-contexts`, and the other tenants still run.
 - An empty source is fine when there's no tenanted data. With tenanted data, each tenant that
   owns rows a sweep could still act on gets a `Failed` run as above.
-- No tenant pass can sweep rows a sweep could still act on whose tenant column holds
-  `Guid.Empty`. The worker logs an
-  error naming the entity at each occurrence; give those rows their real tenant.
+- Rows whose tenant column holds `Guid.Empty` can't be swept by any tenant pass. If a sweep
+  could still act on any of them, the worker logs an error naming the entity at each
+  occurrence; give those rows their real tenant.
 - These runs reach audit observers as `Started` then `Failed`, like any failed run, so your
   existing alerting sees them. They're retried like any failed pass (see below): until the
   source returns the tenant, each occurrence gives it up to `OccurrenceMaxAttempts` `Failed`
@@ -157,8 +157,9 @@ occurrence at or before now. It reads what that occurrence still owes from `swee
 - Every other pass is **pending**: it has no run yet, a `Failed` or `PartiallyFailed` run, or
   a run still `Started` whose owner died, which the worker tells by the pass lock being free.
 - Each pass runs under its own advisory lock (install, tenant, dry or real), and re-reads its
-  ledger under it. A pass another replica is running makes the worker check again after the
-  delay; a pass that finished meanwhile isn't rerun.
+  ledger under it. A pass another replica is running, even its last attempt, makes the worker
+  stop and check again after the delay, so no later pass runs first; a pass that finished
+  meanwhile isn't rerun.
 - The worker runs only the pending passes, in plan order. Passes that succeeded never rerun,
   so their row handlers don't fire twice. [History pruning](/guides/history-pruning) keeps the
   current occurrence's scheduled runs, so this holds with a short retention too.
@@ -179,9 +180,10 @@ schema-qualified `sweep_run` table. The worker lock only keeps replicas from pla
 occurrence side by side: a replica that finds it taken checks again after the delay, by which
 time the passes are usually complete. What guarantees one run per pass is the pass lock, held
 on the connection the pass's run writes on, so it holds even when a replica loses its
-worker-lock session (a timeout, a failover) mid-occurrence. `Started` and every batch check that
-the session still holds its locks before they commit, so a pass whose session was lost records
-nothing, or commits nothing more and settles `Failed`. Installs in different schemas of one database sweep independently. Occurrences are
+worker-lock session (a timeout, a failover) mid-occurrence. `Started`, every batch and every
+per-entity summary check that the session still holds its locks before they commit, so a pass
+whose session was lost, dry run or not, records nothing, or commits nothing more and settles
+`Failed`. Installs in different schemas of one database sweep independently. Occurrences are
 counted on the database clock, the clock that stamps each run's `StartedAt`, so a replica's
 own clock never decides which occurrence is due.
 

@@ -3,7 +3,10 @@ namespace Cohort.Infrastructure;
 /// <summary>Why the worker refused a tenant's pass instead of sweeping it.</summary>
 internal enum RetentionPassRefusal
 {
-    /// <summary>The tenant owns retained rows a sweep could still act on, but the tenant source didn't return it.</summary>
+    /// <summary>
+    /// The tenant owns retained rows a sweep could still act on, but the tenant source didn't
+    /// return it.
+    /// </summary>
     NotInTenantSource,
 
     /// <summary>The tenant source returned the tenant more than once, with different contexts.</summary>

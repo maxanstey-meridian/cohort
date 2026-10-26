@@ -16,10 +16,10 @@ expressed in SQL.
 ## A run
 
 1. **Lock and start.** The run takes its own advisory lock, then commits a `Started` row in
-   `sweep_run`, with `SettledAt = NULL`, before any mutation. `Started` and each batch check
-   that the session still holds that lock (and a scheduled pass's lock) before they commit, so
-   a run whose session was lost and silently reopened records nothing, or commits nothing more
-   and settles `Failed`.
+   `sweep_run`, with `SettledAt = NULL`, before any mutation. `Started`, each batch and each
+   per-entity summary check that the session still holds that lock (and a scheduled pass's
+   lock) before they commit, so a run whose session was lost and silently reopened, dry run or
+   not, records nothing, or commits nothing more and settles `Failed`.
 2. **Order.** Retained entities are processed in foreign-key order, dependents before their
    principals, so a retained child is purged before its retained parent.
 3. **Resolve.** For each entity, the category's rule is resolved for this tenant and time.
@@ -82,9 +82,9 @@ the run's lock, so a live run is never recovered.
 
 A scheduled run that crashed, or a scheduled pass that never started because its process died
 first, doesn't claim its occurrence: the worker reruns that pass, whether the run is still
-`Started` (once its pass lock is free, so its owner is gone) or already recovered as `Failed`, until it succeeds or uses up
-`OccurrenceMaxAttempts`. Passes of the occurrence that already succeeded don't rerun. See
-[Occurrences](/guides/running-retention#occurrences).
+`Started` (once its pass lock is free, so its owner is gone) or already recovered as `Failed`,
+until it succeeds or uses up `OccurrenceMaxAttempts`. Passes of the occurrence that already
+succeeded don't rerun. See [Occurrences](/guides/running-retention#occurrences).
 
 ## After commit
 

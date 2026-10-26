@@ -11,6 +11,7 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
     public DbSet<ExemptDocument> ExemptDocuments => Set<ExemptDocument>();
     public DbSet<SoftDeleteRecord> SoftDeleteRecords => Set<SoftDeleteRecord>();
     public DbSet<AnonymisedContact> AnonymisedContacts => Set<AnonymisedContact>();
+    public DbSet<SoftDeletedContact> SoftDeletedContacts => Set<SoftDeletedContact>();
     public DbSet<ErasureSubjectRecord> ErasureSubjectRecords => Set<ErasureSubjectRecord>();
     public DbSet<HeldRecord> HeldRecords => Set<HeldRecord>();
     public DbSet<TenantlessLog> TenantlessLogs => Set<TenantlessLog>();
@@ -71,6 +72,18 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
                 .HasColumnType("xid")
                 .ValueGeneratedOnAddOrUpdate()
                 .IsConcurrencyToken();
+        });
+
+        modelBuilder.Entity<SoftDeletedContact>(b =>
+        {
+            b.ToTable("soft_deleted_contacts");
+            b.HasKey(contact => contact.Id);
+            b.Property(contact => contact.TenantId).IsRequired();
+            b.Property(contact => contact.CreatedAt).IsRequired();
+            b.Property(contact => contact.EmailAddress);
+            b.Property(contact => contact.IsDeleted).IsRequired();
+            b.Property(contact => contact.DeletedAt);
+            b.Property(contact => contact.AnonymisedAt);
         });
 
         modelBuilder.Entity<ErasureSubjectRecord>(b =>

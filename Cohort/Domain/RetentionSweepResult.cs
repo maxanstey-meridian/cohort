@@ -18,7 +18,8 @@ public sealed record RetentionSweepResult(
 /// erasure only: the subject's rows the resolved rule keeps (younger than the legal minimum,
 /// or every row under an Exempt rule). <see cref="DeferredCount"/> is real runs only: rows
 /// still due once the run finished with the entity that it neither changed nor skipped
-/// (locked by another transaction, not reached, or come into scope mid-run).
+/// (locked by another transaction when a sweep reached them, or come into scope mid-run
+/// behind the rows the run had already passed).
 /// <see cref="BlockedCount"/> is rows a database constraint stopped Cohort changing.
 /// </summary>
 public sealed record EntitySweepCount(

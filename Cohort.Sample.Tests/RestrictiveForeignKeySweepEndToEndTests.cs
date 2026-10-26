@@ -484,38 +484,29 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
         // PostgreSQL raises for RESTRICT and NO ACTION alike), but each row because of what
         // references it, not because of the schema. The model doesn't declare the key, so the
         // reference check can't defer the rows.
-        await ExecuteAsync(
-            database.ConnectionString,
-            reference == "cycle"
-                // The CASCADE child is referenced back from a newer row of the target table, not
-                // yet due: the refusal names the target table itself, though Purge wrote nothing.
-                ? $"""
-                  CREATE TABLE hidden_fk_children (
-                      "Id" uuid PRIMARY KEY,
-                      "ParentId" uuid NOT NULL REFERENCES restrictive_fk_parents ("Id") ON DELETE CASCADE
-                  );
-                  INSERT INTO hidden_fk_children ("Id", "ParentId")
-                      SELECT gen_random_uuid(), "Id" FROM restrictive_fk_parents;
-                  ALTER TABLE restrictive_fk_parents ADD COLUMN "ChildId" uuid REFERENCES hidden_fk_children ("Id");
-                  INSERT INTO restrictive_fk_parents ("Id", "TenantId", "CreatedAt", "ChildId")
-                      SELECT gen_random_uuid(), '{tenantId}', '{asOf:O}', "Id" FROM hidden_fk_children;
-                  """
-                // A CASCADE child the reference check ignores, which a grandchild references.
-                : $"""
-                  CREATE TABLE hidden_fk_children (
-                      "Id" uuid PRIMARY KEY,
-                      "ParentId" uuid NOT NULL REFERENCES restrictive_fk_parents ("Id") ON DELETE CASCADE
-                  );
-                  CREATE TABLE hidden_fk_grandchildren (
-                      "Id" uuid PRIMARY KEY,
-                      "ChildId" uuid NOT NULL REFERENCES hidden_fk_children ("Id"){(reference == "restrict" ? " ON DELETE RESTRICT" : "")}
-                  );
-                  INSERT INTO hidden_fk_children ("Id", "ParentId")
-                      SELECT gen_random_uuid(), "Id" FROM restrictive_fk_parents;
-                  INSERT INTO hidden_fk_grandchildren ("Id", "ChildId")
-                      SELECT gen_random_uuid(), "Id" FROM hidden_fk_children;
-                  """
-        );
+        if (reference == "cycle")
+        {
+            // The CASCADE child is referenced back from a newer row of the target table, not
+            // yet due: the refusal names the target table itself, though Purge wrote nothing.
+            await ExecuteAsync(
+                database.ConnectionString,
+                $"""
+                CREATE TABLE hidden_fk_children (
+                    "Id" uuid PRIMARY KEY,
+                    "ParentId" uuid NOT NULL REFERENCES restrictive_fk_parents ("Id") ON DELETE CASCADE
+                );
+                INSERT INTO hidden_fk_children ("Id", "ParentId")
+                    SELECT gen_random_uuid(), "Id" FROM restrictive_fk_parents;
+                ALTER TABLE restrictive_fk_parents ADD COLUMN "ChildId" uuid REFERENCES hidden_fk_children ("Id");
+                INSERT INTO restrictive_fk_parents ("Id", "TenantId", "CreatedAt", "ChildId")
+                    SELECT gen_random_uuid(), '{tenantId}', '{asOf:O}', "Id" FROM hidden_fk_children;
+                """
+            );
+        }
+        else
+        {
+            await AddHiddenGrandchildReferenceAsync(database.ConnectionString, ids, restrict: reference == "restrict");
+        }
 
         for (var run = 0; run < 2; run++)
         {
@@ -538,8 +529,13 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
     public async Task Discovery_Sends_At_Most_A_Batch_Of_Record_Ids_However_Many_Rows_The_Run_Has_Blocked()
     {
         await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
-        var commands = new RecordingCommandLog();
-        await using var services = BuildServiceProvider(database.ConnectionString, batchSize: 2, commandLog: commands);
+        var logs = new RecordingLogProvider();
+        await using var services = BuildServiceProvider(
+            database.ConnectionString,
+            batchSize: 2,
+            configure: services => services.AddSingleton<ILoggerProvider>(logs),
+            logCommands: true
+        );
         var tenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
         var anchor = asOf.AddDays(-300);
@@ -554,26 +550,10 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
             db.Parents.AddRange(ids.Select(id => Parent(id, tenantId, anchor)));
             await db.SaveChangesAsync();
         }
-        // Eight rows held by a NO ACTION grandchild behind a CASCADE child the reference check
-        // can't see, so each is refused when tried: four full batches of blocked rows.
-        await ExecuteAsync(
-            database.ConnectionString,
-            $"""
-            CREATE TABLE hidden_fk_children (
-                "Id" uuid PRIMARY KEY,
-                "ParentId" uuid NOT NULL REFERENCES restrictive_fk_parents ("Id") ON DELETE CASCADE
-            );
-            CREATE TABLE hidden_fk_grandchildren (
-                "Id" uuid PRIMARY KEY,
-                "ChildId" uuid NOT NULL REFERENCES hidden_fk_children ("Id")
-            );
-            INSERT INTO hidden_fk_children ("Id", "ParentId")
-                SELECT gen_random_uuid(), "Id" FROM restrictive_fk_parents
-                WHERE "Id" = ANY(ARRAY[{string.Join(", ", blockedIds.Select(id => $"'{id}'::uuid"))}]);
-            INSERT INTO hidden_fk_grandchildren ("Id", "ChildId")
-                SELECT gen_random_uuid(), "Id" FROM hidden_fk_children;
-            """
-        );
+        // Eight of the ten rows are held by a NO ACTION grandchild behind a CASCADE child the
+        // reference check can't see, so each is refused when tried, in whatever order discovery
+        // reaches them.
+        await AddHiddenGrandchildReferenceAsync(database.ConnectionString, blockedIds);
 
         var result = await SweepAsync(services, tenantId, asOf);
 
@@ -584,14 +564,18 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
         (await LoadSummaryAsync(database.ConnectionString, result.SweepId, typeof(ARestrictiveParent)))
             .Should().Be(new SummaryCounts(Affected: 2, Deferred: 0, Blocked: 8));
         (await LoadParentIdsAsync(services)).Should().BeEquivalentTo(blockedIds);
+        var commands = LoggedCommands(logs)
+            .Where(command => command.Text.Contains("FROM \"public\".\"restrictive_fk_parents\"", StringComparison.Ordinal))
+            .ToList();
         // Each batch's discovery carries at most a batch's worth of record ids, not every row
         // the run has blocked so far.
-        var discoveries = commands.Commands
-            .Where(command => command.Text.Contains("FROM \"public\".\"restrictive_fk_parents\"", StringComparison.Ordinal)
-                && command.Text.Contains("LIMIT $", StringComparison.Ordinal))
-            .ToList();
+        var discoveries = commands.Where(command => command.Text.Contains("LIMIT $", StringComparison.Ordinal)).ToList();
         discoveries.Should().HaveCountGreaterThanOrEqualTo(5);
         discoveries.Should().OnlyContain(command => command.ArrayElements <= 2);
+        // The positive control: the counts measured after the loop send every blocked id, so
+        // the log does show array parameters, and the check above can't pass by seeing none.
+        commands.Should().Contain(command =>
+            command.Text.Contains("pg_catalog.count(*)", StringComparison.Ordinal) && command.ArrayElements == blockedIds.Length);
     }
 
     [Theory]
@@ -624,19 +608,9 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
             END $$;
             CREATE TRIGGER guard_one_parent BEFORE DELETE ON restrictive_fk_parents
                 FOR EACH ROW EXECUTE FUNCTION guard_one_parent();
-            CREATE TABLE hidden_fk_children (
-                "Id" uuid PRIMARY KEY,
-                "ParentId" uuid NOT NULL REFERENCES restrictive_fk_parents ("Id") ON DELETE CASCADE
-            );
-            CREATE TABLE hidden_fk_no_action_grandchildren (
-                "Id" uuid PRIMARY KEY,
-                "ChildId" uuid NOT NULL REFERENCES hidden_fk_children ("Id")
-            );
-            INSERT INTO hidden_fk_children ("Id", "ParentId") VALUES (gen_random_uuid(), '{ids[1]}');
-            INSERT INTO hidden_fk_no_action_grandchildren ("Id", "ChildId")
-                SELECT gen_random_uuid(), "Id" FROM hidden_fk_children;
             """
         );
+        await AddHiddenGrandchildReferenceAsync(database.ConnectionString, [ids[1]]);
 
         var result = await SweepAsync(services, tenantId, asOf);
 
@@ -788,21 +762,7 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
             db.Parents.AddRange(nullIds.Select(id => Parent(id, tenant.Id, null, subjectId)));
             await db.SaveChangesAsync();
         }
-        await ExecuteAsync(
-            database.ConnectionString,
-            $"""
-            CREATE TABLE hidden_fk_children (
-                "Id" uuid PRIMARY KEY,
-                "ParentId" uuid NOT NULL REFERENCES restrictive_fk_parents ("Id") ON DELETE CASCADE
-            );
-            CREATE TABLE hidden_fk_grandchildren (
-                "Id" uuid PRIMARY KEY,
-                "ChildId" uuid NOT NULL REFERENCES hidden_fk_children ("Id")
-            );
-            INSERT INTO hidden_fk_children ("Id", "ParentId") VALUES (gen_random_uuid(), '{blockedId}');
-            INSERT INTO hidden_fk_grandchildren ("Id", "ChildId") SELECT gen_random_uuid(), "Id" FROM hidden_fk_children;
-            """
-        );
+        await AddHiddenGrandchildReferenceAsync(database.ConnectionString, [blockedId]);
 
         ErasureResult result;
         await using (var scope = services.CreateAsyncScope())
@@ -881,6 +841,40 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
         await command.ExecuteNonQueryAsync();
     }
 
+    /// <summary>
+    /// Holds <paramref name="parentIds"/> through a foreign key the model doesn't declare, so
+    /// the reference check can't see it: each parent gets a CASCADE child, which a NO ACTION
+    /// (or RESTRICT) grandchild references. Deleting the parent fails with SQLSTATE 23503.
+    /// </summary>
+    private static async Task AddHiddenGrandchildReferenceAsync(
+        string connectionString,
+        IReadOnlyCollection<Guid> parentIds,
+        bool restrict = false
+    )
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand(
+            $"""
+            CREATE TABLE hidden_fk_children (
+                "Id" uuid PRIMARY KEY,
+                "ParentId" uuid NOT NULL REFERENCES restrictive_fk_parents ("Id") ON DELETE CASCADE
+            );
+            CREATE TABLE hidden_fk_grandchildren (
+                "Id" uuid PRIMARY KEY,
+                "ChildId" uuid NOT NULL REFERENCES hidden_fk_children ("Id"){(restrict ? " ON DELETE RESTRICT" : "")}
+            );
+            INSERT INTO hidden_fk_children ("Id", "ParentId")
+                SELECT gen_random_uuid(), parent_id FROM unnest(@parentIds) AS parent_id;
+            INSERT INTO hidden_fk_grandchildren ("Id", "ChildId")
+                SELECT gen_random_uuid(), "Id" FROM hidden_fk_children;
+            """,
+            connection
+        );
+        command.Parameters.AddWithValue("parentIds", parentIds.ToArray());
+        await command.ExecuteNonQueryAsync();
+    }
+
     private static async Task<T> ScalarAsync<T>(string connectionString, string sql, params (string Name, object Value)[] parameters)
     {
         await using var connection = new NpgsqlConnection(connectionString);
@@ -944,7 +938,8 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
 
     private sealed record SummaryCounts(long Affected, long Deferred, long Blocked);
 
-    private sealed record LogEntry(LogLevel Level, string Message);
+    /// <summary>A log entry; <c>Fields</c> holds its structured state, the message template's named values.</summary>
+    private sealed record LogEntry(LogLevel Level, string Message, IReadOnlyDictionary<string, object?> Fields);
 
     private sealed class RecordingLogProvider : ILoggerProvider
     {
@@ -971,7 +966,15 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
                 Func<TState, Exception?, string> formatter
             )
             {
-                entries.Enqueue(new LogEntry(logLevel, formatter(state, exception)));
+                var fields = new Dictionary<string, object?>(StringComparer.Ordinal);
+                if (state is IEnumerable<KeyValuePair<string, object?>> values)
+                {
+                    foreach (var (key, value) in values)
+                    {
+                        fields[key] = value;
+                    }
+                }
+                entries.Enqueue(new LogEntry(logLevel, formatter(state, exception), fields));
             }
         }
     }
@@ -989,63 +992,33 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
     private sealed record LoggedCommand(string Text, int ArrayElements);
 
     /// <summary>
-    /// Every command Npgsql executes on the test's data source, with how many elements its
-    /// array parameters carry between them. Cohort runs its sweep SQL on the raw connection,
-    /// outside EF's command pipeline, so an EF interceptor wouldn't see it; Npgsql's own
-    /// command log does, parameters included when parameter logging is on.
+    /// Every command Npgsql logged, with how many elements its array parameters carry between
+    /// them. Cohort runs its sweep SQL on the raw connection, outside EF's command pipeline, so
+    /// an EF interceptor wouldn't see it; Npgsql's own command log does, parameters included
+    /// when parameter logging is on. Npgsql logs an array parameter as "[a, b, c]", cut off
+    /// after 10 elements with ", ...", so a count is exact only up to 10.
     /// </summary>
-    private sealed class RecordingCommandLog : ILoggerProvider
+    private static IEnumerable<LoggedCommand> LoggedCommands(RecordingLogProvider logs) =>
+        logs.Entries
+            .Where(entry => entry.Fields.GetValueOrDefault("CommandText") is string
+                && entry.Fields.GetValueOrDefault("Parameters") is object[])
+            .Select(entry => new LoggedCommand(
+                (string)entry.Fields["CommandText"]!,
+                ((object[])entry.Fields["Parameters"]!).Sum(CountArrayElements)
+            ));
+
+    private static int CountArrayElements(object? value) => value switch
     {
-        private readonly ConcurrentQueue<LoggedCommand> commands = new();
-
-        public IReadOnlyList<LoggedCommand> Commands => commands.ToArray();
-
-        public ILogger CreateLogger(string categoryName) => new CommandLogger(commands);
-
-        public void Dispose() { }
-
-        private sealed class CommandLogger(ConcurrentQueue<LoggedCommand> commands) : ILogger
-        {
-            public IDisposable? BeginScope<TState>(TState state)
-                where TState : notnull => null;
-
-            public bool IsEnabled(LogLevel logLevel) => true;
-
-            public void Log<TState>(
-                LogLevel logLevel,
-                EventId eventId,
-                TState state,
-                Exception? exception,
-                Func<TState, Exception?, string> formatter
-            )
-            {
-                if (state is not IEnumerable<KeyValuePair<string, object?>> fields)
-                {
-                    return;
-                }
-
-                var values = fields.ToDictionary(field => field.Key, field => field.Value, StringComparer.Ordinal);
-                if (values.GetValueOrDefault("CommandText") is string text && values.GetValueOrDefault("Parameters") is object[] parameters)
-                {
-                    commands.Enqueue(new LoggedCommand(text, parameters.Sum(CountArrayElements)));
-                }
-            }
-
-            /// <summary>Npgsql logs an array parameter's value as "[a, b, c]".</summary>
-            private static int CountArrayElements(object? value) => value switch
-            {
-                "[]" => 0,
-                string array when array.StartsWith('[') && array.EndsWith(']') => array.Split(", ").Length,
-                _ => 0,
-            };
-        }
-    }
+        "[]" => 0,
+        string array when array.StartsWith('[') && array.EndsWith(']') => array.Split(", ").Length,
+        _ => 0,
+    };
 
     private static ServiceProvider BuildServiceProvider(
         string connectionString,
         int? batchSize = null,
         Action<IServiceCollection>? configure = null,
-        RecordingCommandLog? commandLog = null
+        bool logCommands = false
     )
     {
         var services = new ServiceCollection();
@@ -1059,21 +1032,22 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
                 .Build()
         );
         services.AddLogging();
-        if (commandLog is null)
+        if (logCommands)
+        {
+            // Npgsql logs its commands to the provider's own logger factory. Built by the
+            // provider, so the provider disposes the data source with everything else.
+            services.AddSingleton(provider => new NpgsqlDataSourceBuilder(connectionString)
+                .UseLoggerFactory(provider.GetRequiredService<ILoggerFactory>())
+                .EnableParameterLogging()
+                .Build());
+            services.AddDbContext<RestrictiveForeignKeyDbContext>((provider, options) =>
+                options.UseNpgsql(provider.GetRequiredService<NpgsqlDataSource>()));
+        }
+        else
         {
             services.AddDbContext<RestrictiveForeignKeyDbContext>(options =>
                 options.UseNpgsql(connectionString)
             );
-        }
-        else
-        {
-            var dataSource = new NpgsqlDataSourceBuilder(connectionString)
-                .UseLoggerFactory(LoggerFactory.Create(logging => logging.AddProvider(commandLog)))
-                .EnableParameterLogging()
-                .Build();
-            // Registered so the provider disposes it.
-            services.AddSingleton(dataSource);
-            services.AddDbContext<RestrictiveForeignKeyDbContext>(options => options.UseNpgsql(dataSource));
         }
         services.AddSingleton<IRetentionRuleProvider>(new PurgeCategoryRepository());
         services.AddSingleton(RetentionExecutionScope.Unisolated);

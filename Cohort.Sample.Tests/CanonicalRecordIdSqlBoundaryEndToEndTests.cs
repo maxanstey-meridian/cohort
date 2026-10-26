@@ -251,9 +251,12 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
     public async Task A_Sweep_In_Small_Batches_Reaches_Every_Row_Whatever_Its_Key_And_Anchor_Types()
     {
         // Each batch continues after the last (anchor, record-id text) the run reached. Numeric
-        // ids sort differently as text ("10" before "2"), citext compares case-insensitively,
-        // and anchors (a DateTime and a DateTimeOffset, both timestamptz) must be compared as
-        // themselves, not through text in the session's time zone (here far from UTC). A cursor
+        // ids sort differently as text ("10" before "2"), and citext compares case-insensitively.
+        // The anchors (a DateTime and a DateTimeOffset, both timestamptz) must be bound back as
+        // timestamptz: the session's time zone, UTC+14, catches a cursor bound as timestamp
+        // without time zone, which PostgreSQL would read as local time, 14 hours off. The
+        // DateTimeOffset anchor is timestamptz(3): Npgsql reports its type as "timestamp(3) with
+        // time zone", which a cursor bound by that name would misread as timestamp. A cursor
         // that disagreed with discovery's order would skip rows and leave them deferred.
         await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
         var connectionString = new NpgsqlConnectionStringBuilder(database.ConnectionString) { Timezone = "Pacific/Kiritimati" }

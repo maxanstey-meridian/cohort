@@ -87,9 +87,11 @@ snapshot, so once the handler or the id is back, [requeue it](#requeuing-dead-le
 
 Upgrading from 0.10, a handler that passed `identity` to `AddRowHandler` keeps its queued work
 by carrying the same UUID in `[RowHandlerId]`. A class registered for several entities with a
-different `identity` each now carries one id, so the other identities' work would be
-orphaned: split it into one class per entity, each with its old UUID, or re-key the other
-identities' rows to the class's id (the `UPDATE` in the 0.11.0 changelog entry). Work queued
+different `identity` each now carries one id, so the other identities' work dead-letters as
+unregistered: split it into one class per entity, each with its old UUID, or re-key the other
+identities' rows to the class's id (the `UPDATE` in the 0.11.0 changelog entry). Two classes
+that shared one `identity` on different entities can't share it now: give one a new id and
+move only its entity's work (the entity-scoped `UPDATE` in the same entry). Work queued
 under a type name, by a handler registered without `identity`, must be drained on 0.10 or
 re-keyed the same way.
 

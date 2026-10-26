@@ -430,7 +430,8 @@ internal sealed class RetentionRun(
     /// raises for RESTRICT and NO ACTION alike, directly or through a cascade) depends on each
     /// row's children, and mixed refusals mean row-level causes, so those rows are only blocked
     /// and the run moves on. An update never changes a referenced key (readiness refuses
-    /// one an anonymise, a soft-delete or the anonymised-at marker writes), so a foreign key refusing it refuses the value the rule writes.
+    /// one an anonymise, a soft-delete or the anonymised-at marker writes), so a foreign key
+    /// refusing it refuses the value the rule writes.
     /// </summary>
     private static DbException? SchemaWideRefusal(Strategy strategy, IReadOnlyList<DbException> failures)
     {
@@ -453,9 +454,9 @@ internal sealed class RetentionRun(
     /// its own transaction, so a large backlog retires incrementally and a failure loses only
     /// the current batch. In the caller's transaction the batches still bound each statement,
     /// but none commits on its own: the entity's savepoint and the caller's commit decide.
-    /// Each batch continues after the last row the previous one reached, so no row is tried
-    /// twice in a run and each batch's discovery costs one batch however many rows came
-    /// before. Rows a constraint refuses are blocked and counted once the loop is done; a
+    /// Each batch continues after the last row the previous one reached, so a row is tried
+    /// again only if its anchor moves past the run's position, and each batch's discovery
+    /// costs one batch however many rows came before. Rows a constraint refuses are blocked and counted once the loop is done; a
     /// full batch in which every row is refused by the same constraint, other than a foreign
     /// key refusing a delete, fails the entity, since the cause is then the rule or the
     /// schema rather than the rows, and bisecting the rest of the table would find the same.

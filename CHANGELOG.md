@@ -88,7 +88,7 @@ unprotected without an error.
   `RequeueDeadLetteredAsync` and the payload-retention scrub still run.
 - Results report what a run left: `EntitySweepCount` and `SweepEvent.EntitySummary` gain
   `RetainedCount` (kept by a legal minimum or an Exempt rule), `DeferredCount` (still due but
-  not reached) and `BlockedCount`; `SweepEvent.EntityProgress` gains `BlockedCount`. Every
+  left by the run) and `BlockedCount`; `SweepEvent.EntityProgress` gains `BlockedCount`. Every
   count on `EntitySweepCount` is now a required constructor argument. `ErasureResult.Complete`
   is true only when nothing of the subject is left.
 - `sweep_run_entity_summary` gains `RetainedCount`, `DeferredCount` and `BlockedCount`
@@ -115,7 +115,9 @@ unprotected without an error.
   on from the last row the previous one reached instead of re-sending every row the run had
   blocked so far, which cost a run with a million blocked rows about 4 GB of ids. A row another
   transaction has locked when the run reaches it is now left for the next run (counted in
-  `DeferredCount`) rather than tried again by a later batch of the same run.
+  `DeferredCount`) rather than tried again by a later batch of the same run. So is a row that
+  comes into scope mid-run behind the rows the run has already passed (a released hold, a
+  backfilled old row); an erasure reports it as `rows-missed`.
 - `OnBeforeAsync` runs in a read-only savepoint that is always rolled back. A database error
   in a handler skips only its row instead of failing the batch, and a handler that writes
   through its `DbContext` now fails (`sqlstate:25006`). Handlers get a `DbContext` of their
@@ -156,9 +158,12 @@ unprotected without an error.
   cleared a row's snapshot once all its handlers had finished, so work 0.10 dead-lettered
   can't be requeued. A handler that already passed `identity` keeps its work by putting the
   same UUID in its attribute. A class 0.10 registered for several entities with a different
-  `identity` each now carries one id, so the other identities' work is orphaned: split the
-  class into one per entity, each with its old UUID, or re-key the other identities' rows to
-  the class's id with the `UPDATE` above.
+  `identity` each now carries one id, so the other identities' work dead-letters as
+  unregistered: split the class into one per entity, each with its old UUID, or re-key the
+  other identities' rows to the class's id with the `UPDATE` above. 0.10 also let two classes
+  share one `identity` on different entities, which 0.11 refuses: give one a new
+  `[RowHandlerId]` and move only its entity's work,
+  `UPDATE <schema>.sweep_row_handler_status SET "HandlerType" = CAST('<new uuid>' AS uuid)::text WHERE "HandlerType" = '<shared uuid>' AND "State" IN (0, 1, 3) AND "SweepRunRowDetailId" IN (SELECT "Id" FROM <schema>.sweep_run_row_detail WHERE "RetentionEntityId" = '<its entity's [RetentionEntityId]>');`
 - Dead-lettered `OnAfterAsync` work keeps its snapshot until
   `RowHandlerDispatch:PayloadRetention`, and the new
   `IRetentionRowDispatcher.RequeueDeadLetteredAsync(sweepId, handlerId)` requeues it: every

@@ -112,7 +112,8 @@ internal abstract class SweepStrategy(
     /// entity that the run did not record (as skipped by a failing OnBefore) or find
     /// <paramref name="blocked"/>: locked by another transaction when discovery passed them,
     /// or come into scope mid-run behind the run's position. Measured once after the loop
-    /// rather than per batch, and sends the blocked ids once. Referenced rows aren't due, so blocked rows are never counted twice.
+    /// rather than per batch, and sends the blocked ids once. Referenced rows aren't due, so
+    /// blocked rows are never counted twice.
     /// </summary>
     public async Task<long> CountDeferredAsync(
         SweepScope scope,

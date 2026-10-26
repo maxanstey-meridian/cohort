@@ -4,6 +4,7 @@ using Cohort.Hosting;
 using Cohort.Sample.Entities;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 
 using Npgsql;
 
@@ -412,6 +413,73 @@ public sealed class SweepConcurrencyAndVolumeEndToEndTests(PostgresFixture fixtu
         remainingIds.Should().BeEquivalentTo(ids[..2]);
     }
 
+    [Fact]
+    public async Task A_Row_Locked_When_The_Sweep_Passes_It_Is_Deferred_Though_Released_Before_The_Run_Ends()
+    {
+        // Each batch continues after the last row the previous one reached, so a row skipped
+        // because another transaction held it isn't met again in this run, even once free.
+        var tenantId = Guid.NewGuid();
+        var asOf = new DateTimeOffset(2026, 4, 13, 12, 0, 0, TimeSpan.Zero);
+        var ids = Enumerable.Range(0, 4).Select(_ => Guid.NewGuid()).ToArray();
+
+        await using (var db = Host.CreateDbContext())
+        {
+            db.Notes.AddRange(
+                ids.Select((id, index) => new Note
+                {
+                    Id = id,
+                    TenantId = tenantId,
+                    CreatedAt = asOf.AddDays(-120).AddMinutes(index),
+                    Body = $"released-lock-{index}",
+                })
+            );
+            await db.SaveChangesAsync();
+        }
+
+        var blocker = await LockRowAsync("notes", ids[0]);
+        await using var blockerConnection = blocker.Connection!;
+        var released = false;
+        var observer = new FirstNoteProgressObserver
+        {
+            // Observers run after each batch commits and before the next begins: the oldest
+            // row is free from the second batch on.
+            OnFirstNoteProgress = async () =>
+            {
+                await blocker.RollbackAsync();
+                released = true;
+            },
+        };
+        using var host = new CohortTestHost(
+            GetConnectionString(),
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                [$"{CohortOptions.SectionName}:SweepBatchSize"] = "1",
+            },
+            configureServices: services => services.AddSingleton<IRetentionAuditObserver>(observer)
+        );
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var result = await host.RunSweepAsync(
+            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
+            asOf,
+            timeout.Token
+        );
+
+        released.Should().BeTrue();
+        result.EntityFailures.Should().BeEmpty();
+        result
+            .Counts.Should()
+            .ContainSingle(count => count.EntityType == typeof(Note))
+            .Which.Should()
+            .Match<EntitySweepCount>(count => count.Affected == ids.Length - 1 && count.DeferredCount == 1);
+
+        await using var verify = Host.CreateDbContext();
+        var remainingIds = await verify.Notes
+            .Where(note => note.TenantId == tenantId)
+            .Select(note => note.Id)
+            .ToListAsync();
+        remainingIds.Should().Equal(ids[0]);
+    }
+
     private string GetConnectionString()
     {
         using var db = Host.CreateDbContext();
@@ -627,4 +695,24 @@ public sealed class SweepConcurrencyAndVolumeEndToEndTests(PostgresFixture fixtu
 
     [RowHandlerId("bff19ce7-59f5-4f29-b53c-9983f0f02d98")]
     private sealed class ConcurrentNoteHandler : IRetentionHandler<Note>;
+
+    private sealed class FirstNoteProgressObserver : IRetentionAuditObserver
+    {
+        private int fired;
+
+        public Func<Task>? OnFirstNoteProgress { get; init; }
+
+        public async Task OnCommittedAsync(SweepEvent evt, CancellationToken ct)
+        {
+            if (
+                evt is SweepEvent.EntityProgress { Affected: > 0 } progress
+                && progress.EntityType == typeof(Note)
+                && Interlocked.Exchange(ref fired, 1) == 0
+                && OnFirstNoteProgress is not null
+            )
+            {
+                await OnFirstNoteProgress();
+            }
+        }
+    }
 }

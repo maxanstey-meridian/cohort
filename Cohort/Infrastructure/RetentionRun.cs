@@ -205,7 +205,12 @@ internal sealed class RetentionRun(
         CancellationToken ct
     )
     {
-        plan = await ReferencingForeignKeySql.AttachAsync(db.Database.GetDbConnection(), plan, ct);
+        plan = await ReferencingForeignKeySql.AttachAsync(
+            db.Database.GetDbConnection(),
+            plan,
+            strategies[Strategy.Purge].HasDependents,
+            ct
+        );
         foreach (var scope in RetentionExecutionPlanOrderer.Order(db, plan, scope => scope.Entry, logger))
         {
             // In the caller's transaction a failed statement would abort everything after it,

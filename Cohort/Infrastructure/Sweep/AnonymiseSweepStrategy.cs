@@ -1,5 +1,6 @@
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Infrastructure.Holds;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -11,9 +12,11 @@ internal sealed class AnonymiseSweepStrategy(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
     AnonymiseAssignmentResolver assignments,
     IEnumerable<IRetentionHandlerRegistration> handlerRegistrations,
+    IEnumerable<IRetentionDependentsRegistration> dependentsRegistrations,
+    RetentionHoldGuard holdGuard,
     IServiceScopeFactory scopeFactory,
     ILogger<AnonymiseSweepStrategy> logger
-) : SweepStrategy(db, handlerRegistrations, scopeFactory, logger)
+) : SweepStrategy(db, handlerRegistrations, dependentsRegistrations, holdGuard, scopeFactory, logger)
 {
     public override Strategy HandlesStrategy => Strategy.Anonymise;
 

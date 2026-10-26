@@ -239,6 +239,7 @@ internal sealed partial class RetentionStartupValidator(
                 }
             }
 
+            ValidateRowWorkTargetsRetainedEntities(errors);
             ValidateErasureSubjectKinds(errors);
 
             try
@@ -297,6 +298,28 @@ internal sealed partial class RetentionStartupValidator(
                 $"[ErasureSubject(\"{kind.Key}\")] columns must all hold one CLR type (after nullable unwrapping), but they hold {string.Join(", ", subjectTypes.Select(type => type.Name).Order(StringComparer.Ordinal))}: {string.Join(", ", found)}. Give each sort of subject its own kind."
             );
         }
+    }
+
+    // Handlers and steps run only where Cohort mutates a row, so one on an entity Cohort never
+    // retains would never run.
+    private void ValidateRowWorkTargetsRetainedEntities(List<string> errors)
+    {
+        var retained = db.Model.GetEntityTypes()
+            .Select(entityType => entityType.ClrType)
+            .Where(clrType => clrType.GetCustomAttribute<RetainAttribute>(inherit: false) is not null)
+            .ToHashSet();
+        errors.AddRange(
+            handlerServices.Registrations()
+                .Select(registration => (Role: "Row handler", Type: registration.HandlerType, registration.EntityType, Method: "AddRowHandler"))
+                .Concat(handlerServices.DependentsRegistrations()
+                    .Select(registration => (Role: "Dependents step", Type: registration.StepType, registration.EntityType, Method: "AddRetentionDependents")))
+                .Where(registration => !retained.Contains(registration.EntityType))
+                .OrderBy(registration => registration.EntityType.FullName, StringComparer.Ordinal)
+                .ThenBy(registration => registration.Type.FullName, StringComparer.Ordinal)
+                .Select(registration =>
+                    $"{registration.Role} {registration.Type.FullName} is registered for {registration.EntityType.FullName}, which isn't a [Retain] entity in the DbContext model, so it would never run. Annotate the entity with [Retain], or remove its {registration.Method} registration."
+                )
+        );
     }
 
     private static bool ValidateRelationalMappingShape(

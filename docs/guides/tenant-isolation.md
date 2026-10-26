@@ -53,7 +53,7 @@ RetentionExecutionContext.System(RetentionSystemWork Work)
 | History pruning | `System(HistoryPruning)` |
 | Startup readiness | `System(Readiness)` |
 | Readiness's cross-tenant hold check, whichever operation runs readiness first | `System(Readiness)` |
-| `IRetentionDeletion`'s check that your scope sees every hold on a tenantless row, in a model with tenantless entities | `System(Readiness)` |
+| `IRetentionDeletion`'s, and each batch with a dependents step's, check that its scope sees every hold on a tenantless row, in a model with tenantless entities | `System(Readiness)` |
 
 The first operation can be any of the above, `IRetentionHoldsRepository`,
 `IRetentionDeletion` or a `Caller` erasure. Apart from those `System(Readiness)` scopes,

@@ -60,7 +60,8 @@ internal sealed record SweepScope(
     public bool SkipLocked => Subject is null;
 
     /// <summary>
-    /// Foreign keys whose referencing rows keep a row from being deleted (Purge only; see
+    /// Foreign keys whose referencing rows keep a row from being deleted (Purge only, and
+    /// none for an entity with a dependents step; see
     /// <see cref="ReferencingForeignKeySql.AttachAsync"/>). Referenced rows are left out of
     /// the candidates and counted as blocked.
     /// </summary>

@@ -59,8 +59,16 @@ internal sealed class RetentionPreviewService(
                 plan.Add(SweepScope.ForSweep(entry, rule, context, timeZone));
             }
 
-            // The blocking keys for every scope in one catalog read, as a run reads them.
-            foreach (var scope in await ReferencingForeignKeySql.AttachAsync(connection, plan, ct))
+            // The blocking keys for every scope in one catalog read, as a run reads them. A
+            // step entity's referenced rows count as eligible: the preview predicts that its
+            // step clears them, the only prediction possible without running host code.
+            var attached = await ReferencingForeignKeySql.AttachAsync(
+                connection,
+                plan,
+                strategies[Strategy.Purge].HasDependents,
+                ct
+            );
+            foreach (var scope in attached)
             {
                 var entry = scope.Entry;
                 var rule = scope.Rule;

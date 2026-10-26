@@ -63,7 +63,10 @@ Both methods are optional. The interface supplies no-op defaults.
   as a scoped "current user" isn't there. State your
   [execution scope](/guides/tenant-isolation) sets up, or an `AsyncLocal` flow, still is. A
   cancellation the handler raises itself, such as an `HttpClient` timeout, is a failure like
-  any other; only the run's own token stops the run. External side effects still belong in `OnAfterAsync`: they survive a rollback,
+  any other; only the run's own token stops the run. Writes that must commit with the row,
+  such as deleting or blanking what depends on it, belong in a
+  [dependents step](#retiring-a-rows-dependents), which runs after every `OnBeforeAsync`.
+  External side effects still belong in `OnAfterAsync`: they survive a rollback,
   they run while the batch holds its row locks, and they can run for a row that's then
   withheld, for example by a hold created mid-sweep or a constraint that refuses the change.
   A write to the row being swept through another connection waits on the sweep's own row
@@ -97,6 +100,81 @@ re-keyed the same way.
 
 When an entity has several handlers, they run in `[RowHandlerPriority(n)]` order, lowest
 first. Handlers without the attribute run last, ordered by type name.
+
+## Retiring a row's dependents
+
+Some rows have dependents that must go with them, in the same transaction: child rows a
+foreign key ties to the row, or copies of its values in an audit table. `OnBeforeAsync` is
+read-only and `OnAfterAsync` runs after commit, so neither can do it. A dependents step can.
+
+```csharp
+[RowHandlerId("6c0e2b9a-41f7-4c3e-8d25-0b7a9f1e6d34")]
+public sealed class RetireCaseDependents(AppDbContext db) : IRetentionDependents<Case>
+{
+    public async Task RetireAsync(Case row, RetentionDependentsContext ctx, CancellationToken ct)
+    {
+        await db.ExportDeliveries.Where(delivery => delivery.CaseId == row.Id).ExecuteDeleteAsync(ct);
+        await db.CaseAuditEvents
+            .Where(audit => audit.CaseId == row.Id)
+            .ExecuteUpdateAsync(set => set.SetProperty(audit => audit.FieldChanges, (string?)null), ct);
+    }
+}
+```
+
+```csharp
+builder.Services.AddRetentionDependents<Case, RetireCaseDependents>();
+```
+
+- **One step per entity.** `AddRetentionDependents` refuses a second class for an entity, so
+  compose several kinds of dependents in one class. It's the only way to register a step:
+  startup refuses an `IRetentionDependents<T>` service in any other shape, as it does a row
+  handler's. The class carries a `[RowHandlerId]`, in the same id space as row handlers: no
+  other handler or step class may use its id, though one class may be both the row handler and
+  the step of the same entity under one id.
+- **Order.** For each row: every `OnBeforeAsync` captures first, so captures see the database
+  before anything is retired; then the step; then Cohort's own change to the row. The step
+  runs read-write on the batch scope's `DbContext`, the one handlers get, on the run's
+  connection and transaction and as the batch's tenant. An entity with a step is always
+  changed row by row, never in one bulk statement.
+- **One savepoint.** The step and the row's change share a savepoint. If a constraint then
+  refuses the change, for example because the row is still referenced, the rollback undoes
+  the step too and the row counts as blocked (`BlockedCount`), so dependents never go without
+  their row. The next run tries the row, and its step, again.
+- **Failures skip the row.** Its writes are rolled back, and the row counts in `SkippedCount`
+  (`rows-skipped`, so the run settles `PartiallyFailed`), with a row detail and a dead-lettered
+  status under the step's id whose `LastError` says why. The step fails when it throws,
+  including a database error or a constraint its own statements hit; when it returns with
+  unsaved changes on its context (`reason=dependents-unsaved-changes`); when it changes a held
+  row (`reason=dependents-changed-held-row`, below); or when it takes its own row out of the
+  run's scope, so Cohort's change finds nothing (`reason=dependents-changed-row`). Only the
+  run's own token stops the run. A step queues no work, so there is nothing to requeue: the
+  next run tries the row again.
+- **Holds.** Any change to, or removal of, a row under an active hold fails the step, whatever
+  the row's entity. An `UPDATE` that writes the same value counts as a change. Cohort compares
+  every visible held row's physical version before and after the step, so the check is
+  fail-safe rather than exact: a hold created anywhere the batch can see while the step runs,
+  or another session's committed update to a held row, also fails it, and the next run retries
+  the row. A Warning names the holds' ids, never the rows. Dependents' legal minimums aren't
+  enforced; a hold is the row-specific protection the step honours, as
+  [`IRetentionDeletion`](/guides/legal-holds#deleting-around-holds) does. When the model has a tenantless retained entity,
+  a tenant's batch must be able to see the active `NULL`-tenant holds, or the entity fails
+  rather than run a step that can't check them (see [Tenant Isolation](/guides/tenant-isolation)).
+- **Foreign keys and previews.** A purge normally leaves out rows still referenced through a
+  `RESTRICT` or `NO ACTION` foreign key. An entity with a step doesn't: its referenced rows are
+  tried, the step runs, and a row still referenced after it is blocked by the constraint
+  itself. Previews and dry runs, a dry-run erasure's `Complete` included, never run the step,
+  so they predict that it clears the references: referenced rows count as eligible, not
+  blocked. A row whose references the step can't clear runs the step once per run, rolled
+  back each time.
+- **Caller-transaction erasures.** In an erasure that joins your transaction, the step runs
+  inside it, on its own context, never yours. Cohort doesn't set `SET CONSTRAINTS ALL
+  IMMEDIATE` in your transaction, so a deferred constraint the step violates fails your
+  `COMMIT`, as one Cohort's own change violates does. In Cohort's own batches constraints are
+  immediate, so the same violation fails the step's statement (a skip) or the row's change (a
+  block).
+- **Locks.** The step runs while the batch holds its row and entity locks, so a slow step
+  makes hold creation on those rows wait. A deadlock or lock timeout in the step fails that
+  row's step, not the batch.
 
 ## Delivery
 

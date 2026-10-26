@@ -23,7 +23,7 @@ entity and the problem.
 - `[RetentionTenantless]` isn't combined with a tenant property. Otherwise the tenant property
   would win and the marker would be silently ignored.
 
-## Row handlers
+## Row handlers and dependents steps
 
 - Every [row handler](/guides/row-handlers) carries a `[RowHandlerId]` holding a non-empty
   UUID, and no two handler classes share an id, whatever their entities. `AddRowHandler`
@@ -31,6 +31,15 @@ entity and the problem.
   registered for two entities keeps its one id.
 - Every `IRetentionHandler<T>` service is registered once, through `AddRowHandler`, as
   scoped. A handler registered any other way is refused and named.
+- Every [dependents step](/guides/row-handlers#retiring-a-rows-dependents) carries a
+  `[RowHandlerId]` in the same id space: `AddRetentionDependents` refuses a missing or
+  malformed id, an id another step or handler class uses (unless that class is the row handler
+  of the same entity), and a second step for an entity.
+- Every `IRetentionDependents<T>` service is registered once, through
+  `AddRetentionDependents`, as scoped. A step registered any other way is refused and named.
+- A row handler or dependents step registered for an entity that isn't a `[Retain]` entity in
+  the `DbContext` model is refused and named: it would never run.
+- On a host that was never started, every Cohort operation refuses these too.
 
 ## Rules and capabilities
 

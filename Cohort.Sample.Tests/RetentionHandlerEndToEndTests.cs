@@ -1454,7 +1454,6 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     AnonymisedContact,
                     AnonymisedContactErasureTrackingHandler
                 >();
-                services.AddRowHandler<ErasureSubjectRecord, ExemptErasureTrackingHandler>();
             }
         );
 
@@ -1585,12 +1584,6 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
             .Contain(type =>
                 type == HandlerIdOf<AnonymisedContactErasureTrackingHandler>()
             );
-        statuses
-            .Select(status => status.HandlerType)
-            .Should()
-            .NotContain(type =>
-                type == HandlerIdOf<ExemptErasureTrackingHandler>()
-            );
 
         await handlerHost.RunWithServicesAsync(async serviceProvider =>
         {
@@ -1716,7 +1709,6 @@ public sealed class RetentionHandlerEndToEndTests(PostgresFixture fixture)
                     AnonymisedContact,
                     AnonymisedContactErasureTrackingHandler
                 >();
-                services.AddRowHandler<ErasureSubjectRecord, ExemptErasureTrackingHandler>();
             }
         );
 
@@ -4154,28 +4146,6 @@ file sealed class AnonymisedContactErasureTrackingHandler(HandlerExecutionSink s
     public Task OnAfterAsync(RetentionAfterContext<AnonymisedContact> ctx, CancellationToken ct)
     {
         sink.AfterCalls.Add($"after-contact:{ctx.Snapshot["email"]}:{ctx.Attempt}");
-        return Task.CompletedTask;
-    }
-}
-
-[RowHandlerId("1a7bcdd6-7d8f-422c-8f60-772ff688a4b4")]
-file sealed class ExemptErasureTrackingHandler(HandlerExecutionSink sink)
-    : IRetentionHandler<ErasureSubjectRecord>
-{
-    public Task OnBeforeAsync(
-        ErasureSubjectRecord row,
-        RetentionBeforeContext ctx,
-        CancellationToken ct
-    )
-    {
-        sink.BeforeCalls.Add($"exempt:{row.Body}");
-        ctx.Snapshot["body"] = row.Body;
-        return Task.CompletedTask;
-    }
-
-    public Task OnAfterAsync(RetentionAfterContext<ErasureSubjectRecord> ctx, CancellationToken ct)
-    {
-        sink.AfterCalls.Add($"after-exempt:{ctx.Snapshot["body"]}:{ctx.Attempt}");
         return Task.CompletedTask;
     }
 }

@@ -142,3 +142,13 @@ Cohort.Application.RowDispatcherFlushResult.DeadLetteredRequeueable.get -> long
 Cohort.Application.RowDispatcherFlushResult.DeadLetteredRequeueable.init -> void
 Cohort.Hosting.RowHandlerDispatchOptions.MaxBackoff.get -> System.TimeSpan
 Cohort.Hosting.RowHandlerDispatchOptions.MaxBackoff.init -> void
+Cohort.Application.IRetentionDependents<TEntity>
+Cohort.Application.IRetentionDependents<TEntity>.RetireAsync(TEntity row, Cohort.Domain.RetentionDependentsContext! ctx, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task!
+Cohort.Domain.RetentionDependentsContext
+Cohort.Domain.RetentionDependentsContext.At.get -> System.DateTimeOffset
+Cohort.Domain.RetentionDependentsContext.Category.get -> string!
+Cohort.Domain.RetentionDependentsContext.RetentionDependentsContext(System.Guid sweepId, string! category, Cohort.Domain.Strategy strategy, System.Guid tenantId, System.DateTimeOffset at) -> void
+Cohort.Domain.RetentionDependentsContext.Strategy.get -> Cohort.Domain.Strategy
+Cohort.Domain.RetentionDependentsContext.SweepId.get -> System.Guid
+Cohort.Domain.RetentionDependentsContext.TenantId.get -> System.Guid
+static Cohort.Hosting.ServiceCollectionExtensions.AddRetentionDependents<TEntity, TStep>(this Microsoft.Extensions.DependencyInjection.IServiceCollection! services) -> Microsoft.Extensions.DependencyInjection.IServiceCollection!

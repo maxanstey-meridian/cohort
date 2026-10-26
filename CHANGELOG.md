@@ -136,6 +136,22 @@ unprotected without an error.
   generic `IRetentionHandler<>`), or registering one handler twice, fails startup and names the handler; on
   a host that was never started, every Cohort operation refuses it. An open-generic handler
   that used to run for every entity is refused: register it per entity.
+- `IRetentionDependents<TEntity>`, registered with `AddRetentionDependents<TEntity, TStep>()`
+  (one per entity), retires what depends on a row (deletes or blanks it) in the row's own
+  transaction, after every `OnBeforeAsync` and before Cohort's change to the row, under the
+  same savepoint. A failure skips the row (`rows-skipped`, dead-lettered under the step's
+  `[RowHandlerId]` with `LastError`, including `reason=dependents-unsaved-changes`,
+  `reason=dependents-changed-held-row` and `reason=dependents-changed-row`), and a constraint
+  refusing the change undoes the step and blocks the row. Any change it makes to, or removal
+  of, a row under an active hold fails it, an `UPDATE` writing the same value included. A
+  Purge entity with a step isn't pre-filtered by referencing foreign keys: its rows are
+  blocked only if still referenced after the step, and previews and dry runs count them as
+  eligible. An entity with a step is always changed row by row. In a caller-transaction
+  erasure the step runs in the caller's transaction, and a deferred constraint it violates
+  fails the caller's commit. See "Retiring a row's dependents" in the row-handlers guide.
+- Startup refuses a row handler registered for an entity that isn't a `[Retain]` entity in the
+  model (an `[ExemptFromRetention]` or unannotated one, or one outside the `DbContext`); it was
+  accepted and never ran. Upgrade: remove the registration, or retain the entity.
 - Row handlers need `[RowHandlerId("uuid")]`, and `AddRowHandler` loses its `identity`
   parameter: it refuses a handler without the attribute, with a malformed one, or with an id
   another handler class already carries, whatever its entity. Queued work is persisted and

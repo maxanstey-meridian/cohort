@@ -25,3 +25,35 @@ internal sealed record RetentionHandlerRegistration<TEntity, THandler>(
 
     public Type HandlerType { get; } = typeof(THandler);
 }
+
+internal interface IRetentionDependentsRegistration
+{
+    internal Type EntityType { get; }
+
+    internal Type StepType { get; }
+
+    internal Guid Identity { get; }
+}
+
+// Closed over the entity/step pair for the same reason as RetentionHandlerRegistration:
+// TryAddEnumerable dedupes instance descriptors by the instance's concrete type.
+internal sealed record RetentionDependentsRegistration<TEntity, TStep>(Guid Identity)
+    : IRetentionDependentsRegistration
+    where TStep : IRetentionDependents<TEntity>
+{
+    public Type EntityType { get; } = typeof(TEntity);
+
+    public Type StepType { get; } = typeof(TStep);
+}
+
+internal static class RetentionDependentsRegistrations
+{
+    /// <summary>
+    /// The dependents step registered for <paramref name="entityType"/>, or null without one.
+    /// <c>AddRetentionDependents</c> allows one per entity.
+    /// </summary>
+    public static IRetentionDependentsRegistration? StepFor(
+        this IEnumerable<IRetentionDependentsRegistration> registrations,
+        Type entityType
+    ) => registrations.SingleOrDefault(registration => registration.EntityType == entityType);
+}

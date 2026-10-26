@@ -1,8 +1,13 @@
+using System.Data;
+
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Infrastructure;
+using Cohort.Infrastructure.Holds;
 using Cohort.Sample.Entities;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
 
 using Npgsql;
@@ -475,6 +480,75 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
         await using var verify = host.CreateDbContext();
         (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
         (await verify.HeldRecords.AnyAsync(hold => hold.HoldId == holdId)).Should().BeTrue();
+    }
+
+    public enum HeldRowWork
+    {
+        RewriteHeldRowUnchanged,
+        DeleteHeldRow,
+        RewriteUnheldRow,
+        HoldCreatedDuringWork,
+    }
+
+    [Theory]
+    [InlineData(HeldRowWork.RewriteHeldRowUnchanged, true, false)]
+    [InlineData(HeldRowWork.DeleteHeldRow, true, true)]
+    [InlineData(HeldRowWork.RewriteUnheldRow, false, false)]
+    [InlineData(HeldRowWork.HoldCreatedDuringWork, true, false)]
+    public async Task Hold_Guard_Flags_Held_Rows_The_Work_Changed_Or_Removed_And_Holds_That_Appeared(
+        HeldRowWork work,
+        bool stepViolation,
+        bool deletionViolation
+    )
+    {
+        var tenantId = Guid.NewGuid();
+        var heldId = Guid.NewGuid();
+        var unheldId = Guid.NewGuid();
+        var holdId = Guid.NewGuid();
+        var lateHoldId = Guid.NewGuid();
+        await SeedNotesAsync(tenantId, heldId, unheldId);
+        await CreateHoldAsync(new RetentionHoldRequest(holdId, RetentionEntityIdentity.For<Note>(), heldId.ToString(), tenantId, "guarded", DateTimeOffset.UtcNow));
+
+        var (changed, removed) = await Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext);
+            var guard = new RetentionHoldGuard(
+                db,
+                services.GetRequiredService<RetentionRegistry>(),
+                services.GetRequiredService<IServiceScopeFactory>()
+            );
+            await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+            var connection = db.Database.GetDbConnection();
+            var dbTransaction = transaction.GetDbTransaction();
+            var baseline = await guard.ReadHeldRowVersionsAsync(connection, dbTransaction, CancellationToken.None);
+
+            switch (work)
+            {
+                case HeldRowWork.RewriteHeldRowUnchanged:
+                    // Writes the same value: still a new row version, so still a change to a held row.
+                    await db.Database.ExecuteSqlAsync($"UPDATE notes SET \"Body\" = \"Body\" WHERE \"Id\" = {heldId}");
+                    break;
+                case HeldRowWork.DeleteHeldRow:
+                    await db.Database.ExecuteSqlAsync($"DELETE FROM notes WHERE \"Id\" = {heldId}");
+                    break;
+                case HeldRowWork.RewriteUnheldRow:
+                    await db.Database.ExecuteSqlAsync($"UPDATE notes SET \"Body\" = 'rewritten' WHERE \"Id\" = {unheldId}");
+                    break;
+                case HeldRowWork.HoldCreatedDuringWork:
+                    // Committed by another session while the work's transaction is open.
+                    await CreateHoldAsync(new RetentionHoldRequest(lateHoldId, RetentionEntityIdentity.For<Note>(), unheldId.ToString(), tenantId, "late", DateTimeOffset.UtcNow));
+                    break;
+            }
+
+            IReadOnlyList<Guid> changed = await guard.ReadChangedHeldRowsAsync(baseline, connection, dbTransaction, CancellationToken.None);
+            IReadOnlyList<Guid> removed = await guard.ReadRemovedHeldRowsAsync(baseline, connection, dbTransaction, CancellationToken.None);
+            await transaction.RollbackAsync();
+            return (changed, removed);
+        });
+
+        var flagged = work == HeldRowWork.HoldCreatedDuringWork ? lateHoldId : holdId;
+        changed.Should().Equal(stepViolation ? [flagged] : []);
+        removed.Should().Equal(deletionViolation ? [flagged] : []);
     }
 
     /// <summary>

@@ -37,5 +37,5 @@ property per entity.
 
 | Attribute | Meaning |
 |---|---|
-| `[RowHandlerId("uuid")]` | The permanent identity a [row handler](/guides/row-handlers)'s queued work is persisted under. Required on every row handler, and unique across handler classes whatever their entity. Never change it. |
+| `[RowHandlerId("uuid")]` | The permanent identity a [row handler](/guides/row-handlers)'s queued work, or a [dependents step](/guides/row-handlers#retiring-a-rows-dependents)'s failure, is persisted under. Required on every row handler and dependents step, and unique across their classes whatever their entity; one class may be both the handler and the step of the same entity under one id. Never change it. |
 | `[RowHandlerPriority(n)]` | Order among an entity's [row handlers](/guides/row-handlers), lowest first. Handlers without it run last. |

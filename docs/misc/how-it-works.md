@@ -29,9 +29,12 @@ expressed in SQL.
 4. **Batch.** Candidate rows past the cutoff, in the tenant and not held, are selected with
    `FOR UPDATE SKIP LOCKED` in batches of `SweepBatchSize` (an erasure waits for locked rows
    instead). A purge also leaves out rows still referenced through a `RESTRICT` or
-   `NO ACTION` foreign key, read from `pg_catalog`. Each batch runs any `OnBeforeAsync`
-   handlers, each in a read-only savepoint that is always rolled back, mutates, writes its
-   audit rows and queues handler work, then **commits on its own**. A large backlog never
+   `NO ACTION` foreign key, read from `pg_catalog`, unless the entity has a
+   [dependents step](/guides/row-handlers#retiring-a-rows-dependents). Each batch runs any
+   `OnBeforeAsync` handlers, each in a read-only savepoint that is always rolled back, then
+   the entity's dependents step and the row's mutation under one savepoint, so a refused
+   mutation undoes the step. It writes its audit rows and queues handler work, then
+   **commits on its own**. A large backlog never
    sits in one unbounded transaction, and a failure loses only the current batch. A batch
    checks its constraints immediately, so a deferred constraint fails at its statement, not
    at `COMMIT`.

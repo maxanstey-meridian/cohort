@@ -78,11 +78,15 @@ internal static class RetentionHoldSql
     }
 
     /// <summary>
-    /// Active holds whose row no longer exists, across every retained entity. Diffing this before
-    /// and after a host deletion callback shows which holds the callback broke, whatever removed
-    /// the row (EF, a client or database cascade, raw SQL).
+    /// Every active hold across every retained entity, with the physical version of the row it
+    /// covers: its <c>tableoid</c> and <c>ctid</c> as text, or NULL when the row no longer exists
+    /// (or the scope cannot see it). Concatenated, not a row value: a row of NULLs casts to a
+    /// non-NULL <c>(,)</c>. PostgreSQL gives every UPDATE, even one writing the same values, a
+    /// new <c>ctid</c>, so diffing this before and after host work inside one transaction shows
+    /// which held rows that work changed or removed, whatever did it (EF, a client or database
+    /// cascade, a trigger, raw SQL). <see cref="RetentionHoldGuard"/> owns the diff.
     /// </summary>
-    internal static (string Sql, SqlParams Parameters) BuildActiveHoldsWithoutRow(
+    internal static (string Sql, SqlParams Parameters) BuildActiveHeldRowVersions(
         RelationalObjectName holdsTable,
         IReadOnlyList<RetentionEntry> entries
     )
@@ -90,7 +94,7 @@ internal static class RetentionHoldSql
         if (entries.Count == 0)
         {
             throw new ArgumentException(
-                "At least one retained entity is required to find holds without a row.",
+                "At least one retained entity is required to read held row versions.",
                 nameof(entries)
             );
         }
@@ -103,15 +107,12 @@ internal static class RetentionHoldSql
             parameters[$"entity{index}"] = entry.RetentionEntityId;
             branches.Add(
                 $"""
-                SELECT hold."HoldId"
+                SELECT hold."HoldId", CAST(target.tableoid AS text) || '/' || CAST(target.ctid AS text)
                 FROM {PostgreSqlIdentifier.Format(holdsTable)} AS hold
+                LEFT JOIN {PostgreSqlIdentifier.Format(entry.Table)} AS target
+                    ON {RecordIdSql.EqualsExpression("target", entry.RecordId, "hold.\"RecordId\"")}
                 WHERE hold."RetentionEntityId" = @entity{index}
                   AND {ActivePredicate("hold")}
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
-                      WHERE {RecordIdSql.EqualsExpression("target", entry.RecordId, "hold.\"RecordId\"")}
-                  )
                 """
             );
         }

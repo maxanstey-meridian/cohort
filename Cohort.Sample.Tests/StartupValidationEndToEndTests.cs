@@ -173,6 +173,100 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
             );
     }
 
+    // The same for a dependents step: only AddRetentionDependents makes one, and startup and a
+    // never-started host's own readiness check refuse any other shape without constructing it.
+    [Theory]
+    [InlineData("type")]
+    [InlineData("instance")]
+    [InlineData("factory")]
+    [InlineData("duplicate")]
+    [InlineData("singleton-first")]
+    [InlineData("keyed")]
+    [InlineData("open-generic")]
+    public async Task Validation_Refuses_A_Dependents_Step_Not_Registered_With_AddRetentionDependents(string registration)
+    {
+        var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder();
+        builder.Configuration.AddInMemoryCollection(
+            new Dictionary<string, string?>
+            {
+                [$"{SampleOptions.SectionName}:{nameof(SampleOptions.ConnectionString)}"] =
+                    connectionString,
+            }
+        );
+        builder.Services.AddSampleRetentionServices();
+        switch (registration)
+        {
+            case "type":
+                builder.Services.AddScoped<IRetentionDependents<Note>, UnconstructableNoteStep>();
+                break;
+            case "instance":
+                builder.Services.AddSingleton<IRetentionDependents<Note>>(new InstanceNoteStep());
+                break;
+            case "factory":
+                builder.Services.AddScoped<IRetentionDependents<Note>>(_ => new UnconstructableNoteStep());
+                break;
+            case "duplicate":
+                builder.Services.AddRetentionDependents<Note, UnconstructableNoteStep>();
+                builder.Services.AddScoped<IRetentionDependents<Note>, UnconstructableNoteStep>();
+                break;
+            case "singleton-first":
+                builder.Services.AddSingleton<IRetentionDependents<Note>, UnconstructableNoteStep>();
+                builder.Services.AddRetentionDependents<Note, UnconstructableNoteStep>();
+                break;
+            case "keyed":
+                builder.Services.AddKeyedScoped<IRetentionDependents<Note>, UnconstructableNoteStep>("k");
+                break;
+            case "open-generic":
+                builder.Services.AddScoped(typeof(IRetentionDependents<>), typeof(OpenStep<>));
+                break;
+        }
+
+        using var host = builder.Build();
+
+        var start = () => host.StartAsync();
+        var sweep = () =>
+            host.Services.GetRequiredService<IRetentionSweep>()
+                .ExecuteAsync(RetentionSweepRequest.Tenantless(dryRun: true));
+
+        var named = registration switch
+        {
+            "factory" or "keyed" => $"IRetentionDependents<{typeof(Note).FullName}>",
+            "open-generic" => "IRetentionDependents<>",
+            "instance" => typeof(InstanceNoteStep).FullName!,
+            _ => typeof(UnconstructableNoteStep).FullName!,
+        };
+        foreach (var act in new[] { start, sweep })
+        {
+            var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+            exception
+                .Which.Errors.Should()
+                .ContainSingle(error =>
+                    error.Contains(named, StringComparison.Ordinal)
+                    && error.Contains("AddRetentionDependents", StringComparison.Ordinal)
+                );
+        }
+
+        UnconstructableNoteStep.Constructed.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Resolving_A_Step_Without_A_Registration_Refuses_It()
+    {
+        var services = new ServiceCollection();
+        services.AddRetentionDependents<Note, InstanceNoteStep>();
+        services.AddScoped<IRetentionDependents<Note>, StrayNoteStep>();
+        using var provider = services.BuildServiceProvider();
+        using var scope = provider.CreateScope();
+
+        var act = () => RetentionHandlerSupport.ResolveDependents(scope.ServiceProvider, typeof(Note));
+
+        act.Should().Throw<RetentionConfigurationException>()
+            .Which.Errors.Should().ContainSingle(error =>
+                error.Contains(typeof(StrayNoteStep).FullName!, StringComparison.Ordinal)
+                && error.Contains("AddRetentionDependents", StringComparison.Ordinal)
+            );
+    }
+
     // The scrub clock starts when a row is mutated and a row's handlers run one after another,
     // so PayloadRetention has to cover every handler's retry schedule on the busiest entity.
     // Each schedule here is 30 minutes and 10 seconds: one 30-minute claim plus one poll.
@@ -268,6 +362,36 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     private sealed class InstanceNoteHandler : IRetentionHandler<Note>;
 
     private sealed class StrayNoteHandler : IRetentionHandler<Note>;
+
+    [RowHandlerId("b4137b7d-6960-43b5-9cbe-560cc7af6a63")]
+    private sealed class UnconstructableNoteStep : IRetentionDependents<Note>
+    {
+        public static bool Constructed { get; private set; }
+
+        public UnconstructableNoteStep()
+        {
+            Constructed = true;
+            throw new InvalidOperationException("Startup must not construct a dependents step.");
+        }
+
+        public Task RetireAsync(Note row, RetentionDependentsContext ctx, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    [RowHandlerId("8e903300-3e52-4f2c-98c8-4c9976907fed")]
+    private sealed class InstanceNoteStep : IRetentionDependents<Note>
+    {
+        public Task RetireAsync(Note row, RetentionDependentsContext ctx, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    private sealed class StrayNoteStep : IRetentionDependents<Note>
+    {
+        public Task RetireAsync(Note row, RetentionDependentsContext ctx, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    private sealed class OpenStep<TEntity> : IRetentionDependents<TEntity>
+    {
+        public Task RetireAsync(TEntity row, RetentionDependentsContext ctx, CancellationToken ct) => Task.CompletedTask;
+    }
 
     private sealed class OpenHandler<TEntity> : IRetentionHandler<TEntity>;
 

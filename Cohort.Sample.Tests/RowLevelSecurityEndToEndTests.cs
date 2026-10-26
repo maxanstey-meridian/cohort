@@ -406,6 +406,55 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
         entries.Ran.Should().Contain(RowDispatch);
     }
 
+    // The step runs as the batch's tenant on the run's connection: its unfiltered update reaches
+    // only that tenant's rows. The model has a tenantless entity, so the step's hold guard needs
+    // the batch's scope to see tenantless holds; hidden by the holds policy, the batch refuses.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_Tenant_Step_Changes_Only_Its_Tenants_Rows(bool tenantsReadTenantlessHolds)
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        var tenantA = Guid.NewGuid();
+        var tenantB = Guid.NewGuid();
+        var log = Log("log-held");
+        await CreateSchemaWithPoliciesAsync(database.ConnectionString, tenantsReadTenantlessHolds);
+        await SeedAsync(
+            database.ConnectionString,
+            [Note(tenantA, "a-expired"), Note(tenantA, "a-young", AsOf.AddDays(-1)), Note(tenantB, "b-expired")],
+            [log]
+        );
+        await SeedTenantlessHoldAsync(database.ConnectionString, log.Id);
+        var observations = new HandlerObservations();
+        using var host = BuildHost(
+            database.ConnectionString,
+            services =>
+            {
+                services.AddSingleton(new EntryLog());
+                services.AddSingleton(observations);
+                services.AddScoped<IRetentionExecutionScope, RecordingExecutionScope>();
+                services.AddRetentionDependents<RlsNote, TouchingNoteStep>();
+            }
+        );
+
+        var result = await host.Services.GetRequiredService<IRetentionSweep>()
+            .ExecuteAsync(RetentionSweepRequest.Tenanted(Tenant(tenantA), AsOf));
+
+        if (!tenantsReadTenantlessHolds)
+        {
+            result.EntityFailures.Should().ContainSingle()
+                .Which.Should().StartWith("type=Cohort.Application.RetentionConfigurationException;");
+            observations.Seen.Should().BeEmpty();
+            (await LoadNoteBodiesAsync(database.ConnectionString)).Should().Equal("a-expired", "a-young", "b-expired");
+            return;
+        }
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(RlsNote)).Which.Affected.Should().Be(1);
+        observations.Seen.Should().Equal(new SessionObservation("step:a-expired", tenantA.ToString(), TenantRole));
+        (await LoadNoteBodiesAsync(database.ConnectionString)).Should().Equal("a-young-touched", "b-expired");
+    }
+
     [Fact]
     public async Task History_Pruning_Runs_As_System_And_Prunes_Every_Tenants_History()
     {
@@ -1027,6 +1076,17 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
 
         public async Task OnAfterAsync(RetentionAfterContext<RlsLog> ctx, CancellationToken ct) =>
             observations.Add(await ObserveAsync(db, $"after:{ctx.Snapshot["payload"]}", ct));
+    }
+
+    [RowHandlerId("98773716-3620-4e82-841b-5c08b95dd0be")]
+    private sealed class TouchingNoteStep(RlsDbContext db, HandlerObservations observations) : IRetentionDependents<RlsNote>
+    {
+        public async Task RetireAsync(RlsNote row, RetentionDependentsContext ctx, CancellationToken ct)
+        {
+            observations.Add(await ObserveAsync(db, $"step:{row.Body}", ct));
+            // No filter: only the tenant's policy limits what it reaches.
+            await db.Notes.ExecuteUpdateAsync(set => set.SetProperty(note => note.Body, note => note.Body + "-touched"), ct);
+        }
     }
 
     private static async Task<SessionObservation> ObserveAsync(RlsDbContext db, string label, CancellationToken ct)

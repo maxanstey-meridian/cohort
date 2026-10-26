@@ -24,14 +24,16 @@ namespace Cohort.Infrastructure.Sweep;
 /// are in play; <see cref="SweepEligibilitySql"/> says which of those the strategy has not
 /// yet handled, and the strategy says how it changes one (<see cref="CreateMutation"/>).
 /// Candidates are discovered, entity-locked and row-locked, then mutated in one statement,
-/// or row by row when handlers run or the new values depend on each row. A row an
-/// integrity constraint refuses is blocked rather than failing its batch: the bulk statement
-/// is bisected under savepoints to find it, and on the row-by-row path each row's change
-/// has its own savepoint.
+/// or row by row when handlers or a dependents step run or the new values depend on each row.
+/// A row an integrity constraint refuses is blocked rather than failing its batch: the bulk
+/// statement is bisected under savepoints to find it, and on the row-by-row path each row's
+/// change has its own savepoint, which its dependents step shares.
 /// </summary>
 internal abstract class SweepStrategy(
     DbContext db,
     IEnumerable<IRetentionHandlerRegistration> handlerRegistrations,
+    IEnumerable<IRetentionDependentsRegistration> dependentsRegistrations,
+    RetentionHoldGuard holdGuard,
     IServiceScopeFactory scopeFactory,
     ILogger logger
 )
@@ -51,6 +53,12 @@ internal abstract class SweepStrategy(
 
     /// <summary>Rejects entries this strategy cannot act on.</summary>
     protected virtual void Validate(RetentionEntry entry) { }
+
+    /// <summary>
+    /// Whether <paramref name="entry"/>'s entity has a dependents step, read from the
+    /// registrations alone so no step is constructed to find out.
+    /// </summary>
+    public bool HasDependents(RetentionEntry entry) => dependentsRegistrations.StepFor(entry.EntityType) is not null;
 
     public async Task<long> CountAsync(
         SweepScope scope,
@@ -199,14 +207,15 @@ internal abstract class SweepStrategy(
     )
     {
         var mutation = CreateMutation(scope);
-        if (!RetentionHandlerSupport.HasHandlers(handlerRegistrations, scope.Entry.EntityType))
+        var hasHandlers = RetentionHandlerSupport.HasHandlers(handlerRegistrations, scope.Entry.EntityType);
+        if (!hasHandlers && !HasDependents(scope.Entry))
         {
-            return await MutateAsync(scope, conn, transaction, candidates, mutation, onBefore: null, execution, ct);
+            return await MutateAsync(scope, conn, transaction, candidates, mutation, handlerScope: null, execution, ct);
         }
 
-        // Handlers never see the run's own context, which in a caller-transaction erasure is
-        // the caller's: they get a scope of their own per batch, whose context joins the run's
-        // connection and transaction before any handler is constructed.
+        // Handlers and steps never see the run's own context, which in a caller-transaction
+        // erasure is the caller's: they get a scope of their own per batch, whose context joins
+        // the run's connection and transaction before any of them is constructed.
         return await scopeFactory.RunInScopeAsync(
             RetentionExecutionScopes.For(scope.Tenant),
             async handlerServices =>
@@ -220,11 +229,23 @@ internal abstract class SweepStrategy(
                 try
                 {
                     await handlerDb.Database.UseTransactionAsync(transaction, ct);
-                    var onBefore = new RetentionHandlerScope(
+                    var handlerScope = new RetentionHandlerScope(
                         handlerDb,
-                        RetentionHandlerSupport.ResolveHandlers(handlerServices, scope.Entry.EntityType)
+                        hasHandlers ? RetentionHandlerSupport.ResolveHandlers(handlerServices, scope.Entry.EntityType) : [],
+                        RetentionHandlerSupport.ResolveDependents(handlerServices, scope.Entry.EntityType)
                     );
-                    return await MutateAsync(scope, conn, transaction, candidates, mutation, onBefore, execution, ct);
+                    if (handlerScope.Dependents is { } step)
+                    {
+                        // The guard reads only the holds this scope can see.
+                        await holdGuard.EnsureTenantlessHoldsVisibleAsync(
+                            conn,
+                            transaction,
+                            $"Dependents step {step.StepType.FullName}",
+                            ct
+                        );
+                    }
+
+                    return await MutateAsync(scope, conn, transaction, candidates, mutation, handlerScope, execution, ct);
                 }
                 finally
                 {
@@ -265,12 +286,12 @@ internal abstract class SweepStrategy(
         DbTransaction transaction,
         IReadOnlyList<string> candidates,
         SweepMutation mutation,
-        RetentionHandlerScope? onBefore,
+        RetentionHandlerScope? handlerScope,
         SweepMutationContext execution,
         CancellationToken ct
     )
     {
-        if (onBefore is null && !mutation.RowByRow)
+        if (handlerScope is null && !mutation.RowByRow)
         {
             var affected = new List<string>();
             var blocked = new BlockedRows();
@@ -292,7 +313,7 @@ internal abstract class SweepStrategy(
         return await (Task<SweepExecutionResult>)
             rowByRow.Invoke(
                 this,
-                [scope, conn, transaction, candidates, mutation, onBefore, execution, ct]
+                [scope, conn, transaction, candidates, mutation, handlerScope, execution, ct]
             )!;
     }
 
@@ -362,7 +383,7 @@ internal abstract class SweepStrategy(
         DbTransaction transaction,
         IReadOnlyList<string> candidates,
         SweepMutation mutation,
-        RetentionHandlerScope? onBefore,
+        RetentionHandlerScope? handlerScope,
         SweepMutationContext execution,
         CancellationToken ct
     )
@@ -389,6 +410,8 @@ internal abstract class SweepStrategy(
         var recordIdProperty = db.Model.FindEntityType(typeof(TEntity))!.FindProperty(entry.RecordId.RecordIdMember)!;
         var recordIdGetter = recordIdProperty.GetGetter();
         var recordIdConverter = recordIdProperty.GetTypeMapping().Converter;
+        var onBefore = handlerScope is { Handlers.Count: > 0 } ? handlerScope : null;
+        var step = handlerScope?.Dependents;
 
         var affected = new List<string>();
         var skipped = 0;
@@ -416,26 +439,8 @@ internal abstract class SweepStrategy(
                 var result = await InvokeOnBeforeReadOnlyAsync(conn, transaction, onBefore, entry.EntityType, row, before, ct);
                 if (!result.Succeeded)
                 {
-                    var skippedId = await RecordIdSql.CanonicalizeAsync(
-                        conn,
-                        transaction,
-                        entry.RecordId,
-                        recordKey,
-                        ct
-                    );
                     skipped++;
-                    await RetentionHandlerSupport.PersistBeforeFailureAsync(
-                        conn,
-                        transaction,
-                        execution,
-                        entry,
-                        scope.Rule.Strategy,
-                        scope.Tenant.Id,
-                        skippedId,
-                        result,
-                        logger,
-                        ct
-                    );
+                    await PersistSkippedAsync(scope, conn, transaction, execution, recordKey, result.ToFailure(), ct);
                     continue;
                 }
 
@@ -455,28 +460,78 @@ internal abstract class SweepStrategy(
                 RETURNING {RecordIdSql.TextExpression("target", entry.RecordId)}
                 """
             );
+
+            // One savepoint for the step and the mutation: whatever undoes one undoes both, so
+            // a row's dependents are never retired without it.
             await transaction.SaveAsync(MutationSavepoint, CancellationToken.None);
+            if (step is not null)
+            {
+                var dependents = new RetentionDependentsContext(
+                    execution.SweepId,
+                    entry.Category,
+                    scope.Rule.Strategy,
+                    scope.Tenant.Id,
+                    execution.At
+                );
+                var stepFailure = await RetireDependentsAsync(
+                    conn,
+                    transaction,
+                    handlerScope!.Db,
+                    step,
+                    (TEntity)row,
+                    dependents,
+                    execution,
+                    ct
+                );
+                if (stepFailure is not null)
+                {
+                    await transaction.RollbackAsync(MutationSavepoint, CancellationToken.None);
+                    skipped++;
+                    await PersistSkippedAsync(scope, conn, transaction, execution, recordKey, stepFailure, ct);
+                    continue;
+                }
+            }
+
             object? changed;
             try
             {
                 changed = await command.ExecuteScalarAsync(ct);
-                await transaction.ReleaseAsync(MutationSavepoint, CancellationToken.None);
             }
             catch (DbException ex) when (IsIntegrityViolation(ex))
             {
-                // Refused by a constraint: nothing changed, so no OnAfter work is queued.
+                // Refused by a constraint: nothing changed, the step is undone with it, and no
+                // OnAfter work is queued.
                 await transaction.RollbackAsync(MutationSavepoint, CancellationToken.None);
                 blocked.Add(await RecordIdSql.CanonicalizeAsync(conn, transaction, entry.RecordId, recordKey, ct), ex);
                 continue;
             }
 
-            // No row back: a hold landed after the row was loaded.
             if (changed is not string recordId)
             {
+                // No row back. The rollback undoes the step, so if the row matches the
+                // statement's own WHERE again, the step had taken it out of scope; otherwise a
+                // hold landed after the row was loaded.
+                await transaction.RollbackAsync(MutationSavepoint, CancellationToken.None);
+                if (step is not null && await IsStillDueAsync(scope, conn, transaction, recordKey, ct))
+                {
+                    skipped++;
+                    await PersistSkippedAsync(
+                        scope,
+                        conn,
+                        transaction,
+                        execution,
+                        recordKey,
+                        BeforeMutationFailure.Step(step, null, BeforeMutationFailure.DependentsChangedRowReason),
+                        ct
+                    );
+                    continue;
+                }
+
                 heldCount++;
                 continue;
             }
 
+            await transaction.ReleaseAsync(MutationSavepoint, CancellationToken.None);
             if (capturedPayload is not null)
             {
                 await RetentionHandlerSupport.PersistCapturedRowAsync(
@@ -499,12 +554,142 @@ internal abstract class SweepStrategy(
         return new SweepExecutionResult(
             affected,
             heldCount,
+            // Only handlers write a row detail for each mutated row; a step alone leaves the
+            // run's own row-detail audit to the engine.
             RowDetailsPersisted: onBefore is not null,
             SkippedCount: skipped,
             CandidateCount: candidates.Count,
             BlockedRecordIds: blocked.RecordIds,
             BlockedFailures: blocked.Failures
         );
+    }
+
+    private async Task PersistSkippedAsync(
+        SweepScope scope,
+        DbConnection conn,
+        DbTransaction transaction,
+        SweepMutationContext execution,
+        object recordKey,
+        BeforeMutationFailure failure,
+        CancellationToken ct
+    )
+    {
+        var entry = scope.Entry;
+        var skippedId = await RecordIdSql.CanonicalizeAsync(conn, transaction, entry.RecordId, recordKey, ct);
+        await RetentionHandlerSupport.PersistBeforeFailureAsync(
+            conn,
+            transaction,
+            execution,
+            entry,
+            scope.Rule.Strategy,
+            scope.Tenant.Id,
+            skippedId,
+            failure,
+            logger,
+            ct
+        );
+    }
+
+    /// <summary>
+    /// Runs the dependents step read-write inside the open mutation savepoint, and returns
+    /// why it failed, or null when the row may be mutated. Like OnBefore, only the run's own
+    /// cancellation propagates; anything else the step throws, a database error included, is
+    /// the step failing. It also fails for unsaved changes it leaves on its context and for
+    /// any change to or removal of a row under an active hold, found by diffing every visible
+    /// held row's physical version before and after it (<see cref="RetentionHoldGuard"/>).
+    /// Whatever it leaves tracked is discarded after every row.
+    /// </summary>
+    private async Task<BeforeMutationFailure?> RetireDependentsAsync<TEntity>(
+        DbConnection conn,
+        DbTransaction transaction,
+        DbContext stepDb,
+        ResolvedRetentionDependents step,
+        TEntity row,
+        RetentionDependentsContext dependents,
+        SweepMutationContext execution,
+        CancellationToken ct
+    )
+    {
+        var baseline = await holdGuard.ReadHeldRowVersionsAsync(conn, transaction, ct);
+        try
+        {
+            try
+            {
+                await ((IRetentionDependents<TEntity>)step.Instance).RetireAsync(row, dependents, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                return BeforeMutationFailure.Step(step, ex);
+            }
+
+            if (RetentionHandlerSupport.HasUnsavedChanges(stepDb))
+            {
+                return BeforeMutationFailure.Step(step, null, BeforeMutationFailure.DependentsUnsavedChangesReason);
+            }
+
+            IReadOnlyList<Guid> changedHolds;
+            try
+            {
+                changedHolds = await holdGuard.ReadChangedHeldRowsAsync(baseline, conn, transaction, ct);
+            }
+            catch (DbException ex) when (!ct.IsCancellationRequested)
+            {
+                // A step that swallowed its own database error leaves the transaction aborted;
+                // the rollback to the savepoint recovers it, and the row is the step's failure.
+                return BeforeMutationFailure.Step(step, ex);
+            }
+
+            if (changedHolds.Count > 0)
+            {
+                logger.LogWarning(
+                    "Cohort run {SweepId}: dependents step {StepType} changed or removed rows under active hold(s) {HoldIds}, so its row is skipped and the step undone.",
+                    execution.SweepId,
+                    step.StepType.FullName,
+                    string.Join(", ", changedHolds)
+                );
+                return BeforeMutationFailure.Step(step, null, BeforeMutationFailure.DependentsChangedHeldRowReason);
+            }
+
+            return null;
+        }
+        finally
+        {
+            stepDb.ChangeTracker.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Whether the row still matches the mutation statement's own WHERE: in scope, eligible
+    /// and not held.
+    /// </summary>
+    private async Task<bool> IsStillDueAsync(
+        SweepScope scope,
+        DbConnection conn,
+        DbTransaction transaction,
+        object recordKey,
+        CancellationToken ct
+    )
+    {
+        var entry = scope.Entry;
+        var parameters = new SqlParams { ["recordKey"] = recordKey };
+        await using var command = parameters.CreateCommand(
+            conn,
+            transaction,
+            $"""
+            SELECT EXISTS (
+                SELECT 1
+                FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
+                WHERE {RecordIdSql.EqualsParameter("target", entry.RecordId, "recordKey")}
+                  AND {ScopeSql(scope, parameters)}
+                  AND {HoldExclusion(scope, parameters)}
+            )
+            """
+        );
+        return await command.ExecuteScalarAsync(ct) is true;
     }
 
     /// <summary>

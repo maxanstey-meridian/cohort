@@ -125,7 +125,9 @@ them. `NULL` holds are different: tenant scopes read them but never write them. 
 calls `IRetentionDeletion` or `IRetentionHoldsRepository` in a tenant's scope on a tenantless
 row must see that row's holds, or the row looks unheld. `IRetentionDeletion` checks: in a
 model with any tenantless entity, it refuses with `RetentionConfigurationException`, deleting
-nothing, when its scope can't see an active `NULL` hold that `System(Readiness)` sees. So the holds policies
+nothing, when its scope can't see an active `NULL` hold that `System(Readiness)` sees. A
+tenant's batch with a [dependents step](/guides/row-handlers#retiring-a-rows-dependents) runs
+the same check, and the entity fails rather than run the step. So the holds policies
 let a tenant read `NULL` holds and write only its own; create and remove holds on tenantless
 rows in a system scope. Example policies, with the tenant in a custom setting:
 

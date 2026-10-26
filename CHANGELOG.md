@@ -139,7 +139,8 @@ unprotected without an error.
   `AddRetentionDependents` get the same checks. An open-generic handler that used to run for
   every entity is refused: register it per entity.
 - `IRetentionDependents<TEntity>`, registered with `AddRetentionDependents<TEntity, TStep>()`
-  (one per entity), retires what depends on a row (deletes or blanks it) in the row's own
+  (one per entity, its class carrying a `[RowHandlerId]` in the row handlers' id space; one
+  class keeps one id as a handler and as a step, for every entity), retires what depends on a row (deletes or blanks it) in the row's own
   transaction, after every `OnBeforeAsync` and before Cohort's change to the row, under the
   same savepoint. A failure skips the row (`rows-skipped`, dead-lettered under the step's
   `[RowHandlerId]` with `LastError`, including `reason=dependents-unsaved-changes`,
@@ -220,7 +221,9 @@ unprotected without an error.
 - A dry-run erasure doesn't settle `PartiallyFailed` for rows it predicts would be left; read
   `Complete`. Rows a foreign key keeps from a purge get one Warning per entity naming the keys.
 - Readiness refuses a retained entity whose table or record-id column the database doesn't
-  have, whatever its strategy: every run would fail.
+  have, whatever its strategy: every run would fail. It also refuses one mapped to a view,
+  materialized view or foreign table: sweeps, hold checks and `IRetentionDeletion` address
+  rows by `ctid`, which only a table has.
 - Readiness refuses an anonymise its column can never take: an anonymised column the
   database no longer has; a model store type the column type can't be assigned to without an
   explicit cast (any method, `Null` included); a literal or empty string, after its value

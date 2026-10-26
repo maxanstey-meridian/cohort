@@ -129,8 +129,8 @@ builder.Services.AddRetentionDependents<Case, RetireCaseDependents>();
   compose several kinds of dependents in one class. It's the only way to register a step:
   startup refuses an `IRetentionDependents<T>` service in any other shape, as it does a row
   handler's. The class carries a `[RowHandlerId]`, in the same id space as row handlers: no
-  other handler or step class may use its id, though one class may be both the row handler and
-  the step of the same entity under one id.
+  other handler or step class may use its id, though one class keeps its one id as a row
+  handler and as a step, for every entity.
 - **Order.** For each row: every `OnBeforeAsync` captures first, so captures see the database
   before anything is retired; then the step; then Cohort's own change to the row. The step
   runs read-write on the batch scope's `DbContext`, the one handlers get, on the run's

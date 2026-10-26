@@ -207,18 +207,24 @@ public sealed class AddRowHandlerRegistrationTests
     }
 
     [Fact]
-    public void One_Class_Can_Not_Be_The_Handler_Of_One_Entity_And_The_Step_Of_Another()
+    public void One_Class_Can_Be_The_Handler_Of_One_Entity_And_The_Step_Of_Another_Under_One_Id()
     {
         var handlerFirst = new ServiceCollection();
         handlerFirst.AddRowHandler<FirstEntity, HandlerAndStep>();
+        handlerFirst.AddRetentionDependents<SecondEntity, HandlerAndStep>();
+
         var stepFirst = new ServiceCollection();
         stepFirst.AddRetentionDependents<SecondEntity, HandlerAndStep>();
+        stepFirst.AddRowHandler<FirstEntity, HandlerAndStep>();
 
-        var stepOfAnother = () => handlerFirst.AddRetentionDependents<SecondEntity, HandlerAndStep>();
-        var handlerOfAnother = () => stepFirst.AddRowHandler<FirstEntity, HandlerAndStep>();
-
-        stepOfAnother.Should().Throw<InvalidOperationException>().WithMessage("*same entity under one id*");
-        handlerOfAnother.Should().Throw<InvalidOperationException>().WithMessage("*same entity under one id*");
+        foreach (var services in new[] { handlerFirst, stepFirst })
+        {
+            using var provider = services.BuildServiceProvider();
+            provider.GetServices<IRetentionHandlerRegistration>().Should().ContainSingle()
+                .Which.EntityType.Should().Be<FirstEntity>();
+            provider.GetServices<IRetentionDependentsRegistration>().Should().ContainSingle()
+                .Which.EntityType.Should().Be<SecondEntity>();
+        }
     }
 
     [Fact]

@@ -940,6 +940,32 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         );
     }
 
+    [Theory]
+    [InlineData("VIEW", "a view")]
+    [InlineData("MATERIALIZED VIEW", "a materialized view")]
+    public async Task Readiness_refuses_a_retained_entity_mapped_to_a_relation_that_is_not_a_table(
+        string relation,
+        string kind
+    )
+    {
+        // Rows are addressed by ctid, which only a table has: a view would fail every run.
+        await using var database = await AnonymiseTargetDatabaseAsync(
+            $"""
+            ALTER TABLE public.anonymise_literal_records RENAME TO anonymise_literal_records_base;
+            CREATE {relation} public.anonymise_literal_records AS
+                SELECT * FROM public.anonymise_literal_records_base;
+            """
+        );
+        await using var provider = BuildAnonymiseTargetProvider(database.ConnectionString);
+
+        var errors = await ReadinessErrorsAsync(provider);
+
+        errors.Should().ContainSingle(error =>
+            error.Contains(typeof(AnonymiseLiteralRecord).FullName!, StringComparison.Ordinal)
+            && error.Contains($"\"public\".\"anonymise_literal_records\" is {kind}, not a table", StringComparison.Ordinal)
+        );
+    }
+
     [Fact]
     public async Task Readiness_probes_a_fixed_literal_after_its_value_converter()
     {

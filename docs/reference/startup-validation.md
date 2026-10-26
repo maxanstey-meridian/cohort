@@ -27,16 +27,15 @@ entity and the problem.
 
 - Every [row handler](/guides/row-handlers) carries a `[RowHandlerId]` holding a non-empty
   UUID, and no two handler classes share an id, whatever their entities. `AddRowHandler`
-  refuses a missing, malformed or shared id when it's called, naming the handler, and an id a
-  dependents step class uses (unless that class is the dependents step of the same entity).
-  One class registered for two entities keeps its one id.
+  refuses a missing, malformed or shared id when it's called, naming the handler, and an id
+  another class uses as a dependents step. One class keeps its one id for every entity it's
+  registered for, as a handler or as a step.
 - Every `IRetentionHandler<T>` service is registered once, through `AddRowHandler`, as
   scoped. A handler registered any other way is refused and named, and so is one whose
   service was removed or replaced after `AddRowHandler` added it: it would never run.
 - Every [dependents step](/guides/row-handlers#retiring-a-rows-dependents) carries a
   `[RowHandlerId]` in the same id space: `AddRetentionDependents` refuses a missing or
-  malformed id, an id another step or handler class uses (unless that class is the row handler
-  of the same entity), and a second step for an entity.
+  malformed id, an id another step or handler class uses, and a second step for an entity.
 - Every `IRetentionDependents<T>` service is registered once, through
   `AddRetentionDependents`, as scoped. A step registered any other way is refused and named,
   and so is one whose service was removed or replaced after `AddRetentionDependents` added it.
@@ -82,7 +81,9 @@ columns or rows belong to it. So these are rejected:
   unique index. A filtered index doesn't make it unique.
 - Record-ID types whose text form depends on session settings are rejected. See
   [Identities](/reference/schema#identities).
-- Each retained table and its record-ID column exist in the database.
+- Each retained table and its record-ID column exist in the database, and the table is an
+  ordinary or partitioned table: not a view, materialized view or foreign table, since Cohort
+  addresses each row by its physical position (`ctid`).
 - Each anonymised column can take what Cohort writes to it, checked against the database
   catalog: the column exists and the model's store type can be assigned to its type without
   an explicit cast; an `EmptyString` or `FixedLiteral` value, after the value converter, is

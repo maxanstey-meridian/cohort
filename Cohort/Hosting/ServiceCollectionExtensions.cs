@@ -191,13 +191,13 @@ public static class ServiceCollectionExtensions
         var stepClash = new RetentionHandlerServiceRegistrations(services).DependentsRegistrations()
             .FirstOrDefault(registration =>
                 registration.Identity == identity
-                && !IsSameClassAndEntity(registration.StepType, registration.EntityType, typeof(THandler), typeof(TEntity))
+                && registration.StepType != typeof(THandler)
             );
         if (stepClash is not null)
         {
             throw new InvalidOperationException(
-                $"Row handler id {identity} is already used by the dependents step {stepClash.StepType.FullName} for entity {stepClash.EntityType.FullName}; give {typeof(THandler).FullName} its own [RowHandlerId]. "
-                    + "One class may be both the row handler and the dependents step of the same entity under one id."
+                $"Row handler id {identity} is already used by the dependents step {stepClash.StepType.FullName}; give {typeof(THandler).FullName} its own [RowHandlerId]. "
+                    + "One class keeps its one id as a row handler and as a dependents step, for every entity."
             );
         }
 
@@ -253,13 +253,13 @@ public static class ServiceCollectionExtensions
         var handlerClash = new RetentionHandlerServiceRegistrations(services).Registrations()
             .FirstOrDefault(registration =>
                 registration.Identity == identity
-                && !IsSameClassAndEntity(registration.HandlerType, registration.EntityType, typeof(TStep), typeof(TEntity))
+                && registration.HandlerType != typeof(TStep)
             );
         if (handlerClash is not null)
         {
             throw new InvalidOperationException(
-                $"Row handler id {identity} is already used by the row handler {handlerClash.HandlerType.FullName} for entity {handlerClash.EntityType.FullName}; give {typeof(TStep).FullName} its own [RowHandlerId]. "
-                    + "One class may be both the row handler and the dependents step of the same entity under one id."
+                $"Row handler id {identity} is already used by the row handler {handlerClash.HandlerType.FullName}; give {typeof(TStep).FullName} its own [RowHandlerId]. "
+                    + "One class keeps its one id as a row handler and as a dependents step, for every entity."
             );
         }
 
@@ -294,9 +294,6 @@ public static class ServiceCollectionExtensions
                 $"{role} {type.FullName} has no [RowHandlerId(\"<uuid>\")] attribute. {why}"
             );
     }
-
-    private static bool IsSameClassAndEntity(Type registeredClass, Type registeredEntity, Type newClass, Type newEntity) =>
-        registeredClass == newClass && registeredEntity == newEntity;
 
     private sealed record CohortRegistrationMarker(Type ContextType);
 

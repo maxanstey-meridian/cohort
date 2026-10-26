@@ -81,6 +81,12 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// A retained table or record-id column the database no longer has fails every run, so it is
     /// refused here too.
     /// </summary>
+    /// <summary>
+    /// Each retained table must exist as an ordinary or partitioned table, since sweeps, the
+    /// hold checks and IRetentionDeletion address rows by their physical position (ctid), which
+    /// a view, materialized view or foreign table lacks; and its record-id column must exist,
+    /// built on a type whose text form doesn't depend on session settings.
+    /// </summary>
     private async Task ValidateRecordIdColumnTypesAsync(CancellationToken ct)
     {
         var entries = registry.Scan().Values.ToArray();
@@ -102,7 +108,10 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 db.Database.CurrentTransaction?.GetDbTransaction(),
                 """
                 WITH RECURSIVE record_id_column AS (
-                    SELECT requested.ordinal, relation.oid AS relation_id, attribute.atttypid AS type_id
+                    SELECT requested.ordinal,
+                           relation.oid AS relation_id,
+                           relation.relkind AS relation_kind,
+                           attribute.atttypid AS type_id
                     FROM ROWS FROM (
                         pg_catalog.unnest(@schemas),
                         pg_catalog.unnest(@tables),
@@ -133,11 +142,15 @@ internal sealed class RetentionRuntimeReadinessValidator(
                     LEFT JOIN pg_catalog.pg_range over_multirange ON over_multirange.rngmultitypid = pgtype.oid
                     WHERE pgtype.typtype IN ('d', 'r', 'm') OR pgtype.typcategory = 'A'
                 )
-                SELECT ordinal, NULL::pg_catalog.name, relation_id IS NULL
+                SELECT ordinal, NULL::pg_catalog.name, relation_id IS NULL, NULL::pg_catalog.char
                 FROM record_id_column
                 WHERE type_id IS NULL
                 UNION ALL
-                SELECT built_on.ordinal, pgtype.typname, NULL
+                SELECT ordinal, NULL, NULL, relation_kind
+                FROM record_id_column
+                WHERE relation_kind NOT IN ('r', 'p')
+                UNION ALL
+                SELECT built_on.ordinal, pgtype.typname, NULL, NULL
                 FROM built_on
                 JOIN pg_catalog.pg_type pgtype ON pgtype.oid = built_on.type_id
                 JOIN pg_catalog.pg_namespace namespace ON namespace.oid = pgtype.typnamespace
@@ -151,6 +164,14 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 while (await reader.ReadAsync(ct))
                 {
                     var entry = entries[(int)reader.GetInt64(0) - 1];
+                    if (!reader.IsDBNull(3))
+                    {
+                        errors.Add(
+                            $"Retained entity {entry.EntityType.FullName}: {PostgreSqlIdentifier.Format(entry.Table)} is {RelationKindName(reader.GetChar(3))}, not a table. Cohort addresses each row by its physical position (ctid), which only a table has, so every run, hold check and IRetentionDeletion call would fail. Map the entity to the table it lives in."
+                        );
+                        continue;
+                    }
+
                     if (reader.IsDBNull(1))
                     {
                         errors.Add(
@@ -183,6 +204,15 @@ internal sealed class RetentionRuntimeReadinessValidator(
             await db.Database.CloseConnectionAsync();
         }
     }
+
+    private static string RelationKindName(char kind) =>
+        kind switch
+        {
+            'v' => "a view",
+            'm' => "a materialized view",
+            'f' => "a foreign table",
+            _ => $"a relation of kind '{kind}'",
+        };
 
     /// <summary>
     /// The startup check knows only an anonymise target's CLR type; the column decides what the

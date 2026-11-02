@@ -10,6 +10,7 @@ using Cohort.Sample.Entities;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -474,6 +475,82 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         );
 
         await InvokePreviewAsync(provider);
+    }
+
+    [Fact]
+    public async Task Readiness_refuses_a_system_scope_whose_context_runs_a_different_model_on_the_same_database()
+    {
+        // The model cache key is what makes two models one: a host whose key factory tells the
+        // System(Readiness) scope's model apart from the caller's runs a different model, even
+        // on the very same database.
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        var spelledDifferently = new NpgsqlConnectionStringBuilder(database.ConnectionString)
+        {
+            ApplicationName = "cohort-readiness",
+        };
+        await using var provider = BuildSystemRoutedProvider(
+            database.ConnectionString,
+            spelledDifferently.ConnectionString,
+            options => options.ReplaceService<IModelCacheKeyFactory, ConnectionStringModelCacheKeyFactory>()
+        );
+
+        var act = () => InvokePreviewAsync(provider);
+
+        (await act.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                error.Contains("different model or database", StringComparison.Ordinal)
+            );
+    }
+
+    [Fact]
+    public async Task Readiness_accepts_a_system_scope_whose_context_built_its_own_copy_of_the_model()
+    {
+        // EF keeps built models in its memory cache and drops one that doesn't fit, so with the
+        // cache full two contexts of one type and options hold equal models that are not the same
+        // object. Sameness is the model cache key's, as EF decides it.
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
+        services.AddDbContext<SampleDbContext>(options =>
+            options
+                .UseNpgsql(database.ConnectionString)
+                .UseMemoryCache(new MemoryCache(new MemoryCacheOptions { SizeLimit = 1 }))
+        );
+        services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
+        services.AddSingleton<GuidTombstoneFactory>();
+        services.AddSingleton<OriginalValueTombstoneFactory>();
+        services.AddSingleton<IAnonymiseValueFactory>(provider =>
+            provider.GetRequiredService<GuidTombstoneFactory>()
+        );
+        services.AddSingleton<IAnonymiseValueFactory>(provider =>
+            provider.GetRequiredService<OriginalValueTombstoneFactory>()
+        );
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
+        services.AddCohort<SampleDbContext>();
+        await using var provider = services.BuildServiceProvider(validateScopes: true);
+
+        using (var scope = provider.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<SampleDbContext>();
+            using var other = provider.CreateScope();
+            ReferenceEquals(db.Model, other.ServiceProvider.GetRequiredService<SampleDbContext>().Model)
+                .Should().BeFalse("the full cache gives every context a model of its own");
+        }
+
+        var result = await provider.GetRequiredService<IRetentionSweep>().ExecuteAsync(
+            RetentionSweepRequest.Tenantless()
+        );
+
+        result.EntityFailures.Should().BeEmpty();
+
+        await using var holdsScope = provider.CreateAsyncScope();
+        (await holdsScope.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>().HasActiveHoldAsync(
+            RetentionEntityIdentity.For<Note>(),
+            Guid.NewGuid().ToString(),
+            Guid.NewGuid(),
+            CancellationToken.None
+        )).Should().BeFalse();
     }
 
     // The same server under another name: a host name becomes one of its addresses, a loopback
@@ -1089,7 +1166,8 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     // host routes to systemConnectionString.
     private static ServiceProvider BuildSystemRoutedProvider(
         string callerConnectionString,
-        string systemConnectionString
+        string systemConnectionString,
+        Action<DbContextOptionsBuilder>? configureContext = null
     )
     {
         var services = new ServiceCollection();
@@ -1097,8 +1175,10 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
         services.AddScoped(_ => new DatabaseRoute(callerConnectionString));
         services.AddDbContext<SampleDbContext>((provider, options) =>
-            options.UseNpgsql(provider.GetRequiredService<DatabaseRoute>().ConnectionString)
-        );
+        {
+            options.UseNpgsql(provider.GetRequiredService<DatabaseRoute>().ConnectionString);
+            configureContext?.Invoke(options);
+        });
         services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
         services.AddSingleton<GuidTombstoneFactory>();
         services.AddSingleton<OriginalValueTombstoneFactory>();
@@ -1113,6 +1193,19 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         );
         services.AddCohort<SampleDbContext>();
         return services.BuildServiceProvider(validateScopes: true);
+    }
+
+    private sealed class ConnectionStringModelCacheKeyFactory : IModelCacheKeyFactory
+    {
+        public object Create(DbContext context, bool designTime) =>
+            (
+                context.GetType(),
+                context.GetService<IDbContextOptions>()
+                    .FindExtension<CoreOptionsExtension>()
+                    ?.ApplicationServiceProvider?.GetService<DatabaseRoute>()
+                    ?.ConnectionString,
+                designTime
+            );
     }
 
     private sealed class RecordingExecutionScope : IRetentionExecutionScope

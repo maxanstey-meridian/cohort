@@ -7,6 +7,7 @@ using Cohort.Infrastructure.Holds;
 using Cohort.Infrastructure.Sweep;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -863,7 +864,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
         try
         {
             if (
-                !ReferenceEquals(systemDb.Model, db.Model)
+                !SameModel(systemDb, db)
                 || await ReadServerDatabaseIdentityAsync(systemDb, holds, ct) != callerDatabase
             )
             {
@@ -908,6 +909,20 @@ internal sealed class RetentionRuntimeReadinessValidator(
             await systemDb.Database.CloseConnectionAsync();
         }
     }
+
+    /// <summary>
+    /// Whether two contexts run on one model, decided as EF decides it: by the model cache key,
+    /// which names the context type and whatever the host adds through a custom
+    /// <see cref="IModelCacheKeyFactory"/>. The <see cref="DbContext.Model"/> instances can't be
+    /// compared, since EF keeps built models in a size-limited memory cache and a model that
+    /// doesn't fit isn't stored, so two contexts of one type and options then each build their
+    /// own equal copy.
+    /// </summary>
+    private static bool SameModel(DbContext left, DbContext right) =>
+        Equals(
+            left.GetService<IModelCacheKeyFactory>().Create(left, designTime: false),
+            right.GetService<IModelCacheKeyFactory>().Create(right, designTime: false)
+        );
 
     /// <summary>
     /// Which database a context's connection reaches, as the server sees it. Connection strings

@@ -26,7 +26,9 @@ expressed in SQL.
 3. **Resolve.** For each entity, the category's rule is resolved for this tenant and time.
    The cutoff is the start of the day `Period` or `LegalMin` (whichever reaches further back)
    before today, counted in calendar years, months and days in the host's `TimeZone`.
-4. **Batch.** Candidate rows past the cutoff, in the tenant and not held, are selected with
+4. **Batch.** Candidate rows past the cutoff, in the tenant and not covered by an active hold
+   (a hold on the row itself, or on a row it's held with through a
+   [hold relation](/guides/legal-holds#holding-related-rows)), are selected with
    `FOR UPDATE SKIP LOCKED` in batches of `SweepBatchSize` (an erasure waits for locked rows
    instead). A purge also leaves out rows still referenced through a `RESTRICT` or
    `NO ACTION` foreign key, read from `pg_catalog`, unless the entity has a
@@ -65,16 +67,18 @@ Along the way:
   rows are only blocked, and the run moves on to the next batch. A foreign key refusing the
   value an anonymise writes, such as a static factory's key that no row has, still fails the
   entity: the value is the rule's.
-- `HeldCount` and `BlockedCount` are measured directly: rows past the cutoff with an active
-  hold, and rows still referenced through a blocking foreign key, plus the rows a constraint
-  refused during the run. Neither is inferred from candidate arithmetic. A sweep's blocked
-  rows leave it `Succeeded`, like held rows, and the next run tries them again; an erasure
+- `HeldCount` and `BlockedCount` are measured directly: rows past the cutoff that an active
+  hold covers (directly or through a hold relation), and rows still referenced through a
+  blocking foreign key, plus the rows a constraint refused during the run. Neither is inferred
+  from candidate arithmetic. A sweep's blocked rows leave it `Succeeded`, like held rows, and the next run tries them again; an erasure
   with blocked rows settles `PartiallyFailed` with a `rows-blocked` reason.
 - Once an entity's batches are done, the rows still due that the run neither changed nor
   skipped are counted once, in `DeferredCount`: rows another transaction had locked when the
   run reached them (a sweep skips them and doesn't come back to them in the same run), and
   rows that came into scope mid-run behind the run. A sweep's next run retires them, so they
   leave it `Succeeded`; an erasure that missed rows settles `PartiallyFailed` with a `rows-missed` reason.
+  `DeferredCount` and `HeldCount` are read in one statement, so a hold that commits meanwhile
+  can't put a row in both.
 - An erasure also reports what its rule keeps in `RetainedCount` (rows younger than the
   legal minimum, or every row under an `Exempt` rule), and `ErasureResult.Complete` says
   whether anything of the subject was left. See

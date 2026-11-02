@@ -42,7 +42,15 @@ internal sealed class RetentionErasureService(
             : null;
 
         await readinessValidator.ValidateAsync(ct);
-        ValidateSubject(scope, entities);
+        // Refused before any run exists: a kind no retained entity declares would erase nothing.
+        ErasureSubjectValidation.Validate(
+            validationState.For(db.Model),
+            registry,
+            scope.Kind,
+            scope.Subject,
+            entities,
+            "the erasure"
+        );
         var (now, startedAt) = await DatabaseClock.ResolveRunTimeAsync(db, request.At, scope.DryRun, ct);
 
         var run = new RetentionRun(
@@ -111,39 +119,6 @@ internal sealed class RetentionErasureService(
         }
 
         return commitInterceptor;
-    }
-
-    /// <summary>
-    /// Refuses, before any run exists, a kind no retained entity in the request's scope
-    /// declares (it would erase nothing) and a subject that isn't of its kind's CLR type.
-    /// Neither message includes the subject's value.
-    /// </summary>
-    private void ValidateSubject(ErasureScope scope, SweepEntityScope entities)
-    {
-        var validation = validationState.For(db.Model);
-        var declared = registry.Scan().Values
-            .Where(entry => entities.Includes(entry))
-            .SelectMany(entry => validation.ErasureSubjects[entry.EntityType])
-            .Select(metadata => metadata.Kind)
-            .ToHashSet(StringComparer.Ordinal);
-        if (!declared.Contains(scope.Kind))
-        {
-            var declaredText = declared.Count == 0
-                ? "none"
-                : string.Join(", ", declared.Order(StringComparer.Ordinal).Select(kind => $"'{kind}'"));
-            var which = entities == SweepEntityScope.TenantedOnly ? "tenanted" : "tenantless";
-            throw new InvalidOperationException(
-                $"Erasure subject kind '{scope.Kind}' isn't declared by any {which} retained entity's [ErasureSubject], so the erasure would match nothing. Declared kinds: {declaredText}."
-            );
-        }
-
-        var subjectType = validation.ErasureSubjectKinds[scope.Kind];
-        if (!subjectType.IsInstanceOfType(scope.Subject))
-        {
-            throw new InvalidOperationException(
-                $"Erasure subject kind '{scope.Kind}' identifies subjects by {subjectType.Name}, but the scope's subject is a {scope.Subject.GetType().Name}."
-            );
-        }
     }
 
     private async Task<IReadOnlyList<SweepScope>> BuildExecutionPlanAsync(

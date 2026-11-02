@@ -86,6 +86,11 @@ columns or rows belong to it. So these are rejected:
   changes rows in place, addressing each by its physical position (`ctid`): a view has no
   `ctid`, a materialized view's rows can't be updated or deleted, and a foreign table's `ctid`
   doesn't reliably identify its rows.
+- Each [hold relation](#hold-relations)'s link column exists in the real table (the message
+  says the link column "was not found in the database"), and its catalog type, resolved
+  through domains, equals the catalog type of the record-ID column it names, since hold SQL
+  equates the two. A link column of another type is refused, naming both. Each message names
+  the declaration and the column.
 - Each anonymised column can take what Cohort writes to it, checked against the database
   catalog: the column exists and the model's store type can be assigned to its type without
   an explicit cast; an `EmptyString` or `FixedLiteral` value, after the value converter, is
@@ -99,6 +104,30 @@ columns or rows belong to it. So these are rejected:
   and deleted-at of an entity that may be soft-deleted, or the anonymised-at marker of one
   that may be anonymised. Changing a referenced key is either refused while a row references
   it or silently rewrites the referencing rows.
+
+## Hold relations
+
+A `[Retain]` entity that carries `[HeldWith]` or `[HeldWithReferencing]` (see
+[Holding related rows](/guides/legal-holds#holding-related-rows)) is refused when:
+
+- the declaring entity isn't `[Retain]`. An attribute on an `[ExemptFromRetention]` or an
+  unannotated entity is an error, not ignored.
+- the related type isn't a `[Retain]` entity in the `DbContext` model.
+- the link member isn't a mapped public property with a table column, on the entity that
+  holds the link: the declaring entity for `[HeldWith]`, the related one for
+  `[HeldWithReferencing]`.
+- the link's type differs from the record ID it names: its provider CLR type (after any value
+  converter, and after unwrapping `Nullable<T>`) or its store type (when both are known).
+- one entity is tenanted and the other `[RetentionTenantless]`.
+- the same relation is declared twice.
+- the relations form a cycle, a relation from an entity to itself included. The message lists
+  the entities and each declaration in the cycle.
+
+Each message, a cycle's included, names the declaration it refuses in the form
+`[HeldWith(typeof(MyApp.Case), "CaseId")] on MyApp.CaseLink`: the attribute, the related type,
+the member and the declaring type. A declaration needs no database foreign key, so none is
+checked. Readiness also checks each link column against the real table
+([Columns](#columns)).
 
 ## Foreign keys
 

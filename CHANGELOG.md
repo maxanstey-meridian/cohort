@@ -2,6 +2,37 @@
 
 Breaking changes come with upgrade steps in the guide that covers them.
 
+## 0.12.0 (unreleased, breaking)
+
+A hold on a row also holds the rows a host declares related to it.
+
+- `[HeldWith(typeof(Case), nameof(CaseId))]` (this entity's member names the related row) and
+  `[HeldWithReferencing(typeof(Case), nameof(Case.SourceSubmissionId))]` (the related entity's
+  member names this row) declare, on the entity whose rows become held, that its rows are held
+  while a related retained row is. Chains follow through, a `NULL` link covers nothing, the
+  link always names the related entity's record ID and needs no database foreign key, and every
+  hop stays in one tenant. A covered row is judged exactly as if it carried its own hold, by
+  sweeps, erasure, previews, dry runs, `IRetentionDeletion` and the dependents step, so
+  `HeldCount` counts it, an erasure over it isn't `Complete`, and `HasActiveHoldAsync` now
+  answers `true` for it. `IRetentionHoldsRepository` gains `ListCoveringAsync` (the holds
+  covering one row) and `ListCoveringSubjectAsync` (the holds covering any row of an erasure
+  subject, in one read with no run recorded); a host that implements the interface must add
+  both. `CreateAsync` row-locks every row the new hold will cover before it inserts the hold, so
+  a sweep or erasure either finishes with a row first or sees the hold, and refuses a caller
+  transaction above READ COMMITTED when the held entity covers related rows; hold creation can
+  deadlock with an erasure or a deletion across entities, and PostgreSQL aborts one side with
+  `40P01`, which is retryable. `IRetentionDeletion` fails and rolls back when a hold on an
+  entity that covers related rows appears while its callback runs. Startup refuses a declaration
+  whose entity or related type isn't `[Retain]`, whose member is missing or mistyped, that
+  joins a tenanted and a tenantless entity, that is declared twice, or that forms a cycle, and
+  readiness checks each link column in the database. The dependents step's held-row guard costs
+  more as holds cover more rows: about two reads per step row, each about 175 ms at 100,000
+  covered rows.
+- A sweep's `DeferredCount` and `HeldCount` are read in one statement, so a hold committing
+  meanwhile can't put a row in both.
+
+Upgrade: [Legal Holds](https://maxanstey-meridian.github.io/cohort/guides/legal-holds#upgrading-to-0-12-0).
+
 ## 0.11.0 (2026-10-26, breaking)
 
 Cohort tells the host whose work it is doing, and closes paths where rows were deleted or left

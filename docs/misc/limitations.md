@@ -22,6 +22,18 @@ These are the deliberate limits of Cohort, so you don't discover them in product
 - One retained entity maps to one independently owned table. Owned types, shared tables,
   entity and table splitting, and inheritance hierarchies are rejected at startup.
 - Retained entities can't form a foreign-key cycle.
+- A [hold relation](/guides/legal-holds#holding-related-rows) always links to the related
+  entity's record ID. A link to an alternate key can't be declared. Relations can't form a
+  cycle, so an entity can't be held with itself (a message replying to a message), and both
+  ends are tenanted or both are `[RetentionTenantless]`.
+- No call lists every row a hold covers. `ListCoveringAsync` and `ListCoveringSubjectAsync`
+  return holds, not rows.
+- A hold covers related rows only while the declarations stay: removing a declaration releases
+  what it covered. Cohort doesn't lock holder rows against your own writes to a link column, so
+  a link written while a sweep mutates a row further down the chain is judged by whichever
+  comes first ([Writing links](/guides/legal-holds#writing-links)).
+- Hold creation, an erasure and an `IRetentionDeletion` callback can deadlock across entities
+  when holds cover related rows. PostgreSQL aborts one side with `40P01`, which is retryable.
 - Rows with a `NULL` anchor never age out of an ordinary sweep.
 - Record IDs whose text form depends on session settings (timestamps, dates, intervals,
   floats, `money`, `bytea`) aren't supported.

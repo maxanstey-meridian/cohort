@@ -112,9 +112,10 @@ internal sealed class EfRetentionDeletion(
         }
 
         // The listed targets are unheld, but the callback can remove more than it listed (an
-        // unlisted row, a client or database cascade, raw SQL). Any active hold whose row
-        // disappears inside this transaction is a violation, whatever removed it. Holds already
-        // orphaned before the callback are not this deletion's doing.
+        // unlisted row, a client or database cascade, raw SQL). Any row an active hold covers that
+        // disappears inside this transaction is a violation, whatever removed it, and so is a hold
+        // on an entity that covers related rows appearing meanwhile. Rows already orphaned before
+        // the callback are not this deletion's doing.
         var heldBefore = await holdGuard.ReadHeldRowVersionsAsync(connection, dbTransaction, ct);
         try
         {
@@ -155,24 +156,14 @@ internal sealed class EfRetentionDeletion(
         CancellationToken ct
     )
     {
-        var parameters = new SqlParams
-        {
-            ["retentionEntityId"] = target.Entry.RetentionEntityId,
-            ["recordId"] = target.RecordId,
-        };
-        if (target.Entry.Tenant is not null)
-        {
-            parameters["tenantId"] = target.TenantId;
-        }
-
-        await using var command = parameters.CreateCommand(
-            db.Database.GetDbConnection(),
-            transaction,
-            RetentionHoldSql.BuildActiveHoldForRecord(
-                tables.RetentionHolds,
-                tenanted: target.Entry.Tenant is not null
-            )
+        // Covered through a relation counts as held, exactly as a sweep judges it.
+        var (sql, parameters) = RetentionHoldSql.BuildAnyCoveringHold(
+            tables.RetentionHolds,
+            target.Entry,
+            target.RecordId,
+            target.TenantId
         );
+        await using var command = parameters.CreateCommand(db.Database.GetDbConnection(), transaction, sql);
         return await command.ExecuteScalarAsync(ct) is not null;
     }
 

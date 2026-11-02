@@ -158,7 +158,9 @@ the run is written to Cohort's ledger.
   (`[ErasureSubject("user")]`), so a user erasure never touches a person column. A non-zero
   `LegalMin` and active holds still block it.
 - [Legal holds](https://maxanstey-meridian.github.io/cohort/guides/legal-holds): a held row
-  survives every strategy. `IRetentionDeletion` lets your own deletes respect holds too.
+  survives every strategy, and so do the rows you declare held with it (`[HeldWith]`,
+  `[HeldWithReferencing]`), so a hold on a Case protects its links, Submission and uploads.
+  `IRetentionDeletion` lets your own deletes respect holds too.
 - [Row handlers](https://maxanstey-meridian.github.io/cohort/guides/row-handlers): capture a
   row before mutation, then clean up blobs or publish events after commit, with
   at-least-once delivery and dead-lettering.

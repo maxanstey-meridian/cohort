@@ -2,7 +2,9 @@ using System.Collections.Frozen;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 
+using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Infrastructure.Holds;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata;
@@ -24,14 +26,28 @@ internal sealed class RetentionEntryBuilder(CohortConventions conventions)
 
     public string ExpectedTenantPropertyName => conventions.TenantPropertyName;
 
-    /// <summary>Every retained entity in <paramref name="model"/>, built once per model.</summary>
+    /// <summary>
+    /// Every retained entity in <paramref name="model"/>, built once per model, with the hold
+    /// relations its declarations form resolved onto each entry. A bad declaration throws the
+    /// same <see cref="RetentionConfigurationException"/> errors startup validation reports.
+    /// </summary>
     public FrozenDictionary<Type, RetentionEntry> BuildAll(IModel model) =>
         entriesByModel.GetValue(
             model,
-            m => m.GetEntityTypes()
-                .Select(TryBuild)
-                .OfType<RetentionEntry>()
-                .ToFrozenDictionary(entry => entry.EntityType)
+            m =>
+            {
+                var entries = m.GetEntityTypes()
+                    .Select(TryBuild)
+                    .OfType<RetentionEntry>()
+                    .ToFrozenDictionary(entry => entry.EntityType);
+                var resolution = HoldRelations.Resolve(m, entries);
+                if (resolution.Errors.Count > 0)
+                {
+                    throw new RetentionConfigurationException(resolution.Errors);
+                }
+
+                return HoldRelations.WithPaths(entries, resolution.Relations).ToFrozenDictionary();
+            }
         );
 
     public RetentionEntry? TryBuild(IEntityType entityType)
@@ -189,7 +205,7 @@ internal sealed class RetentionEntryBuilder(CohortConventions conventions)
         return (property, column, member);
     }
 
-    private static string? TryGetStoreType(IProperty property)
+    internal static string? TryGetStoreType(IProperty property)
     {
         // Null on non-relational providers (metadata-only scans); SQL builders fall back
         // to casting the column to text instead of casting the parameter.

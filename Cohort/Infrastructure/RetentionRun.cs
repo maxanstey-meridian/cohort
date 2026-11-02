@@ -300,23 +300,26 @@ internal sealed class RetentionRun(
             {
                 affected = await strategy.CountAsync(scope, SweepCount.Eligible, connection, ct);
                 blocked = await strategy.CountAsync(scope, SweepCount.Blocked, connection, ct);
+                // Held rows are measured directly (in scope, eligible, actively held) rather
+                // than inferred from candidate arithmetic.
+                held = await strategy.CountAsync(scope, SweepCount.Held, connection, ct);
             }
             else
             {
                 (affected, skipped, var refused) = await ExecuteBatchesAsync(strategy, scope, eventAt, ct);
-                // Measured once the loop is done, like held rows: what is still due and was
-                // neither changed, skipped nor refused by this run, and what a reference
-                // still blocks besides the rows a constraint refused.
-                deferred = await strategy.CountDeferredAsync(scope, SweepId, refused, connection, ct);
-                var referenced = await strategy.CountBlockedAsync(scope, refused, connection, ct);
+                // Measured once the loop is done, in one statement so they share one snapshot
+                // and a hold that commits meanwhile can't put a row in two counts or in none:
+                // what is still due and was neither changed, skipped nor refused by this run,
+                // the held rows, and what a reference still blocks besides the rows a
+                // constraint refused.
+                long referenced;
+                (deferred, held, referenced) = await strategy.CountLeftAsync(scope, SweepId, refused, connection, ct);
                 LogReferenced(scope, referenced);
                 blocked = refused.Count + referenced;
             }
 
-            // Held rows are measured directly (in scope, eligible, actively held) rather
-            // than inferred from candidate arithmetic. Without a cutoff (an erasure with no
-            // legal minimum) a NULL anchor excludes nothing, so there is nothing to report.
-            held = await strategy.CountAsync(scope, SweepCount.Held, connection, ct);
+            // Without a cutoff (an erasure with no legal minimum) a NULL anchor excludes
+            // nothing, so there is nothing to report.
             if (scope.Cutoff is not null)
             {
                 nullAnchors = await strategy.CountAsync(scope, SweepCount.NullAnchor, connection, ct);

@@ -64,7 +64,7 @@ internal abstract class SweepStrategy(
         EnsureHandles(scope);
         if (count == SweepCount.Blocked)
         {
-            return await CountBlockedAsync(scope, [], conn, ct);
+            return await CountBlockedAsync(scope, conn, ct);
         }
 
         var parameters = new SqlParams();
@@ -82,16 +82,11 @@ internal abstract class SweepStrategy(
     }
 
     /// <summary>
-    /// Rows that would be due but for a blocking reference, leaving out
-    /// <paramref name="alreadyBlocked"/>: rows the run already counted as blocked when a
-    /// constraint refused them.
+    /// Rows that would be due but for a blocking reference: what a dry run predicts a
+    /// constraint-free run leaves behind. A real run counts them with the other rows it
+    /// leaves, in <see cref="CountLeftAsync"/>.
     /// </summary>
-    public async Task<long> CountBlockedAsync(
-        SweepScope scope,
-        IReadOnlyCollection<string> alreadyBlocked,
-        DbConnection conn,
-        CancellationToken ct
-    )
+    public async Task<long> CountBlockedAsync(SweepScope scope, DbConnection conn, CancellationToken ct)
     {
         EnsureHandles(scope);
         if (scope.BlockingReferences.Count == 0)
@@ -102,7 +97,7 @@ internal abstract class SweepStrategy(
         var parameters = new SqlParams();
         return await CountWhereAsync(
             scope.Entry,
-            $"{ScopeSql(scope, parameters)} AND {HoldExclusion(scope, parameters)} AND NOT ({ReferencingForeignKeySql.NotReferencedSql(scope)}){NotAnyRecordIdSql(scope.Entry, "alreadyBlockedIds", alreadyBlocked, parameters)}",
+            $"{ScopeSql(scope, parameters)} AND {HoldExclusion(scope, parameters)} AND NOT ({ReferencingForeignKeySql.NotReferencedSql(scope)})",
             parameters,
             conn,
             ct
@@ -110,18 +105,25 @@ internal abstract class SweepStrategy(
     }
 
     /// <summary>
-    /// Rows still due once run <paramref name="sweepId"/> has finished its batches for the
-    /// entity, leaving out the rows the run already accounted for: a row skipped by a failing
-    /// OnBefore handler or dependents step, through the row detail its skip wrote, and a row a
-    /// constraint refused, through <paramref name="blocked"/>. What remains was locked by
-    /// another transaction when discovery passed it, or came into scope mid-run behind the
-    /// run's position. Measured once after the loop rather than per batch, and sends the
-    /// blocked ids once, so no row is counted both deferred and blocked.
+    /// What is left once run <paramref name="sweepId"/> has finished its batches for the
+    /// entity, in one statement: one snapshot and one clock reading, so a hold that commits
+    /// while the run counts can't put a row in two counts or in none.
+    /// <list type="bullet">
+    /// <item><c>Deferred</c>: rows still due, leaving out the rows the run already accounted
+    /// for: a row skipped by a failing OnBefore handler or dependents step, through the row
+    /// detail its skip wrote, and a row a constraint refused, through
+    /// <paramref name="refused"/>. What remains was locked by another transaction when
+    /// discovery passed it, or came into scope mid-run behind the run's position.</item>
+    /// <item><c>Held</c>: the rows of <see cref="SweepCount.Held"/>.</item>
+    /// <item><c>Referenced</c>: rows that would be due but for a blocking reference, leaving
+    /// out <paramref name="refused"/> too, so no row is counted both refused and
+    /// referenced. 0 when the scope has no blocking reference.</item>
+    /// </list>
     /// </summary>
-    public async Task<long> CountDeferredAsync(
+    public async Task<(long Deferred, long Held, long Referenced)> CountLeftAsync(
         SweepScope scope,
         Guid sweepId,
-        IReadOnlyCollection<string> blocked,
+        IReadOnlyCollection<string> refused,
         DbConnection conn,
         CancellationToken ct
     )
@@ -129,13 +131,27 @@ internal abstract class SweepStrategy(
         EnsureHandles(scope);
 
         var parameters = new SqlParams();
-        return await CountWhereAsync(
-            scope.Entry,
-            $"{DueSql(scope, parameters)}{NotRecordedByRunSql(scope, sweepId, parameters)}{NotAnyRecordIdSql(scope.Entry, "blockedRecordIds", blocked, parameters)}",
-            parameters,
+        var scopeSql = ScopeSql(scope, parameters);
+        var notRefused = NotAnyRecordIdSql(scope.Entry, "refusedRecordIds", refused, parameters);
+        var deferred = $"{DueSql(scope, parameters)}{NotRecordedByRunSql(scope, sweepId, parameters)}{notRefused}";
+        var held = $"{scopeSql} AND NOT {HoldExclusion(scope, parameters)}";
+        var referenced = scope.BlockingReferences.Count == 0
+            ? "0::bigint"
+            : $"pg_catalog.count(*) FILTER (WHERE {scopeSql} AND {HoldExclusion(scope, parameters)} AND NOT ({ReferencingForeignKeySql.NotReferencedSql(scope)}){notRefused})";
+        await using var command = parameters.CreateCommand(
             conn,
-            ct
+            null,
+            $"""
+            SELECT pg_catalog.count(*) FILTER (WHERE {deferred}),
+                   pg_catalog.count(*) FILTER (WHERE {held}),
+                   {referenced}
+            FROM {PostgreSqlIdentifier.Format(scope.Entry.Table)} AS target
+            WHERE {scopeSql}
+            """
         );
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        await reader.ReadAsync(ct);
+        return (reader.GetInt64(0), reader.GetInt64(1), reader.GetInt64(2));
     }
 
     /// <summary>
@@ -778,8 +794,10 @@ internal abstract class SweepStrategy(
 
     /// <summary>
     /// Selects up to one batch of candidates after the row the run's previous batch reached,
-    /// and locks them: the entity lock serialises against hold creation, the row lock against
-    /// other runs. Held rows are excluded up front so they are neither locked nor reselected.
+    /// and locks them: the entity lock serialises against creating a hold on a candidate, the
+    /// row lock against other runs and against creating a hold on a related row, which locks the
+    /// rows it will cover <c>FOR SHARE</c> before it commits (<c>EfRetentionHoldsRepository</c>).
+    /// Held rows are excluded up front so they are neither locked nor reselected.
     /// A discovered row that fails the lock re-check (locked by another run, or no longer
     /// due) is passed over, and discovery continues after it until the batch is full or no
     /// row is left: a sweep leaves a locked row for its next run, which counts it as deferred.
@@ -1026,24 +1044,32 @@ internal abstract class SweepStrategy(
         return clauses;
     }
 
+    /// <summary>
+    /// Excludes covered rows: an active hold names the row, or a row it is linked to through a
+    /// declared relation. One parenthesised term, so <c>NOT {HoldExclusion}</c> selects them.
+    /// </summary>
     private static string HoldExclusion(SweepScope scope, SqlParams parameters)
     {
         var entry = scope.Entry;
-        parameters["retentionEntityId"] = entry.RetentionEntityId;
         if (entry.Tenant is not null)
         {
             parameters["tenantId"] = scope.Tenant.Id;
         }
 
-        return RetentionHoldSql.BuildActiveHoldExclusion(
+        var (sql, holdParameters) = RetentionHoldSql.BuildCoveredExclusion(
             entry.CohortTables.RetentionHolds,
-            "target",
-            entry.RecordId.RecordIdColumn,
-            entry.Tenant?.TenantColumn
+            entry,
+            "target"
         );
+        RetentionHoldSql.Merge(parameters, holdParameters);
+        return sql;
     }
 
-    private static string OrderBySql(RetentionEntry entry) =>
+    /// <summary>
+    /// The order a batch is locked in, aliased <c>target</c>; hold creation locks the rows a new
+    /// hold covers in the same order.
+    /// </summary>
+    internal static string OrderBySql(RetentionEntry entry) =>
         $"target.{PostgreSqlIdentifier.Quote(entry.AnchorColumn)} ASC, {RecordIdSql.TextExpression("target", entry.RecordId)} ASC";
 
     private void EnsureHandles(SweepScope scope)

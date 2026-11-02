@@ -52,6 +52,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
             await startupValidator.ValidateAsync(ct);
             await schemaValidator.ValidateAsync(ct);
             await ValidateRetainedTablesAsync(ct);
+            await ValidateHoldRelationLinkColumnsAsync(ct);
             await ValidateAnonymiseTargetsAsync(ct);
             await ValidateReferencedMarkerColumnsAsync(ct);
             // The hold check runs on its own connection, outside the caller's transaction, so its
@@ -186,6 +187,138 @@ internal sealed class RetentionRuntimeReadinessValidator(
                     errors.Add(
                         $"Record-id convention on {entry.EntityType.FullName}: record-id column {PostgreSqlIdentifier.Format(entry.Table)}.{PostgreSqlIdentifier.Quote(entry.RecordId.RecordIdColumn)} is built on '{typeName}', whose text form depends on session settings (TimeZone, DateStyle, IntervalStyle, extra_float_digits), so holds and audit rows could silently stop matching. Use a uuid, integer, numeric, or text record id, or mark a stable unique column with [RetentionRecordId]."
                     );
+                }
+            }
+
+            if (errors.Count != 0)
+            {
+                throw new RetentionConfigurationException([.. errors]);
+            }
+        }
+        finally
+        {
+            await db.Database.CloseConnectionAsync();
+        }
+    }
+
+    /// <summary>
+    /// Each <c>[HeldWith]</c> and <c>[HeldWithReferencing]</c> link column must exist in the real
+    /// table, and its catalog type, resolved through domains, must be the type of the record-id
+    /// column it names, because hold SQL equates the two. The model-level type check can't see a
+    /// domain or a column that migration drift changed. Runs after
+    /// <see cref="ValidateRetainedTablesAsync"/>, which has already refused a missing table or
+    /// record-id column.
+    /// </summary>
+    private async Task ValidateHoldRelationLinkColumnsAsync(CancellationToken ct)
+    {
+        // A relation's declaring entity carries it as a one-hop holder path.
+        var hops = registry
+            .Scan()
+            .Values.OrderBy(entry => entry.EntityType.FullName, StringComparer.Ordinal)
+            .SelectMany(entry => entry.HolderPaths.Where(path => path.Hops.Count == 1).Select(path => path.Hops[0]))
+            .Select(hop =>
+                hop.LinkSide == HoldLinkSide.Near
+                    ? (Hop: hop, Owner: hop.Near, Target: hop.Far)
+                    : (Hop: hop, Owner: hop.Far, Target: hop.Near)
+            )
+            .ToArray();
+        if (hops.Length == 0)
+        {
+            return;
+        }
+
+        await db.Database.OpenConnectionAsync(ct);
+        try
+        {
+            await using var command = new SqlParams
+            {
+                ["owner_schemas"] = hops.Select(hop => hop.Owner.Table.Schema).ToArray(),
+                ["owner_tables"] = hops.Select(hop => hop.Owner.Table.Name).ToArray(),
+                ["link_columns"] = hops.Select(hop => hop.Hop.LinkColumn).ToArray(),
+                ["target_schemas"] = hops.Select(hop => hop.Target.Table.Schema).ToArray(),
+                ["target_tables"] = hops.Select(hop => hop.Target.Table.Name).ToArray(),
+                ["target_columns"] = hops.Select(hop => hop.Target.RecordId.RecordIdColumn).ToArray(),
+            }.CreateCommand(
+                db.Database.GetDbConnection(),
+                db.Database.CurrentTransaction?.GetDbTransaction(),
+                """
+                WITH RECURSIVE requested AS (
+                    SELECT requested.ordinal,
+                           link.atttypid AS link_type_id,
+                           target.atttypid AS target_type_id
+                    FROM ROWS FROM (
+                        pg_catalog.unnest(@owner_schemas),
+                        pg_catalog.unnest(@owner_tables),
+                        pg_catalog.unnest(@link_columns),
+                        pg_catalog.unnest(@target_schemas),
+                        pg_catalog.unnest(@target_tables),
+                        pg_catalog.unnest(@target_columns)
+                    ) WITH ORDINALITY AS requested(owner_schema, owner_table, link_column, target_schema, target_table, target_column, ordinal)
+                    LEFT JOIN pg_catalog.pg_namespace owner_namespace ON owner_namespace.nspname = requested.owner_schema
+                    LEFT JOIN pg_catalog.pg_class owner_relation
+                      ON owner_relation.relnamespace = owner_namespace.oid AND owner_relation.relname = requested.owner_table
+                    LEFT JOIN pg_catalog.pg_attribute link
+                      ON link.attrelid = owner_relation.oid
+                     AND link.attname = requested.link_column
+                     AND link.attnum > 0
+                     AND NOT link.attisdropped
+                    LEFT JOIN pg_catalog.pg_namespace target_namespace ON target_namespace.nspname = requested.target_schema
+                    LEFT JOIN pg_catalog.pg_class target_relation
+                      ON target_relation.relnamespace = target_namespace.oid AND target_relation.relname = requested.target_table
+                    LEFT JOIN pg_catalog.pg_attribute target
+                      ON target.attrelid = target_relation.oid
+                     AND target.attname = requested.target_column
+                     AND target.attnum > 0
+                     AND NOT target.attisdropped
+                ),
+                -- Each type through its domains to the type it is built on.
+                built_on(ordinal, side, type_id) AS (
+                    SELECT ordinal, 'link', link_type_id FROM requested WHERE link_type_id IS NOT NULL
+                    UNION ALL
+                    SELECT ordinal, 'target', target_type_id FROM requested WHERE target_type_id IS NOT NULL
+                    UNION ALL
+                    SELECT built_on.ordinal, built_on.side, pgtype.typbasetype
+                    FROM built_on
+                    JOIN pg_catalog.pg_type pgtype ON pgtype.oid = built_on.type_id
+                    WHERE pgtype.typtype = 'd'
+                ),
+                resolved AS (
+                    SELECT built_on.ordinal, built_on.side, built_on.type_id
+                    FROM built_on
+                    JOIN pg_catalog.pg_type pgtype ON pgtype.oid = built_on.type_id
+                    WHERE pgtype.typtype <> 'd'
+                )
+                SELECT requested.ordinal,
+                       requested.link_type_id IS NOT NULL,
+                       pg_catalog.format_type(requested.link_type_id, NULL),
+                       pg_catalog.format_type(requested.target_type_id, NULL),
+                       link_base.type_id IS NOT DISTINCT FROM target_base.type_id
+                FROM requested
+                LEFT JOIN resolved link_base ON link_base.ordinal = requested.ordinal AND link_base.side = 'link'
+                LEFT JOIN resolved target_base ON target_base.ordinal = requested.ordinal AND target_base.side = 'target'
+                WHERE requested.target_type_id IS NOT NULL
+                """
+            );
+
+            var errors = new SortedSet<string>(StringComparer.Ordinal);
+            await using (var reader = await command.ExecuteReaderAsync(ct))
+            {
+                while (await reader.ReadAsync(ct))
+                {
+                    var (hop, owner, target) = hops[(int)reader.GetInt64(0) - 1];
+                    var column = $"{PostgreSqlIdentifier.Format(owner.Table)}.{PostgreSqlIdentifier.Quote(hop.LinkColumn)}";
+                    if (!reader.GetBoolean(1))
+                    {
+                        errors.Add(
+                            $"Hold relation {hop.Declaration}: link column {column} was not found in the database, so every hold check on it would fail. Apply the host application's pending EF Core migrations, or map the link member to the column it lives in."
+                        );
+                    }
+                    else if (!reader.GetBoolean(4))
+                    {
+                        errors.Add(
+                            $"Hold relation {hop.Declaration}: link column {column} is '{reader.GetString(2)}' in the database, but the record-id column {PostgreSqlIdentifier.Format(target.Table)}.{PostgreSqlIdentifier.Quote(target.RecordId.RecordIdColumn)} it names is '{reader.GetString(3)}', so holds would never match across the relation. Give the link column the record id's type."
+                        );
+                    }
                 }
             }
 

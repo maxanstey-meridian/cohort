@@ -101,7 +101,7 @@ re-keyed the same way.
 When an entity has several handlers, they run in `[RowHandlerPriority(n)]` order, lowest
 first. Handlers without the attribute run last, ordered by type name.
 
-## Retiring a row's dependents
+## Retiring a row's dependents {#retiring-a-rows-dependents}
 
 Some rows have dependents that must go with them, in the same transaction: child rows a
 foreign key ties to the row, or copies of its values in an audit table. `OnBeforeAsync` is
@@ -153,17 +153,29 @@ builder.Services.AddRetentionDependents<Case, RetireCaseDependents>();
   run's own token stops the run. A step queues no work, so there is nothing to requeue: the
   next run tries the row again.
 - **Holds.** Any change to, or removal of, a row under an active hold fails the step, whatever
-  the row's entity, even if the step ends the hold first. An `UPDATE` that writes the same
+  the row's entity, even if the step ends the hold first. A row is under a hold when the hold
+  names it or covers it through a [hold relation](/guides/legal-holds#holding-related-rows), so
+  updating a held Case's upload fails the step. An `UPDATE` that writes the same
   value counts as a change; a hold that merely expires or is released while the step runs
   doesn't fail it. Cohort compares
-  every visible held row's physical version before and after the step, so the check is
-  fail-safe rather than exact: a hold created anywhere the batch can see while the step runs,
-  or another session's committed update to a held row, also fails it, and the next run retries
-  the row. A Warning names the holds' ids, never the rows. Dependents' legal minimums aren't
+  every visible held row's physical version before and after the step, covered rows included,
+  so the check is fail-safe rather than exact: a hold created anywhere the batch can see while
+  the step runs, a row that becomes covered while it runs (the step inserts a row, or links
+  one, under a held row), or another session's committed update to a held row, also fails it,
+  and the next run retries the row. A step that cuts a covered row's link and then changes the
+  row still fails: Cohort compares the row it saw before. A Warning names the holds' ids,
+  never the rows. Dependents' legal minimums aren't
   enforced; a hold is the row-specific protection the step honours, as
   [`IRetentionDeletion`](/guides/legal-holds#deleting-around-holds) does. When the model has a tenantless retained entity,
   a tenant's batch must be able to see the active `NULL`-tenant holds, or the entity fails
   rather than run a step that can't check them (see [Tenant Isolation](/guides/tenant-isolation)).
+- **What the hold check costs.** Cohort reads the held rows' versions twice per row of an
+  entity with a step, and each read scales with the rows active holds cover that the batch can
+  see, not with the table's size. One read takes about 17 ms at 10,000 covered rows, 175 ms at
+  100,000 and 2 s at 1,000,000 (PostgreSQL 16, default configuration). So holds covering about
+  100,000 rows slow a sweep of a step's entity by minutes per 1,000 rows, and about 1,000,000
+  by an hour; uncovered rows cost nothing. See
+  [what it costs](/guides/legal-holds#what-it-costs).
 - **Foreign keys and previews.** A purge normally leaves out rows still referenced through a
   `RESTRICT` or `NO ACTION` foreign key. An entity with a step doesn't: its referenced rows are
   tried, the step runs, and a row still referenced after it is blocked by the constraint
@@ -178,7 +190,7 @@ builder.Services.AddRetentionDependents<Case, RetireCaseDependents>();
   immediate, so the same violation fails the step's statement (a skip) or the row's change (a
   block).
 - **Locks.** The step runs while the batch holds its row and entity locks, so a slow step
-  makes hold creation on those rows wait. A deadlock or lock timeout in the step fails that
+  makes hold creation on those rows, or on a row they're held with, wait. A deadlock or lock timeout in the step fails that
   row's step, not the batch.
 
 ## Delivery

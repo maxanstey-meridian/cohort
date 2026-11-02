@@ -3,6 +3,7 @@ using System.Text.RegularExpressions;
 
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Infrastructure.Holds;
 using Cohort.Infrastructure.Sweep;
 
 using Microsoft.EntityFrameworkCore;
@@ -241,6 +242,7 @@ internal sealed partial class RetentionStartupValidator(
 
             ValidateRowWorkTargetsRetainedEntities(errors);
             ValidateErasureSubjectKinds(errors);
+            ValidateHoldRelations(retainedEntries, errors);
 
             try
             {
@@ -299,6 +301,19 @@ internal sealed partial class RetentionStartupValidator(
             );
         }
     }
+
+    /// <summary>
+    /// Refuses <c>[HeldWith]</c> and <c>[HeldWithReferencing]</c> declarations that can't work.
+    /// It reads the model and attributes directly, through the function
+    /// <see cref="RetentionEntryBuilder.BuildAll"/> also uses, so a bad declaration gives the same
+    /// message whichever path meets it first.
+    /// </summary>
+    private void ValidateHoldRelations(IReadOnlyList<RetentionEntry> retainedEntries, List<string> errors) =>
+        errors.AddRange(
+            HoldRelations
+                .Resolve(db.Model, retainedEntries.ToDictionary(entry => entry.EntityType))
+                .Errors
+        );
 
     // Handlers and steps run only where Cohort mutates a row, so one on an entity Cohort never
     // retains would never run.

@@ -17,7 +17,9 @@ namespace Cohort.Infrastructure.Holds;
 internal sealed class EfRetentionHoldsRepository(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
     RetentionTargetResolver targetResolver,
-    RetentionRuntimeReadinessValidator readinessValidator
+    RetentionRuntimeReadinessValidator readinessValidator,
+    RetentionRegistry registry,
+    RetentionValidationState validationState
 )
     : IRetentionHoldsRepository
 {
@@ -37,6 +39,11 @@ internal sealed class EfRetentionHoldsRepository(
         try
         {
             var existingTransaction = db.Database.CurrentTransaction;
+            if (existingTransaction is not null && entry.CoveredPaths.Count > 0)
+            {
+                await RequireReadCommittedAsync(existingTransaction.GetDbTransaction(), request, ct);
+            }
+
             await using var ownedTransaction = existingTransaction is null
                 ? await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct)
                 : null;
@@ -57,6 +64,7 @@ internal sealed class EfRetentionHoldsRepository(
                 ct
             );
             await ValidateTargetRowAsync(entry, recordId, request, transaction, ct);
+            await LockCoveredRowsAsync(entry, recordId, request.TenantId, transaction, ct);
 
             await using var command = new SqlParams
             {
@@ -101,6 +109,58 @@ internal sealed class EfRetentionHoldsRepository(
         finally
         {
             await db.Database.CloseConnectionAsync();
+        }
+    }
+
+    /// <summary>
+    /// A hold that covers related rows locks them (<see cref="LockCoveredRowsAsync"/>) with
+    /// statements that must each read the current rows, so it can't join a transaction-wide
+    /// snapshot: a row linked after the snapshot would not be locked.
+    /// </summary>
+    private async Task RequireReadCommittedAsync(
+        DbTransaction transaction,
+        RetentionHoldRequest request,
+        CancellationToken ct
+    )
+    {
+        await using var command = new SqlParams().CreateCommand(
+            db.Database.GetDbConnection(),
+            transaction,
+            "SELECT pg_catalog.current_setting('transaction_isolation')"
+        );
+        var isolation = (string?)await command.ExecuteScalarAsync(ct);
+        if (!string.Equals(isolation, "read committed", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Retention hold for entity '{request.RetentionEntityId}' covers related rows, so it needs a READ COMMITTED transaction, but the caller's is {isolation?.ToUpperInvariant()}: under a transaction-wide snapshot a row linked after the transaction began would not be locked. Nothing was changed."
+            );
+        }
+    }
+
+    /// <summary>
+    /// Row-locks, <c>FOR SHARE</c>, every row the new hold will cover through a relation, after the
+    /// target row is validated and before the hold is inserted, so a sweep, erasure, or deletion
+    /// either finishes with such a row before the hold commits or sees the hold (see
+    /// <see cref="RetentionHoldSql.BuildCoveredRowLocks"/>).
+    /// </summary>
+    private async Task LockCoveredRowsAsync(
+        RetentionEntry entry,
+        string recordId,
+        Guid? tenantId,
+        DbTransaction transaction,
+        CancellationToken ct
+    )
+    {
+        foreach (var sql in RetentionHoldSql.BuildCoveredRowLocks(entry, registry.Scan().Values))
+        {
+            var parameters = new SqlParams { ["recordId"] = recordId };
+            if (entry.Tenant is not null)
+            {
+                parameters["tenantId"] = tenantId;
+            }
+
+            await using var command = parameters.CreateCommand(db.Database.GetDbConnection(), transaction, sql);
+            await command.ExecuteNonQueryAsync(ct);
         }
     }
 
@@ -187,25 +247,7 @@ internal sealed class EfRetentionHoldsRepository(
                 """
             );
 
-            var holds = new List<RetentionHold>();
-            await using var reader = await command.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct))
-            {
-                holds.Add(
-                    new RetentionHold(
-                        reader.GetGuid(0),
-                        reader.GetGuid(1),
-                        reader.GetString(2),
-                        reader.IsDBNull(3) ? null : reader.GetGuid(3),
-                        reader.GetString(4),
-                        reader.GetFieldValue<DateTimeOffset>(5),
-                        reader.IsDBNull(6) ? null : reader.GetFieldValue<DateTimeOffset>(6),
-                        reader.IsDBNull(7) ? null : reader.GetFieldValue<DateTimeOffset>(7)
-                    )
-                );
-            }
-
-            return holds;
+            return await ReadHoldsAsync(command, ct);
         }
         finally
         {
@@ -213,10 +255,69 @@ internal sealed class EfRetentionHoldsRepository(
         }
     }
 
+    private static async Task<IReadOnlyList<RetentionHold>> ReadHoldsAsync(DbCommand command, CancellationToken ct)
+    {
+        var holds = new List<RetentionHold>();
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            holds.Add(
+                new RetentionHold(
+                    reader.GetGuid(0),
+                    reader.GetGuid(1),
+                    reader.GetString(2),
+                    reader.IsDBNull(3) ? null : reader.GetGuid(3),
+                    reader.GetString(4),
+                    reader.GetFieldValue<DateTimeOffset>(5),
+                    reader.IsDBNull(6) ? null : reader.GetFieldValue<DateTimeOffset>(6),
+                    reader.IsDBNull(7) ? null : reader.GetFieldValue<DateTimeOffset>(7)
+                )
+            );
+        }
+
+        return holds;
+    }
+
     public async Task<bool> HasActiveHoldAsync(
         Guid retentionEntityId,
         string recordId,
         Guid? tenantId,
+        CancellationToken ct
+    ) =>
+        await ReadCoveringRecordAsync(
+            retentionEntityId,
+            recordId,
+            tenantId,
+            RetentionHoldSql.BuildAnyCoveringHold,
+            async command => await command.ExecuteScalarAsync(ct) is not null,
+            ct
+        );
+
+    public Task<IReadOnlyList<RetentionHold>> ListCoveringAsync(
+        Guid retentionEntityId,
+        string recordId,
+        Guid? tenantId,
+        CancellationToken ct
+    ) =>
+        ReadCoveringRecordAsync(
+            retentionEntityId,
+            recordId,
+            tenantId,
+            RetentionHoldSql.BuildCoveringHolds,
+            command => ReadHoldsAsync(command, ct),
+            ct
+        );
+
+    /// <summary>
+    /// Validates the target as every record read does, then reads the holds that cover it with the
+    /// statement <paramref name="build"/> makes, on the caller's transaction if there is one.
+    /// </summary>
+    private async Task<TResult> ReadCoveringRecordAsync<TResult>(
+        Guid retentionEntityId,
+        string recordId,
+        Guid? tenantId,
+        Func<RelationalObjectName, RetentionEntry, string, Guid?, (string Sql, SqlParams Parameters)> build,
+        Func<DbCommand, Task<TResult>> read,
         CancellationToken ct
     )
     {
@@ -229,31 +330,64 @@ internal sealed class EfRetentionHoldsRepository(
         try
         {
             var transaction = db.Database.CurrentTransaction?.GetDbTransaction();
-            var parameters = new SqlParams
-            {
-                ["retentionEntityId"] = retentionEntityId,
-                ["recordId"] = await targetResolver.CanonicaliseRecordIdAsync(
-                    entry,
-                    recordId,
-                    transaction,
-                    "Retention hold",
-                    ct
-                ),
-            };
-            if (entry.Tenant is not null)
-            {
-                parameters["tenantId"] = tenantId;
-            }
+            var canonicalRecordId = await targetResolver.CanonicaliseRecordIdAsync(
+                entry,
+                recordId,
+                transaction,
+                "Retention hold",
+                ct
+            );
+            var (sql, parameters) = build(tables.RetentionHolds, entry, canonicalRecordId, tenantId);
+            await using var command = parameters.CreateCommand(db.Database.GetDbConnection(), transaction, sql);
+            return await read(command);
+        }
+        finally
+        {
+            await db.Database.CloseConnectionAsync();
+        }
+    }
 
+    public async Task<IReadOnlyList<RetentionHold>> ListCoveringSubjectAsync(
+        string subjectKind,
+        object subject,
+        Guid? tenantId,
+        CancellationToken ct
+    )
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(subjectKind);
+        ArgumentNullException.ThrowIfNull(subject);
+        if (tenantId == Guid.Empty)
+        {
+            throw new ArgumentException("A tenant ID cannot be empty; use null for tenantless entities.", nameof(tenantId));
+        }
+
+        var entities = tenantId is null ? SweepEntityScope.TenantlessOnly : SweepEntityScope.TenantedOnly;
+        // After readiness, like erasure: startup validation fills the state the check reads.
+        await readinessValidator.ValidateAsync(ct);
+        var validation = validationState.For(db.Model);
+        ErasureSubjectValidation.Validate(validation, registry, subjectKind, subject, entities, "the hold lookup");
+
+        var starts = registry.Scan().Values
+            .Where(entry => entities.Includes(entry))
+            .Select(entry => (
+                Entry: entry,
+                Metadata: validation.ErasureSubjects[entry.EntityType]
+                    .FirstOrDefault(metadata => string.Equals(metadata.Kind, subjectKind, StringComparison.Ordinal))
+            ))
+            .Where(start => start.Metadata is not null)
+            .Select(start => (start.Entry, start.Metadata!.CreatePredicate(subject)))
+            .ToList();
+
+        await db.Database.OpenConnectionAsync(ct);
+        try
+        {
+            var (sql, parameters) = RetentionHoldSql.BuildCoveringHoldsForSubject(tables.RetentionHolds, starts, tenantId);
             await using var command = parameters.CreateCommand(
                 db.Database.GetDbConnection(),
-                transaction,
-                RetentionHoldSql.BuildActiveHoldForRecord(
-                    tables.RetentionHolds,
-                    tenanted: entry.Tenant is not null
-                )
+                db.Database.CurrentTransaction?.GetDbTransaction(),
+                sql
             );
-            return await command.ExecuteScalarAsync(ct) is not null;
+            return await ReadHoldsAsync(command, ct);
         }
         finally
         {

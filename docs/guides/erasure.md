@@ -74,7 +74,8 @@ Cohort erases rows that meet all four conditions:
 2. the row belongs to the requested tenant (or, for a tenantless request, the entity is
    `[RetentionTenantless]`)
 3. the category's resolved strategy is eligible for erasure
-4. no active hold covers the row
+4. no active hold covers the row, directly or through a
+   [hold relation](/guides/legal-holds#holding-related-rows)
 
 The erasure runs as of the database's clock, the clock legal holds expire by. You can pass
 an earlier time as `at`. A real erasure refuses a later one with an
@@ -132,14 +133,19 @@ Ordinary `Period` never delays erasure. Legal minimums, holds and Exempt rules d
   [dependents step](/guides/row-handlers#retiring-a-rows-dependents) tries its referenced
   rows anyway: the step can retire what references them, and a row still referenced after it
   is blocked.
-- Active holds always block erasure.
+- Active holds always block erasure. A row is held when a hold names it, or when it's linked
+  by a `[HeldWith]` or `[HeldWithReferencing]` relation to a row a hold covers, so a person's
+  link row on a held Case is held and stays. To ask before erasing whether any of a subject's
+  rows is held, whether or not it's due yet, call
+  [`ListCoveringSubjectAsync`](/guides/legal-holds#asking-what-is-held): one read, with no run
+  recorded.
 
 Each `EntitySweepCount` in the result says what the erasure left of the subject, and why. The
 counts don't overlap:
 
 | Count | Rows left because |
 |---|---|
-| `HeldCount` | an active hold covers them |
+| `HeldCount` | an active hold covers them, directly or through a [hold relation](/guides/legal-holds#holding-related-rows) |
 | `NullAnchorCount` | their anchor is null, so a legal-minimum cutoff never matches them |
 | `RetainedCount` | the rule keeps them: younger than the legal minimum, or every row under an `Exempt` rule |
 | `SkippedCount` | a row handler's `OnBeforeAsync` or its dependents step failed, so the row was left unchanged |

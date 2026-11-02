@@ -129,7 +129,8 @@ internal sealed class EfRetentionHoldsRepository(
             "SELECT pg_catalog.current_setting('transaction_isolation')"
         );
         var isolation = (string?)await command.ExecuteScalarAsync(ct);
-        if (!string.Equals(isolation, "read committed", StringComparison.Ordinal))
+        // PostgreSQL accepts READ UNCOMMITTED and runs it as READ COMMITTED.
+        if (isolation is not ("read committed" or "read uncommitted"))
         {
             throw new InvalidOperationException(
                 $"Retention hold for entity '{request.RetentionEntityId}' covers related rows, so it needs a READ COMMITTED transaction, but the caller's is {isolation?.ToUpperInvariant()}: under a transaction-wide snapshot a row linked after the transaction began would not be locked. Nothing was changed."

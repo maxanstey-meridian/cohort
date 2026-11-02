@@ -478,7 +478,7 @@ internal sealed partial class RetentionStartupValidator(
             return;
         }
 
-        var storeType = TryGetStoreType(recordIdProperty);
+        var storeType = RetentionEntryBuilder.TryGetStoreType(recordIdProperty);
         if (storeType is not null && HasSessionDependentText(storeType))
         {
             errors.Add(
@@ -761,25 +761,12 @@ internal sealed partial class RetentionStartupValidator(
             return;
         }
 
-        var storeType = TryGetStoreType(property);
+        var storeType = RetentionEntryBuilder.TryGetStoreType(property);
         if (storeType is not null && NormalizeStoreType(storeType) != "timestamp with time zone")
         {
             errors.Add(
                 $"Timestamp convention on {entry.EntityType.FullName}: {role} property '{memberName}' is mapped to '{storeType}'. Cohort compares and writes retention timestamps as UTC instants, which requires 'timestamp with time zone'; 'timestamp without time zone' silently drifts with the session TimeZone and rejects UTC-kinded parameters. Map the property with HasColumnType(\"timestamptz\") or use DateTimeOffset."
             );
-        }
-    }
-
-    private static string? TryGetStoreType(Microsoft.EntityFrameworkCore.Metadata.IProperty property)
-    {
-        try
-        {
-            return property.GetColumnType();
-        }
-        catch (Exception ex) when (ex is InvalidOperationException or InvalidCastException)
-        {
-            // Non-relational providers expose no store type.
-            return null;
         }
     }
 

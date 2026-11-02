@@ -3,7 +3,7 @@
 A hold freezes one row, and the rows you declare held with it. While it's active, no strategy
 touches those rows: no sweep, no erasure, and no host deletion that goes through
 `IRetentionDeletion`. See [Holding related rows](#holding-related-rows) to protect a Case's
-links, its Submission and the Submission's uploads with one hold on the Case.
+links, its Submission, and the Submission's uploads with one hold on the Case.
 
 ## Creating a hold
 
@@ -21,7 +21,7 @@ await holds.CreateAsync(
 ```
 
 `holds` is the scoped `IRetentionHoldsRepository`. It also offers `RemoveAsync`,
-`ListActiveAsync`, `HasActiveHoldAsync`, `ListCoveringAsync` and `ListCoveringSubjectAsync`,
+`ListActiveAsync`, `HasActiveHoldAsync`, `ListCoveringAsync`, and `ListCoveringSubjectAsync`,
 which report the holds that protect now (see [When a hold protects](#when-a-hold-protects)
 and [Asking what is held](#asking-what-is-held)). Pass `expiresAt: null` for a hold that
 lasts until it's removed.
@@ -54,15 +54,15 @@ lasts until it's removed.
 
 The repository joins the scoped context's current transaction when there is one. An
 unparsable record ID is rejected under a savepoint, so your transaction stays usable. A hold
-on an entity that covers related rows is refused in a caller transaction above READ COMMITTED
-([why](#the-creation-lock)).
+on an entity that covers related rows is refused in a caller transaction at REPEATABLE READ or
+SERIALIZABLE ([why](#the-creation-lock)).
 
 ## When a hold protects
 
 A row is protected while an active hold **covers** it: a hold names the row itself, or the
 row is linked by a `[HeldWith]` or `[HeldWithReferencing]` relation to a row a hold covers,
 through any chain of such relations, all within one tenant. Protected rows are never purged,
-soft-deleted or anonymised by a sweep or erasure, are counted as `HeldCount` and keep an
+soft-deleted, or anonymised by a sweep or erasure, are counted as `HeldCount` and keep an
 erasure from being `Complete`, are refused by `IRetentionDeletion`, and are guarded against a
 [dependents step](/guides/row-handlers#retiring-a-rows-dependents). Creating a hold locks every
 row it will cover, so a sweep or erasure either finishes with a row before the hold commits or
@@ -85,10 +85,11 @@ logical `now`. A hold created yesterday protects its row even from a backdated s
   the future when the hold is created. The hold stops protecting once the database clock
   passes either.
 
-`ListActiveAsync`, `HasActiveHoldAsync`, `ListCoveringAsync` and `ListCoveringSubjectAsync`
+`ListActiveAsync`, `HasActiveHoldAsync`, `ListCoveringAsync`, and `ListCoveringSubjectAsync`
 answer for now, on the same database clock and with the same rule mutations use, so a report
-never disagrees with what a sweep would do. They don't answer for past moments: [history pruning](/guides/history-pruning) removes holds that
-stopped protecting long ago, so the table can't answer those reliably.
+never disagrees with what a sweep would do. They don't answer for past moments:
+[history pruning](/guides/history-pruning) removes holds that stopped protecting long ago, so
+the table can't answer those reliably.
 
 ## Holding related rows
 
@@ -137,7 +138,7 @@ public sealed class Upload
   it came from. Several Cases can share one Submission, and it stays held while any of them is.
 - Both attributes go on the entity whose rows become held, so everything that protects an
   entity reads on that entity. Each can be repeated for several relations.
-- The link always names the related entity's record ID (`Id`, or the property
+- The link always names the record ID of the row it points at (`Id`, or the property
   `[RetentionRecordId]` marks), because that's what a hold stores. You can't declare a link to
   an alternate key. The link must have the same type as that record ID.
 - No database foreign key is needed, so a link with a composite key, or none at all, works.
@@ -155,11 +156,11 @@ public sealed class Upload
   tenant never protects a row, even when a link names it. Both ends of a relation are tenanted
   or both are `[RetentionTenantless]`.
 
-A bad declaration stops the host from starting, naming the declaring type, the attribute and
+A bad declaration stops the host from starting, naming the declaring type, the attribute, and
 the member. See [Startup Validation](/reference/startup-validation#hold-relations).
 
 A covered row is judged exactly as if it carried its own hold: by sweeps, erasure, previews,
-dry runs, `IRetentionDeletion` and the dependents step.
+dry runs, `IRetentionDeletion`, and the dependents step.
 
 ### Asking what is held
 
@@ -181,20 +182,24 @@ var held = await holds.ListCoveringSubjectAsync("person", personId, tenantId, ct
 - `ListCoveringSubjectAsync` returns the holds covering any row whose `[ErasureSubject(kind)]`
   column equals the subject (see [Right-to-Erasure](/guides/erasure)). A `null` `tenantId`
   reads the `[RetentionTenantless]` entities, as `RetentionErasureRequest.Tenantless` does,
-  and `Guid.Empty` is refused. It ignores age, legal minimum and strategy, so it answers "is
+  and `Guid.Empty` is refused. It ignores age, legal minimum, and strategy, so it answers "is
   any of this subject's data held?", not "would an erasure report `HeldCount > 0`": a Person
   on a held Case is held whether or not the data is due yet. That's the question to ask before
   an erase or a merge.
-- `ListCoveringSubjectAsync` is one read statement: no run, no ledger row, no observer events
+- `ListCoveringSubjectAsync` is one read statement: no run, no ledger row, no observer events,
   and no rule-provider call. Like an erasure, it refuses a kind no retained entity declares and
   a subject of the wrong type, before reading anything.
 
 ### The creation lock
 
 `CreateAsync` row-locks, `FOR SHARE`, every row the new hold will cover, after it validates the
-target row and before it inserts the hold. Rows are locked entity by entity in each entity's
-sweep order (anchor, then record ID), the order a sweep or erasure locks a batch in, so the two
-can't deadlock within one entity. So a hold can't race a sweep or erasure into removing a row it
+target row and before it inserts the hold. The walk takes one statement per covered entity.
+Each statement locks every row of that entity the hold will cover, through all the relation
+paths that end at the entity (so two relations reaching one entity, as in a diamond, are
+locked together), in the entity's sweep order (anchor, then record ID), the order a sweep or
+erasure locks a batch in. So the two can't deadlock within one entity. The entities run in an
+order where every entity on a path to another comes first, so a row is locked before a later
+statement reads through it. A hold can't race a sweep or erasure into removing a row it
 covers:
 
 - If a sweep or erasure had already locked a row to change it, hold creation waits for it, and
@@ -206,11 +211,12 @@ covers:
 - `IRetentionDeletion` takes no row locks, so a callback that deletes a covered row waits for
   the hold to commit and then fails ([below](#deleting-around-holds)).
 
-Because the lock walk must read the current rows, `CreateAsync` refuses a caller transaction
-above READ COMMITTED when the held entity covers related rows (under `REPEATABLE READ` or
-`SERIALIZABLE` a row linked after the snapshot wouldn't be locked). It throws
-`InvalidOperationException`, before changing anything, saying the hold "needs a READ COMMITTED
-transaction". A hold on an entity that covers nothing accepts any isolation, as before.
+Because the lock walk must read the current rows, `CreateAsync` refuses a caller transaction at
+`REPEATABLE READ` or `SERIALIZABLE` when the held entity covers related rows (under either, a
+row linked after the snapshot wouldn't be locked). `READ UNCOMMITTED` is accepted, because
+PostgreSQL runs it as `READ COMMITTED`. The refusal is an `InvalidOperationException`, thrown
+before anything changes, saying the hold "needs a READ COMMITTED transaction". A hold on an
+entity that covers nothing accepts any isolation, as before.
 
 Deadlocks across entities remain possible. Hold creation holds the target's advisory lock and
 then row-locks covered rows entity by entity, while an erasure takes locks entity by entity in
@@ -252,10 +258,10 @@ and for `IRetentionDeletion`. For a step it costs two reads per row of the step'
 each read scales with the rows active holds cover that the scope can see (one tenant's under
 row-level security, every tenant's without it), not with table size. Measured on PostgreSQL 16
 with default configuration, one read takes about 17 ms for 10,000 covered rows, 175 ms for
-100,000 and 2 s for 1,000,000. So holds covering about 100,000 rows slow a sweep of a
+100,000, and 2 s for 1,000,000. So holds covering about 100,000 rows slow a sweep of a
 dependents-step entity by minutes per 1,000 rows, and about 1,000,000 by an hour. Uncovered
 rows cost nothing, even in a table of a million. `IRetentionDeletion` pays one pair of reads
-per call: about 35 ms, 350 ms and 4 s at those sizes.
+per call: about 35 ms, 350 ms, and 4 s at those sizes.
 
 ## Deleting around holds
 
@@ -299,14 +305,15 @@ Cohort checks the callback's work before it commits:
   and a row whose hold the callback ends before deleting it. A hold whose row was already gone
   before the callback ran doesn't count, and neither does a hold that merely expires or is
   released while the callback runs.
-- If a hold appears while the callback runs, on an entity that covers related rows (one with a
-  `[HeldWith]` or `[HeldWithReferencing]` relation pointing at it), `ExecuteAsync` throws and
-  rolls back, naming the hold ID, whatever the callback touched. Hold creation locks the rows
-  it covers, so a callback that deletes one waits for the hold to commit and then runs, and the
-  guard can no longer reach the deleted row from the new hold. The rule is fail-safe, not
-  exact: a covering hold created anywhere the scope can see while the callback runs fails the
+- If a hold appears while the callback runs, on an entity that covers related rows (one that a
+  `[HeldWith]` or `[HeldWithReferencing]` declaration names as its related type),
+  `ExecuteAsync` throws and rolls back, naming the hold ID, whatever the callback touched. Hold
+  creation locks the rows it covers, so a callback that deletes one waits for the hold to
+  commit and then runs, and the guard can no longer reach the deleted row from the new hold.
+  The rule is fail-safe, not exact: a covering hold created anywhere the scope can see while the callback runs fails the
   deletion, even one that covers nothing the callback touched. A retry that lists a covered
-  row sees the hold up front and returns `Protected`. Holds on entities that cover nothing keep the exact rule above.
+  row sees the hold up front and returns `Protected`. Holds on entities that cover nothing keep
+  the exact rule above.
 - After a refusal or failure once the callback has run, the context's change tracker is
   cleared, so a later `SaveChanges` can't apply the callback's changes outside the hold check.
 
@@ -332,13 +339,13 @@ no schema change and no migration.
   that were unheld are held: sweeps leave them and count them in `HeldCount`, an erasure that
   reaches them isn't `Complete`, `IRetentionDeletion` returns `Protected` for them, a
   dependents step that changes one is skipped, and `HasActiveHoldAsync` now answers `true` for
-  them. Check code that treats `false` as permission to delete, merge or erase.
+  them. Check code that treats `false` as permission to delete, merge, or erase.
 - A bad declaration stops the host from starting, and readiness checks each link column in the
   real table ([Startup Validation](/reference/startup-validation#hold-relations)). Fix the
   message it gives, or remove the declaration.
-- Creating a hold on an entity that covers related rows now refuses a caller transaction above
-  READ COMMITTED, and can deadlock with an erasure or a deletion; PostgreSQL aborts one side
-  with `40P01`, which you can retry ([the creation lock](#the-creation-lock)).
+- Creating a hold on an entity that covers related rows now refuses a caller transaction at
+  REPEATABLE READ or SERIALIZABLE, and can deadlock with an erasure or a deletion; PostgreSQL
+  aborts one side with `40P01`, which you can retry ([the creation lock](#the-creation-lock)).
 - `IRetentionDeletion` fails and rolls back when a hold on an entity that covers related rows
   appears while its callback runs, even if the callback touched none of the covered rows.
 - A dependents step now fails on any change to a covered row, and on a row it inserts or links

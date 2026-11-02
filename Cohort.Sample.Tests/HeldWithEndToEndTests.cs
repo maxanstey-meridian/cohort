@@ -62,6 +62,20 @@ public sealed class HeldWithEndToEndTests(PostgresFixture fixture)
     private static readonly Guid CrossTenantUpload = Guid.Parse("23000000-0000-0000-0000-000000000002");
     private static readonly Guid OtherLink = Guid.Parse("24000000-0000-0000-0000-000000000001");
 
+    // The uploads the diamond tests add under tenant one: both reached by a hold on CaseOne, one
+    // by the Case directly and through the shared Submission (BothUpload), one by the Case only
+    // (DirectUpload). Created so the sweep order is Upload, BothUpload, DirectUpload.
+    private static readonly Guid BothUpload = Guid.Parse("13000000-0000-0000-0000-000000000004");
+    private static readonly Guid DirectUpload = Guid.Parse("13000000-0000-0000-0000-000000000005");
+
+    // Tenantless pair: a holder, and a child linked to it, one linked to the other holder, and one
+    // linked to nothing.
+    private static readonly Guid HolderOne = Guid.Parse("41000000-0000-0000-0000-000000000001");
+    private static readonly Guid HolderTwo = Guid.Parse("41000000-0000-0000-0000-000000000002");
+    private static readonly Guid ChildOne = Guid.Parse("42000000-0000-0000-0000-000000000001");
+    private static readonly Guid ChildTwo = Guid.Parse("42000000-0000-0000-0000-000000000002");
+    private static readonly Guid ChildNull = Guid.Parse("42000000-0000-0000-0000-000000000003");
+
     private static readonly TenantContext TenantOneContext = new(TenantOne, "uk", new Dictionary<string, string>());
 
     [Fact]
@@ -286,7 +300,7 @@ public sealed class HeldWithEndToEndTests(PostgresFixture fixture)
         );
         var wrongType = () => holds.ListCoveringSubjectAsync("person", "not-a-guid", TenantOne, CancellationToken.None);
         (await wrongType.Should().ThrowAsync<InvalidOperationException>()).Which.Message.Should().Be(
-            "Erasure subject kind 'person' identifies subjects by Guid, but the scope's subject is a String."
+            "Erasure subject kind 'person' identifies subjects by Guid, but the subject is a String."
         );
     }
 
@@ -326,6 +340,29 @@ public sealed class HeldWithEndToEndTests(PostgresFixture fixture)
         await using var verify = services.CreateAsyncScope();
         (await verify.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>().ListActiveAsync(CancellationToken.None))
             .Select(hold => hold.HoldId).Should().Equal(uploadHold);
+    }
+
+    // PostgreSQL accepts READ UNCOMMITTED and runs it as READ COMMITTED, so the walk reads current
+    // rows and the caller's isolation is no reason to refuse.
+    [Fact]
+    public async Task Creating_A_Hold_On_A_Case_In_A_Read_Uncommitted_Transaction_Succeeds()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using var services = await BuildSeededServicesAsync(database.ConnectionString);
+        var holdId = Guid.NewGuid();
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<HeldWithDbContext>();
+            await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadUncommitted);
+            await scope.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>().CreateAsync(
+                Request(holdId, EntityId<ACase>(), CaseOne, TenantOne),
+                CancellationToken.None
+            );
+            await transaction.CommitAsync();
+        }
+
+        (await ActiveHoldIdsAsync(services)).Should().Equal(holdId);
     }
 
     [Fact]
@@ -487,6 +524,10 @@ public sealed class HeldWithEndToEndTests(PostgresFixture fixture)
         (await ActiveHoldIdsAsync(services)).Should().Equal(holdId);
     }
 
+    // The second lock of the cycle is taken by the test, through RetentionEntityLockSql, after the
+    // erasure has returned: this fixture's plan order can't make the erasure take it itself. So
+    // this proves the hold side of the deadlock (40P01 from either side, and no hold over a removed
+    // row), and doesn't exercise the erasure's own handling of a failure of that entity.
     [Fact]
     public async Task Erasure_And_Hold_Creation_Locking_In_Opposite_Orders_Deadlock_And_Exactly_One_Side_Fails_With_40P01()
     {
@@ -537,6 +578,182 @@ public sealed class HeldWithEndToEndTests(PostgresFixture fixture)
         linkExists.Should().Be(erasureError is not null);
     }
 
+    // ─── Rows covered twice: a diamond of relations ──────────────────────────
+
+    // BothUpload is under the shared Submission and carries CaseOne, so a hold on CaseOne reaches it
+    // by two paths. Everything that reads or judges coverage must still see it once: the guard's
+    // read is DISTINCT (a duplicate key makes HeldRowVersions throw out of the guard), and the
+    // record read is a de-duplicating UNION.
+    [Fact]
+    public async Task A_Dependents_Step_That_Touches_Nothing_Passes_For_Its_Rows_When_A_Held_Row_Is_Covered_By_Two_Paths()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using var services = await BuildSeededServicesAsync(database.ConnectionString, new StepScript());
+        await AddDiamondUploadsAsync(services);
+        await HoldAsync(services, EntityId<ACase>(), CaseOne, TenantOne);
+
+        var result = await SweepAsync(services);
+
+        var links = CountOf<ZCaseLink>(result);
+        links.HeldCount.Should().Be(1);
+        links.SkippedCount.Should().Be(0);
+        links.Affected.Should().Be(3);
+        CountOf<ZUpload>(result).HeldCount.Should().Be(3);
+        (await LoadStepFailuresAsync(database, result.SweepId)).Should().BeEmpty();
+        (await IdsAsync(database, "held_with_links", TenantOne)).Should().Equal(LinkOne);
+    }
+
+    [Fact]
+    public async Task A_Deletion_Of_An_Unrelated_Row_Executes_When_A_Held_Row_Is_Covered_By_Two_Paths()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using var services = await BuildSeededServicesAsync(database.ConnectionString);
+        await AddDiamondUploadsAsync(services);
+        await HoldAsync(services, EntityId<ACase>(), CaseOne, TenantOne);
+
+        var outcome = await DeleteAsync(
+            services,
+            [new RetentionTarget(EntityId<ZCaseLink>(), LinkNull.ToString(), TenantOne)],
+            (db, ct) => db.Links.Where(link => link.Id == LinkNull).ExecuteDeleteAsync(ct)
+        );
+
+        outcome.Should().Be(RetentionDeletionOutcome.Executed);
+        (await IdsAsync(database, "held_with_links", TenantOne)).Should().NotContain(LinkNull);
+        (await IdsAsync(database, "held_with_uploads", TenantOne)).Should().Contain([Upload, BothUpload, DirectUpload]);
+    }
+
+    [Fact]
+    public async Task ListCovering_Returns_The_Cases_Hold_Once_For_An_Upload_Covered_By_Two_Paths()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using var services = await BuildSeededServicesAsync(database.ConnectionString);
+        await AddDiamondUploadsAsync(services);
+        var holdId = await HoldAsync(services, EntityId<ACase>(), CaseOne, TenantOne);
+        await using var scope = services.CreateAsyncScope();
+        var holds = scope.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>();
+
+        (await holds.HasActiveHoldAsync(EntityId<ZUpload>(), BothUpload.ToString(), TenantOne, CancellationToken.None)).Should().BeTrue();
+        (await holds.ListCoveringAsync(EntityId<ZUpload>(), BothUpload.ToString(), TenantOne, CancellationToken.None))
+            .Select(hold => hold.HoldId).Should().Equal(holdId);
+    }
+
+    // ─── The creation walk: one sorted statement per entity, every path, no other tenant ─────
+
+    [Fact]
+    public async Task Hold_Creation_Locks_An_Entitys_Covered_Rows_In_One_Sorted_Statement_Across_Its_Paths()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using var services = await BuildSeededServicesAsync(database.ConnectionString);
+        await AddDiamondUploadsAsync(services);
+        var holdId = Guid.NewGuid();
+
+        // DirectUpload sorts last of the three covered uploads and is reached by the direct path
+        // only. The walk blocks on it, and must by then have locked Upload, which only the path
+        // through the Submission reaches: both are one statement, sorted.
+        await using var blocker = await RowLocker.StartAsync(database.ConnectionString, "held_with_uploads", DirectUpload);
+        var creation = Task.Run(() => HoldAsync(services, EntityId<ACase>(), CaseOne, TenantOne, holdId));
+        await WaitForRowLockWaiterAsync(database.ConnectionString);
+
+        creation.IsCompleted.Should().BeFalse();
+        (await IsRowLockedAsync(database.ConnectionString, "held_with_uploads", Upload)).Should().BeTrue();
+        (await IsRowLockedAsync(database.ConnectionString, "held_with_uploads", BothUpload)).Should().BeTrue();
+
+        await blocker.ReleaseAsync();
+        await creation.WaitAsync(TimeSpan.FromSeconds(15));
+        (await ActiveHoldIdsAsync(services)).Should().Equal(holdId);
+    }
+
+    [Fact]
+    public async Task Hold_Creation_Locks_The_Rows_Every_Path_Reaches_And_None_Of_Another_Tenant()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using var services = await BuildSeededServicesAsync(database.ConnectionString);
+        await AddDiamondUploadsAsync(services);
+        var holdId = Guid.NewGuid();
+        await using var paused = await PausedHold.StartAsync(
+            database.ConnectionString,
+            holdId,
+            () => HoldAsync(services, EntityId<ACase>(), CaseOne, TenantOne, holdId)
+        );
+
+        // Through the Submission only, through both paths, and through the Case only.
+        (await IsRowLockedAsync(database.ConnectionString, "held_with_uploads", Upload)).Should().BeTrue();
+        (await IsRowLockedAsync(database.ConnectionString, "held_with_uploads", BothUpload)).Should().BeTrue();
+        (await IsRowLockedAsync(database.ConnectionString, "held_with_uploads", DirectUpload)).Should().BeTrue();
+        // Another tenant's upload linked to this tenant's Submission isn't covered.
+        (await IsRowLockedAsync(database.ConnectionString, "held_with_uploads", CrossTenantUpload)).Should().BeFalse();
+        await paused.ReleaseAsync();
+    }
+
+    // ─── Tenantless entities ─────────────────────────────────────────────────
+
+    [Fact]
+    public async Task A_Tenantless_Sweep_Leaves_The_Child_Of_A_Held_Holder_Unchanged_And_Counts_It_Held()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using var services = await BuildSeededServicesAsync(database.ConnectionString);
+        await HoldAsync(services, EntityId<TenantlessHolder>(), HolderOne, null);
+
+        var result = await TenantlessSweepAsync(services);
+
+        CountOf<TenantlessHolder>(result).HeldCount.Should().Be(1);
+        CountOf<TenantlessHolder>(result).Affected.Should().Be(1);
+        CountOf<TenantlessChild>(result).HeldCount.Should().Be(1);
+        CountOf<TenantlessChild>(result).Affected.Should().Be(2);
+        (await IdsAsync(database, "held_with_holders")).Should().Equal(HolderOne);
+        (await IdsAsync(database, "held_with_children")).Should().Equal(ChildOne);
+    }
+
+    [Fact]
+    public async Task Reads_Without_A_Tenant_Return_The_Tenantless_Holders_Hold()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using var services = await BuildSeededServicesAsync(database.ConnectionString);
+        var holdId = await HoldAsync(services, EntityId<TenantlessHolder>(), HolderOne, null);
+        await using var scope = services.CreateAsyncScope();
+        var holds = scope.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>();
+
+        (await holds.HasActiveHoldAsync(EntityId<TenantlessChild>(), ChildOne.ToString(), null, CancellationToken.None)).Should().BeTrue();
+        (await holds.ListCoveringAsync(EntityId<TenantlessChild>(), ChildOne.ToString(), null, CancellationToken.None))
+            .Select(hold => hold.HoldId).Should().Equal(holdId);
+        (await holds.ListCoveringAsync(EntityId<TenantlessChild>(), ChildTwo.ToString(), null, CancellationToken.None)).Should().BeEmpty();
+        (await holds.ListCoveringAsync(EntityId<TenantlessChild>(), ChildNull.ToString(), null, CancellationToken.None)).Should().BeEmpty();
+
+        (await holds.ListCoveringSubjectAsync("person", Person, null, CancellationToken.None))
+            .Select(hold => hold.HoldId).Should().Equal(holdId);
+    }
+
+    [Fact]
+    public async Task Hold_Creation_On_A_Tenantless_Holder_Locks_Its_Children_And_Not_Another_Holders()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using var services = await BuildSeededServicesAsync(database.ConnectionString);
+        var holdId = Guid.NewGuid();
+        await using var paused = await PausedHold.StartAsync(
+            database.ConnectionString,
+            holdId,
+            () => HoldAsync(services, EntityId<TenantlessHolder>(), HolderOne, null, holdId)
+        );
+
+        (await IsRowLockedAsync(database.ConnectionString, "held_with_children", ChildOne)).Should().BeTrue();
+        (await IsRowLockedAsync(database.ConnectionString, "held_with_children", ChildTwo)).Should().BeFalse();
+        (await IsRowLockedAsync(database.ConnectionString, "held_with_children", ChildNull)).Should().BeFalse();
+        await paused.ReleaseAsync();
+        (await ActiveHoldIdsAsync(services)).Should().Equal(holdId);
+    }
+
+    private static async Task AddDiamondUploadsAsync(ServiceProvider services)
+    {
+        var created = AsOf.AddDays(-45);
+        await using var scope = services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<HeldWithDbContext>();
+        db.Uploads.AddRange(
+            new ZUpload { Id = BothUpload, TenantId = TenantOne, CreatedAt = created.AddMinutes(1), SubmissionId = Submission, CaseId = CaseOne, Body = "original" },
+            new ZUpload { Id = DirectUpload, TenantId = TenantOne, CreatedAt = created.AddMinutes(2), SubmissionId = null, CaseId = CaseOne, Body = "original" }
+        );
+        await db.SaveChangesAsync();
+    }
+
     private static async Task<Exception?> CaptureAsync(Task task)
     {
         try
@@ -576,14 +793,14 @@ public sealed class HeldWithEndToEndTests(PostgresFixture fixture)
     private static EntitySweepCount CountOf<TEntity>(ErasureResult result) =>
         result.Counts.Should().ContainSingle(count => count.EntityType == typeof(TEntity)).Subject;
 
-    private static RetentionHoldRequest Request(Guid holdId, Guid entityId, Guid recordId, Guid tenantId) =>
+    private static RetentionHoldRequest Request(Guid holdId, Guid entityId, Guid recordId, Guid? tenantId) =>
         new(holdId, entityId, recordId.ToString(), tenantId, "litigation", DateTimeOffset.UtcNow.AddMinutes(-1));
 
     private static async Task<Guid> HoldAsync(
         ServiceProvider services,
         Guid entityId,
         Guid recordId,
-        Guid tenantId,
+        Guid? tenantId,
         Guid? holdId = null
     )
     {
@@ -610,6 +827,14 @@ public sealed class HeldWithEndToEndTests(PostgresFixture fixture)
         return await scope.ServiceProvider
             .GetRequiredService<IRetentionSweep>()
             .ExecuteAsync(RetentionSweepRequest.Tenanted(TenantOneContext, AsOf));
+    }
+
+    private static async Task<RetentionSweepResult> TenantlessSweepAsync(ServiceProvider services)
+    {
+        await using var scope = services.CreateAsyncScope();
+        return await scope.ServiceProvider
+            .GetRequiredService<IRetentionSweep>()
+            .ExecuteAsync(RetentionSweepRequest.Tenantless(AsOf));
     }
 
     private static async Task<RetentionSweepResult> PreviewAsync(ServiceProvider services)
@@ -682,6 +907,22 @@ public sealed class HeldWithEndToEndTests(PostgresFixture fixture)
         await connection.OpenAsync();
         await using var command = new NpgsqlCommand($"SELECT \"Id\" FROM {table} WHERE \"TenantId\" = @tenantId ORDER BY \"Id\"", connection);
         command.Parameters.AddWithValue("tenantId", tenantId);
+        var ids = new List<Guid>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            ids.Add(reader.GetGuid(0));
+        }
+
+        return ids;
+    }
+
+    /// <summary>The ids of a tenantless table, ordered.</summary>
+    private static async Task<List<Guid>> IdsAsync(TemporaryDatabase database, string table)
+    {
+        await using var connection = new NpgsqlConnection(database.ConnectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand($"SELECT \"Id\" FROM {table} ORDER BY \"Id\"", connection);
         var ids = new List<Guid>();
         await using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
@@ -766,6 +1007,15 @@ public sealed class HeldWithEndToEndTests(PostgresFixture fixture)
             new ZUpload { Id = Upload, TenantId = TenantOne, CreatedAt = created, SubmissionId = Submission, Body = "original" },
             new ZUpload { Id = OtherUpload, TenantId = TenantTwo, CreatedAt = created, SubmissionId = OtherSubmission, Body = "original" },
             new ZUpload { Id = CrossTenantUpload, TenantId = TenantTwo, CreatedAt = created, SubmissionId = Submission, Body = "original" }
+        );
+        db.Holders.AddRange(
+            new TenantlessHolder { Id = HolderOne, CreatedAt = created },
+            new TenantlessHolder { Id = HolderTwo, CreatedAt = created.AddMinutes(1) }
+        );
+        db.Children.AddRange(
+            new TenantlessChild { Id = ChildOne, CreatedAt = created, HolderId = HolderOne, PersonId = Person },
+            new TenantlessChild { Id = ChildTwo, CreatedAt = created.AddMinutes(1), HolderId = HolderTwo, PersonId = Person },
+            new TenantlessChild { Id = ChildNull, CreatedAt = created.AddMinutes(2), HolderId = null, PersonId = Person }
         );
         await db.SaveChangesAsync();
         return provider;
@@ -1080,6 +1330,63 @@ public sealed class HeldWithEndToEndTests(PostgresFixture fixture)
     }
 
     /// <summary>
+    /// Whether another transaction holds a lock on the row that conflicts with a row update. The
+    /// probe is a <c>FOR UPDATE NOWAIT</c> in autocommit on its own connection, so a probe that
+    /// gets the row releases it at once.
+    /// </summary>
+    private static async Task<bool> IsRowLockedAsync(string connectionString, string table, Guid id)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand($"SELECT 1 FROM {table} WHERE \"Id\" = @id FOR UPDATE NOWAIT", connection);
+        command.Parameters.AddWithValue("id", id);
+        try
+        {
+            await command.ExecuteScalarAsync();
+            return false;
+        }
+        catch (PostgresException exception) when (exception.SqlState == "55P03")
+        {
+            return true;
+        }
+    }
+
+    /// <summary>Holds a <c>FOR UPDATE</c> lock on one row, in a transaction of its own, until released.</summary>
+    private sealed class RowLocker : IAsyncDisposable
+    {
+        private NpgsqlConnection? connection;
+        private NpgsqlTransaction? transaction;
+
+        public static async Task<RowLocker> StartAsync(string connectionString, string table, Guid id)
+        {
+            var locker = new RowLocker { connection = new NpgsqlConnection(connectionString) };
+            await locker.connection.OpenAsync();
+            locker.transaction = await locker.connection.BeginTransactionAsync();
+            await ExecuteAsync(locker.connection, locker.transaction, $"SELECT 1 FROM {table} WHERE \"Id\" = '{id}' FOR UPDATE");
+            return locker;
+        }
+
+        public async Task ReleaseAsync()
+        {
+            if (transaction is not null)
+            {
+                await transaction.RollbackAsync();
+                await transaction.DisposeAsync();
+                transaction = null;
+            }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await ReleaseAsync();
+            if (connection is not null)
+            {
+                await connection.DisposeAsync();
+            }
+        }
+    }
+
+    /// <summary>
     /// Waits until a statement waits for the advisory lock <paramref name="key"/>, or fails with
     /// <paramref name="running"/> if it ends first.
     /// </summary>
@@ -1158,6 +1465,8 @@ public sealed class HeldWithEndToEndTests(PostgresFixture fixture)
         public DbSet<ASubmission> Submissions => Set<ASubmission>();
         public DbSet<ZCaseLink> Links => Set<ZCaseLink>();
         public DbSet<ZUpload> Uploads => Set<ZUpload>();
+        public DbSet<TenantlessHolder> Holders => Set<TenantlessHolder>();
+        public DbSet<TenantlessChild> Children => Set<TenantlessChild>();
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
@@ -1165,6 +1474,8 @@ public sealed class HeldWithEndToEndTests(PostgresFixture fixture)
             modelBuilder.Entity<ASubmission>(entity => entity.ToTable("held_with_submissions"));
             modelBuilder.Entity<ZCaseLink>(entity => entity.ToTable("held_with_links"));
             modelBuilder.Entity<ZUpload>(entity => entity.ToTable("held_with_uploads"));
+            modelBuilder.Entity<TenantlessHolder>(entity => entity.ToTable("held_with_holders"));
+            modelBuilder.Entity<TenantlessChild>(entity => entity.ToTable("held_with_children"));
             modelBuilder.ConfigureCohortTables();
         }
     }
@@ -1208,12 +1519,40 @@ public sealed class HeldWithEndToEndTests(PostgresFixture fixture)
     [Retain("held-with", nameof(CreatedAt))]
     [RetentionEntityId("00000000-0000-0000-0006-000000000004")]
     [HeldWith(typeof(ASubmission), nameof(SubmissionId))]
+    [HeldWith(typeof(ACase), nameof(CaseId))]
     private sealed class ZUpload
     {
         public Guid Id { get; init; }
         public Guid TenantId { get; init; }
         public DateTimeOffset CreatedAt { get; init; }
         public Guid? SubmissionId { get; init; }
+
+        // A second path from a Case to an upload: the seeded uploads leave it NULL, and the
+        // diamond tests add uploads that carry it.
+        public Guid? CaseId { get; init; }
         public string? Body { get; init; }
+    }
+
+    [Retain("held-with", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0006-000000000005")]
+    [RetentionTenantless]
+    private sealed class TenantlessHolder
+    {
+        public Guid Id { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    [Retain("held-with", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0006-000000000006")]
+    [RetentionTenantless]
+    [HeldWith(typeof(TenantlessHolder), nameof(HolderId))]
+    private sealed class TenantlessChild
+    {
+        public Guid Id { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+        public Guid? HolderId { get; init; }
+
+        [ErasureSubject("person")]
+        public Guid? PersonId { get; init; }
     }
 }

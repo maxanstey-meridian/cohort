@@ -70,15 +70,16 @@ Along the way:
 - `HeldCount` and `BlockedCount` are measured directly: rows past the cutoff that an active
   hold covers (directly or through a hold relation), and rows still referenced through a
   blocking foreign key, plus the rows a constraint refused during the run. Neither is inferred
-  from candidate arithmetic. A sweep's blocked rows leave it `Succeeded`, like held rows, and the next run tries them again; an erasure
-  with blocked rows settles `PartiallyFailed` with a `rows-blocked` reason.
+  from candidate arithmetic. A sweep's blocked rows leave it `Succeeded`, like held rows, and
+  the next run tries them again; an erasure with blocked rows settles `PartiallyFailed` with a
+  `rows-blocked` reason.
 - Once an entity's batches are done, the rows still due that the run neither changed nor
   skipped are counted once, in `DeferredCount`: rows another transaction had locked when the
   run reached them (a sweep skips them and doesn't come back to them in the same run), and
   rows that came into scope mid-run behind the run. A sweep's next run retires them, so they
   leave it `Succeeded`; an erasure that missed rows settles `PartiallyFailed` with a `rows-missed` reason.
-  `DeferredCount` and `HeldCount` are read in one statement, so a hold that commits meanwhile
-  can't put a row in both.
+  `DeferredCount`, `HeldCount`, and the still-referenced part of `BlockedCount` are read in
+  one statement, so a hold that commits meanwhile can't put a row in two counts or in none.
 - An erasure also reports what its rule keeps in `RetainedCount` (rows younger than the
   legal minimum, or every row under an `Exempt` rule), and `ErasureResult.Complete` says
   whether anything of the subject was left. See

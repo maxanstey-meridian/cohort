@@ -56,6 +56,7 @@ public sealed class HeldWithReadinessEndToEndTests(PostgresFixture fixture)
     [Theory]
     [InlineData("held_with_links", "CaseId", "text", "uuid", nameof(ReadinessLink))]
     [InlineData("held_with_cases", "SourceSubmissionId", "bigint", "uuid", nameof(ReadinessSubmission))]
+    [InlineData("held_with_note_links", "NoteId", "citext", "text", nameof(ReadinessNoteLink))]
     public async Task A_Link_Column_Whose_Catalog_Type_Differs_From_The_Target_Record_Id_Fails_Readiness(
         string table,
         string column,
@@ -92,6 +93,81 @@ public sealed class HeldWithReadinessEndToEndTests(PostgresFixture fixture)
             CREATE DOMAIN public.nested_link_id AS public.link_id;
             ALTER TABLE public.held_with_links ALTER COLUMN "CaseId" TYPE public.nested_link_id;
             """
+        );
+
+        var result = await SweepAsync(services);
+
+        result.EntityFailures.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task A_Varchar_Link_Passes_Readiness_Against_A_Text_Record_Id()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using var services = await BuildMigratedServicesAsync(database.ConnectionString);
+        await ExecuteAsync(
+            database.ConnectionString,
+            "ALTER TABLE public.held_with_note_links ALTER COLUMN \"NoteId\" TYPE varchar(36)"
+        );
+
+        var result = await SweepAsync(services);
+
+        result.EntityFailures.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task A_Link_Column_With_A_Nondeterministic_Collation_Fails_Readiness_Against_The_Default_Record_Id()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using var services = await BuildMigratedServicesAsync(database.ConnectionString);
+        await ExecuteAsync(
+            database.ConnectionString,
+            """
+            CREATE COLLATION public.link_ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+            ALTER TABLE public.held_with_note_links ALTER COLUMN "NoteId" TYPE text COLLATE public.link_ci;
+            """
+        );
+
+        var act = () => SweepAsync(services);
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        var error = exception.Which.Errors.Should().ContainSingle().Which;
+        error.Should().Contain($"on {typeof(HeldWithReadinessEndToEndTests).FullName}+{nameof(ReadinessNoteLink)}");
+        error.Should().Contain("link column \"public\".\"held_with_note_links\".\"NoteId\"");
+        error.Should().Contain("nondeterministic collation 'link_ci'");
+        error.Should().Contain("'default'");
+    }
+
+    [Fact]
+    public async Task Two_Different_Non_Default_Collations_Fail_Readiness()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using var services = await BuildMigratedServicesAsync(database.ConnectionString);
+        await ExecuteAsync(
+            database.ConnectionString,
+            """
+            ALTER TABLE public.held_with_notes ALTER COLUMN "Id" TYPE text COLLATE "und-x-icu";
+            ALTER TABLE public.held_with_note_links ALTER COLUMN "NoteId" TYPE text COLLATE "C";
+            """
+        );
+
+        var act = () => SweepAsync(services);
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        var error = exception.Which.Errors.Should().ContainSingle().Which;
+        error.Should().Contain($"on {typeof(HeldWithReadinessEndToEndTests).FullName}+{nameof(ReadinessNoteLink)}");
+        error.Should().Contain("link column \"public\".\"held_with_note_links\".\"NoteId\" has collation 'C'");
+        error.Should().Contain("collation 'und-x-icu'");
+    }
+
+    [Fact]
+    public async Task A_Deterministic_Non_Default_Link_Collation_Passes_Readiness_Against_The_Default_Record_Id()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using var services = await BuildMigratedServicesAsync(database.ConnectionString);
+        await ExecuteAsync(
+            database.ConnectionString,
+            "ALTER TABLE public.held_with_note_links ALTER COLUMN \"NoteId\" TYPE text COLLATE \"C\""
         );
 
         var result = await SweepAsync(services);
@@ -151,6 +227,9 @@ public sealed class HeldWithReadinessEndToEndTests(PostgresFixture fixture)
             modelBuilder.Entity<ReadinessCase>(entity => entity.ToTable("held_with_cases"));
             modelBuilder.Entity<ReadinessLink>(entity => entity.ToTable("held_with_links"));
             modelBuilder.Entity<ReadinessSubmission>(entity => entity.ToTable("held_with_submissions"));
+            modelBuilder.Entity<ReadinessNote>(entity => entity.ToTable("held_with_notes"));
+            modelBuilder.Entity<ReadinessNoteLink>(entity => entity.ToTable("held_with_note_links"));
+            modelBuilder.HasPostgresExtension("citext");
             modelBuilder.ConfigureCohortTables();
         }
     }
@@ -184,5 +263,25 @@ public sealed class HeldWithReadinessEndToEndTests(PostgresFixture fixture)
         public Guid Id { get; init; }
         public Guid TenantId { get; init; }
         public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    [Retain("held-with-readiness", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0005-000000000004")]
+    private sealed class ReadinessNote
+    {
+        public string Id { get; init; } = "";
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    [Retain("held-with-readiness", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0005-000000000005")]
+    [HeldWith(typeof(ReadinessNote), nameof(NoteId))]
+    private sealed class ReadinessNoteLink
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+        public string? NoteId { get; init; }
     }
 }

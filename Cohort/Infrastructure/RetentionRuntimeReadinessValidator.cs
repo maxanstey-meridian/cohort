@@ -203,9 +203,11 @@ internal sealed class RetentionRuntimeReadinessValidator(
 
     /// <summary>
     /// Each <c>[HeldWith]</c> and <c>[HeldWithReferencing]</c> link column must exist in the real
-    /// table, and its catalog type, resolved through domains, must be the type of the record-id
-    /// column it names, because hold SQL equates the two. The model-level type check can't see a
-    /// domain or a column that migration drift changed. Runs after
+    /// table, and its catalog type, resolved through domains (<c>varchar</c> and <c>text</c> count
+    /// as one), must be the type of the record-id column it names, because hold SQL equates the
+    /// two, and the two columns' collations must be comparable. The model-level check compares
+    /// only provider CLR types, so it can't see a store type, a domain, or a column that
+    /// migration drift changed. Runs after
     /// <see cref="ValidateRetainedTablesAsync"/>, which has already refused a missing table or
     /// record-id column.
     /// </summary>
@@ -245,7 +247,9 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 WITH RECURSIVE requested AS (
                     SELECT requested.ordinal,
                            link.atttypid AS link_type_id,
-                           target.atttypid AS target_type_id
+                           target.atttypid AS target_type_id,
+                           link.attcollation AS link_collation_id,
+                           target.attcollation AS target_collation_id
                     FROM ROWS FROM (
                         pg_catalog.unnest(@owner_schemas),
                         pg_catalog.unnest(@owner_tables),
@@ -282,8 +286,15 @@ internal sealed class RetentionRuntimeReadinessValidator(
                     JOIN pg_catalog.pg_type pgtype ON pgtype.oid = built_on.type_id
                     WHERE pgtype.typtype = 'd'
                 ),
+                -- varchar and text are one type here: a varchar link equals a text record id
+                -- without a cast. Folded after the domain recursion, so a domain over varchar folds too.
                 resolved AS (
-                    SELECT built_on.ordinal, built_on.side, built_on.type_id
+                    SELECT built_on.ordinal,
+                           built_on.side,
+                           CASE WHEN built_on.type_id = 'pg_catalog.varchar'::pg_catalog.regtype
+                                THEN 'pg_catalog.text'::pg_catalog.regtype::pg_catalog.oid
+                                ELSE built_on.type_id
+                           END AS type_id
                     FROM built_on
                     JOIN pg_catalog.pg_type pgtype ON pgtype.oid = built_on.type_id
                     WHERE pgtype.typtype <> 'd'
@@ -292,10 +303,28 @@ internal sealed class RetentionRuntimeReadinessValidator(
                        requested.link_type_id IS NOT NULL,
                        pg_catalog.format_type(requested.link_type_id, NULL),
                        pg_catalog.format_type(requested.target_type_id, NULL),
-                       link_base.type_id IS NOT DISTINCT FROM target_base.type_id
+                       link_base.type_id IS NOT DISTINCT FROM target_base.type_id,
+                       -- Collations matter once the types match, for collatable columns only
+                       -- (attcollation is the effective collation, domains included). Two different
+                       -- ones with neither the default (OID 100) can't be compared at all, and a
+                       -- non-default nondeterministic link collation against the default record id
+                       -- would match one link value to several record ids. A default link against
+                       -- any record id collation passes: the record id's collation wins.
+                       CASE WHEN link_base.type_id IS NOT DISTINCT FROM target_base.type_id
+                                 AND requested.link_collation_id <> 0
+                                 AND requested.target_collation_id <> 0
+                                 AND requested.link_collation_id <> requested.target_collation_id
+                                 AND requested.link_collation_id <> 100
+                            THEN CASE WHEN requested.target_collation_id <> 100 THEN 1 WHEN NOT link_collation.collisdeterministic THEN 2 ELSE 0 END
+                            ELSE 0
+                       END,
+                       link_collation.collname,
+                       target_collation.collname
                 FROM requested
                 LEFT JOIN resolved link_base ON link_base.ordinal = requested.ordinal AND link_base.side = 'link'
                 LEFT JOIN resolved target_base ON target_base.ordinal = requested.ordinal AND target_base.side = 'target'
+                LEFT JOIN pg_catalog.pg_collation link_collation ON link_collation.oid = requested.link_collation_id
+                LEFT JOIN pg_catalog.pg_collation target_collation ON target_collation.oid = requested.target_collation_id
                 WHERE requested.target_type_id IS NOT NULL
                 """
             );
@@ -317,6 +346,17 @@ internal sealed class RetentionRuntimeReadinessValidator(
                     {
                         errors.Add(
                             $"Hold relation {hop.Declaration}: link column {column} is '{reader.GetString(2)}' in the database, but the record-id column {PostgreSqlIdentifier.Format(target.Table)}.{PostgreSqlIdentifier.Quote(target.RecordId.RecordIdColumn)} it names is '{reader.GetString(3)}', so holds would never match across the relation. Give the link column the record id's type."
+                        );
+                    }
+                    else if (reader.GetInt32(5) is var collationProblem and not 0)
+                    {
+                        var linkCollation = reader.GetString(6);
+                        var targetCollation = reader.GetString(7);
+                        var record = $"{PostgreSqlIdentifier.Format(target.Table)}.{PostgreSqlIdentifier.Quote(target.RecordId.RecordIdColumn)}";
+                        errors.Add(
+                            collationProblem == 1
+                                ? $"Hold relation {hop.Declaration}: link column {column} has collation '{linkCollation}' in the database, but the record-id column {record} it names has collation '{targetCollation}', and PostgreSQL can't choose between two different non-default collations, so every hold check across the relation would fail. Give the link column the record id's collation, or the default."
+                                : $"Hold relation {hop.Declaration}: link column {column} has the nondeterministic collation '{linkCollation}' in the database, but the record-id column {record} it names is compared under '{targetCollation}', so one link value would match several record ids and a row could be covered by holds on several rows. Give the link column the record id's collation, or a deterministic one."
                         );
                     }
                 }

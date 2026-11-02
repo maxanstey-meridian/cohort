@@ -42,7 +42,7 @@ internal static class ErasureSubjectValidation
         if (!subjectType.IsInstanceOfType(subject))
         {
             throw new InvalidOperationException(
-                $"Erasure subject kind '{kind}' identifies subjects by {subjectType.Name}, but the scope's subject is a {subject.GetType().Name}."
+                $"Erasure subject kind '{kind}' identifies subjects by {subjectType.Name}, but the subject is a {subject.GetType().Name}."
             );
         }
     }

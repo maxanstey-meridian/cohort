@@ -91,7 +91,7 @@ internal static class RetentionHoldSql
         Guid? tenantId
     )
     {
-        var (union, parameters) = CoveringHoldsForRecord(holdsTable, entry, canonicalRecordId, tenantId);
+        var (union, parameters) = CoveringHoldsForRecord(holdsTable, entry, canonicalRecordId, tenantId, "UNION");
         return (
             $"""
             SELECT *
@@ -106,7 +106,7 @@ internal static class RetentionHoldSql
 
     /// <summary>
     /// Selects one row when an active hold covers the row, the same coverage as
-    /// <see cref="BuildCoveringHolds"/>.
+    /// <see cref="BuildCoveringHolds"/>. Existence only, so the branches are not de-duplicated.
     /// </summary>
     internal static (string Sql, SqlParams Parameters) BuildAnyCoveringHold(
         RelationalObjectName holdsTable,
@@ -115,7 +115,7 @@ internal static class RetentionHoldSql
         Guid? tenantId
     )
     {
-        var (union, parameters) = CoveringHoldsForRecord(holdsTable, entry, canonicalRecordId, tenantId);
+        var (union, parameters) = CoveringHoldsForRecord(holdsTable, entry, canonicalRecordId, tenantId, "UNION ALL");
         return (
             $"""
             SELECT 1
@@ -132,7 +132,8 @@ internal static class RetentionHoldSql
         RelationalObjectName holdsTable,
         RetentionEntry entry,
         string canonicalRecordId,
-        Guid? tenantId
+        Guid? tenantId,
+        string setOperator
     )
     {
         var parameters = new SqlParams
@@ -164,7 +165,7 @@ internal static class RetentionHoldSql
             branches.Add(HolderPathBranch(holds, entry, path, holders, startRow));
         }
 
-        return (string.Join("\nUNION\n", branches), parameters);
+        return (string.Join($"\n{setOperator}\n", branches), parameters);
     }
 
     /// <summary>
@@ -348,34 +349,55 @@ internal static class RetentionHoldSql
 
     /// <summary>
     /// Takes every row a hold on <paramref name="entry"/>'s row (<c>@recordId</c>, and
-    /// <c>@tenantId</c> when tenanted) will cover, one statement per covered path (PostgreSQL
-    /// refuses <c>FOR SHARE</c> with <c>UNION</c>, <c>DISTINCT</c>, or the nullable side of an
-    /// outer join), each locking the covered rows <c>FOR SHARE</c> in that entity's sweep order,
-    /// the order a sweep or erasure locks a batch in, so the two can't deadlock within one entity.
-    /// <paramref name="entries"/> supplies each covered entity's anchor for that order.
+    /// <c>@tenantId</c> when tenanted) will cover, one statement per covered <em>entity</em>,
+    /// each locking that entity's covered rows <c>FOR SHARE</c> in one sort, its sweep order (the
+    /// order a sweep or erasure locks a batch in), so the two can't deadlock within one entity,
+    /// even when two covered paths end at it. PostgreSQL refuses <c>FOR SHARE</c> at a query level
+    /// with <c>UNION</c>, <c>DISTINCT</c>, or aggregates, and on the nullable side of an outer
+    /// join, but allows a <c>UNION</c> in a <c>WHERE</c> subquery, so a statement is
+    /// <c>target.&lt;record id&gt; IN (&lt;path select&gt; UNION …)</c>, each path select being the
+    /// index-driven inner joins from the holder row to the covered row. An <c>OR</c> of
+    /// <c>EXISTS</c> terms would plan as a full scan of the covered table. Unlike the join shape,
+    /// a row whose link moves away while the walk waits on it stays share-locked until commit,
+    /// which is harmless: the hold doesn't cover it. Statements run ordered by the longest covered
+    /// path ending at the entity, then by entity name: every entity on a path to X comes before X
+    /// (the graph is acyclic), so a row is locked before a later statement reads through it.
+    /// <paramref name="entries"/> supplies each covered entity's anchor for the sort order.
     /// </summary>
     internal static IReadOnlyList<string> BuildCoveredRowLocks(RetentionEntry entry, IEnumerable<RetentionEntry> entries)
     {
         var byEntity = entries.ToDictionary(candidate => candidate.RetentionEntityId);
-        var statements = new List<string>(entry.CoveredPaths.Count);
-        foreach (var path in entry.CoveredPaths)
-        {
-            var aliases = Aliases(path, "h0", "c");
-            aliases[^1] = "target";
-            var startRow = $"{RecordIdSql.EqualsParameter("h0", entry.RecordId, "recordId")}"
-                + (entry.Tenant is { } tenant ? $" AND h0.{PostgreSqlIdentifier.Quote(tenant.TenantColumn)} = @tenantId" : "");
-            statements.Add(
-                $"""
-                SELECT 1
-                FROM {PostgreSqlIdentifier.Format(entry.Table)} AS h0{JoinChain(path, aliases, 0)}
-                WHERE {startRow}
-                ORDER BY {SweepStrategy.OrderBySql(byEntity[path.End.RetentionEntityId])}
-                FOR SHARE OF target
-                """
-            );
-        }
-
-        return statements;
+        var startRow = $"{RecordIdSql.EqualsParameter("h0", entry.RecordId, "recordId")}"
+            + (entry.Tenant is { } tenant ? $" AND h0.{PostgreSqlIdentifier.Quote(tenant.TenantColumn)} = @tenantId" : "");
+        return
+        [
+            .. entry.CoveredPaths
+                .GroupBy(path => path.End.RetentionEntityId)
+                .OrderBy(group => group.Max(path => path.Hops.Count))
+                .ThenBy(group => group.First().End.EntityType.FullName, StringComparer.Ordinal)
+                .Select(group =>
+                {
+                    var end = group.First().End;
+                    var selects = group.Select(path =>
+                    {
+                        var aliases = Aliases(path, "h0", "c");
+                        return $"""
+                            SELECT {aliases[^1]}.{PostgreSqlIdentifier.Quote(end.RecordId.RecordIdColumn)}
+                                FROM {PostgreSqlIdentifier.Format(entry.Table)} AS h0{JoinChain(path, aliases, 0)}
+                                WHERE {startRow}
+                            """;
+                    });
+                    return $"""
+                        SELECT 1
+                        FROM {PostgreSqlIdentifier.Format(end.Table)} AS target
+                        WHERE target.{PostgreSqlIdentifier.Quote(end.RecordId.RecordIdColumn)} IN (
+                            {string.Join("\n    UNION\n    ", selects)}
+                        )
+                        ORDER BY {SweepStrategy.OrderBySql(byEntity[end.RetentionEntityId])}
+                        FOR SHARE OF target
+                        """;
+                }),
+        ];
     }
 
     /// <summary>

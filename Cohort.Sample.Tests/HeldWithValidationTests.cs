@@ -83,19 +83,23 @@ public sealed class HeldWithValidationTests
         submissionToUpload.LinkSide.Should().Be(HoldLinkSide.Far);
         submissionToUpload.LinkColumn.Should().Be("SubmissionId");
         person.CoveredPaths[0].Hops.Should().ContainSingle().Which.LinkColumn.Should().Be("PersonId");
+
+        // ChainCase.PersonId is a PersonKey with a value converter to Guid: the validation above
+        // passing is the proof that the match is on the provider type; this pins the converter.
+        var link = db.Model.FindEntityType(typeof(ChainCase))!.FindProperty(nameof(ChainCase.PersonId))!;
+        link.ClrType.Should().Be(typeof(PersonKey));
+        link.GetValueConverter()!.ProviderClrType.Should().Be(typeof(Guid));
     }
 
     [Fact]
-    public async Task A_Link_Converted_To_The_Record_Ids_Provider_Type_Passes()
+    public async Task A_Link_Spelled_As_Another_Alias_Of_The_Record_Ids_Store_Type_Passes()
     {
-        // ChainCase.PersonId is a PersonKey with a value converter to Guid: the match is on the
-        // provider type, so the chain test above passing is the proof; this pins the converter.
-        await using var db = CreateContext<ChainDbContext>();
-        var link = db.Model.FindEntityType(typeof(ChainCase))!.FindProperty(nameof(ChainCase.PersonId))!;
+        // int4 is integer, and varchar(36) is HasMaxLength(36)'s character varying(36): one type
+        // each, so only the provider CLR types are compared here and readiness compares the rest.
+        await using var db = CreateContext<StoreTypeSpellingDbContext>();
 
-        link.ClrType.Should().Be(typeof(PersonKey));
-        link.GetValueConverter()!.ProviderClrType.Should().Be(typeof(Guid));
         var act = async () => await CreateValidator(db).ValidateAsync();
+
         await act.Should().NotThrowAsync();
     }
 
@@ -162,18 +166,32 @@ public sealed class HeldWithValidationTests
     {
         var errors = await RefusalsAsync<LinkTypeMismatchDbContext>();
 
-        errors.Should().HaveCount(2);
-        errors.Should().ContainSingle(error =>
-            error.Contains($"\"{nameof(StringLink.CaseId)}\")] on {typeof(StringLink).FullName}", StringComparison.Ordinal)
-            && error.Contains($"link member {typeof(StringLink).FullName}.{nameof(StringLink.CaseId)} is String", StringComparison.Ordinal)
-            && error.Contains($"record id {typeof(HeldTarget).FullName}.Id it must equal is Guid", StringComparison.Ordinal)
-        );
-        // Same CLR type, different store type: text against citext.
-        errors.Should().ContainSingle(error =>
-            error.Contains($"on {typeof(CitextLink).FullName}", StringComparison.Ordinal)
-            && error.Contains("is String (citext)", StringComparison.Ordinal)
-            && error.Contains("is String (text)", StringComparison.Ordinal)
-        );
+        var error = errors.Should().ContainSingle().Which;
+        error.Should().Contain($"\"{nameof(StringLink.CaseId)}\")] on {typeof(StringLink).FullName}");
+        error.Should().Contain($"link member {typeof(StringLink).FullName}.{nameof(StringLink.CaseId)} is String");
+        error.Should().Contain($"record id {typeof(HeldTarget).FullName}.Id it must equal is Guid");
+    }
+
+    [Fact]
+    public async Task A_Blank_Link_Member_Is_Refused_With_The_Declaring_Type()
+    {
+        var errors = await RefusalsAsync<BlankLinkMemberDbContext>();
+
+        var error = errors.Should().ContainSingle().Which;
+        error.Should().Contain($"[HeldWith] or [HeldWithReferencing] on {typeof(BlankLinkMember).FullName} is invalid");
+        error.Should().Contain("Link member cannot be blank");
+    }
+
+    [Fact]
+    public async Task A_Type_Mapped_More_Than_Once_Has_Its_Declarations_Read_Once()
+    {
+        // An owned type used by two owners is two entity types with one CLR type: its one
+        // declaration must be refused once for what it is, not once more as a duplicate.
+        var errors = await RefusalsAsync<OwnedTwiceDbContext>();
+
+        var error = errors.Should().ContainSingle().Which;
+        error.Should().Contain($"on {typeof(OwnedDeclaring).FullName}");
+        error.Should().Contain("isn't a [Retain] entity");
     }
 
     [Fact]
@@ -182,7 +200,7 @@ public sealed class HeldWithValidationTests
         var errors = await RefusalsAsync<TenantMismatchDbContext>();
 
         var error = errors.Should().ContainSingle().Which;
-        error.Should().Contain($"on {typeof(TenantlessLink).FullName}");
+        error.Should().Contain($"{AttributeShape}{typeof(HeldTarget).FullName}), \"TargetId\")] on {typeof(TenantlessLink).FullName}");
         error.Should().Contain($"{typeof(HeldTarget).FullName} is tenanted but {typeof(TenantlessLink).FullName} is tenantless");
     }
 
@@ -493,19 +511,8 @@ public sealed class HeldWithValidationTests
         {
             modelBuilder.ConfigureCohortTables();
             modelBuilder.Entity<HeldTarget>();
-            modelBuilder.Entity<TextTarget>();
             modelBuilder.Entity<StringLink>();
-            modelBuilder.Entity<CitextLink>().Property(record => record.TargetId).HasColumnType("citext");
         }
-    }
-
-    [Retain("held-with", nameof(CreatedAt))]
-    [RetentionEntityId("00000000-0000-0000-0004-000000000030")]
-    private sealed class TextTarget
-    {
-        public string Id { get; init; } = "";
-        public Guid TenantId { get; init; }
-        public DateTimeOffset CreatedAt { get; init; }
     }
 
     [Retain("held-with", nameof(CreatedAt))]
@@ -519,15 +526,107 @@ public sealed class HeldWithValidationTests
         public string CaseId { get; init; } = "";
     }
 
+    private sealed class StoreTypeSpellingDbContext(DbContextOptions<StoreTypeSpellingDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.ConfigureCohortTables();
+            modelBuilder.Entity<IntegerTarget>();
+            modelBuilder.Entity<Int4Link>().Property(record => record.TargetId).HasColumnType("int4");
+            modelBuilder.Entity<BoundedTarget>().Property(record => record.Id).HasMaxLength(36);
+            modelBuilder.Entity<VarcharLink>().Property(record => record.TargetId).HasColumnType("varchar(36)");
+        }
+    }
+
     [Retain("held-with", nameof(CreatedAt))]
-    [RetentionEntityId("00000000-0000-0000-0004-000000000032")]
-    [HeldWith(typeof(TextTarget), nameof(TargetId))]
-    private sealed class CitextLink
+    [RetentionEntityId("00000000-0000-0000-0004-000000000033")]
+    private sealed class IntegerTarget
+    {
+        public int Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    [Retain("held-with", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0004-000000000034")]
+    [HeldWith(typeof(IntegerTarget), nameof(TargetId))]
+    private sealed class Int4Link
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+        public int TargetId { get; init; }
+    }
+
+    [Retain("held-with", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0004-000000000035")]
+    private sealed class BoundedTarget
+    {
+        public string Id { get; init; } = "";
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    [Retain("held-with", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0004-000000000036")]
+    [HeldWith(typeof(BoundedTarget), nameof(TargetId))]
+    private sealed class VarcharLink
     {
         public Guid Id { get; init; }
         public Guid TenantId { get; init; }
         public DateTimeOffset CreatedAt { get; init; }
         public string TargetId { get; init; } = "";
+    }
+
+    private sealed class BlankLinkMemberDbContext(DbContextOptions<BlankLinkMemberDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.ConfigureCohortTables();
+            modelBuilder.Entity<HeldTarget>();
+            modelBuilder.Entity<BlankLinkMember>();
+        }
+    }
+
+    [Retain("held-with", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0004-000000000037")]
+    [HeldWith(typeof(HeldTarget), "")]
+    private sealed class BlankLinkMember
+    {
+        public Guid Id { get; init; }
+        public Guid TenantId { get; init; }
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    private sealed class OwnedTwiceDbContext(DbContextOptions<OwnedTwiceDbContext> options) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.ConfigureCohortTables();
+            modelBuilder.Entity<HeldTarget>();
+            modelBuilder.Entity<OwnerOne>().OwnsOne(owner => owner.Declaring);
+            modelBuilder.Entity<OwnerTwo>().OwnsOne(owner => owner.Declaring);
+        }
+    }
+
+    [HeldWith(typeof(HeldTarget), nameof(TargetId))]
+    private sealed class OwnedDeclaring
+    {
+        public Guid TargetId { get; init; }
+    }
+
+    private sealed class OwnerOne
+    {
+        public Guid Id { get; init; }
+        public OwnedDeclaring? Declaring { get; init; }
+    }
+
+    private sealed class OwnerTwo
+    {
+        public Guid Id { get; init; }
+        public OwnedDeclaring? Declaring { get; init; }
     }
 
     private sealed class TenantMismatchDbContext(DbContextOptions<TenantMismatchDbContext> options)

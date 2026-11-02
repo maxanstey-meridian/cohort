@@ -6,7 +6,9 @@ public interface IRetentionHoldsRepository
 {
     /// <summary>
     /// Creates a hold on an existing row. Refuses an <see cref="RetentionHoldRequest.ExpiresAt"/>
-    /// the database clock has already reached, because that hold would protect nothing.
+    /// the database clock has already reached, because that hold would protect nothing. When the
+    /// entity covers related rows, it also refuses a caller transaction at REPEATABLE READ or
+    /// SERIALIZABLE, before it changes anything.
     /// </summary>
     public Task CreateAsync(RetentionHoldRequest request, CancellationToken ct);
 

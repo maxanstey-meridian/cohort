@@ -750,7 +750,7 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
 
         var exception = await act.Should().ThrowAsync<InvalidOperationException>();
         exception.Which.Message.Should().Be(
-            "Erasure subject kind 'user' identifies subjects by Guid, but the scope's subject is a String."
+            "Erasure subject kind 'user' identifies subjects by Guid, but the subject is a String."
         );
         (await CountRunsAsync(tenantId)).Should().Be(0);
     }
@@ -2157,6 +2157,32 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         (await CountRunsAsync(tenant.Id)).Should().Be(0);
         await using var verify = Host.CreateDbContext();
         (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeTrue();
+    }
+
+    // PostgreSQL accepts READ UNCOMMITTED and runs it as READ COMMITTED, so the erasure's hold
+    // checks see every committed hold and the caller's isolation is no reason to refuse.
+    [Fact]
+    public async Task Caller_Mode_Runs_In_A_Read_Uncommitted_Transaction()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, _) = await SeedCallerErasureAsync(tenant.Id, subject);
+
+        var result = await Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadUncommitted);
+            var erased = await services.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller)
+            );
+            await transaction.CommitAsync();
+            return erased;
+        });
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note)).Which.Affected.Should().Be(1);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeFalse();
     }
 
     [Fact]

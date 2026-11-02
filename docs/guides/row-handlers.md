@@ -160,19 +160,20 @@ builder.Services.AddRetentionDependents<Case, RetireCaseDependents>();
   doesn't fail it. Cohort compares
   every visible held row's physical version before and after the step, covered rows included,
   so the check is fail-safe rather than exact: a hold created anywhere the batch can see while
-  the step runs, a row that becomes covered while it runs (the step inserts a row, or links
-  one, under a held row), or another session's committed update to a held row, also fails it,
-  and the next run retries the row. A step that cuts a covered row's link and then changes the
-  row still fails: Cohort compares the row it saw before. A Warning names the holds' ids,
-  never the rows. Dependents' legal minimums aren't
-  enforced; a hold is the row-specific protection the step honours, as
-  [`IRetentionDeletion`](/guides/legal-holds#deleting-around-holds) does. When the model has a tenantless retained entity,
-  a tenant's batch must be able to see the active `NULL`-tenant holds, or the entity fails
-  rather than run a step that can't check them (see [Tenant Isolation](/guides/tenant-isolation)).
+  the step runs, a row that becomes covered while it runs (the step, or another session,
+  inserts or links a row under a held row), or another session's committed update to a held
+  row, also fails it, and the next run retries the row. A step that cuts a covered row's link
+  and then changes the row still fails: Cohort compares the row it saw before. A Warning names
+  the holds' ids, never the rows. Dependents' legal minimums aren't enforced; a hold is the
+  row-specific protection the step honours, as
+  [`IRetentionDeletion`](/guides/legal-holds#deleting-around-holds) does. When the model has a
+  tenantless retained entity, a tenant's batch must be able to see the active `NULL`-tenant
+  holds, or the entity fails rather than run a step that can't check them (see
+  [Tenant Isolation](/guides/tenant-isolation)).
 - **What the hold check costs.** Cohort reads the held rows' versions twice per row of an
   entity with a step, and each read scales with the rows active holds cover that the batch can
   see, not with the table's size. One read takes about 17 ms at 10,000 covered rows, 175 ms at
-  100,000 and 2 s at 1,000,000 (PostgreSQL 16, default configuration). So holds covering about
+  100,000, and 2 s at 1,000,000 (PostgreSQL 16, default configuration). So holds covering about
   100,000 rows slow a sweep of a step's entity by minutes per 1,000 rows, and about 1,000,000
   by an hour; uncovered rows cost nothing. See
   [what it costs](/guides/legal-holds#what-it-costs).
@@ -190,8 +191,8 @@ builder.Services.AddRetentionDependents<Case, RetireCaseDependents>();
   immediate, so the same violation fails the step's statement (a skip) or the row's change (a
   block).
 - **Locks.** The step runs while the batch holds its row and entity locks, so a slow step
-  makes hold creation on those rows, or on a row they're held with, wait. A deadlock or lock timeout in the step fails that
-  row's step, not the batch.
+  makes hold creation on those rows, or on a row they're held with, wait. A deadlock or lock
+  timeout in the step fails that row's step, not the batch.
 
 ## Delivery
 

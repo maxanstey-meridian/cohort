@@ -1,7 +1,6 @@
 using System.Reflection;
 
 using Cohort.Domain;
-using Cohort.Infrastructure.Sweep;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata;
@@ -70,7 +69,6 @@ internal sealed record HoldRelation(
         new(
             Declaring,
             Related,
-            LinkMember,
             LinkColumn,
             Shape == HoldRelationShape.HeldWith ? HoldLinkSide.Near : HoldLinkSide.Far,
             Declaration
@@ -85,14 +83,12 @@ internal sealed record HoldRelation(
 /// </summary>
 /// <param name="Near">The end the hop starts from: the entry's own entity for a path's first hop, else the previous hop's <see cref="Far"/>.</param>
 /// <param name="Far">The related end the hop reaches.</param>
-/// <param name="LinkMember">The CLR member that holds the link.</param>
 /// <param name="LinkColumn">The link's column, on <see cref="Near"/>'s table or <see cref="Far"/>'s as <paramref name="LinkSide"/> says.</param>
 /// <param name="LinkSide">Which end's table owns <paramref name="LinkColumn"/>.</param>
 /// <param name="Declaration">The attribute declaration this hop follows, for messages.</param>
 internal sealed record HoldHop(
     HoldRelationEnd Near,
     HoldRelationEnd Far,
-    string LinkMember,
     string LinkColumn,
     HoldLinkSide LinkSide,
     string Declaration
@@ -103,7 +99,6 @@ internal sealed record HoldHop(
         new(
             Far,
             Near,
-            LinkMember,
             LinkColumn,
             LinkSide == HoldLinkSide.Near ? HoldLinkSide.Far : HoldLinkSide.Near,
             Declaration
@@ -114,9 +109,6 @@ internal sealed record HoldHop(
 /// <param name="Hops">The hops in walking order. Never empty.</param>
 internal sealed record HoldPath(IReadOnlyList<HoldHop> Hops)
 {
-    /// <summary>The entity the path starts from.</summary>
-    internal HoldRelationEnd Origin => Hops[0].Near;
-
     /// <summary>The entity the path reaches.</summary>
     internal HoldRelationEnd End => Hops[^1].Far;
 
@@ -162,11 +154,13 @@ internal static class HoldRelations
         var relations = new List<HoldRelation>();
         var seen = new HashSet<(Type Declaring, Type Related, string Member, HoldRelationShape Shape)>();
 
-        foreach (var entityType in model.GetEntityTypes().OrderBy(type => type.ClrType.FullName, StringComparer.Ordinal))
+        // One pass per CLR type: a type mapped more than once (an owned type used twice) would
+        // otherwise have its attributes read per mapping and report itself as a duplicate.
+        foreach (var clrType in model.GetEntityTypes().Select(type => type.ClrType).Distinct().OrderBy(type => type.FullName, StringComparer.Ordinal))
         {
-            foreach (var declaration in ReadDeclarations(entityType.ClrType, errors))
+            foreach (var declaration in ReadDeclarations(clrType, errors))
             {
-                var relation = ResolveRelation(model, entries, entityType.ClrType, declaration, seen, errors);
+                var relation = ResolveRelation(model, entries, clrType, declaration, seen, errors);
                 if (relation is not null)
                 {
                     relations.Add(relation);
@@ -346,7 +340,7 @@ internal static class HoldRelations
 
         var valid = true;
         var targetProperty = model.FindEntityType(target.EntityType)?.FindProperty(target.RecordId.RecordIdMember);
-        if (targetProperty is not null && TypeMismatch(linkProperty, targetProperty, target.RecordId) is { } mismatch)
+        if (targetProperty is not null && TypeMismatch(linkProperty, targetProperty) is { } mismatch)
         {
             errors.Add(
                 $"{label}: link member {linkOwner.EntityType.FullName}.{declaration.LinkMember} is {mismatch.Link}, but the record id {target.EntityType.FullName}.{target.RecordId.RecordIdMember} it must equal is {mismatch.Target}. A link has to be the same type as the record id it names, because a hold stores that record id."
@@ -394,23 +388,14 @@ internal static class HoldRelations
 
     /// <summary>
     /// Two types match when their provider CLR types agree (after any value converter and after
-    /// unwrapping <see cref="Nullable{T}"/>) and, when both store types are known, they agree
-    /// once normalised by <see cref="PostgresStoreTypeSql.CastType"/>. Null when they match.
+    /// unwrapping <see cref="Nullable{T}"/>). Store-type identity is readiness's, against the
+    /// catalog: model store-type strings spell one type many ways. Null when they match.
     /// </summary>
-    private static (string Link, string Target)? TypeMismatch(IProperty link, IProperty target, RecordIdConvention targetRecordId)
+    private static (string Link, string Target)? TypeMismatch(IProperty link, IProperty target)
     {
         var linkClr = ProviderClrType(link);
         var targetClr = ProviderClrType(target);
-        var linkStore = PostgresStoreTypeSql.CastType(RetentionEntryBuilder.TryGetStoreType(link));
-        var targetStore = PostgresStoreTypeSql.CastType(targetRecordId.RecordIdStoreType);
-        if (linkClr == targetClr && (linkStore is null || targetStore is null || string.Equals(linkStore, targetStore, StringComparison.OrdinalIgnoreCase)))
-        {
-            return null;
-        }
-
-        return (Name(linkClr, linkStore), Name(targetClr, targetStore));
-
-        static string Name(Type clr, string? store) => store is null ? clr.Name : $"{clr.Name} ({store})";
+        return linkClr == targetClr ? null : (linkClr.Name, targetClr.Name);
     }
 
     private static Type ProviderClrType(IProperty property)

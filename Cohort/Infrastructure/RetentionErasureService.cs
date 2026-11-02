@@ -111,7 +111,8 @@ internal sealed class RetentionErasureService(
             "SELECT pg_catalog.current_setting('transaction_isolation')"
         );
         var isolation = (string?)await command.ExecuteScalarAsync(ct);
-        if (!string.Equals(isolation, "read committed", StringComparison.Ordinal))
+        // PostgreSQL accepts READ UNCOMMITTED and runs it as READ COMMITTED.
+        if (isolation is not ("read committed" or "read uncommitted"))
         {
             throw new InvalidOperationException(
                 $"ErasureTransaction.Caller needs a READ COMMITTED transaction, but the caller's is {isolation?.ToUpperInvariant()}: under a transaction-wide snapshot the hold checks could miss a hold committed after the transaction began."

@@ -72,9 +72,10 @@ Two identities run through these tables, and they're deliberately different:
 - **`RecordId`** is one row's canonical PostgreSQL text identity, `CAST(key AS text)`. Cohort
   stores it as `text` in holds and row details, and compares it with the row's own key cast.
   UUID, integer, string, `numeric`, `citext` and provider-converted keys all match
-  consistently. A hold names one row by it. A row a [hold relation](/guides/legal-holds#holding-related-rows)
-  covers is found through the relation's link column, which equals the related row's record ID
-  and so must be the same type as it; readiness checks the column in the database.
+  consistently. A hold names one row by it. A row a
+  [hold relation](/guides/legal-holds#holding-related-rows) covers is found through the
+  relation's link column, which equals the record ID of the row it points at and so must be the
+  same type as it; readiness checks the column in the database.
 
 Record-ID types whose text form depends on session settings are rejected at startup:
 `timestamp`/`timestamptz`, `date`, `time`, `interval`, `real`/`double precision`, `money` and
@@ -126,10 +127,10 @@ Cohort only touches `Guid.Empty` rows in system scopes, so tenant policies shoul
 them. `NULL` holds are different: tenant scopes read them but never write them. A host that
 calls `IRetentionDeletion` or `IRetentionHoldsRepository` in a tenant's scope on a tenantless
 row must see that row's holds, and the holds of the tenantless rows it's held with through a
-[hold relation](/guides/legal-holds#holding-related-rows), or the row looks unheld. `IRetentionDeletion` checks: in a
-model with any tenantless entity, it refuses with `RetentionConfigurationException`, deleting
-nothing, when its scope can't see an active `NULL` hold that `System(Readiness)` sees. A
-tenant's batch with a [dependents step](/guides/row-handlers#retiring-a-rows-dependents) runs
+[hold relation](/guides/legal-holds#holding-related-rows), or the row looks unheld.
+`IRetentionDeletion` checks: in a model with any tenantless entity, it refuses with
+`RetentionConfigurationException`, deleting nothing, when its scope can't see an active `NULL`
+hold that `System(Readiness)` sees. A tenant's batch with a [dependents step](/guides/row-handlers#retiring-a-rows-dependents) runs
 the same check, and the entity fails rather than run the step. So the holds policies
 let a tenant read `NULL` holds and write only its own; create and remove holds on tenantless
 rows in a system scope. Example policies, with the tenant in a custom setting:

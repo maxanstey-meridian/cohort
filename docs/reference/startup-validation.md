@@ -89,8 +89,9 @@ columns or rows belong to it. So these are rejected:
 - Each [hold relation](#hold-relations)'s link column exists in the real table (the message
   says the link column "was not found in the database"), and its catalog type, resolved
   through domains, equals the catalog type of the record-ID column it names, since hold SQL
-  equates the two. A link column of another type is refused, naming both. Each message names
-  the declaration and the column.
+  equates the two. `varchar` and `text` count as one type, so `varchar(36)` links to a `text`
+  record ID; any other difference is refused, naming both types. Each message names the
+  declaration and the column.
 - Each anonymised column can take what Cohort writes to it, checked against the database
   catalog: the column exists and the model's store type can be assigned to its type without
   an explicit cast; an `EmptyString` or `FixedLiteral` value, after the value converter, is
@@ -107,25 +108,29 @@ columns or rows belong to it. So these are rejected:
 
 ## Hold relations
 
-A `[Retain]` entity that carries `[HeldWith]` or `[HeldWithReferencing]` (see
+An entity that carries `[HeldWith]` or `[HeldWithReferencing]` (see
 [Holding related rows](/guides/legal-holds#holding-related-rows)) is refused when:
 
+- the attribute's arguments are invalid (a null type or a blank member). The message reads
+  "[HeldWith] or [HeldWithReferencing] on `MyApp.CaseLink` is invalid: …".
 - the declaring entity isn't `[Retain]`. An attribute on an `[ExemptFromRetention]` or an
   unannotated entity is an error, not ignored.
 - the related type isn't a `[Retain]` entity in the `DbContext` model.
 - the link member isn't a mapped public property with a table column, on the entity that
   holds the link: the declaring entity for `[HeldWith]`, the related one for
   `[HeldWithReferencing]`.
-- the link's type differs from the record ID it names: its provider CLR type (after any value
-  converter, and after unwrapping `Nullable<T>`) or its store type (when both are known).
+- the link's provider CLR type (after any value converter, and after unwrapping
+  `Nullable<T>`) differs from that of the record ID it names. Startup compares provider CLR
+  types only; store types are compared by readiness, against the database catalog
+  ([Columns](#columns)).
 - one entity is tenanted and the other `[RetentionTenantless]`.
 - the same relation is declared twice.
 - the relations form a cycle, a relation from an entity to itself included. The message lists
   the entities and each declaration in the cycle.
 
-Each message, a cycle's included, names the declaration it refuses in the form
+Each other message, a cycle's included, names the declaration it refuses in the form
 `[HeldWith(typeof(MyApp.Case), "CaseId")] on MyApp.CaseLink`: the attribute, the related type,
-the member and the declaring type. A declaration needs no database foreign key, so none is
+the member, and the declaring type. A declaration needs no database foreign key, so none is
 checked. Readiness also checks each link column against the real table
 ([Columns](#columns)).
 

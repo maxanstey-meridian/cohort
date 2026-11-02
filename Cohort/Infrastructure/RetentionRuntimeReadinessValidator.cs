@@ -356,7 +356,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
                         errors.Add(
                             collationProblem == 1
                                 ? $"Hold relation {hop.Declaration}: link column {column} has collation '{linkCollation}' in the database, but the record-id column {record} it names has collation '{targetCollation}', and PostgreSQL can't choose between two different non-default collations, so every hold check across the relation would fail. Give the link column the record id's collation, or the default."
-                                : $"Hold relation {hop.Declaration}: link column {column} has the nondeterministic collation '{linkCollation}' in the database, but the record-id column {record} it names is compared under '{targetCollation}', so one link value would match several record ids and a row could be covered by holds on several rows. Give the link column the record id's collation, or a deterministic one."
+                                : $"Hold relation {hop.Declaration}: link column {column} has the nondeterministic collation '{linkCollation}' in the database, but the record-id column {record} it names has the default collation, so PostgreSQL compares them under '{linkCollation}' and one link value would match several record ids, so a row could be covered by holds on several rows. Give the link column the record id's collation, or a deterministic one."
                         );
                     }
                 }

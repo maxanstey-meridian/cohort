@@ -25,11 +25,18 @@ A hold on a row also holds the rows a host declares related to it.
   entity that covers related rows appears while its callback runs. Startup refuses a declaration
   whose entity or related type isn't `[Retain]`, whose member is missing or mistyped, that
   joins a tenanted and a tenantless entity, that is declared twice, or that forms a cycle, and
-  readiness checks each link column in the database. The dependents step's held-row guard costs
+  readiness checks each link column in the database: its type must match the record ID's, and
+  its collation must be compatible (equal, or the default; two different non-default
+  collations, or a non-default nondeterministic one against a default record ID, are refused).
+  The dependents step's held-row guard costs
   more as holds cover more rows: about two reads per step row, each about 175 ms at 100,000
   covered rows. A run's `DeferredCount`, `HeldCount`, and the still-referenced part of
   `BlockedCount` are now read in one statement, so a hold committing meanwhile can't put a row
-  in two counts or in none.
+  in two counts or in none, and a dry run or a preview reads its eligible (affected), blocked,
+  and held counts in one statement the same way. An erasure in the caller's transaction now
+  accepts `READ UNCOMMITTED` (PostgreSQL runs it as `READ COMMITTED`; 0.11.0 refused it). An
+  erasure's wrong-type subject message now reads "…but the subject is a {type}." (it was "…but
+  the scope's subject is a {type}.").
 
 Upgrade: [Legal Holds](https://maxanstey-meridian.github.io/cohort/guides/legal-holds#upgrading-to-0-12-0).
 

@@ -459,7 +459,63 @@ public sealed class HeldWithEndToEndTests(PostgresFixture fixture)
     )
     {
         await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
-        // The held Case isn't due, as in the sweep test above.
+        // The held Case isn't due, as in the sweep test above. The sweep's batches skip the link
+        // hold creation has locked and pass the gate; the after-loop count waits at the gate with
+        // its snapshot taken, so the hold commits behind it.
+        var result = await RunWhileHoldCommitsBehindCountGateAsync(database, linkIsReferenced, SweepAsync);
+
+        var links = CountOf<ZCaseLink>(result);
+        (links.DeferredCount, links.HeldCount, links.BlockedCount).Should().Be((deferred, held, blocked));
+        links.Affected.Should().Be(3);
+        (await IdsAsync(database, "held_with_links", TenantOne)).Should().Equal(LinkOne);
+    }
+
+    // A dry run (an erasure's) and a preview take no row locks, so a hold can commit between their
+    // counts. They read Eligible, Held, and Blocked in one statement, so each link is in exactly
+    // the one its snapshot says. Split into separate statements, the link whose hold commits
+    // between them is counted twice (Eligible and Held) or moves from Blocked to Held.
+    [Theory]
+    [InlineData(false, false, 4L, 0L, 0L)]
+    [InlineData(false, true, 3L, 0L, 1L)]
+    [InlineData(true, false, 4L, 0L, 0L)]
+    [InlineData(true, true, 3L, 0L, 1L)]
+    public async Task A_Hold_Committing_While_A_Dry_Run_Or_Preview_Counts_Leaves_The_Link_In_Exactly_One_Count(
+        bool preview,
+        bool linkIsReferenced,
+        long eligible,
+        long held,
+        long blocked
+    )
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+
+        var links = preview
+            ? CountOf<ZCaseLink>(await RunWhileHoldCommitsBehindCountGateAsync(database, linkIsReferenced, PreviewAsync))
+            : CountOf<ZCaseLink>(
+                await RunWhileHoldCommitsBehindCountGateAsync(
+                    database,
+                    linkIsReferenced,
+                    services => EraseAsync(services, dryRun: true)
+                )
+            );
+
+        (links.Affected, links.HeldCount, links.BlockedCount).Should().Be((eligible, held, blocked));
+        // Neither mutates anything.
+        (await IdsAsync(database, "held_with_links", TenantOne)).Should().BeEquivalentTo([LinkOne, LinkTwo, LinkNull, LinkCross]);
+    }
+
+    /// <summary>
+    /// Seeds the database (the held Case isn't due), gates every statement that counts the
+    /// links, and starts <paramref name="run"/> while a hold on the Case waits to commit. Once
+    /// the run waits at the gate, with its counting statement's snapshot taken, the hold commits
+    /// and the gate opens.
+    /// </summary>
+    private static async Task<T> RunWhileHoldCommitsBehindCountGateAsync<T>(
+        TemporaryDatabase database,
+        bool linkIsReferenced,
+        Func<ServiceProvider, Task<T>> run
+    )
+    {
         await (await BuildSeededServicesAsync(database.ConnectionString, caseOneDue: false)).DisposeAsync();
         await using var gate = await CountGate.CreateAsync(database, linkIsReferenced);
         await using var services = BuildServices(gate.ConnectionString);
@@ -471,13 +527,11 @@ public sealed class HeldWithEndToEndTests(PostgresFixture fixture)
             () => HoldAsync(services, EntityId<ACase>(), CaseOne, TenantOne, holdId)
         );
 
-        // The sweep's batches skip the link hold creation has locked and pass the gate; the
-        // after-loop count waits at the gate with its snapshot taken, so the hold commits behind it.
-        var sweep = Task.Run(() => SweepAsync(services));
+        var running = Task.Run(() => run(services));
         try
         {
-            await WaitForAdvisoryLockWaiterAsync(database.ConnectionString, CountGate.Key, sweep);
-            sweep.IsCompleted.Should().BeFalse();
+            await WaitForAdvisoryLockWaiterAsync(database.ConnectionString, CountGate.Key, running);
+            running.IsCompleted.Should().BeFalse();
             await paused.ReleaseAsync();
         }
         finally
@@ -485,13 +539,9 @@ public sealed class HeldWithEndToEndTests(PostgresFixture fixture)
             await gate.OpenAsync();
         }
 
-        var result = await sweep.WaitAsync(TimeSpan.FromSeconds(15));
-
+        var result = await running.WaitAsync(TimeSpan.FromSeconds(15));
         (await ActiveHoldIdsAsync(services)).Should().Equal(holdId);
-        var links = CountOf<ZCaseLink>(result);
-        (links.DeferredCount, links.HeldCount, links.BlockedCount).Should().Be((deferred, held, blocked));
-        links.Affected.Should().Be(3);
-        (await IdsAsync(database, "held_with_links", TenantOne)).Should().Equal(LinkOne);
+        return result;
     }
 
     [Fact]

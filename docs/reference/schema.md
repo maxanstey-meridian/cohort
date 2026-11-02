@@ -75,7 +75,8 @@ Two identities run through these tables, and they're deliberately different:
   consistently. A hold names one row by it. A row a
   [hold relation](/guides/legal-holds#holding-related-rows) covers is found through the
   relation's link column, which equals the record ID of the row it points at and so must be the
-  same type as it; readiness checks the column in the database.
+  same type as it, with a compatible collation; readiness checks the column in the database
+  (see [Startup validation](/reference/startup-validation#columns)).
 
 Record-ID types whose text form depends on session settings are rejected at startup:
 `timestamp`/`timestamptz`, `date`, `time`, `interval`, `real`/`double precision`, `money` and

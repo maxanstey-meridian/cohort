@@ -80,6 +80,8 @@ Along the way:
   leave it `Succeeded`; an erasure that missed rows settles `PartiallyFailed` with a `rows-missed` reason.
   `DeferredCount`, `HeldCount`, and the still-referenced part of `BlockedCount` are read in
   one statement, so a hold that commits meanwhile can't put a row in two counts or in none.
+  A dry run or a preview reads its eligible (affected), blocked, and held counts in one
+  statement the same way.
 - An erasure also reports what its rule keeps in `RetainedCount` (rows younger than the
   legal minimum, or every row under an `Exempt` rule), and `ErasureResult.Complete` says
   whether anything of the subject was left. See

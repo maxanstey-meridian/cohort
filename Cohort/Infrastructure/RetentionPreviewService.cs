@@ -77,10 +77,8 @@ internal sealed class RetentionPreviewService(
                 if (rule.Strategy != Strategy.Exempt)
                 {
                     var strategy = strategies[rule.Strategy];
-                    affected = await strategy.CountAsync(scope, SweepCount.Eligible, connection, ct);
-                    held = await strategy.CountAsync(scope, SweepCount.Held, connection, ct);
+                    (affected, held, blocked) = await strategy.CountPredictedAsync(scope, connection, ct);
                     nullAnchors = await strategy.CountAsync(scope, SweepCount.NullAnchor, connection, ct);
-                    blocked = await strategy.CountAsync(scope, SweepCount.Blocked, connection, ct);
                 }
 
                 counts.Add(

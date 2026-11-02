@@ -90,8 +90,14 @@ columns or rows belong to it. So these are rejected:
   says the link column "was not found in the database"), and its catalog type, resolved
   through domains, equals the catalog type of the record-ID column it names, since hold SQL
   equates the two. `varchar` and `text` count as one type, so `varchar(36)` links to a `text`
-  record ID; any other difference is refused, naming both types. Each message names the
-  declaration and the column.
+  record ID; any other difference is refused, naming both types. Once the types match and
+  both columns are collatable, their collations are checked too. Equal collations pass, and a
+  link with the `default` collation always passes, because the record ID's collation governs
+  the comparison. Two different non-default collations are refused, since PostgreSQL can't
+  choose between them and every hold check across the relation would fail. A non-default
+  nondeterministic link collation against a record ID with the `default` collation is refused
+  too, because one link value would match several record IDs and a row could be covered by
+  holds on several rows. Each message names the declaration and the column.
 - Each anonymised column can take what Cohort writes to it, checked against the database
   catalog: the column exists and the model's store type can be assigned to its type without
   an explicit cast; an `EmptyString` or `FixedLiteral` value, after the value converter, is

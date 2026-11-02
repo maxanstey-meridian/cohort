@@ -298,11 +298,11 @@ internal sealed class RetentionRun(
         {
             if (started.DryRun)
             {
-                affected = await strategy.CountAsync(scope, SweepCount.Eligible, connection, ct);
-                blocked = await strategy.CountAsync(scope, SweepCount.Blocked, connection, ct);
-                // Held rows are measured directly (in scope, eligible, actively held) rather
-                // than inferred from candidate arithmetic.
-                held = await strategy.CountAsync(scope, SweepCount.Held, connection, ct);
+                // One statement, so a hold committing meanwhile (a dry run takes no row locks)
+                // can't put a row in two of the counts or in none. Held rows are measured
+                // directly (in scope, eligible, actively held) rather than inferred from
+                // candidate arithmetic.
+                (affected, held, blocked) = await strategy.CountPredictedAsync(scope, connection, ct);
             }
             else
             {

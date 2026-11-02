@@ -70,12 +70,6 @@ internal sealed record SweepScope(
 
 internal enum SweepCount
 {
-    /// <summary>Rows the strategy would act on now.</summary>
-    Eligible,
-
-    /// <summary>Rows it would act on but for an active hold.</summary>
-    Held,
-
     /// <summary>Rows it could act on whose anchor is NULL, so no cutoff ever matches them.</summary>
     NullAnchor,
 
@@ -84,9 +78,4 @@ internal enum SweepCount
     /// erasure's rule keeps. Zero without a cutoff.
     /// </summary>
     RetainedByRule,
-
-    /// <summary>
-    /// Rows it would act on now but for a blocking reference (held rows count as held).
-    /// </summary>
-    Blocked,
 }

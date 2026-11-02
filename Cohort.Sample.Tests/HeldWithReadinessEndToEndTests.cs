@@ -135,7 +135,7 @@ public sealed class HeldWithReadinessEndToEndTests(PostgresFixture fixture)
         error.Should().Contain($"on {typeof(HeldWithReadinessEndToEndTests).FullName}+{nameof(ReadinessNoteLink)}");
         error.Should().Contain("link column \"public\".\"held_with_note_links\".\"NoteId\"");
         error.Should().Contain("nondeterministic collation 'link_ci'");
-        error.Should().Contain("'default'");
+        error.Should().Contain("has the default collation, so PostgreSQL compares them under 'link_ci'");
     }
 
     [Fact]
@@ -168,6 +168,39 @@ public sealed class HeldWithReadinessEndToEndTests(PostgresFixture fixture)
         await ExecuteAsync(
             database.ConnectionString,
             "ALTER TABLE public.held_with_note_links ALTER COLUMN \"NoteId\" TYPE text COLLATE \"C\""
+        );
+
+        var result = await SweepAsync(services);
+
+        result.EntityFailures.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task A_Default_Link_Collation_Passes_Readiness_Against_A_Record_Id_With_An_Explicit_Collation()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using var services = await BuildMigratedServicesAsync(database.ConnectionString);
+        await ExecuteAsync(
+            database.ConnectionString,
+            "ALTER TABLE public.held_with_notes ALTER COLUMN \"Id\" TYPE text COLLATE \"C\""
+        );
+
+        var result = await SweepAsync(services);
+
+        result.EntityFailures.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task A_Link_Column_Typed_As_A_Domain_Over_Varchar_Passes_Readiness_Against_A_Text_Record_Id()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using var services = await BuildMigratedServicesAsync(database.ConnectionString);
+        await ExecuteAsync(
+            database.ConnectionString,
+            """
+            CREATE DOMAIN public.note_ref AS varchar(36);
+            ALTER TABLE public.held_with_note_links ALTER COLUMN "NoteId" TYPE public.note_ref;
+            """
         );
 
         var result = await SweepAsync(services);

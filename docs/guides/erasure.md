@@ -238,7 +238,8 @@ Resolve `IRetentionErasureService` from the same scope as that `DbContext`; the 
 scoped for this reason. The erasure needs:
 
 - an open `READ COMMITTED` transaction, begun through EF (`BeginTransactionAsync` or
-  `UseTransaction`). Under `REPEATABLE READ` or `SERIALIZABLE` the hold checks would read a
+  `UseTransaction`). `READ UNCOMMITTED` is accepted too, because PostgreSQL runs it as
+  `READ COMMITTED`. Under `REPEATABLE READ` or `SERIALIZABLE` the hold checks would read a
   snapshot from when your transaction began and could miss a hold committed since, so
   Cohort refuses.
 - no unsaved changes on the context. Save or discard them first.

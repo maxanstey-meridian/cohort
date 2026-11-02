@@ -62,16 +62,9 @@ internal abstract class SweepStrategy(
     )
     {
         EnsureHandles(scope);
-        if (count == SweepCount.Blocked)
-        {
-            return await CountBlockedAsync(scope, conn, ct);
-        }
-
         var parameters = new SqlParams();
         var where = count switch
         {
-            SweepCount.Eligible => DueSql(scope, parameters),
-            SweepCount.Held => $"{ScopeSql(scope, parameters)} AND NOT {HoldExclusion(scope, parameters)}",
             // No hold exclusion: a held NULL-anchor row is just as invisible to retention.
             SweepCount.NullAnchor => ScopeSql(scope, parameters, AnchorFilter.Null),
             // No hold exclusion: the rule keeps the row whether or not it is also held.
@@ -82,27 +75,51 @@ internal abstract class SweepStrategy(
     }
 
     /// <summary>
-    /// Rows that would be due but for a blocking reference: what a dry run predicts a
-    /// constraint-free run leaves behind. A real run counts them with the other rows it
-    /// leaves, in <see cref="CountLeftAsync"/>.
+    /// What a dry run or a preview predicts, in one statement: one snapshot and one clock
+    /// reading, so a hold that commits while it counts (a dry run takes no row locks) can't
+    /// put a row in two counts or in none.
+    /// <list type="bullet">
+    /// <item><c>Eligible</c>: rows the strategy would act on now.</item>
+    /// <item><c>Held</c>: rows it would act on but for an active hold.</item>
+    /// <item><c>Blocked</c>: rows it would act on but for a blocking reference (held rows count
+    /// as held). 0 when the scope has no blocking reference.</item>
+    /// </list>
     /// </summary>
-    public async Task<long> CountBlockedAsync(SweepScope scope, DbConnection conn, CancellationToken ct)
+    public async Task<(long Eligible, long Held, long Blocked)> CountPredictedAsync(
+        SweepScope scope,
+        DbConnection conn,
+        CancellationToken ct
+    )
     {
         EnsureHandles(scope);
-        if (scope.BlockingReferences.Count == 0)
-        {
-            return 0;
-        }
 
         var parameters = new SqlParams();
-        return await CountWhereAsync(
-            scope.Entry,
-            $"{ScopeSql(scope, parameters)} AND {HoldExclusion(scope, parameters)} AND NOT ({ReferencingForeignKeySql.NotReferencedSql(scope)})",
-            parameters,
+        var scopeSql = ScopeSql(scope, parameters);
+        var blocked = BlockedSql(scope, scopeSql, parameters);
+        await using var command = parameters.CreateCommand(
             conn,
-            ct
+            null,
+            $"""
+            SELECT pg_catalog.count(*) FILTER (WHERE {DueSql(scope, parameters)}),
+                   pg_catalog.count(*) FILTER (WHERE {scopeSql} AND NOT {HoldExclusion(scope, parameters)}),
+                   {blocked}
+            FROM {PostgreSqlIdentifier.Format(scope.Entry.Table)} AS target
+            WHERE {scopeSql}
+            """
         );
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        await reader.ReadAsync(ct);
+        return (reader.GetInt64(0), reader.GetInt64(1), reader.GetInt64(2));
     }
+
+    /// <summary>
+    /// The select item counting the rows that would be due but for a blocking reference, leaving
+    /// out <paramref name="notRefused"/>; <c>0::bigint</c> when the scope has no blocking reference.
+    /// </summary>
+    private static string BlockedSql(SweepScope scope, string scopeSql, SqlParams parameters, string notRefused = "") =>
+        scope.BlockingReferences.Count == 0
+            ? "0::bigint"
+            : $"pg_catalog.count(*) FILTER (WHERE {scopeSql} AND {HoldExclusion(scope, parameters)} AND NOT ({ReferencingForeignKeySql.NotReferencedSql(scope)}){notRefused})";
 
     /// <summary>
     /// What is left once run <paramref name="sweepId"/> has finished its batches for the
@@ -114,7 +131,7 @@ internal abstract class SweepStrategy(
     /// detail its skip wrote, and a row a constraint refused, through
     /// <paramref name="refused"/>. What remains was locked by another transaction when
     /// discovery passed it, or came into scope mid-run behind the run's position.</item>
-    /// <item><c>Held</c>: the rows of <see cref="SweepCount.Held"/>.</item>
+    /// <item><c>Held</c>: rows it would act on but for an active hold.</item>
     /// <item><c>Referenced</c>: rows that would be due but for a blocking reference, leaving
     /// out <paramref name="refused"/> too, so no row is counted both refused and
     /// referenced. 0 when the scope has no blocking reference.</item>
@@ -135,9 +152,7 @@ internal abstract class SweepStrategy(
         var notRefused = NotAnyRecordIdSql(scope.Entry, "refusedRecordIds", refused, parameters);
         var deferred = $"{DueSql(scope, parameters)}{NotRecordedByRunSql(scope, sweepId, parameters)}{notRefused}";
         var held = $"{scopeSql} AND NOT {HoldExclusion(scope, parameters)}";
-        var referenced = scope.BlockingReferences.Count == 0
-            ? "0::bigint"
-            : $"pg_catalog.count(*) FILTER (WHERE {scopeSql} AND {HoldExclusion(scope, parameters)} AND NOT ({ReferencingForeignKeySql.NotReferencedSql(scope)}){notRefused})";
+        var referenced = BlockedSql(scope, scopeSql, parameters, notRefused);
         await using var command = parameters.CreateCommand(
             conn,
             null,

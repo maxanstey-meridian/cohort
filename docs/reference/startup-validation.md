@@ -107,10 +107,11 @@ columns or rows belong to it. So these are rejected:
   column in the key of an unfiltered unique index whose key lacks the record ID; a literal
   isn't written to a foreign-key column; and no anonymised column is referenced by a foreign
   key. See [Anonymisation](/guides/anonymisation).
-- No foreign key references a column an update strategy always writes: the soft-delete flag
-  and deleted-at of an entity that may be soft-deleted, or the anonymised-at marker of one
-  that may be anonymised. Changing a referenced key is either refused while a row references
-  it or silently rewrites the referencing rows.
+- Each column an update strategy always writes exists, and no foreign key references one: the
+  soft-delete flag and deleted-at of an entity that may be soft-deleted, or the anonymised-at
+  marker of one that may be anonymised. A missing one would fail every such update (the message
+  says the column "was not found in the database"), and changing a referenced key is either
+  refused while a row references it or silently rewrites the referencing rows.
 
 ## Hold relations
 

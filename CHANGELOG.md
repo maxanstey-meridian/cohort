@@ -50,6 +50,10 @@ A hold on a row also holds the rows a host declares related to it.
   different model, since it reads only through its connection; the refusal now says 'a
   different database'. Readiness reads the database's identity from the server once for each
   model copy and connection it hasn't validated, one extra round trip.
+- Readiness refuses a retained entity whose soft-delete flag, deleted-at, or anonymised-at
+  column the database doesn't have, when a strategy its category declares writes it, as it
+  already refused a missing table, record-id column, or anonymised column. Before, every such
+  run failed at its UPDATE.
 
 Upgrade: [Legal Holds](https://maxanstey-meridian.github.io/cohort/guides/legal-holds#upgrading-to-0-12-0).
 

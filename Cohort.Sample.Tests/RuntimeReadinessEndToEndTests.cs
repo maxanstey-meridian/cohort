@@ -1713,6 +1713,52 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         );
     }
 
+    [Theory]
+    [InlineData("IsDeleted")]
+    [InlineData("DeletedAt")]
+    public async Task Readiness_refuses_a_missing_soft_delete_marker_column(string column)
+    {
+        // The migration that adds the marker wasn't applied; every soft-delete would fail at its UPDATE.
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await using (var connection = new NpgsqlConnection(database.ConnectionString))
+        {
+            await connection.OpenAsync();
+            await using var command = new NpgsqlCommand(
+                $"""ALTER TABLE public.soft_delete_records DROP COLUMN "{column}" """,
+                connection
+            );
+            await command.ExecuteNonQueryAsync();
+        }
+
+        using var host = new CohortTestHost(database.ConnectionString);
+
+        var act = () => host.RunSweepAsync(new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()));
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle(error =>
+            error.Contains(typeof(SoftDeleteRecord).FullName!, StringComparison.Ordinal)
+            && error.Contains($"member {column}", StringComparison.Ordinal)
+            && error.Contains("was not found", StringComparison.Ordinal)
+        );
+    }
+
+    [Fact]
+    public async Task Readiness_refuses_a_missing_anonymised_at_marker_column()
+    {
+        await using var database = await AnonymiseTargetDatabaseAsync(
+            """ALTER TABLE public.anonymise_null_records DROP COLUMN "AnonymisedAt" """
+        );
+        await using var provider = BuildAnonymiseTargetProvider(database.ConnectionString);
+
+        var errors = await ReadinessErrorsAsync(provider);
+
+        errors.Should().ContainSingle(error =>
+            error.Contains(typeof(AnonymiseNullRecord).FullName!, StringComparison.Ordinal)
+            && error.Contains("member AnonymisedAt", StringComparison.Ordinal)
+            && error.Contains("was not found", StringComparison.Ordinal)
+        );
+    }
+
     [Fact]
     public async Task Readiness_refuses_null_into_a_column_the_database_declares_not_null()
     {

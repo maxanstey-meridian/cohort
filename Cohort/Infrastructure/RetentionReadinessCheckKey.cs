@@ -13,7 +13,7 @@ internal enum RetentionReadinessCheck
     Schema,
     RetainedTables,
     HoldRelationLinkColumns,
-    ReferencedMarkerColumns,
+    MarkerColumns,
     StoredEntityIdentities,
 }
 

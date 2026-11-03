@@ -142,8 +142,8 @@ internal sealed class RetentionRuntimeReadinessValidator(
             await ValidateAnonymiseTargetsAsync(ct);
             var markers = MarkerColumnRows();
             await RunSharedAsync(
-                Key(RetentionReadinessCheck.ReferencedMarkerColumns, markers),
-                () => ValidateReferencedMarkerColumnsAsync(facade, markers, ct)
+                Key(RetentionReadinessCheck.MarkerColumns, markers),
+                () => ValidateMarkerColumnsAsync(facade, markers, ct)
             );
             var registered = registry.Scan().Values.Select(entry => entry.RetentionEntityId).Order().ToArray();
             object[] storedIdentityInputs = [holds, .. registered];
@@ -799,12 +799,13 @@ internal sealed class RetentionRuntimeReadinessValidator(
     }
 
     /// <summary>
-    /// An update must never change a key another table references: the foreign key would refuse
-    /// it while a row references it, or silently rewrite the referencing rows. The anonymise
-    /// check covers the anonymised columns; this covers the columns the update strategies always
-    /// write, the soft-delete flag and deleted-at, and the anonymised-at marker.
+    /// The columns the update strategies always write, the soft-delete flag and deleted-at, and
+    /// the anonymised-at marker, must exist, or every run would fail at its UPDATE. And an update
+    /// must never change a key another table references: the foreign key would refuse it while a
+    /// row references it, or silently rewrite the referencing rows. The anonymise check covers
+    /// the anonymised columns; the retained-tables check has already refused a missing table.
     /// </summary>
-    private static async Task ValidateReferencedMarkerColumnsAsync(
+    private static async Task ValidateMarkerColumnsAsync(
         DatabaseFacade database,
         MarkerColumnInput[] markers,
         CancellationToken ct
@@ -827,7 +828,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 database.GetDbConnection(),
                 database.CurrentTransaction?.GetDbTransaction(),
                 """
-                SELECT requested.ordinal
+                SELECT requested.ordinal, attribute.attnum IS NULL
                 FROM ROWS FROM (
                     pg_catalog.unnest(@schemas),
                     pg_catalog.unnest(@tables),
@@ -836,12 +837,12 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 JOIN pg_catalog.pg_namespace namespace ON namespace.nspname = requested.schema_name
                 JOIN pg_catalog.pg_class relation
                   ON relation.relnamespace = namespace.oid AND relation.relname = requested.table_name
-                JOIN pg_catalog.pg_attribute attribute
+                LEFT JOIN pg_catalog.pg_attribute attribute
                   ON attribute.attrelid = relation.oid
                  AND attribute.attname = requested.column_name
                  AND attribute.attnum > 0
                  AND NOT attribute.attisdropped
-                WHERE EXISTS (
+                WHERE attribute.attnum IS NULL OR EXISTS (
                     SELECT 1 FROM pg_catalog.pg_constraint foreign_key
                     WHERE foreign_key.contype = 'f'
                       AND foreign_key.confrelid = relation.oid
@@ -856,8 +857,11 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 while (await reader.ReadAsync(ct))
                 {
                     var marker = markers[(int)reader.GetInt64(0) - 1];
+                    var column = $"{PostgreSqlIdentifier.Format(marker.Table)}.{PostgreSqlIdentifier.Quote(marker.Column)}";
                     errors.Add(
-                        $"Retained entity {marker.Entity}: member {marker.Member} writes column {PostgreSqlIdentifier.Format(marker.Table)}.{PostgreSqlIdentifier.Quote(marker.Column)}, which is referenced by a foreign key, so {marker.Strategy} a row would be refused while a row references it or would silently rewrite the referencing rows (ON UPDATE CASCADE or SET NULL). Stop referencing this column."
+                        reader.GetBoolean(1)
+                            ? $"Retained entity {marker.Entity}: member {marker.Member} writes column {column}, which was not found in the database, so {marker.Strategy} a row would fail. Apply the host application's pending EF Core migrations, or map the member to the column it lives in."
+                            : $"Retained entity {marker.Entity}: member {marker.Member} writes column {column}, which is referenced by a foreign key, so {marker.Strategy} a row would be refused while a row references it or would silently rewrite the referencing rows (ON UPDATE CASCADE or SET NULL). Stop referencing this column."
                     );
                 }
             }

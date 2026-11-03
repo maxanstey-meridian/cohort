@@ -320,18 +320,19 @@ internal sealed class RetentionRun(
 
             // Without a cutoff (an erasure with no legal minimum) a NULL anchor excludes
             // nothing, so there is nothing to report.
-            if (scope.Cutoff is not null)
+            if (SweepStatements.CountsNullAnchor(scope))
             {
                 nullAnchors = await strategy.CountAsync(scope, SweepCount.NullAnchor, connection, ct);
-                // What an erasure's legal minimum keeps; a sweep's younger rows are simply
-                // not due yet.
-                if (scope.Subject is not null)
-                {
-                    retained = await strategy.CountAsync(scope, SweepCount.RetainedByRule, connection, ct);
-                }
+            }
+
+            // What an erasure's legal minimum keeps; a sweep's younger rows are simply
+            // not due yet.
+            if (SweepStatements.CountsRetainedByRule(scope))
+            {
+                retained = await strategy.CountAsync(scope, SweepCount.RetainedByRule, connection, ct);
             }
         }
-        else if (scope.Subject is not null)
+        else if (SweepStatements.CountsSubjectRows(scope))
         {
             // An Exempt rule keeps every one of the subject's rows from the erasure.
             retained = await SweepStrategy.CountSubjectRowsAsync(scope, connection, ct);

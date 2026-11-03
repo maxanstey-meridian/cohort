@@ -24,11 +24,25 @@ internal sealed class RetentionRuntimeReadinessValidator(
     RetentionRegistry registry,
     RetentionRuntimeReadinessState state,
     IServiceScopeFactory scopeFactory,
-    AnonymiseAssignmentResolver assignments
+    AnonymiseAssignmentResolver assignments,
+    RetentionValidationState validationState,
+    IEnumerable<IRetentionHandlerRegistration> handlerRegistrations,
+    IEnumerable<IRetentionDependentsRegistration> dependentsRegistrations,
+    IRetentionExecutionSettings settings
 )
 {
     // pg_input_is_valid, which the anonymise-target check relies on, arrived in PostgreSQL 16.
     private static readonly Version MinimumServerVersion = new(16, 0);
+
+    private readonly RetentionStatementReadiness statementReadiness = new(
+        db,
+        registry,
+        validationState,
+        assignments,
+        handlerRegistrations,
+        dependentsRegistrations,
+        settings
+    );
 
     internal IReadOnlyDictionary<string, RetentionCategoryCapabilities>
         ValidatedCapabilities => startupValidator.ValidatedCapabilities;
@@ -85,7 +99,8 @@ internal sealed class RetentionRuntimeReadinessValidator(
             await startupValidator.ValidateAsync(ct);
             var storeTables = CohortStoreTables.FromModel(db.Model);
             var holds = PostgreSqlIdentifier.Format(storeTables.RetentionHolds);
-            var callerDatabase = await ReadServerDatabaseIdentityAsync(facade, holds, ct);
+            var session = await ReadServerSessionAsync(facade, storeTables.RetentionHolds, ct);
+            var callerDatabase = session.Database;
 
             RetentionReadinessCheckKey Key(RetentionReadinessCheck check, IEnumerable<object> inputs) =>
                 new(callerDatabase, check, [.. inputs]);
@@ -114,12 +129,15 @@ internal sealed class RetentionRuntimeReadinessValidator(
             // Order matters. Startup validation runs first, so a model with a retained entity and
             // no or partial Cohort table mapping gets startup validation's aggregated refusal
             // before any key needs the store tables.
-            // Each check then throws before the next runs, and later checks rely on
-            // earlier ones: the link-column check skips rows whose target type is missing, and
-            // the anonymise check skips rows whose table or record id is missing, because the
-            // retained-tables check has already refused those. When that check is skipped as
-            // another copy's recorded pass, the order holds on the same "once, then trusted"
-            // footing as the cache itself.
+            // Each check then throws before the next runs: version, schema, relations, hold
+            // links, statements, columns, anonymise targets, stored identities. The relation and
+            // link rules come before the statement check because their refusals are more specific
+            // than PostgreSQL's for the same fault, and deterministic where a plan-dependent
+            // EXPLAIN isn't. The statement check owns existence, analysable types, writability,
+            // cast types, assignability, and privileges, so the rules after it skip what it has
+            // refused: a missing table or column. When a check is skipped as another copy's
+            // recorded pass, the order holds on the same "once, then trusted" footing as the
+            // cache itself.
             await RunSharedAsync(
                 Key(RetentionReadinessCheck.ServerVersion, []),
                 () => ValidateServerVersionAsync(facade, ct)
@@ -128,23 +146,53 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 Key(RetentionReadinessCheck.Schema, [storeTables]),
                 () => schemaValidator.ValidateAsync(storeTables, facade, ct)
             );
-            var retainedTables = RetainedTableRows();
+            var retainedRelations = RetainedRelationRows();
             await RunSharedAsync(
-                Key(RetentionReadinessCheck.RetainedTables, retainedTables),
-                () => ValidateRetainedTablesAsync(facade, retainedTables, ct)
+                Key(RetentionReadinessCheck.RetainedRelations, retainedRelations),
+                () => ValidateRetainedRelationsAsync(facade, retainedRelations, ct)
             );
             var links = HoldLinkRows();
             await RunSharedAsync(
                 Key(RetentionReadinessCheck.HoldRelationLinkColumns, links),
                 () => ValidateHoldRelationLinkColumnsAsync(facade, links, ct)
             );
+            // The statements are built (reading the Purge scopes' blocking keys) before the key,
+            // because their text and parameter types are the key. It holds the role and the
+            // search path first: privileges depend on the role, and an unqualified type name
+            // resolves through the path.
+            await facade.OpenConnectionAsync(ct);
+            IReadOnlyList<ReadinessStatement> statements;
+            try
+            {
+                statements = await statementReadiness.EnumerateAsync(ValidatedCapabilities, ct);
+            }
+            finally
+            {
+                await facade.CloseConnectionAsync();
+            }
+
+            object[] statementInputs =
+            [
+                session.Role,
+                session.SearchPath,
+                .. statements
+                    .Select(statement => statement.Input)
+                    .OrderBy(input => input.Entity, StringComparer.Ordinal)
+                    .ThenBy(input => input.Name, StringComparer.Ordinal)
+                    .ThenBy(input => input.Sql, StringComparer.Ordinal)
+                    .ThenBy(input => input.ParameterTypes, StringComparer.Ordinal),
+            ];
+            await RunSharedAsync(
+                Key(RetentionReadinessCheck.Statements, statementInputs),
+                () => statementReadiness.ExplainAsync(statements, session.Role, ct)
+            );
+            var columns = RetainedColumnRows();
+            await RunSharedAsync(
+                Key(RetentionReadinessCheck.RetainedColumns, columns),
+                () => ValidateRetainedColumnsAsync(facade, columns, ct)
+            );
             // Not shared: what this reads is session state, which no key captures.
             await ValidateAnonymiseTargetsAsync(ct);
-            var markers = MarkerColumnRows();
-            await RunSharedAsync(
-                Key(RetentionReadinessCheck.MarkerColumns, markers),
-                () => ValidateMarkerColumnsAsync(facade, markers, ct)
-            );
             var registered = registry.Scan().Values.Select(entry => entry.RetentionEntityId).Order().ToArray();
             object[] storedIdentityInputs = [holds, .. registered];
             // The hold check runs on its own connection, outside the caller's transaction, so its
@@ -153,7 +201,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
             // DDL that rolls back, so those are recorded only without one.
             await RunSharedAsync(
                 Key(RetentionReadinessCheck.StoredEntityIdentities, storedIdentityInputs),
-                () => ValidateStoredEntityIdentitiesAsync(scopeFactory, holds, registered, callerDatabase, ct),
+                () => ValidateStoredEntityIdentitiesAsync(scopeFactory, storeTables.RetentionHolds, registered, callerDatabase, ct),
                 recordInsideTransaction: true
             );
 
@@ -169,16 +217,14 @@ internal sealed class RetentionRuntimeReadinessValidator(
     }
 
     /// <summary>
-    /// Each retained table must exist as an ordinary or partitioned table, since Cohort changes
-    /// its rows in place and addresses each by its physical position (ctid), and its record-id
-    /// column must exist. Cohort stores a record id as its column's text form; the model's store
-    /// type name cannot show a domain, and the startup check only knows type names, so each
-    /// record-id column's catalog type is resolved through domains, arrays and ranges to the
-    /// types it is built on, which must not depend on session settings.
+    /// Each retained relation must be an ordinary or partitioned table: Cohort updates, deletes,
+    /// and row-locks its rows in place and addresses each by its physical position (ctid), which
+    /// a view, a materialized view, or a foreign table can't offer or take. A relation that
+    /// doesn't exist is the statement check's to refuse, so it is skipped here.
     /// </summary>
-    private static async Task ValidateRetainedTablesAsync(
+    private static async Task ValidateRetainedRelationsAsync(
         DatabaseFacade database,
-        RetainedTableInput[] entries,
+        RetainedRelationInput[] entries,
         CancellationToken ct
     )
     {
@@ -194,59 +240,19 @@ internal sealed class RetentionRuntimeReadinessValidator(
             {
                 ["schemas"] = entries.Select(entry => entry.Table.Schema).ToArray(),
                 ["tables"] = entries.Select(entry => entry.Table.Name).ToArray(),
-                ["columns"] = entries.Select(entry => entry.RecordIdColumn).ToArray(),
             }.CreateCommand(
                 database.GetDbConnection(),
                 database.CurrentTransaction?.GetDbTransaction(),
                 """
-                WITH RECURSIVE record_id_column AS (
-                    SELECT requested.ordinal,
-                           relation.oid AS relation_id,
-                           relation.relkind AS relation_kind,
-                           attribute.atttypid AS type_id
-                    FROM ROWS FROM (
-                        pg_catalog.unnest(@schemas),
-                        pg_catalog.unnest(@tables),
-                        pg_catalog.unnest(@columns)
-                    ) WITH ORDINALITY AS requested(schema_name, table_name, column_name, ordinal)
-                    LEFT JOIN pg_catalog.pg_namespace namespace ON namespace.nspname = requested.schema_name
-                    LEFT JOIN pg_catalog.pg_class relation
-                      ON relation.relnamespace = namespace.oid AND relation.relname = requested.table_name
-                    LEFT JOIN pg_catalog.pg_attribute attribute
-                      ON attribute.attrelid = relation.oid
-                     AND attribute.attname = requested.column_name
-                     AND attribute.attnum > 0
-                     AND NOT attribute.attisdropped
-                ),
-                built_on(ordinal, type_id) AS (
-                    SELECT ordinal, type_id FROM record_id_column WHERE type_id IS NOT NULL
-                    UNION
-                    SELECT built_on.ordinal,
-                           CASE
-                               WHEN pgtype.typtype = 'd' THEN pgtype.typbasetype
-                               WHEN pgtype.typcategory = 'A' THEN pgtype.typelem
-                               WHEN pgtype.typtype = 'r' THEN over_range.rngsubtype
-                               ELSE over_multirange.rngtypid
-                           END
-                    FROM built_on
-                    JOIN pg_catalog.pg_type pgtype ON pgtype.oid = built_on.type_id
-                    LEFT JOIN pg_catalog.pg_range over_range ON over_range.rngtypid = pgtype.oid
-                    LEFT JOIN pg_catalog.pg_range over_multirange ON over_multirange.rngmultitypid = pgtype.oid
-                    WHERE pgtype.typtype IN ('d', 'r', 'm') OR pgtype.typcategory = 'A'
-                )
-                SELECT ordinal, NULL::pg_catalog.name, relation_id IS NULL, NULL::pg_catalog.char
-                FROM record_id_column
-                WHERE type_id IS NULL
-                UNION ALL
-                SELECT ordinal, NULL, NULL, relation_kind
-                FROM record_id_column
-                WHERE relation_kind NOT IN ('r', 'p')
-                UNION ALL
-                SELECT built_on.ordinal, pgtype.typname, NULL, NULL
-                FROM built_on
-                JOIN pg_catalog.pg_type pgtype ON pgtype.oid = built_on.type_id
-                JOIN pg_catalog.pg_namespace namespace ON namespace.oid = pgtype.typnamespace
-                WHERE namespace.nspname = 'pg_catalog'
+                SELECT requested.ordinal, relation.relkind
+                FROM ROWS FROM (
+                    pg_catalog.unnest(@schemas),
+                    pg_catalog.unnest(@tables)
+                ) WITH ORDINALITY AS requested(schema_name, table_name, ordinal)
+                JOIN pg_catalog.pg_namespace namespace ON namespace.nspname = requested.schema_name
+                JOIN pg_catalog.pg_class relation
+                  ON relation.relnamespace = namespace.oid AND relation.relname = requested.table_name
+                WHERE relation.relkind NOT IN ('r', 'p')
                 """
             );
 
@@ -256,32 +262,8 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 while (await reader.ReadAsync(ct))
                 {
                     var entry = entries[(int)reader.GetInt64(0) - 1];
-                    if (!reader.IsDBNull(3))
-                    {
-                        errors.Add(
-                            $"Retained entity {entry.Entity}: {PostgreSqlIdentifier.Format(entry.Table)} is {NotATable(reader.GetChar(3))}, so Cohort can't retain its rows. Map the entity to the table it lives in."
-                        );
-                        continue;
-                    }
-
-                    if (reader.IsDBNull(1))
-                    {
-                        errors.Add(
-                            reader.GetBoolean(2)
-                                ? $"Retained entity {entry.Entity}: table {PostgreSqlIdentifier.Format(entry.Table)} was not found in the database, so every run would fail. Apply the host application's pending EF Core migrations, or map the entity to the table it lives in."
-                                : $"Record-id convention on {entry.Entity}: record-id column {PostgreSqlIdentifier.Format(entry.Table)}.{PostgreSqlIdentifier.Quote(entry.RecordIdColumn)} was not found in the database, so every run would fail. Apply the host application's pending EF Core migrations, or map the record id to the column it lives in."
-                        );
-                        continue;
-                    }
-
-                    var typeName = reader.GetString(1);
-                    if (!RetentionStartupValidator.HasSessionDependentText(typeName))
-                    {
-                        continue;
-                    }
-
                     errors.Add(
-                        $"Record-id convention on {entry.Entity}: record-id column {PostgreSqlIdentifier.Format(entry.Table)}.{PostgreSqlIdentifier.Quote(entry.RecordIdColumn)} is built on '{typeName}', whose text form depends on session settings (TimeZone, DateStyle, IntervalStyle, extra_float_digits), so holds and audit rows could silently stop matching. Use a uuid, integer, numeric, or text record id, or mark a stable unique column with [RetentionRecordId]."
+                        $"Retained entity {entry.Entity}: {PostgreSqlIdentifier.Format(entry.Table)} is {NotATable(reader.GetChar(1))}, so Cohort can't retain its rows. Map the entity to the table it lives in."
                     );
                 }
             }
@@ -298,31 +280,29 @@ internal sealed class RetentionRuntimeReadinessValidator(
     }
 
     /// <summary>
-    /// What the retained-tables check reads, one row per retained entity, ordered by entity name.
+    /// What the retained-relations check reads, one row per retained entity, ordered by entity name.
     /// </summary>
-    private RetainedTableInput[] RetainedTableRows() =>
+    private RetainedRelationInput[] RetainedRelationRows() =>
         [
             .. registry
                 .Scan()
-                .Values.Select(entry => new RetainedTableInput(
+                .Values.Select(entry => new RetainedRelationInput(
                     entry.EntityType.FullName ?? entry.EntityType.Name,
-                    entry.Table,
-                    entry.RecordId.RecordIdColumn
+                    entry.Table
                 ))
                 .OrderBy(row => row.Entity, StringComparer.Ordinal),
         ];
 
-    private sealed record RetainedTableInput(string Entity, RelationalObjectName Table, string RecordIdColumn);
+    private sealed record RetainedRelationInput(string Entity, RelationalObjectName Table);
 
     /// <summary>
-    /// Each <c>[HeldWith]</c> and <c>[HeldWithReferencing]</c> link column must exist in the real
-    /// table, and its catalog type, resolved through domains (<c>varchar</c> and <c>text</c> count
-    /// as one), must be the type of the record-id column it names, because hold SQL equates the
-    /// two, and the two columns' collations must be comparable. The model-level check compares
-    /// only provider CLR types, so it can't see a store type, a domain, or a column that
-    /// migration drift changed. Runs after
-    /// <see cref="ValidateRetainedTablesAsync"/>, which has already refused a missing table or
-    /// record-id column.
+    /// Each <c>[HeldWith]</c> and <c>[HeldWithReferencing]</c> link column's catalog type,
+    /// resolved through domains (<c>varchar</c> and <c>text</c> count as one), must be the type of
+    /// the record-id column it names, because hold SQL equates the two, and the two columns'
+    /// collations must be comparable. PostgreSQL lets <c>citext</c> and <c>text</c>, or <c>int4</c>
+    /// and <c>numeric</c>, meet in a comparison, and a collation conflict only shows in some
+    /// plans, so the statement check can't see these; the model-level check compares only
+    /// provider CLR types. A missing table or column is skipped: the statement check refuses it.
     /// </summary>
     private static async Task ValidateHoldRelationLinkColumnsAsync(
         DatabaseFacade database,
@@ -406,7 +386,6 @@ internal sealed class RetentionRuntimeReadinessValidator(
                     WHERE pgtype.typtype <> 'd'
                 )
                 SELECT requested.ordinal,
-                       requested.link_type_id IS NOT NULL,
                        pg_catalog.format_type(requested.link_type_id, NULL),
                        pg_catalog.format_type(requested.target_type_id, NULL),
                        link_base.type_id IS NOT DISTINCT FROM target_base.type_id,
@@ -431,7 +410,9 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 LEFT JOIN resolved target_base ON target_base.ordinal = requested.ordinal AND target_base.side = 'target'
                 LEFT JOIN pg_catalog.pg_collation link_collation ON link_collation.oid = requested.link_collation_id
                 LEFT JOIN pg_catalog.pg_collation target_collation ON target_collation.oid = requested.target_collation_id
-                WHERE requested.target_type_id IS NOT NULL
+                -- A missing table or column is refused by the statement check, so those rows
+                -- are skipped.
+                WHERE requested.target_type_id IS NOT NULL AND requested.link_type_id IS NOT NULL
                 """
             );
 
@@ -442,22 +423,16 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 {
                     var hop = hops[(int)reader.GetInt64(0) - 1];
                     var column = $"{PostgreSqlIdentifier.Format(hop.OwnerTable)}.{PostgreSqlIdentifier.Quote(hop.LinkColumn)}";
-                    if (!reader.GetBoolean(1))
+                    if (!reader.GetBoolean(3))
                     {
                         errors.Add(
-                            $"Hold relation {hop.Declaration}: link column {column} was not found in the database, so every hold check on it would fail. Apply the host application's pending EF Core migrations, or map the link member to the column it lives in."
+                            $"Hold relation {hop.Declaration}: link column {column} is '{reader.GetString(1)}' in the database, but the record-id column {PostgreSqlIdentifier.Format(hop.TargetTable)}.{PostgreSqlIdentifier.Quote(hop.TargetRecordIdColumn)} it names is '{reader.GetString(2)}', so holds would never match across the relation. Give the link column the record id's type."
                         );
                     }
-                    else if (!reader.GetBoolean(4))
+                    else if (reader.GetInt32(4) is var collationProblem and not 0)
                     {
-                        errors.Add(
-                            $"Hold relation {hop.Declaration}: link column {column} is '{reader.GetString(2)}' in the database, but the record-id column {PostgreSqlIdentifier.Format(hop.TargetTable)}.{PostgreSqlIdentifier.Quote(hop.TargetRecordIdColumn)} it names is '{reader.GetString(3)}', so holds would never match across the relation. Give the link column the record id's type."
-                        );
-                    }
-                    else if (reader.GetInt32(5) is var collationProblem and not 0)
-                    {
-                        var linkCollation = reader.GetString(6);
-                        var targetCollation = reader.GetString(7);
+                        var linkCollation = reader.GetString(5);
+                        var targetCollation = reader.GetString(6);
                         var record = $"{PostgreSqlIdentifier.Format(hop.TargetTable)}.{PostgreSqlIdentifier.Quote(hop.TargetRecordIdColumn)}";
                         errors.Add(
                             collationProblem == 1
@@ -524,13 +499,15 @@ internal sealed class RetentionRuntimeReadinessValidator(
         };
 
     /// <summary>
-    /// The startup check knows only an anonymise target's CLR type; the column decides what the
-    /// UPDATE can write. Ask the catalog, which sees domains (nested ones included), column types
-    /// declared without a length and migration drift, for each target column's facts. The UPDATE
-    /// casts each value to the model's store type and PostgreSQL then assigns it to the column,
-    /// so the model's type must reach the column's without an explicit cast, and each literal is
-    /// tested with both types' input functions (the column's typmod included), so that a value
-    /// the column can't take fails here instead of on every run.
+    /// The statement check has PostgreSQL analyse the anonymise UPDATE itself, so a missing or
+    /// generated column, an unknown cast type, and a store type the column can't be assigned
+    /// from are refused there. What it can't see, it can't see because EXPLAIN never runs the
+    /// cast on a stored literal or reads a constraint: the catalog is asked, for each target
+    /// column (domains, nested ones included, and migration drift), whether each literal is
+    /// valid for both types' input functions (the column's typmod included), whether Null meets
+    /// a NOT NULL column, whether a single value meets a unique index, whether a literal meets a
+    /// foreign key, and whether the column is referenced by one. A missing table, record id, or
+    /// column is skipped: the statement check has refused it.
     /// </summary>
     private async Task ValidateAnonymiseTargetsAsync(CancellationToken ct)
     {
@@ -577,7 +554,6 @@ internal sealed class RetentionRuntimeReadinessValidator(
                            attribute.attnum,
                            attribute.atttypid,
                            attribute.attnotnull,
-                           attribute.attgenerated <> '' OR attribute.attidentity = 'a' AS is_generated,
                            pg_catalog.format_type(attribute.atttypid, attribute.atttypmod) AS column_type,
                            pg_catalog.to_regtype(requested.cast_type) AS cast_type_id
                     FROM ROWS FROM (
@@ -602,27 +578,20 @@ internal sealed class RetentionRuntimeReadinessValidator(
                      AND record_id.attnum > 0
                      AND NOT record_id.attisdropped
                 ),
-                -- Each type through its domains to its base type (level 0) and, for an array, its
-                -- element type through the element's domains (level 1), as PostgreSQL coerces.
-                type_chain(type_id, level, step_id) AS (
-                    SELECT pgtype.oid, 0, pgtype.oid
+                -- Each column type through its domains, for a NOT NULL anywhere in the chain.
+                type_chain(type_id, step_id) AS (
+                    SELECT pgtype.oid, pgtype.oid
                     FROM pg_catalog.pg_type pgtype
-                    WHERE pgtype.oid IN (SELECT atttypid FROM requested UNION SELECT cast_type_id FROM requested)
+                    WHERE pgtype.oid IN (SELECT atttypid FROM requested)
                     UNION ALL
-                    SELECT chain.type_id,
-                           CASE WHEN step.typtype = 'd' THEN chain.level ELSE 1 END,
-                           CASE WHEN step.typtype = 'd' THEN step.typbasetype ELSE step.typelem END
+                    SELECT chain.type_id, step.typbasetype
                     FROM type_chain chain
                     JOIN pg_catalog.pg_type step ON step.oid = chain.step_id
-                    WHERE step.typtype = 'd' OR (chain.level = 0 AND step.typcategory = 'A')
+                    WHERE step.typtype = 'd'
                 ),
                 type_base AS (
                     SELECT chain.type_id,
-                           pg_catalog.bool_or(step.typnotnull) FILTER (WHERE chain.level = 0) AS not_null,
-                           pg_catalog.max(step.oid) FILTER (WHERE chain.level = 0 AND step.typtype <> 'd') AS base_id,
-                           pg_catalog.max(step.typcategory::text) FILTER (WHERE chain.level = 0 AND step.typtype <> 'd') AS base_category,
-                           pg_catalog.max(step.oid) FILTER (WHERE chain.level = 1 AND step.typtype <> 'd') AS element_id,
-                           pg_catalog.max(step.typcategory::text) FILTER (WHERE chain.level = 1 AND step.typtype <> 'd') AS element_category
+                           pg_catalog.bool_or(step.typnotnull) AS not_null
                     FROM type_chain chain
                     JOIN pg_catalog.pg_type step ON step.oid = chain.step_id
                     GROUP BY chain.type_id
@@ -638,20 +607,6 @@ internal sealed class RetentionRuntimeReadinessValidator(
                        CASE WHEN requested.probe IS NULL OR requested.cast_type_id IS NULL THEN NULL
                             ELSE pg_catalog.pg_input_is_valid(requested.probe, requested.cast_type)
                        END,
-                       -- PostgreSQL's assignment coercion (find_coercion_pathway): domains reduce
-                       -- to their base types; a pg_cast row decides alone; arrays coerce through
-                       -- their elements; any type reaches a string type through text I/O.
-                       CASE WHEN requested.cast_type IS NULL THEN true
-                            WHEN requested.cast_type_id IS NULL THEN NULL
-                            WHEN cast_type.base_id = column_type.base_id THEN true
-                            WHEN base_cast.oid IS NOT NULL THEN base_cast.castcontext IN ('a', 'i')
-                            WHEN cast_type.base_category = 'A' AND column_type.base_category = 'A' THEN
-                                 cast_type.element_id = column_type.element_id
-                                 OR CASE WHEN element_cast.oid IS NOT NULL THEN element_cast.castcontext IN ('a', 'i')
-                                         ELSE column_type.element_category = 'S'
-                                    END
-                            ELSE column_type.base_category = 'S'
-                       END,
                        COALESCE(unique_key.unique_without_record_id, false),
                        COALESCE(unique_key.nulls_not_distinct, false),
                        EXISTS (
@@ -665,17 +620,9 @@ internal sealed class RetentionRuntimeReadinessValidator(
                            WHERE foreign_key.contype = 'f'
                              AND foreign_key.confrelid = requested.relation_id
                              AND requested.attnum = ANY(foreign_key.confkey)
-                       ),
-                       -- A generated column or an identity column GENERATED ALWAYS takes no UPDATE.
-                       COALESCE(requested.is_generated, false)
+                       )
                 FROM requested
                 LEFT JOIN type_base column_type ON column_type.type_id = requested.atttypid
-                LEFT JOIN type_base cast_type ON cast_type.type_id = requested.cast_type_id
-                LEFT JOIN pg_catalog.pg_cast base_cast
-                  ON base_cast.castsource = cast_type.base_id AND base_cast.casttarget = column_type.base_id
-                LEFT JOIN pg_catalog.pg_cast element_cast
-                  ON element_cast.castsource = cast_type.element_id
-                 AND element_cast.casttarget = column_type.element_id
                 -- Unfiltered, non-expression unique indexes whose key (not their INCLUDE columns)
                 -- holds the column but not the record id.
                 CROSS JOIN LATERAL (
@@ -700,57 +647,27 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 while (await reader.ReadAsync(ct))
                 {
                     var (entry, field) = targets[(int)reader.GetInt64(0) - 1];
-                    // The record-id check, which runs first, refuses a missing table or record id.
-                    if (!reader.GetBoolean(1))
+                    // A missing table, record id, or column is the statement check's to refuse.
+                    if (!reader.GetBoolean(1) || !reader.GetBoolean(2))
                     {
                         continue;
                     }
 
                     var target = TargetDescription(entry, field);
-                    if (!reader.GetBoolean(2))
-                    {
-                        errors.Add(
-                            $"{target}, which was not found in the database, so every anonymise of these rows would fail. Apply the host application's pending EF Core migrations, or map the member to the column it lives in."
-                        );
-                        continue;
-                    }
-
                     var columnType = reader.GetString(3);
                     var notNull = reader.GetBoolean(4);
                     var probeValidForColumn = reader.IsDBNull(5) || reader.GetBoolean(5);
                     var probeValidForStoreType = reader.IsDBNull(6) || reader.GetBoolean(6);
-                    bool? storeTypeAssignable = reader.IsDBNull(7) ? null : reader.GetBoolean(7);
-                    var unfilteredUnique = reader.GetBoolean(8);
-                    var nullsNotDistinctUnique = reader.GetBoolean(9);
-                    var foreignKeyChild = reader.GetBoolean(10);
-                    var referencedKey = reader.GetBoolean(11);
-
-                    if (reader.GetBoolean(12))
-                    {
-                        errors.Add(
-                            $"{target}, which the database generates (a generated column, or an identity column GENERATED ALWAYS), so every anonymise of these rows would fail. Make it an ordinary column, or stop anonymising it."
-                        );
-                        continue;
-                    }
+                    var unfilteredUnique = reader.GetBoolean(7);
+                    var nullsNotDistinctUnique = reader.GetBoolean(8);
+                    var foreignKeyChild = reader.GetBoolean(9);
+                    var referencedKey = reader.GetBoolean(10);
 
                     var method = field is AnonymiseLiteralField literal ? literal.Method : (AnonymiseMethod?)null;
                     var writesOneValue =
                         method is AnonymiseMethod.FixedLiteral or AnonymiseMethod.EmptyString
                         || field is AnonymiseFactoryField factoryField && assignments.IsStatic(factoryField);
                     var castType = PostgresStoreTypeSql.CastType(field.StoreType);
-
-                    if (storeTypeAssignable is null)
-                    {
-                        errors.Add(
-                            $"{target}, whose model store type {castType} is not a type the database knows, so every anonymise of these rows would fail. Bring the model and the column back in line."
-                        );
-                    }
-                    else if (storeTypeAssignable is false)
-                    {
-                        errors.Add(
-                            $"{target}, whose model store type {castType} can't be assigned to its column type {columnType} (Cohort's UPDATE casts the value to the model's type, and PostgreSQL has no assignment cast from it), so every anonymise of these rows would fail. Bring the model and the column back in line."
-                        );
-                    }
 
                     if (!probeValidForColumn || !probeValidForStoreType)
                     {
@@ -810,21 +727,25 @@ internal sealed class RetentionRuntimeReadinessValidator(
     }
 
     /// <summary>
-    /// The columns the update strategies always write, the soft-delete flag and deleted-at, and
-    /// the anonymised-at marker, must exist, and must not be one the database generates (a
-    /// generated column, or an identity column GENERATED ALWAYS, which takes no UPDATE), or every
-    /// run would fail at its UPDATE. And an update must never change a key another table
-    /// references: the foreign key would refuse it while a row references it, or silently rewrite
-    /// the referencing rows. The anonymise check covers the anonymised columns; the
-    /// retained-tables check has already refused a missing table.
+    /// The rules for a retained table's columns that the statement check can't see, because
+    /// PostgreSQL accepts the statements: the anchor, deleted-at, and anonymised-at markers must
+    /// be <c>timestamp with time zone</c> (a naive timestamp compares with a cutoff through a
+    /// cross-type operator and silently drifts with the session TimeZone); the tenant column and
+    /// the soft-delete flag must be NOT NULL (a NULL tenant never matches, and <c>= FALSE</c>
+    /// skips a NULL flag); the anonymised-at marker must be nullable (<c>IS NULL</c> never
+    /// matches a NOT NULL column); a column an update writes must not be referenced by a foreign
+    /// key (the key would refuse the update while a row references it, or silently rewrite the
+    /// referencing rows); and a record id's text form must not depend on session settings (hold
+    /// joins compare it). Types and nullability are resolved through any chain of domains. A
+    /// missing table or column is skipped: the statement check refuses it.
     /// </summary>
-    private static async Task ValidateMarkerColumnsAsync(
+    private static async Task ValidateRetainedColumnsAsync(
         DatabaseFacade database,
-        MarkerColumnInput[] markers,
+        RetainedColumnInput[] inputs,
         CancellationToken ct
     )
     {
-        if (markers.Length == 0)
+        if (inputs.Length == 0)
         {
             return;
         }
@@ -834,39 +755,119 @@ internal sealed class RetentionRuntimeReadinessValidator(
         {
             await using var command = new SqlParams
             {
-                ["schemas"] = markers.Select(marker => marker.Table.Schema).ToArray(),
-                ["tables"] = markers.Select(marker => marker.Table.Name).ToArray(),
-                ["columns"] = markers.Select(marker => marker.Column).ToArray(),
+                ["schemas"] = inputs.Select(input => input.Table.Schema).ToArray(),
+                ["tables"] = inputs.Select(input => input.Table.Name).ToArray(),
+                ["columns"] = inputs.Select(input => input.Column).ToArray(),
+                ["base_types"] = inputs.Select(input => input.ExpectedType?.BaseType).ToArray(),
+                ["nullability"] = inputs.Select(input => input.Nullability).ToArray(),
+                ["written"] = inputs.Select(input => input.Strategy is not null).ToArray(),
+                ["session_text"] = inputs.Select(input => input.Kind == RetainedColumnKind.RecordId).ToArray(),
             }.CreateCommand(
                 database.GetDbConnection(),
                 database.CurrentTransaction?.GetDbTransaction(),
                 """
-                SELECT requested.ordinal,
-                       attribute.attnum IS NULL,
-                       -- A generated column or an identity column GENERATED ALWAYS takes no UPDATE.
-                       COALESCE(attribute.attgenerated <> '' OR attribute.attidentity = 'a', false)
-                FROM ROWS FROM (
-                    pg_catalog.unnest(@schemas),
-                    pg_catalog.unnest(@tables),
-                    pg_catalog.unnest(@columns)
-                ) WITH ORDINALITY AS requested(schema_name, table_name, column_name, ordinal)
-                JOIN pg_catalog.pg_namespace namespace ON namespace.nspname = requested.schema_name
-                JOIN pg_catalog.pg_class relation
-                  ON relation.relnamespace = namespace.oid AND relation.relname = requested.table_name
-                LEFT JOIN pg_catalog.pg_attribute attribute
-                  ON attribute.attrelid = relation.oid
-                 AND attribute.attname = requested.column_name
-                 AND attribute.attnum > 0
-                 AND NOT attribute.attisdropped
-                WHERE attribute.attnum IS NULL
-                   OR attribute.attgenerated <> ''
-                   OR attribute.attidentity = 'a'
-                   OR EXISTS (
-                    SELECT 1 FROM pg_catalog.pg_constraint foreign_key
-                    WHERE foreign_key.contype = 'f'
-                      AND foreign_key.confrelid = relation.oid
-                      AND attribute.attnum = ANY(foreign_key.confkey)
+                WITH RECURSIVE requested AS (
+                    SELECT requested.ordinal,
+                           requested.base_type,
+                           requested.nullability,
+                           requested.written,
+                           requested.session_text,
+                           relation.oid AS relation_id,
+                           attribute.attnum,
+                           attribute.atttypid,
+                           attribute.attnotnull,
+                           pg_catalog.format_type(attribute.atttypid, attribute.atttypmod) AS column_type
+                    FROM ROWS FROM (
+                        pg_catalog.unnest(@schemas),
+                        pg_catalog.unnest(@tables),
+                        pg_catalog.unnest(@columns),
+                        pg_catalog.unnest(@base_types),
+                        pg_catalog.unnest(@nullability),
+                        pg_catalog.unnest(@written),
+                        pg_catalog.unnest(@session_text)
+                    ) WITH ORDINALITY AS requested(schema_name, table_name, column_name, base_type, nullability, written, session_text, ordinal)
+                    JOIN pg_catalog.pg_namespace namespace ON namespace.nspname = requested.schema_name
+                    JOIN pg_catalog.pg_class relation
+                      ON relation.relnamespace = namespace.oid AND relation.relname = requested.table_name
+                    JOIN pg_catalog.pg_attribute attribute
+                      ON attribute.attrelid = relation.oid
+                     AND attribute.attname = requested.column_name
+                     AND attribute.attnum > 0
+                     AND NOT attribute.attisdropped
+                ),
+                -- Each column's type through its domains to the type it is built on, with whether
+                -- any domain on the way is NOT NULL.
+                domain_chain(ordinal, type_id, domain_not_null) AS (
+                    SELECT ordinal, atttypid, false FROM requested
+                    UNION ALL
+                    SELECT chain.ordinal, pgtype.typbasetype, chain.domain_not_null OR pgtype.typnotnull
+                    FROM domain_chain chain
+                    JOIN pg_catalog.pg_type pgtype ON pgtype.oid = chain.type_id
+                    WHERE pgtype.typtype = 'd'
+                ),
+                base AS (
+                    SELECT chain.ordinal, pgtype.typname, namespace.nspname, chain.domain_not_null
+                    FROM domain_chain chain
+                    JOIN pg_catalog.pg_type pgtype ON pgtype.oid = chain.type_id
+                    JOIN pg_catalog.pg_namespace namespace ON namespace.oid = pgtype.typnamespace
+                    WHERE pgtype.typtype <> 'd'
+                ),
+                -- A record id's types, through domains, arrays, ranges, and multiranges too.
+                built_on(ordinal, type_id) AS (
+                    SELECT ordinal, atttypid FROM requested WHERE session_text
+                    UNION
+                    SELECT built_on.ordinal,
+                           CASE
+                               WHEN pgtype.typtype = 'd' THEN pgtype.typbasetype
+                               WHEN pgtype.typcategory = 'A' THEN pgtype.typelem
+                               WHEN pgtype.typtype = 'r' THEN over_range.rngsubtype
+                               ELSE over_multirange.rngtypid
+                           END
+                    FROM built_on
+                    JOIN pg_catalog.pg_type pgtype ON pgtype.oid = built_on.type_id
+                    LEFT JOIN pg_catalog.pg_range over_range ON over_range.rngtypid = pgtype.oid
+                    LEFT JOIN pg_catalog.pg_range over_multirange ON over_multirange.rngmultitypid = pgtype.oid
+                    WHERE pgtype.typtype IN ('d', 'r', 'm') OR pgtype.typcategory = 'A'
                 )
+                SELECT checked.ordinal, checked.is_wrong_type, checked.column_type, checked.is_referenced,
+                       checked.is_null_problem, NULL::pg_catalog.text
+                FROM (
+                    SELECT requested.ordinal,
+                           COALESCE(
+                               requested.base_type IS NOT NULL
+                               AND (base.typname <> requested.base_type OR base.nspname <> 'pg_catalog'),
+                               false
+                           ) AS is_wrong_type,
+                           requested.column_type,
+                           COALESCE(
+                               requested.written
+                               AND EXISTS (
+                                   SELECT 1 FROM pg_catalog.pg_constraint foreign_key
+                                   WHERE foreign_key.contype = 'f'
+                                     AND foreign_key.confrelid = requested.relation_id
+                                     AND requested.attnum = ANY(foreign_key.confkey)
+                               ),
+                               false
+                           ) AS is_referenced,
+                           -- The column's own NOT NULL, or a NOT NULL domain anywhere in its chain.
+                           COALESCE(
+                               CASE requested.nullability
+                                   WHEN 'not_null' THEN NOT (requested.attnotnull OR base.domain_not_null)
+                                   WHEN 'nullable' THEN requested.attnotnull OR base.domain_not_null
+                                   ELSE false
+                               END,
+                               false
+                           ) AS is_null_problem
+                    FROM requested
+                    LEFT JOIN base ON base.ordinal = requested.ordinal
+                ) AS checked
+                WHERE checked.is_wrong_type OR checked.is_referenced OR checked.is_null_problem
+                UNION ALL
+                SELECT built_on.ordinal, false, NULL, false, false, pgtype.typname::pg_catalog.text
+                FROM built_on
+                JOIN pg_catalog.pg_type pgtype ON pgtype.oid = built_on.type_id
+                JOIN pg_catalog.pg_namespace namespace ON namespace.oid = pgtype.typnamespace
+                WHERE namespace.nspname = 'pg_catalog'
                 """
             );
 
@@ -875,15 +876,45 @@ internal sealed class RetentionRuntimeReadinessValidator(
             {
                 while (await reader.ReadAsync(ct))
                 {
-                    var marker = markers[(int)reader.GetInt64(0) - 1];
-                    var column = $"{PostgreSqlIdentifier.Format(marker.Table)}.{PostgreSqlIdentifier.Quote(marker.Column)}";
-                    errors.Add(
-                        reader.GetBoolean(1)
-                            ? $"Retained entity {marker.Entity}: member {marker.Member} writes column {column}, which was not found in the database, so {marker.Strategy} any row would fail. Apply the host application's pending EF Core migrations, or map the member to the column it lives in."
-                        : reader.GetBoolean(2)
-                            ? $"Retained entity {marker.Entity}: member {marker.Member} writes column {column}, which the database generates (a generated column, or an identity column GENERATED ALWAYS), so {marker.Strategy} any row would fail. Make it an ordinary column."
-                            : $"Retained entity {marker.Entity}: member {marker.Member} writes column {column}, which is referenced by a foreign key, so {marker.Strategy} a row would be refused while a row references it or would silently rewrite the referencing rows (ON UPDATE CASCADE or SET NULL). Stop referencing this column."
-                    );
+                    var input = inputs[(int)reader.GetInt64(0) - 1];
+                    var column = $"{PostgreSqlIdentifier.Format(input.Table)}.{PostgreSqlIdentifier.Quote(input.Column)}";
+                    var head = $"Retained entity {input.Entity}:";
+                    if (!reader.IsDBNull(5))
+                    {
+                        var typeName = reader.GetString(5);
+                        if (RetentionStartupValidator.HasSessionDependentText(typeName))
+                        {
+                            errors.Add(
+                                $"Record-id convention on {input.Entity}: record-id column {column} is built on '{typeName}', whose text form depends on session settings (TimeZone, DateStyle, IntervalStyle, extra_float_digits), so holds and audit rows could silently stop matching. Use a uuid, integer, numeric, or text record id, or mark a stable unique column with [RetentionRecordId]."
+                            );
+                        }
+
+                        continue;
+                    }
+
+                    if (reader.GetBoolean(1))
+                    {
+                        var expected = input.ExpectedType!;
+                        errors.Add(
+                            $"{head} {input.KindText} member {input.Member} names column {column}, which is {reader.GetString(2)} in the database, not {expected.Display}, so {expected.Consequence}. Migrate the column to {expected.Display}."
+                        );
+                    }
+
+                    if (reader.GetBoolean(4))
+                    {
+                        errors.Add(
+                            input.Kind == RetainedColumnKind.AnonymisedAt
+                                ? $"{head} {input.KindText} member {input.Member} names column {column}, which is NOT NULL in the database, so no row could be found as not yet anonymised (NULL marks those rows) and anonymising would never find a row. Make the column nullable."
+                                : $"{head} {input.KindText} member {input.Member} names column {column}, which is nullable in the database, so a row with a NULL there is never matched ({(input.Kind == RetainedColumnKind.Tenant ? "no tenant's run, erasure, or hold selects it" : "soft-deleting compares the flag with FALSE, which skips NULL")}) and stays forever. Make the column NOT NULL."
+                        );
+                    }
+
+                    if (reader.GetBoolean(3))
+                    {
+                        errors.Add(
+                            $"{head} member {input.Member} writes column {column}, which is referenced by a foreign key, so {input.Strategy} a row would be refused while a row references it or would silently rewrite the referencing rows (ON UPDATE CASCADE or SET NULL). Stop referencing this column."
+                        );
+                    }
                 }
             }
 
@@ -899,10 +930,12 @@ internal sealed class RetentionRuntimeReadinessValidator(
     }
 
     /// <summary>
-    /// What the marker-column check reads, one row per column the update strategies write, as the
-    /// validated capabilities declare them, ordered by entity name and then column.
+    /// What the retained-columns check reads, as the validated capabilities declare them, ordered
+    /// by entity name, column, member, and kind: per retained entity its record id and its anchor
+    /// and, when it has one, its tenant column (all only read), and the columns the update
+    /// strategies write.
     /// </summary>
-    private MarkerColumnInput[] MarkerColumnRows() =>
+    private RetainedColumnInput[] RetainedColumnRows() =>
         [
             .. registry
                 .Scan()
@@ -911,15 +944,49 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 {
                     var strategies = ValidatedCapabilities[entry.Category].Strategies;
                     var entity = entry.EntityType.FullName ?? entry.EntityType.Name;
-                    var columns = new List<MarkerColumnInput>();
+                    var columns = new List<RetainedColumnInput>
+                    {
+                        new(
+                            entity,
+                            RetainedColumnKind.RecordId,
+                            null,
+                            entry.RecordId.RecordIdMember,
+                            entry.Table,
+                            entry.RecordId.RecordIdColumn
+                        ),
+                        new(entity, RetainedColumnKind.Anchor, null, entry.AnchorMember, entry.Table, entry.AnchorColumn),
+                    };
+                    if (entry.Tenant is { } tenant)
+                    {
+                        columns.Add(
+                            new(
+                                entity,
+                                RetainedColumnKind.Tenant,
+                                null,
+                                tenant.TenantMember,
+                                entry.Table,
+                                tenant.TenantColumn
+                            )
+                        );
+                    }
+
                     if (strategies.Contains(Strategy.SoftDelete) && entry.SoftDelete is { } softDelete)
                     {
                         columns.Add(
-                            new(entity, "soft-deleting", softDelete.IsDeletedMember, entry.Table, softDelete.IsDeletedColumn)
+                            new(
+                                entity,
+                                RetainedColumnKind.SoftDeleteFlag,
+                                "soft-deleting",
+                                softDelete.IsDeletedMember,
+                                entry.Table,
+                                softDelete.IsDeletedColumn
+                            )
                         );
                         if (softDelete is { DeletedAtMember: { } member, DeletedAtColumn: { } column })
                         {
-                            columns.Add(new(entity, "soft-deleting", member, entry.Table, column));
+                            columns.Add(
+                                new(entity, RetainedColumnKind.DeletedAt, "soft-deleting", member, entry.Table, column)
+                            );
                         }
                     }
 
@@ -928,6 +995,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
                         columns.Add(
                             new(
                                 entity,
+                                RetainedColumnKind.AnonymisedAt,
                                 "anonymising",
                                 anonymisedAt.AnonymisedAtMember,
                                 entry.Table,
@@ -938,19 +1006,71 @@ internal sealed class RetentionRuntimeReadinessValidator(
 
                     return columns;
                 })
-                .OrderBy(marker => marker.Entity, StringComparer.Ordinal)
-                .ThenBy(marker => marker.Column, StringComparer.Ordinal)
-                .ThenBy(marker => marker.Member, StringComparer.Ordinal)
-                .ThenBy(marker => marker.Strategy, StringComparer.Ordinal),
+                .OrderBy(input => input.Entity, StringComparer.Ordinal)
+                .ThenBy(input => input.Column, StringComparer.Ordinal)
+                .ThenBy(input => input.Member, StringComparer.Ordinal)
+                .ThenBy(input => input.KindText, StringComparer.Ordinal),
         ];
 
-    private sealed record MarkerColumnInput(
+    // Which column of a retained entity a row names; it decides the rules the column must meet and
+    // the words a message calls it by. Strategy is "soft-deleting" or "anonymising" for a column
+    // that strategy writes, and null for a column Cohort only reads.
+    private enum RetainedColumnKind
+    {
+        RecordId,
+        Anchor,
+        Tenant,
+        SoftDeleteFlag,
+        DeletedAt,
+        AnonymisedAt,
+    }
+
+    private sealed record RetainedColumnInput(
         string Entity,
-        string Strategy,
+        RetainedColumnKind Kind,
+        string? Strategy,
         string Member,
         RelationalObjectName Table,
         string Column
-    );
+    )
+    {
+        internal string KindText =>
+            Kind switch
+            {
+                RetainedColumnKind.RecordId => "record-id",
+                RetainedColumnKind.Anchor => "anchor",
+                RetainedColumnKind.Tenant => "tenant",
+                RetainedColumnKind.SoftDeleteFlag => "soft-delete flag",
+                RetainedColumnKind.DeletedAt => "deleted-at",
+                RetainedColumnKind.AnonymisedAt => "anonymised-at",
+                _ => throw new ArgumentOutOfRangeException(nameof(Kind), Kind, null),
+            };
+
+        // Only the timestamp columns have a type rule left: PostgreSQL compares or assigns a
+        // timestamp without time zone through a cross-type operator, so the statement check
+        // passes it. The other columns' types are the statement check's.
+        internal ExpectedColumnType? ExpectedType =>
+            Kind is RetainedColumnKind.Anchor or RetainedColumnKind.DeletedAt or RetainedColumnKind.AnonymisedAt
+                ? new(
+                    "timestamptz",
+                    "timestamp with time zone",
+                    "every run would fail or, for timestamp without time zone, silently drift with the session TimeZone"
+                )
+                : null;
+
+        // A tenant column or a soft-delete flag must be NOT NULL (a NULL one is never matched);
+        // the anonymised-at marker must be nullable (IS NULL never matches a NOT NULL column).
+        internal string Nullability =>
+            Kind switch
+            {
+                RetainedColumnKind.Tenant or RetainedColumnKind.SoftDeleteFlag => "not_null",
+                RetainedColumnKind.AnonymisedAt => "nullable",
+                _ => "",
+            };
+    }
+
+    // BaseType is the pg_catalog type name (typname) the column must be built on.
+    private sealed record ExpectedColumnType(string BaseType, string Display, string Consequence);
 
     private static string TargetDescription(RetentionEntry entry, AnonymiseField field) =>
         $"Anonymise convention on {entry.EntityType.FullName}: {(field is AnonymiseFactoryField ? "[AnonymiseWith]" : "[Anonymise]")} member {field.MemberName} writes column {PostgreSqlIdentifier.Format(entry.Table)}.{PostgreSqlIdentifier.Quote(field.ColumnName)}";
@@ -1006,6 +1126,9 @@ internal sealed class RetentionRuntimeReadinessValidator(
         }
     }
 
+    /// <summary>The database a session reaches, the role it runs as, and its search path.</summary>
+    private sealed record ServerSession(ServerDatabaseIdentity Database, string Role, string SearchPath);
+
     private static async Task<(Version Version, string Text)> ReadServerVersionAsync(
         DatabaseFacade database,
         CancellationToken ct
@@ -1038,7 +1161,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// </summary>
     private static async Task ValidateStoredEntityIdentitiesAsync(
         IServiceScopeFactory scopeFactory,
-        string holds,
+        RelationalObjectName holdsTable,
         Guid[] registered,
         ServerDatabaseIdentity callerDatabase,
         CancellationToken ct
@@ -1049,7 +1172,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
             services => ValidateStoredEntityIdentitiesAsync(
                 services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext).Database,
                 registered,
-                holds,
+                holdsTable,
                 callerDatabase,
                 ct
             ),
@@ -1060,15 +1183,17 @@ internal sealed class RetentionRuntimeReadinessValidator(
     private static async Task ValidateStoredEntityIdentitiesAsync(
         DatabaseFacade systemDatabase,
         Guid[] registered,
-        string holds,
+        RelationalObjectName holdsTable,
         ServerDatabaseIdentity callerDatabase,
         CancellationToken ct
     )
     {
+        var holds = PostgreSqlIdentifier.Format(holdsTable);
         await systemDatabase.OpenConnectionAsync(ct);
         try
         {
-            if (await ReadServerDatabaseIdentityAsync(systemDatabase, holds, ct) != callerDatabase)
+            // Only the database is compared: the System scope may run under another role.
+            if ((await ReadServerSessionAsync(systemDatabase, holdsTable, ct)).Database != callerDatabase)
             {
                 throw new RetentionConfigurationException([
                     "Cohort's readiness scope resolved a DbContext that reaches a different database from the calling scope's. Cohort checks holds across tenants in a System(Readiness) scope, so every scope must reach the same database.",
@@ -1116,34 +1241,52 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// Which database a connection reaches, as the server sees it. Connection strings
     /// spell one database many ways (<c>localhost</c> or <c>127.0.0.1</c>, a pooler or the direct
     /// port), so the database name and OID, the server's start time, and the holds table's OID
-    /// decide sameness instead. Reads in the database's current transaction when it has one.
+    /// decide sameness instead. Also reads the session's role and search path (<c>$user</c>
+    /// expanded), which the statement check is keyed by. Reads in the database's current
+    /// transaction when it has one.
     /// </summary>
-    private static async Task<ServerDatabaseIdentity> ReadServerDatabaseIdentityAsync(
+    private static async Task<ServerSession> ReadServerSessionAsync(
         DatabaseFacade database,
-        string holds,
+        RelationalObjectName holdsTable,
         CancellationToken ct
     )
     {
         await database.OpenConnectionAsync(ct);
         try
         {
-            await using var command = new SqlParams { ["holds"] = holds }.CreateCommand(
+            // The holds table's OID comes from the catalog by schema and name, not to_regclass:
+            // resolving a name needs USAGE on its schema, and a role without it must reach the
+            // statement check, which refuses it by name.
+            await using var command = new SqlParams
+            {
+                ["holds_schema"] = holdsTable.Schema,
+                ["holds_name"] = holdsTable.Name,
+            }.CreateCommand(
                 database.GetDbConnection(),
                 database.CurrentTransaction?.GetDbTransaction(),
                 """
                 SELECT pg_catalog.current_database()::text,
                        (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())::bigint,
                        pg_catalog.pg_postmaster_start_time(),
-                       pg_catalog.to_regclass(@holds)::oid::bigint
+                       (SELECT relation.oid
+                        FROM pg_catalog.pg_class relation
+                        JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+                        WHERE namespace.nspname = @holds_schema AND relation.relname = @holds_name)::bigint,
+                       current_user::pg_catalog.text,
+                       pg_catalog.array_to_string(pg_catalog.current_schemas(true)::pg_catalog.text[], ',')
                 """
             );
             await using var reader = await command.ExecuteReaderAsync(ct);
             await reader.ReadAsync(ct);
-            return new ServerDatabaseIdentity(
-                reader.GetString(0),
-                reader.GetInt64(1),
-                reader.GetFieldValue<DateTime>(2),
-                reader.IsDBNull(3) ? null : reader.GetInt64(3)
+            return new ServerSession(
+                new ServerDatabaseIdentity(
+                    reader.GetString(0),
+                    reader.GetInt64(1),
+                    reader.GetFieldValue<DateTime>(2),
+                    reader.IsDBNull(3) ? null : reader.GetInt64(3)
+                ),
+                reader.GetString(4),
+                reader.GetString(5)
             );
         }
         finally

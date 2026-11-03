@@ -12,6 +12,7 @@ public sealed class PostgresFixture : IAsyncLifetime
 {
     private readonly PostgreSqlContainer container = new PostgreSqlBuilder()
         .WithImage("postgres:16-alpine")
+        .WithCommand("-c", "shared_preload_libraries=pg_stat_statements")
         .Build();
 
     public string ConnectionString => container.GetConnectionString();

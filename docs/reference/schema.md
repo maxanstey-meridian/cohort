@@ -58,7 +58,9 @@ skipped startup validation still can't run against a missing or outdated schema.
 Readiness validates once per service provider and database, then trusts the result: each
 database check keeps its success, unless it passed inside the caller's transaction, under what
 it read, so later contexts, including new copies of the same EF model, don't run it again. The
-anonymise-target check is the exception and runs once for each copy of the model. A schema that
+anonymise-target check is the exception and runs once for each copy of the model. The statement
+check is also kept per database role and search path, since privileges depend on the role and
+type names resolve through the path. A schema that
 drifts after that isn't refused by readiness; the run fails at the statement the change
 breaks. A change readiness would refuse, made while the application runs, is caught when it
 next starts.

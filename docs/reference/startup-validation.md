@@ -81,40 +81,89 @@ columns or rows belong to it. So these are rejected:
   unique index. A filtered index doesn't make it unique.
 - Record-ID types whose text form depends on session settings are rejected. See
   [Identities](/reference/schema#identities).
-- Each retained table and its record-ID column exist in the database, and the table is an
-  ordinary or partitioned table: not a view, materialized view, or foreign table, since Cohort
-  changes rows in place, addressing each by its physical position (`ctid`): a view has no
-  `ctid`, a materialized view's rows can't be updated or deleted, and a foreign table's `ctid`
-  doesn't reliably identify its rows.
-- Each [hold relation](#hold-relations)'s link column exists in the real table (the message
-  says the link column "was not found in the database"), and its catalog type, resolved
-  through domains, equals the catalog type of the record-ID column it names, since hold SQL
-  equates the two. `varchar` and `text` count as one type, so `varchar(36)` links to a `text`
-  record ID; any other difference is refused, naming both types. Once the types match and
-  both columns are collatable, their collations are checked too. Equal collations pass, and a
+- A retained entity's `AnonymisedAt` marker has no default or value generation mapped in the
+  EF model (`HasDefaultValue`, `HasDefaultValueSql`, or `ValueGenerated` other than `Never`).
+  EF would then leave it out of an insert and the database would fill it in, so every row
+  would be born marked as anonymised and never anonymised. `NULL` must mark the rows still to
+  anonymise.
+
+### Statements
+
+Readiness asks PostgreSQL to analyse and plan, without running, every statement Cohort can send
+for the host's model and the strategies its categories declare: sweeps, previews, and dry runs;
+erasures, for each subject kind an entity maps, with and without a legal minimum; holds and
+their deletion check; and the worker's tenant-coverage scan. It builds them with the code the
+runs execute, so what readiness explains is what a run sends, and it refuses what PostgreSQL
+refuses, for every column those statements use. The error holds one entry per entity, with
+PostgreSQL's SQLSTATE and message, the operations that send the statement, the statement text
+around the error, and the tables it reads. Data-only values are bound as typed `NULL`s, so
+that text carries no subject data. PostgreSQL refuses:
+
+- a table or column the statements read or write that the database doesn't have (`42P01`,
+  `42703`): a retained table, a record-ID, anchor, tenant, soft-delete, deleted-at, or
+  anonymised-at column, an anonymised column, an erasure-subject column, or a hold-relation
+  link column;
+- a comparison with no operator, such as a tenant column that is `text` against a `uuid`, or a
+  flag that is `integer` against `boolean` (`42883`), and a value that can't be assigned to the
+  column it is written to (`42804`): the model's store type, `Null` and factory values
+  included, against the column's type. See [Anonymisation](/guides/anonymisation);
+- a column the database generates (a generated column, or an identity column
+  `GENERATED ALWAYS`), which takes no `UPDATE` (`428C9`);
+- a cast type the database doesn't know, resolved through the session's search path
+  (`42704`);
+- a privilege the database role lacks (`42501`), `USAGE` on a schema included. The role
+  readiness validates under must be able to run every statement Cohort may send, for every
+  operation: a host that splits roles gives the role that reaches readiness the privileges of
+  all of them (`SELECT`, `INSERT`, `UPDATE`, and `DELETE` on the retained tables, and row locks
+  need `UPDATE`). A role that can't prove it is permitted is refused, not skipped.
+
+The pass is kept per database, role, and search path. See [Readiness](/reference/schema#readiness).
+
+### Rules
+
+A short list of rules covers what PostgreSQL accepts but the statements still get wrong:
+
+- Each retained table is an ordinary or partitioned table: not a view, materialized view, or
+  foreign table, since Cohort changes rows in place, addressing each by its physical position
+  (`ctid`): a view has no `ctid`, a materialized view's rows can't be updated or deleted, and a
+  foreign table's `ctid` doesn't reliably identify its rows.
+- Each [hold relation](#hold-relations)'s link column has the catalog type, resolved through
+  domains, of the record-ID column it names, since hold SQL equates the two. PostgreSQL
+  compares `citext` with `text` and `integer` with `numeric` without complaint, so only a
+  rule sees them differ. `varchar` and `text` count as one type, so `varchar(36)` links to a
+  `text` record ID; any other difference is refused, naming both types. Once the types match
+  and both columns are collatable, their collations are checked too: PostgreSQL only fails on
+  a collation conflict when the plan compares the two columns. Equal collations pass, and a
   link with the `default` collation always passes, because the record ID's collation governs
   the comparison. Two different non-default collations are refused, since PostgreSQL can't
   choose between them and every hold check across the relation would fail. A non-default
   nondeterministic link collation against a record ID with the `default` collation is refused
   too, because one link value would match several record IDs and a row could be covered by
-  holds on several rows. Each message names the declaration and the column.
-- Each anonymised column can take what Cohort writes to it, checked against the database
-  catalog: the column exists, the database doesn't generate it (a generated column, or an
-  identity column `GENERATED ALWAYS`, takes no `UPDATE`), and the model's store type can be assigned to its type without
-  an explicit cast; an `EmptyString` or `FixedLiteral` value, after the value converter, is
-  valid input for both types (length, type, and domain `CHECK` included); `Null` doesn't go
-  into a column the database declares `NOT NULL`, directly or through nested domains; a value
-  every row shares (`EmptyString`, `FixedLiteral`, a `Static` factory) isn't written to a
-  column in the key of an unfiltered unique index whose key lacks the record ID; a literal
-  isn't written to a foreign-key column; and no anonymised column is referenced by a foreign
-  key. See [Anonymisation](/guides/anonymisation).
-- Each column an update strategy always writes exists, isn't generated by the database, and
-  isn't referenced by a foreign key: the soft-delete flag and deleted-at of an entity that may
-  be soft-deleted, or the anonymised-at marker of one that may be anonymised. A missing one
-  would fail every such update (the message says the column "was not found in the database"),
-  and so would a generated column or an identity column `GENERATED ALWAYS`, which takes no
-  `UPDATE` (the message says the database "generates" it). Changing a referenced key is either
-  refused while a row references it or silently rewrites the referencing rows.
+  holds on several rows. Each message names the declaration and the column. A missing link
+  column is the statement check's.
+- A record ID's text form doesn't depend on session settings, since hold joins compare it. See
+  [Identities](/reference/schema#identities).
+- The anchor, deleted-at, and anonymised-at columns are `timestamp with time zone`, seen
+  through any chain of domains. A `timestamp without time zone` compares and assigns through a
+  cross-type operator, so PostgreSQL accepts it and the value drifts with the session time
+  zone.
+- A column an update strategy writes isn't referenced by a foreign key: the soft-delete flag
+  and deleted-at of an entity that may be soft-deleted, or the anonymised-at marker of one
+  that may be anonymised. Changing a referenced key is either refused while a row references it
+  or silently rewrites the referencing rows.
+- A tenant column is `NOT NULL`, since a `NULL` tenant never matches a tenant's run, erasure,
+  or hold. When `SoftDelete` is declared, the soft-delete flag is `NOT NULL`, since
+  `= FALSE` skips a `NULL`. When `Anonymise` is declared, the anonymised-at column is nullable,
+  since `IS NULL` finds the rows still to anonymise and never matches a `NOT NULL` column. A
+  column's own `NOT NULL`, or a `NOT NULL` domain anywhere in its chain, counts.
+- Each anonymised column takes what Cohort writes to it, checked against the database
+  catalog: an `EmptyString` or `FixedLiteral` value, after the value converter, is valid input
+  for both the cast type and the column type (length, type, and domain `CHECK` included);
+  `Null` doesn't go into a column the database declares `NOT NULL`, directly or through nested
+  domains; a value every row shares (`EmptyString`, `FixedLiteral`, a `Static` factory) isn't
+  written to a column in the key of an unfiltered unique index whose key lacks the record ID;
+  a literal isn't written to a foreign-key column; and no anonymised column is referenced by a
+  foreign key. See [Anonymisation](/guides/anonymisation).
 
 ## Hold relations
 
@@ -132,7 +181,7 @@ An entity that carries `[HeldWith]` or `[HeldWithReferencing]` (see
 - the link's provider CLR type (after any value converter, and after unwrapping
   `Nullable<T>`) differs from that of the record ID it names. Startup compares provider CLR
   types only; store types are compared by readiness, against the database catalog
-  ([Columns](#columns)).
+  ([Rules](#rules)).
 - one entity is tenanted and the other `[RetentionTenantless]`.
 - the same relation is declared twice.
 - the relations form a cycle, a relation from an entity to itself included. The message lists
@@ -142,7 +191,7 @@ Each other message, a cycle's included, names the declaration it refuses in the 
 `[HeldWith(typeof(MyApp.Case), "CaseId")] on MyApp.CaseLink`: the attribute, the related type,
 the member, and the declaring type. A declaration needs no database foreign key, so none is
 checked. Readiness also checks each link column against the real table
-([Columns](#columns)).
+([Statements](#statements) and [Rules](#rules)).
 
 ## Foreign keys
 

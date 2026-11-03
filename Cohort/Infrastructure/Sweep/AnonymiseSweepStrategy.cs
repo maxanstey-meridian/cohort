@@ -43,14 +43,9 @@ internal sealed class AnonymiseSweepStrategy(
     protected override SweepMutation CreateMutation(SweepScope scope)
     {
         var entry = scope.Entry;
-        var set = entry.AnonymiseFields.Select((field, index) => field.AssignmentSql($"value{index}"));
         var staticValues = assignments.CreateStaticAssignments(entry, scope.Tenant.Id, scope.Now);
 
         return new SweepMutation(
-            $"""
-            UPDATE {PostgreSqlIdentifier.Format(entry.Table)} AS target
-            SET {string.Join(", ", set)}, {PostgreSqlIdentifier.Quote(entry.AnonymisedAt!.AnonymisedAtColumn)} = @anonymisedAt
-            """,
             (parameters, row) =>
             {
                 var values = row is null

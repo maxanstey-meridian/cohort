@@ -43,6 +43,39 @@ internal sealed class RetentionTargetResolver(
         }
     }
 
+    /// <summary>
+    /// S18: the canonical text of a record id through the stored row or the store type. Prefers
+    /// the stored row's own text: equality under the column type (citext, unscaled numeric) can
+    /// admit spellings whose cast-to-text differs from what sweeps compare. Null when the store
+    /// type isn't a plain type name to cast to: the run canonicalises in memory and issues no
+    /// statement.
+    /// </summary>
+    internal static SweepStatement? CanonicaliseStatement(RetentionEntry entry, object? recordId)
+    {
+        if (PostgresStoreTypeSql.CastType(entry.RecordId.RecordIdStoreType) is not { } storeType)
+        {
+            return null;
+        }
+
+        return new SweepStatement(
+            "canonicalise-target-record-id",
+            entry.EntityType,
+            $"""
+            SELECT COALESCE(
+                (
+                    SELECT {RecordIdSql.TextExpression("target", entry.RecordId)}
+                    FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
+                    WHERE {RecordIdSql.EqualsParameter("target", entry.RecordId, "recordId")}
+                    LIMIT 1
+                ),
+                CAST(CAST(@recordId AS {storeType}) AS text)
+            )
+            """,
+            new SqlParams { ["recordId"] = recordId },
+            [entry.Table]
+        );
+    }
+
     internal async Task<string> CanonicaliseRecordIdAsync(
         RetentionEntry entry,
         string recordId,
@@ -61,27 +94,15 @@ internal sealed class RetentionTargetResolver(
             );
         }
 
-        if (PostgresStoreTypeSql.CastType(entry.RecordId.RecordIdStoreType) is not { } storeType)
+        if (CanonicaliseStatement(entry, recordId) is not { } statement)
         {
             return keyClrType == typeof(Guid) ? Guid.Parse(recordId).ToString("D") : recordId;
         }
 
-        // Prefer the stored row's own text: equality under the column type (citext, unscaled
-        // numeric) can admit spellings whose cast-to-text differs from what sweeps compare.
-        await using var command = new SqlParams { ["recordId"] = recordId }.CreateCommand(
+        await using var command = statement.Parameters.CreateCommand(
             db.Database.GetDbConnection(),
             transaction,
-            $"""
-            SELECT COALESCE(
-                (
-                    SELECT {RecordIdSql.TextExpression("target", entry.RecordId)}
-                    FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
-                    WHERE {RecordIdSql.EqualsParameter("target", entry.RecordId, "recordId")}
-                    LIMIT 1
-                ),
-                CAST(CAST(@recordId AS {storeType}) AS text)
-            )
-            """
+            statement.Sql
         );
 
         // A failed cast aborts the enclosing transaction, which may be the host's own.
@@ -108,7 +129,7 @@ internal sealed class RetentionTargetResolver(
             }
 
             throw new InvalidOperationException(
-                $"{operation} record id '{recordId}' for entity '{entry.RetentionEntityId}' is not valid for provider type '{storeType}'. The target would never match its row.",
+                $"{operation} record id '{recordId}' for entity '{entry.RetentionEntityId}' is not valid for provider type '{PostgresStoreTypeSql.CastType(entry.RecordId.RecordIdStoreType)}'. The target would never match its row.",
                 exception
             );
         }

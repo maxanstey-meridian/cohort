@@ -82,17 +82,21 @@ internal static class RetentionHoldSql
     /// holder path, once each: ordered by entity, record id, then hold id, like
     /// <c>ListActiveAsync</c>. A direct hold counts even when its row is gone (the record id is
     /// canonical text, matched by parameter); a path starts from the row itself, which must belong
-    /// to <paramref name="tenantId"/> when the entity is tenanted.
+    /// to <paramref name="tenantId"/> when the entity is tenanted. The record id
+    /// (canonical text) and the tenant id (a <see cref="Guid"/>, bound only for a tenanted entity)
+    /// are bound as given, so a check can pass typed NULLs.
     /// </summary>
-    internal static (string Sql, SqlParams Parameters) BuildCoveringHolds(
+    internal static SweepStatement BuildCoveringHolds(
         RelationalObjectName holdsTable,
         RetentionEntry entry,
-        string canonicalRecordId,
-        Guid? tenantId
+        object? canonicalRecordId,
+        object? tenantId
     )
     {
         var (union, parameters) = CoveringHoldsForRecord(holdsTable, entry, canonicalRecordId, tenantId, "UNION");
-        return (
+        return new SweepStatement(
+            "covering-holds",
+            entry.EntityType,
             $"""
             SELECT *
             FROM (
@@ -100,7 +104,8 @@ internal static class RetentionHoldSql
             ) AS covering
             ORDER BY "RetentionEntityId", "RecordId", "HoldId"
             """,
-            parameters
+            parameters,
+            HolderPathTables(entry)
         );
     }
 
@@ -108,15 +113,17 @@ internal static class RetentionHoldSql
     /// Selects one row when an active hold covers the row, the same coverage as
     /// <see cref="BuildCoveringHolds"/>. Existence only, so the branches are not de-duplicated.
     /// </summary>
-    internal static (string Sql, SqlParams Parameters) BuildAnyCoveringHold(
+    internal static SweepStatement BuildAnyCoveringHold(
         RelationalObjectName holdsTable,
         RetentionEntry entry,
-        string canonicalRecordId,
-        Guid? tenantId
+        object? canonicalRecordId,
+        object? tenantId
     )
     {
         var (union, parameters) = CoveringHoldsForRecord(holdsTable, entry, canonicalRecordId, tenantId, "UNION ALL");
-        return (
+        return new SweepStatement(
+            "any-covering-hold",
+            entry.EntityType,
             $"""
             SELECT 1
             FROM (
@@ -124,15 +131,16 @@ internal static class RetentionHoldSql
             ) AS covering
             LIMIT 1
             """,
-            parameters
+            parameters,
+            HolderPathTables(entry)
         );
     }
 
     private static (string Union, SqlParams Parameters) CoveringHoldsForRecord(
         RelationalObjectName holdsTable,
         RetentionEntry entry,
-        string canonicalRecordId,
-        Guid? tenantId,
+        object? canonicalRecordId,
+        object? tenantId,
         string setOperator
     )
     {
@@ -172,17 +180,20 @@ internal static class RetentionHoldSql
     /// Every active hold that covers any row whose <c>[ErasureSubject]</c> columns match the
     /// subject, once each, in <paramref name="starts"/>'s entities (the tenant split's tenanted
     /// or tenantless entities), directly or through a holder path. Age, legal minimum and
-    /// strategy eligibility play no part. Ordered like <see cref="BuildCoveringHolds"/>.
+    /// strategy eligibility play no part. Ordered like <see cref="BuildCoveringHolds"/>. Null when
+    /// <paramref name="starts"/> is empty: nothing to read. <paramref name="tenantId"/> is bound
+    /// as given when it isn't null, so a check passes a typed NULL for a tenanted split and null
+    /// for a tenantless one.
     /// </summary>
-    internal static (string Sql, SqlParams Parameters) BuildCoveringHoldsForSubject(
+    internal static SweepStatement? BuildCoveringHoldsForSubject(
         RelationalObjectName holdsTable,
         IReadOnlyList<(RetentionEntry Entry, ErasureSubjectPredicate Subject)> starts,
-        Guid? tenantId
+        object? tenantId
     )
     {
         if (starts.Count == 0)
         {
-            throw new ArgumentException("At least one entity with the subject's kind is required.", nameof(starts));
+            return null;
         }
 
         var parameters = new SqlParams();
@@ -224,7 +235,9 @@ internal static class RetentionHoldSql
             }
         }
 
-        return (
+        return new SweepStatement(
+            "covering-holds-for-subject",
+            null,
             $"""
             SELECT *
             FROM (
@@ -232,9 +245,31 @@ internal static class RetentionHoldSql
             ) AS covering
             ORDER BY "RetentionEntityId", "RecordId", "HoldId"
             """,
-            parameters
+            parameters,
+            [.. starts.SelectMany(start => PathTables(start.Entry, start.Entry.HolderPaths, includeEntry: true)).Distinct()]
         );
     }
+
+    /// <summary>
+    /// The host tables a path walk reads: <paramref name="entry"/>'s own (when
+    /// <paramref name="includeEntry"/>) and each hop's far table, once each.
+    /// </summary>
+    private static IEnumerable<RelationalObjectName> PathTables(
+        RetentionEntry entry,
+        IEnumerable<HoldPath> paths,
+        bool includeEntry
+    )
+    {
+        var far = paths.SelectMany(path => path.Hops.Select(hop => hop.Far.Table));
+        return (includeEntry ? far.Prepend(entry.Table) : far).Distinct();
+    }
+
+    /// <summary>
+    /// The tables the direct-or-holder-path hold reads touch: none for an entity without holder
+    /// paths (its direct branch reads only the holds table), otherwise the entity's and every hop's.
+    /// </summary>
+    private static RelationalObjectName[] HolderPathTables(RetentionEntry entry) =>
+        [.. PathTables(entry, entry.HolderPaths, includeEntry: entry.HolderPaths.Count > 0)];
 
     /// <summary>
     /// <c>SELECT</c>s the holds a holder path reaches from the rows <paramref name="startRow"/>
@@ -362,9 +397,16 @@ internal static class RetentionHoldSql
     /// which is harmless: the hold doesn't cover it. Statements run ordered by the longest covered
     /// path ending at the entity, then by entity name: every entity on a path to X comes before X
     /// (the graph is acyclic), so a row is locked before a later statement reads through it.
-    /// <paramref name="entries"/> supplies each covered entity's anchor for the sort order.
+    /// <paramref name="entries"/> supplies each covered entity's anchor for the sort order. Each
+    /// statement binds its own <c>recordId</c>, and <c>tenantId</c> when <paramref name="entry"/>
+    /// is tenanted, as given.
     /// </summary>
-    internal static IReadOnlyList<string> BuildCoveredRowLocks(RetentionEntry entry, IEnumerable<RetentionEntry> entries)
+    internal static IReadOnlyList<SweepStatement> BuildCoveredRowLocks(
+        RetentionEntry entry,
+        IEnumerable<RetentionEntry> entries,
+        object? recordId,
+        object? tenantId
+    )
     {
         var byEntity = entries.ToDictionary(candidate => candidate.RetentionEntityId);
         var startRow = $"{RecordIdSql.EqualsParameter("h0", entry.RecordId, "recordId")}"
@@ -387,17 +429,56 @@ internal static class RetentionHoldSql
                                 WHERE {startRow}
                             """;
                     });
-                    return $"""
+                    var parameters = new SqlParams { ["recordId"] = recordId };
+                    if (entry.Tenant is not null)
+                    {
+                        parameters["tenantId"] = tenantId;
+                    }
+
+                    return new SweepStatement(
+                        "lock-covered-rows",
+                        entry.EntityType,
+                        $"""
                         SELECT 1
                         FROM {PostgreSqlIdentifier.Format(end.Table)} AS target
                         WHERE target.{PostgreSqlIdentifier.Quote(end.RecordId.RecordIdColumn)} IN (
                             {string.Join("\n    UNION\n    ", selects)}
                         )
-                        ORDER BY {SweepStrategy.OrderBySql(byEntity[end.RetentionEntityId])}
+                        ORDER BY {SweepStatements.OrderBySql(byEntity[end.RetentionEntityId])}
                         FOR SHARE OF target
-                        """;
+                        """,
+                        parameters,
+                        [.. PathTables(entry, group, includeEntry: true)]
+                    );
                 }),
         ];
+    }
+
+    /// <summary>
+    /// S13: reads and share-locks the row a hold names, for its existence and its tenant: the
+    /// select item is <c>1</c> for a tenantless entity and the tenant column for a tenanted one.
+    /// FOR SHARE reads the row's current version, not the caller's snapshot: under REPEATABLE
+    /// READ a row deleted since the snapshot raises a serialization failure instead of taking a
+    /// hold that protects nothing.
+    /// </summary>
+    internal static SweepStatement BuildTargetRowLock(RetentionEntry entry, object? recordId)
+    {
+        var targetValue = entry.Tenant is null
+            ? "1"
+            : $"target.{PostgreSqlIdentifier.Quote(entry.Tenant.TenantColumn)}";
+        return new SweepStatement(
+            "hold-target-row",
+            entry.EntityType,
+            $"""
+            SELECT {targetValue}
+            FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
+            WHERE {RecordIdSql.EqualsParameter("target", entry.RecordId, "recordId")}
+            LIMIT 1
+            FOR SHARE
+            """,
+            new SqlParams { ["recordId"] = recordId },
+            [entry.Table]
+        );
     }
 
     /// <summary>
@@ -417,23 +498,24 @@ internal static class RetentionHoldSql
     /// held rows that work changed or removed, whatever did it (EF, a client or database cascade, a
     /// trigger, raw SQL). A savepoint the work rolls back restores the old tuple, version and all.
     /// Columns: hold id, the hold's entity, the covered row's entity, its record id, its version.
-    /// <see cref="RetentionHoldGuard"/> owns the diff.
+    /// <see cref="RetentionHoldGuard"/> owns the diff. Null when there are no
+    /// <paramref name="entries"/>: no entity can have a held row. The branches follow the order of
+    /// <paramref name="entries"/>, and so does the numbering of <c>@entity{n}</c>, so a check has
+    /// to pass the entries in the order the guard does. <paramref name="baselineHoldIds"/> (a
+    /// <c>Guid[]</c>) is bound as given.
     /// </summary>
-    internal static (string Sql, SqlParams Parameters) BuildHeldRowVersions(
+    internal static SweepStatement? BuildHeldRowVersions(
         RelationalObjectName holdsTable,
         IReadOnlyList<RetentionEntry> entries,
-        IReadOnlyCollection<Guid> baselineHoldIds
+        object? baselineHoldIds
     )
     {
         if (entries.Count == 0)
         {
-            throw new ArgumentException(
-                "At least one retained entity is required to read held row versions.",
-                nameof(entries)
-            );
+            return null;
         }
 
-        var parameters = new SqlParams { ["baselineHoldIds"] = baselineHoldIds.ToArray() };
+        var parameters = new SqlParams { ["baselineHoldIds"] = baselineHoldIds };
         var entities = new NamedGuids(parameters, "entity");
         var holds = PostgreSqlIdentifier.Format(holdsTable);
         var branches = new List<string>();
@@ -476,31 +558,55 @@ internal static class RetentionHoldSql
             }
         }
 
-        return ($"SELECT DISTINCT *\nFROM (\n{string.Join("\nUNION ALL\n", branches)}\n) AS versions", parameters);
+        return new SweepStatement(
+            "held-row-versions",
+            null,
+            $"SELECT DISTINCT *\nFROM (\n{string.Join("\nUNION ALL\n", branches)}\n) AS versions",
+            parameters,
+            [.. entries.SelectMany(entry => PathTables(entry, entry.CoveredPaths, includeEntry: true)).Distinct()]
+        );
     }
 
     /// <summary>
-    /// Re-reads the version of each key in <paramref name="keys"/>, by record id, for the holds
-    /// that still exist: a covered row that left the covered-path read (its link was cut, or the
-    /// row was deleted) is still compared by its row. A row that is gone yields a NULL version.
-    /// Same columns and version expression as <see cref="BuildHeldRowVersions"/>.
+    /// Re-reads the version of each covered row in <paramref name="rereads"/>, by record id, for
+    /// the holds that still exist: a covered row that left the covered-path read (its link was
+    /// cut, or the row was deleted) is still compared by its row. A row that is gone yields a NULL
+    /// version. Same columns and version expression as <see cref="BuildHeldRowVersions"/>. One
+    /// branch per entity in <paramref name="rereads"/>, in the order of
+    /// <paramref name="entries"/> (the registry's), so the same set of entities gives the same text
+    /// whatever order the keys went missing in. Null when <paramref name="rereads"/> is empty.
     /// </summary>
-    internal static (string Sql, SqlParams Parameters) BuildHeldRowRereads(
+    internal static SweepStatement? BuildHeldRowRereads(
         RelationalObjectName holdsTable,
         IReadOnlyList<RetentionEntry> entries,
-        IReadOnlyCollection<HeldRowKey> keys
+        IReadOnlyCollection<HeldRowReread> rereads
     )
     {
+        if (rereads.Count == 0)
+        {
+            return null;
+        }
+
+        var byEntity = rereads.ToDictionary(reread => reread.RetentionEntityId);
+        var ordered = entries.Where(entry => byEntity.ContainsKey(entry.RetentionEntityId)).ToList();
+        if (ordered.Count != byEntity.Count)
+        {
+            var unknown = byEntity.Keys.Except(ordered.Select(entry => entry.RetentionEntityId)).First();
+            throw new InvalidOperationException(
+                $"Retention entity ID '{unknown}' does not match a retained entity in the EF model."
+            );
+        }
+
         var parameters = new SqlParams();
         var holds = PostgreSqlIdentifier.Format(holdsTable);
         var branches = new List<string>();
         var index = 0;
-        foreach (var group in keys.GroupBy(key => key.RetentionEntityId))
+        foreach (var entry in ordered)
         {
-            var entry = entries.Single(candidate => candidate.RetentionEntityId == group.Key);
-            parameters[$"rereadEntity{index}"] = group.Key;
-            parameters[$"rereadHoldIds{index}"] = group.Select(key => key.HoldId).ToArray();
-            parameters[$"rereadRecordIds{index}"] = group.Select(key => key.RecordId).ToArray();
+            var keys = byEntity[entry.RetentionEntityId];
+            parameters[$"rereadEntity{index}"] = entry.RetentionEntityId;
+            parameters[$"rereadHoldIds{index}"] = keys.HoldIds;
+            parameters[$"rereadRecordIds{index}"] = keys.RecordIds;
             branches.Add(
                 $"""
                 SELECT hold."HoldId" AS "HoldId", hold."RetentionEntityId" AS "HoldEntityId",
@@ -516,7 +622,121 @@ internal static class RetentionHoldSql
             index++;
         }
 
-        return (string.Join("\nUNION ALL\n", branches), parameters);
+        return new SweepStatement(
+            "held-row-rereads",
+            null,
+            string.Join("\nUNION ALL\n", branches),
+            parameters,
+            [.. ordered.Select(entry => entry.Table)]
+        );
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Enumeration: every statement the hold calls can issue.
+    // ------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Every statement a hold call on one row of <paramref name="entry"/> can issue: the target
+    /// row's lock, both covering reads, the record id's canonicalisation when the run issues it,
+    /// and the covered rows' locks when the entity has covered paths. The values are bound as
+    /// given: <paramref name="recordId"/> (text), and <paramref name="tenantId"/>, bound for a
+    /// tenanted entity only. <paramref name="entries"/> is the registry's entries, for the covered
+    /// rows' sort order.
+    /// </summary>
+    internal static IReadOnlyList<SweepStatement> ForEntity(
+        RelationalObjectName holdsTable,
+        RetentionEntry entry,
+        IEnumerable<RetentionEntry> entries,
+        object? recordId,
+        object? tenantId
+    )
+    {
+        var statements = new List<SweepStatement>
+        {
+            BuildTargetRowLock(entry, recordId),
+            BuildCoveringHolds(holdsTable, entry, recordId, tenantId),
+            BuildAnyCoveringHold(holdsTable, entry, recordId, tenantId),
+        };
+        if (RetentionTargetResolver.CanonicaliseStatement(entry, recordId) is { } canonicalise)
+        {
+            statements.Add(canonicalise);
+        }
+
+        statements.AddRange(BuildCoveredRowLocks(entry, entries, recordId, tenantId));
+        return statements;
+    }
+
+    /// <summary>
+    /// The covering read for one erasure-subject kind, per tenant split: the tenanted entities of
+    /// <paramref name="starts"/> with <paramref name="tenantId"/> bound, and the tenantless ones
+    /// without it, in the order given, as <c>ListCoveringSubjectAsync</c> splits them. A split with
+    /// no entity gives no statement.
+    /// </summary>
+    internal static IReadOnlyList<SweepStatement> ForSubjectKind(
+        RelationalObjectName holdsTable,
+        IReadOnlyList<(RetentionEntry Entry, ErasureSubjectPredicate Subject)> starts,
+        object? tenantId
+    )
+    {
+        var tenanted = starts.Where(start => start.Entry.Tenant is not null).ToList();
+        var tenantless = starts.Where(start => start.Entry.Tenant is null).ToList();
+        return
+        [
+            .. new[]
+            {
+                BuildCoveringHoldsForSubject(holdsTable, tenanted, tenantId),
+                BuildCoveringHoldsForSubject(holdsTable, tenantless, null),
+            }.OfType<SweepStatement>(),
+        ];
+    }
+
+    /// <summary>
+    /// Every statement the held-row guard can issue over <paramref name="entries"/>, which must be
+    /// the guard's own list in its order (the registry's entries, as
+    /// <see cref="RetentionHoldGuard"/> reads them), so the first statement is the text the guard
+    /// sends. Then, to tell which entity a refusal comes from, the same read over each entity alone
+    /// and a re-read of each entity's covered rows. <paramref name="baselineHoldIds"/> is bound as
+    /// a <c>Guid[]</c>, and <paramref name="rereadHoldIds"/> and <paramref name="rereadRecordIds"/>
+    /// as a <c>Guid[]</c> and a <c>string[]</c>. None for an empty model.
+    /// </summary>
+    internal static IReadOnlyList<SweepStatement> ForModel(
+        RelationalObjectName holdsTable,
+        IReadOnlyList<RetentionEntry> entries,
+        object? baselineHoldIds,
+        object? rereadHoldIds,
+        object? rereadRecordIds
+    )
+    {
+        var statements = new List<SweepStatement>();
+        if (BuildHeldRowVersions(holdsTable, entries, baselineHoldIds) is not { } all)
+        {
+            return statements;
+        }
+
+        statements.Add(all);
+        foreach (var entry in entries)
+        {
+            statements.Add(
+                BuildHeldRowVersions(holdsTable, [entry], baselineHoldIds)!
+                    with
+                    {
+                        Name = "held-row-versions-of-entity",
+                        Entity = entry.EntityType,
+                    }
+            );
+            statements.Add(
+                BuildHeldRowRereads(
+                    holdsTable,
+                    entries,
+                    [new HeldRowReread(entry.RetentionEntityId, rereadHoldIds, rereadRecordIds)]
+                )! with
+                {
+                    Entity = entry.EntityType,
+                }
+            );
+        }
+
+        return statements;
     }
 
     /// <summary>The hold's tenant against the tenant of the row it covers, or NULL for a tenantless row.</summary>
@@ -540,3 +760,9 @@ internal static class RetentionHoldSql
         }
     }
 }
+
+/// <summary>
+/// The covered rows of one entity the held-row guard re-reads: the holds' ids and the rows'
+/// canonical record ids, as parallel arrays (<c>Guid[]</c> and <c>string[]</c> for a run).
+/// </summary>
+internal readonly record struct HeldRowReread(Guid RetentionEntityId, object? HoldIds, object? RecordIds);

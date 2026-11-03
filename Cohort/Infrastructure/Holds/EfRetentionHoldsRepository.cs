@@ -157,15 +157,13 @@ internal sealed class EfRetentionHoldsRepository(
         CancellationToken ct
     )
     {
-        foreach (var sql in RetentionHoldSql.BuildCoveredRowLocks(entry, registry.Scan().Values))
+        foreach (var statement in RetentionHoldSql.BuildCoveredRowLocks(entry, registry.Scan().Values, recordId, tenantId))
         {
-            var parameters = new SqlParams { ["recordId"] = recordId };
-            if (entry.Tenant is not null)
-            {
-                parameters["tenantId"] = tenantId;
-            }
-
-            await using var command = parameters.CreateCommand(db.Database.GetDbConnection(), transaction, sql);
+            await using var command = statement.Parameters.CreateCommand(
+                db.Database.GetDbConnection(),
+                transaction,
+                statement.Sql
+            );
             await command.ExecuteNonQueryAsync(ct);
         }
     }
@@ -178,22 +176,11 @@ internal sealed class EfRetentionHoldsRepository(
         CancellationToken ct
     )
     {
-        var targetValue = entry.Tenant is null
-            ? "1"
-            : $"target.{PostgreSqlIdentifier.Quote(entry.Tenant.TenantColumn)}";
-        // FOR SHARE reads the row's current version, not the caller's snapshot: under
-        // REPEATABLE READ a row deleted since the snapshot raises a serialization failure
-        // instead of taking a hold that protects nothing.
-        await using var command = new SqlParams { ["recordId"] = recordId }.CreateCommand(
+        var statement = RetentionHoldSql.BuildTargetRowLock(entry, recordId);
+        await using var command = statement.Parameters.CreateCommand(
             db.Database.GetDbConnection(),
             transaction,
-            $"""
-            SELECT {targetValue}
-            FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
-            WHERE {RecordIdSql.EqualsParameter("target", entry.RecordId, "recordId")}
-            LIMIT 1
-            FOR SHARE
-            """
+            statement.Sql
         );
 
         var rowTenant = await command.ExecuteScalarAsync(ct);
@@ -322,7 +309,7 @@ internal sealed class EfRetentionHoldsRepository(
         Guid retentionEntityId,
         string recordId,
         Guid? tenantId,
-        Func<RelationalObjectName, RetentionEntry, string, Guid?, (string Sql, SqlParams Parameters)> build,
+        Func<RelationalObjectName, RetentionEntry, object?, object?, SweepStatement> build,
         Func<DbCommand, Task<TResult>> read,
         CancellationToken ct
     )
@@ -344,8 +331,12 @@ internal sealed class EfRetentionHoldsRepository(
                 "Retention hold",
                 ct
             );
-            var (sql, parameters) = build(Tables.RetentionHolds, entry, canonicalRecordId, tenantId);
-            await using var command = parameters.CreateCommand(db.Database.GetDbConnection(), transaction, sql);
+            var statement = build(Tables.RetentionHolds, entry, canonicalRecordId, tenantId);
+            await using var command = statement.Parameters.CreateCommand(
+                db.Database.GetDbConnection(),
+                transaction,
+                statement.Sql
+            );
             return await read(command);
         }
         finally
@@ -388,11 +379,16 @@ internal sealed class EfRetentionHoldsRepository(
         await db.Database.OpenConnectionAsync(ct);
         try
         {
-            var (sql, parameters) = RetentionHoldSql.BuildCoveringHoldsForSubject(Tables.RetentionHolds, starts, tenantId);
-            await using var command = parameters.CreateCommand(
+            // Validated above, so some entity declares the kind; null (no starts) reads no holds.
+            if (RetentionHoldSql.BuildCoveringHoldsForSubject(Tables.RetentionHolds, starts, tenantId) is not { } statement)
+            {
+                return [];
+            }
+
+            await using var command = statement.Parameters.CreateCommand(
                 db.Database.GetDbConnection(),
                 db.Database.CurrentTransaction?.GetDbTransaction(),
-                sql
+                statement.Sql
             );
             return await ReadHoldsAsync(command, ct);
         }

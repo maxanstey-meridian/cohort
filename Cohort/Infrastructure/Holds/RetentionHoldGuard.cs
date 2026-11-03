@@ -1,6 +1,7 @@
 using System.Data.Common;
 
 using Cohort.Application;
+using Cohort.Infrastructure.Sweep;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -94,20 +95,31 @@ internal sealed class RetentionHoldGuard(
         var versions = new Dictionary<HeldRowKey, string?>();
         var entityByHold = new Dictionary<Guid, Guid>();
 
-        var (sql, parameters) = RetentionHoldSql.BuildHeldRowVersions(
-            holdsTable,
-            entries,
-            baseline?.HoldIds.ToArray() ?? []
-        );
-        await ReadIntoAsync(connection, transaction, sql, parameters, versions, entityByHold, ct);
+        // No retained entity means no held row: nothing to read, and nothing to re-read.
+        if (RetentionHoldSql.BuildHeldRowVersions(holdsTable, entries, baseline?.HoldIds.ToArray() ?? []) is not { } read)
+        {
+            return new HeldRowVersions(versions, entityByHold);
+        }
+
+        await ReadIntoAsync(connection, transaction, read, versions, entityByHold, ct);
 
         if (baseline is not null)
         {
             var missing = baseline.ByRow.Keys.Where(key => !versions.ContainsKey(key)).ToArray();
             if (missing.Length > 0)
             {
-                var (rereadSql, rereadParameters) = RetentionHoldSql.BuildHeldRowRereads(holdsTable, entries, missing);
-                await ReadIntoAsync(connection, transaction, rereadSql, rereadParameters, versions, entityByHold, ct);
+                var rereads = missing
+                    .GroupBy(key => key.RetentionEntityId)
+                    .Select(group => new HeldRowReread(
+                        group.Key,
+                        group.Select(key => key.HoldId).ToArray(),
+                        group.Select(key => key.RecordId).ToArray()
+                    ))
+                    .ToArray();
+                if (RetentionHoldSql.BuildHeldRowRereads(holdsTable, entries, rereads) is { } reread)
+                {
+                    await ReadIntoAsync(connection, transaction, reread, versions, entityByHold, ct);
+                }
             }
         }
 
@@ -117,14 +129,13 @@ internal sealed class RetentionHoldGuard(
     private static async Task ReadIntoAsync(
         DbConnection connection,
         DbTransaction transaction,
-        string sql,
-        SqlParams parameters,
+        SweepStatement statement,
         Dictionary<HeldRowKey, string?> versions,
         Dictionary<Guid, Guid> entityByHold,
         CancellationToken ct
     )
     {
-        await using var command = parameters.CreateCommand(connection, transaction, sql);
+        await using var command = statement.Parameters.CreateCommand(connection, transaction, statement.Sql);
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
         {

@@ -2,6 +2,7 @@ using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
 using Cohort.Infrastructure;
+using Cohort.Infrastructure.Migrations;
 using Cohort.Infrastructure.Sweep;
 using Cohort.Sample.Entities;
 
@@ -9,6 +10,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 
 namespace Cohort.Sample.Tests;
@@ -392,6 +394,97 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         public Guid Id { get; set; }
 
         public DateTimeOffset CreatedAt { get; set; }
+    }
+
+    // NULL marks the rows still to anonymise. A default or value generation mapped on the marker
+    // makes EF leave it out of an insert, so the database fills it in and every row is born
+    // marked as anonymised: startup refuses it, since no database check could tell.
+    [Theory]
+    [InlineData("default-sql")]
+    [InlineData("value-generated")]
+    public async Task Startup_refuses_an_anonymised_at_marker_with_a_mapped_default(string mapping)
+    {
+        var errors = mapping switch
+        {
+            "default-sql" => await StartupErrorsAsync<MarkerDefaultSqlDbContext>(),
+            _ => await StartupErrorsAsync<MarkerValueGeneratedDbContext>(),
+        };
+
+        errors.Should().ContainSingle(error =>
+            error.Contains(typeof(MarkerRecord).FullName!, StringComparison.Ordinal)
+            && error.Contains("the AnonymisedAt marker AnonymisedAt has a default or value generation mapped", StringComparison.Ordinal)
+        );
+    }
+
+    private async Task<IReadOnlyList<string>> StartupErrorsAsync<TContext>()
+        where TContext : DbContext
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
+        services.AddDbContext<TContext>(options => options.UseNpgsql(connectionString));
+        services.AddSingleton<IRetentionRuleProvider>(new MarkerRuleProvider());
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
+        services.AddCohort<TContext>();
+        await using var provider = services.BuildServiceProvider(validateScopes: true);
+
+        var start = () => provider
+            .GetServices<IHostedService>()
+            .Single(service => service.GetType().Name == "RetentionValidationHostedService")
+            .StartAsync(CancellationToken.None);
+
+        return (await start.Should().ThrowAsync<RetentionConfigurationException>()).Which.Errors;
+    }
+
+    private sealed class MarkerDefaultSqlDbContext(DbContextOptions<MarkerDefaultSqlDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder
+                .Entity<MarkerRecord>()
+                .ToTable("marker_records")
+                .Property(record => record.AnonymisedAt)
+                .HasDefaultValueSql("now()");
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    private sealed class MarkerValueGeneratedDbContext(DbContextOptions<MarkerValueGeneratedDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder
+                .Entity<MarkerRecord>()
+                .ToTable("marker_records")
+                .Property(record => record.AnonymisedAt)
+                .ValueGeneratedOnAdd();
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    [Retain("marker", nameof(CreatedAt))]
+    [RetentionEntityId("d4a1f8e3-6b25-4c97-8e0d-3a7c9b2f5e18")]
+    [RetentionTenantless]
+    private sealed class MarkerRecord
+    {
+        public Guid Id { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
+
+        [Anonymise(AnonymiseMethod.EmptyString)]
+        public string Label { get; set; } = "";
+
+        public DateTimeOffset? AnonymisedAt { get; set; }
+    }
+
+    private sealed class MarkerRuleProvider : IRetentionRuleProvider
+    {
+        public RetentionCategoryCapabilities? GetCapabilities(string category) =>
+            category == "marker" ? new RetentionCategoryCapabilities([Strategy.Anonymise]) : null;
+
+        public Task<RetentionRule?> ResolveAsync(RetentionResolutionContext context, CancellationToken ct) =>
+            Task.FromResult<RetentionRule?>(new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise));
     }
 
     [RowHandlerId("3a4e2f9b-7c61-4d08-b5e2-91f0c6d7a843")]

@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Data;
 using System.Data.Common;
 using System.Globalization;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 
 using Cohort.Application;
@@ -685,9 +686,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
 
         (await act.Should().ThrowAsync<RetentionConfigurationException>())
             .Which.Errors.Should().ContainSingle(error =>
-                error.Contains(typeof(Note).FullName!, StringComparison.Ordinal)
-                && error.Contains("\"public\".\"notes_elsewhere\"", StringComparison.Ordinal)
-                && error.Contains("was not found in the database", StringComparison.Ordinal)
+                RefusesWith(error, typeof(Note), "42P01", "\"public.notes_elsewhere\"")
             );
     }
 
@@ -750,11 +749,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
 
         (await act.Should().ThrowAsync<RetentionConfigurationException>())
             .Which.Errors.Should().ContainSingle(error =>
-                error.Contains(typeof(HoldLinkChild).Name, StringComparison.Ordinal)
-                && error.Contains(
-                    "link column \"public\".\"hold_link_children\".\"CaseIdElsewhere\" was not found in the database",
-                    StringComparison.Ordinal
-                )
+                RefusesWith(error, typeof(HoldLinkChild), "42703", "\"CaseIdElsewhere\"")
             );
     }
 
@@ -827,7 +822,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     }
 
     // T5d: and a copy that reads the same things as one that passed is not checked on them again,
-    // whatever the database has become since: the retained-tables and marker-column checks would
+    // whatever the database has become since: the retained-tables and retained-columns checks would
     // each refuse what the database looks like now.
     [Fact]
     public async Task A_model_copy_that_reads_what_a_passed_copy_read_skips_the_retained_table_and_marker_checks()
@@ -901,9 +896,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
 
         (await act.Should().ThrowAsync<RetentionConfigurationException>())
             .Which.Errors.Should().ContainSingle(error =>
-                error.Contains(typeof(TenantlessLog).FullName!, StringComparison.Ordinal)
-                && error.Contains("\"public\".\"tenantless_logs\"", StringComparison.Ordinal)
-                && error.Contains("was not found in the database", StringComparison.Ordinal)
+                RefusesWith(error, typeof(TenantlessLog), "42P01", "\"public.tenantless_logs\"")
             );
     }
 
@@ -920,7 +913,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         try
         {
             await using var database = await AnonymiseTargetDatabaseAsync();
-            await GrantReadAsync(database, role);
+            await GrantCohortPrivilegesAsync(database, role);
 
             var thrown = await ListActiveHoldsAfterAnonymiseColumnShrinksAsync(
                 database,
@@ -940,6 +933,105 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         {
             await ExecuteAsync(fixture.ConnectionString, $"DROP ROLE IF EXISTS \"{role}\"");
         }
+    }
+
+    // Privileges depend on the role, so the statement check's shared pass is keyed by it. Role B
+    // differs from role A only in its user name: if the key left the role out, B would find A's
+    // pass.
+    [Fact]
+    public async Task A_second_role_on_the_same_database_is_checked_again()
+    {
+        var full = $"cohort_readiness_{Guid.NewGuid():N}";
+        var readOnly = $"cohort_readiness_{Guid.NewGuid():N}";
+        const string password = "readiness-test-password";
+        await CreateReadRoleAsync(full, password);
+        await CreateReadRoleAsync(readOnly, password);
+        try
+        {
+            await using var database = await AnonymiseTargetDatabaseAsync();
+            await GrantCohortPrivilegesAsync(database, full);
+            await GrantReadOnlyAsync(database, readOnly);
+            var connectionString = AsRole(database, full, password);
+            await using var provider = BuildAnonymiseTargetProvider(
+                connectionString,
+                options => options.UseNpgsql(connectionString)
+            );
+
+            await using (var first = provider.CreateAsyncScope())
+            {
+                await ListActiveHoldsAsync(first.ServiceProvider);
+            }
+
+            connectionString = AsRole(database, readOnly, password);
+            await using var second = provider.CreateAsyncScope();
+            var act = () => ListActiveHoldsAsync(second.ServiceProvider);
+
+            (await act.Should().ThrowAsync<RetentionConfigurationException>())
+                .Which.Errors.Should().Contain(error =>
+                    error.Contains(" 42501: permission denied for table ", StringComparison.Ordinal)
+                    && error.Contains($"The database role '{readOnly}' lacks this privilege", StringComparison.Ordinal)
+                );
+        }
+        finally
+        {
+            await ExecuteAsync(fixture.ConnectionString, $"DROP ROLE IF EXISTS \"{full}\"");
+            await ExecuteAsync(fixture.ConnectionString, $"DROP ROLE IF EXISTS \"{readOnly}\"");
+        }
+    }
+
+    // Unqualified type names resolve through the search path, so the statement check's pass is
+    // keyed by it too. The domain is in a schema only the first connection string searches.
+    [Fact]
+    public async Task A_second_search_path_is_checked_again()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        var searching = new NpgsqlConnectionStringBuilder(database.ConnectionString)
+        {
+            SearchPath = "key_types,public",
+        }.ConnectionString;
+        var notSearching = new NpgsqlConnectionStringBuilder(database.ConnectionString)
+        {
+            SearchPath = "public",
+        }.ConnectionString;
+        // The create script names its table without a schema, so it lands in the first schema of
+        // the path: public first, with the domain's schema after it.
+        var creating = new NpgsqlConnectionStringBuilder(database.ConnectionString)
+        {
+            SearchPath = "public,key_types",
+        }.ConnectionString;
+        await using (var db = new SearchPathDbContext(
+            new DbContextOptionsBuilder<SearchPathDbContext>().UseNpgsql(creating).Options
+        ))
+        {
+            await db.Database.ExecuteSqlRawAsync(
+                "CREATE SCHEMA key_types; CREATE DOMAIN key_types.search_path_key AS text"
+            );
+            await db.Database.ExecuteSqlRawAsync(db.Database.GenerateCreateScript());
+        }
+
+        var connectionString = searching;
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
+        services.AddDbContext<SearchPathDbContext>(options => options.UseNpgsql(connectionString));
+        services.AddSingleton<IRetentionRuleProvider>(new SessionKeyRuleProvider());
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
+        services.AddCohort<SearchPathDbContext>();
+        await using var provider = services.BuildServiceProvider(validateScopes: true);
+
+        await using (var first = provider.CreateAsyncScope())
+        {
+            await ListActiveHoldsAsync(first.ServiceProvider);
+        }
+
+        connectionString = notSearching;
+        await using var second = provider.CreateAsyncScope();
+        var act = () => ListActiveHoldsAsync(second.ServiceProvider);
+
+        (await act.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                RefusesWith(error, typeof(SearchPathKeyRecord), "42704", "type \"search_path_key\" does not exist")
+            );
     }
 
     [Fact]
@@ -974,7 +1066,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         try
         {
             await using var database = await AnonymiseTargetDatabaseAsync();
-            await GrantReadAsync(database, role);
+            await GrantCohortPrivilegesAsync(database, role);
             var asRole = new NpgsqlConnectionStringBuilder(database.ConnectionString)
             {
                 Username = role,
@@ -996,6 +1088,83 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             );
 
             thrown.Should().BeNull("a rotated password reaches the same database, so the pass is kept");
+        }
+        finally
+        {
+            await ExecuteAsync(fixture.ConnectionString, $"DROP ROLE IF EXISTS \"{role}\"");
+        }
+    }
+
+    // A role that lacks a privilege some statement needs is refused (42501), naming the role and
+    // what it lacks: the row locks and writes need UPDATE, and every statement needs the schema.
+    [Theory]
+    [InlineData("REVOKE INSERT, UPDATE, DELETE ON public.soft_delete_records FROM \"{0}\"", "permission denied for table soft_delete_records")]
+    // PUBLIC holds USAGE on public by default, so it is revoked from PUBLIC too (the temporary
+    // database is dropped afterwards, so nothing needs restoring).
+    [InlineData("REVOKE USAGE ON SCHEMA public FROM PUBLIC, \"{0}\"", "permission denied for schema public")]
+    public async Task Readiness_refuses_a_role_without_the_privileges_cohort_needs(string revoke, string message)
+    {
+        var role = $"cohort_readiness_{Guid.NewGuid():N}";
+        const string password = "readiness-test-password";
+        await CreateReadRoleAsync(role, password);
+        try
+        {
+            await using var database = await MigratedTemporaryDatabaseAsync();
+            await GrantCohortPrivilegesAsync(database, role);
+            await ExecuteAsync(database, string.Format(CultureInfo.InvariantCulture, revoke, role));
+            using var host = new CohortTestHost(AsRole(database, role, password));
+
+            var act = () => host.RunSweepAsync(new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()));
+
+            (await act.Should().ThrowAsync<RetentionConfigurationException>())
+                .Which.Errors.Should().Contain(error =>
+                    error.Contains(" 42501: ", StringComparison.Ordinal)
+                    && error.Contains(message, StringComparison.Ordinal)
+                    && error.Contains($"The database role '{role}' lacks this privilege", StringComparison.Ordinal)
+                );
+        }
+        finally
+        {
+            await ExecuteAsync(fixture.ConnectionString, $"DROP ROLE IF EXISTS \"{role}\"");
+        }
+    }
+
+    // The role may use Cohort's schema but not the one the host's table lives in.
+    [Fact]
+    public async Task Readiness_refuses_a_role_without_usage_on_the_schema_of_a_retained_table()
+    {
+        var role = $"cohort_readiness_{Guid.NewGuid():N}";
+        const string password = "readiness-test-password";
+        await CreateReadRoleAsync(role, password);
+        try
+        {
+            await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+            await using (var db = new HostSchemaDbContext(
+                new DbContextOptionsBuilder<HostSchemaDbContext>().UseNpgsql(database.ConnectionString).Options
+            ))
+            {
+                await db.Database.ExecuteSqlRawAsync(db.Database.GenerateCreateScript());
+            }
+
+            await GrantCohortPrivilegesAsync(database, role);
+            await ExecuteAsync(
+                database,
+                $"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA host_data TO \"{role}\""
+            );
+            var connectionString = AsRole(database, role, password);
+            await using var provider = BuildModelCopyProvider<HostSchemaDbContext>(
+                connectionString,
+                new SessionKeyRuleProvider()
+            );
+            await using var scope = provider.CreateAsyncScope();
+
+            var act = () => ListActiveHoldsAsync(scope.ServiceProvider);
+
+            (await act.Should().ThrowAsync<RetentionConfigurationException>())
+                .Which.Errors.Should().ContainSingle(error =>
+                    RefusesWith(error, typeof(HostSchemaRecord), "42501", "permission denied for schema host_data")
+                    && error.Contains($"The database role '{role}' lacks this privilege", StringComparison.Ordinal)
+                );
         }
         finally
         {
@@ -1026,7 +1195,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         try
         {
             await using var database = await AnonymiseTargetDatabaseAsync();
-            await GrantReadAsync(database, role);
+            await GrantCohortPrivilegesAsync(database, role);
             var asRole = new NpgsqlConnectionStringBuilder(database.ConnectionString)
             {
                 Username = role,
@@ -1124,7 +1293,27 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     private Task CreateReadRoleAsync(string role, string password) =>
         ExecuteAsync(fixture.ConnectionString, $"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}'");
 
-    private static async Task GrantReadAsync(TemporaryDatabase database, string role)
+    private static Task GrantReadOnlyAsync(TemporaryDatabase database, string role)
+    {
+        var name = new NpgsqlConnectionStringBuilder(database.ConnectionString).Database!;
+        return ExecuteAsync(
+            database,
+            $"""
+            GRANT CONNECT ON DATABASE "{name}" TO "{role}";
+            GRANT USAGE ON SCHEMA public TO "{role}";
+            GRANT SELECT ON ALL TABLES IN SCHEMA public TO "{role}";
+            """
+        );
+    }
+
+    private static string AsRole(TemporaryDatabase database, string role, string password) =>
+        new NpgsqlConnectionStringBuilder(database.ConnectionString) { Username = role, Password = password }
+            .ConnectionString;
+
+    // Readiness refuses a role that lacks a privilege for any statement Cohort may send, so a
+    // role that reaches it holds all of them: the reads, the writes, and the row locks (which
+    // need UPDATE).
+    private static async Task GrantCohortPrivilegesAsync(TemporaryDatabase database, string role)
     {
         var name = new NpgsqlConnectionStringBuilder(database.ConnectionString).Database!;
         await ExecuteAsync(
@@ -1132,7 +1321,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             $"""
             GRANT CONNECT ON DATABASE "{name}" TO "{role}";
             GRANT USAGE ON SCHEMA public TO "{role}";
-            GRANT SELECT ON ALL TABLES IN SCHEMA public TO "{role}";
+            GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "{role}";
             """
         );
     }
@@ -1169,6 +1358,93 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
                 error.Contains("missing Cohort runtime capabilities", StringComparison.Ordinal)
                 && error.Contains("sweep_run_row_detail", StringComparison.Ordinal)
             );
+    }
+
+    // Readiness explains its statements inside the caller's transaction, and PostgreSQL aborts a
+    // transaction on the first error: each EXPLAIN is followed by a rollback to a savepoint, so a
+    // refusal leaves the caller's transaction as usable as it found it.
+    [Fact]
+    public async Task A_statement_refused_inside_a_caller_transaction_leaves_it_usable()
+    {
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await ExecuteAsync(database, """ALTER TABLE public.soft_delete_records DROP COLUMN "DeletedAt" """);
+        await using var provider = BuildModelCopyProvider(database.ConnectionString);
+        await using var scope = provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<SampleDbContext>();
+        await using var transaction = await db.Database.BeginTransactionAsync();
+
+        var act = () => ListActiveHoldsAsync(scope.ServiceProvider);
+
+        (await act.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                RefusesWith(error, typeof(SoftDeleteRecord), "42703", "\"DeletedAt\"")
+            );
+        (await db.Database.SqlQueryRaw<int>("SELECT 1 AS \"Value\"").SingleAsync()).Should().Be(1);
+        await transaction.RollbackAsync();
+    }
+
+    // Every refused entity is reported, not the first: the error barriers keep the batch running
+    // past a failed EXPLAIN.
+    [Fact]
+    public async Task Readiness_reports_every_refused_entity_in_one_error_list()
+    {
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await ExecuteAsync(
+            database,
+            """
+            ALTER TABLE public.soft_delete_records DROP COLUMN "DeletedAt";
+            ALTER TABLE public.tenantless_logs DROP COLUMN "CreatedAt" CASCADE;
+            """
+        );
+        using var host = new CohortTestHost(database.ConnectionString);
+
+        var act = () => host.RunSweepAsync(new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()));
+
+        var errors = (await act.Should().ThrowAsync<RetentionConfigurationException>()).Which.Errors;
+
+        errors.Should().HaveCount(2);
+        errors.Should().ContainSingle(error =>
+            RefusesWith(error, typeof(SoftDeleteRecord), "42703", "\"DeletedAt\"")
+        );
+        errors.Should().ContainSingle(error =>
+            RefusesWith(error, typeof(TenantlessLog), "42703", "\"CreatedAt\"")
+        );
+    }
+
+    // A wrapped DbConnection can't batch, so its statements are explained one at a time.
+    [Fact]
+    public async Task Readiness_checks_statements_over_a_wrapped_connection()
+    {
+        await using var database = await AnonymiseTargetDatabaseAsync(
+            """ALTER TABLE public.anonymise_literal_records DROP COLUMN "Label" """
+        );
+        var wrappers = new List<PassThroughConnection>();
+        await using var provider = BuildAnonymiseTargetProvider(
+            database.ConnectionString,
+            options =>
+            {
+                var wrapper = new PassThroughConnection(new NpgsqlConnection(database.ConnectionString));
+                wrappers.Add(wrapper);
+                options.UseNpgsql(wrapper);
+            }
+        );
+
+        try
+        {
+            var errors = await ReadinessErrorsAsync(provider);
+
+            errors.Should().ContainSingle(error =>
+                RefusesWith(error, typeof(AnonymiseLiteralRecord), "42703", "\"Label\"")
+            );
+            wrappers.Should().NotBeEmpty("the context runs on the wrapper, not on an NpgsqlConnection");
+        }
+        finally
+        {
+            foreach (var wrapper in wrappers)
+            {
+                await wrapper.DisposeAsync();
+            }
+        }
     }
 
     // T7: the anonymise check reads session state no key captures, so every model copy runs it.
@@ -1517,12 +1793,12 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     [Theory]
     [InlineData("ALTER TABLE public.anonymise_literal_records ALTER COLUMN \"Label\" TYPE character varying(8)", "character varying(8)")]
     [InlineData("ALTER TABLE public.anonymise_literal_records ALTER COLUMN \"Label\" TYPE character(4)", "character(4)")]
-    [InlineData("ALTER TABLE public.anonymise_literal_records ALTER COLUMN \"Label\" TYPE uuid USING NULL", "uuid")]
     public async Task Readiness_refuses_a_fixed_literal_its_column_cannot_take(string ddl, string columnType)
     {
-        // The model says text; only the catalog knows the column became varchar(8), a char(4)
-        // declared by column type alone, or a uuid. "[redacted]" is too long for the first two
-        // and not a uuid, so every anonymise of these rows would fail at runtime.
+        // The model says text; only the catalog knows the column became varchar(8) or a char(4)
+        // declared by column type alone. "[redacted]" is too long for both, so every anonymise of
+        // these rows would fail at runtime. EXPLAIN binds no literal, so the literal probe owns
+        // this; a column that can't be assigned from text at all is the statement check's.
         await using var database = await AnonymiseTargetDatabaseAsync(ddl);
         await using var provider = BuildAnonymiseTargetProvider(database.ConnectionString);
 
@@ -1736,9 +2012,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle(error =>
-            error.Contains(typeof(SoftDeleteRecord).FullName!, StringComparison.Ordinal)
-            && error.Contains($"member {column}", StringComparison.Ordinal)
-            && error.Contains("was not found", StringComparison.Ordinal)
+            RefusesWith(error, typeof(SoftDeleteRecord), "42703", $"\"{column}\"")
         );
     }
 
@@ -1753,9 +2027,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         var errors = await ReadinessErrorsAsync(provider);
 
         errors.Should().ContainSingle(error =>
-            error.Contains(typeof(AnonymiseNullRecord).FullName!, StringComparison.Ordinal)
-            && error.Contains("member AnonymisedAt", StringComparison.Ordinal)
-            && error.Contains("was not found", StringComparison.Ordinal)
+            RefusesWith(error, typeof(AnonymiseNullRecord), "42703", "\"AnonymisedAt\"")
         );
     }
 
@@ -1784,10 +2056,263 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle(error =>
-            error.Contains(typeof(SoftDeleteRecord).FullName!, StringComparison.Ordinal)
-            && error.Contains("member IsDeleted", StringComparison.Ordinal)
-            && error.Contains("the database generates", StringComparison.Ordinal)
+            RefusesWith(error, typeof(SoftDeleteRecord), "428C9", "column \"IsDeleted\" can only be updated to DEFAULT")
         );
+    }
+
+    // Cohort's SQL assigns the flag as boolean and equates the tenant with a uuid, so PostgreSQL
+    // refuses a statement that compares a column that drifted to another type (42883).
+    [Theory]
+    [InlineData("IsDeleted", """ALTER COLUMN "IsDeleted" TYPE integer USING "IsDeleted"::integer""", "integer = boolean")]
+    [InlineData("TenantId", """ALTER COLUMN "TenantId" TYPE text USING "TenantId"::text""", "text = uuid")]
+    public async Task Readiness_refuses_a_retained_column_a_statement_cannot_compare(
+        string column,
+        string alteration,
+        string comparison
+    )
+    {
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await ExecuteAsync(database, $"ALTER TABLE public.soft_delete_records {alteration}");
+
+        using var host = new CohortTestHost(database.ConnectionString);
+
+        var act = () => host.RunSweepAsync(new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()));
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle(error =>
+            RefusesWith(error, typeof(SoftDeleteRecord), "42883", $"\"{column}\"")
+            && error.Contains($"operator does not exist: {comparison}", StringComparison.Ordinal)
+        );
+    }
+
+    [Theory]
+    [InlineData("DeletedAt", "DeletedAt", """ALTER COLUMN "DeletedAt" TYPE timestamp without time zone""")]
+    [InlineData("CreatedAt", "CreatedAt", """ALTER COLUMN "CreatedAt" TYPE timestamp without time zone""")]
+    public async Task Readiness_refuses_a_retained_column_of_the_wrong_type(
+        string column,
+        string member,
+        string alteration
+    )
+    {
+        // Cohort's SQL writes and compares the timestamps as timestamptz; a timestamp without time
+        // zone drifts with the session TimeZone, and PostgreSQL compares it without complaint, so
+        // a catalog rule owns this.
+        Assert.Equal("CreatedAt", typeof(SoftDeleteRecord).GetCustomAttribute<RetainAttribute>()!.AnchorMember);
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await using (var connection = new NpgsqlConnection(database.ConnectionString))
+        {
+            await connection.OpenAsync();
+            await using var command = new NpgsqlCommand(
+                $"ALTER TABLE public.soft_delete_records {alteration}",
+                connection
+            );
+            await command.ExecuteNonQueryAsync();
+        }
+
+        using var host = new CohortTestHost(database.ConnectionString);
+
+        var act = () => host.RunSweepAsync(new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()));
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle(error =>
+            error.Contains(typeof(SoftDeleteRecord).FullName!, StringComparison.Ordinal)
+            && error.Contains($"member {member}", StringComparison.Ordinal)
+            && error.Contains($"\"{column}\"", StringComparison.Ordinal)
+            && error.Contains("in the database, not", StringComparison.Ordinal)
+        );
+    }
+
+    [Fact]
+    public async Task Readiness_refuses_an_anonymised_at_marker_column_of_the_wrong_type()
+    {
+        await using var database = await AnonymiseTargetDatabaseAsync(
+            """ALTER TABLE public.anonymise_null_records ALTER COLUMN "AnonymisedAt" TYPE text"""
+        );
+        await using var provider = BuildAnonymiseTargetProvider(database.ConnectionString);
+
+        var errors = await ReadinessErrorsAsync(provider);
+
+        errors.Should().ContainSingle(error =>
+            error.Contains(typeof(AnonymiseNullRecord).FullName!, StringComparison.Ordinal)
+            && error.Contains("member AnonymisedAt", StringComparison.Ordinal)
+            && error.Contains("in the database, not", StringComparison.Ordinal)
+        );
+    }
+
+    [Theory]
+    [InlineData("CreatedAt")]
+    [InlineData("TenantId")]
+    public async Task Readiness_refuses_a_missing_anchor_or_tenant_column(string column)
+    {
+        // The migration that adds the column wasn't applied; every run reads it.
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await using (var connection = new NpgsqlConnection(database.ConnectionString))
+        {
+            await connection.OpenAsync();
+            await using var command = new NpgsqlCommand(
+                $"""ALTER TABLE public.soft_delete_records DROP COLUMN "{column}" CASCADE""",
+                connection
+            );
+            await command.ExecuteNonQueryAsync();
+        }
+
+        using var host = new CohortTestHost(database.ConnectionString);
+
+        var act = () => host.RunSweepAsync(new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()));
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle(error =>
+            RefusesWith(error, typeof(SoftDeleteRecord), "42703", $"\"{column}\"")
+        );
+    }
+
+    // An erasure matches rows by the subject column and a hold listing joins through it, so a
+    // subject column the database lost, or retyped away from the model's uuid, fails every
+    // erasure of its kind. Only the erasure scopes and the subject-kind hold listing read it.
+    [Theory]
+    [InlineData("""ALTER TABLE public.soft_delete_records DROP COLUMN "SubjectId" """, "42703", "column ")]
+    [InlineData(
+        """ALTER TABLE public.soft_delete_records ALTER COLUMN "SubjectId" TYPE text USING "SubjectId"::text""",
+        "42883",
+        "operator does not exist: text = uuid"
+    )]
+    public async Task Readiness_refuses_an_erasure_subject_column_missing_or_of_the_wrong_type(
+        string ddl,
+        string sqlState,
+        string message
+    )
+    {
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await ExecuteAsync(database, ddl);
+        using var host = new CohortTestHost(database.ConnectionString);
+
+        var act = () => host.RunSweepAsync(new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()));
+
+        (await act.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                RefusesWith(error, typeof(SoftDeleteRecord), sqlState, "\"SubjectId\"")
+                && error.Contains(message, StringComparison.Ordinal)
+                && error.Contains("erasing subjects of kind 'user'", StringComparison.Ordinal)
+            );
+    }
+
+    // A NULL tenant never matches a tenant's run, erasure, or hold, and `= FALSE` skips a NULL
+    // flag, so such rows stay forever. PostgreSQL accepts the statements, so a catalog rule owns
+    // this; a NOT NULL domain makes a nullable column NOT NULL.
+    [Theory]
+    [InlineData("""ALTER TABLE public.soft_delete_records ALTER COLUMN "TenantId" DROP NOT NULL""", true)]
+    [InlineData("SELECT 1", false)]
+    [InlineData(
+        """
+        CREATE DOMAIN public.required_tenant AS uuid NOT NULL;
+        ALTER TABLE public.soft_delete_records ALTER COLUMN "TenantId" DROP NOT NULL;
+        ALTER TABLE public.soft_delete_records ALTER COLUMN "TenantId" TYPE public.required_tenant;
+        """,
+        false
+    )]
+    public Task Readiness_checks_a_tenant_column_is_not_null(string ddl, bool refused) =>
+        AssertSoftDeleteRecordColumnNullabilityAsync(ddl, refused, "TenantId");
+
+    [Theory]
+    [InlineData("""ALTER TABLE public.soft_delete_records ALTER COLUMN "IsDeleted" DROP NOT NULL""", true)]
+    [InlineData("SELECT 1", false)]
+    [InlineData(
+        """
+        CREATE DOMAIN public.required_flag AS boolean NOT NULL;
+        ALTER TABLE public.soft_delete_records ALTER COLUMN "IsDeleted" DROP NOT NULL;
+        ALTER TABLE public.soft_delete_records ALTER COLUMN "IsDeleted" TYPE public.required_flag;
+        """,
+        false
+    )]
+    public Task Readiness_checks_a_soft_delete_flag_is_not_null(string ddl, bool refused) =>
+        AssertSoftDeleteRecordColumnNullabilityAsync(ddl, refused, "IsDeleted");
+
+    private async Task AssertSoftDeleteRecordColumnNullabilityAsync(string ddl, bool refused, string member)
+    {
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await ExecuteAsync(database, ddl);
+        using var host = new CohortTestHost(database.ConnectionString);
+
+        var act = () => host.RunSweepAsync(new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()));
+
+        if (refused)
+        {
+            (await act.Should().ThrowAsync<RetentionConfigurationException>())
+                .Which.Errors.Should().ContainSingle(error =>
+                    error.Contains(typeof(SoftDeleteRecord).FullName!, StringComparison.Ordinal)
+                    && error.Contains($"member {member}", StringComparison.Ordinal)
+                    && error.Contains("which is nullable in the database", StringComparison.Ordinal)
+                );
+        }
+        else
+        {
+            (await act()).EntityFailures.Should().BeEmpty();
+        }
+    }
+
+    // `AnonymisedAt IS NULL` finds the rows still to anonymise, so a NOT NULL marker, or a column
+    // over a NOT NULL domain, never matches a row.
+    [Theory]
+    [InlineData("""ALTER TABLE public.anonymise_null_records ALTER COLUMN "AnonymisedAt" SET NOT NULL""", true)]
+    [InlineData(
+        """
+        CREATE DOMAIN required_instant AS timestamptz NOT NULL;
+        ALTER TABLE public.anonymise_null_records ALTER COLUMN "AnonymisedAt" TYPE required_instant;
+        """,
+        true
+    )]
+    [InlineData("SELECT 1", false)]
+    public async Task Readiness_checks_an_anonymised_at_column_can_be_null(string ddl, bool refused)
+    {
+        await using var database = await AnonymiseTargetDatabaseAsync(ddl);
+        await using var provider = BuildAnonymiseTargetProvider(database.ConnectionString);
+
+        if (refused)
+        {
+            var errors = await ReadinessErrorsAsync(provider);
+
+            errors.Should().ContainSingle(error =>
+                error.Contains(typeof(AnonymiseNullRecord).FullName!, StringComparison.Ordinal)
+                && error.Contains("member AnonymisedAt", StringComparison.Ordinal)
+                && error.Contains("which is NOT NULL in the database", StringComparison.Ordinal)
+            );
+        }
+        else
+        {
+            var result = await provider.GetRequiredService<IRetentionSweep>().ExecuteAsync(
+                RetentionSweepRequest.Tenantless()
+            );
+
+            result.EntityFailures.Should().BeEmpty();
+        }
+    }
+
+    [Fact]
+    public async Task Readiness_accepts_a_soft_delete_flag_on_a_domain_over_boolean()
+    {
+        // A domain over a domain over boolean assigns and compares as boolean.
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await using (var connection = new NpgsqlConnection(database.ConnectionString))
+        {
+            await connection.OpenAsync();
+            await using var command = new NpgsqlCommand(
+                """
+                CREATE DOMAIN public.flag AS boolean;
+                CREATE DOMAIN public.flag2 AS public.flag;
+                ALTER TABLE public.soft_delete_records ALTER COLUMN "IsDeleted" TYPE public.flag2;
+                """,
+                connection
+            );
+            await command.ExecuteNonQueryAsync();
+        }
+
+        using var host = new CohortTestHost(database.ConnectionString);
+
+        var result = await host.RunSweepAsync(
+            new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>())
+        );
+
+        result.EntityFailures.Should().BeEmpty();
     }
 
     [Fact]
@@ -1831,9 +2356,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         var errors = await ReadinessErrorsAsync(provider);
 
         errors.Should().ContainSingle(error =>
-            error.Contains(entity.FullName!, StringComparison.Ordinal)
-            && error.Contains("member Label", StringComparison.Ordinal)
-            && error.Contains("the database generates", StringComparison.Ordinal)
+            RefusesWith(error, entity, "428C9", "column \"Label\" can only be updated to DEFAULT")
         );
     }
 
@@ -1934,9 +2457,11 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     // column, so the column needs an assignment path from the model's type. text to uuid has no
     // pg_cast row and uuid isn't a string type, so even a valid uuid literal, or a Null, fails
     // every run. integer to boolean has a pg_cast row, but it is explicit-only. An array assigns
-    // only through its elements, and text to uuid fails there too.
+    // only through its elements, and text to uuid fails there too. PostgreSQL refuses the
+    // anonymise UPDATE itself (42804), which readiness explains.
     [Theory]
     [InlineData("anonymise_uuid_literal_records", typeof(AnonymiseUuidLiteralRecord), "uuid", "text")]
+    [InlineData("anonymise_literal_records", typeof(AnonymiseLiteralRecord), "uuid", "text")]
     [InlineData("anonymise_null_records", typeof(AnonymiseNullRecord), "uuid", "text")]
     [InlineData("anonymise_null_integer_records", typeof(AnonymiseNullIntegerRecord), "boolean", "integer")]
     [InlineData("anonymise_null_text_array_records", typeof(AnonymiseNullTextArrayRecord), "uuid[]", "text[]")]
@@ -1955,11 +2480,11 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         var errors = await ReadinessErrorsAsync(provider);
 
         errors.Should().ContainSingle(error =>
-            error.Contains(entityType.FullName!, StringComparison.Ordinal)
-            && error.Contains("member Label", StringComparison.Ordinal)
-            && error.Contains(
-                $"model store type {modelType} can't be assigned to its column type {columnType} ",
-                StringComparison.Ordinal
+            RefusesWith(
+                error,
+                entityType,
+                "42804",
+                $"column \"Label\" is of type {columnType} but expression is of type {modelType}"
             )
         );
     }
@@ -1992,13 +2517,13 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     }
 
     [Theory]
-    [InlineData("""ALTER TABLE public.anonymise_literal_records DROP COLUMN "Label" """, "column", "\"Label\"")]
-    [InlineData("""ALTER TABLE public.anonymise_literal_records DROP COLUMN "Id" """, "record-id column", "\"Id\"")]
-    [InlineData("DROP TABLE public.anonymise_literal_records", "table", "\"public\".\"anonymise_literal_records\"")]
+    [InlineData("""ALTER TABLE public.anonymise_literal_records DROP COLUMN "Label" """, "42703", "\"Label\"")]
+    [InlineData("""ALTER TABLE public.anonymise_literal_records DROP COLUMN "Id" """, "42703", "\"Id\"")]
+    [InlineData("DROP TABLE public.anonymise_literal_records", "42P01", "\"public.anonymise_literal_records\"")]
     public async Task Readiness_refuses_an_anonymise_target_missing_from_the_database(
         string ddl,
-        string missing,
-        string name
+        string sqlState,
+        string quoted
     )
     {
         await using var database = await AnonymiseTargetDatabaseAsync(ddl);
@@ -2007,10 +2532,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         var errors = await ReadinessErrorsAsync(provider);
 
         errors.Should().ContainSingle(error =>
-            error.Contains(typeof(AnonymiseLiteralRecord).FullName!, StringComparison.Ordinal)
-            && error.Contains($"{missing} ", StringComparison.Ordinal)
-            && error.Contains(name, StringComparison.Ordinal)
-            && error.Contains("not found in the database", StringComparison.Ordinal)
+            RefusesWith(error, typeof(AnonymiseLiteralRecord), sqlState, quoted)
         );
     }
 
@@ -2107,6 +2629,15 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             && error.Contains(nameof(FormatException), StringComparison.Ordinal)
         );
     }
+
+    // PostgreSQL's refusal as readiness reports it: one error per entity holding the SQLSTATE, the
+    // message, and the statement text around the error's position. `quoted` is a fragment the
+    // message or that text carries, such as a quoted column or a message's own wording; the
+    // "reading" list of tables comes after both and never names a column.
+    private static bool RefusesWith(string error, Type entity, string sqlState, string quoted) =>
+        error.Contains($"Retained entity {entity.FullName}:", StringComparison.Ordinal)
+        && error.Contains($" {sqlState}: ", StringComparison.Ordinal)
+        && error.Contains(quoted, StringComparison.Ordinal);
 
     private Task<TemporaryDatabase> AnonymiseTargetDatabaseAsync(string? ddl = null) =>
         AnonymiseTargetDatabaseAsync<AnonymiseTargetDbContext>(ddl);
@@ -2296,40 +2827,79 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     )
     {
         // The EF model says text; only the catalog knows the column is a domain, array or range
-        // over a type whose text form follows TimeZone, DateStyle or extra_float_digits.
-        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
-        var options = new DbContextOptionsBuilder<SessionKeyDbContext>()
-            .UseNpgsql(database.ConnectionString)
-            .Options;
-        await using (var db = new SessionKeyDbContext(options))
-        {
-            await db.Database.ExecuteSqlRawAsync(db.Database.GenerateCreateScript());
-            if (typeDefinition != "")
-            {
-                await db.Database.ExecuteSqlRawAsync(typeDefinition);
-            }
-            var alter = $"ALTER TABLE public.session_key_records ALTER COLUMN \"Id\" TYPE {columnType} USING NULL";
-            await db.Database.ExecuteSqlRawAsync(alter);
-        }
-
-        var services = new ServiceCollection();
-        services.AddLogging();
-        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
-        services.AddDbContext<SessionKeyDbContext>(builder => builder.UseNpgsql(database.ConnectionString));
-        services.AddSingleton<IRetentionRuleProvider>(new SessionKeyRuleProvider());
-        services.AddSingleton(RetentionExecutionScope.Unisolated);
-        services.AddCohort<SessionKeyDbContext>();
-        await using var provider = services.BuildServiceProvider(validateScopes: true);
-
-        var act = () => provider.GetRequiredService<IRetentionSweep>().ExecuteAsync(
-            RetentionSweepRequest.Tenantless()
+        // over a type whose text form follows TimeZone, DateStyle or extra_float_digits. Here
+        // PostgreSQL has no operator for the column against text, so the statement check
+        // refuses it (42883) before the session-settings rule is reached.
+        await using var database = await SessionKeyDatabaseAsync<SessionKeyDbContext>(
+            "session_key_records",
+            typeDefinition,
+            columnType
         );
 
-        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        exception.Which.Errors.Should().ContainSingle(error =>
+        var errors = await SessionKeyErrorsAsync<SessionKeyDbContext>(database);
+
+        errors.Should().ContainSingle(error =>
+            RefusesWith(error, typeof(SessionKeyRecord), "42883", "\"Id\"")
+            && error.Contains($"operator does not exist: {columnType} = text", StringComparison.Ordinal)
+        );
+    }
+
+    [Fact]
+    public async Task Readiness_refuses_a_record_id_column_whose_text_form_depends_on_session_settings_when_it_compares()
+    {
+        // A numeric record id over a double precision column: float8 = numeric resolves through an
+        // implicit cast, so the statement check passes, and a hold join compares the column's text
+        // form, which follows extra_float_digits. The catalog rule owns this.
+        await using var database = await SessionKeyDatabaseAsync<NumericSessionKeyDbContext>(
+            "numeric_session_key_records",
+            typeDefinition: "",
+            "double precision"
+        );
+
+        var errors = await SessionKeyErrorsAsync<NumericSessionKeyDbContext>(database);
+
+        errors.Should().ContainSingle(error =>
             error.Contains("record-id column", StringComparison.Ordinal)
             && error.Contains("depends on session settings", StringComparison.Ordinal)
         );
+    }
+
+    // Creates the context's schema and retypes the record id column, which the model says is not
+    // what the database has.
+    private async Task<TemporaryDatabase> SessionKeyDatabaseAsync<TContext>(
+        string table,
+        string typeDefinition,
+        string columnType
+    )
+        where TContext : DbContext
+    {
+        var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        var options = new DbContextOptionsBuilder<TContext>().UseNpgsql(database.ConnectionString).Options;
+        await using var db = (TContext)Activator.CreateInstance(typeof(TContext), options)!;
+        await db.Database.ExecuteSqlRawAsync(db.Database.GenerateCreateScript());
+        if (typeDefinition != "")
+        {
+            await db.Database.ExecuteSqlRawAsync(typeDefinition);
+        }
+
+        var alter = $"ALTER TABLE public.{table} ALTER COLUMN \"Id\" TYPE {columnType} USING NULL";
+        await db.Database.ExecuteSqlRawAsync(alter);
+        return database;
+    }
+
+    private static async Task<IReadOnlyList<string>> SessionKeyErrorsAsync<TContext>(TemporaryDatabase database)
+        where TContext : DbContext
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
+        services.AddDbContext<TContext>(builder => builder.UseNpgsql(database.ConnectionString));
+        services.AddSingleton<IRetentionRuleProvider>(new SessionKeyRuleProvider());
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
+        services.AddCohort<TContext>();
+        await using var provider = services.BuildServiceProvider(validateScopes: true);
+
+        return await ReadinessErrorsAsync(provider);
     }
 
     [Fact]
@@ -2527,6 +3097,59 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         }
     }
 
+    // A retained table in a schema of its own, Cohort's tables in public.
+    private sealed class HostSchemaDbContext(DbContextOptions<HostSchemaDbContext> options) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<HostSchemaRecord>().ToTable("host_schema_records", "host_data");
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    [Retain("session-key", nameof(CreatedAt))]
+    [RetentionEntityId("9b3e7a15-4c82-4d60-b1f9-0a6d2e8c5f73")]
+    [RetentionTenantless]
+    private sealed class HostSchemaRecord
+    {
+        public Guid Id { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
+    }
+
+    // A record id whose store type is a domain, named without a schema, so PostgreSQL resolves
+    // the cast Cohort's statements make through the search path.
+    private sealed class SearchPathDbContext(DbContextOptions<SearchPathDbContext> options) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder
+                .Entity<SearchPathKeyRecord>()
+                .ToTable("search_path_key_records")
+                .Property(record => record.Id)
+                .HasColumnType("search_path_key");
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    [Retain("session-key", nameof(CreatedAt))]
+    [RetentionEntityId("2f6a9c13-8d47-4b05-a1e8-5c3b7d9f0e62")]
+    [RetentionTenantless]
+    private sealed class SearchPathKeyRecord
+    {
+        public string Id { get; set; } = "";
+        public DateTimeOffset CreatedAt { get; set; }
+    }
+
+    private sealed class NumericSessionKeyDbContext(DbContextOptions<NumericSessionKeyDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<NumericSessionKeyRecord>().ToTable("numeric_session_key_records");
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
     // A retained entity and no ConfigureCohortTables().
     private sealed class NoCohortTablesDbContext(DbContextOptions<NoCohortTablesDbContext> options)
         : DbContext(options)
@@ -2591,6 +3214,15 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     private sealed class SessionKeyRecord
     {
         public string Id { get; set; } = "";
+        public DateTimeOffset CreatedAt { get; set; }
+    }
+
+    [Retain("session-key", nameof(CreatedAt))]
+    [RetentionEntityId("7d1b4e92-3a60-4c85-b2f7-9e0a5c8d3f14")]
+    [RetentionTenantless]
+    private sealed class NumericSessionKeyRecord
+    {
+        public decimal Id { get; set; }
         public DateTimeOffset CreatedAt { get; set; }
     }
 

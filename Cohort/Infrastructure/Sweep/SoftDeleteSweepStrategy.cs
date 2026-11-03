@@ -35,34 +35,10 @@ internal sealed class SoftDeleteSweepStrategy(
         var softDelete = entry.SoftDelete!;
         if (softDelete.DeletedAtColumn is null)
         {
-            return new(
-                $"UPDATE {PostgreSqlIdentifier.Format(entry.Table)} AS target SET {PostgreSqlIdentifier.Quote(softDelete.IsDeletedColumn)} = TRUE",
-                static (_, _) => { }
-            );
+            return new(static (_, _) => { });
         }
 
-        var deletedAt = DeletedAtValue(entry, softDelete, scope.Now);
-        return new(
-            $"UPDATE {PostgreSqlIdentifier.Format(entry.Table)} AS target SET {PostgreSqlIdentifier.Quote(softDelete.IsDeletedColumn)} = TRUE, {PostgreSqlIdentifier.Quote(softDelete.DeletedAtColumn)} = @deletedAt",
-            (parameters, _) => parameters["deletedAt"] = deletedAt
-        );
-    }
-
-    private static object DeletedAtValue(
-        RetentionEntry entry,
-        SoftDeleteConvention softDelete,
-        DateTimeOffset now
-    )
-    {
-        var type = ReflectionMemberResolver
-            .FindPropertyByName(entry.EntityType, softDelete.DeletedAtMember!)
-            ?.PropertyType;
-        return type == typeof(DateTime) || type == typeof(DateTime?)
-            ? now.UtcDateTime
-            : type == typeof(DateTimeOffset) || type == typeof(DateTimeOffset?)
-                ? now
-                : throw new InvalidOperationException(
-                    $"Soft-delete DeletedAt member '{softDelete.DeletedAtMember}' on {entry.EntityType.FullName} must be DateTime or DateTimeOffset (nullable allowed), got {type?.Name ?? "no property"}."
-                );
+        var deletedAt = SweepStatements.DeletedAtValue(entry, softDelete, scope.Now);
+        return new((parameters, _) => parameters["deletedAt"] = deletedAt);
     }
 }

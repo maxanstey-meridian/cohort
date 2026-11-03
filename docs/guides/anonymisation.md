@@ -41,12 +41,11 @@ public string Phone { get; set; } = "";
 Cohort checks each anonymised column in the database when the host starts and refuses to run
 if the write could never succeed:
 
-- a column the database doesn't have, or one whose type the EF model's store type can't be
-  assigned to: Cohort's UPDATE casts each value, `Null` and factory values included, to the
-  model's store type, so a model that says `text` over a column migrated to `uuid` or `jsonb`
-  fails every run
-- a column the database generates (a generated column, or an identity column
-  `GENERATED ALWAYS`), which takes no UPDATE
+- PostgreSQL refuses the anonymise UPDATE itself, which readiness explains before any run: a
+  missing column, a column the database generates, a type it doesn't know, or one the value
+  can't be assigned to. Cohort's UPDATE casts each value, `Null` and factory values included,
+  to the model's store type, so a model that says `text` over a column migrated to `uuid` or
+  `jsonb` is refused
 - an `EmptyString` or `FixedLiteral` value, after the property's value converter, that the
   model's store type or the column type won't accept: too long for a `varchar(n)` or `char(n)`,
   not valid input for the type (a `uuid`, `jsonb`, or integer column behind a string converter),

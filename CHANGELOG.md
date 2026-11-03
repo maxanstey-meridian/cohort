@@ -50,11 +50,23 @@ A hold on a row also holds the rows a host declares related to it.
   different model, since it reads only through its connection; the refusal now says 'a
   different database'. Readiness reads the database's identity from the server once for each
   model copy and connection it hasn't validated, one extra round trip.
-- Readiness refuses a retained entity whose soft-delete flag, deleted-at, or anonymised-at
-  column the database doesn't have, when a strategy its category declares writes it, as it
-  already refused a missing table, record-id column, or anonymised column. It also refuses a
-  marker or anonymised column the database generates (a generated column, or an identity column
-  `GENERATED ALWAYS`), which takes no UPDATE. Before, every such run failed at its UPDATE.
+- Readiness asks PostgreSQL to analyse and plan, without running, every statement Cohort can
+  send for the host's model and declared strategies (sweeps, previews, erasures for each subject
+  kind, holds, and the tenant-coverage scan), and refuses what PostgreSQL refuses: a missing
+  table or column, including erasure-subject columns, a type a statement can't compare or
+  assign, a column the database generates, an unknown cast type, or a privilege the database
+  role lacks for any statement Cohort may send. The role readiness validates under must hold
+  every privilege Cohort needs. The refusal carries PostgreSQL's SQLSTATE and message. It also
+  refuses a nullable tenant column, a nullable soft-delete flag, and an anonymised-at column
+  that is NOT NULL, since each makes rows silently never match. Startup refuses an anonymised-at
+  marker with a default or value generation mapped in the EF model, since EF then never writes
+  it NULL; the anchor, deleted-at, and anonymised-at columns must be `timestamp with time zone`.
+  The statement check's success is kept per database, role, and search path. Before, every such
+  run failed at its SQL, or, for a timestamp without time zone, drifted with the session
+  TimeZone. Breaking: the refusal texts for missing or mistyped columns are now PostgreSQL's
+  (one error per entity, with its SQLSTATE, message, and the statement text around the error),
+  and a host whose role lacks a privilege for any of Cohort's statements is refused at readiness
+  instead of failing the first run that needs it.
 
 Upgrade: [Legal Holds](https://maxanstey-meridian.github.io/cohort/guides/legal-holds#upgrading-to-0-12-0).
 

@@ -35,39 +35,12 @@ internal static class RetentionTenantCoverage
         var emptyTenantEntities = new List<Type>();
         foreach (var entry in registry.Scan().Values)
         {
-            if (entry.Tenant is not { } tenant)
+            if (Statement(entry, capabilities, sourceTenantIds.ToArray()) is not { } statement)
             {
                 continue;
             }
 
-            // The missing tenant's own rule can't be resolved without the context it lacks, so
-            // every strategy the category may resolve to counts. A category with no validated
-            // capabilities counts every row: the conservative answer.
-            var actionable = capabilities.TryGetValue(entry.Category, out var declared)
-                ? SweepEligibilitySql.AnyPredicate(declared.Strategies, entry)
-                : "";
-            if (actionable is null)
-            {
-                continue;
-            }
-
-            // One pass over the table, whatever its indexes: the source's tenants and retired
-            // rows are filtered out as rows are read, and only the tenants left are aggregated.
-            var table = PostgreSqlIdentifier.Format(entry.Table);
-            var column = PostgreSqlIdentifier.Quote(tenant.TenantColumn);
-            var actionableClause = actionable.Length > 0 ? $"AND ({actionable})" : "";
-            await using var command = new SqlParams
-            {
-                ["sourceTenantIds"] = sourceTenantIds.ToArray(),
-            }.CreateCommand(
-                connection,
-                null,
-                $"""
-                SELECT DISTINCT target.{column} FROM {table} AS target
-                WHERE target.{column} IS NOT NULL AND NOT (target.{column} = ANY(@sourceTenantIds))
-                {actionableClause}
-                """
-            );
+            await using var command = statement.Parameters.CreateCommand(connection, null, statement.Sql);
             await using var reader = await command.ExecuteReaderAsync(ct);
             while (await reader.ReadAsync(ct))
             {
@@ -84,6 +57,51 @@ internal static class RetentionTenantCoverage
         }
 
         return new TenantCoverageGaps(missing.ToArray(), emptyTenantEntities);
+    }
+
+    /// <summary>
+    /// S12: the scan for one entity, or null when the run issues none: a tenantless entity, or a
+    /// category whose declared strategies act on no row (only Exempt). <paramref name="sourceTenantIds"/>
+    /// (a <c>Guid[]</c>) is bound as given.
+    /// </summary>
+    internal static SweepStatement? Statement(
+        RetentionEntry entry,
+        IReadOnlyDictionary<string, RetentionCategoryCapabilities> capabilities,
+        object? sourceTenantIds
+    )
+    {
+        if (entry.Tenant is not { } tenant)
+        {
+            return null;
+        }
+
+        // The missing tenant's own rule can't be resolved without the context it lacks, so
+        // every strategy the category may resolve to counts. A category with no validated
+        // capabilities counts every row: the conservative answer.
+        var actionable = capabilities.TryGetValue(entry.Category, out var declared)
+            ? SweepEligibilitySql.AnyPredicate(declared.Strategies, entry)
+            : "";
+        if (actionable is null)
+        {
+            return null;
+        }
+
+        // One pass over the table, whatever its indexes: the source's tenants and retired
+        // rows are filtered out as rows are read, and only the tenants left are aggregated.
+        var table = PostgreSqlIdentifier.Format(entry.Table);
+        var column = PostgreSqlIdentifier.Quote(tenant.TenantColumn);
+        var actionableClause = actionable.Length > 0 ? $"AND ({actionable})" : "";
+        return new SweepStatement(
+            "tenant-coverage",
+            entry.EntityType,
+            $"""
+            SELECT DISTINCT target.{column} FROM {table} AS target
+            WHERE target.{column} IS NOT NULL AND NOT (target.{column} = ANY(@sourceTenantIds))
+            {actionableClause}
+            """,
+            new SqlParams { ["sourceTenantIds"] = sourceTenantIds },
+            [entry.Table]
+        );
     }
 }
 

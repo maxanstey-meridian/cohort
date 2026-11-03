@@ -160,13 +160,17 @@ internal sealed class EfRetentionDeletion(
     )
     {
         // Covered through a relation counts as held, exactly as a sweep judges it.
-        var (sql, parameters) = RetentionHoldSql.BuildAnyCoveringHold(
+        var statement = RetentionHoldSql.BuildAnyCoveringHold(
             Tables.RetentionHolds,
             target.Entry,
             target.RecordId,
             target.TenantId
         );
-        await using var command = parameters.CreateCommand(db.Database.GetDbConnection(), transaction, sql);
+        await using var command = statement.Parameters.CreateCommand(
+            db.Database.GetDbConnection(),
+            transaction,
+            statement.Sql
+        );
         return await command.ExecuteScalarAsync(ct) is not null;
     }
 

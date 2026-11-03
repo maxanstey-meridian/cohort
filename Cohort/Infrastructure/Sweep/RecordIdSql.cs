@@ -51,22 +51,34 @@ internal static class RecordIdSql
             : $"CAST({targetAlias}.{PostgreSqlIdentifier.Quote(recordId.RecordIdColumn)} AS text) = ANY(@{parameterName})";
     }
 
+    /// <summary>
+    /// S11: the canonical text of a record key, through the store type. It reads no host table:
+    /// it only needs the store type to be one PostgreSQL knows.
+    /// </summary>
+    internal static SweepStatement CanonicalizeStatement(RetentionEntry entry, object? value)
+    {
+        var storeType = PostgresStoreTypeSql.CastType(entry.RecordId.RecordIdStoreType);
+        return new SweepStatement(
+            "canonicalize-record-id",
+            entry.EntityType,
+            storeType is null
+                ? "SELECT CAST(@recordId AS text)"
+                : $"SELECT CAST(CAST(@recordId AS {storeType}) AS text)",
+            new SqlParams { ["recordId"] = value },
+            []
+        );
+    }
+
     internal static async Task<string> CanonicalizeAsync(
         DbConnection connection,
         DbTransaction transaction,
-        RecordIdConvention recordId,
+        RetentionEntry entry,
         object value,
         CancellationToken ct
     )
     {
-        var storeType = PostgresStoreTypeSql.CastType(recordId.RecordIdStoreType);
-        await using var command = new SqlParams { ["recordId"] = value }.CreateCommand(
-            connection,
-            transaction,
-            storeType is null
-                ? "SELECT CAST(@recordId AS text)"
-                : $"SELECT CAST(CAST(@recordId AS {storeType}) AS text)"
-        );
+        var statement = CanonicalizeStatement(entry, value);
+        await using var command = statement.Parameters.CreateCommand(connection, transaction, statement.Sql);
         return (string)(await command.ExecuteScalarAsync(ct))!;
     }
 }

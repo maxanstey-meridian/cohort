@@ -39,6 +39,17 @@ internal sealed class AnonymiseAssignmentResolver(
     internal object? ProviderLiteral(RetentionEntry entry, AnonymiseLiteralField field) =>
         ConvertAssignmentValueToProvider(entry, field, CreateLiteralAssignmentValue(field));
 
+    /// <summary>
+    /// The CLR type the UPDATE binds for the field's value: its property's value converter's
+    /// provider type, else the property's own. Reads the model only, so it runs no converter and
+    /// no factory.
+    /// </summary>
+    internal Type ProviderType(RetentionEntry entry, AnonymiseField field)
+    {
+        var property = ResolveEfProperty(entry, field.MemberName);
+        return property.GetTypeMapping().Converter?.ProviderClrType ?? property.ClrType;
+    }
+
     private IReadOnlyList<AnonymiseFactoryField> GetOriginalValueFields(RetentionEntry entry)
     {
         return entry

@@ -31,12 +31,11 @@ public sealed class HeldWithReadinessEndToEndTests(PostgresFixture fixture)
     }
 
     [Theory]
-    [InlineData("held_with_links", "CaseId", "[HeldWith(typeof(", nameof(ReadinessLink))]
-    [InlineData("held_with_cases", "SourceSubmissionId", "[HeldWithReferencing(typeof(", nameof(ReadinessSubmission))]
+    [InlineData("held_with_links", "CaseId", nameof(ReadinessLink))]
+    [InlineData("held_with_cases", "SourceSubmissionId", nameof(ReadinessSubmission))]
     public async Task A_Link_Column_Missing_From_The_Real_Table_Fails_Readiness(
         string table,
         string column,
-        string attribute,
         string declaringType
     )
     {
@@ -46,11 +45,19 @@ public sealed class HeldWithReadinessEndToEndTests(PostgresFixture fixture)
 
         var act = () => SweepAsync(services);
 
+        // The hold statements of both ends of the link read the column, so PostgreSQL refuses both
+        // ends' statements; the declaring entity's error carries the column (42703) and the table
+        // the statements read.
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-        var error = exception.Which.Errors.Should().ContainSingle().Which;
-        error.Should().Contain(attribute);
-        error.Should().Contain($"on {typeof(HeldWithReadinessEndToEndTests).FullName}+{declaringType}");
-        error.Should().Contain($"link column \"public\".\"{table}\".\"{column}\" was not found in the database");
+        exception.Which.Errors.Should().ContainSingle(error =>
+            error.StartsWith(
+                $"Retained entity {typeof(HeldWithReadinessEndToEndTests).FullName}+{declaringType}:",
+                StringComparison.Ordinal
+            )
+            && error.Contains(" 42703: column ", StringComparison.Ordinal)
+            && error.Contains($"\"{column}\"", StringComparison.Ordinal)
+            && error.Contains($"\"public\".\"{table}\"", StringComparison.Ordinal)
+        );
     }
 
     [Theory]
@@ -228,18 +235,32 @@ public sealed class HeldWithReadinessEndToEndTests(PostgresFixture fixture)
 
     private static async Task<ServiceProvider> BuildMigratedServicesAsync(string connectionString)
     {
+        var provider = BuildServices(connectionString);
+
+        await using var scope = provider.CreateAsyncScope();
+        await scope.ServiceProvider.GetRequiredService<HeldWithReadinessDbContext>().Database.EnsureCreatedAsync();
+        return provider;
+    }
+
+    // This test class's model, which declares hold relations the sample's doesn't, as a host
+    // would register it. ReadinessStatementCoverageTests runs it too.
+    internal static ServiceProvider BuildServices(
+        string connectionString,
+        Action<IServiceCollection>? configure = null,
+        IReadOnlyDictionary<string, string?>? configuration = null
+    )
+    {
         var services = new ServiceCollection();
-        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().AddInMemoryCollection().Build());
+        services.AddSingleton<IConfiguration>(
+            new ConfigurationBuilder().AddInMemoryCollection(configuration).Build()
+        );
         services.AddLogging();
         services.AddDbContext<HeldWithReadinessDbContext>(options => options.UseNpgsql(connectionString));
         services.AddSingleton<IRetentionRuleProvider>(new PurgeCategoryProvider());
         services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<HeldWithReadinessDbContext>();
-        var provider = services.BuildServiceProvider(validateScopes: true);
-
-        await using var scope = provider.CreateAsyncScope();
-        await scope.ServiceProvider.GetRequiredService<HeldWithReadinessDbContext>().Database.EnsureCreatedAsync();
-        return provider;
+        configure?.Invoke(services);
+        return services.BuildServiceProvider(validateScopes: true);
     }
 
     private sealed class PurgeCategoryProvider : ITestRetentionRuleProvider
@@ -252,7 +273,7 @@ public sealed class HeldWithReadinessEndToEndTests(PostgresFixture fixture)
             Task.FromResult<ITestRetentionRule?>(category == "held-with-readiness" ? Resolver : null);
     }
 
-    private sealed class HeldWithReadinessDbContext(DbContextOptions<HeldWithReadinessDbContext> options)
+    internal sealed class HeldWithReadinessDbContext(DbContextOptions<HeldWithReadinessDbContext> options)
         : DbContext(options)
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
@@ -300,7 +321,7 @@ public sealed class HeldWithReadinessEndToEndTests(PostgresFixture fixture)
 
     [Retain("held-with-readiness", nameof(CreatedAt))]
     [RetentionEntityId("00000000-0000-0000-0005-000000000004")]
-    private sealed class ReadinessNote
+    internal sealed class ReadinessNote
     {
         public string Id { get; init; } = "";
         public Guid TenantId { get; init; }

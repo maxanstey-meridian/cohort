@@ -227,6 +227,19 @@ internal sealed partial class RetentionStartupValidator(
                                 $"Anonymise convention on {clrType.FullName}: retained Anonymise categories require a nullable DateTimeOffset marker property (named AnonymisedAt by convention, or marked with [RetentionAnonymisedAt]). NULL marks rows not yet anonymised; without it anonymisation re-scrubs every expired row on every sweep."
                             );
                         }
+                        else if (
+                            entityType.FindProperty(entry.AnonymisedAt.AnonymisedAtMember) is { } marker
+                            && (
+                                marker.GetDefaultValue() is not null
+                                || marker.GetDefaultValueSql() is not null
+                                || marker.ValueGenerated != ValueGenerated.Never
+                            )
+                        )
+                        {
+                            errors.Add(
+                                $"Anonymise convention on {clrType.FullName}: the AnonymisedAt marker {entry.AnonymisedAt.AnonymisedAtMember} has a default or value generation mapped in the EF model (HasDefaultValue, HasDefaultValueSql, or ValueGenerated), so EF leaves it out of an insert and the database fills it in: every row would be born marked as anonymised and never anonymised. Remove the default or the value generation; NULL must mark rows not yet anonymised."
+                            );
+                        }
                     }
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)

@@ -45,13 +45,15 @@ if the write could never succeed:
   assigned to: Cohort's UPDATE casts each value, `Null` and factory values included, to the
   model's store type, so a model that says `text` over a column migrated to `uuid` or `jsonb`
   fails every run
+- a column the database generates (a generated column, or an identity column
+  `GENERATED ALWAYS`), which takes no UPDATE
 - an `EmptyString` or `FixedLiteral` value, after the property's value converter, that the
   model's store type or the column type won't accept: too long for a `varchar(n)` or `char(n)`,
-  not valid input for the type (a `uuid`, `jsonb` or integer column behind a string converter),
+  not valid input for the type (a `uuid`, `jsonb`, or integer column behind a string converter),
   or refused by a domain's `CHECK`; or a literal the value converter throws on
 - `Null` into a column the database declares `NOT NULL`, directly or through its domain (or a
   domain that domain is built on), even when the EF model says nullable
-- `EmptyString`, `FixedLiteral` or a `Static` factory on a column in the key of a unique index
+- `EmptyString`, `FixedLiteral`, or a `Static` factory on a column in the key of a unique index
   that has no filter and doesn't have the record ID in its key, because every anonymised row
   would get the same value (also `Null` when the index is `NULLS NOT DISTINCT`). A unique index
   filtered on `"AnonymisedAt" IS NULL` is fine, and so is a column the index only `INCLUDE`s

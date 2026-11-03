@@ -577,6 +577,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
                            attribute.attnum,
                            attribute.atttypid,
                            attribute.attnotnull,
+                           attribute.attgenerated <> '' OR attribute.attidentity = 'a' AS is_generated,
                            pg_catalog.format_type(attribute.atttypid, attribute.atttypmod) AS column_type,
                            pg_catalog.to_regtype(requested.cast_type) AS cast_type_id
                     FROM ROWS FROM (
@@ -664,7 +665,9 @@ internal sealed class RetentionRuntimeReadinessValidator(
                            WHERE foreign_key.contype = 'f'
                              AND foreign_key.confrelid = requested.relation_id
                              AND requested.attnum = ANY(foreign_key.confkey)
-                       )
+                       ),
+                       -- A generated column or an identity column GENERATED ALWAYS takes no UPDATE.
+                       COALESCE(requested.is_generated, false)
                 FROM requested
                 LEFT JOIN type_base column_type ON column_type.type_id = requested.atttypid
                 LEFT JOIN type_base cast_type ON cast_type.type_id = requested.cast_type_id
@@ -721,6 +724,14 @@ internal sealed class RetentionRuntimeReadinessValidator(
                     var nullsNotDistinctUnique = reader.GetBoolean(9);
                     var foreignKeyChild = reader.GetBoolean(10);
                     var referencedKey = reader.GetBoolean(11);
+
+                    if (reader.GetBoolean(12))
+                    {
+                        errors.Add(
+                            $"{target}, which the database generates (a generated column, or an identity column GENERATED ALWAYS), so every anonymise of these rows would fail. Make it an ordinary column, or stop anonymising it."
+                        );
+                        continue;
+                    }
 
                     var method = field is AnonymiseLiteralField literal ? literal.Method : (AnonymiseMethod?)null;
                     var writesOneValue =
@@ -800,10 +811,12 @@ internal sealed class RetentionRuntimeReadinessValidator(
 
     /// <summary>
     /// The columns the update strategies always write, the soft-delete flag and deleted-at, and
-    /// the anonymised-at marker, must exist, or every run would fail at its UPDATE. And an update
-    /// must never change a key another table references: the foreign key would refuse it while a
-    /// row references it, or silently rewrite the referencing rows. The anonymise check covers
-    /// the anonymised columns; the retained-tables check has already refused a missing table.
+    /// the anonymised-at marker, must exist, and must not be one the database generates (a
+    /// generated column, or an identity column GENERATED ALWAYS, which takes no UPDATE), or every
+    /// run would fail at its UPDATE. And an update must never change a key another table
+    /// references: the foreign key would refuse it while a row references it, or silently rewrite
+    /// the referencing rows. The anonymise check covers the anonymised columns; the
+    /// retained-tables check has already refused a missing table.
     /// </summary>
     private static async Task ValidateMarkerColumnsAsync(
         DatabaseFacade database,
@@ -828,7 +841,10 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 database.GetDbConnection(),
                 database.CurrentTransaction?.GetDbTransaction(),
                 """
-                SELECT requested.ordinal, attribute.attnum IS NULL
+                SELECT requested.ordinal,
+                       attribute.attnum IS NULL,
+                       -- A generated column or an identity column GENERATED ALWAYS takes no UPDATE.
+                       COALESCE(attribute.attgenerated <> '' OR attribute.attidentity = 'a', false)
                 FROM ROWS FROM (
                     pg_catalog.unnest(@schemas),
                     pg_catalog.unnest(@tables),
@@ -842,7 +858,10 @@ internal sealed class RetentionRuntimeReadinessValidator(
                  AND attribute.attname = requested.column_name
                  AND attribute.attnum > 0
                  AND NOT attribute.attisdropped
-                WHERE attribute.attnum IS NULL OR EXISTS (
+                WHERE attribute.attnum IS NULL
+                   OR attribute.attgenerated <> ''
+                   OR attribute.attidentity = 'a'
+                   OR EXISTS (
                     SELECT 1 FROM pg_catalog.pg_constraint foreign_key
                     WHERE foreign_key.contype = 'f'
                       AND foreign_key.confrelid = relation.oid
@@ -860,7 +879,9 @@ internal sealed class RetentionRuntimeReadinessValidator(
                     var column = $"{PostgreSqlIdentifier.Format(marker.Table)}.{PostgreSqlIdentifier.Quote(marker.Column)}";
                     errors.Add(
                         reader.GetBoolean(1)
-                            ? $"Retained entity {marker.Entity}: member {marker.Member} writes column {column}, which was not found in the database, so {marker.Strategy} a row would fail. Apply the host application's pending EF Core migrations, or map the member to the column it lives in."
+                            ? $"Retained entity {marker.Entity}: member {marker.Member} writes column {column}, which was not found in the database, so {marker.Strategy} any row would fail. Apply the host application's pending EF Core migrations, or map the member to the column it lives in."
+                        : reader.GetBoolean(2)
+                            ? $"Retained entity {marker.Entity}: member {marker.Member} writes column {column}, which the database generates (a generated column, or an identity column GENERATED ALWAYS), so {marker.Strategy} any row would fail. Make it an ordinary column."
                             : $"Retained entity {marker.Entity}: member {marker.Member} writes column {column}, which is referenced by a foreign key, so {marker.Strategy} a row would be refused while a row references it or would silently rewrite the referencing rows (ON UPDATE CASCADE or SET NULL). Stop referencing this column."
                     );
                 }

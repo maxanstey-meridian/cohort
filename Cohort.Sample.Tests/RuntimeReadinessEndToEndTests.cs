@@ -1760,6 +1760,84 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Readiness_refuses_a_soft_delete_marker_column_the_database_generates()
+    {
+        // A generated column takes no UPDATE; every soft-delete would fail at "column can only be updated to DEFAULT".
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await using (var connection = new NpgsqlConnection(database.ConnectionString))
+        {
+            await connection.OpenAsync();
+            await using var command = new NpgsqlCommand(
+                """
+                ALTER TABLE public.soft_delete_records DROP COLUMN "IsDeleted";
+                ALTER TABLE public.soft_delete_records
+                    ADD COLUMN "IsDeleted" boolean GENERATED ALWAYS AS ("DeletedAt" IS NOT NULL) STORED
+                """,
+                connection
+            );
+            await command.ExecuteNonQueryAsync();
+        }
+
+        using var host = new CohortTestHost(database.ConnectionString);
+
+        var act = () => host.RunSweepAsync(new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()));
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle(error =>
+            error.Contains(typeof(SoftDeleteRecord).FullName!, StringComparison.Ordinal)
+            && error.Contains("member IsDeleted", StringComparison.Ordinal)
+            && error.Contains("the database generates", StringComparison.Ordinal)
+        );
+    }
+
+    [Fact]
+    public async Task Readiness_accepts_a_missing_marker_column_no_declared_strategy_writes()
+    {
+        // The category declares only Purge, which never writes the soft-delete flag.
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await using (var connection = new NpgsqlConnection(database.ConnectionString))
+        {
+            await connection.OpenAsync();
+            await using var command = new NpgsqlCommand(
+                """ALTER TABLE public.soft_delete_records DROP COLUMN "IsDeleted" """,
+                connection
+            );
+            await command.ExecuteNonQueryAsync();
+        }
+
+        using var host = new CohortTestHost(database.ConnectionString, new PurgeOnlySoftDeleteRuleProvider());
+
+        var result = await host.RunSweepAsync(
+            new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>())
+        );
+
+        result.EntityFailures.Should().BeEmpty();
+    }
+
+    [Theory]
+    [InlineData(typeof(AnonymiseNullRecord), "anonymise_null_records", "text GENERATED ALWAYS AS ('x') STORED")]
+    [InlineData(typeof(AnonymiseNullIntegerRecord), "anonymise_null_integer_records", "integer GENERATED ALWAYS AS IDENTITY")]
+    public async Task Readiness_refuses_an_anonymised_column_the_database_generates(
+        Type entity,
+        string table,
+        string definition
+    )
+    {
+        await using var database = await AnonymiseTargetDatabaseAsync(
+            $"""ALTER TABLE public.{table} DROP COLUMN "Label"; ALTER TABLE public.{table} ADD COLUMN "Label" {definition}"""
+        );
+        await using var provider = BuildAnonymiseTargetProvider(database.ConnectionString);
+
+        var errors = await ReadinessErrorsAsync(provider);
+
+        errors.Should().ContainSingle(error =>
+            error.Contains(entity.FullName!, StringComparison.Ordinal)
+            && error.Contains("member Label", StringComparison.Ordinal)
+            && error.Contains("the database generates", StringComparison.Ordinal)
+        );
+    }
+
+    [Fact]
     public async Task Readiness_refuses_null_into_a_column_the_database_declares_not_null()
     {
         // The model says nullable; the database was changed underneath it.
@@ -2712,6 +2790,22 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         public string[]? Label { get; set; }
 
         public DateTimeOffset? AnonymisedAt { get; set; }
+    }
+
+    // The sample's rules, except that its soft-delete category declares and resolves Purge only.
+    private sealed class PurgeOnlySoftDeleteRuleProvider : IRetentionRuleProvider
+    {
+        private readonly SampleRetentionRuleProvider sample = new();
+
+        public RetentionCategoryCapabilities? GetCapabilities(string category) =>
+            category == "soft-delete"
+                ? new RetentionCategoryCapabilities([Strategy.Purge])
+                : sample.GetCapabilities(category);
+
+        public Task<RetentionRule?> ResolveAsync(RetentionResolutionContext context, CancellationToken ct) =>
+            context.Category == "soft-delete"
+                ? Task.FromResult<RetentionRule?>(new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge))
+                : sample.ResolveAsync(context, ct);
     }
 
     private sealed class AnonymiseTargetRuleProvider : IRetentionRuleProvider

@@ -1446,11 +1446,53 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         }
     }
 
+    // Not every refusal is a class 42 error. Plain EXPLAIN still starts the executor, which checks
+    // each table an UPDATE or DELETE targets: a retained table in a publication that publishes
+    // updates and deletes, with no replica identity, can take neither (SQLSTATE 55000). Every run
+    // would hit that, so readiness refuses it, naming the entity, as it refuses a missing column.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Readiness_refuses_a_retained_table_whose_publication_cannot_take_its_updates(bool wrapped)
+    {
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await ExecuteAsync(
+            database,
+            """
+            ALTER TABLE public.soft_delete_records REPLICA IDENTITY NOTHING;
+            CREATE PUBLICATION cohort_readiness_pub FOR TABLE public.soft_delete_records WITH (publish = 'update, delete');
+            """
+        );
+        var wrappers = new List<PassThroughConnection>();
+        await using var provider = BuildModelCopyProvider(
+            database.ConnectionString,
+            connect: WrapWhen(wrapped, wrappers)
+        );
+
+        try
+        {
+            var errors = await ReadinessErrorsAsync(provider);
+
+            errors.Should().ContainSingle(error =>
+                RefusesWith(error, typeof(SoftDeleteRecord), "55000", "replica identity")
+            );
+            (wrappers.Count > 0).Should().Be(wrapped, "the context runs on a wrapper exactly when wrapped");
+        }
+        finally
+        {
+            foreach (var wrapper in wrappers)
+            {
+                await wrapper.DisposeAsync();
+            }
+        }
+    }
+
     // Only a rule violation (SQLSTATE class 42 and the like) says the host's schema is wrong. A
-    // lock timeout says nothing about it, so readiness lets it propagate as PostgreSQL raised it,
-    // and leaves a caller's transaction usable, as a refusal does. A second connection holds an
-    // ACCESS EXCLUSIVE lock on a retained table, so the first EXPLAIN that reads it waits for
-    // 200 ms and times out.
+    // lock timeout says nothing about it, so readiness lets it propagate as PostgreSQL raised it
+    // (a PostgresException on a plain connection and on a wrapped one, even though the batch path
+    // sees one failure per EXPLAIN that reads the table), and leaves a caller's transaction
+    // usable, as a refusal does. A second connection holds an ACCESS EXCLUSIVE lock on a retained
+    // table, so each EXPLAIN that reads it waits for 200 ms and times out.
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -1481,18 +1523,16 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
                 RetentionSweepRequest.Tenantless()
             );
 
-            var inOwnTransaction = (await ownTransaction.Should().ThrowAsync<Exception>()).Which;
-            inOwnTransaction.Should().NotBeOfType<RetentionConfigurationException>();
-            PostgresFailureIn(inOwnTransaction).Should().Be(PostgresErrorCodes.LockNotAvailable);
+            (await ownTransaction.Should().ThrowAsync<PostgresException>())
+                .Which.SqlState.Should().Be(PostgresErrorCodes.LockNotAvailable);
 
             await using var scope = provider.CreateAsyncScope();
             var db = scope.ServiceProvider.GetRequiredService<SampleDbContext>();
             await using var transaction = await db.Database.BeginTransactionAsync();
             var inCallerTransaction = () => ListActiveHoldsAsync(scope.ServiceProvider);
 
-            var inCaller = (await inCallerTransaction.Should().ThrowAsync<Exception>()).Which;
-            inCaller.Should().NotBeOfType<RetentionConfigurationException>();
-            PostgresFailureIn(inCaller).Should().Be(PostgresErrorCodes.LockNotAvailable);
+            (await inCallerTransaction.Should().ThrowAsync<PostgresException>())
+                .Which.SqlState.Should().Be(PostgresErrorCodes.LockNotAvailable);
             (await db.Database.SqlQueryRaw<int>("SELECT 1 AS \"Value\"").SingleAsync()).Should().Be(1);
             await transaction.RollbackAsync();
             (wrappers.Count > 0).Should().Be(wrapped, "the context runs on a wrapper exactly when wrapped");
@@ -1506,19 +1546,6 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             }
         }
     }
-
-    // The SQLSTATE of the PostgreSQL error an exception carries: itself, or inside the exception a
-    // batch throws (an NpgsqlException over an AggregateException), which readiness rethrows
-    // unchanged.
-    private static string? PostgresFailureIn(Exception exception) =>
-        exception switch
-        {
-            PostgresException failure => failure.SqlState,
-            AggregateException aggregate => aggregate
-                .InnerExceptions.Select(PostgresFailureIn)
-                .FirstOrDefault(state => state is not null),
-            _ => exception.InnerException is { } inner ? PostgresFailureIn(inner) : null,
-        };
 
     // A wrapped DbConnection can't batch, so its statements are explained one at a time.
     [Fact]

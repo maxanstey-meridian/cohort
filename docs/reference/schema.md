@@ -55,12 +55,14 @@ the same key columns counts, unique or not.
 The application services and the dispatcher check readiness themselves, so a host that
 skipped startup validation still can't run against a missing or outdated schema.
 
-Readiness validates once per service provider and database, then trusts the result: each
+Readiness validates once per model and connection string, then trusts the result: each
 database check keeps its success, unless it passed inside the caller's transaction, under what
 it read, so later contexts, including new copies of the same EF model, don't run it again. The
-anonymise-target check is the exception and runs once for each copy of the model. The statement
-check is also kept per database role and search path, since privileges depend on the role and
-type names resolve through the path. A schema that
+anonymise-target check is the exception and runs once for each copy of the model. Because
+readiness runs once, only the role of the first operation to reach it is checked, so a role
+switched later (by `SET ROLE` in an execution-scope hook, say) is never checked. The statement
+check's pass is shared between copies of the model only for the same database, role, and search
+path, since privileges depend on the role and type names resolve through the path. A schema that
 drifts after that isn't refused by readiness; the run fails at the statement the change
 breaks. A change readiness would refuse, made while the application runs, is caught when it
 next starts.

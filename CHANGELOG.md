@@ -58,16 +58,19 @@ A hold on a row also holds the rows a host declares related to it.
   generates, an unknown cast type, or a privilege the database role lacks for one of those
   statements. The role readiness validates under must hold the privileges those statements need
   (`SELECT` and `UPDATE` on the retained tables, `DELETE` where `Purge` is declared, `SELECT` on
-  `retention_holds` and `sweep_run_row_detail`, and `USAGE` on their schemas). The refusal
+  `retention_holds`, `sweep_run_row_detail`, and the child table of any foreign key that blocks
+  a purge, and `USAGE` on the schemas of all of those tables). The refusal
   carries PostgreSQL's SQLSTATE and message. It also refuses a nullable tenant column, a
   nullable soft-delete flag, and an anonymised-at column that is NOT NULL, since each makes
   rows silently never match. Readiness also refuses an anchor, deleted-at, or anonymised-at
   column the database types as `timestamp without time zone`, seen through any domains. Startup
   refuses an anonymised-at marker with a default or value generation mapped in the EF model,
   since EF then never writes it NULL and every row is born marked as anonymised. The statement
-  check's success is kept per database, role, and search path. Before, a run over such a
-  database failed at the statement, silently skipped rows (or, for the mapped default, never
-  anonymised them), or, for a timestamp without time zone, drifted with the session TimeZone.
+  check's success is kept per database, role, and search path, but readiness runs once per model
+  and connection string, so only the role of the first operation to reach it is checked. Before,
+  a run over such a database failed at the statement, silently skipped rows (or, for the mapped
+  default, never anonymised them), or, for a timestamp without time zone, drifted with the
+  session TimeZone.
   Breaking: the refusal texts for a missing table or column, a mistyped column, a generated
   column, and a missing link column are now PostgreSQL's (one error per entity, with its
   SQLSTATE, message, and the statement text around the error), and a host whose role lacks a

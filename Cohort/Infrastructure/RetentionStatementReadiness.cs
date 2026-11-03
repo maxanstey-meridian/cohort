@@ -1,4 +1,5 @@
 using System.Data.Common;
+using System.Runtime.ExceptionServices;
 using System.Text;
 using Cohort.Application;
 using Cohort.Domain;
@@ -607,14 +608,21 @@ internal sealed class RetentionStatementReadiness(
                     (Index: Array.IndexOf(explains, failure.BatchCommand), Failure: failure)
                 )
                 .ToList();
+            if (refusals is null || refusals.Any(refusal => refusal.Index < 0))
+            {
+                // Not one of the explained statements (the savepoint, a lost connection).
+                throw;
+            }
+
             if (
-                refusals is null
-                || refusals.Any(refusal => refusal.Index < 0 || !IsRefusal(refusal.Failure))
+                refusals.Select(refusal => refusal.Failure).FirstOrDefault(f => !IsRefusal(f)) is
+                { } operational
             )
             {
-                // Not one of the explained statements (the savepoint, a lost connection), or an
-                // operational failure (a lock or statement timeout, a deadlock): not a refusal.
-                throw;
+                // An operational failure (a lock or statement timeout, a deadlock): not a refusal.
+                // Rethrow the first as PostgreSQL raised it, as the one-at-a-time path does, not
+                // as the aggregate Npgsql wraps two or more in.
+                ExceptionDispatchInfo.Capture(operational).Throw();
             }
 
             return
@@ -707,13 +715,22 @@ internal sealed class RetentionStatementReadiness(
         }
     }
 
-    // Only a statement PostgreSQL can't plan is a configuration refusal: a syntax error or access
-    // rule violation (class 42, such as a missing table or column or a lacking privilege), an
-    // invalid schema name (3F), an unsupported feature (0A), or a data exception from a constant
-    // in Cohort's text (22). A timeout, deadlock, serialization failure, resource exhaustion, or
-    // operator intervention says nothing about the host's schema, so it propagates.
+    // Only a statement PostgreSQL can't plan or start is a configuration refusal: a syntax error or
+    // access rule violation (class 42, such as a missing table or column or a lacking privilege),
+    // an invalid schema name (3F), an unsupported feature (0A), a data exception from a constant
+    // in Cohort's text (22), a limit the statement itself exceeds (class 54, such as too many
+    // columns), or a table that can't take the write (55000, such as a retained table in a
+    // publication of updates and deletes with no replica identity, which plain EXPLAIN reaches
+    // because it starts the executor). A timeout, deadlock, serialization failure, resource
+    // exhaustion, or operator intervention says nothing about the host's schema, so it
+    // propagates, and so do the rest of class 55 (55P03 lock_not_available, 55006 object_in_use):
+    // the code is tested whole, not its class.
     private static bool IsRefusal(PostgresException failure) =>
-        failure.SqlState is { Length: >= 2 } state && state[..2] is "42" or "3F" or "0A" or "22";
+        failure.SqlState is { } state
+        && (
+            state is "55000"
+            || (state.Length >= 2 && state[..2] is "42" or "3F" or "0A" or "22" or "54")
+        );
 
     private sealed record Refusal(ReadinessStatement Statement, PostgresException Failure);
 

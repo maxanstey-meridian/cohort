@@ -43,7 +43,7 @@ Cohort/                 — the library. No tests of its own.
 │   ├── Holds/          — EfRetentionHoldsRepository, RetentionHoldSql
 │   ├── Handlers/       — RowHandlerQueueSql (the row-handler queue's statements)
 │   ├── RetentionRunLedgerSql, HistoryPruningSql — the worker's ledger, abandoned-run recovery, history pruning
-│   ├── RetentionStatementReadiness — readiness's statement check: explains the run's statements
+│   ├── RetentionStatementReadiness — readiness's statement check: explains the statements runs send against host tables
 │   ├── Audit/          — EfRetentionAuditWriter
 │   └── Migrations/     — CohortModelBuilder (ConfigureCohortTables extension)
 └── Hosting/            — CohortOptions, RetentionWorker, RetentionRowDispatcher, AddCohort<TContext>()

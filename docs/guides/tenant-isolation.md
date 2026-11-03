@@ -195,8 +195,11 @@ on your retained tables. The identity columns behind `sweep_run_row_detail.Id` a
 `sweep_row_handler_status.Id` need no separate sequence grant.
 
 Readiness explains the statements of every scope under the role that reaches it, whichever
-operation that is first. So if your scopes use different roles, the role that first reaches
-readiness must hold the host-table privileges of every scope, not just its own: `SELECT` on
-each retained table, `retention_holds`, and `sweep_run_row_detail`; `UPDATE` on each retained
-table; `DELETE` where `Purge` is declared; and `USAGE` on their schemas. See
+operation that is first, and it runs once per model and connection string. So if your scopes
+use different roles, only the role of the first operation to reach readiness is checked, and
+it must hold the host-table privileges of every scope, not just its own. Give every role that
+may come first the same privileges: `SELECT` on each retained table, `retention_holds`,
+`sweep_run_row_detail`, and the child table of any foreign key that blocks a purge; `UPDATE`
+on each retained table; `DELETE` where `Purge` is declared; and `USAGE` on the schemas of all
+of those tables. See
 [Upgrading to 0.12.0](/reference/startup-validation#upgrading-to-0-12-0).

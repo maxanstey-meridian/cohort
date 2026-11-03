@@ -124,7 +124,9 @@ PostgreSQL refuses:
   `Purge` is declared; and `USAGE` on each schema those tables live in. A role that can't prove
   it is permitted is refused, not skipped.
 
-The pass is kept per database, role, and search path. See [Readiness](/reference/schema#readiness).
+The pass is kept per database, role, and search path, but readiness runs once per model and
+connection string, so a role that reaches it later isn't checked. See
+[Readiness](/reference/schema#readiness).
 
 ### Rules
 
@@ -240,12 +242,14 @@ entity and column it refuses.
 
 - A role that lacks a privilege the statements need is refused at readiness instead of failing
   the first run that needs it. Give the role that first reaches readiness `SELECT` on every
-  retained table, on `retention_holds`, and on `sweep_run_row_detail`; `UPDATE` on every
-  retained table; `DELETE` where `Purge` is declared; and `USAGE` on each schema those tables
-  live in ([Statements](#statements)). A host that splits roles (a role for each tenant, say)
-  gives the role that first reaches readiness the host-table privileges of every scope, since
-  readiness explains the statements of all of them under that role. The pass is kept per role,
-  so each role that reaches readiness is checked the same way. See
+  retained table, on `retention_holds`, on `sweep_run_row_detail`, and on the child table of
+  any foreign key that blocks a purge; `UPDATE` on every retained table; `DELETE` where
+  `Purge` is declared; and `USAGE` on each schema those tables live in
+  ([Statements](#statements)). A host that splits roles (a role for each tenant, say) gives the
+  role that first reaches readiness the host-table privileges of every scope, since readiness
+  explains the statements of all of them under that role. Readiness runs once per model and
+  connection string, so only the role of the first operation to reach it is checked; give every
+  role that may come first the same privileges. See
   [Tenant Isolation](/guides/tenant-isolation#grants).
 - A tenant column that is nullable in the database: make it `NOT NULL`. A `NULL` tenant never
   matches any tenant's run, erasure, or hold, so those rows were silently never swept.

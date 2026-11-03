@@ -58,8 +58,6 @@ internal sealed partial class RetentionStartupValidator(
 
     public async Task ValidateAsync(CancellationToken ct = default)
     {
-        // Resolved once: the gate taken below is the gate released, and every result lands in
-        // the entry the gate guards.
         var validation = validationState.For(db.Model);
         if (validation.Validated)
         {
@@ -920,5 +918,5 @@ internal sealed class RetentionModelValidation
     internal Dictionary<string, RetentionCategoryCapabilities> Capabilities { get; } =
         new(StringComparer.Ordinal);
 
-    internal bool Validated { get; set; }
+    internal volatile bool Validated;
 }

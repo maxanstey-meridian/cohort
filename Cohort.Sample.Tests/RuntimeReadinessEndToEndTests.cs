@@ -512,26 +512,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         // object. The System(Readiness) scope's context is used only through its connection, so
         // its copy of the model is as good as the caller's.
         await using var database = await MigratedTemporaryDatabaseAsync();
-        var services = new ServiceCollection();
-        services.AddLogging();
-        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
-        services.AddDbContext<SampleDbContext>(options =>
-            options
-                .UseNpgsql(database.ConnectionString)
-                .UseMemoryCache(ModelCacheThatHoldsNothing)
-        );
-        services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
-        services.AddSingleton<GuidTombstoneFactory>();
-        services.AddSingleton<OriginalValueTombstoneFactory>();
-        services.AddSingleton<IAnonymiseValueFactory>(provider =>
-            provider.GetRequiredService<GuidTombstoneFactory>()
-        );
-        services.AddSingleton<IAnonymiseValueFactory>(provider =>
-            provider.GetRequiredService<OriginalValueTombstoneFactory>()
-        );
-        services.AddSingleton(RetentionExecutionScope.Unisolated);
-        services.AddCohort<SampleDbContext>();
-        await using var provider = services.BuildServiceProvider(validateScopes: true);
+        await using var provider = BuildModelCopyProvider(database.ConnectionString);
 
         using (var scope = provider.CreateScope())
         {
@@ -657,7 +638,8 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         }
 
         await using var elsewhere = provider.CreateAsyncScope();
-        elsewhere.ServiceProvider.GetRequiredService<ModelVariant>().Marked = true;
+        elsewhere.ServiceProvider.GetRequiredService<ModelVariant>()
+            .CustomizeModelWith<RetainedEntityElsewhereModelCustomizer>();
         var act = () => ListActiveHoldsAsync(elsewhere.ServiceProvider);
 
         (await act.Should().ThrowAsync<RetentionConfigurationException>())
@@ -666,6 +648,252 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
                 && error.Contains("\"public\".\"notes_elsewhere\"", StringComparison.Ordinal)
                 && error.Contains("was not found in the database", StringComparison.Ordinal)
             );
+    }
+
+    // T5a: each shared check's key carries what its check reads. A copy that no longer registers
+    // an entity with an active hold would otherwise skip the orphaned-hold refusal and leave
+    // that hold silently matching nothing.
+    [Fact]
+    public async Task A_model_copy_that_stops_registering_an_entity_with_an_active_hold_is_checked_again()
+    {
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        var noteIdentity = RetentionEntityIdentity.For<Note>();
+        await InsertHoldAsync(
+            new DbContextOptionsBuilder<SampleDbContext>().UseNpgsql(database.ConnectionString).Options,
+            Guid.NewGuid(),
+            noteIdentity,
+            Guid.NewGuid().ToString(),
+            Guid.NewGuid(),
+            expiresAt: null,
+            removedAt: null
+        );
+        await using var provider = BuildModelCopyProvider(database.ConnectionString);
+
+        await using (var passing = provider.CreateAsyncScope())
+        {
+            await ListActiveHoldsAsync(passing.ServiceProvider);
+        }
+
+        await using var withoutNote = provider.CreateAsyncScope();
+        withoutNote.ServiceProvider.GetRequiredService<ModelVariant>()
+            .CustomizeModelWith<RetainedEntityIgnoredModelCustomizer>();
+        var act = () => ListActiveHoldsAsync(withoutNote.ServiceProvider);
+
+        (await act.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                error.Contains($"'{noteIdentity}'", StringComparison.Ordinal)
+                && error.Contains("is not registered by any retained entity", StringComparison.Ordinal)
+                && error.Contains("1 active hold(s)", StringComparison.Ordinal)
+            );
+    }
+
+    // T5b: a copy that maps a hold relation's link member to another column is checked on it.
+    [Fact]
+    public async Task A_model_copy_that_maps_a_hold_relation_link_elsewhere_is_checked_again()
+    {
+        await using var database = await AnonymiseTargetDatabaseAsync<HoldLinkDbContext>();
+        await using var provider = BuildHoldLinkModelCopyProvider(database.ConnectionString);
+
+        await using (var passing = provider.CreateAsyncScope())
+        {
+            await ListActiveHoldsAsync(passing.ServiceProvider);
+        }
+
+        await using var elsewhere = provider.CreateAsyncScope();
+        elsewhere.ServiceProvider.GetRequiredService<ModelVariant>()
+            .CustomizeModelWith<HoldLinkColumnElsewhereModelCustomizer>();
+        var act = () => ListActiveHoldsAsync(elsewhere.ServiceProvider);
+
+        (await act.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                error.Contains(typeof(HoldLinkChild).Name, StringComparison.Ordinal)
+                && error.Contains(
+                    "link column \"public\".\"hold_link_children\".\"CaseIdElsewhere\" was not found in the database",
+                    StringComparison.Ordinal
+                )
+            );
+    }
+
+    // T5c: a copy that writes its soft-delete flag to another column is checked on that column.
+    [Fact]
+    public async Task A_model_copy_that_writes_a_marker_to_a_referenced_column_is_checked_again()
+    {
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await ExecuteAsync(
+            database,
+            """
+            ALTER TABLE public.soft_delete_records
+                ADD COLUMN "IsDeletedReferenced" boolean NOT NULL DEFAULT false,
+                ADD CONSTRAINT soft_delete_referenced_live UNIQUE ("Id", "IsDeletedReferenced");
+            CREATE TABLE public.soft_delete_referenced_children (
+                "ParentId" uuid,
+                "ParentIsDeleted" boolean,
+                FOREIGN KEY ("ParentId", "ParentIsDeleted")
+                    REFERENCES public.soft_delete_records ("Id", "IsDeletedReferenced")
+            );
+            """
+        );
+        await using var provider = BuildModelCopyProvider(database.ConnectionString);
+
+        await using (var passing = provider.CreateAsyncScope())
+        {
+            await ListActiveHoldsAsync(passing.ServiceProvider);
+        }
+
+        await using var referenced = provider.CreateAsyncScope();
+        referenced.ServiceProvider.GetRequiredService<ModelVariant>()
+            .CustomizeModelWith<SoftDeleteFlagInReferencedColumnModelCustomizer>();
+        var act = () => ListActiveHoldsAsync(referenced.ServiceProvider);
+
+        (await act.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                error.Contains(typeof(SoftDeleteRecord).FullName!, StringComparison.Ordinal)
+                && error.Contains("member IsDeleted", StringComparison.Ordinal)
+                && error.Contains("which is referenced by a foreign key", StringComparison.Ordinal)
+            );
+    }
+
+    // T5d: and a copy that reads the same things as one that passed is not checked on them again,
+    // whatever the database has become since: the retained-tables and marker-column checks would
+    // each refuse what the database looks like now.
+    [Fact]
+    public async Task A_model_copy_that_reads_what_a_passed_copy_read_skips_the_retained_table_and_marker_checks()
+    {
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await using var provider = BuildModelCopyProvider(database.ConnectionString);
+
+        await using var first = provider.CreateAsyncScope();
+        var firstModel = first.ServiceProvider.GetRequiredService<SampleDbContext>().Model;
+        await ListActiveHoldsAsync(first.ServiceProvider);
+
+        await ExecuteAsync(
+            database,
+            """
+            ALTER TABLE public.tenantless_logs RENAME TO tenantless_logs_gone;
+            ALTER TABLE public.soft_delete_records
+                ADD CONSTRAINT soft_delete_live UNIQUE ("Id", "IsDeleted");
+            CREATE TABLE public.soft_delete_children (
+                "ParentId" uuid,
+                "ParentIsDeleted" boolean,
+                FOREIGN KEY ("ParentId", "ParentIsDeleted")
+                    REFERENCES public.soft_delete_records ("Id", "IsDeleted")
+            );
+            """
+        );
+
+        await using var second = provider.CreateAsyncScope();
+        ReferenceEquals(firstModel, second.ServiceProvider.GetRequiredService<SampleDbContext>().Model)
+            .Should().BeFalse("the full cache gives every context a model of its own");
+        var act = () => ListActiveHoldsAsync(second.ServiceProvider);
+
+        await act.Should().NotThrowAsync();
+    }
+
+    // A1: the database a shared pass was recorded against is the one the server reports, not the
+    // connection string's spelling. A database dropped and rebuilt under the same name, with the
+    // same connection string, is another database.
+    [Fact]
+    public async Task A_database_rebuilt_under_the_same_name_is_checked_again()
+    {
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await using var provider = BuildModelCopyProvider(database.ConnectionString);
+
+        await using (var passing = provider.CreateAsyncScope())
+        {
+            await ListActiveHoldsAsync(passing.ServiceProvider);
+        }
+
+        var holdsTableBefore = await HoldsTableOidAsync(database);
+        var name = new NpgsqlConnectionStringBuilder(database.ConnectionString).Database!;
+        var admin = new NpgsqlConnectionStringBuilder(database.ConnectionString) { Database = "postgres" }
+            .ConnectionString;
+        NpgsqlConnection.ClearAllPools();
+        await ExecuteAsync(admin, $"DROP DATABASE \"{name}\" WITH (FORCE)");
+        await ExecuteAsync(admin, $"CREATE DATABASE \"{name}\"");
+        await using (var rebuilt = new SampleDbContext(
+            new DbContextOptionsBuilder<SampleDbContext>().UseNpgsql(database.ConnectionString).Options
+        ))
+        {
+            await rebuilt.Database.MigrateAsync();
+        }
+
+        await ExecuteAsync(database, "DROP TABLE public.tenantless_logs");
+        NpgsqlConnection.ClearAllPools();
+        (await HoldsTableOidAsync(database)).Should().NotBe(
+            holdsTableBefore,
+            "a database built afresh gets tables of its own, which is what tells it from the old one"
+        );
+
+        await using var again = provider.CreateAsyncScope();
+        var act = () => ListActiveHoldsAsync(again.ServiceProvider);
+
+        (await act.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                error.Contains(typeof(TenantlessLog).FullName!, StringComparison.Ordinal)
+                && error.Contains("\"public\".\"tenantless_logs\"", StringComparison.Ordinal)
+                && error.Contains("was not found in the database", StringComparison.Ordinal)
+            );
+    }
+
+    // A1: one model instance reaches one database under two user names (a pooler can route by
+    // user name), and each is validated: the model's own memory is keyed by the user name too.
+    // The anonymise check is not shared between model copies, so only that memory could skip it.
+    [Fact]
+    public async Task A_second_user_name_on_the_same_model_and_database_is_validated_again()
+    {
+        var role = $"cohort_readiness_{Guid.NewGuid():N}";
+        const string password = "readiness-test-password";
+        await ExecuteAsync(fixture.ConnectionString, $"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}'");
+        try
+        {
+            await using var database = await AnonymiseTargetDatabaseAsync();
+            var name = new NpgsqlConnectionStringBuilder(database.ConnectionString).Database!;
+            await ExecuteAsync(
+                database,
+                $"""
+                GRANT CONNECT ON DATABASE "{name}" TO "{role}";
+                GRANT USAGE ON SCHEMA public TO "{role}";
+                GRANT SELECT ON ALL TABLES IN SCHEMA public TO "{role}";
+                """
+            );
+            var asFirstUser = database.ConnectionString;
+            var asSecondUser = new NpgsqlConnectionStringBuilder(asFirstUser)
+            {
+                Username = role,
+                Password = password,
+            }.ConnectionString;
+            var connectionString = asFirstUser;
+            await using var provider = BuildAnonymiseTargetProvider(
+                asFirstUser,
+                options => options.UseNpgsql(connectionString)
+            );
+
+            await using var first = provider.CreateAsyncScope();
+            var firstModel = first.ServiceProvider.GetRequiredService<AnonymiseTargetDbContext>().Model;
+            await ListActiveHoldsAsync(first.ServiceProvider);
+
+            await ExecuteAsync(
+                database,
+                "ALTER TABLE public.anonymise_literal_records ALTER COLUMN \"Label\" TYPE character varying(8)"
+            );
+
+            connectionString = asSecondUser;
+            await using var second = provider.CreateAsyncScope();
+            ReferenceEquals(firstModel, second.ServiceProvider.GetRequiredService<AnonymiseTargetDbContext>().Model)
+                .Should().BeTrue("the default model cache gives both contexts one model");
+            var act = () => ListActiveHoldsAsync(second.ServiceProvider);
+
+            (await act.Should().ThrowAsync<RetentionConfigurationException>())
+                .Which.Errors.Should().ContainSingle(error =>
+                    error.Contains(typeof(AnonymiseLiteralRecord).FullName!, StringComparison.Ordinal)
+                    && error.Contains("member Label", StringComparison.Ordinal)
+                    && error.Contains("not valid for its column type character varying(8)", StringComparison.Ordinal)
+                );
+        }
+        finally
+        {
+            await ExecuteAsync(fixture.ConnectionString, $"DROP ROLE IF EXISTS \"{role}\"");
+        }
     }
 
     // T6: a check that passed inside a caller's transaction may have seen DDL that rolls back.
@@ -734,9 +962,15 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             );
     }
 
+    // What a scope changes about the options of the context it resolves, set before the scope
+    // resolves it: here, the model customizer that makes the context run a variant model.
     private sealed class ModelVariant
     {
-        public bool Marked { get; set; }
+        public Action<DbContextOptionsBuilder>? Configure { get; private set; }
+
+        public void CustomizeModelWith<TCustomizer>()
+            where TCustomizer : class, IModelCustomizer =>
+            Configure = options => options.ReplaceService<IModelCustomizer, TCustomizer>();
     }
 
     // Maps a retained entity to a table the database doesn't have.
@@ -750,10 +984,46 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         }
     }
 
+    // Stops registering a retained entity.
+    private sealed class RetainedEntityIgnoredModelCustomizer(ModelCustomizerDependencies dependencies)
+        : ModelCustomizer(dependencies)
+    {
+        public override void Customize(ModelBuilder modelBuilder, DbContext context)
+        {
+            base.Customize(modelBuilder, context);
+            modelBuilder.Ignore<Note>();
+        }
+    }
+
+    // Maps a hold relation's link member to a column the database doesn't have.
+    private sealed class HoldLinkColumnElsewhereModelCustomizer(ModelCustomizerDependencies dependencies)
+        : ModelCustomizer(dependencies)
+    {
+        public override void Customize(ModelBuilder modelBuilder, DbContext context)
+        {
+            base.Customize(modelBuilder, context);
+            modelBuilder.Entity<HoldLinkChild>().Property(child => child.CaseId).HasColumnName("CaseIdElsewhere");
+        }
+    }
+
+    // Maps a soft-delete flag to a second column the test's DDL made foreign-key-referenced.
+    private sealed class SoftDeleteFlagInReferencedColumnModelCustomizer(ModelCustomizerDependencies dependencies)
+        : ModelCustomizer(dependencies)
+    {
+        public override void Customize(ModelBuilder modelBuilder, DbContext context)
+        {
+            base.Customize(modelBuilder, context);
+            modelBuilder
+                .Entity<SoftDeleteRecord>()
+                .Property(record => record.IsDeleted)
+                .HasColumnName("IsDeletedReferenced");
+        }
+    }
+
     // Every scope builds a model of its own, since the shared cache holds nothing. A scope's
-    // ModelVariant, set before the scope resolves its context, makes that context run a model
-    // that maps a retained entity elsewhere. Readiness is triggered through
-    // ListActiveHoldsAsync, because IRetentionSweep and IRetentionPreview open scopes of their own.
+    // ModelVariant, set before the scope resolves its context, makes that context run a variant
+    // of the model. Readiness is triggered through ListActiveHoldsAsync, because IRetentionSweep
+    // and IRetentionPreview open scopes of their own.
     private static ServiceProvider BuildModelCopyProvider(
         string connectionString,
         IRetentionRuleProvider? ruleProvider = null,
@@ -765,13 +1035,8 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
         services.AddScoped<ModelVariant>();
         services.AddDbContext<SampleDbContext>((provider, options) =>
-        {
-            options.UseNpgsql(connectionString).UseMemoryCache(ModelCacheThatHoldsNothing);
-            if (provider.GetRequiredService<ModelVariant>().Marked)
-            {
-                options.ReplaceService<IModelCustomizer, RetainedEntityElsewhereModelCustomizer>();
-            }
-        });
+            UseModelCopy(options, provider, connectionString)
+        );
         services.AddSingleton<IRetentionRuleProvider>(ruleProvider ?? new SampleRetentionRuleProvider());
         services.AddSingleton<GuidTombstoneFactory>();
         services.AddSingleton<OriginalValueTombstoneFactory>();
@@ -784,6 +1049,32 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         services.AddSingleton<IRetentionExecutionScope>(executionScope ?? RetentionExecutionScope.Unisolated);
         services.AddCohort<SampleDbContext>();
         return services.BuildServiceProvider(validateScopes: true);
+    }
+
+    // The same, over a context whose model carries a hold relation, which the sample's doesn't.
+    private static ServiceProvider BuildHoldLinkModelCopyProvider(string connectionString)
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
+        services.AddScoped<ModelVariant>();
+        services.AddDbContext<HoldLinkDbContext>((provider, options) =>
+            UseModelCopy(options, provider, connectionString)
+        );
+        services.AddSingleton<IRetentionRuleProvider>(new HoldLinkRuleProvider());
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
+        services.AddCohort<HoldLinkDbContext>();
+        return services.BuildServiceProvider(validateScopes: true);
+    }
+
+    private static void UseModelCopy(
+        DbContextOptionsBuilder options,
+        IServiceProvider scopeServices,
+        string connectionString
+    )
+    {
+        options.UseNpgsql(connectionString).UseMemoryCache(ModelCacheThatHoldsNothing);
+        scopeServices.GetRequiredService<ModelVariant>().Configure?.Invoke(options);
     }
 
     private static Task ListActiveHoldsAsync(IServiceProvider scopeServices) =>
@@ -800,12 +1091,23 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         return new WeakReference(db.Model);
     }
 
-    private static async Task ExecuteAsync(TemporaryDatabase database, string sql)
+    private static Task ExecuteAsync(TemporaryDatabase database, string sql) =>
+        ExecuteAsync(database.ConnectionString, sql);
+
+    private static async Task ExecuteAsync(string connectionString, string sql)
     {
-        await using var connection = new NpgsqlConnection(database.ConnectionString);
+        await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync();
         await using var command = new NpgsqlCommand(sql, connection);
         await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<long> HoldsTableOidAsync(TemporaryDatabase database)
+    {
+        await using var connection = new NpgsqlConnection(database.ConnectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand("SELECT to_regclass('public.retention_holds')::oid::bigint", connection);
+        return (long)(await command.ExecuteScalarAsync())!;
     }
 
     // The same server under another name: a host name becomes one of its addresses, a loopback
@@ -1746,6 +2048,45 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         {
             modelBuilder.ConfigureCohortTables();
         }
+    }
+
+    private sealed class HoldLinkDbContext(DbContextOptions<HoldLinkDbContext> options) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<HoldLinkCase>().ToTable("hold_link_cases");
+            modelBuilder.Entity<HoldLinkChild>().ToTable("hold_link_children");
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    [Retain("hold-link", nameof(CreatedAt))]
+    [RetentionEntityId("a3f1c7d2-5b84-4e0a-9d16-2c8e7b4f1a05")]
+    private sealed class HoldLinkCase
+    {
+        public Guid Id { get; set; }
+        public Guid TenantId { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
+    }
+
+    [Retain("hold-link", nameof(CreatedAt))]
+    [RetentionEntityId("e7b2d9a4-1c63-4f58-8a0d-6b3f5e2c9d17")]
+    [HeldWith(typeof(HoldLinkCase), nameof(CaseId))]
+    private sealed class HoldLinkChild
+    {
+        public Guid Id { get; set; }
+        public Guid TenantId { get; set; }
+        public DateTimeOffset CreatedAt { get; set; }
+        public Guid? CaseId { get; set; }
+    }
+
+    private sealed class HoldLinkRuleProvider : IRetentionRuleProvider
+    {
+        public RetentionCategoryCapabilities? GetCapabilities(string category) =>
+            category == "hold-link" ? new RetentionCategoryCapabilities([Strategy.Purge]) : null;
+
+        public Task<RetentionRule?> ResolveAsync(RetentionResolutionContext context, CancellationToken ct) =>
+            Task.FromResult<RetentionRule?>(new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge));
     }
 
     [Retain("session-key", nameof(CreatedAt))]

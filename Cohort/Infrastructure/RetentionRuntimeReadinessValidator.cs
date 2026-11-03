@@ -37,16 +37,21 @@ internal sealed class RetentionRuntimeReadinessValidator(
         ValidateProvider();
         ValidateSessionLocks();
         // Two levels of memory. The model instance the context runs has its own entry (its pass
-        // and its gate), per database. Each database check also records its pass by value, under
-        // the database and everything the check reads, so a rebuilt copy of a model that reads
-        // the same things skips it. Npgsql's DataSource already carries host and port. This only
-        // keys the memory, so two spellings of one database each validate once; whether two
-        // contexts reach the same database is decided on the server.
+        // and its gate), keyed by the connection's spelling, user, and options so the fast path
+        // costs nothing. Each database check also records its pass by value, under everything
+        // the check reads, so a rebuilt copy of a model that reads the same things skips it.
+        // Those shared passes are keyed by the database as the server reports it, read once per
+        // entry miss.
         var facade = db.Database;
         var connection = facade.GetDbConnection();
-        var dataSource = connection.DataSource;
-        var databaseName = connection.Database;
-        var readiness = state.For(db.Model, dataSource, databaseName);
+        var connectionString = new NpgsqlConnectionStringBuilder(connection.ConnectionString);
+        var readiness = state.For(
+            db.Model,
+            connection.DataSource,
+            connection.Database,
+            connectionString.Username ?? "",
+            connectionString.Options ?? ""
+        );
         if (readiness.Validated)
         {
             return;
@@ -60,8 +65,33 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 return;
             }
 
+            var storeTables = CohortStoreTables.FromModel(db.Model);
+            var holds = PostgreSqlIdentifier.Format(storeTables.RetentionHolds);
+            var callerDatabase = await ReadServerDatabaseIdentityAsync(facade, holds, ct);
+
             RetentionReadinessCheckKey Key(RetentionReadinessCheck check, IEnumerable<object> inputs) =>
-                new(dataSource, databaseName, check, [.. inputs]);
+                new(callerDatabase, check, [.. inputs]);
+
+            // Runs a database check unless another copy of the model already passed it against
+            // this database on the same inputs; records the pass. A failure is never recorded. A
+            // recorded pass is skipped inside a caller's transaction too.
+            async Task RunSharedAsync(
+                RetentionReadinessCheckKey key,
+                Func<Task> run,
+                bool recordInsideTransaction = false
+            )
+            {
+                if (state.HasPassed(key))
+                {
+                    return;
+                }
+
+                await run();
+                if (recordInsideTransaction || facade.CurrentTransaction is null)
+                {
+                    state.RecordPassed(key);
+                }
+            }
 
             // Order matters. Each check throws before the next runs, and later checks rely on
             // earlier ones: the link-column check skips rows whose target type is missing, and
@@ -74,7 +104,6 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 () => ValidateServerVersionAsync(facade, ct)
             );
             await startupValidator.ValidateAsync(ct);
-            var storeTables = CohortStoreTables.FromModel(db.Model);
             await RunSharedAsync(
                 Key(RetentionReadinessCheck.Schema, [storeTables]),
                 () => schemaValidator.ValidateAsync(storeTables, facade, ct)
@@ -96,7 +125,6 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 Key(RetentionReadinessCheck.ReferencedMarkerColumns, markers),
                 () => ValidateReferencedMarkerColumnsAsync(facade, markers, ct)
             );
-            var holds = PostgreSqlIdentifier.Format(storeTables.RetentionHolds);
             var registered = registry.Scan().Values.Select(entry => entry.RetentionEntityId).Order().ToArray();
             object[] storedIdentityInputs = [holds, .. registered];
             // The hold check runs on its own connection, outside the caller's transaction, so its
@@ -105,7 +133,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
             // DDL that rolls back, so those are recorded only without one.
             await RunSharedAsync(
                 Key(RetentionReadinessCheck.StoredEntityIdentities, storedIdentityInputs),
-                () => ValidateStoredEntityIdentitiesAsync(facade, scopeFactory, holds, registered, ct),
+                () => ValidateStoredEntityIdentitiesAsync(scopeFactory, holds, registered, callerDatabase, ct),
                 recordInsideTransaction: true
             );
 
@@ -117,29 +145,6 @@ internal sealed class RetentionRuntimeReadinessValidator(
         finally
         {
             readiness.Gate.Release();
-        }
-    }
-
-    /// <summary>
-    /// Runs a database check unless another copy of the model already passed it against this
-    /// database on the same inputs; records the pass. A failure is never recorded. A recorded
-    /// pass is skipped inside a caller's transaction too.
-    /// </summary>
-    private async Task RunSharedAsync(
-        RetentionReadinessCheckKey key,
-        Func<Task> run,
-        bool recordInsideTransaction = false
-    )
-    {
-        if (state.HasPassed(key))
-        {
-            return;
-        }
-
-        await run();
-        if (recordInsideTransaction || db.Database.CurrentTransaction is null)
-        {
-            state.RecordPassed(key);
         }
     }
 
@@ -987,14 +992,13 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// connection; a recorded pass skips the scope altogether.
     /// </summary>
     private static async Task ValidateStoredEntityIdentitiesAsync(
-        DatabaseFacade database,
         IServiceScopeFactory scopeFactory,
         string holds,
         Guid[] registered,
+        ServerDatabaseIdentity callerDatabase,
         CancellationToken ct
     )
     {
-        var callerDatabase = await ReadServerDatabaseIdentityAsync(database, holds, ct);
         await scopeFactory.RunInScopeAsync(
             new RetentionExecutionContext.System(RetentionSystemWork.Readiness),
             services => ValidateStoredEntityIdentitiesAsync(
@@ -1101,12 +1105,6 @@ internal sealed class RetentionRuntimeReadinessValidator(
         }
     }
 
-    private sealed record ServerDatabaseIdentity(
-        string Database,
-        DateTime ServerStartedAt,
-        long? HoldsTableOid
-    );
-
     /// <summary>
     /// The worker, each run and each row-handler delivery hold PostgreSQL session advisory
     /// locks. Under Npgsql multiplexing a connection is bound to a server session only inside a
@@ -1160,21 +1158,33 @@ internal sealed class RetentionRuntimeReadinessState
     // a new instance per context that dies with its context instead of being kept alive here.
     private readonly ConditionalWeakTable<
         IModel,
-        ConcurrentDictionary<(string DataSource, string Database), RetentionRuntimeReadinessEntry>
+        ConcurrentDictionary<
+            (string DataSource, string Database, string Username, string Options),
+            RetentionRuntimeReadinessEntry
+        >
     > entries = new();
 
     // The database checks that passed, by value: one small key per distinct input per database
     // per check, never evicted. A rebuilt copy of a model that reads the same things skips them.
     private readonly ConcurrentDictionary<RetentionReadinessCheckKey, byte> passed = new();
 
-    internal RetentionRuntimeReadinessEntry For(IModel model, string dataSource, string database) =>
+    internal RetentionRuntimeReadinessEntry For(
+        IModel model,
+        string dataSource,
+        string database,
+        string username,
+        string options
+    ) =>
         entries
             .GetValue(
                 model,
                 static _ =>
-                    new ConcurrentDictionary<(string DataSource, string Database), RetentionRuntimeReadinessEntry>()
+                    new ConcurrentDictionary<
+                        (string DataSource, string Database, string Username, string Options),
+                        RetentionRuntimeReadinessEntry
+                    >()
             )
-            .GetOrAdd((dataSource, database), static _ => new RetentionRuntimeReadinessEntry());
+            .GetOrAdd((dataSource, database, username, options), static _ => new RetentionRuntimeReadinessEntry());
 
     internal bool HasPassed(RetentionReadinessCheckKey key) => passed.ContainsKey(key);
 

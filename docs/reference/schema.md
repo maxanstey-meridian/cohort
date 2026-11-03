@@ -55,9 +55,10 @@ the same key columns counts, unique or not.
 The application services and the dispatcher check readiness themselves, so a host that
 skipped startup validation still can't run against a missing or outdated schema.
 
-Readiness validates once per process and database, then trusts the result: each database
-check keeps its success under what it read, so later contexts, including new copies of the
-same EF model, don't run it again. The anonymise-target check is the exception and runs once
+Readiness validates once per service provider and database, then trusts the result: each
+database check keeps its success, unless it passed inside the caller's transaction, under
+what it read, so later contexts, including new copies of the same EF model, don't run it
+again. The anonymise-target check is the exception and runs once
 for each copy of the model. A schema that drifts after that isn't refused by readiness; the
 run fails at the statement the change breaks. A change readiness would refuse, made while the
 application runs, is caught when it next starts.
@@ -98,8 +99,8 @@ Holds store the `RetentionEntityId` of the entity they protect. If an entity's
 identity never match a row again. Readiness therefore refuses to run while an active hold
 names an identity no retained entity in the model declares, and names each such identity and
 its count of holds. Expired and removed holds, and audit history, are not checked. The check
-reads holds across every tenant, so it runs once per database and set of retained entity
-identities, in its own `System(Readiness)` scope, whichever operation triggered readiness.
+reads holds across every tenant, so it runs once per database, holds table, and set of
+retained entity identities, in its own `System(Readiness)` scope, whichever operation triggered readiness.
 That scope must reach the same database as the caller; it reads only through its connection,
 so its model may differ. The server decides that (database name, server start time and the
 holds table), so `localhost` versus `127.0.0.1`, or a pooler versus a direct port, is fine.

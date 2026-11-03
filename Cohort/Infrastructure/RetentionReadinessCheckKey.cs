@@ -18,29 +18,35 @@ internal enum RetentionReadinessCheck
 }
 
 /// <summary>
+/// Which database a connection reaches, as the server sees it. Connection strings spell one
+/// database many ways (<c>localhost</c> or <c>127.0.0.1</c>, a pooler or the direct port), and
+/// one spelling can reach different databases (a pooler that routes by user name), so the
+/// database name, the server's start time and the hold table's OID decide sameness instead.
+/// </summary>
+internal sealed record ServerDatabaseIdentity(string Database, DateTime ServerStartedAt, long? HoldsTableOid);
+
+/// <summary>
 /// One passed readiness check: the database it passed against, which check it was, and everything
 /// the check read from the model, the capabilities, and the services, reduced to values. Each
 /// element of <paramref name="Inputs"/> is a string, a <see cref="Guid"/>, or a record whose
 /// members are such values, never a list, since a record compares a list by reference. Two keys
-/// are equal when their inputs are equal element by element, whichever model instance built them.
+/// are equal when their database identities are equal and their inputs are equal element by
+/// element, whichever model instance built them.
 /// </summary>
 internal sealed record RetentionReadinessCheckKey(
-    string DataSource,
-    string Database,
+    ServerDatabaseIdentity Database,
     RetentionReadinessCheck Check,
     object[] Inputs
 )
 {
     public bool Equals(RetentionReadinessCheckKey? other) =>
         other is not null
-        && string.Equals(DataSource, other.DataSource, StringComparison.Ordinal)
-        && string.Equals(Database, other.Database, StringComparison.Ordinal)
+        && Database == other.Database
         && Check == other.Check
         && StructuralComparisons.StructuralEqualityComparer.Equals(Inputs, other.Inputs);
 
     public override int GetHashCode() =>
         HashCode.Combine(
-            DataSource,
             Database,
             Check,
             StructuralComparisons.StructuralEqualityComparer.GetHashCode(Inputs)

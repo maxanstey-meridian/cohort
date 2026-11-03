@@ -35,23 +35,35 @@ internal sealed class RetentionRuntimeReadinessValidator(
     public async Task ValidateAsync(CancellationToken ct = default)
     {
         ValidateProvider();
-        ValidateSessionLocks();
-        // Two levels of memory. The model instance the context runs has its own entry (its pass
-        // and its gate), keyed by the connection's spelling, user, and options so the fast path
-        // costs nothing. Each database check also records its pass by value, under everything
-        // the check reads, so a rebuilt copy of a model that reads the same things skips it.
-        // Those shared passes are keyed by the database as the server reports it, read once per
-        // entry miss.
         var facade = db.Database;
         var connection = facade.GetDbConnection();
-        var connectionString = new NpgsqlConnectionStringBuilder(connection.ConnectionString);
-        var readiness = state.For(
-            db.Model,
-            connection.DataSource,
-            connection.Database,
-            connectionString.Username ?? "",
-            connectionString.Options ?? ""
-        );
+        var settings = connection is NpgsqlConnection
+            ? new NpgsqlConnectionStringBuilder(connection.ConnectionString)
+            : null;
+        ValidateSessionLocks(settings);
+        // Two levels of memory. The model instance the context runs has its own entry (its pass
+        // and its gate), keyed by the connection string without its password, parsed once per
+        // call with no round trip. The password stays out because it is a secret that a rotating
+        // token would turn into one entry per token, and because Npgsql drops it once the
+        // connection opens. The key still carries everything else a pooler can route by under
+        // one host, port, and database name (user, options); two spellings of one database each
+        // validate once. A wrapped DbConnection can't be inspected, so it keys by its raw string.
+        // Each database check also records its pass by value, under everything the check reads,
+        // so a rebuilt copy of a model that reads the same things skips it. Those shared passes
+        // are keyed by the database as the server reports it, read once per entry miss.
+        string entryKey;
+        if (settings is null)
+        {
+            entryKey = connection.ConnectionString;
+        }
+        else
+        {
+            settings.Password = null;
+            settings.PersistSecurityInfo = false;
+            entryKey = settings.ConnectionString;
+        }
+
+        var readiness = state.For(db.Model, entryKey);
         if (readiness.Validated)
         {
             return;
@@ -65,6 +77,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 return;
             }
 
+            await startupValidator.ValidateAsync(ct);
             var storeTables = CohortStoreTables.FromModel(db.Model);
             var holds = PostgreSqlIdentifier.Format(storeTables.RetentionHolds);
             var callerDatabase = await ReadServerDatabaseIdentityAsync(facade, holds, ct);
@@ -93,7 +106,9 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 }
             }
 
-            // Order matters. Each check throws before the next runs, and later checks rely on
+            // Order matters. Startup validation runs first, so a model with no or partial Cohort
+            // table mapping gets its aggregated refusal before any key needs the store tables.
+            // Each check then throws before the next runs, and later checks rely on
             // earlier ones: the link-column check skips rows whose target type is missing, and
             // the anonymise check skips rows whose table or record id is missing, because the
             // retained-tables check has already refused those. When that check is skipped as
@@ -103,7 +118,6 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 Key(RetentionReadinessCheck.ServerVersion, []),
                 () => ValidateServerVersionAsync(facade, ct)
             );
-            await startupValidator.ValidateAsync(ct);
             await RunSharedAsync(
                 Key(RetentionReadinessCheck.Schema, [storeTables]),
                 () => schemaValidator.ValidateAsync(storeTables, facade, ct)
@@ -1070,8 +1084,8 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// <summary>
     /// Which database a connection reaches, as the server sees it. Connection strings
     /// spell one database many ways (<c>localhost</c> or <c>127.0.0.1</c>, a pooler or the direct
-    /// port), so the database name, the server's start time and the hold table's OID decide
-    /// sameness instead. Reads in the database's current transaction when it has one.
+    /// port), so the database name and OID, the server's start time, and the holds table's OID
+    /// decide sameness instead. Reads in the database's current transaction when it has one.
     /// </summary>
     private static async Task<ServerDatabaseIdentity> ReadServerDatabaseIdentityAsync(
         DatabaseFacade database,
@@ -1087,6 +1101,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 database.CurrentTransaction?.GetDbTransaction(),
                 """
                 SELECT pg_catalog.current_database()::text,
+                       (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())::bigint,
                        pg_catalog.pg_postmaster_start_time(),
                        pg_catalog.to_regclass(@holds)::oid::bigint
                 """
@@ -1095,8 +1110,9 @@ internal sealed class RetentionRuntimeReadinessValidator(
             await reader.ReadAsync(ct);
             return new ServerDatabaseIdentity(
                 reader.GetString(0),
-                reader.GetFieldValue<DateTime>(1),
-                reader.IsDBNull(2) ? null : reader.GetInt64(2)
+                reader.GetInt64(1),
+                reader.GetFieldValue<DateTime>(2),
+                reader.IsDBNull(3) ? null : reader.GetInt64(3)
             );
         }
         finally
@@ -1110,13 +1126,14 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// locks. Under Npgsql multiplexing a connection is bound to a server session only inside a
     /// transaction, so a lock taken outside one stays on whichever session ran it while the
     /// unlock runs on another and finds nothing to release. Checked on every call, not cached:
-    /// neither the model's entry nor a recorded check is keyed by connection settings. A wrapped
-    /// DbConnection (a profiler, say) can't be inspected, so it is the host's to configure.
+    /// the model's entry is keyed by the connection string, and a recorded check by the server's
+    /// database, so a pass recorded before Multiplexing was turned on would otherwise speak for
+    /// it. A wrapped DbConnection (a profiler, say) can't be inspected, so it is the host's to
+    /// configure; <paramref name="settings"/> is null for one.
     /// </summary>
-    private void ValidateSessionLocks()
+    private static void ValidateSessionLocks(NpgsqlConnectionStringBuilder? settings)
     {
-        if (db.Database.GetDbConnection() is NpgsqlConnection connection
-            && new NpgsqlConnectionStringBuilder(connection.ConnectionString).Multiplexing)
+        if (settings is { Multiplexing: true })
         {
             throw new RetentionConfigurationException([
                 "Cohort can't run on an Npgsql connection with Multiplexing enabled: its worker, runs and row-handler deliveries hold PostgreSQL session advisory locks, and a multiplexed connection only keeps one server session inside a transaction, so those locks would be taken on one session and released on another. Give Cohort's DbContext a connection string without Multiplexing=true.",
@@ -1156,35 +1173,27 @@ internal sealed class RetentionRuntimeReadinessState
     // Per model instance, held weakly (like RetentionValidationState): the entry is exact for
     // whichever model the context runs, and a host whose EF model cache can't hold its models gets
     // a new instance per context that dies with its context instead of being kept alive here.
+    // Within a model, the entry is keyed (ordinal) by the connection string without its
+    // password: parsed once per call, no round trip. It carries everything a pooler can route by
+    // under one host, port, and database name (user, options). Two spellings of one database each
+    // validate once.
     private readonly ConditionalWeakTable<
         IModel,
-        ConcurrentDictionary<
-            (string DataSource, string Database, string Username, string Options),
-            RetentionRuntimeReadinessEntry
-        >
+        ConcurrentDictionary<string, RetentionRuntimeReadinessEntry>
     > entries = new();
 
     // The database checks that passed, by value: one small key per distinct input per database
     // per check, never evicted. A rebuilt copy of a model that reads the same things skips them.
     private readonly ConcurrentDictionary<RetentionReadinessCheckKey, byte> passed = new();
 
-    internal RetentionRuntimeReadinessEntry For(
-        IModel model,
-        string dataSource,
-        string database,
-        string username,
-        string options
-    ) =>
+    internal RetentionRuntimeReadinessEntry For(IModel model, string connectionString) =>
         entries
             .GetValue(
                 model,
                 static _ =>
-                    new ConcurrentDictionary<
-                        (string DataSource, string Database, string Username, string Options),
-                        RetentionRuntimeReadinessEntry
-                    >()
+                    new ConcurrentDictionary<string, RetentionRuntimeReadinessEntry>(StringComparer.Ordinal)
             )
-            .GetOrAdd((dataSource, database, username, options), static _ => new RetentionRuntimeReadinessEntry());
+            .GetOrAdd(connectionString, static _ => new RetentionRuntimeReadinessEntry());
 
     internal bool HasPassed(RetentionReadinessCheckKey key) => passed.ContainsKey(key);
 

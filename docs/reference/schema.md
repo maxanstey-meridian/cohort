@@ -42,11 +42,11 @@ change up from your model like any other.
 ## Readiness
 
 Cohort validates the installed schema but never creates or upgrades it at runtime. Readiness
-requires the columns, keys, unique indexes (not deferrable) and named `CHECK` constraints
+requires the columns, keys, unique indexes (not deferrable), and named `CHECK` constraints
 Cohort relies on. It also refuses an extra `NOT NULL` column on a Cohort table that has no
 default and isn't an identity or generated column: Cohort's inserts leave it out, so every
 insert would fail. And it refuses a default on `sweep_run_entity_summary`'s `RetainedCount`,
-`DeferredCount` and `BlockedCount`, which an older Cohort leaves out of its inserts: with a
+`DeferredCount`, and `BlockedCount`, which an older Cohort leaves out of its inserts: with a
 default, that version would record it instead of failing.
 
 A missing performance-only index is logged as a warning rather than failing. Any index on
@@ -56,12 +56,12 @@ The application services and the dispatcher check readiness themselves, so a hos
 skipped startup validation still can't run against a missing or outdated schema.
 
 Readiness validates once per service provider and database, then trusts the result: each
-database check keeps its success, unless it passed inside the caller's transaction, under
-what it read, so later contexts, including new copies of the same EF model, don't run it
-again. The anonymise-target check is the exception and runs once
-for each copy of the model. A schema that drifts after that isn't refused by readiness; the
-run fails at the statement the change breaks. A change readiness would refuse, made while the
-application runs, is caught when it next starts.
+database check keeps its success, unless it passed inside the caller's transaction, under what
+it read, so later contexts, including new copies of the same EF model, don't run it again. The
+anonymise-target check is the exception and runs once for each copy of the model. A schema that
+drifts after that isn't refused by readiness; the run fails at the statement the change
+breaks. A change readiness would refuse, made while the application runs, is caught when it
+next starts.
 
 ## Schema qualification
 
@@ -79,15 +79,15 @@ Two identities run through these tables, and they're deliberately different:
   metadata only.
 - **`RecordId`** is one row's canonical PostgreSQL text identity, `CAST(key AS text)`. Cohort
   stores it as `text` in holds and row details, and compares it with the row's own key cast.
-  UUID, integer, string, `numeric`, `citext` and provider-converted keys all match
-  consistently. A hold names one row by it. A row a
+  UUID, integer, string, `numeric`, `citext`, and provider-converted keys all
+  match consistently. A hold names one row by it. A row a
   [hold relation](/guides/legal-holds#holding-related-rows) covers is found through the
   relation's link column, which equals the record ID of the row it points at and so must be the
   same type as it, with a compatible collation; readiness checks the column in the database
   (see [Startup validation](/reference/startup-validation#columns)).
 
 Record-ID types whose text form depends on session settings are rejected at startup:
-`timestamp`/`timestamptz`, `date`, `time`, `interval`, `real`/`double precision`, `money` and
+`timestamp`/`timestamptz`, `date`, `time`, `interval`, `real`/`double precision`, `money`, and
 `bytea`. Their canonical text could change between sessions and silently detach holds.
 Readiness checks the record-ID column's actual catalog type, so domains, arrays and ranges
 built on those types are rejected too.
@@ -100,10 +100,11 @@ identity never match a row again. Readiness therefore refuses to run while an ac
 names an identity no retained entity in the model declares, and names each such identity and
 its count of holds. Expired and removed holds, and audit history, are not checked. The check
 reads holds across every tenant, so it runs once per database, holds table, and set of
-retained entity identities, in its own `System(Readiness)` scope, whichever operation triggered readiness.
-That scope must reach the same database as the caller; it reads only through its connection,
-so its model may differ. The server decides that (database name, server start time and the
-holds table), so `localhost` versus `127.0.0.1`, or a pooler versus a direct port, is fine.
+retained entity identities, in its own `System(Readiness)` scope, whichever operation
+triggered readiness. That scope must reach the same database as the caller; it reads only
+through its connection, so its model may differ. The server decides that (database name and
+OID, server start time, and the holds table), so `localhost` versus `127.0.0.1`, or a pooler
+versus a direct port, is fine.
 
 The fix is to restore `[RetentionEntityId("old id")]` on the entity. If the change is
 deliberate, re-point the holds as part of deploying the new identity:

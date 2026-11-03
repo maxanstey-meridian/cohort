@@ -38,7 +38,11 @@ A hold on a row also holds the rows a host declares related to it.
   erasure's wrong-type subject message now reads "…but the subject is a {type}." (it was "…but
   the scope's subject is a {type}.").
 - Readiness keeps its results per EF model instance without holding the model, and keeps each
-  database check's success under exactly what that check reads. A host whose EF model cache
+  database check's success under exactly what that check reads. Shared passes are keyed by the
+  database the server reports (its name and OID, the server's start time, and the holds
+  table), and a model's own entry by the connection string without its password, so tenants a
+  pooler routes by user name or options under one host, port, and database name each get their
+  own readiness. A host whose EF model cache
   can't hold its models (many context types, or a model per tenant) no longer repeats
   readiness's catalog checks or its `System(Readiness)` scope for every context once one copy
   of the model has passed: only the anonymise-target check, whose result can depend on session

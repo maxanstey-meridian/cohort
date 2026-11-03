@@ -15,6 +15,7 @@ using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 
 using Npgsql;
 
@@ -692,7 +693,10 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     public async Task A_model_copy_that_maps_a_hold_relation_link_elsewhere_is_checked_again()
     {
         await using var database = await AnonymiseTargetDatabaseAsync<HoldLinkDbContext>();
-        await using var provider = BuildHoldLinkModelCopyProvider(database.ConnectionString);
+        await using var provider = BuildModelCopyProvider<HoldLinkDbContext>(
+            database.ConnectionString,
+            new HoldLinkRuleProvider()
+        );
 
         await using (var passing = provider.CreateAsyncScope())
         {
@@ -712,6 +716,35 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
                     StringComparison.Ordinal
                 )
             );
+    }
+
+    // T5b, skip side: a copy that maps the link to the column the first copy passed on is not
+    // checked again, even though the database has since lost that column. Nothing else reads the
+    // link column, so only the link check could refuse.
+    [Fact]
+    public async Task A_model_copy_that_maps_a_hold_relation_link_as_before_is_not_checked_again()
+    {
+        await using var database = await AnonymiseTargetDatabaseAsync<HoldLinkDbContext>();
+        await using var provider = BuildModelCopyProvider<HoldLinkDbContext>(
+            database.ConnectionString,
+            new HoldLinkRuleProvider()
+        );
+
+        await using var first = provider.CreateAsyncScope();
+        var firstModel = first.ServiceProvider.GetRequiredService<HoldLinkDbContext>().Model;
+        await ListActiveHoldsAsync(first.ServiceProvider);
+
+        await ExecuteAsync(
+            database,
+            "ALTER TABLE public.hold_link_children RENAME COLUMN \"CaseId\" TO \"CaseIdGone\""
+        );
+
+        await using var second = provider.CreateAsyncScope();
+        ReferenceEquals(firstModel, second.ServiceProvider.GetRequiredService<HoldLinkDbContext>().Model)
+            .Should().BeFalse("the full cache gives every context a model of its own");
+        var act = () => ListActiveHoldsAsync(second.ServiceProvider);
+
+        await act.Should().NotThrowAsync();
     }
 
     // T5c: a copy that writes its soft-delete flag to another column is checked on that column.
@@ -818,7 +851,6 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         }
 
         await ExecuteAsync(database, "DROP TABLE public.tenantless_logs");
-        NpgsqlConnection.ClearAllPools();
         (await HoldsTableOidAsync(database)).Should().NotBe(
             holdsTableBefore,
             "a database built afresh gets tables of its own, which is what tells it from the old one"
@@ -835,65 +867,155 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             );
     }
 
-    // A1: one model instance reaches one database under two user names (a pooler can route by
-    // user name), and each is validated: the model's own memory is keyed by the user name too.
-    // The anonymise check is not shared between model copies, so only that memory could skip it.
+    // A1: one model instance reaches one database under two connection strings that differ in
+    // what a pooler can route by (user name, options), and each is validated: the model's own
+    // memory is keyed by the connection string without its password. The anonymise check is not
+    // shared between model copies, so only that memory could skip it.
     [Fact]
     public async Task A_second_user_name_on_the_same_model_and_database_is_validated_again()
     {
         var role = $"cohort_readiness_{Guid.NewGuid():N}";
         const string password = "readiness-test-password";
-        await ExecuteAsync(fixture.ConnectionString, $"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}'");
+        await CreateReadRoleAsync(role, password);
         try
         {
             await using var database = await AnonymiseTargetDatabaseAsync();
-            var name = new NpgsqlConnectionStringBuilder(database.ConnectionString).Database!;
-            await ExecuteAsync(
+            await GrantReadAsync(database, role);
+
+            var thrown = await ListActiveHoldsAfterAnonymiseColumnShrinksAsync(
                 database,
-                $"""
-                GRANT CONNECT ON DATABASE "{name}" TO "{role}";
-                GRANT USAGE ON SCHEMA public TO "{role}";
-                GRANT SELECT ON ALL TABLES IN SCHEMA public TO "{role}";
-                """
-            );
-            var asFirstUser = database.ConnectionString;
-            var asSecondUser = new NpgsqlConnectionStringBuilder(asFirstUser)
-            {
-                Username = role,
-                Password = password,
-            }.ConnectionString;
-            var connectionString = asFirstUser;
-            await using var provider = BuildAnonymiseTargetProvider(
-                asFirstUser,
-                options => options.UseNpgsql(connectionString)
+                database.ConnectionString,
+                () => Task.FromResult(
+                    new NpgsqlConnectionStringBuilder(database.ConnectionString)
+                    {
+                        Username = role,
+                        Password = password,
+                    }.ConnectionString
+                )
             );
 
-            await using var first = provider.CreateAsyncScope();
-            var firstModel = first.ServiceProvider.GetRequiredService<AnonymiseTargetDbContext>().Model;
-            await ListActiveHoldsAsync(first.ServiceProvider);
-
-            await ExecuteAsync(
-                database,
-                "ALTER TABLE public.anonymise_literal_records ALTER COLUMN \"Label\" TYPE character varying(8)"
-            );
-
-            connectionString = asSecondUser;
-            await using var second = provider.CreateAsyncScope();
-            ReferenceEquals(firstModel, second.ServiceProvider.GetRequiredService<AnonymiseTargetDbContext>().Model)
-                .Should().BeTrue("the default model cache gives both contexts one model");
-            var act = () => ListActiveHoldsAsync(second.ServiceProvider);
-
-            (await act.Should().ThrowAsync<RetentionConfigurationException>())
-                .Which.Errors.Should().ContainSingle(error =>
-                    error.Contains(typeof(AnonymiseLiteralRecord).FullName!, StringComparison.Ordinal)
-                    && error.Contains("member Label", StringComparison.Ordinal)
-                    && error.Contains("not valid for its column type character varying(8)", StringComparison.Ordinal)
-                );
+            AssertAnonymiseColumnRefused(thrown);
         }
         finally
         {
             await ExecuteAsync(fixture.ConnectionString, $"DROP ROLE IF EXISTS \"{role}\"");
         }
+    }
+
+    [Fact]
+    public async Task A_second_options_string_on_the_same_model_and_database_is_validated_again()
+    {
+        await using var database = await AnonymiseTargetDatabaseAsync();
+
+        var thrown = await ListActiveHoldsAfterAnonymiseColumnShrinksAsync(
+            database,
+            database.ConnectionString,
+            () => Task.FromResult(
+                new NpgsqlConnectionStringBuilder(database.ConnectionString)
+                {
+                    Options = "-c statement_timeout=0",
+                }.ConnectionString
+            )
+        );
+
+        AssertAnonymiseColumnRefused(thrown);
+    }
+
+    // The password stays out of the model's key: a rotating credential would otherwise make one
+    // entry per token. The same role under a new password reaches the same database, so the pass
+    // is shared and the anonymise check is not run again.
+    [Fact]
+    public async Task A_rotated_password_on_the_same_model_and_database_is_not_validated_again()
+    {
+        var role = $"cohort_readiness_{Guid.NewGuid():N}";
+        const string firstPassword = "readiness-test-password";
+        const string rotatedPassword = "readiness-test-rotated-password";
+        await CreateReadRoleAsync(role, firstPassword);
+        try
+        {
+            await using var database = await AnonymiseTargetDatabaseAsync();
+            await GrantReadAsync(database, role);
+            var asRole = new NpgsqlConnectionStringBuilder(database.ConnectionString)
+            {
+                Username = role,
+                Password = firstPassword,
+            };
+
+            var thrown = await ListActiveHoldsAfterAnonymiseColumnShrinksAsync(
+                database,
+                asRole.ConnectionString,
+                async () =>
+                {
+                    await ExecuteAsync(
+                        fixture.ConnectionString,
+                        $"ALTER ROLE \"{role}\" PASSWORD '{rotatedPassword}'"
+                    );
+                    asRole.Password = rotatedPassword;
+                    return asRole.ConnectionString;
+                }
+            );
+
+            thrown.Should().BeNull("a rotated password reaches the same database, so the pass is kept");
+        }
+        finally
+        {
+            await ExecuteAsync(fixture.ConnectionString, $"DROP ROLE IF EXISTS \"{role}\"");
+        }
+    }
+
+    // Readiness passes for one model instance under firstConnectionString. The anonymise column
+    // then shrinks in the database, secondConnectionString says how the next scope reaches the
+    // same database, and what readiness throws in that scope comes back (null when nothing).
+    private async Task<Exception?> ListActiveHoldsAfterAnonymiseColumnShrinksAsync(
+        TemporaryDatabase database,
+        string firstConnectionString,
+        Func<Task<string>> secondConnectionString
+    )
+    {
+        var connectionString = firstConnectionString;
+        await using var provider = BuildAnonymiseTargetProvider(
+            firstConnectionString,
+            options => options.UseNpgsql(connectionString)
+        );
+
+        await using var first = provider.CreateAsyncScope();
+        var firstModel = first.ServiceProvider.GetRequiredService<AnonymiseTargetDbContext>().Model;
+        await ListActiveHoldsAsync(first.ServiceProvider);
+
+        await ExecuteAsync(
+            database,
+            "ALTER TABLE public.anonymise_literal_records ALTER COLUMN \"Label\" TYPE character varying(8)"
+        );
+
+        connectionString = await secondConnectionString();
+        await using var second = provider.CreateAsyncScope();
+        ReferenceEquals(firstModel, second.ServiceProvider.GetRequiredService<AnonymiseTargetDbContext>().Model)
+            .Should().BeTrue("the default model cache gives both contexts one model");
+        return await Record.ExceptionAsync(() => ListActiveHoldsAsync(second.ServiceProvider));
+    }
+
+    private static void AssertAnonymiseColumnRefused(Exception? thrown) =>
+        thrown.Should().BeOfType<RetentionConfigurationException>()
+            .Which.Errors.Should().ContainSingle(error =>
+                error.Contains(typeof(AnonymiseLiteralRecord).FullName!, StringComparison.Ordinal)
+                && error.Contains("member Label", StringComparison.Ordinal)
+                && error.Contains("not valid for its column type character varying(8)", StringComparison.Ordinal)
+            );
+
+    private Task CreateReadRoleAsync(string role, string password) =>
+        ExecuteAsync(fixture.ConnectionString, $"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}'");
+
+    private static async Task GrantReadAsync(TemporaryDatabase database, string role)
+    {
+        var name = new NpgsqlConnectionStringBuilder(database.ConnectionString).Database!;
+        await ExecuteAsync(
+            database,
+            $"""
+            GRANT CONNECT ON DATABASE "{name}" TO "{role}";
+            GRANT USAGE ON SCHEMA public TO "{role}";
+            GRANT SELECT ON ALL TABLES IN SCHEMA public TO "{role}";
+            """
+        );
     }
 
     // T6: a check that passed inside a caller's transaction may have seen DDL that rolls back.
@@ -1028,42 +1150,43 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         string connectionString,
         IRetentionRuleProvider? ruleProvider = null,
         IRetentionExecutionScope? executionScope = null
-    )
-    {
-        var services = new ServiceCollection();
-        services.AddLogging();
-        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
-        services.AddScoped<ModelVariant>();
-        services.AddDbContext<SampleDbContext>((provider, options) =>
-            UseModelCopy(options, provider, connectionString)
+    ) =>
+        BuildModelCopyProvider<SampleDbContext>(
+            connectionString,
+            ruleProvider ?? new SampleRetentionRuleProvider(),
+            services =>
+            {
+                services.AddSingleton<GuidTombstoneFactory>();
+                services.AddSingleton<OriginalValueTombstoneFactory>();
+                services.AddSingleton<IAnonymiseValueFactory>(provider =>
+                    provider.GetRequiredService<GuidTombstoneFactory>()
+                );
+                services.AddSingleton<IAnonymiseValueFactory>(provider =>
+                    provider.GetRequiredService<OriginalValueTombstoneFactory>()
+                );
+            },
+            executionScope
         );
-        services.AddSingleton<IRetentionRuleProvider>(ruleProvider ?? new SampleRetentionRuleProvider());
-        services.AddSingleton<GuidTombstoneFactory>();
-        services.AddSingleton<OriginalValueTombstoneFactory>();
-        services.AddSingleton<IAnonymiseValueFactory>(provider =>
-            provider.GetRequiredService<GuidTombstoneFactory>()
-        );
-        services.AddSingleton<IAnonymiseValueFactory>(provider =>
-            provider.GetRequiredService<OriginalValueTombstoneFactory>()
-        );
-        services.AddSingleton<IRetentionExecutionScope>(executionScope ?? RetentionExecutionScope.Unisolated);
-        services.AddCohort<SampleDbContext>();
-        return services.BuildServiceProvider(validateScopes: true);
-    }
 
-    // The same, over a context whose model carries a hold relation, which the sample's doesn't.
-    private static ServiceProvider BuildHoldLinkModelCopyProvider(string connectionString)
+    // The same over any context, such as one whose model carries a hold relation, which the
+    // sample's doesn't. register adds what the context's retained entities need.
+    private static ServiceProvider BuildModelCopyProvider<TContext>(
+        string connectionString,
+        IRetentionRuleProvider ruleProvider,
+        Action<IServiceCollection>? register = null,
+        IRetentionExecutionScope? executionScope = null
+    )
+        where TContext : DbContext
     {
         var services = new ServiceCollection();
         services.AddLogging();
         services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
         services.AddScoped<ModelVariant>();
-        services.AddDbContext<HoldLinkDbContext>((provider, options) =>
-            UseModelCopy(options, provider, connectionString)
-        );
-        services.AddSingleton<IRetentionRuleProvider>(new HoldLinkRuleProvider());
-        services.AddSingleton(RetentionExecutionScope.Unisolated);
-        services.AddCohort<HoldLinkDbContext>();
+        services.AddDbContext<TContext>((provider, options) => UseModelCopy(options, provider, connectionString));
+        services.AddSingleton(ruleProvider);
+        register?.Invoke(services);
+        services.AddSingleton<IRetentionExecutionScope>(executionScope ?? RetentionExecutionScope.Unisolated);
+        services.AddCohort<TContext>();
         return services.BuildServiceProvider(validateScopes: true);
     }
 
@@ -1161,6 +1284,33 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             await holds.ListActiveAsync(CancellationToken.None);
             executionScope.Ran.Should().ContainSingle(context => context == readiness);
         });
+    }
+
+    // Startup validation runs before readiness reads anything from the Cohort tables' mapping, so
+    // a model with none gets the aggregated refusal that says what to call, not a bare exception.
+    [Fact]
+    public async Task Readiness_refuses_a_model_with_no_cohort_table_mappings_with_the_aggregated_error()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
+        services.AddDbContext<NoCohortTablesDbContext>(builder => builder.UseNpgsql(fixture.ConnectionString));
+        services.AddSingleton<IRetentionRuleProvider>(new SessionKeyRuleProvider());
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
+        services.AddCohort<NoCohortTablesDbContext>();
+        await using var provider = services.BuildServiceProvider(validateScopes: true);
+
+        // Host startup is the port that gets to readiness: the sweep and holds ports read the
+        // Cohort tables' mapping when they are built.
+        var validation = provider
+            .GetServices<IHostedService>()
+            .Single(service => service.GetType().Name == "RetentionValidationHostedService");
+        var act = () => validation.StartAsync(CancellationToken.None);
+
+        (await act.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().Contain(error =>
+                error.Contains("The EF model contains no Cohort table mappings", StringComparison.Ordinal)
+            );
     }
 
     [Fact]
@@ -2038,6 +2188,16 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         {
             modelBuilder.Entity<SessionKeyRecord>().ToTable("session_key_records");
             modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    // A retained entity and no ConfigureCohortTables().
+    private sealed class NoCohortTablesDbContext(DbContextOptions<NoCohortTablesDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<SessionKeyRecord>().ToTable("session_key_records");
         }
     }
 

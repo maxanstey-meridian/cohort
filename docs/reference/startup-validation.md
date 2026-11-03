@@ -73,7 +73,8 @@ columns or rows belong to it. So these are rejected:
 - Anchor, `DeletedAt`, and `AnonymisedAt` columns map to `timestamp with time zone`
   (`timestamptz` and precision variants are fine). Cohort compares and writes retention
   timestamps as UTC instants, and a naive `timestamp without time zone` column silently drifts
-  with the session time zone.
+  with the session time zone. Readiness also reads the database's own column type, through any
+  domains, and refuses a naive one ([Rules](#rules)).
 - Tenant, anchor, soft-delete, deleted-at, and anonymised-at properties don't use EF value
   converters. Cohort filters and writes those columns in SQL, where a converter wouldn't
   apply.
@@ -81,23 +82,26 @@ columns or rows belong to it. So these are rejected:
   unique index. A filtered index doesn't make it unique.
 - Record-ID types whose text form depends on session settings are rejected. See
   [Identities](/reference/schema#identities).
-- A retained entity's `AnonymisedAt` marker has no default or value generation mapped in the
-  EF model (`HasDefaultValue`, `HasDefaultValueSql`, or `ValueGenerated` other than `Never`).
+- The `AnonymisedAt` marker of an entity whose category may anonymise has no default or value
+  generation mapped in the EF model (`HasDefaultValue`, `HasDefaultValueSql`, or
+  `ValueGenerated` other than `Never`).
   EF would then leave it out of an insert and the database would fill it in, so every row
   would be born marked as anonymised and never anonymised. `NULL` must mark the rows still to
   anonymise.
 
 ### Statements
 
-Readiness asks PostgreSQL to analyse and plan, without running, every statement Cohort can send
-for the host's model and the strategies its categories declare: sweeps, previews, and dry runs;
-erasures, for each subject kind an entity maps, with and without a legal minimum; holds and
-their deletion check; and the worker's tenant-coverage scan. It builds them with the code the
-runs execute, so what readiness explains is what a run sends, and it refuses what PostgreSQL
-refuses, for every column those statements use. The error holds one entry per entity, with
-PostgreSQL's SQLSTATE and message, the operations that send the statement, the statement text
-around the error, and the tables it reads. Data-only values are bound as typed `NULL`s, so
-that text carries no subject data. PostgreSQL refuses:
+Readiness asks PostgreSQL to analyse and plan, without running, the statements Cohort sends
+against the host's retained tables, for the host's model and the strategies its categories
+declare: sweeps, previews, and dry runs; erasures, for each subject kind an entity maps, with
+and without a legal minimum; holds and their deletion check; and the worker's tenant-coverage
+scan. Some of them also read Cohort's `retention_holds` and `sweep_run_row_detail` tables. It
+builds them with the code the runs execute, so what readiness explains is what a run sends
+against those tables, and it refuses what PostgreSQL refuses, for every column those
+statements use. The error holds one entry per entity, with PostgreSQL's SQLSTATE and message,
+the operations that send the statement, the statement text around the error, and the tables
+it reads. Data-only values are bound as typed `NULL`s, so that text carries no subject data.
+PostgreSQL refuses:
 
 - a table or column the statements read or write that the database doesn't have (`42P01`,
   `42703`): a retained table, a record-ID, anchor, tenant, soft-delete, deleted-at, or
@@ -111,11 +115,14 @@ that text carries no subject data. PostgreSQL refuses:
   `GENERATED ALWAYS`), which takes no `UPDATE` (`428C9`);
 - a cast type the database doesn't know, resolved through the session's search path
   (`42704`);
-- a privilege the database role lacks (`42501`), `USAGE` on a schema included. The role
-  readiness validates under must be able to run every statement Cohort may send, for every
-  operation: a host that splits roles gives the role that reaches readiness the privileges of
-  all of them (`SELECT`, `INSERT`, `UPDATE`, and `DELETE` on the retained tables, and row locks
-  need `UPDATE`). A role that can't prove it is permitted is refused, not skipped.
+- a privilege the database role lacks (`42501`). The role readiness validates under must be
+  able to run those statements, for every operation: a host that splits roles gives the role
+  that reaches readiness the host-table privileges of all of them. That is `SELECT` on every
+  retained table, on `retention_holds`, on `sweep_run_row_detail`, and on the child table of
+  any foreign key that blocks a purge; `UPDATE` on every retained table, since row locks
+  (`FOR UPDATE` and `FOR SHARE`) need it, as `SoftDelete` and `Anonymise` do; `DELETE` where
+  `Purge` is declared; and `USAGE` on each schema those tables live in. A role that can't prove
+  it is permitted is refused, not skipped.
 
 The pass is kept per database, role, and search path. See [Readiness](/reference/schema#readiness).
 
@@ -222,3 +229,40 @@ checked. Readiness also checks each link column against the real table
   `RowHandlerDispatch:PayloadRetention` is longer than the retry schedule of the entity with
   the most handlers (see [Configuration](/reference/configuration#row-handler-dispatch)), on
   start and on every reload.
+
+## Upgrading to 0.12.0
+
+::: warning Breaking change
+0.12.0 asks PostgreSQL to check the statements Cohort sends against your tables, and refuses
+more of what it finds at startup and at readiness. There is no Cohort schema change and no
+migration, but your own tables, roles, and EF model may need one. Each message names the
+entity and column it refuses.
+
+- A role that lacks a privilege the statements need is refused at readiness instead of failing
+  the first run that needs it. Give the role that first reaches readiness `SELECT` on every
+  retained table, on `retention_holds`, and on `sweep_run_row_detail`; `UPDATE` on every
+  retained table; `DELETE` where `Purge` is declared; and `USAGE` on each schema those tables
+  live in ([Statements](#statements)). A host that splits roles (a role for each tenant, say)
+  gives the role that first reaches readiness the host-table privileges of every scope, since
+  readiness explains the statements of all of them under that role. The pass is kept per role,
+  so each role that reaches readiness is checked the same way. See
+  [Tenant Isolation](/guides/tenant-isolation#grants).
+- A tenant column that is nullable in the database: make it `NOT NULL`. A `NULL` tenant never
+  matches any tenant's run, erasure, or hold, so those rows were silently never swept.
+- A soft-delete flag that is nullable, on an entity whose category may soft-delete: make it
+  `NOT NULL`, with a default of `false` if rows exist. A `NULL` flag was silently skipped.
+- An anchor, deleted-at, or anonymised-at column the database types as
+  `timestamp without time zone`: change it to `timestamp with time zone`, converting existing
+  values from the zone they were written in. The naive type drifted with the session time
+  zone.
+- An anonymised-at column that is `NOT NULL`, on an entity whose category may anonymise: make
+  it nullable. `NULL` marks the rows still to anonymise, so a `NOT NULL` column never matched
+  any.
+- An `AnonymisedAt` marker with `HasDefaultValue`, `HasDefaultValueSql`, or value generation
+  mapped in the EF model, on an entity whose category may anonymise: remove the default or the
+  generation. With one, every row was born marked as anonymised. Rows already inserted that way
+  need their marker set back to `NULL` if they should still be anonymised.
+- The text of a refusal for a missing table or column, a mistyped column, a generated column,
+  or a missing hold-relation link column is now PostgreSQL's, with its SQLSTATE and message.
+  Code or alerts that match the old text need updating.
+:::

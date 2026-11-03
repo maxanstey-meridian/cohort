@@ -50,25 +50,32 @@ A hold on a row also holds the rows a host declares related to it.
   different model, since it reads only through its connection; the refusal now says 'a
   different database'. Readiness reads the database's identity from the server once for each
   model copy and connection it hasn't validated, one extra round trip.
-- Readiness asks PostgreSQL to analyse and plan, without running, every statement Cohort can
-  send for the host's model and declared strategies (sweeps, previews, erasures for each subject
-  kind, holds, and the tenant-coverage scan), and refuses what PostgreSQL refuses: a missing
-  table or column, including erasure-subject columns, a type a statement can't compare or
-  assign, a column the database generates, an unknown cast type, or a privilege the database
-  role lacks for any statement Cohort may send. The role readiness validates under must hold
-  every privilege Cohort needs. The refusal carries PostgreSQL's SQLSTATE and message. It also
-  refuses a nullable tenant column, a nullable soft-delete flag, and an anonymised-at column
-  that is NOT NULL, since each makes rows silently never match. Startup refuses an anonymised-at
-  marker with a default or value generation mapped in the EF model, since EF then never writes
-  it NULL; the anchor, deleted-at, and anonymised-at columns must be `timestamp with time zone`.
-  The statement check's success is kept per database, role, and search path. Before, every such
-  run failed at its SQL, or, for a timestamp without time zone, drifted with the session
-  TimeZone. Breaking: the refusal texts for missing or mistyped columns are now PostgreSQL's
-  (one error per entity, with its SQLSTATE, message, and the statement text around the error),
-  and a host whose role lacks a privilege for any of Cohort's statements is refused at readiness
-  instead of failing the first run that needs it.
+- Readiness asks PostgreSQL to analyse and plan, without running, the statements Cohort sends
+  against the host's retained tables for the host's model and declared strategies (sweeps,
+  previews, erasures for each subject kind, holds, deletion checks, and the tenant-coverage
+  scan), and refuses what PostgreSQL refuses: a missing table or column, including
+  erasure-subject columns, a type a statement can't compare or assign, a column the database
+  generates, an unknown cast type, or a privilege the database role lacks for one of those
+  statements. The role readiness validates under must hold the privileges those statements need
+  (`SELECT` and `UPDATE` on the retained tables, `DELETE` where `Purge` is declared, `SELECT` on
+  `retention_holds` and `sweep_run_row_detail`, and `USAGE` on their schemas). The refusal
+  carries PostgreSQL's SQLSTATE and message. It also refuses a nullable tenant column, a
+  nullable soft-delete flag, and an anonymised-at column that is NOT NULL, since each makes
+  rows silently never match. Readiness also refuses an anchor, deleted-at, or anonymised-at
+  column the database types as `timestamp without time zone`, seen through any domains. Startup
+  refuses an anonymised-at marker with a default or value generation mapped in the EF model,
+  since EF then never writes it NULL and every row is born marked as anonymised. The statement
+  check's success is kept per database, role, and search path. Before, a run over such a
+  database failed at the statement, silently skipped rows (or, for the mapped default, never
+  anonymised them), or, for a timestamp without time zone, drifted with the session TimeZone.
+  Breaking: the refusal texts for a missing table or column, a mistyped column, a generated
+  column, and a missing link column are now PostgreSQL's (one error per entity, with its
+  SQLSTATE, message, and the statement text around the error), and a host whose role lacks a
+  privilege for one of those statements is refused at readiness instead of failing the first
+  run that needs it.
 
-Upgrade: [Legal Holds](https://maxanstey-meridian.github.io/cohort/guides/legal-holds#upgrading-to-0-12-0).
+Upgrade: [Legal Holds](https://maxanstey-meridian.github.io/cohort/guides/legal-holds#upgrading-to-0-12-0)
+and [Startup Validation](https://maxanstey-meridian.github.io/cohort/reference/startup-validation#upgrading-to-0-12-0).
 
 ## 0.11.0 (2026-10-26, breaking)
 

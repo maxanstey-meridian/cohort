@@ -105,7 +105,7 @@ internal static class RetentionHoldSql
             ORDER BY "RetentionEntityId", "RecordId", "HoldId"
             """,
             parameters,
-            HolderPathTables(entry)
+            [.. HolderPathTables(entry), holdsTable]
         );
     }
 
@@ -132,7 +132,7 @@ internal static class RetentionHoldSql
             LIMIT 1
             """,
             parameters,
-            HolderPathTables(entry)
+            [.. HolderPathTables(entry), holdsTable]
         );
     }
 
@@ -246,7 +246,10 @@ internal static class RetentionHoldSql
             ORDER BY "RetentionEntityId", "RecordId", "HoldId"
             """,
             parameters,
-            [.. starts.SelectMany(start => PathTables(start.Entry, start.Entry.HolderPaths, includeEntry: true)).Distinct()]
+            [
+                .. starts.SelectMany(start => PathTables(start.Entry, start.Entry.HolderPaths, includeEntry: true)).Distinct(),
+                holdsTable,
+            ]
         );
     }
 
@@ -254,7 +257,7 @@ internal static class RetentionHoldSql
     /// The host tables a path walk reads: <paramref name="entry"/>'s own (when
     /// <paramref name="includeEntry"/>) and each hop's far table, once each.
     /// </summary>
-    private static IEnumerable<RelationalObjectName> PathTables(
+    internal static IEnumerable<RelationalObjectName> PathTables(
         RetentionEntry entry,
         IEnumerable<HoldPath> paths,
         bool includeEntry
@@ -563,7 +566,10 @@ internal static class RetentionHoldSql
             null,
             $"SELECT DISTINCT *\nFROM (\n{string.Join("\nUNION ALL\n", branches)}\n) AS versions",
             parameters,
-            [.. entries.SelectMany(entry => PathTables(entry, entry.CoveredPaths, includeEntry: true)).Distinct()]
+            [
+                .. entries.SelectMany(entry => PathTables(entry, entry.CoveredPaths, includeEntry: true)).Distinct(),
+                holdsTable,
+            ]
         );
     }
 
@@ -627,7 +633,7 @@ internal static class RetentionHoldSql
             null,
             string.Join("\nUNION ALL\n", branches),
             parameters,
-            [.. ordered.Select(entry => entry.Table)]
+            [.. ordered.Select(entry => entry.Table), holdsTable]
         );
     }
 
@@ -678,8 +684,8 @@ internal static class RetentionHoldSql
         object? tenantId
     )
     {
-        var tenanted = starts.Where(start => start.Entry.Tenant is not null).ToList();
-        var tenantless = starts.Where(start => start.Entry.Tenant is null).ToList();
+        var tenanted = starts.Where(start => SweepEntityScope.TenantedOnly.Includes(start.Entry)).ToList();
+        var tenantless = starts.Where(start => SweepEntityScope.TenantlessOnly.Includes(start.Entry)).ToList();
         return
         [
             .. new[]

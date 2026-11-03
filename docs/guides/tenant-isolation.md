@@ -193,3 +193,10 @@ headroom.
 The tenant role needs `SELECT, INSERT, UPDATE, DELETE` on the five Cohort tables, as well as
 on your retained tables. The identity columns behind `sweep_run_row_detail.Id` and
 `sweep_row_handler_status.Id` need no separate sequence grant.
+
+Readiness explains the statements of every scope under the role that reaches it, whichever
+operation that is first. So if your scopes use different roles, the role that first reaches
+readiness must hold the host-table privileges of every scope, not just its own: `SELECT` on
+each retained table, `retention_holds`, and `sweep_run_row_detail`; `UPDATE` on each retained
+table; `DELETE` where `Purge` is declared; and `USAGE` on their schemas. See
+[Upgrading to 0.12.0](/reference/startup-validation#upgrading-to-0-12-0).

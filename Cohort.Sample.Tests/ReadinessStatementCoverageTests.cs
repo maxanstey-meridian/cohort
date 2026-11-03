@@ -1,3 +1,4 @@
+using System.Reflection;
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
@@ -18,12 +19,12 @@ namespace Cohort.Sample.Tests;
 // same text>"), and every host-table statement a real run sent must have its EXPLAIN. When a
 // statement is missing from readiness's set, the failure names its text.
 //
-// Each run group gets its own fresh database, seeded first, then pg_stat_statements is reset for
-// that database, readiness runs, and the operations run: batch size 1 with several due rows
-// (the cursor statements), dry runs and live sweeps, previews, erasures with and without a legal
-// minimum, holds, a deletion check, the worker's tenant-coverage scan, and hosts with a row
-// handler and with a dependents step (the row-by-row statements). Host SQL a step runs starts
-// "/* host */" and is excluded: it is the host's, not Cohort's.
+// Each run group gets its own fresh database, seeded first, then pg_stat_statements is reset (the
+// whole view, with its eviction count noted), readiness runs, and the operations run: batch size
+// 1 with several due rows (the cursor statements), dry runs and live sweeps, previews, erasures
+// with and without a legal minimum, holds, a deletion check, the worker's tenant-coverage scan,
+// and hosts with a row handler and with a dependents step (the row-by-row statements). Host SQL
+// a step runs starts "/* host */" and is excluded: it is the host's, not Cohort's.
 // ────────────────────────────────────────────────────────────────────────────
 
 [Collection("Integration")]
@@ -46,7 +47,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         );
         await SeedAsync(database, tenants);
 
-        await StartRecordingAsync(database);
+        var recording = await StartRecordingAsync(database);
         await host.RunWithServicesAsync(services =>
             services
                 .GetRequiredService<IRetentionHoldsRepository>()
@@ -186,7 +187,16 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             );
         });
 
-        await AssertEveryRunStatementIsExplainedAsync<SampleDbContext>(database);
+        // The tenantless sweep and erasure reach the tenantless tables; the second batch of each
+        // entity reaches S5's cursor, the Exempt erasure S4, and the worker's scan S12.
+        await AssertEveryRunStatementIsExplainedAsync<SampleDbContext>(
+            database,
+            recording,
+            runsReachTenantless: true,
+            AnchoredCursor,
+            SubjectCount,
+            TenantCoverage
+        );
     }
 
     [Fact]
@@ -202,7 +212,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         );
         await SeedAsync(database, tenants);
 
-        await StartRecordingAsync(database);
+        var recording = await StartRecordingAsync(database);
         await host.RunWithServicesAsync(services =>
             services
                 .GetRequiredService<IRetentionHoldsRepository>()
@@ -215,7 +225,13 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             .BeEmpty();
         await EraseAsync(host, tenants.WithoutLegalMinimum, "user", tenants.Subject);
 
-        await AssertEveryRunStatementIsExplainedAsync<SampleDbContext>(database);
+        // Only tenanted runs: the tenantless tables are not reached.
+        await AssertEveryRunStatementIsExplainedAsync<SampleDbContext>(
+            database,
+            recording,
+            runsReachTenantless: false,
+            AnchoredCursor
+        );
     }
 
     [Fact]
@@ -247,7 +263,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             """
         );
 
-        await StartRecordingAsync(database);
+        var recording = await StartRecordingAsync(database);
         await host.RunWithServicesAsync(services =>
             services
                 .GetRequiredService<IRetentionHoldsRepository>()
@@ -262,7 +278,15 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
                 && failure.Contains(typeof(Note).FullName!, StringComparison.Ordinal)
             );
 
-        await AssertEveryRunStatementIsExplainedAsync<SampleDbContext>(database);
+        // Only a tenanted sweep, but the held-row guard's statements span the whole model, so the
+        // tenantless tables appear too.
+        await AssertEveryRunStatementIsExplainedAsync<SampleDbContext>(
+            database,
+            recording,
+            runsReachTenantless: true,
+            AnchoredCursor,
+            StillDue
+        );
     }
 
     [Fact]
@@ -277,7 +301,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         await EnsureCreatedAsync(services);
         await SeedHeldWithAsync(database, tenant);
 
-        await StartRecordingAsync(database);
+        var recording = await StartRecordingAsync(database);
         await using (var scope = services.CreateAsyncScope())
         {
             var provider = scope.ServiceProvider;
@@ -352,7 +376,12 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         }
 
         await AssertEveryRunStatementIsExplainedAsync<HeldWithReadinessEndToEndTests.HeldWithReadinessDbContext>(
-            database
+            database,
+            recording,
+            runsReachTenantless: true,
+            AnchoredCursor,
+            TenantCoverage,
+            CoveredRowLocks
         );
     }
 
@@ -373,7 +402,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         await EnsureCreatedAsync(services);
         await SeedHeldWithAsync(database, tenant);
 
-        await StartRecordingAsync(database);
+        var recording = await StartRecordingAsync(database);
         await using (var scope = services.CreateAsyncScope())
         {
             var provider = scope.ServiceProvider;
@@ -412,48 +441,162 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         }
 
         await AssertEveryRunStatementIsExplainedAsync<HeldWithReadinessEndToEndTests.HeldWithReadinessDbContext>(
-            database
+            database,
+            recording,
+            runsReachTenantless: true,
+            AnchoredCursor,
+            CoveredRowLocks
         );
     }
 
     // ── the proof ───────────────────────────────────────────────────────────
 
-    private async Task AssertEveryRunStatementIsExplainedAsync<TContext>(TemporaryDatabase database)
+    // Five claims, each its own assertion so none can stand in for another:
+    //   1. pg_stat_statements evicted nothing while the runs went (it caps its entries at
+    //      pg_stat_statements.max, shared by every database, and an evicted statement would drop
+    //      out of the comparison below without a word);
+    //   2. every retained host table the runs reach shows up in at least one executed statement,
+    //      so a table filter that stopped matching can't leave "sent" holding only
+    //      canonical-text statements;
+    //   3. the record key's canonical-text statements (S11, S18) were executed, as their own
+    //      clause;
+    //   4. each statement family the group was built to reach is still executed. The family is
+    //      read from the statement text the server recorded (a marker the family's builder always
+    //      writes), not from an outcome: an outcome like "several batches ran" can hold while the
+    //      statement it should prove goes unsent;
+    //   5. last, every sent statement was explained.
+    private async Task AssertEveryRunStatementIsExplainedAsync<TContext>(
+        TemporaryDatabase database,
+        Recording recording,
+        bool runsReachTenantless,
+        params Family[] reached
+    )
         where TContext : DbContext
     {
-        var hostTables = HostTables<TContext>(database);
+        var hostTables = ModelTables<TContext>(database, _ => true);
+        // The retained tables this group's runs reach: a tenantless entity is reached only by a
+        // tenantless run or a statement that spans the model.
+        var retainedTables = ModelTables<TContext>(
+            database,
+            type =>
+                type.GetCustomAttribute<RetainAttribute>() is not null
+                && (
+                    runsReachTenantless
+                    || type.GetCustomAttribute<RetentionTenantlessAttribute>() is null
+                )
+        );
         var recorded = await RecordedStatementsAsync(database);
+        (await DeallocationsAsync(database))
+            .Should()
+            .Be(
+                recording.Deallocations,
+                "pg_stat_statements evicted entries during the runs, so a sent statement or its EXPLAIN may be missing from the view; raise pg_stat_statements.max for the test server"
+            );
 
         var explained = recorded
-            .Where(query => query.StartsWith(Explain, StringComparison.Ordinal))
-            .Select(query => query[Explain.Length..])
+            .Where(statement => statement.Query.StartsWith(Explain, StringComparison.Ordinal))
+            .Select(statement => statement.Query[Explain.Length..])
             .ToHashSet(StringComparer.Ordinal);
-        var sent = recorded
-            .Where(query =>
-                !query.StartsWith(Explain, StringComparison.Ordinal)
-                && !query.StartsWith(HostComment, StringComparison.Ordinal)
-                && (
-                    hostTables.Any(table => query.Contains(table, StringComparison.Ordinal))
-                    // A record key's canonical text (S11, S18) reads no table, but it casts to the
-                    // model's store type, which the database may not know.
-                    || query.StartsWith(CanonicalText, StringComparison.Ordinal)
+        // The statements the runs sent, one entry per text. pg_stat_statements also lists a
+        // statement PostgreSQL only analysed, with no call: EXPLAIN's inner statement, or one that
+        // raised an error. Those count as sent for the comparison with readiness's set (a run
+        // statement that errors is still one readiness must have explained), but not for the
+        // claims that a run reached something: only a statement a run executed (Calls above 0)
+        // does, or readiness's own EXPLAIN of a table or family would satisfy them.
+        var runStatements = recorded
+            .Where(statement =>
+                !statement.Query.StartsWith(Explain, StringComparison.Ordinal)
+                && !statement.Query.StartsWith(HostComment, StringComparison.Ordinal)
+            )
+            .GroupBy(statement => statement.Query, StringComparer.Ordinal)
+            .Select(group => new Recorded(group.Key, group.Sum(statement => statement.Calls)))
+            .ToList();
+        bool IsOnHostTable(Recorded statement) =>
+            hostTables.Any(table => statement.Query.Contains(table, StringComparison.Ordinal));
+        // A record key's canonical text (S11, S18) reads no table, but it casts to the model's
+        // store type, which the database may not know.
+        bool IsCanonicalText(Recorded statement) =>
+            statement.Query.StartsWith(CanonicalText, StringComparison.Ordinal);
+        var sent = runStatements.Where(s => IsOnHostTable(s) || IsCanonicalText(s)).ToList();
+        var executed = sent.Where(statement => statement.Calls > 0).ToList();
+
+        retainedTables
+            .Where(table =>
+                !executed.Any(statement =>
+                    IsOnHostTable(statement)
+                    && statement.Query.Contains(table, StringComparison.Ordinal)
                 )
             )
-            .Distinct(StringComparer.Ordinal)
-            .ToList();
-
-        sent.Should()
-            .NotBeEmpty("the runs must have sent host-table statements for this to prove anything");
-        sent.Where(query => !explained.Contains(query))
+            .Should()
+            .BeEmpty(
+                "every retained host table the runs reach must appear in a statement a run executed"
+            );
+        executed
+            .Where(IsCanonicalText)
+            .Should()
+            .NotBeEmpty("the runs must have executed the record key's canonical-text statements");
+        string.Join(
+                "; ",
+                reached
+                    .Where(family => !executed.Any(statement => family.IsSent(statement.Query)))
+                    .Select(family => family.Name)
+            )
+            .Should()
+            .BeEmpty("the group was built to reach these statement families, and no run executed them");
+        sent.Select(statement => statement.Query)
+            .Where(query => !explained.Contains(query))
             .Should()
             .BeEmpty(
                 "readiness must EXPLAIN every host-table statement a run sends; these were sent and never explained"
             );
     }
 
+    // What the server's statements carry for each family, with Npgsql's $n for every parameter.
+    private sealed record Family(string Name, Func<string, bool> IsSent);
+
+    private sealed record Recording(long Deallocations);
+
+    // S5: the keyset after the first batch, `(anchor, record id) > ($n, $n)`.
+    private static readonly Family AnchoredCursor = new(
+        "S5, discovery's anchored cursor (a second batch)",
+        query => query.Contains(") > ($", StringComparison.Ordinal)
+    );
+
+    // S4: an Exempt erasure only counts the subject's rows, so the count has the subject and the
+    // tenant and no anchor or eligibility test (the other counts all mention the anchor).
+    private static readonly Family SubjectCount = new(
+        "S4, an Exempt erasure's count of the subject's rows",
+        query =>
+            query.StartsWith("SELECT pg_catalog.count(*) FROM ", StringComparison.Ordinal)
+            && query.Contains("\"SubjectId\" = CAST(", StringComparison.Ordinal)
+            && !query.Contains("\"CreatedAt\"", StringComparison.Ordinal)
+    );
+
+    // S10: a dependents step's still-due check, the only statement that is a bare SELECT EXISTS.
+    private static readonly Family StillDue = new(
+        "S10, the dependents step's still-due check",
+        query => query.StartsWith("SELECT EXISTS (", StringComparison.Ordinal)
+    );
+
+    // S12: the worker's tenant-coverage scan, the only SELECT DISTINCT of a tenant column.
+    private static readonly Family TenantCoverage = new(
+        "S12, the tenant-coverage scan",
+        query => query.StartsWith("SELECT DISTINCT target.", StringComparison.Ordinal)
+    );
+
+    // S14: the covered-row locks of a hold on a row with hold paths. S13's lock of the held row is a
+    // plain FOR SHARE.
+    private static readonly Family CoveredRowLocks = new(
+        "S14, the covered-row locks",
+        query => query.Contains("FOR SHARE OF target", StringComparison.Ordinal)
+    );
+
     // The quoted, schema-qualified names of the model's own tables (not Cohort's), as Cohort's
-    // statements spell them.
-    private static List<string> HostTables<TContext>(TemporaryDatabase database)
+    // statements spell them, for the entity types that pass include.
+    private static List<string> ModelTables<TContext>(
+        TemporaryDatabase database,
+        Func<Type, bool> include
+    )
         where TContext : DbContext
     {
         using var db = (TContext)
@@ -475,6 +618,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             .. db
                 .Model.GetEntityTypes()
                 .Where(entityType => entityType.GetTableName() is not null)
+                .Where(entityType => include(entityType.ClrType))
                 .Select(entityType => new RelationalObjectName(
                     entityType.GetSchema() ?? "public",
                     entityType.GetTableName()!
@@ -484,35 +628,50 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         ];
     }
 
-    private static async Task StartRecordingAsync(TemporaryDatabase database)
+    // Resets the whole view, not only this database's entries: pg_stat_statements.max (5000 by
+    // default) is shared by every temporary database in the suite, and the Integration collection
+    // runs one test at a time, so nothing else is writing to it. Then notes how many times the
+    // view has evicted entries, so the proof can fail loudly if it evicts during the runs.
+    private static async Task<Recording> StartRecordingAsync(TemporaryDatabase database)
     {
         await ExecuteAsync(database, "CREATE EXTENSION IF NOT EXISTS pg_stat_statements");
-        await ExecuteAsync(
-            database,
-            "SELECT pg_stat_statements_reset(0, (SELECT oid FROM pg_database WHERE datname = current_database()), 0)"
-        );
+        await ExecuteAsync(database, "SELECT pg_stat_statements_reset()");
+        return new Recording(await DeallocationsAsync(database));
     }
 
-    private static async Task<List<string>> RecordedStatementsAsync(TemporaryDatabase database)
+    private static async Task<long> DeallocationsAsync(TemporaryDatabase database)
+    {
+        await using var connection = new NpgsqlConnection(database.ConnectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand(
+            "SELECT dealloc FROM pg_stat_statements_info",
+            connection
+        );
+        return (long)(await command.ExecuteScalarAsync())!;
+    }
+
+    private static async Task<List<Recorded>> RecordedStatementsAsync(TemporaryDatabase database)
     {
         await using var connection = new NpgsqlConnection(database.ConnectionString);
         await connection.OpenAsync();
         await using var command = new NpgsqlCommand(
             """
-            SELECT query FROM pg_stat_statements
+            SELECT query, calls FROM pg_stat_statements
             WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
             """,
             connection
         );
-        var statements = new List<string>();
+        var statements = new List<Recorded>();
         await using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
         {
-            statements.Add(reader.GetString(0));
+            statements.Add(new Recorded(reader.GetString(0), reader.GetInt64(1)));
         }
 
         return statements;
     }
+
+    private sealed record Recorded(string Query, long Calls);
 
     // ── the sample model ────────────────────────────────────────────────────
 

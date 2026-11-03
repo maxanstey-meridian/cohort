@@ -141,7 +141,7 @@ public sealed class Upload
 - The link always names the record ID of the row it points at (`Id`, or the property
   `[RetentionRecordId]` marks), because that's what a hold stores. You can't declare a link to
   an alternate key. The link must have the same type as that record ID and a
-  compatible collation (see [Startup validation](/reference/startup-validation#columns)).
+  compatible collation (see [Startup validation](/reference/startup-validation#rules)).
 - No database foreign key is needed, so a link with a composite key, or none at all, works.
   Cohort matches the link column to the record ID in its own SQL.
 - A `NULL` link covers nothing: a link row with no `CaseId` is swept as usual.

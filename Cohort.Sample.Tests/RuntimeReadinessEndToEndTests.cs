@@ -968,7 +968,8 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
 
             (await act.Should().ThrowAsync<RetentionConfigurationException>())
                 .Which.Errors.Should().Contain(error =>
-                    error.Contains(" 42501: permission denied for table ", StringComparison.Ordinal)
+                    error.Contains("Retained entity ", StringComparison.Ordinal)
+                    && error.Contains(" 42501: permission denied for table ", StringComparison.Ordinal)
                     && error.Contains($"The database role '{readOnly}' lacks this privilege", StringComparison.Ordinal)
                 );
         }
@@ -1362,31 +1363,52 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
 
     // Readiness explains its statements inside the caller's transaction, and PostgreSQL aborts a
     // transaction on the first error: each EXPLAIN is followed by a rollback to a savepoint, so a
-    // refusal leaves the caller's transaction as usable as it found it.
-    [Fact]
-    public async Task A_statement_refused_inside_a_caller_transaction_leaves_it_usable()
+    // refusal leaves the caller's transaction as usable as it found it. A wrapped DbConnection
+    // can't batch, so its statements go one at a time with a savepoint loop of their own.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_statement_refused_inside_a_caller_transaction_leaves_it_usable(bool wrapped)
     {
         await using var database = await MigratedTemporaryDatabaseAsync();
         await ExecuteAsync(database, """ALTER TABLE public.soft_delete_records DROP COLUMN "DeletedAt" """);
-        await using var provider = BuildModelCopyProvider(database.ConnectionString);
-        await using var scope = provider.CreateAsyncScope();
-        var db = scope.ServiceProvider.GetRequiredService<SampleDbContext>();
-        await using var transaction = await db.Database.BeginTransactionAsync();
+        var wrappers = new List<PassThroughConnection>();
+        await using var provider = BuildModelCopyProvider(
+            database.ConnectionString,
+            connect: WrapWhen(wrapped, wrappers)
+        );
 
-        var act = () => ListActiveHoldsAsync(scope.ServiceProvider);
+        try
+        {
+            await using var scope = provider.CreateAsyncScope();
+            var db = scope.ServiceProvider.GetRequiredService<SampleDbContext>();
+            await using var transaction = await db.Database.BeginTransactionAsync();
 
-        (await act.Should().ThrowAsync<RetentionConfigurationException>())
-            .Which.Errors.Should().ContainSingle(error =>
-                RefusesWith(error, typeof(SoftDeleteRecord), "42703", "\"DeletedAt\"")
-            );
-        (await db.Database.SqlQueryRaw<int>("SELECT 1 AS \"Value\"").SingleAsync()).Should().Be(1);
-        await transaction.RollbackAsync();
+            var act = () => ListActiveHoldsAsync(scope.ServiceProvider);
+
+            (await act.Should().ThrowAsync<RetentionConfigurationException>())
+                .Which.Errors.Should().ContainSingle(error =>
+                    RefusesWith(error, typeof(SoftDeleteRecord), "42703", "\"DeletedAt\"")
+                );
+            (await db.Database.SqlQueryRaw<int>("SELECT 1 AS \"Value\"").SingleAsync()).Should().Be(1);
+            await transaction.RollbackAsync();
+            (wrappers.Count > 0).Should().Be(wrapped, "the context runs on a wrapper exactly when wrapped");
+        }
+        finally
+        {
+            foreach (var wrapper in wrappers)
+            {
+                await wrapper.DisposeAsync();
+            }
+        }
     }
 
     // Every refused entity is reported, not the first: the error barriers keep the batch running
-    // past a failed EXPLAIN.
-    [Fact]
-    public async Task Readiness_reports_every_refused_entity_in_one_error_list()
+    // past a failed EXPLAIN, and the savepoint rollback does the same one at a time.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Readiness_reports_every_refused_entity_in_one_error_list(bool wrapped)
     {
         await using var database = await MigratedTemporaryDatabaseAsync();
         await ExecuteAsync(
@@ -1396,20 +1418,107 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             ALTER TABLE public.tenantless_logs DROP COLUMN "CreatedAt" CASCADE;
             """
         );
-        using var host = new CohortTestHost(database.ConnectionString);
-
-        var act = () => host.RunSweepAsync(new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()));
-
-        var errors = (await act.Should().ThrowAsync<RetentionConfigurationException>()).Which.Errors;
-
-        errors.Should().HaveCount(2);
-        errors.Should().ContainSingle(error =>
-            RefusesWith(error, typeof(SoftDeleteRecord), "42703", "\"DeletedAt\"")
+        var wrappers = new List<PassThroughConnection>();
+        await using var provider = BuildModelCopyProvider(
+            database.ConnectionString,
+            connect: WrapWhen(wrapped, wrappers)
         );
-        errors.Should().ContainSingle(error =>
-            RefusesWith(error, typeof(TenantlessLog), "42703", "\"CreatedAt\"")
-        );
+
+        try
+        {
+            var errors = await ReadinessErrorsAsync(provider);
+
+            errors.Should().HaveCount(2);
+            errors.Should().ContainSingle(error =>
+                RefusesWith(error, typeof(SoftDeleteRecord), "42703", "\"DeletedAt\"")
+            );
+            errors.Should().ContainSingle(error =>
+                RefusesWith(error, typeof(TenantlessLog), "42703", "\"CreatedAt\"")
+            );
+            (wrappers.Count > 0).Should().Be(wrapped, "the context runs on a wrapper exactly when wrapped");
+        }
+        finally
+        {
+            foreach (var wrapper in wrappers)
+            {
+                await wrapper.DisposeAsync();
+            }
+        }
     }
+
+    // Only a rule violation (SQLSTATE class 42 and the like) says the host's schema is wrong. A
+    // lock timeout says nothing about it, so readiness lets it propagate as PostgreSQL raised it,
+    // and leaves a caller's transaction usable, as a refusal does. A second connection holds an
+    // ACCESS EXCLUSIVE lock on a retained table, so the first EXPLAIN that reads it waits for
+    // 200 ms and times out.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Readiness_lets_an_operational_failure_propagate_instead_of_refusing(bool wrapped)
+    {
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        var shortLockTimeout = new NpgsqlConnectionStringBuilder(database.ConnectionString)
+        {
+            Options = "-c lock_timeout=200",
+        }.ConnectionString;
+        var wrappers = new List<PassThroughConnection>();
+        await using var provider = BuildModelCopyProvider(shortLockTimeout, connect: WrapWhen(wrapped, wrappers));
+        await using var blocker = new NpgsqlConnection(database.ConnectionString);
+        await blocker.OpenAsync();
+        await using var blocking = await blocker.BeginTransactionAsync();
+        await using (var lockTable = new NpgsqlCommand(
+            "LOCK TABLE public.soft_delete_records IN ACCESS EXCLUSIVE MODE",
+            blocker,
+            blocking
+        ))
+        {
+            await lockTable.ExecuteNonQueryAsync();
+        }
+
+        try
+        {
+            var ownTransaction = () => provider.GetRequiredService<IRetentionSweep>().ExecuteAsync(
+                RetentionSweepRequest.Tenantless()
+            );
+
+            var inOwnTransaction = (await ownTransaction.Should().ThrowAsync<Exception>()).Which;
+            inOwnTransaction.Should().NotBeOfType<RetentionConfigurationException>();
+            PostgresFailureIn(inOwnTransaction).Should().Be(PostgresErrorCodes.LockNotAvailable);
+
+            await using var scope = provider.CreateAsyncScope();
+            var db = scope.ServiceProvider.GetRequiredService<SampleDbContext>();
+            await using var transaction = await db.Database.BeginTransactionAsync();
+            var inCallerTransaction = () => ListActiveHoldsAsync(scope.ServiceProvider);
+
+            var inCaller = (await inCallerTransaction.Should().ThrowAsync<Exception>()).Which;
+            inCaller.Should().NotBeOfType<RetentionConfigurationException>();
+            PostgresFailureIn(inCaller).Should().Be(PostgresErrorCodes.LockNotAvailable);
+            (await db.Database.SqlQueryRaw<int>("SELECT 1 AS \"Value\"").SingleAsync()).Should().Be(1);
+            await transaction.RollbackAsync();
+            (wrappers.Count > 0).Should().Be(wrapped, "the context runs on a wrapper exactly when wrapped");
+        }
+        finally
+        {
+            await blocking.RollbackAsync();
+            foreach (var wrapper in wrappers)
+            {
+                await wrapper.DisposeAsync();
+            }
+        }
+    }
+
+    // The SQLSTATE of the PostgreSQL error an exception carries: itself, or inside the exception a
+    // batch throws (an NpgsqlException over an AggregateException), which readiness rethrows
+    // unchanged.
+    private static string? PostgresFailureIn(Exception exception) =>
+        exception switch
+        {
+            PostgresException failure => failure.SqlState,
+            AggregateException aggregate => aggregate
+                .InnerExceptions.Select(PostgresFailureIn)
+                .FirstOrDefault(state => state is not null),
+            _ => exception.InnerException is { } inner ? PostgresFailureIn(inner) : null,
+        };
 
     // A wrapped DbConnection can't batch, so its statements are explained one at a time.
     [Fact]
@@ -1544,7 +1653,8 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     private static ServiceProvider BuildModelCopyProvider(
         string connectionString,
         IRetentionRuleProvider? ruleProvider = null,
-        IRetentionExecutionScope? executionScope = null
+        IRetentionExecutionScope? executionScope = null,
+        Func<string, DbConnection>? connect = null
     ) =>
         BuildModelCopyProvider<SampleDbContext>(
             connectionString,
@@ -1560,16 +1670,19 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
                     provider.GetRequiredService<OriginalValueTombstoneFactory>()
                 );
             },
-            executionScope
+            executionScope,
+            connect
         );
 
     // The same over any context, such as one whose model carries a hold relation, which the
-    // sample's doesn't. register adds what the context's retained entities need.
+    // sample's doesn't. register adds what the context's retained entities need. connect, when
+    // given, hands each context the DbConnection it wraps around the string.
     private static ServiceProvider BuildModelCopyProvider<TContext>(
         string connectionString,
         IRetentionRuleProvider ruleProvider,
         Action<IServiceCollection>? register = null,
-        IRetentionExecutionScope? executionScope = null
+        IRetentionExecutionScope? executionScope = null,
+        Func<string, DbConnection>? connect = null
     )
         where TContext : DbContext
     {
@@ -1577,7 +1690,9 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         services.AddLogging();
         services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
         services.AddScoped<ModelVariant>();
-        services.AddDbContext<TContext>((provider, options) => UseModelCopy(options, provider, connectionString));
+        services.AddDbContext<TContext>(
+            (provider, options) => UseModelCopy(options, provider, connectionString, connect)
+        );
         services.AddSingleton(ruleProvider);
         register?.Invoke(services);
         services.AddSingleton<IRetentionExecutionScope>(executionScope ?? RetentionExecutionScope.Unisolated);
@@ -1588,12 +1703,34 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     private static void UseModelCopy(
         DbContextOptionsBuilder options,
         IServiceProvider scopeServices,
-        string connectionString
+        string connectionString,
+        Func<string, DbConnection>? connect = null
     )
     {
-        options.UseNpgsql(connectionString).UseMemoryCache(ModelCacheThatHoldsNothing);
+        if (connect is null)
+        {
+            options.UseNpgsql(connectionString);
+        }
+        else
+        {
+            options.UseNpgsql(connect(connectionString));
+        }
+
+        options.UseMemoryCache(ModelCacheThatHoldsNothing);
         scopeServices.GetRequiredService<ModelVariant>().Configure?.Invoke(options);
     }
+
+    // Hands each context a PassThroughConnection (not an NpgsqlConnection, so readiness explains
+    // one statement at a time) when wrapped, and keeps it for the test to dispose.
+    private static Func<string, DbConnection>? WrapWhen(bool wrapped, List<PassThroughConnection> wrappers) =>
+        wrapped
+            ? connectionString =>
+            {
+                var wrapper = new PassThroughConnection(new NpgsqlConnection(connectionString));
+                wrappers.Add(wrapper);
+                return wrapper;
+            }
+            : null;
 
     private static Task ListActiveHoldsAsync(IServiceProvider scopeServices) =>
         scopeServices.GetRequiredService<IRetentionHoldsRepository>().ListActiveAsync(CancellationToken.None);
@@ -2086,18 +2223,14 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     }
 
     [Theory]
-    [InlineData("DeletedAt", "DeletedAt", """ALTER COLUMN "DeletedAt" TYPE timestamp without time zone""")]
-    [InlineData("CreatedAt", "CreatedAt", """ALTER COLUMN "CreatedAt" TYPE timestamp without time zone""")]
-    public async Task Readiness_refuses_a_retained_column_of_the_wrong_type(
-        string column,
-        string member,
-        string alteration
-    )
+    [InlineData("DeletedAt", """ALTER COLUMN "DeletedAt" TYPE timestamp without time zone""")]
+    [InlineData("CreatedAt", """ALTER COLUMN "CreatedAt" TYPE timestamp without time zone""")]
+    public async Task Readiness_refuses_a_retained_column_of_the_wrong_type(string column, string alteration)
     {
         // Cohort's SQL writes and compares the timestamps as timestamptz; a timestamp without time
         // zone drifts with the session TimeZone, and PostgreSQL compares it without complaint, so
-        // a catalog rule owns this.
-        Assert.Equal("CreatedAt", typeof(SoftDeleteRecord).GetCustomAttribute<RetainAttribute>()!.AnchorMember);
+        // a catalog rule owns this. The column and its member share a name on this entity.
+        typeof(SoftDeleteRecord).GetCustomAttribute<RetainAttribute>()!.AnchorMember.Should().Be("CreatedAt");
         await using var database = await MigratedTemporaryDatabaseAsync();
         await using (var connection = new NpgsqlConnection(database.ConnectionString))
         {
@@ -2116,7 +2249,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle(error =>
             error.Contains(typeof(SoftDeleteRecord).FullName!, StringComparison.Ordinal)
-            && error.Contains($"member {member}", StringComparison.Ordinal)
+            && error.Contains($"member {column}", StringComparison.Ordinal)
             && error.Contains($"\"{column}\"", StringComparison.Ordinal)
             && error.Contains("in the database, not", StringComparison.Ordinal)
         );
@@ -2844,16 +2977,22 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         );
     }
 
-    [Fact]
-    public async Task Readiness_refuses_a_record_id_column_whose_text_form_depends_on_session_settings_when_it_compares()
+    [Theory]
+    [InlineData("", "double precision")]
+    [InlineData("CREATE DOMAIN session_float AS double precision", "session_float")]
+    public async Task Readiness_refuses_a_record_id_column_whose_text_form_depends_on_session_settings_when_it_compares(
+        string typeDefinition,
+        string columnType
+    )
     {
-        // A numeric record id over a double precision column: float8 = numeric resolves through an
-        // implicit cast, so the statement check passes, and a hold join compares the column's text
-        // form, which follows extra_float_digits. The catalog rule owns this.
+        // A numeric record id over a double precision column, or a domain over one: float8 =
+        // numeric resolves through an implicit cast (a domain compares as its base type), so the
+        // statement check passes, and a hold join compares the column's text form, which follows
+        // extra_float_digits. The catalog rule owns this, and walks the domain chain to see it.
         await using var database = await SessionKeyDatabaseAsync<NumericSessionKeyDbContext>(
             "numeric_session_key_records",
-            typeDefinition: "",
-            "double precision"
+            typeDefinition,
+            columnType
         );
 
         var errors = await SessionKeyErrorsAsync<NumericSessionKeyDbContext>(database);
@@ -3064,10 +3203,135 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
 
         public override void Close() => inner.Close();
 
-        protected override DbCommand CreateDbCommand() => inner.CreateCommand();
+        protected override DbCommand CreateDbCommand() => new PassThroughCommand(this, inner.CreateCommand());
 
         protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel) =>
-            inner.BeginTransaction(isolationLevel);
+            new PassThroughTransaction(this, inner.BeginTransaction(isolationLevel));
+
+        public override ValueTask DisposeAsync() => inner.DisposeAsync();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                inner.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
+    }
+
+    // The transaction and command of that wrapper, as a profiler's are: neither is an Npgsql type,
+    // so a caller's transaction on the wrapper is not an NpgsqlTransaction and readiness explains
+    // its statements one at a time, in that transaction.
+    private sealed class PassThroughTransaction(PassThroughConnection connection, NpgsqlTransaction inner)
+        : DbTransaction
+    {
+        internal NpgsqlTransaction Inner => inner;
+
+        protected override DbConnection DbConnection => connection;
+
+        public override IsolationLevel IsolationLevel => inner.IsolationLevel;
+
+        public override void Commit() => inner.Commit();
+
+        public override void Rollback() => inner.Rollback();
+
+        public override Task CommitAsync(CancellationToken cancellationToken = default) =>
+            inner.CommitAsync(cancellationToken);
+
+        public override Task RollbackAsync(CancellationToken cancellationToken = default) =>
+            inner.RollbackAsync(cancellationToken);
+
+        public override ValueTask DisposeAsync() => inner.DisposeAsync();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                inner.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
+    }
+
+    private sealed class PassThroughCommand(PassThroughConnection connection, NpgsqlCommand inner) : DbCommand
+    {
+        private PassThroughTransaction? transaction;
+
+        [System.Diagnostics.CodeAnalysis.AllowNull]
+        public override string CommandText
+        {
+            get => inner.CommandText;
+            set => inner.CommandText = value;
+        }
+
+        public override int CommandTimeout
+        {
+            get => inner.CommandTimeout;
+            set => inner.CommandTimeout = value;
+        }
+
+        public override CommandType CommandType
+        {
+            get => inner.CommandType;
+            set => inner.CommandType = value;
+        }
+
+        public override bool DesignTimeVisible
+        {
+            get => inner.DesignTimeVisible;
+            set => inner.DesignTimeVisible = value;
+        }
+
+        public override UpdateRowSource UpdatedRowSource
+        {
+            get => inner.UpdatedRowSource;
+            set => inner.UpdatedRowSource = value;
+        }
+
+        protected override DbConnection? DbConnection
+        {
+            get => connection;
+            set { }
+        }
+
+        protected override DbParameterCollection DbParameterCollection => inner.Parameters;
+
+        protected override DbTransaction? DbTransaction
+        {
+            get => transaction;
+            set
+            {
+                transaction = (PassThroughTransaction?)value;
+                inner.Transaction = transaction?.Inner;
+            }
+        }
+
+        public override void Cancel() => inner.Cancel();
+
+        public override int ExecuteNonQuery() => inner.ExecuteNonQuery();
+
+        public override object? ExecuteScalar() => inner.ExecuteScalar();
+
+        public override void Prepare() => inner.Prepare();
+
+        public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken) =>
+            inner.ExecuteNonQueryAsync(cancellationToken);
+
+        public override Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken) =>
+            inner.ExecuteScalarAsync(cancellationToken);
+
+        protected override DbParameter CreateDbParameter() => inner.CreateParameter();
+
+        protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior) =>
+            inner.ExecuteReader(behavior);
+
+        protected override async Task<DbDataReader> ExecuteDbDataReaderAsync(
+            CommandBehavior behavior,
+            CancellationToken cancellationToken
+        ) => await inner.ExecuteReaderAsync(behavior, cancellationToken);
 
         public override ValueTask DisposeAsync() => inner.DisposeAsync();
 

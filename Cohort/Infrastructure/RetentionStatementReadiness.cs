@@ -106,9 +106,8 @@ internal static class ReadinessExcerpt
     /// </summary>
     private static string Rewrite(string sql, IReadOnlyCollection<string> names)
     {
-        var exact = new HashSet<string>(names, StringComparer.Ordinal);
-        var ignoringCase = new HashSet<string>(names, StringComparer.OrdinalIgnoreCase);
-        var numbers = new Dictionary<string, int>(StringComparer.Ordinal);
+        var known = new HashSet<string>(names, StringComparer.OrdinalIgnoreCase);
+        var numbers = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var text = new StringBuilder(sql.Length);
         var at = 0;
         while (at < sql.Length)
@@ -148,7 +147,7 @@ internal static class ReadinessExcerpt
                     }
 
                     var name = sql[(at + 1)..end];
-                    if (exact.Contains(name) || ignoringCase.Contains(name))
+                    if (known.Contains(name))
                     {
                         if (!numbers.TryGetValue(name, out var number))
                         {
@@ -466,7 +465,7 @@ internal sealed class RetentionStatementReadiness(
                     new ReadinessTypedNull(typeof(string)),
                     entry.Tenant is null ? null : ReadinessTenantId
                 ),
-                "creating, listing, or checking holds"
+                "creating, listing, or checking holds, or checking a deletion"
             );
             if (
                 RetentionTenantCoverage.Statement(entry, capabilities, Array.Empty<Guid>()) is
@@ -608,9 +607,13 @@ internal sealed class RetentionStatementReadiness(
                     (Index: Array.IndexOf(explains, failure.BatchCommand), Failure: failure)
                 )
                 .ToList();
-            if (refusals is null || refusals.Any(refusal => refusal.Index < 0))
+            if (
+                refusals is null
+                || refusals.Any(refusal => refusal.Index < 0 || !IsRefusal(refusal.Failure))
+            )
             {
-                // Not one of the explained statements (the savepoint, a lost connection): not a refusal.
+                // Not one of the explained statements (the savepoint, a lost connection), or an
+                // operational failure (a lock or statement timeout, a deadlock): not a refusal.
                 throw;
             }
 
@@ -642,9 +645,24 @@ internal sealed class RetentionStatementReadiness(
                     ReadinessParameters.From(statement.Parameters)
                 );
             }
-            catch (PostgresException failure)
+            catch (PostgresException failure) when (IsRefusal(failure))
             {
                 refusals.Add(new Refusal(statement, failure));
+            }
+            catch (PostgresException)
+            {
+                // An operational failure (a lock or statement timeout, a deadlock): leave the
+                // caller's transaction as a refusal does, then let the original propagate.
+                try
+                {
+                    await RunAsync($"ROLLBACK TO SAVEPOINT {Savepoint}", []);
+                }
+                catch (Exception)
+                {
+                    // The original is the failure to report; the throw below rethrows it.
+                }
+
+                throw;
             }
 
             await RunAsync($"ROLLBACK TO SAVEPOINT {Savepoint}", []);
@@ -688,6 +706,14 @@ internal sealed class RetentionStatementReadiness(
             }
         }
     }
+
+    // Only a statement PostgreSQL can't plan is a configuration refusal: a syntax error or access
+    // rule violation (class 42, such as a missing table or column or a lacking privilege), an
+    // invalid schema name (3F), an unsupported feature (0A), or a data exception from a constant
+    // in Cohort's text (22). A timeout, deadlock, serialization failure, resource exhaustion, or
+    // operator intervention says nothing about the host's schema, so it propagates.
+    private static bool IsRefusal(PostgresException failure) =>
+        failure.SqlState is { Length: >= 2 } state && state[..2] is "42" or "3F" or "0A" or "22";
 
     private sealed record Refusal(ReadinessStatement Statement, PostgresException Failure);
 

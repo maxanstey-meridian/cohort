@@ -39,10 +39,11 @@ Cohort/                 — the library. No tests of its own.
 ├── Domain/             — pure types. Depends on NOTHING (not even EF Core).
 ├── Application/        — ports + orchestration. Depends on Domain only.
 ├── Infrastructure/     — EF defaults, raw SQL adapters. Depends on Application + Domain.
-│   ├── Sweep/          — SweepStrategy (one SQL pipeline for every strategy, driven by SweepScope), Purge/SoftDelete/AnonymiseSweepStrategy, SweepEligibilitySql
+│   ├── Sweep/          — SweepStrategy (one SQL pipeline for every strategy, driven by SweepScope), Purge/SoftDelete/AnonymiseSweepStrategy, SweepEligibilitySql, SweepStatements (each sweep statement's builder, shared by runs and readiness)
 │   ├── Holds/          — EfRetentionHoldsRepository, RetentionHoldSql
 │   ├── Handlers/       — RowHandlerQueueSql (the row-handler queue's statements)
 │   ├── RetentionRunLedgerSql, HistoryPruningSql — the worker's ledger, abandoned-run recovery, history pruning
+│   ├── RetentionStatementReadiness — readiness's statement check: explains the run's statements
 │   ├── Audit/          — EfRetentionAuditWriter
 │   └── Migrations/     — CohortModelBuilder (ConfigureCohortTables extension)
 └── Hosting/            — CohortOptions, RetentionWorker, RetentionRowDispatcher, AddCohort<TContext>()

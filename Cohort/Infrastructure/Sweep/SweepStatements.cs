@@ -8,8 +8,8 @@ namespace Cohort.Infrastructure.Sweep;
 
 /// <summary>
 /// One host-table statement a run, a preview, or readiness sends: its text, the values it
-/// binds, and the tables it reads. <see cref="Entity"/> is the one entity whose scope or hold
-/// call issues it, or null for a statement that spans entities.
+/// binds, and every table it reads, the host's and Cohort's own. <see cref="Entity"/> is the one
+/// entity whose scope or hold call issues it, or null for a statement that spans entities.
 /// </summary>
 internal sealed record SweepStatement(
     string Name,
@@ -71,6 +71,12 @@ internal static class SweepStatements
 
     /// <summary>Whether a run counts the rows whose anchor is NULL: only with a cutoff.</summary>
     internal static bool CountsNullAnchor(SweepScope scope) => scope.Cutoff is not null;
+
+    /// <summary>
+    /// Whether rows whose anchor is NULL are in the scope, so discovery continues past them: only
+    /// without a cutoff (an erasure without a legal minimum).
+    /// </summary>
+    internal static bool HasNullAnchorsInScope(SweepScope scope) => scope.Cutoff is null;
 
     /// <summary>Whether a run counts the rows an erasure's legal minimum keeps.</summary>
     internal static bool CountsRetainedByRule(SweepScope scope) =>
@@ -165,7 +171,7 @@ internal static class SweepStatements
                 values.RecordIdText
             )
         );
-        if (scope.Cutoff is null)
+        if (HasNullAnchorsInScope(scope))
         {
             statements.Add(
                 Discover(
@@ -301,6 +307,7 @@ internal static class SweepStatements
             scope,
             sql,
             parameters,
+            rowDetail: true,
             references: true
         );
     }
@@ -333,7 +340,7 @@ internal static class SweepStatements
             scope,
             $"SELECT pg_catalog.count(*) FROM {PostgreSqlIdentifier.Format(scope.Entry.Table)} AS target WHERE {where}",
             parameters,
-            holdPaths: false
+            holdExclusion: false
         );
 
     /// <summary>
@@ -374,7 +381,7 @@ internal static class SweepStatements
             SweepCursorKind.Anchored => "discover-after-anchor",
             _ => "discover-after-null-anchor",
         };
-        return Statement(name, scope, sql, parameters, references: true);
+        return Statement(name, scope, sql, parameters, rowDetail: true, references: true);
     }
 
     /// <summary>
@@ -589,7 +596,7 @@ internal static class SweepStatements
         }
 
         parameters["cursorAnchor"] = cursorAnchor;
-        var nullAnchors = scope.Cutoff is null ? $" OR {anchor} IS NULL" : "";
+        var nullAnchors = HasNullAnchorsInScope(scope) ? $" OR {anchor} IS NULL" : "";
         return $"\n  AND (({anchor}, {recordId}) > (@cursorAnchor, @cursorRecordId){nullAnchors})";
     }
 
@@ -761,7 +768,8 @@ internal static class SweepStatements
         SweepScope scope,
         string sql,
         SqlParams parameters,
-        bool holdPaths = true,
+        bool holdExclusion = true,
+        bool rowDetail = false,
         bool references = false
     ) =>
         new(
@@ -769,26 +777,33 @@ internal static class SweepStatements
             scope.Entry.EntityType,
             sql,
             parameters,
-            ReadTables(scope, holdPaths, references)
+            ReadTables(scope, holdExclusion, rowDetail, references)
         );
 
     /// <summary>
-    /// The tables a scope's statement reads: the entity's own, those along its hold paths
-    /// (<see cref="RetentionEntry.HolderPaths"/>) and, where the statement leaves out referenced
-    /// rows, the child tables of the blocking foreign keys.
+    /// The tables a scope's statement reads: the entity's own; where the statement leaves out
+    /// held rows, the holds table and the tables along the entity's hold paths
+    /// (<see cref="RetentionEntry.HolderPaths"/>); where it leaves out the rows the run already
+    /// recorded, the row-detail table; and, where it leaves out referenced rows, the child
+    /// tables of the blocking foreign keys.
     /// </summary>
     private static RelationalObjectName[] ReadTables(
         SweepScope scope,
-        bool holdPaths,
+        bool holdExclusion,
+        bool rowDetail,
         bool references
     )
     {
-        var tables = new List<RelationalObjectName> { scope.Entry.Table };
-        if (holdPaths)
+        var entry = scope.Entry;
+        var tables = holdExclusion
+            ? RetentionHoldSql
+                .PathTables(entry, entry.HolderPaths, includeEntry: true)
+                .Append(entry.CohortTables.RetentionHolds)
+                .ToList()
+            : [entry.Table];
+        if (rowDetail)
         {
-            tables.AddRange(
-                scope.Entry.HolderPaths.SelectMany(path => path.Hops.Select(hop => hop.Far.Table))
-            );
+            tables.Add(entry.CohortTables.SweepRunRowDetail);
         }
 
         if (references)

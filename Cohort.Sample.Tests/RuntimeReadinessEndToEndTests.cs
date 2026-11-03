@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Data;
+using System.Data.Common;
 using System.Globalization;
 using System.Runtime.CompilerServices;
 
@@ -94,6 +96,44 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
                 error.Contains("Multiplexing", StringComparison.Ordinal)
                 && error.Contains("session advisory locks", StringComparison.Ordinal)
             );
+    }
+
+    // A wrapped DbConnection (a profiler, say) is not an NpgsqlConnection, but its string says
+    // Multiplexing=true just the same.
+    [Fact]
+    public async Task A_wrapped_multiplexed_connection_is_refused()
+    {
+        var multiplexed = new NpgsqlConnectionStringBuilder(fixture.ConnectionString) { Multiplexing = true };
+        var wrappers = new List<PassThroughConnection>();
+        await using var provider = BuildAnonymiseTargetProvider(
+            multiplexed.ConnectionString,
+            options =>
+            {
+                var wrapper = new PassThroughConnection(new NpgsqlConnection(multiplexed.ConnectionString));
+                wrappers.Add(wrapper);
+                options.UseNpgsql(wrapper);
+            }
+        );
+
+        try
+        {
+            await using var scope = provider.CreateAsyncScope();
+            var act = () => ListActiveHoldsAsync(scope.ServiceProvider);
+
+            (await act.Should().ThrowAsync<RetentionConfigurationException>())
+                .Which.Errors.Should().ContainSingle(error =>
+                    error.Contains("Multiplexing", StringComparison.Ordinal)
+                    && error.Contains("session advisory locks", StringComparison.Ordinal)
+                );
+            wrappers.Should().NotBeEmpty("the context runs on the wrapper, not on an NpgsqlConnection");
+        }
+        finally
+        {
+            foreach (var wrapper in wrappers)
+            {
+                await wrapper.DisposeAsync();
+            }
+        }
     }
 
     [Fact]
@@ -963,19 +1003,98 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         }
     }
 
+    // A wrapped DbConnection (a profiler, say) is keyed like any other: by its parsed string
+    // without the password, so a rotated password is not validated again.
+    [Fact]
+    public Task A_rotated_password_on_a_wrapped_connection_is_not_validated_again() =>
+        RotatedPasswordOnAWrappedConnectionIsNotValidatedAgainAsync(connectionStringSuffix: "");
+
+    // A wrapper that adds a keyword of its own to the string it reports is one Npgsql rejects, so
+    // the entry key is built without parsing it as Npgsql settings. The password stays out of it
+    // all the same.
+    [Fact]
+    public Task A_rotated_password_on_a_wrapped_connection_whose_string_Npgsql_rejects_is_not_validated_again() =>
+        RotatedPasswordOnAWrappedConnectionIsNotValidatedAgainAsync(connectionStringSuffix: ";ProfilerTag=x");
+
+    private async Task RotatedPasswordOnAWrappedConnectionIsNotValidatedAgainAsync(string connectionStringSuffix)
+    {
+        var role = $"cohort_readiness_{Guid.NewGuid():N}";
+        const string firstPassword = "readiness-test-password";
+        const string rotatedPassword = "readiness-test-rotated-password";
+        await CreateReadRoleAsync(role, firstPassword);
+        var wrappers = new List<PassThroughConnection>();
+        try
+        {
+            await using var database = await AnonymiseTargetDatabaseAsync();
+            await GrantReadAsync(database, role);
+            var asRole = new NpgsqlConnectionStringBuilder(database.ConnectionString)
+            {
+                Username = role,
+                Password = firstPassword,
+            };
+
+            var thrown = await ListActiveHoldsAfterAnonymiseColumnShrinksAsync(
+                database,
+                asRole.ConnectionString,
+                async () =>
+                {
+                    await ExecuteAsync(
+                        fixture.ConnectionString,
+                        $"ALTER ROLE \"{role}\" PASSWORD '{rotatedPassword}'"
+                    );
+                    asRole.Password = rotatedPassword;
+                    return asRole.ConnectionString;
+                },
+                connectionString =>
+                {
+                    var wrapper = new PassThroughConnection(
+                        new NpgsqlConnection(connectionString),
+                        connectionStringSuffix
+                    );
+                    wrappers.Add(wrapper);
+                    return wrapper;
+                }
+            );
+
+            wrappers.Should().NotBeEmpty("the contexts run on the wrapper, not on an NpgsqlConnection");
+            thrown.Should().BeNull("a rotated password reaches the same database, so the pass is kept");
+        }
+        finally
+        {
+            foreach (var wrapper in wrappers)
+            {
+                await wrapper.DisposeAsync();
+            }
+
+            await ExecuteAsync(fixture.ConnectionString, $"DROP ROLE IF EXISTS \"{role}\"");
+        }
+    }
+
     // Readiness passes for one model instance under firstConnectionString. The anonymise column
     // then shrinks in the database, secondConnectionString says how the next scope reaches the
     // same database, and what readiness throws in that scope comes back (null when nothing).
+    // connect, when given, hands each context the DbConnection it wraps around the string.
     private async Task<Exception?> ListActiveHoldsAfterAnonymiseColumnShrinksAsync(
         TemporaryDatabase database,
         string firstConnectionString,
-        Func<Task<string>> secondConnectionString
+        Func<Task<string>> secondConnectionString,
+        Func<string, DbConnection>? connect = null
     )
     {
         var connectionString = firstConnectionString;
         await using var provider = BuildAnonymiseTargetProvider(
             firstConnectionString,
-            options => options.UseNpgsql(connectionString)
+            options =>
+            {
+                if (connect is null)
+                {
+                    options.UseNpgsql(connectionString);
+                }
+                else
+                {
+                    options.UseNpgsql(connect(connectionString));
+                }
+            }
         );
 
         await using var first = provider.CreateAsyncScope();
@@ -1286,10 +1405,29 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         });
     }
 
+    public enum NoMappingEntryPoint
+    {
+        HostStartup,
+        Sweep,
+        ListActiveHolds,
+        CreateHold,
+        HasActiveHold,
+    }
+
     // Startup validation runs before readiness reads anything from the Cohort tables' mapping, so
     // a model with none gets the aggregated refusal that says what to call, not a bare exception.
-    [Fact]
-    public async Task Readiness_refuses_a_model_with_no_cohort_table_mappings_with_the_aggregated_error()
+    // Covers host startup, a sweep, and three holds-repository calls: listing, creating a hold,
+    // and asking whether a row is held. The last two resolve a retained entity's target, which
+    // reads the mapping, so they only pass when readiness runs before that resolve.
+    [Theory]
+    [InlineData(NoMappingEntryPoint.HostStartup)]
+    [InlineData(NoMappingEntryPoint.Sweep)]
+    [InlineData(NoMappingEntryPoint.ListActiveHolds)]
+    [InlineData(NoMappingEntryPoint.CreateHold)]
+    [InlineData(NoMappingEntryPoint.HasActiveHold)]
+    public async Task Readiness_refuses_a_model_with_no_cohort_table_mappings_with_the_aggregated_error(
+        NoMappingEntryPoint entryPoint
+    )
     {
         var services = new ServiceCollection();
         services.AddLogging();
@@ -1300,12 +1438,40 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         services.AddCohort<NoCohortTablesDbContext>();
         await using var provider = services.BuildServiceProvider(validateScopes: true);
 
-        // Host startup is the port that gets to readiness: the sweep and holds ports read the
-        // Cohort tables' mapping when they are built.
-        var validation = provider
-            .GetServices<IHostedService>()
-            .Single(service => service.GetType().Name == "RetentionValidationHostedService");
-        var act = () => validation.StartAsync(CancellationToken.None);
+        await using var scope = provider.CreateAsyncScope();
+        Func<Task> act = entryPoint switch
+        {
+            NoMappingEntryPoint.HostStartup => () => provider
+                .GetServices<IHostedService>()
+                .Single(service => service.GetType().Name == "RetentionValidationHostedService")
+                .StartAsync(CancellationToken.None),
+            NoMappingEntryPoint.Sweep => () => scope.ServiceProvider
+                .GetRequiredService<IRetentionSweep>()
+                .ExecuteAsync(RetentionSweepRequest.Tenantless()),
+            NoMappingEntryPoint.ListActiveHolds => () => ListActiveHoldsAsync(scope.ServiceProvider),
+            NoMappingEntryPoint.CreateHold => () => scope.ServiceProvider
+                .GetRequiredService<IRetentionHoldsRepository>()
+                .CreateAsync(
+                    new RetentionHoldRequest(
+                        Guid.NewGuid(),
+                        RetentionEntityIdentity.For<SessionKeyRecord>(),
+                        Guid.NewGuid().ToString("D"),
+                        tenantId: null,
+                        "litigation",
+                        DateTimeOffset.UtcNow
+                    ),
+                    CancellationToken.None
+                ),
+            NoMappingEntryPoint.HasActiveHold => () => scope.ServiceProvider
+                .GetRequiredService<IRetentionHoldsRepository>()
+                .HasActiveHoldAsync(
+                    RetentionEntityIdentity.For<SessionKeyRecord>(),
+                    Guid.NewGuid().ToString("D"),
+                    tenantId: null,
+                    CancellationToken.None
+                ),
+            _ => throw new ArgumentOutOfRangeException(nameof(entryPoint)),
+        };
 
         (await act.Should().ThrowAsync<RetentionConfigurationException>())
             .Which.Errors.Should().Contain(error =>
@@ -2174,6 +2340,52 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             RetentionResolutionContext context,
             CancellationToken ct
         ) => inner.ResolveAsync(context, ct);
+    }
+
+    // A wrapper that forwards to an NpgsqlConnection and is not one itself, as a profiler's is.
+    // connectionStringSuffix is appended to the string it reports, as a wrapper's own settings are.
+    private sealed class PassThroughConnection(NpgsqlConnection inner, string connectionStringSuffix = "")
+        : DbConnection
+    {
+        [System.Diagnostics.CodeAnalysis.AllowNull]
+        public override string ConnectionString
+        {
+            get => inner.ConnectionString + connectionStringSuffix;
+            set => inner.ConnectionString = value;
+        }
+
+        public override string Database => inner.Database;
+
+        public override string DataSource => inner.DataSource;
+
+        public override string ServerVersion => inner.ServerVersion;
+
+        public override ConnectionState State => inner.State;
+
+        public override void ChangeDatabase(string databaseName) => inner.ChangeDatabase(databaseName);
+
+        public override void Open() => inner.Open();
+
+        public override Task OpenAsync(CancellationToken cancellationToken) => inner.OpenAsync(cancellationToken);
+
+        public override void Close() => inner.Close();
+
+        protected override DbCommand CreateDbCommand() => inner.CreateCommand();
+
+        protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel) =>
+            inner.BeginTransaction(isolationLevel);
+
+        public override ValueTask DisposeAsync() => inner.DisposeAsync();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                inner.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
     }
 
     private sealed class DatabaseRoute(string connectionString)

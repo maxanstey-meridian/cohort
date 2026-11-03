@@ -23,17 +23,22 @@ internal sealed class EfRetentionHoldsRepository(
 )
     : IRetentionHoldsRepository
 {
-    private readonly CohortStoreTables tables = CohortStoreTables.FromModel(db.Model);
+    private CohortStoreTables? tables;
+
+    // Read lazily, after readiness, so a model with no Cohort mapping reaches readiness's refusal.
+    private CohortStoreTables Tables => tables ??= CohortStoreTables.FromModel(db.Model);
 
     public async Task CreateAsync(RetentionHoldRequest request, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
 
+        // Readiness first: resolving the target reads the Cohort mapping, which readiness refuses
+        // with its aggregated message when it is missing.
+        await readinessValidator.ValidateAsync(ct);
         // A hold with an unknown stable identity or record-id format the sweep-side NOT EXISTS
         // match never hits would look persisted while protecting nothing. Fail loudly instead.
         var entry = targetResolver.ResolveTarget(request.RetentionEntityId);
         RetentionTargetResolver.ValidateTenantOwnership(entry, request.TenantId, "Retention hold");
-        await readinessValidator.ValidateAsync(ct);
 
         await db.Database.OpenConnectionAsync(ct);
         try
@@ -82,7 +87,7 @@ internal sealed class EfRetentionHoldsRepository(
                 // protects. Refuse it by row count, not a SQL error, so a caller-owned transaction
                 // stays usable. CAST: an untyped NULL can't be inferred in IS NULL.
                 $"""
-                INSERT INTO {PostgreSqlIdentifier.Format(tables.RetentionHolds)}
+                INSERT INTO {PostgreSqlIdentifier.Format(Tables.RetentionHolds)}
                     ("HoldId", "RetentionEntityId", "RecordId", "TenantId", "Reason", "CreatedAt", "ExpiresAt", "RemovedAt")
                 SELECT
                     @holdId, @retentionEntityId, @recordId, @tenantId, @reason,
@@ -215,7 +220,7 @@ internal sealed class EfRetentionHoldsRepository(
         await readinessValidator.ValidateAsync(ct);
         var removed = await db.Database.ExecuteSqlRawAsync(
             $"""
-            UPDATE {PostgreSqlIdentifier.Format(tables.RetentionHolds)}
+            UPDATE {PostgreSqlIdentifier.Format(Tables.RetentionHolds)}
             SET "RemovedAt" = @removedAt
             WHERE "HoldId" = @holdId
               AND "RemovedAt" IS NULL
@@ -242,7 +247,7 @@ internal sealed class EfRetentionHoldsRepository(
                 db.Database.CurrentTransaction?.GetDbTransaction(),
                 $"""
                 SELECT "HoldId", "RetentionEntityId", "RecordId", "TenantId", "Reason", "CreatedAt", "ExpiresAt", "RemovedAt"
-                FROM {PostgreSqlIdentifier.Format(tables.RetentionHolds)} AS hold
+                FROM {PostgreSqlIdentifier.Format(Tables.RetentionHolds)} AS hold
                 WHERE {RetentionHoldSql.ActivePredicate("hold")}
                 ORDER BY "RetentionEntityId", "RecordId", "HoldId"
                 """
@@ -323,9 +328,10 @@ internal sealed class EfRetentionHoldsRepository(
     )
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(recordId);
+        // Readiness first, as in CreateAsync: resolving the target reads the Cohort mapping.
+        await readinessValidator.ValidateAsync(ct);
         var entry = targetResolver.ResolveTarget(retentionEntityId);
         RetentionTargetResolver.ValidateTenantOwnership(entry, tenantId, "Retention hold");
-        await readinessValidator.ValidateAsync(ct);
 
         await db.Database.OpenConnectionAsync(ct);
         try
@@ -338,7 +344,7 @@ internal sealed class EfRetentionHoldsRepository(
                 "Retention hold",
                 ct
             );
-            var (sql, parameters) = build(tables.RetentionHolds, entry, canonicalRecordId, tenantId);
+            var (sql, parameters) = build(Tables.RetentionHolds, entry, canonicalRecordId, tenantId);
             await using var command = parameters.CreateCommand(db.Database.GetDbConnection(), transaction, sql);
             return await read(command);
         }
@@ -382,7 +388,7 @@ internal sealed class EfRetentionHoldsRepository(
         await db.Database.OpenConnectionAsync(ct);
         try
         {
-            var (sql, parameters) = RetentionHoldSql.BuildCoveringHoldsForSubject(tables.RetentionHolds, starts, tenantId);
+            var (sql, parameters) = RetentionHoldSql.BuildCoveringHoldsForSubject(Tables.RetentionHolds, starts, tenantId);
             await using var command = parameters.CreateCommand(
                 db.Database.GetDbConnection(),
                 db.Database.CurrentTransaction?.GetDbTransaction(),

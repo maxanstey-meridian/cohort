@@ -16,7 +16,10 @@ internal sealed class EfRetentionDeletion(
     RetentionHoldGuard holdGuard
 ) : IRetentionDeletion
 {
-    private readonly CohortStoreTables tables = CohortStoreTables.FromModel(db.Model);
+    private CohortStoreTables? tables;
+
+    // Read lazily, after readiness, so a model with no Cohort mapping reaches readiness's refusal.
+    private CohortStoreTables Tables => tables ??= CohortStoreTables.FromModel(db.Model);
 
     public async Task<RetentionDeletionOutcome> ExecuteAsync(
         IReadOnlyCollection<RetentionTarget> targets,
@@ -158,7 +161,7 @@ internal sealed class EfRetentionDeletion(
     {
         // Covered through a relation counts as held, exactly as a sweep judges it.
         var (sql, parameters) = RetentionHoldSql.BuildAnyCoveringHold(
-            tables.RetentionHolds,
+            Tables.RetentionHolds,
             target.Entry,
             target.RecordId,
             target.TenantId

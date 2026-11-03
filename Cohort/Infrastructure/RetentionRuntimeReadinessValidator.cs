@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Data.Common;
 using System.Runtime.CompilerServices;
 
 using Cohort.Application;
@@ -37,30 +38,34 @@ internal sealed class RetentionRuntimeReadinessValidator(
         ValidateProvider();
         var facade = db.Database;
         var connection = facade.GetDbConnection();
-        var settings = connection is NpgsqlConnection
+        // Every connection's string is parsed once per call, with no round trip, a wrapped
+        // DbConnection's too, since the provider is already confirmed as Npgsql. Only a string
+        // Npgsql rejects (a wrapper's own keywords) is left unparsed: it can't be checked for
+        // Multiplexing and is the host's to configure.
+        var parsed = connection is NpgsqlConnection
             ? new NpgsqlConnectionStringBuilder(connection.ConnectionString)
-            : null;
-        ValidateSessionLocks(settings);
+            : TryParseConnectionString(connection.ConnectionString);
+        ValidateSessionLocks(parsed);
         // Two levels of memory. The model instance the context runs has its own entry (its pass
-        // and its gate), keyed by the connection string without its password, parsed once per
-        // call with no round trip. The password stays out because it is a secret that a rotating
-        // token would turn into one entry per token, and because Npgsql drops it once the
-        // connection opens. The key still carries everything else a pooler can route by under
-        // one host, port, and database name (user, options); two spellings of one database each
-        // validate once. A wrapped DbConnection can't be inspected, so it keys by its raw string.
+        // and its gate), keyed by the connection string without its password. The password stays
+        // out because it is a secret that a rotating token would turn into one entry per token,
+        // and because Npgsql drops it once the connection opens. The key still carries everything
+        // else a pooler can route by under one host, port, and database name (user, options); two
+        // spellings of one database each validate once. A string Npgsql rejects keys by a generic
+        // parse without its password keys, or by the raw string if even that parse rejects it.
         // Each database check also records its pass by value, under everything the check reads,
         // so a rebuilt copy of a model that reads the same things skips it. Those shared passes
         // are keyed by the database as the server reports it, read once per entry miss.
         string entryKey;
-        if (settings is null)
+        if (parsed is null)
         {
-            entryKey = connection.ConnectionString;
+            entryKey = KeyWithoutPassword(connection.ConnectionString);
         }
         else
         {
-            settings.Password = null;
-            settings.PersistSecurityInfo = false;
-            entryKey = settings.ConnectionString;
+            parsed.Password = null;
+            parsed.PersistSecurityInfo = false;
+            entryKey = parsed.ConnectionString;
         }
 
         var readiness = state.For(db.Model, entryKey);
@@ -106,8 +111,9 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 }
             }
 
-            // Order matters. Startup validation runs first, so a model with no or partial Cohort
-            // table mapping gets its aggregated refusal before any key needs the store tables.
+            // Order matters. Startup validation runs first, so a model with a retained entity and
+            // no or partial Cohort table mapping gets startup validation's aggregated refusal
+            // before any key needs the store tables.
             // Each check then throws before the next runs, and later checks rely on
             // earlier ones: the link-column check skips rows whose target type is missing, and
             // the anonymise check skips rows whose table or record id is missing, because the
@@ -1125,10 +1131,10 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// The worker, each run and each row-handler delivery hold PostgreSQL session advisory
     /// locks. Under Npgsql multiplexing a connection is bound to a server session only inside a
     /// transaction, so a lock taken outside one stays on whichever session ran it while the
-    /// unlock runs on another and finds nothing to release. Checked on every call, not cached:
-    /// the model's entry is keyed by the connection string, and a recorded check by the server's
-    /// database, so a pass recorded before Multiplexing was turned on would otherwise speak for
-    /// it. A wrapped DbConnection (a profiler, say) can't be inspected, so it is the host's to
+    /// unlock runs on another and finds nothing to release. Checked on every call, before the
+    /// entry is looked up; it reads the builder the entry key is built from, so it costs nothing
+    /// extra. A wrapped DbConnection (a profiler, say) is checked by its connection string like
+    /// any other. Only a string Npgsql rejects can't be inspected, so it is the host's to
     /// configure; <paramref name="settings"/> is null for one.
     /// </summary>
     private static void ValidateSessionLocks(NpgsqlConnectionStringBuilder? settings)
@@ -1138,6 +1144,39 @@ internal sealed class RetentionRuntimeReadinessValidator(
             throw new RetentionConfigurationException([
                 "Cohort can't run on an Npgsql connection with Multiplexing enabled: its worker, runs and row-handler deliveries hold PostgreSQL session advisory locks, and a multiplexed connection only keeps one server session inside a transaction, so those locks would be taken on one session and released on another. Give Cohort's DbContext a connection string without Multiplexing=true.",
             ]);
+        }
+    }
+
+    // Null when Npgsql rejects the string (an unknown keyword, a malformed value), which a
+    // wrapper can pass through for its own settings.
+    private static NpgsqlConnectionStringBuilder? TryParseConnectionString(string connectionString)
+    {
+        try
+        {
+            return new NpgsqlConnectionStringBuilder(connectionString);
+        }
+        catch (ArgumentException)
+        {
+            return null;
+        }
+    }
+
+    // The entry key for a string Npgsql rejects: any keyword is accepted, and the password
+    // (Npgsql's synonyms; the builder's keys are case-insensitive) stays out of the key. Raw only
+    // when even this parse throws ArgumentException (an unterminated quote, say).
+    private static string KeyWithoutPassword(string connectionString)
+    {
+        try
+        {
+            var builder = new DbConnectionStringBuilder { ConnectionString = connectionString };
+            builder.Remove("Password");
+            builder.Remove("PWD");
+            builder.Remove("PSW");
+            return builder.ConnectionString;
+        }
+        catch (ArgumentException)
+        {
+            return connectionString;
         }
     }
 
@@ -1174,9 +1213,10 @@ internal sealed class RetentionRuntimeReadinessState
     // whichever model the context runs, and a host whose EF model cache can't hold its models gets
     // a new instance per context that dies with its context instead of being kept alive here.
     // Within a model, the entry is keyed (ordinal) by the connection string without its
-    // password: parsed once per call, no round trip. It carries everything a pooler can route by
-    // under one host, port, and database name (user, options). Two spellings of one database each
-    // validate once.
+    // password: parsed once per call, no round trip, for every connection's string (a wrapped
+    // DbConnection's too); a string Npgsql rejects keys by its raw string. It carries everything a
+    // pooler can route by under one host, port, and database name (user, options). Two spellings
+    // of one database each validate once.
     private readonly ConditionalWeakTable<
         IModel,
         ConcurrentDictionary<string, RetentionRuntimeReadinessEntry>

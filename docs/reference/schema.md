@@ -1,6 +1,6 @@
 # Schema & Migrations
 
-Cohort stores its ledger, holds and handler queue in five tables in your database. You own
+Cohort stores its ledger, holds, and handler queue in five tables in your database. You own
 them: they're part of your EF model and your migrations.
 
 ## Tables
@@ -75,12 +75,12 @@ Two identities run through these tables, and they're deliberately different:
 
 - **`RetentionEntityId`** is the stable UUID you assign to a retained entity type with
   `[RetentionEntityId]`. It survives CLR and table renames, and correlates rules, holds,
-  summaries, row details and handler work. `EntityType` on audit rows is readable diagnostic
+  summaries, row details, and handler work. `EntityType` on audit rows is readable diagnostic
   metadata only.
 - **`RecordId`** is one row's canonical PostgreSQL text identity, `CAST(key AS text)`. Cohort
   stores it as `text` in holds and row details, and compares it with the row's own key cast.
-  UUID, integer, string, `numeric`, `citext`, and provider-converted keys all
-  match consistently. A hold names one row by it. A row a
+  UUID, integer, string, `numeric`, `citext`, and provider-converted keys all match
+  consistently. A hold names one row by it. A row a
   [hold relation](/guides/legal-holds#holding-related-rows) covers is found through the
   relation's link column, which equals the record ID of the row it points at and so must be the
   same type as it, with a compatible collation; readiness checks the column in the database
@@ -89,7 +89,7 @@ Two identities run through these tables, and they're deliberately different:
 Record-ID types whose text form depends on session settings are rejected at startup:
 `timestamp`/`timestamptz`, `date`, `time`, `interval`, `real`/`double precision`, `money`, and
 `bytea`. Their canonical text could change between sessions and silently detach holds.
-Readiness checks the record-ID column's actual catalog type, so domains, arrays and ranges
+Readiness checks the record-ID column's actual catalog type, so domains, arrays, and ranges
 built on those types are rejected too.
 
 ### Changed entity identities
@@ -165,7 +165,7 @@ CREATE POLICY tenant_isolation ON public.sweep_row_handler_status
 ```
 
 Permissive policies combine with `OR`, but only those for the command at hand: a `SELECT`
-passes either holds policy, while `INSERT`, `UPDATE` and `DELETE` only have `holds_write`, whose
+passes either holds policy, while `INSERT`, `UPDATE`, and `DELETE` only have `holds_write`, whose
 `USING` also checks new rows. Use the schema you passed to `ConfigureCohortTables` in place of
 `public`.
 

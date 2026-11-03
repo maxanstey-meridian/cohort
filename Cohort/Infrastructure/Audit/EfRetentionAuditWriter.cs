@@ -17,7 +17,10 @@ internal sealed class EfRetentionAuditWriter(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db
 )
 {
-    private readonly CohortStoreTables tables = CohortStoreTables.FromModel(db.Model);
+    private CohortStoreTables? tables;
+
+    // Read lazily, after readiness, so a model with no Cohort mapping reaches readiness's refusal.
+    private CohortStoreTables Tables => tables ??= CohortStoreTables.FromModel(db.Model);
 
     public Task WriteAsync(SweepEvent evt, CancellationToken ct)
     {
@@ -43,7 +46,7 @@ internal sealed class EfRetentionAuditWriter(
     {
         return ExecuteAsync(
             $"""
-            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRun)}
+            INSERT INTO {PostgreSqlIdentifier.Format(Tables.SweepRun)}
                 ("SweepId", "StartedAt", "Status", "SettledAt", "Duration", "TriggerKind", "DryRun", "TenantId", "TotalAffected", "ErasureSubjectKind")
             VALUES (@sweepId, @startedAt, @status, NULL, NULL, @triggerKind, @dryRun, @tenantId, 0, @erasureSubjectKind)
             """,
@@ -65,7 +68,7 @@ internal sealed class EfRetentionAuditWriter(
     {
         return ExecuteAsync(
             $"""
-            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRunEntitySummary)} AS current_summary
+            INSERT INTO {PostgreSqlIdentifier.Format(Tables.SweepRunEntitySummary)} AS current_summary
                 ("SweepId", "At", "EntityType", "RetentionEntityId", "Category", "TenantId", "Strategy",
                  "ResolvedMonths", "ResolvedDays", "Affected", "HeldCount", "SkippedCount", "NullAnchorCount",
                  "RetainedCount", "DeferredCount", "BlockedCount", "RuleSource", "RuleReason")
@@ -116,7 +119,7 @@ internal sealed class EfRetentionAuditWriter(
         return ExecuteAsync(
             $"""
             WITH upserted_summary AS (
-                INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRunEntitySummary)} AS current_summary
+                INSERT INTO {PostgreSqlIdentifier.Format(Tables.SweepRunEntitySummary)} AS current_summary
                     ("SweepId", "At", "EntityType", "RetentionEntityId", "Category", "TenantId", "Strategy",
                      "ResolvedMonths", "ResolvedDays", "Affected", "HeldCount", "SkippedCount", "NullAnchorCount",
                      "RetainedCount", "DeferredCount", "BlockedCount", "RuleSource", "RuleReason")
@@ -131,7 +134,7 @@ internal sealed class EfRetentionAuditWriter(
                     "BlockedCount" = current_summary."BlockedCount" + EXCLUDED."BlockedCount"
                 RETURNING 1
             )
-            UPDATE {PostgreSqlIdentifier.Format(tables.SweepRun)}
+            UPDATE {PostgreSqlIdentifier.Format(Tables.SweepRun)}
             SET "TotalAffected" = "TotalAffected" + @affected
             WHERE "SweepId" = @sweepId
               AND EXISTS (SELECT 1 FROM upserted_summary)
@@ -161,7 +164,7 @@ internal sealed class EfRetentionAuditWriter(
     {
         return ExecuteAsync(
             $"""
-            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRunRowDetail)}
+            INSERT INTO {PostgreSqlIdentifier.Format(Tables.SweepRunRowDetail)}
                 ("SweepId", "At", "EntityType", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId")
             VALUES (@sweepId, @at, @entityType, @retentionEntityId, @recordId, @category, @strategy, @tenantId)
             """,
@@ -196,7 +199,7 @@ internal sealed class EfRetentionAuditWriter(
     {
         var settled = await ExecuteAsync(
             $"""
-            UPDATE {PostgreSqlIdentifier.Format(tables.SweepRun)}
+            UPDATE {PostgreSqlIdentifier.Format(Tables.SweepRun)}
             SET "Status" = @status,
                 "SettledAt" = @settledAt,
                 "Duration" = @duration,

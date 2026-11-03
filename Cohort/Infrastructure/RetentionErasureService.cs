@@ -43,8 +43,9 @@ internal sealed class RetentionErasureService(
 
         await readinessValidator.ValidateAsync(ct);
         // Refused before any run exists: a kind no retained entity declares would erase nothing.
+        var validation = validationState.For(db.Model);
         ErasureSubjectValidation.Validate(
-            validationState.For(db.Model),
+            validation,
             registry,
             scope.Kind,
             scope.Subject,
@@ -70,7 +71,7 @@ internal sealed class RetentionErasureService(
             callerCommit
         );
         // Built before the run exists: a request refused by policy leaves no attempted run.
-        var plan = await BuildExecutionPlanAsync(tenant, entities, scope, now, run, ct);
+        var plan = await BuildExecutionPlanAsync(validation, tenant, entities, scope, now, run, ct);
         await run.ExecuteAsync(() => run.RunEntitiesAsync(plan, strategies, dependentsRegistrations, ct), ct);
         return run.CreateErasureResult(scope);
     }
@@ -123,6 +124,7 @@ internal sealed class RetentionErasureService(
     }
 
     private async Task<IReadOnlyList<SweepScope>> BuildExecutionPlanAsync(
+        RetentionModelValidation validation,
         TenantContext tenant,
         SweepEntityScope entities,
         ErasureScope scope,
@@ -142,8 +144,7 @@ internal sealed class RetentionErasureService(
                 continue;
             }
 
-            var subjectMetadata = validationState
-                .For(db.Model)
+            var subjectMetadata = validation
                 .ErasureSubjects[entry.EntityType]
                 .FirstOrDefault(metadata => string.Equals(metadata.Kind, scope.Kind, StringComparison.Ordinal));
             if (subjectMetadata is null)

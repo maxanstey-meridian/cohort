@@ -66,7 +66,7 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
         using var host = new CohortTestHost(connectionString);
 
         var act = () => host.RunWithServicesAsync(serviceProvider =>
-            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+            ValidateSchemaAsync(serviceProvider)
         );
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
@@ -84,7 +84,7 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
         );
 
         var act = () => host.RunWithServicesAsync(serviceProvider =>
-            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+            ValidateSchemaAsync(serviceProvider)
         );
 
         await act.Should().NotThrowAsync();
@@ -110,7 +110,7 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
         );
 
         await host.RunWithServicesAsync(serviceProvider =>
-            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+            ValidateSchemaAsync(serviceProvider)
         );
 
         logs.Entries.Should().NotContain(entry => entry.Level == LogLevel.Warning);
@@ -129,7 +129,7 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
         using var host = new CohortTestHost(connectionString);
 
         var act = () => host.RunWithServicesAsync(serviceProvider =>
-            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+            ValidateSchemaAsync(serviceProvider)
         );
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
@@ -156,7 +156,7 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
         using var host = new CohortTestHost(connectionString);
 
         var act = () => host.RunWithServicesAsync(serviceProvider =>
-            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+            ValidateSchemaAsync(serviceProvider)
         );
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
@@ -176,7 +176,7 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
         using var host = new CohortTestHost(connectionString);
 
         var act = () => host.RunWithServicesAsync(serviceProvider =>
-            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+            ValidateSchemaAsync(serviceProvider)
         );
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
@@ -209,7 +209,7 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
 
         using var host = new CohortTestHost(connectionString);
         var act = () => host.RunWithServicesAsync(serviceProvider =>
-            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+            ValidateSchemaAsync(serviceProvider)
         );
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
@@ -230,7 +230,7 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
         using var host = new CohortTestHost(connectionString);
 
         var act = () => host.RunWithServicesAsync(serviceProvider =>
-            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+            ValidateSchemaAsync(serviceProvider)
         );
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
@@ -258,10 +258,22 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
         using var host = new CohortTestHost(connectionString);
 
         var act = () => host.RunWithServicesAsync(serviceProvider =>
-            serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(default)
+            ValidateSchemaAsync(serviceProvider)
         );
 
         await act.Should().NotThrowAsync();
+    }
+
+    // The validator reads the store tables from the caller's model and talks to the database
+    // through the caller's facade; it takes no DbContext of its own.
+    private static Task ValidateSchemaAsync(IServiceProvider serviceProvider)
+    {
+        var db = serviceProvider.GetRequiredService<SampleDbContext>();
+        return serviceProvider.GetRequiredService<CohortSchemaValidator>().ValidateAsync(
+            CohortStoreTables.FromModel(db.Model),
+            db.Database,
+            default
+        );
     }
 
     private async Task ExecuteAsync(string sql)

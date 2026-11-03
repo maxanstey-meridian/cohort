@@ -1,5 +1,5 @@
 using System.Collections.Concurrent;
-using System.Data.Common;
+using System.Runtime.CompilerServices;
 
 using Cohort.Application;
 using Cohort.Domain;
@@ -8,6 +8,7 @@ using Cohort.Infrastructure.Sweep;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -35,7 +36,17 @@ internal sealed class RetentionRuntimeReadinessValidator(
     {
         ValidateProvider();
         ValidateSessionLocks();
-        var readiness = state.For(CreateKey());
+        // Two levels of memory. The model instance the context runs has its own entry (its pass
+        // and its gate), per database. Each database check also records its pass by value, under
+        // the database and everything the check reads, so a rebuilt copy of a model that reads
+        // the same things skips it. Npgsql's DataSource already carries host and port. This only
+        // keys the memory, so two spellings of one database each validate once; whether two
+        // contexts reach the same database is decided on the server.
+        var facade = db.Database;
+        var connection = facade.GetDbConnection();
+        var dataSource = connection.DataSource;
+        var databaseName = connection.Database;
+        var readiness = state.For(db.Model, dataSource, databaseName);
         if (readiness.Validated)
         {
             return;
@@ -49,23 +60,56 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 return;
             }
 
-            await ValidateServerVersionAsync(ct);
-            await startupValidator.ValidateAsync(ct);
-            await schemaValidator.ValidateAsync(ct);
-            await ValidateRetainedTablesAsync(ct);
-            await ValidateHoldRelationLinkColumnsAsync(ct);
-            await ValidateAnonymiseTargetsAsync(ct);
-            await ValidateReferencedMarkerColumnsAsync(ct);
-            // The hold check runs on its own connection, outside the caller's transaction, so its
-            // success stands whatever transaction the caller is in; cache it apart from the checks
-            // that read through the caller's connection.
-            if (!readiness.StoredEntityIdentitiesValidated)
-            {
-                await ValidateStoredEntityIdentitiesAsync(ct);
-                readiness.StoredEntityIdentitiesValidated = true;
-            }
+            RetentionReadinessCheckKey Key(RetentionReadinessCheck check, IEnumerable<object> inputs) =>
+                new(dataSource, databaseName, check, [.. inputs]);
 
-            if (db.Database.CurrentTransaction is null)
+            // Order matters. Each check throws before the next runs, and later checks rely on
+            // earlier ones: the link-column check skips rows whose target type is missing, and
+            // the anonymise check skips rows whose table or record id is missing, because the
+            // retained-tables check has already refused those. When that check is skipped as
+            // another copy's recorded pass, the order holds on the same "once, then trusted"
+            // footing as the cache itself.
+            await RunSharedAsync(
+                Key(RetentionReadinessCheck.ServerVersion, []),
+                () => ValidateServerVersionAsync(facade, ct)
+            );
+            await startupValidator.ValidateAsync(ct);
+            var storeTables = CohortStoreTables.FromModel(db.Model);
+            await RunSharedAsync(
+                Key(RetentionReadinessCheck.Schema, [storeTables]),
+                () => schemaValidator.ValidateAsync(storeTables, facade, ct)
+            );
+            var retainedTables = RetainedTableRows();
+            await RunSharedAsync(
+                Key(RetentionReadinessCheck.RetainedTables, retainedTables),
+                () => ValidateRetainedTablesAsync(facade, retainedTables, ct)
+            );
+            var links = HoldLinkRows();
+            await RunSharedAsync(
+                Key(RetentionReadinessCheck.HoldRelationLinkColumns, links),
+                () => ValidateHoldRelationLinkColumnsAsync(facade, links, ct)
+            );
+            // Not shared: what this reads is session state, which no key captures.
+            await ValidateAnonymiseTargetsAsync(ct);
+            var markers = MarkerColumnRows();
+            await RunSharedAsync(
+                Key(RetentionReadinessCheck.ReferencedMarkerColumns, markers),
+                () => ValidateReferencedMarkerColumnsAsync(facade, markers, ct)
+            );
+            var holds = PostgreSqlIdentifier.Format(storeTables.RetentionHolds);
+            var registered = registry.Scan().Values.Select(entry => entry.RetentionEntityId).Order().ToArray();
+            object[] storedIdentityInputs = [holds, .. registered];
+            // The hold check runs on its own connection, outside the caller's transaction, so its
+            // success stands whatever transaction the caller is in. The checks above read through
+            // the caller's connection, and one that passed inside a transaction may have seen
+            // DDL that rolls back, so those are recorded only without one.
+            await RunSharedAsync(
+                Key(RetentionReadinessCheck.StoredEntityIdentities, storedIdentityInputs),
+                () => ValidateStoredEntityIdentitiesAsync(facade, scopeFactory, holds, registered, ct),
+                recordInsideTransaction: true
+            );
+
+            if (facade.CurrentTransaction is null)
             {
                 readiness.Validated = true;
             }
@@ -77,6 +121,29 @@ internal sealed class RetentionRuntimeReadinessValidator(
     }
 
     /// <summary>
+    /// Runs a database check unless another copy of the model already passed it against this
+    /// database on the same inputs; records the pass. A failure is never recorded. A recorded
+    /// pass is skipped inside a caller's transaction too.
+    /// </summary>
+    private async Task RunSharedAsync(
+        RetentionReadinessCheckKey key,
+        Func<Task> run,
+        bool recordInsideTransaction = false
+    )
+    {
+        if (state.HasPassed(key))
+        {
+            return;
+        }
+
+        await run();
+        if (recordInsideTransaction || db.Database.CurrentTransaction is null)
+        {
+            state.RecordPassed(key);
+        }
+    }
+
+    /// <summary>
     /// Each retained table must exist as an ordinary or partitioned table, since Cohort changes
     /// its rows in place and addresses each by its physical position (ctid), and its record-id
     /// column must exist. Cohort stores a record id as its column's text form; the model's store
@@ -84,25 +151,28 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// record-id column's catalog type is resolved through domains, arrays and ranges to the
     /// types it is built on, which must not depend on session settings.
     /// </summary>
-    private async Task ValidateRetainedTablesAsync(CancellationToken ct)
+    private static async Task ValidateRetainedTablesAsync(
+        DatabaseFacade database,
+        RetainedTableInput[] entries,
+        CancellationToken ct
+    )
     {
-        var entries = registry.Scan().Values.ToArray();
         if (entries.Length == 0)
         {
             return;
         }
 
-        await db.Database.OpenConnectionAsync(ct);
+        await database.OpenConnectionAsync(ct);
         try
         {
             await using var command = new SqlParams
             {
                 ["schemas"] = entries.Select(entry => entry.Table.Schema).ToArray(),
                 ["tables"] = entries.Select(entry => entry.Table.Name).ToArray(),
-                ["columns"] = entries.Select(entry => entry.RecordId.RecordIdColumn).ToArray(),
+                ["columns"] = entries.Select(entry => entry.RecordIdColumn).ToArray(),
             }.CreateCommand(
-                db.Database.GetDbConnection(),
-                db.Database.CurrentTransaction?.GetDbTransaction(),
+                database.GetDbConnection(),
+                database.CurrentTransaction?.GetDbTransaction(),
                 """
                 WITH RECURSIVE record_id_column AS (
                     SELECT requested.ordinal,
@@ -164,7 +234,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
                     if (!reader.IsDBNull(3))
                     {
                         errors.Add(
-                            $"Retained entity {entry.EntityType.FullName}: {PostgreSqlIdentifier.Format(entry.Table)} is {NotATable(reader.GetChar(3))}, so Cohort can't retain its rows. Map the entity to the table it lives in."
+                            $"Retained entity {entry.Entity}: {PostgreSqlIdentifier.Format(entry.Table)} is {NotATable(reader.GetChar(3))}, so Cohort can't retain its rows. Map the entity to the table it lives in."
                         );
                         continue;
                     }
@@ -173,8 +243,8 @@ internal sealed class RetentionRuntimeReadinessValidator(
                     {
                         errors.Add(
                             reader.GetBoolean(2)
-                                ? $"Retained entity {entry.EntityType.FullName}: table {PostgreSqlIdentifier.Format(entry.Table)} was not found in the database, so every run would fail. Apply the host application's pending EF Core migrations, or map the entity to the table it lives in."
-                                : $"Record-id convention on {entry.EntityType.FullName}: record-id column {PostgreSqlIdentifier.Format(entry.Table)}.{PostgreSqlIdentifier.Quote(entry.RecordId.RecordIdColumn)} was not found in the database, so every run would fail. Apply the host application's pending EF Core migrations, or map the record id to the column it lives in."
+                                ? $"Retained entity {entry.Entity}: table {PostgreSqlIdentifier.Format(entry.Table)} was not found in the database, so every run would fail. Apply the host application's pending EF Core migrations, or map the entity to the table it lives in."
+                                : $"Record-id convention on {entry.Entity}: record-id column {PostgreSqlIdentifier.Format(entry.Table)}.{PostgreSqlIdentifier.Quote(entry.RecordIdColumn)} was not found in the database, so every run would fail. Apply the host application's pending EF Core migrations, or map the record id to the column it lives in."
                         );
                         continue;
                     }
@@ -186,7 +256,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
                     }
 
                     errors.Add(
-                        $"Record-id convention on {entry.EntityType.FullName}: record-id column {PostgreSqlIdentifier.Format(entry.Table)}.{PostgreSqlIdentifier.Quote(entry.RecordId.RecordIdColumn)} is built on '{typeName}', whose text form depends on session settings (TimeZone, DateStyle, IntervalStyle, extra_float_digits), so holds and audit rows could silently stop matching. Use a uuid, integer, numeric, or text record id, or mark a stable unique column with [RetentionRecordId]."
+                        $"Record-id convention on {entry.Entity}: record-id column {PostgreSqlIdentifier.Format(entry.Table)}.{PostgreSqlIdentifier.Quote(entry.RecordIdColumn)} is built on '{typeName}', whose text form depends on session settings (TimeZone, DateStyle, IntervalStyle, extra_float_digits), so holds and audit rows could silently stop matching. Use a uuid, integer, numeric, or text record id, or mark a stable unique column with [RetentionRecordId]."
                     );
                 }
             }
@@ -198,9 +268,26 @@ internal sealed class RetentionRuntimeReadinessValidator(
         }
         finally
         {
-            await db.Database.CloseConnectionAsync();
+            await database.CloseConnectionAsync();
         }
     }
+
+    /// <summary>
+    /// What the retained-tables check reads, one row per retained entity, ordered by entity name.
+    /// </summary>
+    private RetainedTableInput[] RetainedTableRows() =>
+        [
+            .. registry
+                .Scan()
+                .Values.Select(entry => new RetainedTableInput(
+                    entry.EntityType.FullName ?? entry.EntityType.Name,
+                    entry.Table,
+                    entry.RecordId.RecordIdColumn
+                ))
+                .OrderBy(row => row.Entity, StringComparer.Ordinal),
+        ];
+
+    private sealed record RetainedTableInput(string Entity, RelationalObjectName Table, string RecordIdColumn);
 
     /// <summary>
     /// Each <c>[HeldWith]</c> and <c>[HeldWithReferencing]</c> link column must exist in the real
@@ -212,38 +299,31 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// <see cref="ValidateRetainedTablesAsync"/>, which has already refused a missing table or
     /// record-id column.
     /// </summary>
-    private async Task ValidateHoldRelationLinkColumnsAsync(CancellationToken ct)
+    private static async Task ValidateHoldRelationLinkColumnsAsync(
+        DatabaseFacade database,
+        HoldLinkInput[] hops,
+        CancellationToken ct
+    )
     {
-        // A relation's declaring entity carries it as a one-hop holder path.
-        var hops = registry
-            .Scan()
-            .Values.OrderBy(entry => entry.EntityType.FullName, StringComparer.Ordinal)
-            .SelectMany(entry => entry.HolderPaths.Where(path => path.Hops.Count == 1).Select(path => path.Hops[0]))
-            .Select(hop =>
-                hop.LinkSide == HoldLinkSide.Near
-                    ? (Hop: hop, Owner: hop.Near, Target: hop.Far)
-                    : (Hop: hop, Owner: hop.Far, Target: hop.Near)
-            )
-            .ToArray();
         if (hops.Length == 0)
         {
             return;
         }
 
-        await db.Database.OpenConnectionAsync(ct);
+        await database.OpenConnectionAsync(ct);
         try
         {
             await using var command = new SqlParams
             {
-                ["owner_schemas"] = hops.Select(hop => hop.Owner.Table.Schema).ToArray(),
-                ["owner_tables"] = hops.Select(hop => hop.Owner.Table.Name).ToArray(),
-                ["link_columns"] = hops.Select(hop => hop.Hop.LinkColumn).ToArray(),
-                ["target_schemas"] = hops.Select(hop => hop.Target.Table.Schema).ToArray(),
-                ["target_tables"] = hops.Select(hop => hop.Target.Table.Name).ToArray(),
-                ["target_columns"] = hops.Select(hop => hop.Target.RecordId.RecordIdColumn).ToArray(),
+                ["owner_schemas"] = hops.Select(hop => hop.OwnerTable.Schema).ToArray(),
+                ["owner_tables"] = hops.Select(hop => hop.OwnerTable.Name).ToArray(),
+                ["link_columns"] = hops.Select(hop => hop.LinkColumn).ToArray(),
+                ["target_schemas"] = hops.Select(hop => hop.TargetTable.Schema).ToArray(),
+                ["target_tables"] = hops.Select(hop => hop.TargetTable.Name).ToArray(),
+                ["target_columns"] = hops.Select(hop => hop.TargetRecordIdColumn).ToArray(),
             }.CreateCommand(
-                db.Database.GetDbConnection(),
-                db.Database.CurrentTransaction?.GetDbTransaction(),
+                database.GetDbConnection(),
+                database.CurrentTransaction?.GetDbTransaction(),
                 """
                 WITH RECURSIVE requested AS (
                     SELECT requested.ordinal,
@@ -335,8 +415,8 @@ internal sealed class RetentionRuntimeReadinessValidator(
             {
                 while (await reader.ReadAsync(ct))
                 {
-                    var (hop, owner, target) = hops[(int)reader.GetInt64(0) - 1];
-                    var column = $"{PostgreSqlIdentifier.Format(owner.Table)}.{PostgreSqlIdentifier.Quote(hop.LinkColumn)}";
+                    var hop = hops[(int)reader.GetInt64(0) - 1];
+                    var column = $"{PostgreSqlIdentifier.Format(hop.OwnerTable)}.{PostgreSqlIdentifier.Quote(hop.LinkColumn)}";
                     if (!reader.GetBoolean(1))
                     {
                         errors.Add(
@@ -346,14 +426,14 @@ internal sealed class RetentionRuntimeReadinessValidator(
                     else if (!reader.GetBoolean(4))
                     {
                         errors.Add(
-                            $"Hold relation {hop.Declaration}: link column {column} is '{reader.GetString(2)}' in the database, but the record-id column {PostgreSqlIdentifier.Format(target.Table)}.{PostgreSqlIdentifier.Quote(target.RecordId.RecordIdColumn)} it names is '{reader.GetString(3)}', so holds would never match across the relation. Give the link column the record id's type."
+                            $"Hold relation {hop.Declaration}: link column {column} is '{reader.GetString(2)}' in the database, but the record-id column {PostgreSqlIdentifier.Format(hop.TargetTable)}.{PostgreSqlIdentifier.Quote(hop.TargetRecordIdColumn)} it names is '{reader.GetString(3)}', so holds would never match across the relation. Give the link column the record id's type."
                         );
                     }
                     else if (reader.GetInt32(5) is var collationProblem and not 0)
                     {
                         var linkCollation = reader.GetString(6);
                         var targetCollation = reader.GetString(7);
-                        var record = $"{PostgreSqlIdentifier.Format(target.Table)}.{PostgreSqlIdentifier.Quote(target.RecordId.RecordIdColumn)}";
+                        var record = $"{PostgreSqlIdentifier.Format(hop.TargetTable)}.{PostgreSqlIdentifier.Quote(hop.TargetRecordIdColumn)}";
                         errors.Add(
                             collationProblem == 1
                                 ? $"Hold relation {hop.Declaration}: link column {column} has collation '{linkCollation}' in the database, but the record-id column {record} it names has collation '{targetCollation}', and PostgreSQL can't choose between two different non-default collations, so every hold check across the relation would fail. Give the link column the record id's collation, or the default."
@@ -370,9 +450,44 @@ internal sealed class RetentionRuntimeReadinessValidator(
         }
         finally
         {
-            await db.Database.CloseConnectionAsync();
+            await database.CloseConnectionAsync();
         }
     }
+
+    /// <summary>
+    /// What the link-column check reads, one row per one-hop holder, ordered by the entity that
+    /// carries the relation. A relation's declaring entity carries it as a one-hop holder path.
+    /// </summary>
+    private HoldLinkInput[] HoldLinkRows() =>
+        [
+            .. registry
+                .Scan()
+                .Values.OrderBy(entry => entry.EntityType.FullName, StringComparer.Ordinal)
+                .SelectMany(entry => entry.HolderPaths.Where(path => path.Hops.Count == 1).Select(path => path.Hops[0]))
+                .Select(hop =>
+                {
+                    var (owner, target) = hop.LinkSide == HoldLinkSide.Near ? (hop.Near, hop.Far) : (hop.Far, hop.Near);
+                    return new HoldLinkInput(
+                        hop.Declaration,
+                        owner.EntityType.FullName ?? owner.EntityType.Name,
+                        target.EntityType.FullName ?? target.EntityType.Name,
+                        owner.Table,
+                        hop.LinkColumn,
+                        target.Table,
+                        target.RecordId.RecordIdColumn
+                    );
+                }),
+        ];
+
+    private sealed record HoldLinkInput(
+        string Declaration,
+        string OwnerEntity,
+        string TargetEntity,
+        RelationalObjectName OwnerTable,
+        string LinkColumn,
+        RelationalObjectName TargetTable,
+        string TargetRecordIdColumn
+    );
 
     private static string NotATable(char kind) =>
         kind switch
@@ -664,48 +779,28 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// check covers the anonymised columns; this covers the columns the update strategies always
     /// write, the soft-delete flag and deleted-at, and the anonymised-at marker.
     /// </summary>
-    private async Task ValidateReferencedMarkerColumnsAsync(CancellationToken ct)
+    private static async Task ValidateReferencedMarkerColumnsAsync(
+        DatabaseFacade database,
+        MarkerColumnInput[] markers,
+        CancellationToken ct
+    )
     {
-        var markers = registry
-            .Scan()
-            .Values.Where(entry => ValidatedCapabilities.ContainsKey(entry.Category))
-            .SelectMany(entry =>
-            {
-                var strategies = ValidatedCapabilities[entry.Category].Strategies;
-                var columns = new List<(RetentionEntry Entry, string Strategy, string Member, string Column)>();
-                if (strategies.Contains(Strategy.SoftDelete) && entry.SoftDelete is { } softDelete)
-                {
-                    columns.Add((entry, "soft-deleting", softDelete.IsDeletedMember, softDelete.IsDeletedColumn));
-                    if (softDelete is { DeletedAtMember: { } member, DeletedAtColumn: { } column })
-                    {
-                        columns.Add((entry, "soft-deleting", member, column));
-                    }
-                }
-
-                if (strategies.Contains(Strategy.Anonymise) && entry.AnonymisedAt is { } anonymisedAt)
-                {
-                    columns.Add((entry, "anonymising", anonymisedAt.AnonymisedAtMember, anonymisedAt.AnonymisedAtColumn));
-                }
-
-                return columns;
-            })
-            .ToArray();
         if (markers.Length == 0)
         {
             return;
         }
 
-        await db.Database.OpenConnectionAsync(ct);
+        await database.OpenConnectionAsync(ct);
         try
         {
             await using var command = new SqlParams
             {
-                ["schemas"] = markers.Select(marker => marker.Entry.Table.Schema).ToArray(),
-                ["tables"] = markers.Select(marker => marker.Entry.Table.Name).ToArray(),
+                ["schemas"] = markers.Select(marker => marker.Table.Schema).ToArray(),
+                ["tables"] = markers.Select(marker => marker.Table.Name).ToArray(),
                 ["columns"] = markers.Select(marker => marker.Column).ToArray(),
             }.CreateCommand(
-                db.Database.GetDbConnection(),
-                db.Database.CurrentTransaction?.GetDbTransaction(),
+                database.GetDbConnection(),
+                database.CurrentTransaction?.GetDbTransaction(),
                 """
                 SELECT requested.ordinal
                 FROM ROWS FROM (
@@ -735,9 +830,9 @@ internal sealed class RetentionRuntimeReadinessValidator(
             {
                 while (await reader.ReadAsync(ct))
                 {
-                    var (entry, strategy, member, column) = markers[(int)reader.GetInt64(0) - 1];
+                    var marker = markers[(int)reader.GetInt64(0) - 1];
                     errors.Add(
-                        $"Retained entity {entry.EntityType.FullName}: member {member} writes column {PostgreSqlIdentifier.Format(entry.Table)}.{PostgreSqlIdentifier.Quote(column)}, which is referenced by a foreign key, so {strategy} a row would be refused while a row references it or would silently rewrite the referencing rows (ON UPDATE CASCADE or SET NULL). Stop referencing this column."
+                        $"Retained entity {marker.Entity}: member {marker.Member} writes column {PostgreSqlIdentifier.Format(marker.Table)}.{PostgreSqlIdentifier.Quote(marker.Column)}, which is referenced by a foreign key, so {marker.Strategy} a row would be refused while a row references it or would silently rewrite the referencing rows (ON UPDATE CASCADE or SET NULL). Stop referencing this column."
                     );
                 }
             }
@@ -749,9 +844,63 @@ internal sealed class RetentionRuntimeReadinessValidator(
         }
         finally
         {
-            await db.Database.CloseConnectionAsync();
+            await database.CloseConnectionAsync();
         }
     }
+
+    /// <summary>
+    /// What the marker-column check reads, one row per column the update strategies write, as the
+    /// validated capabilities declare them, ordered by entity name and then column.
+    /// </summary>
+    private MarkerColumnInput[] MarkerColumnRows() =>
+        [
+            .. registry
+                .Scan()
+                .Values.Where(entry => ValidatedCapabilities.ContainsKey(entry.Category))
+                .SelectMany(entry =>
+                {
+                    var strategies = ValidatedCapabilities[entry.Category].Strategies;
+                    var entity = entry.EntityType.FullName ?? entry.EntityType.Name;
+                    var columns = new List<MarkerColumnInput>();
+                    if (strategies.Contains(Strategy.SoftDelete) && entry.SoftDelete is { } softDelete)
+                    {
+                        columns.Add(
+                            new(entity, "soft-deleting", softDelete.IsDeletedMember, entry.Table, softDelete.IsDeletedColumn)
+                        );
+                        if (softDelete is { DeletedAtMember: { } member, DeletedAtColumn: { } column })
+                        {
+                            columns.Add(new(entity, "soft-deleting", member, entry.Table, column));
+                        }
+                    }
+
+                    if (strategies.Contains(Strategy.Anonymise) && entry.AnonymisedAt is { } anonymisedAt)
+                    {
+                        columns.Add(
+                            new(
+                                entity,
+                                "anonymising",
+                                anonymisedAt.AnonymisedAtMember,
+                                entry.Table,
+                                anonymisedAt.AnonymisedAtColumn
+                            )
+                        );
+                    }
+
+                    return columns;
+                })
+                .OrderBy(marker => marker.Entity, StringComparer.Ordinal)
+                .ThenBy(marker => marker.Column, StringComparer.Ordinal)
+                .ThenBy(marker => marker.Member, StringComparer.Ordinal)
+                .ThenBy(marker => marker.Strategy, StringComparer.Ordinal),
+        ];
+
+    private sealed record MarkerColumnInput(
+        string Entity,
+        string Strategy,
+        string Member,
+        RelationalObjectName Table,
+        string Column
+    );
 
     private static string TargetDescription(RetentionEntry entry, AnonymiseField field) =>
         $"Anonymise convention on {entry.EntityType.FullName}: {(field is AnonymiseFactoryField ? "[AnonymiseWith]" : "[Anonymise]")} member {field.MemberName} writes column {PostgreSqlIdentifier.Format(entry.Table)}.{PostgreSqlIdentifier.Quote(field.ColumnName)}";
@@ -786,14 +935,14 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// Cohort's catalog checks call <c>pg_input_is_valid</c>, which PostgreSQL 16 added, so
     /// refuse an older server before any of them runs.
     /// </summary>
-    private async Task ValidateServerVersionAsync(CancellationToken ct)
+    private static async Task ValidateServerVersionAsync(DatabaseFacade database, CancellationToken ct)
     {
-        await db.Database.OpenConnectionAsync(ct);
+        await database.OpenConnectionAsync(ct);
         try
         {
             // Asked of the server rather than read off NpgsqlConnection: a host may hand EF a
             // wrapped DbConnection (a profiler, say).
-            var (version, versionText) = await ReadServerVersionAsync(db.Database.GetDbConnection(), ct);
+            var (version, versionText) = await ReadServerVersionAsync(database, ct);
             if (version < MinimumServerVersion)
             {
                 throw new RetentionConfigurationException([
@@ -803,18 +952,18 @@ internal sealed class RetentionRuntimeReadinessValidator(
         }
         finally
         {
-            await db.Database.CloseConnectionAsync();
+            await database.CloseConnectionAsync();
         }
     }
 
-    private async Task<(Version Version, string Text)> ReadServerVersionAsync(
-        DbConnection connection,
+    private static async Task<(Version Version, string Text)> ReadServerVersionAsync(
+        DatabaseFacade database,
         CancellationToken ct
     )
     {
         await using var command = new SqlParams().CreateCommand(
-            connection,
-            db.Database.CurrentTransaction?.GetDbTransaction(),
+            database.GetDbConnection(),
+            database.CurrentTransaction?.GetDbTransaction(),
             "SELECT pg_catalog.current_setting('server_version_num')::integer, pg_catalog.current_setting('server_version')"
         );
         await using var reader = await command.ExecuteReaderAsync(ct);
@@ -831,18 +980,25 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// Holds span tenants, so this runs in its own <see cref="RetentionSystemWork.Readiness"/>
     /// scope whatever scope readiness was called from: a tenant's scope would see only that
     /// tenant's holds under row-level security. It also runs when no entity is retained, since
-    /// removing the last <c>[Retain]</c> orphans holds the same way.
+    /// removing the last <c>[Retain]</c> orphans holds the same way. The scope's context is used
+    /// only through its connection, so its model doesn't matter, but it must reach the caller's
+    /// database. Its success is recorded under the holds relation and the registered ids, and
+    /// stands whatever transaction the caller is in, since it never reads through the caller's
+    /// connection; a recorded pass skips the scope altogether.
     /// </summary>
-    private async Task ValidateStoredEntityIdentitiesAsync(CancellationToken ct)
+    private static async Task ValidateStoredEntityIdentitiesAsync(
+        DatabaseFacade database,
+        IServiceScopeFactory scopeFactory,
+        string holds,
+        Guid[] registered,
+        CancellationToken ct
+    )
     {
-        var registered = registry.Scan().Values.Select(entry => entry.RetentionEntityId).ToArray();
-        var holds = PostgreSqlIdentifier.Format(CohortStoreTables.FromModel(db.Model).RetentionHolds);
-
-        var callerDatabase = await ReadServerDatabaseIdentityAsync(db, holds, ct);
+        var callerDatabase = await ReadServerDatabaseIdentityAsync(database, holds, ct);
         await scopeFactory.RunInScopeAsync(
             new RetentionExecutionContext.System(RetentionSystemWork.Readiness),
             services => ValidateStoredEntityIdentitiesAsync(
-                services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext),
+                services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext).Database,
                 registered,
                 holds,
                 callerDatabase,
@@ -852,29 +1008,26 @@ internal sealed class RetentionRuntimeReadinessValidator(
         );
     }
 
-    private async Task ValidateStoredEntityIdentitiesAsync(
-        DbContext systemDb,
+    private static async Task ValidateStoredEntityIdentitiesAsync(
+        DatabaseFacade systemDatabase,
         Guid[] registered,
         string holds,
         ServerDatabaseIdentity callerDatabase,
         CancellationToken ct
     )
     {
-        await systemDb.Database.OpenConnectionAsync(ct);
+        await systemDatabase.OpenConnectionAsync(ct);
         try
         {
-            if (
-                !SameModel(systemDb, db)
-                || await ReadServerDatabaseIdentityAsync(systemDb, holds, ct) != callerDatabase
-            )
+            if (await ReadServerDatabaseIdentityAsync(systemDatabase, holds, ct) != callerDatabase)
             {
                 throw new RetentionConfigurationException([
-                    "Cohort's readiness scope resolved a DbContext with a different model or database from the calling scope's. Cohort checks holds across tenants in a System(Readiness) scope, so every scope must reach the same database and model.",
+                    "Cohort's readiness scope resolved a DbContext that reaches a different database from the calling scope's. Cohort checks holds across tenants in a System(Readiness) scope, so every scope must reach the same database.",
                 ]);
             }
 
             await using var command = new SqlParams { ["registered"] = registered }.CreateCommand(
-                systemDb.Database.GetDbConnection(),
+                systemDatabase.GetDbConnection(),
                 null,
                 $"""
                 SELECT hold."RetentionEntityId", pg_catalog.count(*)
@@ -906,42 +1059,28 @@ internal sealed class RetentionRuntimeReadinessValidator(
         }
         finally
         {
-            await systemDb.Database.CloseConnectionAsync();
+            await systemDatabase.CloseConnectionAsync();
         }
     }
 
     /// <summary>
-    /// Whether two contexts run on one model, decided as EF decides it: by the model cache key,
-    /// which names the context type and whatever the host adds through a custom
-    /// <see cref="IModelCacheKeyFactory"/>. The <see cref="DbContext.Model"/> instances can't be
-    /// compared, since EF keeps built models in a size-limited memory cache and a model that
-    /// doesn't fit isn't stored, so two contexts of one type and options then each build their
-    /// own equal copy.
-    /// </summary>
-    private static bool SameModel(DbContext left, DbContext right) =>
-        Equals(
-            left.GetService<IModelCacheKeyFactory>().Create(left, designTime: false),
-            right.GetService<IModelCacheKeyFactory>().Create(right, designTime: false)
-        );
-
-    /// <summary>
-    /// Which database a context's connection reaches, as the server sees it. Connection strings
+    /// Which database a connection reaches, as the server sees it. Connection strings
     /// spell one database many ways (<c>localhost</c> or <c>127.0.0.1</c>, a pooler or the direct
     /// port), so the database name, the server's start time and the hold table's OID decide
-    /// sameness instead. Reads in the context's current transaction when it has one.
+    /// sameness instead. Reads in the database's current transaction when it has one.
     /// </summary>
     private static async Task<ServerDatabaseIdentity> ReadServerDatabaseIdentityAsync(
-        DbContext context,
+        DatabaseFacade database,
         string holds,
         CancellationToken ct
     )
     {
-        await context.Database.OpenConnectionAsync(ct);
+        await database.OpenConnectionAsync(ct);
         try
         {
             await using var command = new SqlParams { ["holds"] = holds }.CreateCommand(
-                context.Database.GetDbConnection(),
-                context.Database.CurrentTransaction?.GetDbTransaction(),
+                database.GetDbConnection(),
+                database.CurrentTransaction?.GetDbTransaction(),
                 """
                 SELECT pg_catalog.current_database()::text,
                        pg_catalog.pg_postmaster_start_time(),
@@ -958,7 +1097,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
         }
         finally
         {
-            await context.Database.CloseConnectionAsync();
+            await database.CloseConnectionAsync();
         }
     }
 
@@ -968,23 +1107,13 @@ internal sealed class RetentionRuntimeReadinessValidator(
         long? HoldsTableOid
     );
 
-    // Readiness depends on the model (and so Cohort's table mapping) and on the database it
-    // runs against; Npgsql's DataSource already carries host and port. This only keys the
-    // cache, so two spellings of one database each validate once; whether two contexts reach
-    // the same database is decided on the server.
-    private RetentionRuntimeReadinessKey CreateKey()
-    {
-        var connection = db.Database.GetDbConnection();
-        return new RetentionRuntimeReadinessKey(db.Model, connection.DataSource, connection.Database);
-    }
-
     /// <summary>
     /// The worker, each run and each row-handler delivery hold PostgreSQL session advisory
     /// locks. Under Npgsql multiplexing a connection is bound to a server session only inside a
     /// transaction, so a lock taken outside one stays on whichever session ran it while the
     /// unlock runs on another and finds nothing to release. Checked on every call, not cached:
-    /// the readiness key doesn't carry connection settings. A wrapped DbConnection (a profiler,
-    /// say) can't be inspected, so it is the host's to configure.
+    /// neither the model's entry nor a recorded check is keyed by connection settings. A wrapped
+    /// DbConnection (a profiler, say) can't be inspected, so it is the host's to configure.
     /// </summary>
     private void ValidateSessionLocks()
     {
@@ -1026,30 +1155,35 @@ internal sealed class RetentionRuntimeReadinessValidator(
 
 internal sealed class RetentionRuntimeReadinessState
 {
-    private readonly ConcurrentDictionary<
-        RetentionRuntimeReadinessKey,
-        RetentionRuntimeReadinessEntry
+    // Per model instance, held weakly (like RetentionValidationState): the entry is exact for
+    // whichever model the context runs, and a host whose EF model cache can't hold its models gets
+    // a new instance per context that dies with its context instead of being kept alive here.
+    private readonly ConditionalWeakTable<
+        IModel,
+        ConcurrentDictionary<(string DataSource, string Database), RetentionRuntimeReadinessEntry>
     > entries = new();
 
-    internal RetentionRuntimeReadinessEntry For(RetentionRuntimeReadinessKey key) =>
-        entries.GetOrAdd(key, static _ => new RetentionRuntimeReadinessEntry());
-}
+    // The database checks that passed, by value: one small key per distinct input per database
+    // per check, never evicted. A rebuilt copy of a model that reads the same things skips them.
+    private readonly ConcurrentDictionary<RetentionReadinessCheckKey, byte> passed = new();
 
-internal sealed record RetentionRuntimeReadinessKey(
-    Microsoft.EntityFrameworkCore.Metadata.IModel Model,
-    string DataSource,
-    string Database
-);
+    internal RetentionRuntimeReadinessEntry For(IModel model, string dataSource, string database) =>
+        entries
+            .GetValue(
+                model,
+                static _ =>
+                    new ConcurrentDictionary<(string DataSource, string Database), RetentionRuntimeReadinessEntry>()
+            )
+            .GetOrAdd((dataSource, database), static _ => new RetentionRuntimeReadinessEntry());
+
+    internal bool HasPassed(RetentionReadinessCheckKey key) => passed.ContainsKey(key);
+
+    internal void RecordPassed(RetentionReadinessCheckKey key) => passed.TryAdd(key, 0);
+}
 
 internal sealed class RetentionRuntimeReadinessEntry
 {
     internal SemaphoreSlim Gate { get; } = new(1, 1);
 
     internal volatile bool Validated;
-
-    /// <summary>
-    /// The cross-tenant hold check passed. Set even when the caller was in a transaction, because
-    /// that check never reads through the caller's connection.
-    /// </summary>
-    internal volatile bool StoredEntityIdentitiesValidated;
 }

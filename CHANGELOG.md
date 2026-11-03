@@ -37,6 +37,14 @@ A hold on a row also holds the rows a host declares related to it.
   accepts `READ UNCOMMITTED` (PostgreSQL runs it as `READ COMMITTED`; 0.11.0 refused it). An
   erasure's wrong-type subject message now reads "…but the subject is a {type}." (it was "…but
   the scope's subject is a {type}.").
+- Readiness keeps its results per EF model instance without holding the model, and keeps each
+  database check's success under exactly what that check reads. A host whose EF model cache
+  can't hold its models (many context types, or a model per tenant) no longer repeats
+  readiness's catalog checks or its `System(Readiness)` scope for every context once one copy
+  of the model has passed: only the anonymise-target check, whose result can depend on session
+  settings, runs again for each copy. Cohort no longer keeps every model alive. The
+  `System(Readiness)` scope must reach the caller's database but may run a different model,
+  since it reads only through its connection; the refusal now says 'a different database'.
 
 Upgrade: [Legal Holds](https://maxanstey-meridian.github.io/cohort/guides/legal-holds#upgrading-to-0-12-0).
 

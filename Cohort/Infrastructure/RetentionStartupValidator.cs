@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
 
 using Cohort.Application;
@@ -7,6 +8,7 @@ using Cohort.Infrastructure.Holds;
 using Cohort.Infrastructure.Sweep;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Infrastructure;
@@ -51,28 +53,29 @@ internal sealed partial class RetentionStartupValidator(
         .ToDictionary(group => group.Key, group => group.Count());
 
     // Resolved lazily: touching db.Model before the provider check would mask a wrong provider.
-    private RetentionModelValidation ModelValidation => validationState.For(db.Model);
-
     internal IReadOnlyDictionary<string, RetentionCategoryCapabilities> ValidatedCapabilities =>
-        ModelValidation.Capabilities;
+        validationState.For(db.Model).Capabilities;
 
     public async Task ValidateAsync(CancellationToken ct = default)
     {
-        if (ModelValidation.Validated)
+        // Resolved once: the gate taken below is the gate released, and every result lands in
+        // the entry the gate guards.
+        var validation = validationState.For(db.Model);
+        if (validation.Validated)
         {
             return;
         }
 
-        await ModelValidation.Gate.WaitAsync(ct);
+        await validation.Gate.WaitAsync(ct);
         try
         {
-            if (ModelValidation.Validated)
+            if (validation.Validated)
             {
                 return;
             }
 
-            ModelValidation.ErasureSubjects.Clear();
-            ModelValidation.ErasureSubjectKinds.Clear();
+            validation.ErasureSubjects.Clear();
+            validation.ErasureSubjectKinds.Clear();
             var validatedCapabilities = new Dictionary<string, RetentionCategoryCapabilities>(
                 StringComparer.Ordinal
             );
@@ -185,7 +188,7 @@ internal sealed partial class RetentionStartupValidator(
 
                 try
                 {
-                    ModelValidation.ErasureSubjects[entry.EntityType] =
+                    validation.ErasureSubjects[entry.EntityType] =
                         erasureSubjectMetadataResolver.Resolve(entry);
 
                     if (capabilities.Strategies.Contains(Strategy.Purge))
@@ -241,7 +244,7 @@ internal sealed partial class RetentionStartupValidator(
             }
 
             ValidateRowWorkTargetsRetainedEntities(errors);
-            ValidateErasureSubjectKinds(errors);
+            ValidateErasureSubjectKinds(validation, errors);
             ValidateHoldRelations(retainedEntries, errors);
 
             try
@@ -258,16 +261,16 @@ internal sealed partial class RetentionStartupValidator(
                 throw new RetentionConfigurationException(errors);
             }
 
-            ModelValidation.Capabilities.Clear();
+            validation.Capabilities.Clear();
             foreach (var capability in validatedCapabilities)
             {
-                ModelValidation.Capabilities.Add(capability.Key, capability.Value);
+                validation.Capabilities.Add(capability.Key, capability.Value);
             }
-            ModelValidation.Validated = true;
+            validation.Validated = true;
         }
         finally
         {
-            ModelValidation.Gate.Release();
+            validation.Gate.Release();
         }
     }
 
@@ -275,9 +278,9 @@ internal sealed partial class RetentionStartupValidator(
     /// A kind names one sort of subject, so every column of that kind, across the model,
     /// must hold the same CLR type; an erasure's subject is checked against it.
     /// </summary>
-    private void ValidateErasureSubjectKinds(List<string> errors)
+    private static void ValidateErasureSubjectKinds(RetentionModelValidation validation, List<string> errors)
     {
-        var membersByKind = ModelValidation
+        var membersByKind = validation
             .ErasureSubjects.Values.SelectMany(metadata => metadata)
             .GroupBy(metadata => metadata.Kind, StringComparer.Ordinal)
             .OrderBy(group => group.Key, StringComparer.Ordinal);
@@ -289,7 +292,7 @@ internal sealed partial class RetentionStartupValidator(
             var subjectTypes = members.Select(pair => pair.Member.SubjectType).Distinct().ToArray();
             if (subjectTypes.Length == 1)
             {
-                ModelValidation.ErasureSubjectKinds.Add(kind.Key, subjectTypes[0]);
+                validation.ErasureSubjectKinds.Add(kind.Key, subjectTypes[0]);
                 continue;
             }
 
@@ -892,15 +895,16 @@ internal sealed partial class RetentionStartupValidator(
 
 internal sealed class RetentionValidationState
 {
-    // Keyed by IModel instance: hosts using IModelCacheKeyFactory run different models in
-    // different scopes, and metadata validated for one must never be applied to another.
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<
-        Microsoft.EntityFrameworkCore.Metadata.IModel,
-        RetentionModelValidation
-    > models = new();
+    // Keyed by the IModel instance the context runs, and held weakly: hosts using
+    // IModelCacheKeyFactory, UseModel, or per-scope provider options run different models in
+    // different scopes, and metadata validated for one (its erasure subjects hold that model's
+    // IProperty) must never be applied to another. A host whose EF model cache can't hold its
+    // models gets a new instance per context; each validates once and dies with its model, so
+    // Cohort never keeps a model alive.
+    private readonly ConditionalWeakTable<IModel, RetentionModelValidation> models = new();
 
-    internal RetentionModelValidation For(Microsoft.EntityFrameworkCore.Metadata.IModel model) =>
-        models.GetOrAdd(model, static _ => new RetentionModelValidation());
+    internal RetentionModelValidation For(IModel model) =>
+        models.GetValue(model, static _ => new RetentionModelValidation());
 }
 
 internal sealed class RetentionModelValidation

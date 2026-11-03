@@ -5,26 +5,27 @@ using Cohort.Application;
 using Cohort.Infrastructure.Migrations;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Storage;
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
 namespace Cohort.Infrastructure;
 
-internal sealed class CohortSchemaValidator(
-    [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
-    ILogger<CohortSchemaValidator> logger
-)
+internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logger)
 {
-    public async Task ValidateAsync(CancellationToken ct)
+    /// <summary>
+    /// Checks the database's Cohort tables against <see cref="CohortSchemaContract"/>, reading
+    /// only <paramref name="storeTables"/> and the database's catalog. Readiness records a pass
+    /// by value under the tables, so the missing-index warning is logged once per distinct
+    /// mapping per database, not once per model instance.
+    /// </summary>
+    public async Task ValidateAsync(CohortStoreTables storeTables, DatabaseFacade database, CancellationToken ct)
     {
-        var connection = db.Database.GetDbConnection();
-        await db.Database.OpenConnectionAsync(ct);
+        var connection = database.GetDbConnection();
+        await database.OpenConnectionAsync(ct);
         try
         {
-
-            var storeTables = CohortStoreTables.FromModel(db.Model);
-            var existingTransaction = db.Database.CurrentTransaction;
+            var existingTransaction = database.CurrentTransaction;
             await using var ownedTransaction = existingTransaction is null
                 ? await connection.BeginTransactionAsync(IsolationLevel.RepeatableRead, ct)
                 : null;
@@ -216,7 +217,7 @@ internal sealed class CohortSchemaValidator(
         }
         finally
         {
-            await db.Database.CloseConnectionAsync();
+            await database.CloseConnectionAsync();
         }
     }
 
@@ -467,6 +468,9 @@ internal sealed class CohortSchemaValidator(
         command.Parameters.Add(parameter);
     }
 
+    // A required index predicate must use only pg_catalog names and no style-dependent literals:
+    // pg_get_expr's output depends on search_path and IntervalStyle, and this check's pass is
+    // shared across sessions (readiness records it by value, per database).
     private static string? NormalizePredicate(string? predicate)
     {
         return predicate is null

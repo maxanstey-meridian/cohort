@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Runtime.CompilerServices;
 
 using Cohort.Application;
 using Cohort.Domain;
@@ -22,6 +23,11 @@ namespace Cohort.Sample.Tests;
 [Collection("Integration")]
 public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
 {
+    // One cache every context shares, as a host's UseMemoryCache gives them, but too small for
+    // any model: each context builds a model of its own. (A new cache per context would be a
+    // different internal service provider each time, which EF treats as different models.)
+    private static readonly MemoryCache ModelCacheThatHoldsNothing = new(new MemoryCacheOptions { SizeLimit = 1 });
+
     [Fact]
     public async Task Direct_public_operation_rejects_a_non_npgsql_provider()
     {
@@ -454,7 +460,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
 
         (await act.Should().ThrowAsync<RetentionConfigurationException>())
             .Which.Errors.Should().ContainSingle(error =>
-                error.Contains("different model or database", StringComparison.Ordinal)
+                error.Contains("different database", StringComparison.Ordinal)
             );
     }
 
@@ -478,11 +484,12 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task Readiness_refuses_a_system_scope_whose_context_runs_a_different_model_on_the_same_database()
+    public async Task Readiness_accepts_a_system_scope_whose_context_runs_a_different_model_on_the_same_database()
     {
-        // The model cache key is what makes two models one: a host whose key factory tells the
-        // System(Readiness) scope's model apart from the caller's runs a different model, even
-        // on the very same database.
+        // The System(Readiness) scope's context is used only through its connection: the holds
+        // relation and the registered ids come from the caller's model. So a host whose key
+        // factory gives that scope a different model still reaches the same database, and
+        // that is all the scope has to do.
         await using var database = await MigratedTemporaryDatabaseAsync();
         var spelledDifferently = new NpgsqlConnectionStringBuilder(database.ConnectionString)
         {
@@ -494,12 +501,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             options => options.ReplaceService<IModelCacheKeyFactory, ConnectionStringModelCacheKeyFactory>()
         );
 
-        var act = () => InvokePreviewAsync(provider);
-
-        (await act.Should().ThrowAsync<RetentionConfigurationException>())
-            .Which.Errors.Should().ContainSingle(error =>
-                error.Contains("different model or database", StringComparison.Ordinal)
-            );
+        await InvokePreviewAsync(provider);
     }
 
     [Fact]
@@ -507,7 +509,8 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     {
         // EF keeps built models in its memory cache and drops one that doesn't fit, so with the
         // cache full two contexts of one type and options hold equal models that are not the same
-        // object. Sameness is the model cache key's, as EF decides it.
+        // object. The System(Readiness) scope's context is used only through its connection, so
+        // its copy of the model is as good as the caller's.
         await using var database = await MigratedTemporaryDatabaseAsync();
         var services = new ServiceCollection();
         services.AddLogging();
@@ -515,7 +518,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         services.AddDbContext<SampleDbContext>(options =>
             options
                 .UseNpgsql(database.ConnectionString)
-                .UseMemoryCache(new MemoryCache(new MemoryCacheOptions { SizeLimit = 1 }))
+                .UseMemoryCache(ModelCacheThatHoldsNothing)
         );
         services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
         services.AddSingleton<GuidTombstoneFactory>();
@@ -551,6 +554,258 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             Guid.NewGuid(),
             CancellationToken.None
         )).Should().BeFalse();
+    }
+
+    // T1: the catalog checks a model copy shares are not run again for the next copy.
+    [Fact]
+    public async Task A_rebuilt_copy_of_a_validated_model_runs_no_catalog_check_again()
+    {
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await using var provider = BuildModelCopyProvider(database.ConnectionString);
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var now = new DateTimeOffset(2026, 7, 12, 12, 0, 0, TimeSpan.Zero);
+        var sweep = provider.GetRequiredService<IRetentionSweep>();
+
+        using (var first = provider.CreateScope())
+        using (var second = provider.CreateScope())
+        {
+            ReferenceEquals(
+                first.ServiceProvider.GetRequiredService<SampleDbContext>().Model,
+                second.ServiceProvider.GetRequiredService<SampleDbContext>().Model
+            ).Should().BeFalse("the full cache gives every context a model of its own");
+        }
+
+        (await sweep.ExecuteAsync(RetentionSweepRequest.Tenanted(tenant, now))).EntityFailures.Should().BeEmpty();
+
+        // Readiness's schema check would refuse this; the sweep then only fails on the missing
+        // table, per entity, as in Direct_sweep_retries_after_schema_repair_and_caches_successful_readiness.
+        await ExecuteAsync(
+            database,
+            "ALTER TABLE public.sweep_run_row_detail RENAME TO malformed_sweep_run_row_detail"
+        );
+
+        var result = await sweep.ExecuteAsync(RetentionSweepRequest.Tenanted(tenant, now));
+
+        result.EntityFailures.Should().NotBeEmpty().And.OnlyContain(failure =>
+            failure.Contains("code=sqlstate:42P01", StringComparison.Ordinal)
+        );
+    }
+
+    // T2: nor does it open the System(Readiness) scope again, though the host is asked for its
+    // capabilities again (Decision 6: capabilities stay per model instance).
+    [Fact]
+    public async Task A_rebuilt_copy_of_a_validated_model_opens_no_second_readiness_scope()
+    {
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        var executionScope = new RecordingExecutionScope();
+        var ruleProvider = new CountingRuleProvider();
+        await using var provider = BuildModelCopyProvider(
+            database.ConnectionString,
+            ruleProvider,
+            executionScope
+        );
+        var readiness = new RetentionExecutionContext.System(RetentionSystemWork.Readiness);
+
+        await using var first = provider.CreateAsyncScope();
+        var firstModel = first.ServiceProvider.GetRequiredService<SampleDbContext>().Model;
+        await ListActiveHoldsAsync(first.ServiceProvider);
+        executionScope.Ran.Should().ContainSingle(context => context == readiness);
+        var capabilityCallsForFirstCopy = ruleProvider.CapabilityCallCount;
+        capabilityCallsForFirstCopy.Should().BePositive();
+
+        await using var second = provider.CreateAsyncScope();
+        ReferenceEquals(firstModel, second.ServiceProvider.GetRequiredService<SampleDbContext>().Model)
+            .Should().BeFalse("the full cache gives every context a model of its own");
+        await ListActiveHoldsAsync(second.ServiceProvider);
+
+        executionScope.Ran.Should().ContainSingle(context => context == readiness);
+        ruleProvider.CapabilityCallCount.Should().Be(
+            2 * capabilityCallsForFirstCopy,
+            "each model instance asks the host for its categories' capabilities again"
+        );
+    }
+
+    // T3: Cohort's per-model state dies with the model.
+    [Fact]
+    public async Task Cohort_keeps_no_model_alive_after_its_context()
+    {
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await using var provider = BuildModelCopyProvider(database.ConnectionString);
+
+        var model = await ReadinessModelInDisposedScopeAsync(provider);
+        // The helper's continuation runs this one inline, on the helper's own stack, which still
+        // refers to the context; yielding gets this method a fresh stack.
+        await Task.Yield();
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        model.IsAlive.Should().BeFalse("readiness's and validation's per-model state is held weakly");
+    }
+
+    // T5: a model copy that reads different things is checked on those things.
+    [Fact]
+    public async Task A_model_copy_that_maps_a_retained_entity_elsewhere_is_checked_again()
+    {
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await using var provider = BuildModelCopyProvider(database.ConnectionString);
+
+        await using (var passing = provider.CreateAsyncScope())
+        {
+            await ListActiveHoldsAsync(passing.ServiceProvider);
+        }
+
+        await using var elsewhere = provider.CreateAsyncScope();
+        elsewhere.ServiceProvider.GetRequiredService<ModelVariant>().Marked = true;
+        var act = () => ListActiveHoldsAsync(elsewhere.ServiceProvider);
+
+        (await act.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                error.Contains(typeof(Note).FullName!, StringComparison.Ordinal)
+                && error.Contains("\"public\".\"notes_elsewhere\"", StringComparison.Ordinal)
+                && error.Contains("was not found in the database", StringComparison.Ordinal)
+            );
+    }
+
+    // T6: a check that passed inside a caller's transaction may have seen DDL that rolls back.
+    [Fact]
+    public async Task A_check_passed_inside_a_caller_transaction_is_not_kept()
+    {
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await ExecuteAsync(
+            database,
+            "ALTER TABLE public.sweep_run_row_detail RENAME TO malformed_sweep_run_row_detail"
+        );
+        await using var provider = BuildModelCopyProvider(database.ConnectionString);
+
+        await using (var first = provider.CreateAsyncScope())
+        {
+            var db = first.ServiceProvider.GetRequiredService<SampleDbContext>();
+            await using var transaction = await db.Database.BeginTransactionAsync();
+            await db.Database.ExecuteSqlRawAsync(
+                "ALTER TABLE public.malformed_sweep_run_row_detail RENAME TO sweep_run_row_detail"
+            );
+
+            await ListActiveHoldsAsync(first.ServiceProvider);
+
+            await transaction.RollbackAsync();
+        }
+
+        await using var second = provider.CreateAsyncScope();
+        var act = () => ListActiveHoldsAsync(second.ServiceProvider);
+
+        (await act.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                error.Contains("missing Cohort runtime capabilities", StringComparison.Ordinal)
+                && error.Contains("sweep_run_row_detail", StringComparison.Ordinal)
+            );
+    }
+
+    // T7: the anonymise check reads session state no key captures, so every model copy runs it.
+    [Fact]
+    public async Task A_rebuilt_copy_runs_the_anonymise_check_again()
+    {
+        await using var database = await AnonymiseTargetDatabaseAsync();
+        await using var provider = BuildAnonymiseTargetProvider(
+            database.ConnectionString,
+            options => options.UseMemoryCache(ModelCacheThatHoldsNothing)
+        );
+
+        await using var first = provider.CreateAsyncScope();
+        var firstModel = first.ServiceProvider.GetRequiredService<AnonymiseTargetDbContext>().Model;
+        await ListActiveHoldsAsync(first.ServiceProvider);
+
+        await ExecuteAsync(
+            database,
+            "ALTER TABLE public.anonymise_literal_records ALTER COLUMN \"Label\" TYPE character varying(8)"
+        );
+
+        await using var second = provider.CreateAsyncScope();
+        ReferenceEquals(firstModel, second.ServiceProvider.GetRequiredService<AnonymiseTargetDbContext>().Model)
+            .Should().BeFalse("the full cache gives every context a model of its own");
+        var act = () => ListActiveHoldsAsync(second.ServiceProvider);
+
+        (await act.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                error.Contains(typeof(AnonymiseLiteralRecord).FullName!, StringComparison.Ordinal)
+                && error.Contains("member Label", StringComparison.Ordinal)
+                && error.Contains("not valid for its column type character varying(8)", StringComparison.Ordinal)
+            );
+    }
+
+    private sealed class ModelVariant
+    {
+        public bool Marked { get; set; }
+    }
+
+    // Maps a retained entity to a table the database doesn't have.
+    private sealed class RetainedEntityElsewhereModelCustomizer(ModelCustomizerDependencies dependencies)
+        : ModelCustomizer(dependencies)
+    {
+        public override void Customize(ModelBuilder modelBuilder, DbContext context)
+        {
+            base.Customize(modelBuilder, context);
+            modelBuilder.Entity<Note>().ToTable("notes_elsewhere");
+        }
+    }
+
+    // Every scope builds a model of its own, since the shared cache holds nothing. A scope's
+    // ModelVariant, set before the scope resolves its context, makes that context run a model
+    // that maps a retained entity elsewhere. Readiness is triggered through
+    // ListActiveHoldsAsync, because IRetentionSweep and IRetentionPreview open scopes of their own.
+    private static ServiceProvider BuildModelCopyProvider(
+        string connectionString,
+        IRetentionRuleProvider? ruleProvider = null,
+        IRetentionExecutionScope? executionScope = null
+    )
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
+        services.AddScoped<ModelVariant>();
+        services.AddDbContext<SampleDbContext>((provider, options) =>
+        {
+            options.UseNpgsql(connectionString).UseMemoryCache(ModelCacheThatHoldsNothing);
+            if (provider.GetRequiredService<ModelVariant>().Marked)
+            {
+                options.ReplaceService<IModelCustomizer, RetainedEntityElsewhereModelCustomizer>();
+            }
+        });
+        services.AddSingleton<IRetentionRuleProvider>(ruleProvider ?? new SampleRetentionRuleProvider());
+        services.AddSingleton<GuidTombstoneFactory>();
+        services.AddSingleton<OriginalValueTombstoneFactory>();
+        services.AddSingleton<IAnonymiseValueFactory>(provider =>
+            provider.GetRequiredService<GuidTombstoneFactory>()
+        );
+        services.AddSingleton<IAnonymiseValueFactory>(provider =>
+            provider.GetRequiredService<OriginalValueTombstoneFactory>()
+        );
+        services.AddSingleton<IRetentionExecutionScope>(executionScope ?? RetentionExecutionScope.Unisolated);
+        services.AddCohort<SampleDbContext>();
+        return services.BuildServiceProvider(validateScopes: true);
+    }
+
+    private static Task ListActiveHoldsAsync(IServiceProvider scopeServices) =>
+        scopeServices.GetRequiredService<IRetentionHoldsRepository>().ListActiveAsync(CancellationToken.None);
+
+    // A separate method that returns only the weak reference, so nothing in the caller keeps the
+    // scope, the context, or the model alive.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static async Task<WeakReference> ReadinessModelInDisposedScopeAsync(ServiceProvider provider)
+    {
+        await using var scope = provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<SampleDbContext>();
+        await ListActiveHoldsAsync(scope.ServiceProvider);
+        return new WeakReference(db.Model);
+    }
+
+    private static async Task ExecuteAsync(TemporaryDatabase database, string sql)
+    {
+        await using var connection = new NpgsqlConnection(database.ConnectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand(sql, connection);
+        await command.ExecuteNonQueryAsync();
     }
 
     // The same server under another name: a host name becomes one of its addresses, a loopback
@@ -1111,30 +1366,43 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         );
     }
 
-    private Task<TemporaryDatabase> AnonymiseTargetDatabaseAsync(string ddl) =>
+    private Task<TemporaryDatabase> AnonymiseTargetDatabaseAsync(string? ddl = null) =>
         AnonymiseTargetDatabaseAsync<AnonymiseTargetDbContext>(ddl);
 
-    private async Task<TemporaryDatabase> AnonymiseTargetDatabaseAsync<TContext>(string ddl)
+    private async Task<TemporaryDatabase> AnonymiseTargetDatabaseAsync<TContext>(string? ddl = null)
         where TContext : DbContext
     {
         var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
         var options = new DbContextOptionsBuilder<TContext>().UseNpgsql(database.ConnectionString).Options;
         await using var db = (TContext)Activator.CreateInstance(typeof(TContext), options)!;
         await db.Database.ExecuteSqlRawAsync(db.Database.GenerateCreateScript());
-        await db.Database.ExecuteSqlRawAsync(ddl);
+        if (ddl is not null)
+        {
+            await db.Database.ExecuteSqlRawAsync(ddl);
+        }
+
         return database;
     }
 
-    private static ServiceProvider BuildAnonymiseTargetProvider(string connectionString) =>
-        BuildAnonymiseTargetProvider<AnonymiseTargetDbContext>(connectionString);
+    private static ServiceProvider BuildAnonymiseTargetProvider(
+        string connectionString,
+        Action<DbContextOptionsBuilder>? configureContext = null
+    ) => BuildAnonymiseTargetProvider<AnonymiseTargetDbContext>(connectionString, configureContext);
 
-    private static ServiceProvider BuildAnonymiseTargetProvider<TContext>(string connectionString)
+    private static ServiceProvider BuildAnonymiseTargetProvider<TContext>(
+        string connectionString,
+        Action<DbContextOptionsBuilder>? configureContext = null
+    )
         where TContext : DbContext
     {
         var services = new ServiceCollection();
         services.AddLogging();
         services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
-        services.AddDbContext<TContext>(builder => builder.UseNpgsql(connectionString));
+        services.AddDbContext<TContext>(builder =>
+        {
+            builder.UseNpgsql(connectionString);
+            configureContext?.Invoke(builder);
+        });
         services.AddSingleton<IRetentionRuleProvider>(new AnonymiseTargetRuleProvider());
         services.AddSingleton<IAnonymiseValueFactory, StaticLabelFactory>();
         services.AddSingleton(RetentionExecutionScope.Unisolated);

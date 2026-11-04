@@ -1,5 +1,7 @@
 using System.Data.Common;
 
+using Cohort.Infrastructure.Sweep;
+
 namespace Cohort.Infrastructure.Holds;
 
 internal static class RetentionEntityLockSql
@@ -70,9 +72,19 @@ internal static class RetentionEntityLockSql
             .Order(StringComparer.Ordinal)
             .ToArray();
 
-        await using var command = new SqlParams { ["hashSeed"] = HashSeed, ["lockKeys"] = lockKeys }.CreateCommand(
-            connection,
-            transaction,
+        var statement = LockStatement(lockKeys);
+        await using var command = statement.Parameters.CreateCommand(connection, transaction, statement.Sql);
+        await command.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>
+    /// Takes the transaction-scoped lock of every key in <paramref name="lockKeys"/> (from
+    /// <see cref="BuildKey"/>), in key order so two sessions taking overlapping sets can't
+    /// deadlock.
+    /// </summary>
+    internal static SweepStatement LockStatement(string[] lockKeys) =>
+        CohortStatements.Statement(
+            "entity-lock",
             """
             SELECT pg_catalog.pg_advisory_xact_lock(
                 pg_catalog.hashtextextended(ordered.lock_key, @hashSeed)
@@ -82,10 +94,9 @@ internal static class RetentionEntityLockSql
                 FROM pg_catalog.unnest(@lockKeys) AS keys(lock_key)
                 ORDER BY lock_key
             ) AS ordered
-            """
+            """,
+            new SqlParams { ["hashSeed"] = HashSeed, ["lockKeys"] = lockKeys }
         );
-        await command.ExecuteNonQueryAsync(ct);
-    }
 
     private static string BuildKey(Guid retentionEntityId, Guid? tenantId, string canonicalRecordId)
     {

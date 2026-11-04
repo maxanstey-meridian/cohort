@@ -68,7 +68,7 @@ internal sealed class RetentionWorker(
             logger.LogInformation("Cohort worker is paused: the kill switch is on, so no occurrence starts.");
         }
         paused = current.KillSwitch;
-        if (current.KillSwitch || string.IsNullOrWhiteSpace(current.Schedule))
+        if (!current.WorkerRuns)
         {
             await DelayUntilNextPollAsync(stoppingToken);
             return settled;
@@ -288,7 +288,7 @@ internal sealed class RetentionWorker(
     {
         await services
             .GetRequiredService<RetentionRuntimeReadinessValidator>()
-            .ValidateAsync(ct);
+            .ValidateAsync(RetentionStatementGroup.Worker, ct);
         var db = services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext);
 
         // The advisory lock is session-scoped, so this coordination connection stays open for

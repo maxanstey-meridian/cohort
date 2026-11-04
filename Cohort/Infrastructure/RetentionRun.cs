@@ -70,10 +70,10 @@ internal sealed class RetentionRun(
             // by then the run has settled. A session lock would also have to be released
             // inside a transaction that may already be aborted. The ledger table is resolved
             // now, so the post-commit check touches no model metadata.
-            var sweepRun = PostgreSqlIdentifier.Format(CohortStoreTables.FromModel(db.Model).SweepRun);
+            var committed = CommittedStatement(CohortStoreTables.FromModel(db.Model), SweepId);
             callerCommit.AfterCommit(
                 db.Database.CurrentTransaction!,
-                connection => IsCommittedAsync(connection, sweepRun),
+                connection => IsCommittedAsync(connection, committed),
                 NotifyDeferredAsync,
                 committedWithoutRows => logger.LogInformation(
                     committedWithoutRows
@@ -685,15 +685,20 @@ internal sealed class RetentionRun(
     /// transaction: the run's ledger row exists only if the commit kept the run, rather than
     /// a rollback to a savepoint taken before it, or an aborted transaction, discarding it.
     /// </summary>
-    private async Task<bool> IsCommittedAsync(DbConnection connection, string sweepRun)
+    private static async Task<bool> IsCommittedAsync(DbConnection connection, SweepStatement committed)
     {
-        await using var command = new SqlParams { ["sweepId"] = SweepId }.CreateCommand(
-            connection,
-            null,
-            $"SELECT EXISTS (SELECT 1 FROM {sweepRun} WHERE \"SweepId\" = @sweepId)"
-        );
+        await using var command = committed.Parameters.CreateCommand(connection, null, committed.Sql);
         return await command.ExecuteScalarAsync(CancellationToken.None) is true;
     }
+
+    /// <summary>R7: whether the run's ledger row exists.</summary>
+    internal static SweepStatement CommittedStatement(CohortStoreTables tables, Guid sweepId) =>
+        CohortStatements.Statement(
+            "run-committed",
+            $"SELECT EXISTS (SELECT 1 FROM {PostgreSqlIdentifier.Format(tables.SweepRun)} WHERE \"SweepId\" = @sweepId)",
+            new SqlParams { ["sweepId"] = sweepId },
+            tables.SweepRun
+        );
 
     private async Task NotifyDeferredAsync()
     {

@@ -46,10 +46,13 @@ internal sealed class RetentionRowDispatcher(
 
     public async Task<RowDispatcherFlushResult> FlushAsync(CancellationToken ct = default)
     {
-        await ValidateReadinessAsync(ct);
+        // The scrub goes first and needs only its own group, so a refusal of the dispatcher's
+        // statements can't keep personal data past its retention.
+        await ValidateReadinessAsync(RetentionStatementGroup.Scrub, ct);
+        await ScrubExpiredPayloadsAsync(ct);
+        await ValidateReadinessAsync(RetentionStatementGroup.Dispatch, ct);
         await RecoverAbandonedRunsAsync(DateTimeOffset.UtcNow, ct);
         await RecoverExpiredClaimsAsync(ct);
-        await ScrubExpiredPayloadsAsync(ct);
         await DrainQueueAsync(stopOnKillSwitch: false, ct);
 
         // Pending rows left here were not dispatchable (waiting out their backoff, deferred
@@ -64,7 +67,7 @@ internal sealed class RetentionRowDispatcher(
         CancellationToken ct = default
     )
     {
-        await ValidateReadinessAsync(ct);
+        await ValidateReadinessAsync(RetentionStatementGroup.Dispatch, ct);
         // Every dead-lettered handler of a matching row goes back together: the claim's
         // ordering only waits on pending or in-flight siblings, so requeuing a later handler
         // alone would let it run ahead of an earlier one. Attempt is kept: a handler resumes
@@ -117,14 +120,17 @@ internal sealed class RetentionRowDispatcher(
     /// <summary>
     /// One background poll. The kill switch stops delivery: no claims are reclaimed or taken,
     /// and a drain in progress stops after the batch it is running. The payload-retention
-    /// scrub still runs, so the switch never keeps personal data past its retention.
+    /// scrub still runs, so the switch never keeps personal data past its retention. The scrub is
+    /// checked inside its hourly gate, before the gate is spent, so a refusal retries at the next
+    /// poll; the dispatcher's statements are checked after the kill switch's return, so a refusal
+    /// of them never stops the scrub.
     /// </summary>
     internal async Task PollAsync(CancellationToken ct)
     {
-        await ValidateReadinessAsync(ct);
         var now = DateTimeOffset.UtcNow;
         if (now - lastPayloadScrubAt >= PayloadScrubInterval)
         {
+            await ValidateReadinessAsync(RetentionStatementGroup.Scrub, ct);
             lastPayloadScrubAt = now;
             await ScrubExpiredPayloadsAsync(ct);
         }
@@ -134,6 +140,7 @@ internal sealed class RetentionRowDispatcher(
             return;
         }
 
+        await ValidateReadinessAsync(RetentionStatementGroup.Dispatch, ct);
         await RecoverAbandonedRunsAsync(now, ct);
         await RecoverExpiredClaimsAsync(ct);
         await DrainQueueAsync(stopOnKillSwitch: true, ct);
@@ -614,10 +621,10 @@ internal sealed class RetentionRowDispatcher(
         );
 
     // Once per poll or flush, not per statement: the result is cached after the first pass.
-    private Task ValidateReadinessAsync(CancellationToken ct) =>
+    private Task ValidateReadinessAsync(RetentionStatementGroup group, CancellationToken ct) =>
         scopeFactory.RunInScopeAsync(
             RowDispatch,
-            services => services.GetRequiredService<RetentionRuntimeReadinessValidator>().ValidateAsync(ct),
+            services => services.GetRequiredService<RetentionRuntimeReadinessValidator>().ValidateAsync(group, ct),
             ct
         );
 

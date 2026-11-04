@@ -59,7 +59,7 @@ internal sealed class EfRetentionDeletion(
             );
         }
 
-        await readinessValidator.ValidateAsync(ct);
+        await readinessValidator.ValidateAsync(RetentionStatementGroup.Deletion, ct);
         // The hold checks rely on each statement taking a fresh snapshot after the advisory lock.
         await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
         var dbTransaction = transaction.GetDbTransaction();

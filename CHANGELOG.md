@@ -56,7 +56,7 @@ A hold on a row also holds the rows a host declares related to it.
   scan), and refuses what PostgreSQL refuses: a missing table or column, including
   erasure-subject columns, a type a statement can't compare or assign, a column the database
   generates, an unknown cast type, or a privilege the database role lacks for one of those
-  statements. The role readiness validates under must hold the privileges those statements need
+  statements. The role of the scope that sends them must hold the privileges they need
   (`SELECT` and `UPDATE` on the retained tables, `DELETE` where `Purge` is declared, `SELECT` on
   `retention_holds`, `sweep_run_row_detail`, and the child table of any foreign key that blocks
   a purge, and `USAGE` on the schemas of all of those tables). The refusal
@@ -66,8 +66,8 @@ A hold on a row also holds the rows a host declares related to it.
   column the database types as `timestamp without time zone`, seen through any domains. Startup
   refuses an anonymised-at marker with a default or value generation mapped in the EF model,
   since EF then never writes it NULL and every row is born marked as anonymised. The statement
-  check's success is kept per database, role, and search path, but readiness runs once per model
-  and connection string, so only the role of the first operation to reach it is checked. Before,
+  check's success is kept per database, role, and search path, and each scope's role is checked,
+  for the statements that scope sends, the first time it reaches readiness. Before,
   a run over such a database failed at the statement, silently skipped rows (or, for the mapped
   default, never anonymised them), or, for a timestamp without time zone, drifted with the
   session TimeZone.
@@ -76,6 +76,15 @@ A hold on a row also holds the rows a host declares related to it.
   SQLSTATE, message, and the statement text around the error), and a host whose role lacks a
   privilege for one of those statements is refused at readiness instead of failing the first
   run that needs it.
+- Readiness also explains the statements Cohort sends against its own tables and the
+  PostgreSQL functions it calls, grouped by the scope that sends them and checked under that
+  scope's role, and refuses a role that lacks a privilege for them, including `USAGE` on the
+  sequence behind a serial `Id` column. The row-handler dispatcher, the worker, and history
+  pruning are checked only when they run, pruning only for the retentions it prunes: at
+  startup a refusal stops the host; later (after an options reload, say) the refused subsystem
+  logs it and does nothing while runs carry on, and the payload scrub still runs. Breaking: a
+  role that can't write Cohort's tables is refused at readiness instead of failing the first
+  statement that writes them.
 
 Upgrade: [Legal Holds](https://maxanstey-meridian.github.io/cohort/guides/legal-holds#upgrading-to-0-12-0)
 and [Startup Validation](https://maxanstey-meridian.github.io/cohort/reference/startup-validation#upgrading-to-0-12-0).

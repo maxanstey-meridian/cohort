@@ -2,14 +2,14 @@ using System.Data;
 
 using Cohort.Application;
 using Cohort.Infrastructure.Handlers;
+using Cohort.Infrastructure.Sweep;
 
 using Microsoft.EntityFrameworkCore;
 
 namespace Cohort.Infrastructure;
 
 // The only interpolations in this file's raw SQL are Cohort's own table names, quoted from
-// the EF model; every value is a positional parameter.
-#pragma warning disable EF1002
+// the EF model; every value is a named parameter.
 
 /// <summary>
 /// The statements behind history pruning: one batch of settled runs, one batch of inactive
@@ -42,102 +42,148 @@ internal static class HistoryPruningSql
         CancellationToken ct
     )
     {
-        var tables = CohortStoreTables.FromModel(db.Model).Quoted();
-        object[] parameters =
-        [
-            Started,
-            Succeeded,
-            PartiallyFailed,
-            Failed,
-            Cancelled,
-            (object?)succeededCutoff ?? DBNull.Value,
-            (object?)failedCutoff ?? DBNull.Value,
-            HandlerPending,
-            HandlerInFlight,
-            HandlerDeadLettered,
-            batchSize,
-            (int)SweepTriggerKind.Scheduled,
-            (object?)currentOccurrence ?? DBNull.Value,
-        ];
+        var tables = CohortStoreTables.FromModel(db.Model);
+        var eligible = EligibleRunsStatement(tables, succeededCutoff, failedCutoff, currentOccurrence, batchSize);
 
         await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
         var sweepIds = await db.Database
-            .SqlQueryRaw<Guid>(
-                $$"""
-                SELECT run."SweepId" AS "Value"
-                FROM {{tables.SweepRun}} AS run
-                WHERE {{EligibleRunPredicate(tables)}}
-                ORDER BY run."SettledAt", run."SweepId"
-                LIMIT {10}
-                FOR UPDATE OF run SKIP LOCKED
-                """,
-                parameters
-            )
+            .SqlQueryRaw<Guid>(eligible.Sql, eligible.Parameters.ToDbParameters(db.Database.GetDbConnection()))
             .ToArrayAsync(ct);
         if (sweepIds.Length == 0)
         {
             return 0;
         }
 
-        await db.Database.ExecuteSqlRawAsync(
-            $$"""DELETE FROM {{tables.SweepRunRowDetail}} WHERE "SweepId" = ANY({0})""",
-            [sweepIds],
-            ct
-        );
-        await db.Database.ExecuteSqlRawAsync(
-            $$"""DELETE FROM {{tables.SweepRunEntitySummary}} WHERE "SweepId" = ANY({0})""",
-            [sweepIds],
-            ct
-        );
-        await db.Database.ExecuteSqlRawAsync(
-            $$"""DELETE FROM {{tables.SweepRun}} WHERE "SweepId" = ANY({0})""",
-            [sweepIds],
-            ct
-        );
+        await ExecuteAsync(db, DeleteRowDetailsStatement(tables, sweepIds), ct);
+        await ExecuteAsync(db, DeleteEntitySummariesStatement(tables, sweepIds), ct);
+        await ExecuteAsync(db, DeleteRunsStatement(tables, sweepIds), ct);
 
         await transaction.CommitAsync(ct);
         return sweepIds.Length;
     }
 
     /// <summary>
-    /// Deletes up to <paramref name="batchSize"/> holds whose earlier of <c>RemovedAt</c> and
-    /// <c>ExpiresAt</c> is before the cutoff. The eligibility test reads only the hold's own
+    /// R8: the oldest settled runs eligible for pruning, locked with <c>FOR UPDATE SKIP
+    /// LOCKED</c>. A null cutoff or occurrence binds as SQL NULL.
+    /// </summary>
+    internal static SweepStatement EligibleRunsStatement(
+        CohortStoreTables tables,
+        DateTimeOffset? succeededCutoff,
+        DateTimeOffset? failedCutoff,
+        DateTimeOffset? currentOccurrence,
+        int batchSize
+    ) =>
+        CohortStatements.Statement(
+            "eligible-runs",
+            $"""
+            SELECT run."SweepId" AS "Value"
+            FROM {PostgreSqlIdentifier.Format(tables.SweepRun)} AS run
+            WHERE {EligibleRunPredicate(tables.Quoted())}
+            ORDER BY run."SettledAt", run."SweepId"
+            LIMIT @batchSize
+            FOR UPDATE OF run SKIP LOCKED
+            """,
+            new SqlParams
+            {
+                ["started"] = Started,
+                ["succeeded"] = Succeeded,
+                ["partiallyFailed"] = PartiallyFailed,
+                ["failed"] = Failed,
+                ["cancelled"] = Cancelled,
+                ["succeededCutoff"] = succeededCutoff,
+                ["failedCutoff"] = failedCutoff,
+                ["handlerPending"] = HandlerPending,
+                ["handlerInFlight"] = HandlerInFlight,
+                ["handlerDeadLettered"] = HandlerDeadLettered,
+                ["batchSize"] = batchSize,
+                ["scheduled"] = (int)SweepTriggerKind.Scheduled,
+                ["currentOccurrence"] = currentOccurrence,
+            },
+            tables.SweepRun,
+            tables.SweepRunRowDetail,
+            tables.SweepRowHandlerStatus
+        );
+
+    /// <summary>D8: deletes the row details of the pruned runs (handler statuses cascade).</summary>
+    internal static SweepStatement DeleteRowDetailsStatement(CohortStoreTables tables, Guid[] sweepIds) =>
+        CohortStatements.Statement(
+            "prune-row-details",
+            $"""DELETE FROM {PostgreSqlIdentifier.Format(tables.SweepRunRowDetail)} WHERE "SweepId" = ANY(@sweepIds)""",
+            new SqlParams { ["sweepIds"] = sweepIds },
+            tables.SweepRunRowDetail
+        );
+
+    /// <summary>S3: deletes the entity summaries of the pruned runs.</summary>
+    internal static SweepStatement DeleteEntitySummariesStatement(CohortStoreTables tables, Guid[] sweepIds) =>
+        CohortStatements.Statement(
+            "prune-entity-summaries",
+            $"""DELETE FROM {PostgreSqlIdentifier.Format(tables.SweepRunEntitySummary)} WHERE "SweepId" = ANY(@sweepIds)""",
+            new SqlParams { ["sweepIds"] = sweepIds },
+            tables.SweepRunEntitySummary
+        );
+
+    /// <summary>R9: deletes the pruned runs.</summary>
+    internal static SweepStatement DeleteRunsStatement(CohortStoreTables tables, Guid[] sweepIds) =>
+        CohortStatements.Statement(
+            "prune-runs",
+            $"""DELETE FROM {PostgreSqlIdentifier.Format(tables.SweepRun)} WHERE "SweepId" = ANY(@sweepIds)""",
+            new SqlParams { ["sweepIds"] = sweepIds },
+            tables.SweepRun
+        );
+
+    /// <summary>
+    /// H11: deletes up to <paramref name="batchSize"/> holds whose earlier of <c>RemovedAt</c>
+    /// and <c>ExpiresAt</c> is before the cutoff. The eligibility test reads only the hold's own
     /// columns, so the lock re-evaluates it against the latest committed version of each
     /// claimed row.
+    /// </summary>
+    internal static SweepStatement PruneHoldsStatement(CohortStoreTables tables, DateTimeOffset cutoff, int batchSize)
+    {
+        var holds = PostgreSqlIdentifier.Format(tables.RetentionHolds);
+        return CohortStatements.Statement(
+            "prune-holds",
+            $"""
+            WITH candidates AS (
+                SELECT "HoldId"
+                FROM {holds}
+                WHERE LEAST("RemovedAt", "ExpiresAt") < @cutoff
+                ORDER BY LEAST("RemovedAt", "ExpiresAt"), "HoldId"
+                LIMIT @batchSize
+                FOR UPDATE SKIP LOCKED
+            )
+            DELETE FROM {holds} AS hold
+            USING candidates
+            WHERE hold."HoldId" = candidates."HoldId"
+              AND LEAST(hold."RemovedAt", hold."ExpiresAt") < @cutoff
+            """,
+            new SqlParams { ["cutoff"] = cutoff, ["batchSize"] = batchSize },
+            tables.RetentionHolds
+        );
+    }
+
+    /// <summary>
+    /// Deletes up to <paramref name="batchSize"/> holds whose earlier of <c>RemovedAt</c> and
+    /// <c>ExpiresAt</c> is before the cutoff.
     /// </summary>
     internal static Task<int> PruneHoldBatchAsync(
         DbContext db,
         DateTimeOffset cutoff,
         int batchSize,
         CancellationToken ct
-    )
-    {
-        var holds = CohortStoreTables.FromModel(db.Model).Quoted().RetentionHolds;
-        return db.Database.ExecuteSqlRawAsync(
-            $$"""
-            WITH candidates AS (
-                SELECT "HoldId"
-                FROM {{holds}}
-                WHERE LEAST("RemovedAt", "ExpiresAt") < {0}
-                ORDER BY LEAST("RemovedAt", "ExpiresAt"), "HoldId"
-                LIMIT {1}
-                FOR UPDATE SKIP LOCKED
-            )
-            DELETE FROM {{holds}} AS hold
-            USING candidates
-            WHERE hold."HoldId" = candidates."HoldId"
-              AND LEAST(hold."RemovedAt", hold."ExpiresAt") < {0}
-            """,
-            [cutoff, batchSize],
+    ) => ExecuteAsync(db, PruneHoldsStatement(CohortStoreTables.FromModel(db.Model), cutoff, batchSize), ct);
+
+    private static Task<int> ExecuteAsync(DbContext db, SweepStatement statement, CancellationToken ct) =>
+        db.Database.ExecuteSqlRawAsync(
+            statement.Sql,
+            statement.Parameters.ToDbParameters(db.Database.GetDbConnection()),
             ct
         );
-    }
 
     /// <summary>
-    /// Settled-run eligibility. Positional parameters: {0} Started, {1} Succeeded,
-    /// {2} PartiallyFailed, {3} Failed, {4} Cancelled, {5} succeeded cutoff, {6} failed
-    /// cutoff, {7} handler Pending, {8} handler InFlight, {9} handler DeadLettered, {11}
-    /// Scheduled, {12} the schedule's current occurrence. A null cutoff makes its comparison
+    /// Settled-run eligibility. Named parameters: @started, @succeeded, @partiallyFailed,
+    /// @failed, @cancelled, @succeededCutoff, @failedCutoff, @handlerPending, @handlerInFlight,
+    /// @handlerDeadLettered, @scheduled, and @currentOccurrence (the schedule's current
+    /// occurrence). A null cutoff makes its comparison
     /// null, so that class of run is never eligible. A run whose row details still hold a
     /// snapshot is never eligible either: dead-lettered work keeps its snapshot until
     /// <c>RowHandlerDispatch:PayloadRetention</c> so it can be requeued. That can't race a
@@ -154,31 +200,31 @@ internal static class HistoryPruningSql
                         ON status."SweepRunRowDetailId" = detail."Id"
                     WHERE detail."SweepId" = run."SweepId"
             """;
-        return $$"""
-            run."Status" <> {0}
+        return $"""
+            run."Status" <> @started
                   AND (
                       (
-                          run."Status" = {1}
-                          AND run."SettledAt" < CAST({5} AS timestamptz)
-                          AND NOT EXISTS (SELECT 1 {{handlerWork}} AND status."State" = {9})
+                          run."Status" = @succeeded
+                          AND run."SettledAt" < CAST(@succeededCutoff AS timestamptz)
+                          AND NOT EXISTS (SELECT 1 {handlerWork} AND status."State" = @handlerDeadLettered)
                       )
                       OR (
                           (
-                              run."Status" IN ({2}, {3}, {4})
-                              OR EXISTS (SELECT 1 {{handlerWork}} AND status."State" = {9})
+                              run."Status" IN (@partiallyFailed, @failed, @cancelled)
+                              OR EXISTS (SELECT 1 {handlerWork} AND status."State" = @handlerDeadLettered)
                           )
-                          AND run."SettledAt" < CAST({6} AS timestamptz)
+                          AND run."SettledAt" < CAST(@failedCutoff AS timestamptz)
                       )
                   )
-                  AND NOT EXISTS (SELECT 1 {{handlerWork}} AND status."State" IN ({7}, {8}))
+                  AND NOT EXISTS (SELECT 1 {handlerWork} AND status."State" IN (@handlerPending, @handlerInFlight))
                   AND NOT EXISTS (
-                      SELECT 1 FROM {{tables.SweepRunRowDetail}} AS retained
+                      SELECT 1 FROM {tables.SweepRunRowDetail} AS retained
                       WHERE retained."SweepId" = run."SweepId" AND retained."CapturedPayload" IS NOT NULL
                   )
                   AND (
-                      CAST({12} AS timestamptz) IS NULL
-                      OR run."TriggerKind" <> {11}
-                      OR run."StartedAt" < CAST({12} AS timestamptz)
+                      CAST(@currentOccurrence AS timestamptz) IS NULL
+                      OR run."TriggerKind" <> @scheduled
+                      OR run."StartedAt" < CAST(@currentOccurrence AS timestamptz)
                   )
             """;
     }

@@ -1,4 +1,6 @@
 using Cohort.Application;
+using Cohort.Domain;
+using Cohort.Infrastructure.Sweep;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -11,7 +13,8 @@ namespace Cohort.Infrastructure.Audit;
 
 /// <summary>
 /// Writes the audit ledger. Statements run on the scoped DbContext, so they join the
-/// caller's transaction when there is one.
+/// caller's transaction when there is one. Each statement is built by a static builder
+/// (<see cref="StartedStatement"/> and its siblings) that readiness explains as the run sends it.
 /// </summary>
 internal sealed class EfRetentionAuditWriter(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db
@@ -28,10 +31,23 @@ internal sealed class EfRetentionAuditWriter(
 
         return evt switch
         {
-            SweepEvent.Started started => WriteStartedAsync(started, ct),
-            SweepEvent.EntityProgress progress => WriteEntityProgressAsync(progress, ct),
-            SweepEvent.EntitySummary summary => WriteEntitySummaryAsync(summary, ct),
-            SweepEvent.RowDetail rowDetail => WriteRowDetailAsync(rowDetail, ct),
+            SweepEvent.Started started => ExecuteAsync(StartedStatement(Tables, started), ct),
+            SweepEvent.EntityProgress progress => ExecuteAsync(EntityProgressStatement(Tables, progress), ct),
+            SweepEvent.EntitySummary summary => ExecuteAsync(EntitySummaryStatement(Tables, summary), ct),
+            SweepEvent.RowDetail rowDetail => ExecuteAsync(
+                RowDetailStatement(
+                    Tables,
+                    rowDetail.SweepId,
+                    rowDetail.At,
+                    rowDetail.EntityType,
+                    rowDetail.RetentionEntityId,
+                    rowDetail.RecordId,
+                    rowDetail.Category,
+                    rowDetail.Strategy,
+                    rowDetail.TenantId
+                ),
+                ct
+            ),
             SweepEvent.Completed e => WriteTerminalAsync(e.SweepId, SweepRunStatus.Succeeded, e.At, e.Duration, e.TotalAffected, null, ct),
             SweepEvent.PartiallyFailed e => WriteTerminalAsync(e.SweepId, SweepRunStatus.PartiallyFailed, e.At, e.Duration, e.TotalAffected, e.Error, ct),
             SweepEvent.Failed e => WriteTerminalAsync(e.SweepId, SweepRunStatus.Failed, e.At, e.Duration, e.TotalAffected, e.Error, ct),
@@ -42,11 +58,14 @@ internal sealed class EfRetentionAuditWriter(
         };
     }
 
-    private Task WriteStartedAsync(SweepEvent.Started started, CancellationToken ct)
+    /// <summary>R1: records a run as Started.</summary>
+    internal static SweepStatement StartedStatement(CohortStoreTables tables, SweepEvent.Started started)
     {
-        return ExecuteAsync(
+        var sweepRun = PostgreSqlIdentifier.Format(tables.SweepRun);
+        return CohortStatements.Statement(
+            "run-started",
             $"""
-            INSERT INTO {PostgreSqlIdentifier.Format(Tables.SweepRun)}
+            INSERT INTO {sweepRun}
                 ("SweepId", "StartedAt", "Status", "SettledAt", "Duration", "TriggerKind", "DryRun", "TenantId", "TotalAffected", "ErasureSubjectKind")
             VALUES (@sweepId, @startedAt, @status, NULL, NULL, @triggerKind, @dryRun, @tenantId, 0, @erasureSubjectKind)
             """,
@@ -60,15 +79,18 @@ internal sealed class EfRetentionAuditWriter(
                 ["tenantId"] = started.TenantId,
                 ["erasureSubjectKind"] = started.ErasureSubjectKind,
             },
-            ct
+            tables.SweepRun
         );
     }
 
-    private Task WriteEntitySummaryAsync(SweepEvent.EntitySummary summary, CancellationToken ct)
+    /// <summary>S1: records an entity's summary, replacing the progress rows written so far.</summary>
+    internal static SweepStatement EntitySummaryStatement(CohortStoreTables tables, SweepEvent.EntitySummary summary)
     {
-        return ExecuteAsync(
+        var entitySummary = PostgreSqlIdentifier.Format(tables.SweepRunEntitySummary);
+        return CohortStatements.Statement(
+            "entity-summary",
             $"""
-            INSERT INTO {PostgreSqlIdentifier.Format(Tables.SweepRunEntitySummary)} AS current_summary
+            INSERT INTO {entitySummary} AS current_summary
                 ("SweepId", "At", "EntityType", "RetentionEntityId", "Category", "TenantId", "Strategy",
                  "ResolvedMonths", "ResolvedDays", "Affected", "HeldCount", "SkippedCount", "NullAnchorCount",
                  "RetainedCount", "DeferredCount", "BlockedCount", "RuleSource", "RuleReason")
@@ -110,16 +132,22 @@ internal sealed class EfRetentionAuditWriter(
                 ["ruleSource"] = summary.Provenance?.Source,
                 ["ruleReason"] = summary.Provenance?.Reason,
             },
-            ct
+            tables.SweepRunEntitySummary
         );
     }
 
-    private Task WriteEntityProgressAsync(SweepEvent.EntityProgress progress, CancellationToken ct)
+    /// <summary>
+    /// S2 and R2: adds a batch to an entity's summary and to the run's total, in one statement.
+    /// </summary>
+    internal static SweepStatement EntityProgressStatement(CohortStoreTables tables, SweepEvent.EntityProgress progress)
     {
-        return ExecuteAsync(
+        var entitySummary = PostgreSqlIdentifier.Format(tables.SweepRunEntitySummary);
+        var sweepRun = PostgreSqlIdentifier.Format(tables.SweepRun);
+        return CohortStatements.Statement(
+            "entity-progress",
             $"""
             WITH upserted_summary AS (
-                INSERT INTO {PostgreSqlIdentifier.Format(Tables.SweepRunEntitySummary)} AS current_summary
+                INSERT INTO {entitySummary} AS current_summary
                     ("SweepId", "At", "EntityType", "RetentionEntityId", "Category", "TenantId", "Strategy",
                      "ResolvedMonths", "ResolvedDays", "Affected", "HeldCount", "SkippedCount", "NullAnchorCount",
                      "RetainedCount", "DeferredCount", "BlockedCount", "RuleSource", "RuleReason")
@@ -134,7 +162,7 @@ internal sealed class EfRetentionAuditWriter(
                     "BlockedCount" = current_summary."BlockedCount" + EXCLUDED."BlockedCount"
                 RETURNING 1
             )
-            UPDATE {PostgreSqlIdentifier.Format(Tables.SweepRun)}
+            UPDATE {sweepRun}
             SET "TotalAffected" = "TotalAffected" + @affected
             WHERE "SweepId" = @sweepId
               AND EXISTS (SELECT 1 FROM upserted_summary)
@@ -156,50 +184,70 @@ internal sealed class EfRetentionAuditWriter(
                 ["ruleSource"] = progress.Provenance?.Source,
                 ["ruleReason"] = progress.Provenance?.Reason,
             },
-            ct
+            tables.SweepRunEntitySummary,
+            tables.SweepRun
         );
     }
 
-    private Task WriteRowDetailAsync(SweepEvent.RowDetail rowDetail, CancellationToken ct)
+    /// <summary>
+    /// D1: records one mutated row. <paramref name="recordId"/> is bound as given (the row's
+    /// canonical text in a run), so a check can pass a typed NULL.
+    /// </summary>
+    internal static SweepStatement RowDetailStatement(
+        CohortStoreTables tables,
+        Guid sweepId,
+        DateTimeOffset at,
+        Type entityType,
+        Guid retentionEntityId,
+        object? recordId,
+        string category,
+        Strategy strategy,
+        Guid tenantId
+    )
     {
-        return ExecuteAsync(
+        var rowDetail = PostgreSqlIdentifier.Format(tables.SweepRunRowDetail);
+        return CohortStatements.Statement(
+            "row-detail",
             $"""
-            INSERT INTO {PostgreSqlIdentifier.Format(Tables.SweepRunRowDetail)}
+            INSERT INTO {rowDetail}
                 ("SweepId", "At", "EntityType", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId")
             VALUES (@sweepId, @at, @entityType, @retentionEntityId, @recordId, @category, @strategy, @tenantId)
             """,
             new SqlParams
             {
-                ["sweepId"] = rowDetail.SweepId,
-                ["at"] = rowDetail.At,
-                ["entityType"] = EntityTypeName(rowDetail.EntityType),
-                ["retentionEntityId"] = rowDetail.RetentionEntityId,
-                ["recordId"] = rowDetail.RecordId,
-                ["category"] = rowDetail.Category,
-                ["strategy"] = (int)rowDetail.Strategy,
-                ["tenantId"] = rowDetail.TenantId,
+                ["sweepId"] = sweepId,
+                ["at"] = at,
+                ["entityType"] = EntityTypeName(entityType),
+                ["retentionEntityId"] = retentionEntityId,
+                ["recordId"] = recordId,
+                ["category"] = category,
+                ["strategy"] = (int)strategy,
+                ["tenantId"] = tenantId,
             },
-            ct
+            tables.SweepRunRowDetail
         );
     }
 
     /// <summary>
-    /// Settles a Started run. A real run's total is the sum of its committed progress, so
-    /// only a dry run takes the event's total.
+    /// R3: settles a Started run. A real run's total is the sum of its committed progress, so
+    /// only a dry run takes <paramref name="totalAffected"/>. <paramref name="error"/> is bound
+    /// as given, so a check can pass a typed NULL.
     /// </summary>
-    private async Task WriteTerminalAsync(
+    internal static SweepStatement TerminalStatement(
+        CohortStoreTables tables,
         Guid sweepId,
         SweepRunStatus status,
         DateTimeOffset settledAt,
         TimeSpan? duration,
         long? totalAffected,
-        string? error,
-        CancellationToken ct
+        object? error
     )
     {
-        var settled = await ExecuteAsync(
+        var sweepRun = PostgreSqlIdentifier.Format(tables.SweepRun);
+        return CohortStatements.Statement(
+            "run-settled",
             $"""
-            UPDATE {PostgreSqlIdentifier.Format(Tables.SweepRun)}
+            UPDATE {sweepRun}
             SET "Status" = @status,
                 "SettledAt" = @settledAt,
                 "Duration" = @duration,
@@ -218,6 +266,26 @@ internal sealed class EfRetentionAuditWriter(
                 ["totalAffected"] = totalAffected,
                 ["error"] = error,
             },
+            tables.SweepRun
+        );
+    }
+
+    /// <summary>
+    /// Settles a Started run. A real run's total is the sum of its committed progress, so
+    /// only a dry run takes the event's total.
+    /// </summary>
+    private async Task WriteTerminalAsync(
+        Guid sweepId,
+        SweepRunStatus status,
+        DateTimeOffset settledAt,
+        TimeSpan? duration,
+        long? totalAffected,
+        string? error,
+        CancellationToken ct
+    )
+    {
+        var settled = await ExecuteAsync(
+            TerminalStatement(Tables, sweepId, status, settledAt, duration, totalAffected, error),
             ct
         );
         if (settled != 1)
@@ -228,8 +296,12 @@ internal sealed class EfRetentionAuditWriter(
         }
     }
 
-    private Task<int> ExecuteAsync(string sql, SqlParams parameters, CancellationToken ct) =>
-        db.Database.ExecuteSqlRawAsync(sql, parameters.ToDbParameters(db.Database.GetDbConnection()), ct);
+    private Task<int> ExecuteAsync(SweepStatement statement, CancellationToken ct) =>
+        db.Database.ExecuteSqlRawAsync(
+            statement.Sql,
+            statement.Parameters.ToDbParameters(db.Database.GetDbConnection()),
+            ct
+        );
 
     private static string EntityTypeName(Type entityType) => entityType.FullName ?? entityType.Name;
 }

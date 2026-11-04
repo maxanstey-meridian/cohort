@@ -3,6 +3,8 @@ using System.Data.Common;
 using System.Security.Cryptography;
 using System.Text;
 
+using Cohort.Infrastructure.Sweep;
+
 namespace Cohort.Infrastructure;
 
 /// <summary>
@@ -47,15 +49,64 @@ internal static class RetentionRunAdvisoryLock
     internal static long RowHandlerKeyFor(RelationalObjectName statusTable, long statusId) =>
         HashKey($"cohort-row-handler:{PostgreSqlIdentifier.Format(statusTable)}:{statusId}");
 
+    internal static SweepStatement LockStatement(long key) =>
+        CohortStatements.Statement("advisory-lock", "SELECT pg_catalog.pg_advisory_lock(@key)", new SqlParams { ["key"] = key });
+
+    internal static SweepStatement TryLockStatement(long key) =>
+        CohortStatements.Statement(
+            "advisory-try-lock",
+            "SELECT pg_catalog.pg_try_advisory_lock(@key)",
+            new SqlParams { ["key"] = key }
+        );
+
+    internal static SweepStatement UnlockStatement(long key) =>
+        CohortStatements.Statement(
+            "advisory-unlock",
+            "SELECT pg_catalog.pg_advisory_unlock(@key)",
+            new SqlParams { ["key"] = key }
+        );
+
+    /// <summary>Takes every key in key order, as <see cref="AcquireAllAsync"/> does.</summary>
+    internal static SweepStatement LockAllStatement(IReadOnlyCollection<long> keys) =>
+        CohortStatements.Statement(
+            "advisory-lock-all",
+            "SELECT pg_catalog.pg_advisory_lock(k) FROM pg_catalog.unnest(@keys) AS k ORDER BY k",
+            new SqlParams { ["keys"] = keys.ToArray() }
+        );
+
+    /// <summary>Releases every session advisory lock the connection holds.</summary>
+    internal static SweepStatement UnlockAllStatement() =>
+        CohortStatements.Statement(
+            "advisory-unlock-all",
+            "SELECT pg_catalog.pg_advisory_unlock_all()",
+            new SqlParams()
+        );
+
+    /// <summary>Whether the session holds every key, as <see cref="HoldsAllAsync"/> asks.</summary>
+    internal static SweepStatement HoldsAllStatement(IReadOnlyCollection<long> keys) =>
+        // A bigint advisory key is held as classid (high 32 bits) and objid (low 32 bits).
+        CohortStatements.Statement(
+            "advisory-locks-held",
+            """
+            SELECT pg_catalog.count(*) = pg_catalog.cardinality(@keys)
+            FROM pg_catalog.pg_locks AS l
+            JOIN pg_catalog.unnest(@keys) AS k(key)
+              ON l.classid = ((k.key >> 32) & 4294967295)::oid AND l.objid = (k.key & 4294967295)::oid
+            WHERE l.locktype = 'advisory' AND l.objsubid = 1 AND l.granted
+              AND l.pid = pg_catalog.pg_backend_pid()
+            """,
+            new SqlParams { ["keys"] = keys.ToArray() }
+        );
+
     internal static Task AcquireAsync(DbConnection connection, long key, CancellationToken ct) =>
-        ExecuteAsync(connection, "SELECT pg_catalog.pg_advisory_lock(@key)", key, ct);
+        ExecuteAsync(connection, null, LockStatement(key), ct);
 
     internal static async Task<bool> TryAcquireAsync(DbConnection connection, long key, CancellationToken ct) =>
-        await ExecuteAsync(connection, "SELECT pg_catalog.pg_try_advisory_lock(@key)", key, ct) is true;
+        await ExecuteAsync(connection, null, TryLockStatement(key), ct) is true;
 
     internal static async Task ReleaseAsync(DbConnection connection, long key, CancellationToken ct)
     {
-        if (await ExecuteAsync(connection, "SELECT pg_catalog.pg_advisory_unlock(@key)", key, ct) is not true)
+        if (await ExecuteAsync(connection, null, UnlockStatement(key), ct) is not true)
         {
             throw new InvalidOperationException(
                 $"PostgreSQL reported that Cohort advisory lock {key} was not owned by this connection."
@@ -76,23 +127,13 @@ internal static class RetentionRunAdvisoryLock
         CancellationToken ct
     )
     {
-        await using var command = new SqlParams { ["keys"] = keys.ToArray() }.CreateCommand(
-            connection,
-            transaction,
-            "SELECT pg_catalog.pg_advisory_lock(k) FROM pg_catalog.unnest(@keys) AS k ORDER BY k"
-        );
-        await command.ExecuteNonQueryAsync(ct);
+        await ExecuteNonQueryAsync(connection, transaction, LockAllStatement(keys), ct);
     }
 
     /// <summary>Releases every session advisory lock the connection holds.</summary>
     internal static async Task ReleaseAllAsync(DbConnection connection, CancellationToken ct)
     {
-        await using var command = new SqlParams().CreateCommand(
-            connection,
-            null,
-            "SELECT pg_catalog.pg_advisory_unlock_all()"
-        );
-        await command.ExecuteNonQueryAsync(ct);
+        await ExecuteNonQueryAsync(connection, null, UnlockAllStatement(), ct);
     }
 
     /// <summary>
@@ -108,20 +149,7 @@ internal static class RetentionRunAdvisoryLock
         CancellationToken ct
     )
     {
-        // A bigint advisory key is held as classid (high 32 bits) and objid (low 32 bits).
-        await using var command = new SqlParams { ["keys"] = keys.ToArray() }.CreateCommand(
-            connection,
-            transaction,
-            """
-            SELECT pg_catalog.count(*) = pg_catalog.cardinality(@keys)
-            FROM pg_catalog.pg_locks AS l
-            JOIN pg_catalog.unnest(@keys) AS k(key)
-              ON l.classid = ((k.key >> 32) & 4294967295)::oid AND l.objid = (k.key & 4294967295)::oid
-            WHERE l.locktype = 'advisory' AND l.objsubid = 1 AND l.granted
-              AND l.pid = pg_catalog.pg_backend_pid()
-            """
-        );
-        return await command.ExecuteScalarAsync(ct) is true;
+        return await ExecuteAsync(connection, transaction, HoldsAllStatement(keys), ct) is true;
     }
 
     private static long HashKey(string name)
@@ -131,9 +159,25 @@ internal static class RetentionRunAdvisoryLock
         return BinaryPrimitives.ReadInt64BigEndian(hash);
     }
 
-    private static async Task<object?> ExecuteAsync(DbConnection connection, string sql, long key, CancellationToken ct)
+    private static async Task<object?> ExecuteAsync(
+        DbConnection connection,
+        DbTransaction? transaction,
+        SweepStatement statement,
+        CancellationToken ct
+    )
     {
-        await using var command = new SqlParams { ["key"] = key }.CreateCommand(connection, null, sql);
+        await using var command = statement.Parameters.CreateCommand(connection, transaction, statement.Sql);
         return await command.ExecuteScalarAsync(ct);
+    }
+
+    private static async Task ExecuteNonQueryAsync(
+        DbConnection connection,
+        DbTransaction? transaction,
+        SweepStatement statement,
+        CancellationToken ct
+    )
+    {
+        await using var command = statement.Parameters.CreateCommand(connection, transaction, statement.Sql);
+        await command.ExecuteNonQueryAsync(ct);
     }
 }

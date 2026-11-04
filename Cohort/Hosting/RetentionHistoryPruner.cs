@@ -70,20 +70,25 @@ internal sealed class RetentionHistoryPruner(
     /// </summary>
     internal async Task<RetentionHistoryPruneResult> PruneAsync(CancellationToken ct = default)
     {
-        var pruning = options.Current.HistoryPruning;
-        if (!pruning.Enabled || options.Current.KillSwitch)
+        // One reading of the options decides what is pruned and what readiness checks.
+        var current = options.Current;
+        if (current.PruningScope is not { } scope)
         {
             return new RetentionHistoryPruneResult(0, 0);
         }
 
+        var pruning = current.HistoryPruning;
         var currentOccurrence = await scopeFactory.RunInScopeAsync(
             HistoryPruning,
             async services =>
             {
-                await services.GetRequiredService<RetentionRuntimeReadinessValidator>().ValidateAsync(ct);
+                await services
+                    .GetRequiredService<RetentionRuntimeReadinessValidator>()
+                    .ValidateAsync(RetentionStatementGroup.Pruning(scope), ct);
                 return await CurrentOccurrenceAsync(
                     services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext),
-                    options.Current.Schedule,
+                    scope,
+                    current.Schedule,
                     ct
                 );
             },
@@ -93,10 +98,9 @@ internal sealed class RetentionHistoryPruner(
         var now = DateTimeOffset.UtcNow;
         var succeededCutoff = Cutoff(now, pruning.SucceededRunRetention);
         var failedCutoff = Cutoff(now, pruning.FailedRunRetention);
-        var holdCutoff = Cutoff(now, pruning.InactiveHoldRetention);
 
         long runs = 0;
-        if (succeededCutoff is not null || failedCutoff is not null)
+        if (scope.Runs)
         {
             int deleted;
             do
@@ -109,13 +113,15 @@ internal sealed class RetentionHistoryPruner(
         }
 
         long holds = 0;
-        if (holdCutoff is not null && !options.Current.KillSwitch)
+        if (scope.Holds && !options.Current.KillSwitch)
         {
+            // The scope has holds exactly when the hold retention is set.
+            var holdCutoff = Cutoff(now, pruning.InactiveHoldRetention)!.Value;
             int deleted;
             do
             {
                 ct.ThrowIfCancellationRequested();
-                deleted = await PruneHoldBatchAsync(holdCutoff.Value, ct);
+                deleted = await PruneHoldBatchAsync(holdCutoff, ct);
                 holds += deleted;
             }
             while (deleted == BatchSize && !options.Current.KillSwitch);
@@ -157,16 +163,18 @@ internal sealed class RetentionHistoryPruner(
 
     /// <summary>
     /// The latest occurrence of <paramref name="schedule"/> at or before the database clock,
-    /// the occurrence the worker is catching up; null without a schedule.
+    /// the occurrence the worker is catching up; null when <paramref name="scope"/> doesn't read
+    /// the clock (no schedule).
     /// </summary>
     private static async Task<DateTimeOffset?> CurrentOccurrenceAsync(
         DbContext db,
+        PruningScope scope,
         string? schedule,
         CancellationToken ct
     ) =>
-        string.IsNullOrWhiteSpace(schedule)
-            ? null
-            : CohortScheduleParser.GetPreviousOccurrence(schedule, await DatabaseClock.NowAsync(db, ct));
+        scope.ReadsClock
+            ? CohortScheduleParser.GetPreviousOccurrence(schedule!, await DatabaseClock.NowAsync(db, ct))
+            : null;
 
     /// <summary>
     /// One batch of inactive holds; see <see cref="HistoryPruningSql.PruneHoldBatchAsync"/>.

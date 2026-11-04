@@ -7,9 +7,10 @@ namespace Cohort.Infrastructure.Sweep;
 // types; every value is a named parameter.
 
 /// <summary>
-/// One host-table statement a run, a preview, or readiness sends: its text, the values it
-/// binds, and every table it reads, the host's and Cohort's own. <see cref="Entity"/> is the one
-/// entity whose scope or hold call issues it, or null for a statement that spans entities.
+/// One statement Cohort sends, against a host table, Cohort's own tables, or a PostgreSQL
+/// function: its text, the values it binds, and every table it reads, the host's and Cohort's
+/// own. <see cref="Entity"/> is the one entity whose scope or hold call issues it, or null for
+/// a statement that spans entities or names none.
 /// </summary>
 internal sealed record SweepStatement(
     string Name,

@@ -1,3 +1,5 @@
+using Cohort.Infrastructure.Sweep;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 
@@ -12,17 +14,23 @@ internal static class DatabaseClock
     /// <summary>The database clock in SQL. Every comparison against "now" in Cohort's SQL uses it.</summary>
     internal const string Sql = "pg_catalog.statement_timestamp()";
 
+    /// <summary>
+    /// The statement that reads the database clock. statement_timestamp(), not now(): inside a
+    /// caller's long transaction now() is the transaction's start.
+    /// </summary>
+    internal static SweepStatement NowStatement() =>
+        CohortStatements.Statement("database-clock", $"SELECT {Sql}", new SqlParams());
+
     internal static async Task<DateTimeOffset> NowAsync(DbContext db, CancellationToken ct)
     {
         await db.Database.OpenConnectionAsync(ct);
         try
         {
-            // statement_timestamp(), not now(): inside a caller's long transaction now() is
-            // the transaction's start.
-            await using var command = new SqlParams().CreateCommand(
+            var statement = NowStatement();
+            await using var command = statement.Parameters.CreateCommand(
                 db.Database.GetDbConnection(),
                 db.Database.CurrentTransaction?.GetDbTransaction(),
-                $"SELECT {Sql}"
+                statement.Sql
             );
             var value = await command.ExecuteScalarAsync(ct);
             return value switch

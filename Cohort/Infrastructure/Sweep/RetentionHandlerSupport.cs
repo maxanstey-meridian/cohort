@@ -316,29 +316,97 @@ internal static class RetentionHandlerSupport
         CancellationToken ct
     )
     {
-        await using var command = new SqlParams
-        {
-            ["sweepId"] = execution.SweepId,
-            ["at"] = execution.At,
-            ["entityType"] = entry.EntityType.FullName ?? entry.EntityType.Name,
-            ["retentionEntityId"] = entry.RetentionEntityId,
-            ["recordId"] = recordId,
-            ["category"] = entry.Category,
-            ["strategy"] = (int)strategy,
-            ["tenantId"] = tenantId,
-            ["capturedPayload"] = capturedPayload,
-        }.CreateCommand(
-            conn,
-            transaction,
+        var statement = RowDetailWithPayloadStatement(
+            entry.CohortTables,
+            execution.SweepId,
+            execution.At,
+            entry.EntityType,
+            entry.RetentionEntityId,
+            recordId,
+            entry.Category,
+            strategy,
+            tenantId,
+            capturedPayload
+        );
+        await using var command = statement.Parameters.CreateCommand(conn, transaction, statement.Sql);
+        return (long)(await command.ExecuteScalarAsync(ct))!;
+    }
+
+    /// <summary>
+    /// D2: records a mutated row with its captured payload and returns the row's id.
+    /// <paramref name="recordId"/> (canonical text) and <paramref name="capturedPayload"/> are
+    /// bound as given, so a check can pass typed NULLs.
+    /// </summary>
+    internal static SweepStatement RowDetailWithPayloadStatement(
+        CohortStoreTables tables,
+        Guid sweepId,
+        DateTimeOffset at,
+        Type entityType,
+        Guid retentionEntityId,
+        object? recordId,
+        string category,
+        Strategy strategy,
+        Guid tenantId,
+        object? capturedPayload
+    ) =>
+        CohortStatements.Statement(
+            "row-detail-with-payload",
             $"""
-            INSERT INTO {PostgreSqlIdentifier.Format(entry.CohortTables.SweepRunRowDetail)}
+            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRunRowDetail)}
                 ("SweepId", "At", "EntityType", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId", "CapturedPayload")
             VALUES (@sweepId, @at, @entityType, @retentionEntityId, @recordId, @category, @strategy, @tenantId, @capturedPayload)
             RETURNING "Id"
-            """
+            """,
+            new SqlParams
+            {
+                ["sweepId"] = sweepId,
+                ["at"] = at,
+                ["entityType"] = entityType.FullName ?? entityType.Name,
+                ["retentionEntityId"] = retentionEntityId,
+                ["recordId"] = recordId,
+                ["category"] = category,
+                ["strategy"] = (int)strategy,
+                ["tenantId"] = tenantId,
+                ["capturedPayload"] = capturedPayload,
+            },
+            tables.SweepRunRowDetail
         );
-        return (long)(await command.ExecuteScalarAsync(ct))!;
-    }
+
+    /// <summary>
+    /// T1: queues a handler status for a row detail. <paramref name="lastError"/> is bound as
+    /// given, so a check can pass a typed NULL.
+    /// </summary>
+    internal static SweepStatement HandlerStatusStatement(
+        CohortStoreTables tables,
+        long rowDetailId,
+        string handlerType,
+        RowHandlerDispatchPhase dispatchPhase,
+        SweepRowHandlerDispatchState state,
+        int attempt,
+        DateTimeOffset at,
+        DateTimeOffset? completedAt,
+        object? lastError
+    ) =>
+        CohortStatements.Statement(
+            "handler-status",
+            $"""
+            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)}
+                ("SweepRunRowDetailId", "HandlerType", "DispatchPhase", "State", "Attempt", "QueuedAt", "NextAttemptAt", "ClaimedAt", "CompletedAt", "LastError")
+            VALUES (@rowDetailId, @handlerType, @dispatchPhase, @state, @attempt, @at, @at, NULL, @completedAt, @lastError)
+            """,
+            new SqlParams
+            {
+                ["rowDetailId"] = rowDetailId,
+                ["handlerType"] = handlerType,
+                ["dispatchPhase"] = (int)dispatchPhase,
+                ["state"] = (int)state,
+                ["attempt"] = attempt,
+                ["at"] = at,
+                ["completedAt"] = completedAt,
+                ["lastError"] = lastError,
+            },
+            tables.SweepRowHandlerStatus
+        );
 
     /// <summary>
     /// Queues a pending status, or with <paramref name="failure"/> records one already
@@ -356,25 +424,18 @@ internal static class RetentionHandlerSupport
         CancellationToken ct
     )
     {
-        await using var command = new SqlParams
-        {
-            ["rowDetailId"] = rowDetailId,
-            ["handlerType"] = identity,
-            ["dispatchPhase"] = (int)dispatchPhase,
-            ["state"] = (int)(failure is null ? SweepRowHandlerDispatchState.Pending : SweepRowHandlerDispatchState.DeadLettered),
-            ["attempt"] = failure is null ? 0 : 1,
-            ["at"] = at,
-            ["completedAt"] = failure is null ? null : at,
-            ["lastError"] = failure,
-        }.CreateCommand(
-            conn,
-            transaction,
-            $"""
-            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)}
-                ("SweepRunRowDetailId", "HandlerType", "DispatchPhase", "State", "Attempt", "QueuedAt", "NextAttemptAt", "ClaimedAt", "CompletedAt", "LastError")
-            VALUES (@rowDetailId, @handlerType, @dispatchPhase, @state, @attempt, @at, @at, NULL, @completedAt, @lastError)
-            """
+        var statement = HandlerStatusStatement(
+            tables,
+            rowDetailId,
+            identity,
+            dispatchPhase,
+            failure is null ? SweepRowHandlerDispatchState.Pending : SweepRowHandlerDispatchState.DeadLettered,
+            failure is null ? 0 : 1,
+            at,
+            failure is null ? null : at,
+            failure
         );
+        await using var command = statement.Parameters.CreateCommand(conn, transaction, statement.Sql);
         await command.ExecuteNonQueryAsync(ct);
     }
 }

@@ -29,8 +29,11 @@ public sealed class HistoryPruningOptions
 
     internal static TimeSpan MinimumRetention { get; } = TimeSpan.FromDays(1);
 
-    internal bool Enabled =>
-        SucceededRunRetention is not null
-        || FailedRunRetention is not null
-        || InactiveHoldRetention is not null;
+    /// <summary>Whether a retention for settled runs is set.</summary>
+    internal bool PrunesRuns => SucceededRunRetention is not null || FailedRunRetention is not null;
+
+    /// <summary>Whether a retention for inactive holds is set.</summary>
+    internal bool PrunesHolds => InactiveHoldRetention is not null;
+
+    internal bool Enabled => PrunesRuns || PrunesHolds;
 }

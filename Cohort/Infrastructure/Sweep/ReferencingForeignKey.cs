@@ -57,6 +57,7 @@ internal static class ReferencingForeignKeySql
                 connection,
                 null,
                 """
+                /* cohort catalog */
                 SELECT requested.ordinal,
                        foreign_key.conname,
                        child_namespace.nspname,

@@ -2,6 +2,7 @@ using System.Data;
 
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Infrastructure.Sweep;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
@@ -10,8 +11,7 @@ using Microsoft.Extensions.Logging;
 namespace Cohort.Infrastructure.Handlers;
 
 // The only interpolations in this file's raw SQL are Cohort's own table names, quoted from
-// the EF model; every value is a positional parameter.
-#pragma warning disable EF1002
+// the EF model; every value is a named parameter.
 
 /// <summary>
 /// The row-handler queue's statements: claiming due work, settling a delivery while its claim
@@ -31,42 +31,106 @@ internal static class RowHandlerQueueSql
 
     private const string DependentDeadLetterReason = "Skipped because an earlier handler for the same row dead-lettered.";
 
-    // Values: {0} state, {1} completed-at, {2} last error.
+    // Values: @state, @at (the completion time), @lastError.
     private const string DeadLetterAssignments =
         """
-        "State" = {0}, "CompletedAt" = {1}, "ClaimedAt" = NULL, "ClaimToken" = NULL, "LastError" = {2}
+        "State" = @state, "CompletedAt" = @at, "ClaimedAt" = NULL, "ClaimToken" = NULL, "LastError" = @lastError
         """;
 
     /// <summary>
-    /// The queue's remaining work: claims in flight, pending rows, and dead-lettered rows that
-    /// still hold a snapshot to requeue. Raw SQL, not LINQ: EF emits an unqualified COUNT that
-    /// a search_path decoy can shadow.
+    /// Q1: the queue's remaining work: claims in flight, pending rows, and dead-lettered rows
+    /// that still hold a snapshot to requeue. Raw SQL, not LINQ: EF emits an unqualified COUNT
+    /// that a search_path decoy can shadow.
+    /// </summary>
+    internal static SweepStatement RemainingWorkStatement(CohortStoreTables tables) =>
+        CohortStatements.Statement(
+            "remaining-work",
+            $"""
+            SELECT
+                pg_catalog.count(*) FILTER (WHERE status."State" = @inFlight) AS "InFlight",
+                pg_catalog.count(*) FILTER (WHERE status."State" = @pending) AS "Pending",
+                pg_catalog.count(*) FILTER (
+                    WHERE status."State" = @deadLettered AND detail."CapturedPayload" IS NOT NULL
+                ) AS "DeadLetteredRequeueable"
+            FROM {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)} AS status
+            INNER JOIN {PostgreSqlIdentifier.Format(tables.SweepRunRowDetail)} AS detail
+                ON detail."Id" = status."SweepRunRowDetailId"
+            """,
+            new SqlParams { ["inFlight"] = InFlight, ["pending"] = Pending, ["deadLettered"] = DeadLettered },
+            tables.SweepRowHandlerStatus,
+            tables.SweepRunRowDetail
+        );
+
+    /// <summary>
+    /// Counts the queue's remaining work. A composed <c>SingleAsync</c> would make EF wrap the
+    /// statement, so it is read as a list and its one row taken.
     /// </summary>
     internal static async Task<RowDispatcherFlushResult> CountRemainingAsync(DbContext db, CancellationToken ct)
     {
-        var tables = CohortStoreTables.FromModel(db.Model).Quoted();
-        var remaining = await db.Database
-            .SqlQueryRaw<RemainingWork>(
-                $$"""
-                SELECT
-                    pg_catalog.count(*) FILTER (WHERE status."State" = {0}) AS "InFlight",
-                    pg_catalog.count(*) FILTER (WHERE status."State" = {1}) AS "Pending",
-                    pg_catalog.count(*) FILTER (
-                        WHERE status."State" = {2} AND detail."CapturedPayload" IS NOT NULL
-                    ) AS "DeadLetteredRequeueable"
-                FROM {{tables.SweepRowHandlerStatus}} AS status
-                INNER JOIN {{tables.SweepRunRowDetail}} AS detail
-                    ON detail."Id" = status."SweepRunRowDetailId"
-                """,
-                InFlight,
-                Pending,
-                DeadLettered
-            )
-            .SingleAsync(ct);
+        var statement = RemainingWorkStatement(CohortStoreTables.FromModel(db.Model));
+        var remaining = (
+            await db.Database
+                .SqlQueryRaw<RemainingWork>(
+                    statement.Sql,
+                    statement.Parameters.ToDbParameters(db.Database.GetDbConnection())
+                )
+                .ToListAsync(ct)
+        ).Single();
         return new RowDispatcherFlushResult(
             remaining.InFlight,
             remaining.Pending,
             remaining.DeadLetteredRequeueable
+        );
+    }
+
+    /// <summary>
+    /// Q2: requeues every dead-lettered handler of each row that still holds its snapshot,
+    /// optionally only rows of <paramref name="sweepId"/> with a dead-lettered
+    /// <paramref name="handlerId"/>. One text covers all four combinations: the two booleans
+    /// switch each filter off.
+    /// </summary>
+    internal static SweepStatement RequeueDeadLetteredStatement(
+        CohortStoreTables tables,
+        Guid? sweepId,
+        Guid? handlerId,
+        DateTimeOffset now
+    )
+    {
+        var detail = PostgreSqlIdentifier.Format(tables.SweepRunRowDetail);
+        var status = PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus);
+        return CohortStatements.Statement(
+            "requeue-dead-lettered",
+            $"""
+            WITH target AS (
+                SELECT detail."Id"
+                FROM {detail} AS detail
+                WHERE detail."CapturedPayload" IS NOT NULL
+                  AND (@anySweep OR detail."SweepId" = @sweepId)
+                  AND EXISTS (
+                      SELECT 1 FROM {status} AS dead
+                      WHERE dead."SweepRunRowDetailId" = detail."Id"
+                        AND dead."State" = @deadLettered
+                        AND (@anyHandler OR dead."HandlerType" = @handlerType)
+                  )
+                FOR UPDATE OF detail
+            )
+            UPDATE {status} AS status
+            SET "State" = @pending, "NextAttemptAt" = @now, "CompletedAt" = NULL
+            FROM target
+            WHERE status."SweepRunRowDetailId" = target."Id" AND status."State" = @deadLettered
+            """,
+            new SqlParams
+            {
+                ["anySweep"] = sweepId is null,
+                ["sweepId"] = sweepId ?? Guid.Empty,
+                ["anyHandler"] = handlerId is null,
+                ["handlerType"] = handlerId?.ToString("D") ?? "",
+                ["deadLettered"] = DeadLettered,
+                ["pending"] = Pending,
+                ["now"] = now,
+            },
+            tables.SweepRunRowDetail,
+            tables.SweepRowHandlerStatus
         );
     }
 
@@ -83,75 +147,104 @@ internal static class RowHandlerQueueSql
         Guid? handlerId,
         DateTimeOffset now,
         CancellationToken ct
-    )
-    {
-        var tables = CohortStoreTables.FromModel(db.Model).Quoted();
-        return db.Database.ExecuteSqlRawAsync(
-            $$"""
-            WITH target AS (
-                SELECT detail."Id"
-                FROM {{tables.SweepRunRowDetail}} AS detail
-                WHERE detail."CapturedPayload" IS NOT NULL
-                  AND ({0} OR detail."SweepId" = {1})
-                  AND EXISTS (
-                      SELECT 1 FROM {{tables.SweepRowHandlerStatus}} AS dead
-                      WHERE dead."SweepRunRowDetailId" = detail."Id"
-                        AND dead."State" = {4}
-                        AND ({2} OR dead."HandlerType" = {3})
-                  )
-                FOR UPDATE OF detail
-            )
-            UPDATE {{tables.SweepRowHandlerStatus}} AS status
-            SET "State" = {5}, "NextAttemptAt" = {6}, "CompletedAt" = NULL
-            FROM target
-            WHERE status."SweepRunRowDetailId" = target."Id" AND status."State" = {4}
-            """,
-            [
-                sweepId is null,
-                sweepId ?? Guid.Empty,
-                handlerId is null,
-                handlerId?.ToString("D") ?? "",
-                DeadLettered,
-                Pending,
-                now,
-            ],
+    ) =>
+        ExecuteAsync(
+            db,
+            RequeueDeadLetteredStatement(CohortStoreTables.FromModel(db.Model), sweepId, handlerId, now),
             ct
         );
-    }
+
+    /// <summary>Q3: clears every captured snapshot taken before <paramref name="cutoff"/>.</summary>
+    internal static SweepStatement ScrubExpiredPayloadsStatement(CohortStoreTables tables, DateTimeOffset cutoff) =>
+        CohortStatements.Statement(
+            "payload-scrub",
+            $"""
+            UPDATE {PostgreSqlIdentifier.Format(tables.SweepRunRowDetail)}
+            SET "CapturedPayload" = NULL
+            WHERE "CapturedPayload" IS NOT NULL AND "At" < @cutoff
+            """,
+            new SqlParams { ["cutoff"] = cutoff },
+            tables.SweepRunRowDetail
+        );
 
     /// <summary>Clears every captured snapshot taken before <paramref name="cutoff"/>.</summary>
     internal static Task<int> ScrubExpiredPayloadsAsync(DbContext db, DateTimeOffset cutoff, CancellationToken ct) =>
-        db.Database.ExecuteSqlRawAsync(
-            $$"""
-            UPDATE {{CohortStoreTables.FromModel(db.Model).Quoted().SweepRunRowDetail}}
+        ExecuteAsync(db, ScrubExpiredPayloadsStatement(CohortStoreTables.FromModel(db.Model), cutoff), ct);
+
+    /// <summary>
+    /// Q4: clears a row detail's captured snapshot once every handler for that row has
+    /// succeeded.
+    /// </summary>
+    internal static SweepStatement ClearDeliveredPayloadStatement(CohortStoreTables tables, long rowDetailId) =>
+        CohortStatements.Statement(
+            "delivered-payload-clear",
+            $"""
+            UPDATE {PostgreSqlIdentifier.Format(tables.SweepRunRowDetail)} AS detail
             SET "CapturedPayload" = NULL
-            WHERE "CapturedPayload" IS NOT NULL AND "At" < {0}
+            WHERE detail."Id" = @rowDetailId
+              AND detail."CapturedPayload" IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)} AS status
+                  WHERE status."SweepRunRowDetailId" = detail."Id"
+                    AND status."State" <> @succeeded
+              )
             """,
-            [cutoff],
-            ct
+            new SqlParams { ["rowDetailId"] = rowDetailId, ["succeeded"] = Succeeded },
+            tables.SweepRunRowDetail,
+            tables.SweepRowHandlerStatus
         );
 
     /// <summary>
     /// Clears a row detail's captured snapshot once every handler for that row has succeeded.
     /// </summary>
-    internal static Task<int> ClearDeliveredPayloadAsync(DbContext db, long rowDetailId)
-    {
-        var tables = CohortStoreTables.FromModel(db.Model).Quoted();
-        return db.Database.ExecuteSqlRawAsync(
-            $$"""
-            UPDATE {{tables.SweepRunRowDetail}} AS detail
-            SET "CapturedPayload" = NULL
-            WHERE detail."Id" = {0}
-              AND detail."CapturedPayload" IS NOT NULL
-              AND NOT EXISTS (
-                  SELECT 1 FROM {{tables.SweepRowHandlerStatus}} AS status
-                  WHERE status."SweepRunRowDetailId" = detail."Id"
-                    AND status."State" <> {1}
-              )
-            """,
-            [rowDetailId, Succeeded]
+    internal static Task<int> ClearDeliveredPayloadAsync(DbContext db, long rowDetailId) =>
+        ExecuteAsync(
+            db,
+            ClearDeliveredPayloadStatement(CohortStoreTables.FromModel(db.Model), rowDetailId),
+            CancellationToken.None
         );
-    }
+
+    /// <summary>
+    /// Q5: one page of claims held since <paramref name="leaseCutoff"/> or earlier, in
+    /// (<c>ClaimedAt</c>, <c>Id</c>) order after <paramref name="after"/> (from the start when
+    /// null).
+    /// </summary>
+    internal static SweepStatement ExpiredClaimsStatement(
+        CohortStoreTables tables,
+        DateTimeOffset leaseCutoff,
+        ExpiredClaim? after,
+        int batchSize
+    ) =>
+        CohortStatements.Statement(
+            "expired-claims",
+            $"""
+            SELECT
+                status."Id" AS "StatusId",
+                status."SweepRunRowDetailId" AS "RowDetailId",
+                status."Attempt",
+                status."ClaimToken",
+                status."ClaimedAt",
+                detail."SweepId"
+            FROM {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)} AS status
+            INNER JOIN {PostgreSqlIdentifier.Format(tables.SweepRunRowDetail)} AS detail
+                ON detail."Id" = status."SweepRunRowDetailId"
+            WHERE status."State" = @inFlight AND status."ClaimedAt" <= @leaseCutoff
+              AND (@fromStart OR (status."ClaimedAt", status."Id") > (@afterClaimedAt, @afterStatusId))
+            ORDER BY status."ClaimedAt", status."Id"
+            LIMIT @batchSize
+            """,
+            new SqlParams
+            {
+                ["inFlight"] = InFlight,
+                ["leaseCutoff"] = leaseCutoff,
+                ["batchSize"] = batchSize,
+                ["fromStart"] = after is null,
+                ["afterClaimedAt"] = after?.ClaimedAt ?? leaseCutoff,
+                ["afterStatusId"] = after?.StatusId ?? 0L,
+            },
+            tables.SweepRowHandlerStatus,
+            tables.SweepRunRowDetail
+        );
 
     /// <summary>
     /// One page of claims held since <paramref name="leaseCutoff"/> or earlier, in
@@ -166,34 +259,30 @@ internal static class RowHandlerQueueSql
         CancellationToken ct
     )
     {
-        var tables = CohortStoreTables.FromModel(db.Model).Quoted();
+        var statement = ExpiredClaimsStatement(CohortStoreTables.FromModel(db.Model), leaseCutoff, after, batchSize);
         return db.Database
             .SqlQueryRaw<ExpiredClaim>(
-                $$"""
-                SELECT
-                    status."Id" AS "StatusId",
-                    status."SweepRunRowDetailId" AS "RowDetailId",
-                    status."Attempt",
-                    status."ClaimToken",
-                    status."ClaimedAt",
-                    detail."SweepId"
-                FROM {{tables.SweepRowHandlerStatus}} AS status
-                INNER JOIN {{tables.SweepRunRowDetail}} AS detail
-                    ON detail."Id" = status."SweepRunRowDetailId"
-                WHERE status."State" = {0} AND status."ClaimedAt" <= {1}
-                  AND ({3} OR (status."ClaimedAt", status."Id") > ({4}, {5}))
-                ORDER BY status."ClaimedAt", status."Id"
-                LIMIT {2}
-                """,
-                InFlight,
-                leaseCutoff,
-                batchSize,
-                after is null,
-                after?.ClaimedAt ?? leaseCutoff,
-                after?.StatusId ?? 0L
+                statement.Sql,
+                statement.Parameters.ToDbParameters(db.Database.GetDbConnection())
             )
             .ToListAsync(ct);
     }
+
+    /// <summary>
+    /// Q6: locks one status row if it is still in flight under <paramref name="claimToken"/>,
+    /// skipping one a claim or another recovery holds.
+    /// </summary>
+    internal static SweepStatement ReclaimLockStatement(CohortStoreTables tables, long statusId, Guid claimToken) =>
+        CohortStatements.Statement(
+            "reclaim-lock",
+            $"""
+            SELECT "Id" AS "Value" FROM {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)}
+            WHERE "Id" = @statusId AND "State" = @inFlight AND "ClaimToken" = @claimToken
+            FOR UPDATE SKIP LOCKED
+            """,
+            new SqlParams { ["statusId"] = statusId, ["inFlight"] = InFlight, ["claimToken"] = claimToken },
+            tables.SweepRowHandlerStatus
+        );
 
     /// <summary>
     /// Reclaims one expired claim in one transaction. Locks the status row (skipping one a
@@ -213,23 +302,15 @@ internal static class RowHandlerQueueSql
     {
         var connection = db.Database.GetDbConnection();
         var now = DateTimeOffset.UtcNow;
-        var statusTable = CohortStoreTables.FromModel(db.Model).SweepRowHandlerStatus;
-        var key = RetentionRunAdvisoryLock.RowHandlerKeyFor(statusTable, claim.StatusId);
+        var tables = CohortStoreTables.FromModel(db.Model);
+        var key = RetentionRunAdvisoryLock.RowHandlerKeyFor(tables.SweepRowHandlerStatus, claim.StatusId);
         var locked = false;
         try
         {
             await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+            var reclaimLock = ReclaimLockStatement(tables, claim.StatusId, claim.ClaimToken);
             var stillClaimed = await db.Database
-                .SqlQueryRaw<long>(
-                    $$"""
-                    SELECT "Id" AS "Value" FROM {{PostgreSqlIdentifier.Format(statusTable)}}
-                    WHERE "Id" = {0} AND "State" = {1} AND "ClaimToken" = {2}
-                    FOR UPDATE SKIP LOCKED
-                    """,
-                    claim.StatusId,
-                    InFlight,
-                    claim.ClaimToken
-                )
+                .SqlQueryRaw<long>(reclaimLock.Sql, reclaimLock.Parameters.ToDbParameters(connection))
                 .ToListAsync(ct);
             if (stillClaimed.Count == 0)
             {
@@ -247,10 +328,11 @@ internal static class RowHandlerQueueSql
             {
                 await UpdateOwnedAsync(
                     db,
+                    OwnedUpdate.DeadLetter,
                     claim.StatusId,
                     claim.ClaimToken,
-                    DeadLetterAssignments,
-                    [DeadLettered, now, ExhaustedClaimReason],
+                    now,
+                    ExhaustedClaimReason,
                     ct
                 );
                 await DeadLetterDependentsAsync(db, claim.RowDetailId, claim.StatusId, now, ct);
@@ -258,16 +340,7 @@ internal static class RowHandlerQueueSql
             }
             else
             {
-                await UpdateOwnedAsync(
-                    db,
-                    claim.StatusId,
-                    claim.ClaimToken,
-                    """
-                    "State" = {0}, "NextAttemptAt" = {1}, "ClaimedAt" = NULL, "ClaimToken" = NULL
-                    """,
-                    [Pending, now],
-                    ct
-                );
+                await UpdateOwnedAsync(db, OwnedUpdate.Requeue, claim.StatusId, claim.ClaimToken, now, null, ct);
                 outcome = ReclaimOutcome.Requeued;
             }
 
@@ -295,15 +368,104 @@ internal static class RowHandlerQueueSql
     /// counts.
     /// </summary>
     internal static Task<int> RequeueInterruptedAsync(DbContext db, Guid claimToken, CancellationToken ct) =>
-        db.Database.ExecuteSqlRawAsync(
-            $$"""
-            UPDATE {{CohortStoreTables.FromModel(db.Model).Quoted().SweepRowHandlerStatus}}
-            SET "State" = {0}, "ClaimedAt" = NULL, "ClaimToken" = NULL
-            WHERE "ClaimToken" = {1} AND "State" = {2}
+        ExecuteAsync(db, RequeueInterruptedStatement(CohortStoreTables.FromModel(db.Model), claimToken), ct);
+
+    /// <summary>
+    /// T5: puts back in the queue every claim <paramref name="claimToken"/> still holds.
+    /// </summary>
+    internal static SweepStatement RequeueInterruptedStatement(CohortStoreTables tables, Guid claimToken) =>
+        CohortStatements.Statement(
+            "requeue-interrupted",
+            $"""
+            UPDATE {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)}
+            SET "State" = @pending, "ClaimedAt" = NULL, "ClaimToken" = NULL
+            WHERE "ClaimToken" = @claimToken AND "State" = @inFlight
             """,
-            [Pending, claimToken, InFlight],
-            ct
+            new SqlParams { ["pending"] = Pending, ["claimToken"] = claimToken, ["inFlight"] = InFlight },
+            tables.SweepRowHandlerStatus
         );
+
+    /// <summary>
+    /// T2: claims up to <paramref name="limit"/> due rows under <paramref name="claimToken"/> and
+    /// returns them with their row details, locking the due rows with <c>SKIP LOCKED</c>.
+    /// </summary>
+    internal static SweepStatement ClaimStatement(
+        CohortStoreTables tables,
+        Guid claimToken,
+        int limit,
+        DateTimeOffset now
+    )
+    {
+        var status = PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus);
+        var detail = PostgreSqlIdentifier.Format(tables.SweepRunRowDetail);
+        return CohortStatements.Statement(
+            "claim-handlers",
+            $"""
+            WITH due AS (
+                SELECT status."Id"
+                FROM {status} AS status
+                INNER JOIN {detail} AS detail
+                    ON detail."Id" = status."SweepRunRowDetailId"
+                INNER JOIN {PostgreSqlIdentifier.Format(tables.SweepRun)} AS run
+                    ON run."SweepId" = detail."SweepId"
+                WHERE status."State" = @pending AND status."NextAttemptAt" <= @now
+                  AND (
+                      status."DispatchPhase" = @immediate
+                      OR (run."SettledAt" IS NOT NULL AND run."Status" <> @started)
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {status} AS blocker
+                      WHERE blocker."SweepRunRowDetailId" = status."SweepRunRowDetailId"
+                        AND blocker."Id" < status."Id"
+                        AND blocker."State" IN (@pending, @inFlight)
+                  )
+                ORDER BY status."NextAttemptAt", status."Id"
+                FOR UPDATE OF status SKIP LOCKED
+                LIMIT @limit
+            ),
+            claimed AS (
+                UPDATE {status} AS status
+                SET "State" = @inFlight, "ClaimedAt" = @now, "ClaimToken" = @claimToken, "Attempt" = status."Attempt" + 1
+                FROM due
+                WHERE status."Id" = due."Id"
+                RETURNING status."Id", status."SweepRunRowDetailId", status."HandlerType", status."Attempt", status."ClaimedAt", status."ClaimToken"
+            )
+            SELECT
+                claimed."Id" AS "StatusId",
+                detail."Id" AS "RowDetailId",
+                claimed."HandlerType",
+                claimed."Attempt",
+                claimed."ClaimedAt",
+                claimed."ClaimToken",
+                detail."SweepId",
+                detail."At",
+                detail."RetentionEntityId",
+                detail."EntityType",
+                detail."RecordId",
+                detail."Category",
+                detail."Strategy",
+                detail."TenantId",
+                detail."CapturedPayload"
+            FROM claimed
+            INNER JOIN {detail} AS detail
+                ON detail."Id" = claimed."SweepRunRowDetailId"
+            ORDER BY claimed."Id"
+            """,
+            new SqlParams
+            {
+                ["pending"] = Pending,
+                ["inFlight"] = InFlight,
+                ["now"] = now,
+                ["immediate"] = (int)RowHandlerDispatchPhase.Immediate,
+                ["started"] = (int)SweepRunStatus.Started,
+                ["limit"] = limit,
+                ["claimToken"] = claimToken,
+            },
+            tables.SweepRowHandlerStatus,
+            tables.SweepRunRowDetail,
+            tables.SweepRun
+        );
+    }
 
     /// <summary>
     /// Claims up to <paramref name="limit"/> due rows under <paramref name="claimToken"/> and
@@ -319,71 +481,14 @@ internal static class RowHandlerQueueSql
         CancellationToken ct
     )
     {
-        var storeTables = CohortStoreTables.FromModel(leaseDb.Model);
-        var tables = storeTables.Quoted();
-        var now = DateTimeOffset.UtcNow;
+        var tables = CohortStoreTables.FromModel(leaseDb.Model);
+        var statement = ClaimStatement(tables, claimToken, limit, DateTimeOffset.UtcNow);
         await using var transaction = await leaseDb.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
 
         var claimed = await leaseDb.Database
             .SqlQueryRaw<ClaimedHandlerRow>(
-                $$"""
-                WITH due AS (
-                    SELECT status."Id"
-                    FROM {{tables.SweepRowHandlerStatus}} AS status
-                    INNER JOIN {{tables.SweepRunRowDetail}} AS detail
-                        ON detail."Id" = status."SweepRunRowDetailId"
-                    INNER JOIN {{tables.SweepRun}} AS run
-                        ON run."SweepId" = detail."SweepId"
-                    WHERE status."State" = {0} AND status."NextAttemptAt" <= {2}
-                      AND (
-                          status."DispatchPhase" = {3}
-                          OR (run."SettledAt" IS NOT NULL AND run."Status" <> {4})
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM {{tables.SweepRowHandlerStatus}} AS blocker
-                          WHERE blocker."SweepRunRowDetailId" = status."SweepRunRowDetailId"
-                            AND blocker."Id" < status."Id"
-                            AND blocker."State" IN ({0}, {1})
-                      )
-                    ORDER BY status."NextAttemptAt", status."Id"
-                    FOR UPDATE OF status SKIP LOCKED
-                    LIMIT {5}
-                ),
-                claimed AS (
-                    UPDATE {{tables.SweepRowHandlerStatus}} AS status
-                    SET "State" = {1}, "ClaimedAt" = {2}, "ClaimToken" = {6}, "Attempt" = status."Attempt" + 1
-                    FROM due
-                    WHERE status."Id" = due."Id"
-                    RETURNING status."Id", status."SweepRunRowDetailId", status."HandlerType", status."Attempt", status."ClaimedAt", status."ClaimToken"
-                )
-                SELECT
-                    claimed."Id" AS "StatusId",
-                    detail."Id" AS "RowDetailId",
-                    claimed."HandlerType",
-                    claimed."Attempt",
-                    claimed."ClaimedAt",
-                    claimed."ClaimToken",
-                    detail."SweepId",
-                    detail."At",
-                    detail."RetentionEntityId",
-                    detail."EntityType",
-                    detail."RecordId",
-                    detail."Category",
-                    detail."Strategy",
-                    detail."TenantId",
-                    detail."CapturedPayload"
-                FROM claimed
-                INNER JOIN {{tables.SweepRunRowDetail}} AS detail
-                    ON detail."Id" = claimed."SweepRunRowDetailId"
-                ORDER BY claimed."Id"
-                """,
-                Pending,
-                InFlight,
-                now,
-                (int)RowHandlerDispatchPhase.Immediate,
-                (int)SweepRunStatus.Started,
-                limit,
-                claimToken
+                statement.Sql,
+                statement.Parameters.ToDbParameters(leaseDb.Database.GetDbConnection())
             )
             .ToListAsync(ct);
 
@@ -394,7 +499,7 @@ internal static class RowHandlerQueueSql
             await RetentionRunAdvisoryLock.AcquireAllAsync(
                 leaseDb.Database.GetDbConnection(),
                 transaction.GetDbTransaction(),
-                [.. claimed.Select(row => RetentionRunAdvisoryLock.RowHandlerKeyFor(storeTables.SweepRowHandlerStatus, row.StatusId))],
+                [.. claimed.Select(row => RetentionRunAdvisoryLock.RowHandlerKeyFor(tables.SweepRowHandlerStatus, row.StatusId))],
                 ct
             );
         }
@@ -410,12 +515,11 @@ internal static class RowHandlerQueueSql
     internal static async Task<bool> SettleSucceededAsync(DbContext db, ClaimedHandlerRow claimed, CancellationToken ct) =>
         await UpdateOwnedAsync(
             db,
+            OwnedUpdate.Succeeded,
             claimed.StatusId,
             claimed.ClaimToken,
-            """
-            "State" = {0}, "CompletedAt" = {1}, "ClaimedAt" = NULL, "ClaimToken" = NULL, "LastError" = NULL
-            """,
-            [Succeeded, DateTimeOffset.UtcNow],
+            DateTimeOffset.UtcNow,
+            null,
             ct
         ) == 1;
 
@@ -432,12 +536,11 @@ internal static class RowHandlerQueueSql
     ) =>
         await UpdateOwnedAsync(
             db,
+            OwnedUpdate.Retry,
             claimed.StatusId,
             claimed.ClaimToken,
-            """
-            "State" = {0}, "NextAttemptAt" = {1}, "ClaimedAt" = NULL, "ClaimToken" = NULL, "LastError" = {2}
-            """,
-            [Pending, nextAttemptAt, lastError],
+            nextAttemptAt,
+            lastError,
             ct
         ) == 1;
 
@@ -458,10 +561,11 @@ internal static class RowHandlerQueueSql
         await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
         var settled = await UpdateOwnedAsync(
             db,
+            OwnedUpdate.DeadLetter,
             claimed.StatusId,
             claimed.ClaimToken,
-            DeadLetterAssignments,
-            [DeadLettered, now, lastError],
+            now,
+            lastError,
             ct
         );
         if (settled != 1)
@@ -481,42 +585,135 @@ internal static class RowHandlerQueueSql
         DateTimeOffset now,
         CancellationToken ct
     ) =>
-        db.Database.ExecuteSqlRawAsync(
-            $$"""
-            UPDATE {{CohortStoreTables.FromModel(db.Model).Quoted().SweepRowHandlerStatus}}
-            SET {{DeadLetterAssignments}}
-            WHERE "SweepRunRowDetailId" = {3} AND "Id" > {4} AND "State" IN ({5}, {6})
-            """,
-            [DeadLettered, now, DependentDeadLetterReason, rowDetailId, statusId, Pending, InFlight],
+        ExecuteAsync(
+            db,
+            DeadLetterDependentsStatement(
+                CohortStoreTables.FromModel(db.Model),
+                rowDetailId,
+                statusId,
+                now,
+                DependentDeadLetterReason
+            ),
             ct
         );
 
     /// <summary>
-    /// Updates this handler row only while this delivery still owns its claim: a reclaim
-    /// replaces the token, so a stale delivery matches nothing. Raw SQL rather
-    /// than ExecuteUpdateAsync: Cohort builds against EF Core 9, and EF Core 10 replaced the
-    /// setter types, so a compiled ExecuteUpdateAsync call fails to load on EF Core 10 hosts.
+    /// T6: dead-letters every pending or in-flight handler of the row detail after
+    /// <paramref name="statusId"/>, which can never run now. <paramref name="reason"/> is bound as
+    /// given, so a check can pass a typed NULL.
     /// </summary>
-    private static Task<int> UpdateOwnedAsync(
-        DbContext db,
+    internal static SweepStatement DeadLetterDependentsStatement(
+        CohortStoreTables tables,
+        long rowDetailId,
+        long statusId,
+        DateTimeOffset now,
+        object? reason
+    ) =>
+        CohortStatements.Statement(
+            "dead-letter-dependents",
+            $"""
+            UPDATE {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)}
+            SET {DeadLetterAssignments}
+            WHERE "SweepRunRowDetailId" = @rowDetailId AND "Id" > @statusId AND "State" IN (@pending, @inFlight)
+            """,
+            new SqlParams
+            {
+                ["state"] = DeadLettered,
+                ["at"] = now,
+                ["lastError"] = reason,
+                ["rowDetailId"] = rowDetailId,
+                ["statusId"] = statusId,
+                ["pending"] = Pending,
+                ["inFlight"] = InFlight,
+            },
+            tables.SweepRowHandlerStatus
+        );
+
+    /// <summary>
+    /// T4: updates this handler row only while the delivery still owns its claim: a reclaim
+    /// replaces the token, so a stale delivery matches nothing. <paramref name="at"/> is the
+    /// completion time, or the next attempt's for a retry or a requeue; <paramref name="lastError"/>
+    /// is bound as given and only a retry or a dead letter has one. Raw SQL rather than
+    /// ExecuteUpdateAsync: Cohort builds against EF Core 9, and EF Core 10 replaced the setter
+    /// types, so a compiled ExecuteUpdateAsync call fails to load on EF Core 10 hosts.
+    /// </summary>
+    internal static SweepStatement OwnedUpdateStatement(
+        CohortStoreTables tables,
+        OwnedUpdate form,
         long statusId,
         Guid claimToken,
-        string assignments,
-        object[] values,
-        CancellationToken ct
+        DateTimeOffset at,
+        object? lastError
     )
     {
-        var n = values.Length;
-        return db.Database.ExecuteSqlRawAsync(
-            $$"""
-            UPDATE {{CohortStoreTables.FromModel(db.Model).Quoted().SweepRowHandlerStatus}}
-            SET {{assignments}}
-            WHERE "Id" = {{{n}}} AND "State" = {{{n + 1}}} AND "ClaimToken" = {{{n + 2}}}
+        var (name, assignments, state) = form switch
+        {
+            OwnedUpdate.Succeeded => (
+                "handler-status-succeeded",
+                """
+                "State" = @state, "CompletedAt" = @at, "ClaimedAt" = NULL, "ClaimToken" = NULL, "LastError" = NULL
+                """,
+                Succeeded
+            ),
+            OwnedUpdate.Retry => (
+                "handler-status-retry",
+                """
+                "State" = @state, "NextAttemptAt" = @at, "ClaimedAt" = NULL, "ClaimToken" = NULL, "LastError" = @lastError
+                """,
+                Pending
+            ),
+            OwnedUpdate.DeadLetter => ("handler-status-dead-letter", DeadLetterAssignments, DeadLettered),
+            OwnedUpdate.Requeue => (
+                "handler-status-requeue",
+                """
+                "State" = @state, "NextAttemptAt" = @at, "ClaimedAt" = NULL, "ClaimToken" = NULL
+                """,
+                Pending
+            ),
+            _ => throw new ArgumentOutOfRangeException(nameof(form)),
+        };
+        var parameters = new SqlParams { ["state"] = state, ["at"] = at };
+        if (form is OwnedUpdate.Retry or OwnedUpdate.DeadLetter)
+        {
+            parameters["lastError"] = lastError;
+        }
+
+        parameters["statusId"] = statusId;
+        parameters["inFlight"] = InFlight;
+        parameters["claimToken"] = claimToken;
+        return CohortStatements.Statement(
+            name,
+            $"""
+            UPDATE {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)}
+            SET {assignments}
+            WHERE "Id" = @statusId AND "State" = @inFlight AND "ClaimToken" = @claimToken
             """,
-            [.. values, statusId, InFlight, claimToken],
-            ct
+            parameters,
+            tables.SweepRowHandlerStatus
         );
     }
+
+    private static Task<int> UpdateOwnedAsync(
+        DbContext db,
+        OwnedUpdate form,
+        long statusId,
+        Guid claimToken,
+        DateTimeOffset at,
+        object? lastError,
+        CancellationToken ct
+    ) =>
+        ExecuteAsync(
+            db,
+            OwnedUpdateStatement(CohortStoreTables.FromModel(db.Model), form, statusId, claimToken, at, lastError),
+            ct
+        );
+
+    private static Task<int> ExecuteAsync(DbContext db, SweepStatement statement, CancellationToken ct) =>
+        db.Database.ExecuteSqlRawAsync(
+            statement.Sql,
+            statement.Parameters.ToDbParameters(db.Database.GetDbConnection()),
+            ct
+        );
 
     private sealed class RemainingWork
     {
@@ -524,6 +721,25 @@ internal static class RowHandlerQueueSql
         public long Pending { get; init; }
         public long DeadLetteredRequeueable { get; init; }
     }
+}
+
+/// <summary>
+/// Which assignments <see cref="RowHandlerQueueSql.OwnedUpdateStatement"/> makes to a handler row
+/// whose claim the caller still owns.
+/// </summary>
+internal enum OwnedUpdate
+{
+    /// <summary>The delivery succeeded.</summary>
+    Succeeded,
+
+    /// <summary>The delivery failed and goes back in the queue until its next attempt.</summary>
+    Retry,
+
+    /// <summary>The delivery failed for good.</summary>
+    DeadLetter,
+
+    /// <summary>An expired claim with attempts left goes back in the queue.</summary>
+    Requeue,
 }
 
 /// <summary>

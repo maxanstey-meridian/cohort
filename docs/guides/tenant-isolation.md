@@ -190,16 +190,37 @@ headroom.
 
 ## Grants
 
-The tenant role needs `SELECT, INSERT, UPDATE, DELETE` on the five Cohort tables, as well as
-on your retained tables. The identity columns behind `sweep_run_row_detail.Id` and
-`sweep_row_handler_status.Id` need no separate sequence grant.
+Readiness explains the statements each operation sends, grouped by operation, under the role
+of the scope that sends them, the first time that role reaches readiness. So each scope's role
+needs only the privileges of the groups it runs, on Cohort's five tables and on your retained
+tables, and a role that lacks one is refused before the operation writes anything:
 
-Readiness explains the statements of every scope under the role that reaches it, whichever
-operation that is first, and it runs once per model and connection string. So if your scopes
-use different roles, only the role of the first operation to reach readiness is checked, and
-it must hold the host-table privileges of every scope, not just its own. Give every role that
-may come first the same privileges: `SELECT` on each retained table, `retention_holds`,
-`sweep_run_row_detail`, and the child table of any foreign key that blocks a purge; `UPDATE`
-on each retained table; `DELETE` where `Purge` is declared; and `USAGE` on the schemas of all
-of those tables. See
-[Upgrading to 0.12.0](/reference/startup-validation#upgrading-to-0-12-0).
+| Group | Sent in | Needs on Cohort's tables |
+|---|---|---|
+| Sweeps, dry runs, and scheduled passes | `Tenant`, or `System(TenantlessPass)` | `SELECT`, `INSERT`, `UPDATE` on `sweep_run` and `sweep_run_entity_summary`; `SELECT`, `INSERT` on `sweep_run_row_detail`; `SELECT` on `retention_holds`; `INSERT` on `sweep_row_handler_status` with a row handler or dependents step |
+| Erasures | `Tenant`, or `System(TenantlessPass)`; your own scope for `ErasureTransaction.Caller` | The same as sweeps |
+| Previews | `Tenant`, or `System(TenantlessPass)` | `SELECT` on `retention_holds` |
+| `IRetentionHoldsRepository` | Your scope | `SELECT`, `INSERT`, `UPDATE` on `retention_holds` |
+| `IRetentionDeletion` | Your scope | `SELECT` on `retention_holds` |
+| Readiness's own reads | `System(Readiness)` | `SELECT` on `retention_holds` |
+| Payload scrub | `System(RowDispatch)` | `SELECT`, `UPDATE` on `sweep_run_row_detail` |
+| Row-handler dispatch | `System(RowDispatch)` | `SELECT`, `UPDATE` on `sweep_run`, `sweep_run_row_detail`, and `sweep_row_handler_status` |
+| The scheduled worker's lock, ledger, and tenant coverage check | `System(WorkerCoordination)` | `SELECT` on `sweep_run` |
+| History pruning | `System(HistoryPruning)` | Per retention set (`DELETE` on the run tables only when run retention is set; `UPDATE`, `DELETE` on `retention_holds` only when hold retention is) |
+
+On your retained tables the same roles need `SELECT`, and `UPDATE` where they lock rows
+(sweeps, erasures, and holds); sweeps and erasures also need `DELETE` where `Purge` is declared
+and `SELECT` on the child table of any foreign key that blocks a purge. The worker needs only
+`SELECT` on each tenanted retained table. Every role needs `USAGE` on the schemas of the
+tables it touches. See [Startup Validation](/reference/startup-validation#statements) for the
+full list, including `EXECUTE` on the PostgreSQL functions Cohort calls, which PUBLIC holds by
+default.
+
+A tenant's or your own scope's role is checked at its first use, not at startup: a second
+tenant's role, or a role a scope hook switches to later, is checked when it first reaches
+readiness. Startup does check the payload scrub, the dispatcher (while the kill switch is
+off), the worker (when it runs), and pruning (for the retentions set), each in its own scope
+under its own role. The identity
+columns behind `sweep_run_row_detail.Id` and `sweep_row_handler_status.Id` need no separate
+sequence grant; a serial column in their place needs `USAGE` on its sequence, which readiness
+checks. See [Upgrading to 0.12.0](/reference/startup-validation#upgrading-to-0-12-0).

@@ -41,7 +41,7 @@ internal sealed class RetentionErasureService(
             ? await ValidateCallerTransactionAsync(ct)
             : null;
 
-        await readinessValidator.ValidateAsync(ct);
+        await readinessValidator.ValidateAsync(RetentionStatementGroup.Erasure, ct);
         // Refused before any run exists: a kind no retained entity declares would erase nothing.
         var validation = validationState.For(db.Model);
         ErasureSubjectValidation.Validate(
@@ -106,10 +106,11 @@ internal sealed class RetentionErasureService(
             );
         }
 
-        await using var command = new SqlParams().CreateCommand(
+        var statement = CohortStatements.TransactionIsolation();
+        await using var command = statement.Parameters.CreateCommand(
             db.Database.GetDbConnection(),
             transaction.GetDbTransaction(),
-            "SELECT pg_catalog.current_setting('transaction_isolation')"
+            statement.Sql
         );
         var isolation = (string?)await command.ExecuteScalarAsync(ct);
         // PostgreSQL accepts READ UNCOMMITTED and runs it as READ COMMITTED.

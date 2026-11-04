@@ -20,7 +20,8 @@ namespace Cohort.Infrastructure.Holds;
 internal sealed class RetentionHoldGuard(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
     RetentionRegistry registry,
-    IServiceScopeFactory scopeFactory
+    IServiceScopeFactory scopeFactory,
+    RetentionRuntimeReadinessValidator readinessValidator
 )
 {
     /// <summary>
@@ -184,8 +185,12 @@ internal sealed class RetentionHoldGuard(
         registry.Scan().Values.Where(entry => entry.CoveredPaths.Count > 0).Select(entry => entry.RetentionEntityId).ToHashSet()
     );
 
-    private Task<HashSet<Guid>> ReadSystemTenantlessHoldsAsync(CancellationToken ct) =>
-        scopeFactory.RunInScopeAsync(
+    private async Task<HashSet<Guid>> ReadSystemTenantlessHoldsAsync(CancellationToken ct)
+    {
+        // Read before the scope opens, so no statement of the caller's connection runs inside
+        // the scope's hook.
+        var callerDatabase = await readinessValidator.ReadCallerDatabaseAsync(ct);
+        return await scopeFactory.RunInScopeAsync(
             new RetentionExecutionContext.System(RetentionSystemWork.Readiness),
             async services =>
             {
@@ -193,6 +198,9 @@ internal sealed class RetentionHoldGuard(
                 await systemDb.Database.OpenConnectionAsync(ct);
                 try
                 {
+                    // A scope that reaches another database, or runs as a role the model pass
+                    // never saw, is refused here rather than failing the read below.
+                    await readinessValidator.ValidateReadinessScopeAsync(systemDb.Database, callerDatabase, ct);
                     return await ReadActiveTenantlessHoldsAsync(systemDb.Database.GetDbConnection(), null, ct);
                 }
                 finally
@@ -202,6 +210,7 @@ internal sealed class RetentionHoldGuard(
             },
             ct
         );
+    }
 
     private async Task<HashSet<Guid>> ReadActiveTenantlessHoldsAsync(
         DbConnection connection,
@@ -209,11 +218,8 @@ internal sealed class RetentionHoldGuard(
         CancellationToken ct
     )
     {
-        await using var command = new SqlParams().CreateCommand(
-            connection,
-            transaction,
-            RetentionHoldSql.BuildActiveTenantlessHoldIds(CohortStoreTables.FromModel(db.Model).RetentionHolds)
-        );
+        var statement = RetentionHoldSql.BuildActiveTenantlessHoldIds(CohortStoreTables.FromModel(db.Model).RetentionHolds);
+        await using var command = statement.Parameters.CreateCommand(connection, transaction, statement.Sql);
         var holdIds = new HashSet<Guid>();
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))

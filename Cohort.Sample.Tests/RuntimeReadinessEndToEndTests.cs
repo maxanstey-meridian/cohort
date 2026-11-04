@@ -506,6 +506,37 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             );
     }
 
+    // The model pass checks the System(Readiness) scope's database once per entry. The guard that
+    // reads tenantless holds before IRetentionDeletion runs checks its own scope's database each
+    // time, so a scope a hook routes elsewhere after readiness passed is refused before it reads.
+    // Make-fail: the database comparison skipped in the readiness scope's check (the deletion
+    // completes and the callback removes the row).
+    [Fact]
+    public async Task A_readiness_scope_switched_to_another_database_is_refused_before_the_guard_reads_holds()
+    {
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await using var otherDatabase = await MigratedTemporaryDatabaseAsync();
+        string? systemRoute = null;
+        await using var provider = BuildSystemRoutedProvider(database.ConnectionString, () => systemRoute);
+        var first = await SeedTenantlessLogAsync(database.ConnectionString);
+        var second = await SeedTenantlessLogAsync(database.ConnectionString);
+
+        await using (var scope = provider.CreateAsyncScope())
+        {
+            (await DeleteTenantlessLogAsync(scope.ServiceProvider, first)).Should().Be(RetentionDeletionOutcome.Executed);
+        }
+
+        systemRoute = otherDatabase.ConnectionString;
+        await using var switchedScope = provider.CreateAsyncScope();
+        var act = () => DeleteTenantlessLogAsync(switchedScope.ServiceProvider, second);
+
+        (await act.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                error.Contains("different database", StringComparison.Ordinal)
+            );
+        (await TenantlessLogExistsAsync(database.ConnectionString, second)).Should().BeTrue();
+    }
+
     [Fact]
     public async Task Readiness_accepts_a_system_scope_that_reaches_the_same_database_through_a_differently_spelled_connection_string()
     {
@@ -1327,6 +1358,630 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         );
     }
 
+    // ── each scope's role is checked for the statements its operation sends ────────────────────
+    //
+    // ScopeRoles gives every kind of scope Cohort creates a role of its own (the connecting
+    // superuser switches into it when a connection opens), so these tests revoke a privilege
+    // from one scope's role and see which operations notice.
+
+    public enum CohortOperation
+    {
+        Sweep,
+        SweepWithHandler,
+        SweepWithoutPerRowAnonymise,
+        CreateHold,
+    }
+
+    // The role is refused in the Cohort error for the privilege it lacks, naming the operation
+    // and the role. The handler-status revoke is refused only where a run records handler
+    // bookkeeping (a row handler): a host with only per-row Anonymise sends neither statement
+    // for it, and neither does one with no per-row Anonymise at all.
+    // Make-fails: ForSweep and ForHolds dropped from RetentionStatementReadiness.EnumerateAsync
+    // (rows 1 to 4 pass instead of being refused); then HandlerBookkeeping derived from PathOf
+    // (the per-row Anonymise row is refused).
+    [Theory]
+    [InlineData("INSERT ON public.sweep_run", CohortOperation.Sweep, "sweeps", "sweep_run", true)]
+    [InlineData("UPDATE ON public.sweep_run_entity_summary", CohortOperation.Sweep, "sweeps", "sweep_run_entity_summary", true)]
+    [InlineData("INSERT ON public.retention_holds", CohortOperation.CreateHold, "hold calls", "retention_holds", true)]
+    [InlineData("INSERT ON public.sweep_row_handler_status", CohortOperation.SweepWithHandler, "sweeps", "sweep_row_handler_status", true)]
+    [InlineData("INSERT ON public.sweep_row_handler_status", CohortOperation.Sweep, "sweeps", "sweep_row_handler_status", false)]
+    [InlineData("INSERT ON public.sweep_row_handler_status", CohortOperation.SweepWithoutPerRowAnonymise, "sweeps", "sweep_row_handler_status", false)]
+    public async Task Readiness_refuses_a_role_that_cannot_write_cohorts_tables(
+        string revoke,
+        CohortOperation operation,
+        string scope,
+        string table,
+        bool refused
+    )
+    {
+        await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await roles.GrantAsync(database);
+        // A hold is created in the caller's own scope; a sweep runs as the tenant.
+        var role = operation == CohortOperation.CreateHold ? roles.Caller : roles.Tenant;
+        await ExecuteAsync(database, $"REVOKE {revoke} FROM \"{role}\"");
+        using var host = RoleHost(
+            database,
+            roles,
+            operation == CohortOperation.SweepWithoutPerRowAnonymise ? new PurgeOnlyTombstoneRuleProvider() : null,
+            configure: operation == CohortOperation.SweepWithHandler
+                ? services => services.AddRowHandler<Note, NoOpNoteHandler>()
+                : null
+        );
+
+        var act = () => operation == CohortOperation.CreateHold
+            ? host.RunWithServicesAsync(services => services.GetRequiredService<IRetentionHoldsRepository>().CreateAsync(
+                new RetentionHoldRequest(Guid.NewGuid(), Note.RetentionIdentity, Guid.NewGuid().ToString(), Guid.NewGuid(), "litigation", DateTimeOffset.UtcNow),
+                CancellationToken.None
+            ))
+            : host.RunSweepAsync(NewTenant());
+
+        if (refused)
+        {
+            (await act.Should().ThrowAsync<RetentionConfigurationException>())
+                .Which.Errors.Should().ContainSingle(error => RefusesCohortTables(error, scope, role, table));
+        }
+        else
+        {
+            await act.Should().NotThrowAsync();
+        }
+    }
+
+    // A role with only SELECT can preview (the preview's counts and the clock) and is refused at
+    // a sweep (the audit rows and the host-table writes).
+    // Make-fail: RetentionPreviewService validates RetentionStatementGroup.Sweep.
+    [Fact]
+    public async Task A_read_only_role_can_preview()
+    {
+        await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await roles.GrantAsync(database);
+        await ExecuteAsync(database, $"REVOKE INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public FROM \"{roles.Tenant}\"");
+        using var host = RoleHost(database, roles);
+
+        var preview = () => host.RunPreviewAsync(NewTenant());
+        var sweep = () => host.RunSweepAsync(NewTenant());
+
+        await preview.Should().NotThrowAsync();
+        (await sweep.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().Contain(error =>
+                error.StartsWith("Cohort's own tables and functions: ", StringComparison.Ordinal)
+                && error.Contains(" in sweeps. ", StringComparison.Ordinal)
+                && error.Contains($"The database role '{roles.Tenant}' lacks this privilege", StringComparison.Ordinal)
+            );
+    }
+
+    // A System(Readiness) role that only reads passes startup, even with a serial row-detail Id
+    // it has no sequence grant for: the port groups' privileges belong to roles startup can't
+    // take on (a tenant's, say), so startup only reports a fault the database has whatever the
+    // role. A retained column the database lost refuses startup. The same role, when a sweep
+    // runs under it, is refused at its group pass for the privileges it lacks.
+    // Make-fails: startup's port check refuses 42501 (tolerateInsufficientPrivilege false);
+    // startup skips its port check; startup records its port check as a pass; startup runs
+    // Decision 7's sequence rule.
+    [Fact]
+    public async Task Startup_refuses_a_schema_fault_but_not_a_port_privilege()
+    {
+        await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await roles.GrantAsync(database);
+        await ExecuteAsync(database, $"REVOKE INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public FROM \"{roles.Readiness}\"");
+        await MakeRowDetailIdSerialAsync(database);
+        var tenant = NewTenant();
+        roles.AssignTenant(tenant.Id, roles.Readiness);
+        using var host = RoleHost(database, roles);
+
+        var start = () => host.RunWithServicesAsync(services => StartValidationAsync(services));
+        await start.Should().NotThrowAsync();
+
+        var sweep = () => host.RunSweepAsync(tenant);
+        (await sweep.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().Contain(error => RefusesCohortTables(error, "sweeps", roles.Readiness, "sweep_run"));
+
+        await ExecuteAsync(database, """ALTER TABLE public.soft_delete_records DROP COLUMN "DeletedAt" """);
+        // One error per group that reads the column (sweeps, erasures, and so on), as each is
+        // explained for its own scope.
+        (await start.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().Contain(error =>
+                RefusesWith(error, typeof(SoftDeleteRecord), "42703", "\"DeletedAt\"")
+            );
+    }
+
+    // A serial Id default needs USAGE on its sequence, which EXPLAIN never checks (it never
+    // calls nextval): a role without it fails the first row it inserts. An identity column needs
+    // no grant.
+    // Make-fail: the sequence rule removed from the Sweep and Erasure group passes.
+    [Theory]
+    [InlineData(true, false, true)]
+    [InlineData(true, true, false)]
+    [InlineData(false, false, false)]
+    public async Task Readiness_refuses_a_serial_row_detail_id_without_sequence_usage(
+        bool serial,
+        bool grantUsage,
+        bool refused
+    )
+    {
+        await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await roles.GrantAsync(database);
+        if (serial)
+        {
+            await MakeRowDetailIdSerialAsync(database);
+        }
+
+        if (grantUsage)
+        {
+            await ExecuteAsync(database, $"GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO \"{roles.Tenant}\"");
+        }
+
+        using var host = RoleHost(database, roles);
+
+        var act = () => host.RunSweepAsync(NewTenant());
+
+        if (refused)
+        {
+            (await act.Should().ThrowAsync<RetentionConfigurationException>())
+                .Which.Errors.Should().ContainSingle(error =>
+                    error.StartsWith("Cohort's own tables and functions: ", StringComparison.Ordinal)
+                    && error.Contains("\"public\".\"sweep_run_row_detail\".\"Id\"", StringComparison.Ordinal)
+                    && error.Contains("sweep_run_row_detail_id_seq", StringComparison.Ordinal)
+                    && error.Contains($"the database role '{roles.Tenant}' holds neither USAGE nor UPDATE on it", StringComparison.Ordinal)
+                    && error.Contains("make the column an identity column", StringComparison.Ordinal)
+                );
+        }
+        else
+        {
+            (await act()).EntityFailures.Should().BeEmpty();
+        }
+    }
+
+    // Cohort's lock calls are functions with a privilege of their own, which PUBLIC holds
+    // unless the database takes it away. Readiness binds the lock keys as real values: a NULL
+    // argument would let PostgreSQL fold a strict function away unchecked.
+    // Make-fail: the lock keys bound as typed NULLs in the readiness statements.
+    [Fact]
+    public async Task Readiness_refuses_a_role_without_execute_on_the_advisory_lock_functions()
+    {
+        await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await roles.GrantAsync(database);
+        await ExecuteAsync(database, "REVOKE EXECUTE ON FUNCTION pg_catalog.pg_advisory_lock(bigint) FROM PUBLIC");
+        using var host = RoleHost(database, roles);
+
+        var act = () => host.RunSweepAsync(NewTenant());
+
+        (await act.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                RefusesCohortTables(error, "sweeps", roles.Tenant, "function pg_advisory_lock")
+            );
+    }
+
+    // The stored entity identities are read in a System(Readiness) scope, which readiness
+    // explains first, so a role that cannot read the holds is refused in the Cohort error
+    // instead of failing the read.
+    // Make-fail: the Readiness group not explained before the read (ForReadiness skipped).
+    [Fact]
+    public async Task Readiness_refuses_a_readiness_scope_that_cannot_read_holds()
+    {
+        await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await roles.GrantAsync(database);
+        await ExecuteAsync(database, $"REVOKE SELECT ON public.retention_holds FROM \"{roles.Readiness}\"");
+        using var host = RoleHost(database, roles);
+
+        var act = () => host.RunSweepAsync(NewTenant());
+
+        (await act.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                RefusesCohortTables(error, "readiness", roles.Readiness, "retention_holds")
+            );
+    }
+
+    // The model pass explains the Readiness group once per entry, under the role its scope ran
+    // as. A scope hook that switches System(Readiness) to another role later is checked when it
+    // first reaches the guard that reads tenantless holds: a refusal in the Cohort error, not
+    // the raw 42501 of the read, and nothing deleted.
+    // Make-fail: the guard's call to ValidateReadinessScopeAsync removed (the deletion throws
+    // PostgresException).
+    [Fact]
+    public async Task A_readiness_role_switched_after_the_model_pass_is_checked_before_the_guard_reads_holds()
+    {
+        await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await roles.GrantAsync(database);
+        using var host = RoleHost(database, roles);
+        var first = await SeedTenantlessLogAsync(database.ConnectionString);
+        var second = await SeedTenantlessLogAsync(database.ConnectionString);
+
+        (await host.RunWithServicesAsync(services => DeleteTenantlessLogAsync(services, first)))
+            .Should().Be(RetentionDeletionOutcome.Executed);
+        var switched = await roles.UseReadinessRoleAsync(database);
+        var act = () => host.RunWithServicesAsync(services => DeleteTenantlessLogAsync(services, second));
+
+        (await act.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                RefusesCohortTables(error, "readiness", switched, "retention_holds")
+            );
+        (await TenantlessLogExistsAsync(database.ConnectionString, second)).Should().BeTrue();
+    }
+
+    // Each role is checked the first time it reaches readiness, for what its operation sends.
+    // Make-fail: ValidateAsync returns once the model pass stands (a validated entry), so the
+    // second tenant's role is never checked.
+    [Fact]
+    public async Task Each_scopes_role_is_checked_for_what_it_sends()
+    {
+        await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await roles.GrantAsync(database);
+        var first = NewTenant();
+        var second = NewTenant();
+        var secondRole = await roles.AddTenantRoleAsync(database, second.Id);
+        await ExecuteAsync(database, $"REVOKE INSERT ON public.sweep_run FROM \"{secondRole}\"");
+        // The dispatcher's role writes no host table: it sends only Cohort's own statements.
+        await RevokeHostTableWritesAsync(database, roles.RowDispatch);
+        using var host = RoleHost(database, roles);
+
+        var firstSweep = () => host.RunSweepAsync(first);
+        var secondSweep = () => host.RunSweepAsync(second);
+        var flush = () => host.RunWithServicesAsync(services => services.GetRequiredService<IRetentionRowDispatcher>().FlushAsync());
+
+        (await firstSweep()).EntityFailures.Should().BeEmpty();
+        (await secondSweep.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error => RefusesCohortTables(error, "sweeps", secondRole, "sweep_run"));
+        await flush.Should().NotThrowAsync();
+    }
+
+    // A dispatcher role that cannot claim work is refused in the Cohort error, from FlushAsync
+    // and from a poll alike, but only after the payload scrub has run: personal data never
+    // outlives its retention because the dispatcher's statements are refused. The tenant
+    // role's sweeps are untouched.
+    // Make-fails: Dispatch not validated by FlushAsync and PollAsync; then Dispatch validated
+    // before the scrub in both.
+    [Fact]
+    public async Task The_dispatcher_is_refused_under_a_role_that_cannot_claim_work()
+    {
+        await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await roles.GrantAsync(database);
+        await ExecuteAsync(database, $"REVOKE UPDATE ON public.sweep_row_handler_status FROM \"{roles.RowDispatch}\"");
+        using var host = RoleHost(database, roles);
+        var viaPoll = await SeedExpiredPayloadAsync(database);
+
+        var poll = () => host.RunWithServicesAsync(services => services.GetRequiredService<RetentionRowDispatcher>().PollAsync(CancellationToken.None));
+        var flush = () => host.RunWithServicesAsync(services => services.GetRequiredService<IRetentionRowDispatcher>().FlushAsync());
+
+        (await poll.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                RefusesCohortTables(error, "row-handler dispatch", roles.RowDispatch, "sweep_row_handler_status")
+            );
+        (await CapturedPayloadAsync(database, viaPoll)).Should().BeNull("the poll scrubbed before it refused");
+        var viaFlush = await SeedExpiredPayloadAsync(database);
+        (await flush.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                RefusesCohortTables(error, "row-handler dispatch", roles.RowDispatch, "sweep_row_handler_status")
+            );
+        (await CapturedPayloadAsync(database, viaFlush)).Should().BeNull("flush scrubbed before it refused");
+        (await host.RunSweepAsync(NewTenant())).EntityFailures.Should().BeEmpty();
+    }
+
+    // The worker's ledger read is the worker's group, checked when an iteration starts, before
+    // the iteration reads the clock or runs any pass.
+    // Make-fail: RetentionWorker.RunIterationAsync does not validate the Worker group.
+    [Fact]
+    public async Task The_worker_is_refused_under_a_role_that_cannot_read_the_ledger()
+    {
+        await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await roles.GrantAsync(database);
+        await ExecuteAsync(database, $"REVOKE SELECT ON public.sweep_run FROM \"{roles.WorkerCoordination}\"");
+        using var host = RoleHost(database, roles);
+
+        var act = () => host.RunWithServicesAsync(services => services
+            .GetServices<IHostedService>().OfType<RetentionWorker>().Single()
+            .RunScheduledIterationAsync("0 0 0 * * *", dryRun: false, settled: null, CancellationToken.None));
+
+        (await act.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                RefusesCohortTables(error, "the scheduled worker", roles.WorkerCoordination, "sweep_run")
+            );
+        (await CountAsync(database, "sweep_run")).Should().Be(0, "no pass ran");
+    }
+
+    public enum PruningCase
+    {
+        HoldsOnly,
+        RunsConfigured,
+        HoldsOnlyThenRunsByReload,
+    }
+
+    // The pruner's role is checked for the retentions it prunes. Without DELETE on the run
+    // tables, a pruner that only prunes inactive holds is fine, one that prunes settled runs is
+    // refused before it deletes anything, and a reload that adds the run retention is caught at
+    // the next prune.
+    // Make-fails: Pruning always enumerated with PruningScope(true, true, ...); then the
+    // Pruning enumeration kept without its scope.
+    [Theory]
+    [InlineData(PruningCase.HoldsOnly)]
+    [InlineData(PruningCase.RunsConfigured)]
+    [InlineData(PruningCase.HoldsOnlyThenRunsByReload)]
+    public async Task Pruning_is_checked_only_for_the_retentions_it_prunes(PruningCase pruningCase)
+    {
+        await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await roles.GrantAsync(database);
+        await ExecuteAsync(
+            database,
+            $"""REVOKE DELETE ON public.sweep_run, public.sweep_run_entity_summary, public.sweep_run_row_detail FROM "{roles.HistoryPruning}" """
+        );
+        await SeedSettledRunAsync(database, DateTimeOffset.UtcNow.AddDays(-100));
+        await SeedInactiveHoldAsync(database, DateTimeOffset.UtcNow.AddDays(-100));
+        var settings = new Dictionary<string, string?>
+        {
+            [$"{CohortOptions.SectionName}:HistoryPruning:InactiveHoldRetention"] = "1.00:00:00",
+        };
+        if (pruningCase == PruningCase.RunsConfigured)
+        {
+            settings[$"{CohortOptions.SectionName}:HistoryPruning:SucceededRunRetention"] = "1.00:00:00";
+        }
+
+        using var host = RoleHost(database, roles, configuration: settings);
+        var prune = () => host.RunWithServicesAsync(services => services.GetRequiredService<RetentionHistoryPruner>().PruneAsync());
+
+        if (pruningCase == PruningCase.HoldsOnly)
+        {
+            (await prune()).Should().Be(new RetentionHistoryPruneResult(0, 1));
+            (await CountAsync(database, "sweep_run")).Should().Be(1);
+            return;
+        }
+
+        if (pruningCase == PruningCase.HoldsOnlyThenRunsByReload)
+        {
+            (await prune()).Should().Be(new RetentionHistoryPruneResult(0, 1));
+            await host.RunWithServicesAsync(services =>
+            {
+                var configuration = (IConfigurationRoot)services.GetRequiredService<IConfiguration>();
+                configuration[$"{CohortOptions.SectionName}:HistoryPruning:SucceededRunRetention"] = "1.00:00:00";
+                configuration.Reload();
+                return Task.CompletedTask;
+            });
+        }
+
+        (await prune.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                RefusesCohortTables(error, "history pruning", roles.HistoryPruning, "sweep_run")
+            );
+        (await CountAsync(database, "sweep_run")).Should().Be(1, "nothing was deleted");
+    }
+
+    // Startup checks, in its own scope and under its own role, each background subsystem that
+    // will run: a dispatcher role that cannot claim work stops the host; a pruner role without
+    // DELETE does not while pruning is off.
+    // Make-fails: the startup groups skipped (RetentionValidationHostedService); then Pruning
+    // checked unconditionally.
+    [Fact]
+    public async Task Startup_checks_each_group_that_will_run_in_its_own_scope()
+    {
+        await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await roles.GrantAsync(database);
+        await ExecuteAsync(
+            database,
+            $"""REVOKE DELETE ON public.sweep_run, public.sweep_run_entity_summary, public.sweep_run_row_detail FROM "{roles.HistoryPruning}" """
+        );
+        using var pruningOff = RoleHost(database, roles);
+        await pruningOff.RunWithServicesAsync(services => StartValidationAsync(services));
+
+        await ExecuteAsync(database, $"REVOKE UPDATE ON public.sweep_row_handler_status FROM \"{roles.RowDispatch}\"");
+        using var host = RoleHost(database, roles);
+
+        var start = () => host.RunWithServicesAsync(services => StartValidationAsync(services));
+
+        (await start.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                RefusesCohortTables(error, "row-handler dispatch", roles.RowDispatch, "sweep_row_handler_status")
+            );
+    }
+
+    private CohortTestHost RoleHost(
+        TemporaryDatabase database,
+        ScopeRoles roles,
+        IRetentionRuleProvider? ruleProvider = null,
+        IReadOnlyDictionary<string, string?>? configuration = null,
+        Action<IServiceCollection>? configure = null
+    ) =>
+        new(
+            database.ConnectionString,
+            ruleProvider,
+            configuration,
+            services =>
+            {
+                roles.Install<SampleDbContext>(services);
+                configure?.Invoke(services);
+            }
+        );
+
+    private static TenantContext NewTenant() =>
+        new(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+
+    private static async Task<Guid> SeedTenantlessLogAsync(string connectionString)
+    {
+        await using var db = new SampleDbContext(
+            new DbContextOptionsBuilder<SampleDbContext>().UseNpgsql(connectionString).Options
+        );
+        var log = new TenantlessLog { Id = Guid.NewGuid(), CreatedAt = DateTimeOffset.UtcNow, Payload = "readiness" };
+        db.TenantlessLogs.Add(log);
+        await db.SaveChangesAsync();
+        return log.Id;
+    }
+
+    private static async Task<bool> TenantlessLogExistsAsync(string connectionString, Guid id)
+    {
+        await using var db = new SampleDbContext(
+            new DbContextOptionsBuilder<SampleDbContext>().UseNpgsql(connectionString).Options
+        );
+        return await db.TenantlessLogs.AnyAsync(log => log.Id == id);
+    }
+
+    // Deletes one tenantless row through the deletion port, the callback removing it for real.
+    private static Task<RetentionDeletionOutcome> DeleteTenantlessLogAsync(IServiceProvider services, Guid id)
+    {
+        var db = services.GetRequiredService<SampleDbContext>();
+        return services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+            [new RetentionTarget(RetentionEntityIdentity.For<TenantlessLog>(), id.ToString(), null)],
+            async ct => await db.TenantlessLogs.Where(log => log.Id == id).ExecuteDeleteAsync(ct)
+        );
+    }
+
+    // Cohort's error for statements against its own tables and functions: the operation, the
+    // PostgreSQL message, and the role that lacks the privilege.
+    private static bool RefusesCohortTables(string error, string scope, string role, string denied) =>
+        error.StartsWith("Cohort's own tables and functions: PostgreSQL refused statements Cohort sends in ", StringComparison.Ordinal)
+        && error.Contains($" in {scope}. ", StringComparison.Ordinal)
+        && error.Contains($" 42501: permission denied for {(denied.StartsWith("function ", StringComparison.Ordinal) ? denied : $"table {denied}")}", StringComparison.Ordinal)
+        && error.Contains($"The database role '{role}' lacks this privilege", StringComparison.Ordinal);
+
+    // Runs the hosted startup check, which a host runs once before it serves.
+    private static Task StartValidationAsync(IServiceProvider services) =>
+        services.GetServices<IHostedService>().OfType<RetentionValidationHostedService>().Single()
+            .StartAsync(CancellationToken.None);
+
+    // A bigserial default on the row-detail Id, which the schema validator accepts and which
+    // needs USAGE on the sequence.
+    private static Task MakeRowDetailIdSerialAsync(TemporaryDatabase database) =>
+        ExecuteAsync(
+            database,
+            """
+            ALTER TABLE public.sweep_run_row_detail ALTER COLUMN "Id" DROP IDENTITY;
+            CREATE SEQUENCE public.sweep_run_row_detail_id_seq OWNED BY public.sweep_run_row_detail."Id";
+            ALTER TABLE public.sweep_run_row_detail
+                ALTER COLUMN "Id" SET DEFAULT nextval('public.sweep_run_row_detail_id_seq')
+            """
+        );
+
+    // Everything but Cohort's five tables: the host's own.
+    private static Task RevokeHostTableWritesAsync(TemporaryDatabase database, string role) =>
+        ExecuteAsync(
+            database,
+            $$"""
+            DO $$
+            DECLARE name text;
+            BEGIN
+                FOR name IN
+                    SELECT tablename FROM pg_catalog.pg_tables
+                    WHERE schemaname = 'public'
+                      AND tablename NOT IN ('retention_holds', 'sweep_run', 'sweep_run_entity_summary',
+                                            'sweep_run_row_detail', 'sweep_row_handler_status')
+                LOOP
+                    EXECUTE format('REVOKE INSERT, UPDATE, DELETE ON public.%I FROM %I', name, '{{role}}');
+                END LOOP;
+            END
+            $$
+            """
+        );
+
+    // A run's row detail whose captured payload is past PayloadRetention (30 days by default).
+    private static async Task<long> SeedExpiredPayloadAsync(TemporaryDatabase database)
+    {
+        var sweepId = Guid.NewGuid();
+        var at = DateTimeOffset.UtcNow.AddDays(-60);
+        await using var connection = new NpgsqlConnection(database.ConnectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO "sweep_run"
+                ("SweepId", "StartedAt", "Status", "SettledAt", "Duration", "TriggerKind", "DryRun", "TenantId", "TotalAffected")
+            VALUES (@sweepId, @at, 1, @at, INTERVAL '0', 2, FALSE, @tenantId, 1);
+            INSERT INTO "sweep_run_row_detail"
+                ("SweepId", "At", "EntityType", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId", "CapturedPayload")
+            VALUES (@sweepId, @at, 'Cohort.Sample.Entities.Note', @entityId, @recordId, 'short-lived', 0, @tenantId, '{"body":"personal"}')
+            RETURNING "Id";
+            """;
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        command.Parameters.AddWithValue("at", at);
+        command.Parameters.AddWithValue("tenantId", Guid.NewGuid());
+        command.Parameters.AddWithValue("entityId", Note.RetentionIdentity);
+        command.Parameters.AddWithValue("recordId", Guid.NewGuid().ToString());
+        return Convert.ToInt64(await command.ExecuteScalarAsync(), CultureInfo.InvariantCulture);
+    }
+
+    private static async Task<string?> CapturedPayloadAsync(TemporaryDatabase database, long rowDetailId)
+    {
+        await using var connection = new NpgsqlConnection(database.ConnectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand(
+            """SELECT "CapturedPayload" FROM "sweep_run_row_detail" WHERE "Id" = @id""",
+            connection
+        );
+        command.Parameters.AddWithValue("id", rowDetailId);
+        return await command.ExecuteScalarAsync() as string;
+    }
+
+    private static async Task SeedSettledRunAsync(TemporaryDatabase database, DateTimeOffset settledAt)
+    {
+        await using var connection = new NpgsqlConnection(database.ConnectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand(
+            """
+            INSERT INTO "sweep_run"
+                ("SweepId", "StartedAt", "Status", "SettledAt", "Duration", "TriggerKind", "DryRun", "TenantId", "TotalAffected")
+            VALUES (@sweepId, @settledAt - INTERVAL '1 minute', 1, @settledAt, INTERVAL '1 minute', 2, FALSE, @tenantId, 0)
+            """,
+            connection
+        );
+        command.Parameters.AddWithValue("sweepId", Guid.NewGuid());
+        command.Parameters.AddWithValue("settledAt", settledAt);
+        command.Parameters.AddWithValue("tenantId", Guid.NewGuid());
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task SeedInactiveHoldAsync(TemporaryDatabase database, DateTimeOffset removedAt)
+    {
+        await using var connection = new NpgsqlConnection(database.ConnectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand(
+            """
+            INSERT INTO "retention_holds"
+                ("HoldId", "RetentionEntityId", "RecordId", "TenantId", "Reason", "CreatedAt", "ExpiresAt", "RemovedAt")
+            VALUES (@holdId, @entityId, @recordId, @tenantId, 'pruning test', @removedAt - INTERVAL '1 day', NULL, @removedAt)
+            """,
+            connection
+        );
+        command.Parameters.AddWithValue("holdId", Guid.NewGuid());
+        command.Parameters.AddWithValue("entityId", Note.RetentionIdentity);
+        command.Parameters.AddWithValue("recordId", Guid.NewGuid().ToString());
+        command.Parameters.AddWithValue("tenantId", Guid.NewGuid());
+        command.Parameters.AddWithValue("removedAt", removedAt);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<long> CountAsync(TemporaryDatabase database, string table)
+    {
+        await using var connection = new NpgsqlConnection(database.ConnectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand($"""SELECT count(*) FROM public."{table}" """, connection);
+        return (long)(await command.ExecuteScalarAsync())!;
+    }
+
+    [RowHandlerId("3f6a9c12-5d84-4b07-a1e3-8c2d7b5f0e49")]
+    private sealed class NoOpNoteHandler : IRetentionHandler<Note>;
+
+    // The sample's rules, except that its per-row Anonymise category declares and resolves Purge.
+    private sealed class PurgeOnlyTombstoneRuleProvider : IRetentionRuleProvider
+    {
+        private readonly SampleRetentionRuleProvider sample = new();
+
+        public RetentionCategoryCapabilities? GetCapabilities(string category) =>
+            category == "tombstone-anonymise"
+                ? new RetentionCategoryCapabilities([Strategy.Purge])
+                : sample.GetCapabilities(category);
+
+        public Task<RetentionRule?> ResolveAsync(RetentionResolutionContext context, CancellationToken ct) =>
+            context.Category == "tombstone-anonymise"
+                ? Task.FromResult<RetentionRule?>(new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge))
+                : sample.ResolveAsync(context, ct);
+    }
+
     // T6: a check that passed inside a caller's transaction may have seen DDL that rolls back.
     [Fact]
     public async Task A_check_passed_inside_a_caller_transaction_is_not_kept()
@@ -1364,7 +2019,9 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     // Readiness explains its statements inside the caller's transaction, and PostgreSQL aborts a
     // transaction on the first error: each EXPLAIN is followed by a rollback to a savepoint, so a
     // refusal leaves the caller's transaction as usable as it found it. A wrapped DbConnection
-    // can't batch, so its statements go one at a time with a savepoint loop of their own.
+    // can't batch, so its statements go one at a time with a savepoint loop of their own. The
+    // erasure runs in the caller's own transaction and sends the statements that read the column
+    // (a hold listing sends none of them).
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -1384,7 +2041,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             var db = scope.ServiceProvider.GetRequiredService<SampleDbContext>();
             await using var transaction = await db.Database.BeginTransactionAsync();
 
-            var act = () => ListActiveHoldsAsync(scope.ServiceProvider);
+            var act = () => EraseInCallerTransactionAsync(scope.ServiceProvider);
 
             (await act.Should().ThrowAsync<RetentionConfigurationException>())
                 .Which.Errors.Should().ContainSingle(error =>
@@ -1759,6 +2416,15 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             }
             : null;
 
+    private static Task EraseInCallerTransactionAsync(IServiceProvider scopeServices) =>
+        scopeServices.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+            RetentionErasureRequest.Tenanted(
+                new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
+                new ErasureScope("user", Guid.NewGuid(), allowSoftDeleteAsErasure: true),
+                transaction: ErasureTransaction.Caller
+            )
+        );
+
     private static Task ListActiveHoldsAsync(IServiceProvider scopeServices) =>
         scopeServices.GetRequiredService<IRetentionHoldsRepository>().ListActiveAsync(CancellationToken.None);
 
@@ -1957,6 +2623,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     [Theory]
     [InlineData("ALTER TABLE public.anonymise_literal_records ALTER COLUMN \"Label\" TYPE character varying(8)", "character varying(8)")]
     [InlineData("ALTER TABLE public.anonymise_literal_records ALTER COLUMN \"Label\" TYPE character(4)", "character(4)")]
+    [InlineData("ALTER TABLE public.anonymise_literal_records ALTER COLUMN \"Label\" TYPE uuid USING NULL", "uuid")]
     public async Task Readiness_refuses_a_fixed_literal_its_column_cannot_take(string ddl, string columnType)
     {
         // The model says text; only the catalog knows the column became varchar(8) or a char(4)
@@ -2198,22 +2865,44 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     [Fact]
     public async Task Readiness_refuses_a_soft_delete_marker_column_the_database_generates()
     {
-        // A generated column takes no UPDATE; every soft-delete would fail at "column can only be updated to DEFAULT".
+        // A generated column takes no UPDATE; every soft-delete would fail at "column can only be
+        // updated to DEFAULT". A generated column is nullable unless declared otherwise, and the
+        // model pass's nullable-flag rule refuses that before any group pass explains the UPDATE.
         await using var database = await MigratedTemporaryDatabaseAsync();
-        await using (var connection = new NpgsqlConnection(database.ConnectionString))
-        {
-            await connection.OpenAsync();
-            await using var command = new NpgsqlCommand(
-                """
-                ALTER TABLE public.soft_delete_records DROP COLUMN "IsDeleted";
-                ALTER TABLE public.soft_delete_records
-                    ADD COLUMN "IsDeleted" boolean GENERATED ALWAYS AS ("DeletedAt" IS NOT NULL) STORED
-                """,
-                connection
-            );
-            await command.ExecuteNonQueryAsync();
-        }
+        await ExecuteAsync(
+            database,
+            """
+            ALTER TABLE public.soft_delete_records DROP COLUMN "IsDeleted";
+            ALTER TABLE public.soft_delete_records
+                ADD COLUMN "IsDeleted" boolean GENERATED ALWAYS AS ("DeletedAt" IS NOT NULL) STORED
+            """
+        );
+        using var host = new CohortTestHost(database.ConnectionString);
 
+        var act = () => host.RunSweepAsync(new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()));
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle(error =>
+            error.Contains(typeof(SoftDeleteRecord).FullName!, StringComparison.Ordinal)
+            && error.Contains("member IsDeleted", StringComparison.Ordinal)
+            && error.Contains("which is nullable in the database", StringComparison.Ordinal)
+        );
+    }
+
+    // The same fault the flag rule skips: a generated column declared NOT NULL passes the rule,
+    // so the soft-delete UPDATE's own group pass refuses it.
+    [Fact]
+    public async Task Readiness_refuses_a_not_null_soft_delete_marker_column_the_database_generates()
+    {
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await ExecuteAsync(
+            database,
+            """
+            ALTER TABLE public.soft_delete_records DROP COLUMN "IsDeleted";
+            ALTER TABLE public.soft_delete_records
+                ADD COLUMN "IsDeleted" boolean NOT NULL GENERATED ALWAYS AS ("DeletedAt" IS NOT NULL) STORED
+            """
+        );
         using var host = new CohortTestHost(database.ConnectionString);
 
         var act = () => host.RunSweepAsync(new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()));
@@ -2328,7 +3017,8 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
 
     // An erasure matches rows by the subject column and a hold listing joins through it, so a
     // subject column the database lost, or retyped away from the model's uuid, fails every
-    // erasure of its kind. Only the erasure scopes and the subject-kind hold listing read it.
+    // erasure of its kind. Only the erasure scopes and the subject-kind hold listing read it, so
+    // an erasure's group pass refuses it, not a sweep's.
     [Theory]
     [InlineData("""ALTER TABLE public.soft_delete_records DROP COLUMN "SubjectId" """, "42703", "column ")]
     [InlineData(
@@ -2346,7 +3036,11 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         await ExecuteAsync(database, ddl);
         using var host = new CohortTestHost(database.ConnectionString);
 
-        var act = () => host.RunSweepAsync(new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()));
+        // Only an erasure reads the subject column (a sweep sends no statement over it).
+        var act = () => host.RunErasureAsync(
+            new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>()),
+            new ErasureScope("user", Guid.NewGuid(), allowSoftDeleteAsErasure: true)
+        );
 
         (await act.Should().ThrowAsync<RetentionConfigurationException>())
             .Which.Errors.Should().ContainSingle(error =>
@@ -2499,24 +3193,43 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         result.EntityFailures.Should().BeEmpty();
     }
 
-    [Theory]
-    [InlineData(typeof(AnonymiseNullRecord), "anonymise_null_records", "text GENERATED ALWAYS AS ('x') STORED")]
-    [InlineData(typeof(AnonymiseNullIntegerRecord), "anonymise_null_integer_records", "integer GENERATED ALWAYS AS IDENTITY")]
-    public async Task Readiness_refuses_an_anonymised_column_the_database_generates(
-        Type entity,
-        string table,
-        string definition
-    )
+    [Fact]
+    public async Task Readiness_refuses_an_anonymised_column_the_database_generates()
     {
         await using var database = await AnonymiseTargetDatabaseAsync(
-            $"""ALTER TABLE public.{table} DROP COLUMN "Label"; ALTER TABLE public.{table} ADD COLUMN "Label" {definition}"""
+            """
+            ALTER TABLE public.anonymise_null_records DROP COLUMN "Label";
+            ALTER TABLE public.anonymise_null_records ADD COLUMN "Label" text GENERATED ALWAYS AS ('x') STORED
+            """
         );
         await using var provider = BuildAnonymiseTargetProvider(database.ConnectionString);
 
         var errors = await ReadinessErrorsAsync(provider);
 
         errors.Should().ContainSingle(error =>
-            RefusesWith(error, entity, "428C9", "column \"Label\" can only be updated to DEFAULT")
+            RefusesWith(error, typeof(AnonymiseNullRecord), "428C9", "column \"Label\" can only be updated to DEFAULT")
+        );
+    }
+
+    // An identity column is NOT NULL, so the model pass's Null-method rule refuses it before the
+    // UPDATE (which PostgreSQL would also refuse, 428C9) is explained.
+    [Fact]
+    public async Task Readiness_refuses_a_null_anonymise_into_an_identity_column()
+    {
+        await using var database = await AnonymiseTargetDatabaseAsync(
+            """
+            ALTER TABLE public.anonymise_null_integer_records DROP COLUMN "Label";
+            ALTER TABLE public.anonymise_null_integer_records ADD COLUMN "Label" integer GENERATED ALWAYS AS IDENTITY
+            """
+        );
+        await using var provider = BuildAnonymiseTargetProvider(database.ConnectionString);
+
+        var errors = await ReadinessErrorsAsync(provider);
+
+        errors.Should().ContainSingle(error =>
+            error.Contains(typeof(AnonymiseNullIntegerRecord).FullName!, StringComparison.Ordinal)
+            && error.Contains("member Label", StringComparison.Ordinal)
+            && error.Contains("uses Null but the column is NOT NULL", StringComparison.Ordinal)
         );
     }
 
@@ -2618,10 +3331,10 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     // pg_cast row and uuid isn't a string type, so even a valid uuid literal, or a Null, fails
     // every run. integer to boolean has a pg_cast row, but it is explicit-only. An array assigns
     // only through its elements, and text to uuid fails there too. PostgreSQL refuses the
-    // anonymise UPDATE itself (42804), which readiness explains.
+    // anonymise UPDATE itself (42804), which readiness explains. (A FixedLiteral that no uuid
+    // accepts is the literal probe's refusal first: Readiness_refuses_a_fixed_literal_its_column_cannot_take.)
     [Theory]
     [InlineData("anonymise_uuid_literal_records", typeof(AnonymiseUuidLiteralRecord), "uuid", "text")]
-    [InlineData("anonymise_literal_records", typeof(AnonymiseLiteralRecord), "uuid", "text")]
     [InlineData("anonymise_null_records", typeof(AnonymiseNullRecord), "uuid", "text")]
     [InlineData("anonymise_null_integer_records", typeof(AnonymiseNullIntegerRecord), "boolean", "integer")]
     [InlineData("anonymise_null_text_array_records", typeof(AnonymiseNullTextArrayRecord), "uuid[]", "text[]")]
@@ -2869,6 +3582,14 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         string callerConnectionString,
         string systemConnectionString,
         Action<DbContextOptionsBuilder>? configureContext = null
+    ) => BuildSystemRoutedProvider(callerConnectionString, () => systemConnectionString, configureContext);
+
+    // A system route read each time a scope's work starts: null routes nowhere, so a test can
+    // switch it after readiness has passed.
+    private static ServiceProvider BuildSystemRoutedProvider(
+        string callerConnectionString,
+        Func<string?> systemConnectionString,
+        Action<DbContextOptionsBuilder>? configureContext = null
     )
     {
         var services = new ServiceCollection();
@@ -2922,14 +3643,14 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         }
     }
 
-    private sealed class SystemWorkRoutingScope(DatabaseRoute route, string systemConnectionString)
+    private sealed class SystemWorkRoutingScope(DatabaseRoute route, Func<string?> systemConnectionString)
         : IRetentionExecutionScope
     {
         public Task RunAsync(RetentionExecutionContext context, Func<Task> work, CancellationToken ct)
         {
-            if (context is RetentionExecutionContext.System)
+            if (context is RetentionExecutionContext.System && systemConnectionString() is { } routed)
             {
-                route.ConnectionString = systemConnectionString;
+                route.ConnectionString = routed;
             }
 
             return work();
@@ -2977,19 +3698,21 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     }
 
     [Theory]
-    [InlineData("CREATE DOMAIN session_instant AS timestamptz", "session_instant")]
-    [InlineData("CREATE DOMAIN session_ids AS timestamptz[]", "session_ids")]
-    [InlineData("", "tstzrange")]
-    [InlineData("", "double precision[]")]
+    [InlineData("CREATE DOMAIN session_instant AS timestamptz", "session_instant", "timestamptz")]
+    [InlineData("CREATE DOMAIN session_ids AS timestamptz[]", "session_ids", "timestamptz")]
+    [InlineData("", "tstzrange", "timestamptz")]
+    [InlineData("", "double precision[]", "float8")]
     public async Task Readiness_rejects_a_record_id_column_whose_text_form_depends_on_session_settings(
         string typeDefinition,
-        string columnType
+        string columnType,
+        string baseType
     )
     {
         // The EF model says text; only the catalog knows the column is a domain, array or range
         // over a type whose text form follows TimeZone, DateStyle or extra_float_digits. Here
-        // PostgreSQL has no operator for the column against text, so the statement check
-        // refuses it (42883) before the session-settings rule is reached.
+        // PostgreSQL has no operator for the column against text either (42883), but the model
+        // pass's column rule runs before any group pass explains a statement, so the rule's
+        // refusal is the one reported, and it names the base type it walked to.
         await using var database = await SessionKeyDatabaseAsync<SessionKeyDbContext>(
             "session_key_records",
             typeDefinition,
@@ -2999,8 +3722,10 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         var errors = await SessionKeyErrorsAsync<SessionKeyDbContext>(database);
 
         errors.Should().ContainSingle(error =>
-            RefusesWith(error, typeof(SessionKeyRecord), "42883", "\"Id\"")
-            && error.Contains($"operator does not exist: {columnType} = text", StringComparison.Ordinal)
+            error.Contains($"Record-id convention on {typeof(SessionKeyRecord).FullName}", StringComparison.Ordinal)
+            && error.Contains("record-id column \"public\".\"session_key_records\".\"Id\"", StringComparison.Ordinal)
+            && error.Contains($"is built on '{baseType}'", StringComparison.Ordinal)
+            && error.Contains("depends on session settings", StringComparison.Ordinal)
         );
     }
 

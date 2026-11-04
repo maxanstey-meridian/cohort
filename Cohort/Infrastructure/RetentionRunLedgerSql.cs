@@ -1,6 +1,7 @@
 using System.Data.Common;
 
 using Cohort.Application;
+using Cohort.Infrastructure.Sweep;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
@@ -8,8 +9,7 @@ using Microsoft.Extensions.Logging;
 namespace Cohort.Infrastructure;
 
 // The only interpolations in this file's raw SQL are Cohort's own table names, quoted from
-// the EF model; every value is a positional parameter.
-#pragma warning disable EF1002
+// the EF model; every value is a named parameter.
 
 /// <summary>
 /// The <c>sweep_run</c> ledger reads and writes the scheduled worker and the row-handler
@@ -32,17 +32,10 @@ internal static class RetentionRunLedgerSql
         CancellationToken ct
     )
     {
-        var sweepRun = CohortStoreTables.FromModel(db.Model).Quoted().SweepRun;
+        var tables = CohortStoreTables.FromModel(db.Model);
+        var abandoned = AbandonedRunsStatement(tables, cutoff);
         var staleSweepIds = await db.Database
-            .SqlQueryRaw<Guid>(
-                $$"""
-                SELECT "SweepId" AS "Value" FROM {{sweepRun}}
-                WHERE "Status" = {0} AND "StartedAt" <= {1}
-                ORDER BY "StartedAt"
-                """,
-                (int)SweepRunStatus.Started,
-                cutoff
-            )
+            .SqlQueryRaw<Guid>(abandoned.Sql, abandoned.Parameters.ToDbParameters(db.Database.GetDbConnection()))
             .ToListAsync(ct);
         if (staleSweepIds.Count == 0)
         {
@@ -64,19 +57,10 @@ internal static class RetentionRunLedgerSql
 
                 try
                 {
+                    var failed = AbandonedRunFailedStatement(tables, sweepId, now, AbandonedRunError);
                     var updated = await db.Database.ExecuteSqlRawAsync(
-                        $$"""
-                        UPDATE {{sweepRun}}
-                        SET "Status" = {0}, "SettledAt" = {1}, "Duration" = {1} - "StartedAt", "Error" = {2}
-                        WHERE "SweepId" = {3} AND "Status" = {4}
-                        """,
-                        [
-                            (int)SweepRunStatus.Failed,
-                            now,
-                            AbandonedRunError,
-                            sweepId,
-                            (int)SweepRunStatus.Started,
-                        ],
+                        failed.Sql,
+                        failed.Parameters.ToDbParameters(connection),
                         ct
                     );
                     if (updated > 0)
@@ -96,17 +80,58 @@ internal static class RetentionRunLedgerSql
         }
     }
 
+    /// <summary>R4: the runs left <c>Started</c> at or before <paramref name="cutoff"/>, oldest first.</summary>
+    internal static SweepStatement AbandonedRunsStatement(CohortStoreTables tables, DateTimeOffset cutoff) =>
+        CohortStatements.Statement(
+            "abandoned-runs",
+            $"""
+            SELECT "SweepId" AS "Value" FROM {PostgreSqlIdentifier.Format(tables.SweepRun)}
+            WHERE "Status" = @started AND "StartedAt" <= @cutoff
+            ORDER BY "StartedAt"
+            """,
+            new SqlParams { ["started"] = (int)SweepRunStatus.Started, ["cutoff"] = cutoff },
+            tables.SweepRun
+        );
+
     /// <summary>
-    /// What the ledger holds for one occurrence's scheduled runs of one kind, per pass, or for
-    /// only <paramref name="tenantId"/>'s pass when one is given.
+    /// R5: settles an abandoned run as failed, at <paramref name="now"/> (the settled time, and
+    /// the start of its duration). <paramref name="error"/> is bound as given, so a check can
+    /// pass a typed NULL.
     /// </summary>
-    internal static async Task<OccurrenceLedger> LoadOccurrenceAsync(
-        DbConnection connection,
+    internal static SweepStatement AbandonedRunFailedStatement(
+        CohortStoreTables tables,
+        Guid sweepId,
+        DateTimeOffset now,
+        object? error
+    ) =>
+        CohortStatements.Statement(
+            "abandoned-run-failed",
+            $"""
+            UPDATE {PostgreSqlIdentifier.Format(tables.SweepRun)}
+            SET "Status" = @failed, "SettledAt" = @now, "Duration" = @now - "StartedAt", "Error" = @error
+            WHERE "SweepId" = @sweepId AND "Status" = @started
+            """,
+            new SqlParams
+            {
+                ["failed"] = (int)SweepRunStatus.Failed,
+                ["now"] = now,
+                ["error"] = error,
+                ["sweepId"] = sweepId,
+                ["started"] = (int)SweepRunStatus.Started,
+            },
+            tables.SweepRun
+        );
+
+    /// <summary>
+    /// R6: the scheduled runs of one kind since <paramref name="occurrence"/>, per pass, or for
+    /// only <paramref name="tenantId"/>'s pass when one is given (the clause and its parameter
+    /// exist only then).
+    /// </summary>
+    internal static SweepStatement OccurrenceStatement(
         RelationalObjectName sweepRun,
         DateTimeOffset occurrence,
         bool dryRun,
-        Guid? tenantId,
-        CancellationToken ct
+        Guid? tenantId
     )
     {
         // A pass is keyed by its tenant (Guid.Empty for the tenantless pass), and only runs of
@@ -127,9 +152,8 @@ internal static class RetentionRunLedgerSql
             parameters["tenantId"] = tenant;
         }
 
-        await using var command = parameters.CreateCommand(
-            connection,
-            null,
+        return CohortStatements.Statement(
+            "occurrence-ledger",
             $"""
             SELECT "TenantId",
                    pg_catalog.bool_or("Status" = @succeeded) AS completed,
@@ -138,8 +162,27 @@ internal static class RetentionRunLedgerSql
             WHERE "TriggerKind" = @scheduled AND "DryRun" = @dryRun AND "StartedAt" >= @occurrence
             {(tenantId is null ? "" : "AND \"TenantId\" = @tenantId")}
             GROUP BY "TenantId"
-            """
+            """,
+            parameters,
+            sweepRun
         );
+    }
+
+    /// <summary>
+    /// What the ledger holds for one occurrence's scheduled runs of one kind, per pass, or for
+    /// only <paramref name="tenantId"/>'s pass when one is given.
+    /// </summary>
+    internal static async Task<OccurrenceLedger> LoadOccurrenceAsync(
+        DbConnection connection,
+        RelationalObjectName sweepRun,
+        DateTimeOffset occurrence,
+        bool dryRun,
+        Guid? tenantId,
+        CancellationToken ct
+    )
+    {
+        var statement = OccurrenceStatement(sweepRun, occurrence, dryRun, tenantId);
+        await using var command = statement.Parameters.CreateCommand(connection, null, statement.Sql);
         var passes = new Dictionary<Guid, (bool Completed, long Attempts)>();
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))

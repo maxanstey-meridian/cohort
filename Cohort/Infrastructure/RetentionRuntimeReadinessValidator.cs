@@ -47,7 +47,71 @@ internal sealed class RetentionRuntimeReadinessValidator(
     internal IReadOnlyDictionary<string, RetentionCategoryCapabilities>
         ValidatedCapabilities => startupValidator.ValidatedCapabilities;
 
-    public async Task ValidateAsync(CancellationToken ct = default)
+    /// <summary>
+    /// Readiness for one operation: the model pass (once per model and connection string), then
+    /// the group pass (once per entry, group, role, and search path), which explains the group's
+    /// statements under the role of the scope this call runs in and refuses what PostgreSQL
+    /// refuses. Each caller passes the group of statements it is about to send.
+    /// </summary>
+    public async Task ValidateAsync(RetentionStatementGroup group, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(group);
+        var (readiness, session) = await ValidateModelAsync(ct);
+        await ValidateGroupAsync(readiness, group, session, ct);
+    }
+
+    /// <summary>
+    /// Readiness at host startup, in <see cref="RetentionSystemWork.Readiness"/>: the model pass,
+    /// then an early check of the port groups' statements under this scope's role. Their roles
+    /// belong to scopes startup can't take on, so a privilege the role lacks (42501) is not
+    /// reported here; a missing column, a wrong type, or a generated column is. The sequence rule
+    /// is about privilege and is skipped too. Nothing is recorded as a pass, so each port's role
+    /// still gets its strict group pass when it first reaches readiness.
+    /// </summary>
+    public async Task ValidateAtStartupAsync(CancellationToken ct = default)
+    {
+        var (readiness, session) = await ValidateModelAsync(ct);
+        var facade = db.Database;
+        session ??= await ReadServerSessionAsync(
+            facade,
+            CohortStoreTables.FromModel(db.Model).RetentionHolds,
+            ct
+        );
+        await readiness.Gate.WaitAsync(ct);
+        try
+        {
+            var errors = new List<string>();
+            foreach (var group in RetentionStatementReadiness.PortGroups)
+            {
+                var enumerated = await EnumerateGroupAsync(readiness, group, ct);
+                errors.AddRange(
+                    await statementReadiness.ExplainAsync(
+                        facade,
+                        enumerated.Statements,
+                        session.Role,
+                        RetentionStatementReadiness.ScopeOf(group),
+                        tolerateInsufficientPrivilege: true,
+                        ct
+                    )
+                );
+            }
+
+            if (errors.Count != 0)
+            {
+                throw new RetentionConfigurationException([.. errors.Distinct(StringComparer.Ordinal)]);
+            }
+        }
+        finally
+        {
+            readiness.Gate.Release();
+        }
+    }
+
+    // The model pass, once per model and connection string. Returns the entry and, when the pass
+    // ran, the session it read (null when an earlier call's pass stands).
+    private async Task<(RetentionRuntimeReadinessEntry Entry, ServerSession? Session)> ValidateModelAsync(
+        CancellationToken ct
+    )
     {
         ValidateProvider();
         var facade = db.Database;
@@ -83,132 +147,26 @@ internal sealed class RetentionRuntimeReadinessValidator(
         }
 
         var readiness = state.For(db.Model, entryKey);
-        if (readiness.Validated)
+        if (readiness.ModelValidated)
         {
-            return;
+            return (readiness, null);
         }
 
         await readiness.Gate.WaitAsync(ct);
         try
         {
-            if (readiness.Validated)
+            if (readiness.ModelValidated)
             {
-                return;
+                return (readiness, null);
             }
 
-            await startupValidator.ValidateAsync(ct);
-            var storeTables = CohortStoreTables.FromModel(db.Model);
-            var holds = PostgreSqlIdentifier.Format(storeTables.RetentionHolds);
-            var session = await ReadServerSessionAsync(facade, storeTables.RetentionHolds, ct);
-            var callerDatabase = session.Database;
-
-            RetentionReadinessCheckKey Key(RetentionReadinessCheck check, IEnumerable<object> inputs) =>
-                new(callerDatabase, check, [.. inputs]);
-
-            // Runs a database check unless another copy of the model already passed it against
-            // this database on the same inputs; records the pass. A failure is never recorded. A
-            // recorded pass is skipped inside a caller's transaction too.
-            async Task RunSharedAsync(
-                RetentionReadinessCheckKey key,
-                Func<Task> run,
-                bool recordInsideTransaction = false
-            )
-            {
-                if (state.HasPassed(key))
-                {
-                    return;
-                }
-
-                await run();
-                if (recordInsideTransaction || facade.CurrentTransaction is null)
-                {
-                    state.RecordPassed(key);
-                }
-            }
-
-            // Order matters. Startup validation runs first, so a model with a retained entity and
-            // no or partial Cohort table mapping gets startup validation's aggregated refusal
-            // before any key needs the store tables.
-            // Each check then throws before the next runs: version, schema, relations, hold
-            // links, statements, columns, anonymise targets, stored identities. The relation and
-            // link rules come before the statement check because their refusals are more specific
-            // than PostgreSQL's for the same fault, and deterministic where a plan-dependent
-            // EXPLAIN isn't. The statement check owns existence, analysable types, writability,
-            // cast types, assignability, and privileges, so the rules after it skip what it has
-            // refused: a missing table or column. When a check is skipped as another copy's
-            // recorded pass, the order holds on the same "once, then trusted" footing as the
-            // cache itself.
-            await RunSharedAsync(
-                Key(RetentionReadinessCheck.ServerVersion, []),
-                () => ValidateServerVersionAsync(facade, ct)
-            );
-            await RunSharedAsync(
-                Key(RetentionReadinessCheck.Schema, [storeTables]),
-                () => schemaValidator.ValidateAsync(storeTables, facade, ct)
-            );
-            var retainedRelations = RetainedRelationRows();
-            await RunSharedAsync(
-                Key(RetentionReadinessCheck.RetainedRelations, retainedRelations),
-                () => ValidateRetainedRelationsAsync(facade, retainedRelations, ct)
-            );
-            var links = HoldLinkRows();
-            await RunSharedAsync(
-                Key(RetentionReadinessCheck.HoldRelationLinkColumns, links),
-                () => ValidateHoldRelationLinkColumnsAsync(facade, links, ct)
-            );
-            // The statements are built (reading the Purge scopes' blocking keys) before the key,
-            // because their text and parameter types are the key. It holds the role and the
-            // search path first: privileges depend on the role, and an unqualified type name
-            // resolves through the path.
-            await facade.OpenConnectionAsync(ct);
-            IReadOnlyList<ReadinessStatement> statements;
-            try
-            {
-                statements = await statementReadiness.EnumerateAsync(ValidatedCapabilities, ct);
-            }
-            finally
-            {
-                await facade.CloseConnectionAsync();
-            }
-
-            object[] statementInputs =
-            [
-                session.Role,
-                session.SearchPath,
-                .. statements
-                    .Select(statement => statement.Input)
-                    .OrderBy(input => input.Entity, StringComparer.Ordinal)
-                    .ThenBy(input => input.Name, StringComparer.Ordinal)
-                    .ThenBy(input => input.Sql, StringComparer.Ordinal)
-                    .ThenBy(input => input.ParameterTypes, StringComparer.Ordinal),
-            ];
-            await RunSharedAsync(
-                Key(RetentionReadinessCheck.Statements, statementInputs),
-                () => statementReadiness.ExplainAsync(statements, session.Role, ct)
-            );
-            var columns = RetainedColumnRows();
-            await RunSharedAsync(
-                Key(RetentionReadinessCheck.RetainedColumns, columns),
-                () => ValidateRetainedColumnsAsync(facade, columns, ct)
-            );
-            // Not shared: what this reads is session state, which no key captures.
-            await ValidateAnonymiseTargetsAsync(ct);
-            var registered = registry.Scan().Values.Select(entry => entry.RetentionEntityId).Order().ToArray();
-            object[] storedIdentityInputs = [holds, .. registered];
-            // The hold check runs on its own connection, outside the caller's transaction, so its
-            // success stands whatever transaction the caller is in. The checks above read through
-            // the caller's connection, and one that passed inside a transaction may have seen
-            // DDL that rolls back, so those are recorded only without one.
-            await RunSharedAsync(
-                Key(RetentionReadinessCheck.StoredEntityIdentities, storedIdentityInputs),
-                () => ValidateStoredEntityIdentitiesAsync(scopeFactory, storeTables.RetentionHolds, registered, callerDatabase, ct),
-                recordInsideTransaction: true
-            );
-
+            var session = await RunModelPassAsync(ct);
             if (facade.CurrentTransaction is null)
             {
-                readiness.Validated = true;
+                readiness.ModelValidated = true;
             }
+
+            return (readiness, session);
         }
         finally
         {
@@ -216,11 +174,225 @@ internal sealed class RetentionRuntimeReadinessValidator(
         }
     }
 
+    private async Task<ServerSession> RunModelPassAsync(CancellationToken ct)
+    {
+        var facade = db.Database;
+        await startupValidator.ValidateAsync(ct);
+        var storeTables = CohortStoreTables.FromModel(db.Model);
+        var holds = PostgreSqlIdentifier.Format(storeTables.RetentionHolds);
+        var session = await ReadServerSessionAsync(facade, storeTables.RetentionHolds, ct);
+        var callerDatabase = session.Database;
+
+        // Order matters. Startup validation runs first, so a model with a retained entity and no
+        // or partial Cohort table mapping gets startup validation's aggregated refusal before
+        // any key needs the store tables.
+        // Each check then throws before the next runs: version, schema, relations, hold links,
+        // columns, anonymise targets, stored identities (which explains the Readiness group
+        // under its own scope's role before it reads). The relation and link rules refuse a
+        // fault with a message more specific than PostgreSQL's, and deterministically where a
+        // plan-dependent EXPLAIN isn't.
+        // The statements are not part of this pass. Each port's group pass explains them, under
+        // that port's role, after this pass; it owns existence, analysable types, writability,
+        // cast types, assignability, and privileges. So the rules here skip what a group pass
+        // refuses, a missing table or column, and the port's group pass refuses it before that
+        // port runs; a group that sends no host-table statement (Scrub, Dispatch, the Worker's
+        // ledger, and Pruning) never touches the table that is missing. When a check is skipped
+        // as another copy's recorded pass, the order holds on the same "once, then trusted"
+        // footing as the cache itself.
+        await RunSharedAsync(
+            Key(callerDatabase, RetentionReadinessCheck.ServerVersion, []),
+            () => ValidateServerVersionAsync(facade, ct)
+        );
+        await RunSharedAsync(
+            Key(callerDatabase, RetentionReadinessCheck.Schema, [storeTables]),
+            () => schemaValidator.ValidateAsync(storeTables, facade, ct)
+        );
+        var retainedRelations = RetainedRelationRows();
+        await RunSharedAsync(
+            Key(callerDatabase, RetentionReadinessCheck.RetainedRelations, retainedRelations),
+            () => ValidateRetainedRelationsAsync(facade, retainedRelations, ct)
+        );
+        var links = HoldLinkRows();
+        await RunSharedAsync(
+            Key(callerDatabase, RetentionReadinessCheck.HoldRelationLinkColumns, links),
+            () => ValidateHoldRelationLinkColumnsAsync(facade, links, ct)
+        );
+        var columns = RetainedColumnRows();
+        await RunSharedAsync(
+            Key(callerDatabase, RetentionReadinessCheck.RetainedColumns, columns),
+            () => ValidateRetainedColumnsAsync(facade, columns, ct)
+        );
+        // Not shared: what this reads is session state, which no key captures.
+        await ValidateAnonymiseTargetsAsync(ct);
+        var registered = registry.Scan().Values.Select(entry => entry.RetentionEntityId).Order().ToArray();
+        object[] storedIdentityInputs = [holds, .. registered];
+        // The hold check runs on its own connection, outside the caller's transaction, so its
+        // success stands whatever transaction the caller is in. The checks above read through
+        // the caller's connection, and one that passed inside a transaction may have seen
+        // DDL that rolls back, so those are recorded only without one.
+        await RunSharedAsync(
+            Key(callerDatabase, RetentionReadinessCheck.StoredEntityIdentities, storedIdentityInputs),
+            () => ValidateStoredEntityIdentitiesAsync(storeTables.RetentionHolds, registered, callerDatabase, ct),
+            recordInsideTransaction: true
+        );
+        return session;
+    }
+
+    private static RetentionReadinessCheckKey Key(
+        ServerDatabaseIdentity database,
+        RetentionReadinessCheck check,
+        IEnumerable<object> inputs
+    ) => new(database, check, [.. inputs]);
+
+    // Runs a database check unless another copy of the model already passed it against this
+    // database on the same inputs; records the pass. A failure is never recorded. A recorded pass
+    // is skipped inside a caller's transaction too.
+    private async Task RunSharedAsync(
+        RetentionReadinessCheckKey key,
+        Func<Task> run,
+        bool recordInsideTransaction = false
+    )
+    {
+        if (state.HasPassed(key))
+        {
+            return;
+        }
+
+        await run();
+        if (recordInsideTransaction || db.Database.CurrentTransaction is null)
+        {
+            state.RecordPassed(key);
+        }
+    }
+
+    /// <summary>
+    /// The group pass: reads the session (its role and search path), then explains the group's
+    /// statements under that role, once per entry, group, role, and search path. A recorded pass
+    /// costs the session read. Privileges depend on the role, and an unqualified type name (a
+    /// domain, <c>citext</c>) resolves through the path, so a pass under one says nothing about
+    /// another. In a caller's transaction nothing is recorded or kept (the transaction's reads
+    /// may have seen DDL that rolls back), so the pass runs again until a call outside one
+    /// records it.
+    /// </summary>
+    private async Task ValidateGroupAsync(
+        RetentionRuntimeReadinessEntry readiness,
+        RetentionStatementGroup group,
+        ServerSession? known,
+        CancellationToken ct
+    )
+    {
+        var facade = db.Database;
+        var session =
+            known
+            ?? await ReadServerSessionAsync(facade, CohortStoreTables.FromModel(db.Model).RetentionHolds, ct);
+        if (
+            readiness.Enumerations.TryGetValue(group, out var kept)
+            && state.HasPassed(GroupKey(session, group, kept))
+        )
+        {
+            return;
+        }
+
+        await readiness.Gate.WaitAsync(ct);
+        try
+        {
+            var enumerated = await EnumerateGroupAsync(readiness, group, ct);
+            await RunSharedAsync(
+                GroupKey(session, group, enumerated),
+                async () =>
+                {
+                    var errors = new List<string>(
+                        await statementReadiness.ExplainAsync(
+                            facade,
+                            enumerated.Statements,
+                            session.Role,
+                            RetentionStatementReadiness.ScopeOf(group),
+                            tolerateInsufficientPrivilege: false,
+                            ct
+                        )
+                    );
+                    if (group.Kind is RetentionStatementGroupKind.Sweep or RetentionStatementGroupKind.Erasure)
+                    {
+                        errors.AddRange(await statementReadiness.CheckSequencesAsync(facade, session.Role, ct));
+                    }
+
+                    if (errors.Count != 0)
+                    {
+                        throw new RetentionConfigurationException(errors);
+                    }
+                }
+            );
+        }
+        finally
+        {
+            readiness.Gate.Release();
+        }
+    }
+
+    // The group's statements, enumerated once per entry and kept, but only when they were
+    // enumerated outside a caller's transaction, the rule a recorded pass follows.
+    private async Task<GroupStatements> EnumerateGroupAsync(
+        RetentionRuntimeReadinessEntry readiness,
+        RetentionStatementGroup group,
+        CancellationToken ct
+    )
+    {
+        if (readiness.Enumerations.TryGetValue(group, out var kept))
+        {
+            return kept;
+        }
+
+        // The statements are built (reading the Purge scopes' blocking keys) before the key,
+        // because their text and parameter types are the key.
+        var facade = db.Database;
+        await facade.OpenConnectionAsync(ct);
+        IReadOnlyList<ReadinessStatement> statements;
+        try
+        {
+            statements = await statementReadiness.EnumerateAsync(group, ValidatedCapabilities, ct);
+        }
+        finally
+        {
+            await facade.CloseConnectionAsync();
+        }
+
+        var enumerated = new GroupStatements(statements, StatementInputs(statements));
+        if (facade.CurrentTransaction is null)
+        {
+            readiness.Enumerations[group] = enumerated;
+        }
+
+        return enumerated;
+    }
+
+    // The group first (its kind and, for pruning, its scope), then the role and the search path,
+    // then the statements by entity, name, text, and parameter types.
+    private static RetentionReadinessCheckKey GroupKey(
+        ServerSession session,
+        object group,
+        GroupStatements statements
+    ) =>
+        Key(
+            session.Database,
+            RetentionReadinessCheck.Statements,
+            [group, session.Role, session.SearchPath, .. statements.Inputs]
+        );
+
+    private static object[] StatementInputs(IReadOnlyList<ReadinessStatement> statements) =>
+        [
+            .. statements
+                .Select(statement => statement.Input)
+                .OrderBy(input => input.Entity, StringComparer.Ordinal)
+                .ThenBy(input => input.Name, StringComparer.Ordinal)
+                .ThenBy(input => input.Sql, StringComparer.Ordinal)
+                .ThenBy(input => input.ParameterTypes, StringComparer.Ordinal),
+        ];
+
     /// <summary>
     /// Each retained relation must be an ordinary or partitioned table: Cohort updates, deletes,
     /// and row-locks its rows in place and addresses each by its physical position (ctid), which
     /// a view, a materialized view, or a foreign table can't offer or take. A relation that
-    /// doesn't exist is the statement check's to refuse, so it is skipped here.
+    /// doesn't exist is skipped here: each port's group pass refuses it before that port runs.
     /// </summary>
     private static async Task ValidateRetainedRelationsAsync(
         DatabaseFacade database,
@@ -244,6 +416,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 database.GetDbConnection(),
                 database.CurrentTransaction?.GetDbTransaction(),
                 """
+                /* cohort catalog */
                 SELECT requested.ordinal, relation.relkind
                 FROM ROWS FROM (
                     pg_catalog.unnest(@schemas),
@@ -301,8 +474,9 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// the record-id column it names, because hold SQL equates the two, and the two columns'
     /// collations must be comparable. PostgreSQL lets <c>citext</c> and <c>text</c>, or <c>int4</c>
     /// and <c>numeric</c>, meet in a comparison, and a collation conflict only shows in some
-    /// plans, so the statement check can't see these; the model-level check compares only
-    /// provider CLR types. A missing table or column is skipped: the statement check refuses it.
+    /// plans, so a group pass can't see these; the model-level check compares only provider CLR
+    /// types. A missing table or column is skipped: each port's group pass refuses it before
+    /// that port runs.
     /// </summary>
     private static async Task ValidateHoldRelationLinkColumnsAsync(
         DatabaseFacade database,
@@ -330,6 +504,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 database.GetDbConnection(),
                 database.CurrentTransaction?.GetDbTransaction(),
                 """
+                /* cohort catalog */
                 WITH RECURSIVE requested AS (
                     SELECT requested.ordinal,
                            link.atttypid AS link_type_id,
@@ -410,7 +585,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 LEFT JOIN resolved target_base ON target_base.ordinal = requested.ordinal AND target_base.side = 'target'
                 LEFT JOIN pg_catalog.pg_collation link_collation ON link_collation.oid = requested.link_collation_id
                 LEFT JOIN pg_catalog.pg_collation target_collation ON target_collation.oid = requested.target_collation_id
-                -- A missing table or column is refused by the statement check, so those rows
+                -- A missing table or column is refused by each port's group pass, so those rows
                 -- are skipped.
                 WHERE requested.target_type_id IS NOT NULL AND requested.link_type_id IS NOT NULL
                 """
@@ -499,7 +674,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
         };
 
     /// <summary>
-    /// The statement check has PostgreSQL analyse the anonymise UPDATE itself, so a missing or
+    /// A group pass has PostgreSQL analyse the anonymise UPDATE itself, so a missing or
     /// generated column, an unknown cast type, and a store type the column can't be assigned
     /// from are refused there. What it can't see, it can't see because EXPLAIN never runs the
     /// cast on a stored literal or reads a constraint: the catalog is asked, for each target
@@ -507,7 +682,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// valid for both types' input functions (the column's typmod included), whether Null meets
     /// a NOT NULL column, whether a single value meets a unique index, whether a literal meets a
     /// foreign key, and whether the column is referenced by one. A missing table, record id, or
-    /// column is skipped: the statement check has refused it.
+    /// column is skipped: each port's group pass refuses it before that port runs.
     /// </summary>
     private async Task ValidateAnonymiseTargetsAsync(CancellationToken ct)
     {
@@ -545,6 +720,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 db.Database.GetDbConnection(),
                 db.Database.CurrentTransaction?.GetDbTransaction(),
                 """
+                /* cohort catalog */
                 WITH RECURSIVE requested AS (
                     SELECT requested.ordinal,
                            requested.cast_type,
@@ -647,7 +823,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 while (await reader.ReadAsync(ct))
                 {
                     var (entry, field) = targets[(int)reader.GetInt64(0) - 1];
-                    // A missing table, record id, or column is the statement check's to refuse.
+                    // A missing table, record id, or column is each port's group pass to refuse.
                     if (!reader.GetBoolean(1) || !reader.GetBoolean(2))
                     {
                         continue;
@@ -727,7 +903,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
     }
 
     /// <summary>
-    /// The rules for a retained table's columns that the statement check can't see, because
+    /// The rules for a retained table's columns that a group pass can't see, because
     /// PostgreSQL accepts the statements: the anchor, deleted-at, and anonymised-at markers must
     /// be <c>timestamp with time zone</c> (a naive timestamp compares with a cutoff through a
     /// cross-type operator and silently drifts with the session TimeZone); the tenant column and
@@ -737,7 +913,8 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// key (the key would refuse the update while a row references it, or silently rewrite the
     /// referencing rows); and a record id's text form must not depend on session settings (hold
     /// joins compare it). Types and nullability are resolved through any chain of domains. A
-    /// missing table or column is skipped: the statement check refuses it.
+    /// missing table or column is skipped: each port's group pass refuses it before that port
+    /// runs.
     /// </summary>
     private static async Task ValidateRetainedColumnsAsync(
         DatabaseFacade database,
@@ -766,6 +943,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 database.GetDbConnection(),
                 database.CurrentTransaction?.GetDbTransaction(),
                 """
+                /* cohort catalog */
                 WITH RECURSIVE requested AS (
                     SELECT requested.ordinal,
                            requested.base_type,
@@ -1047,8 +1225,8 @@ internal sealed class RetentionRuntimeReadinessValidator(
             };
 
         // Only the timestamp columns have a type rule left: PostgreSQL compares or assigns a
-        // timestamp without time zone through a cross-type operator, so the statement check
-        // passes it. The other columns' types are the statement check's.
+        // timestamp without time zone through a cross-type operator, so a group pass passes it.
+        // The other columns' types are the group passes'.
         internal ExpectedColumnType? ExpectedType =>
             Kind is RetainedColumnKind.Anchor or RetainedColumnKind.DeletedAt or RetainedColumnKind.AnonymisedAt
                 ? new(
@@ -1137,7 +1315,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
         await using var command = new SqlParams().CreateCommand(
             database.GetDbConnection(),
             database.CurrentTransaction?.GetDbTransaction(),
-            "SELECT pg_catalog.current_setting('server_version_num')::integer, pg_catalog.current_setting('server_version')"
+            "/* cohort catalog */ SELECT pg_catalog.current_setting('server_version_num')::integer, pg_catalog.current_setting('server_version')"
         );
         await using var reader = await command.ExecuteReaderAsync(ct);
         await reader.ReadAsync(ct);
@@ -1158,16 +1336,23 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// database. Its success is recorded under the holds relation and the registered ids, and
     /// stands whatever transaction the caller is in, since it never reads through the caller's
     /// connection; a recorded pass skips the scope altogether.
+    /// <para>
+    /// The scope's own statements (the Readiness group: this read, and the tenantless holds read
+    /// when a retained entity is tenantless) are explained first, under the role of this scope's
+    /// session, keyed by it, and that scope's database is compared with the caller's
+    /// (<see cref="ValidateReadinessScopeAsync"/>). This step runs once per entry, so the hold
+    /// guard checks its own <c>System(Readiness)</c> scope the same way before it reads
+    /// tenantless holds (<see cref="ReadCallerDatabaseAsync"/>): a role or database that scope
+    /// reaches only later is checked when it first does.
+    /// </para>
     /// </summary>
-    private static async Task ValidateStoredEntityIdentitiesAsync(
-        IServiceScopeFactory scopeFactory,
+    private Task ValidateStoredEntityIdentitiesAsync(
         RelationalObjectName holdsTable,
         Guid[] registered,
         ServerDatabaseIdentity callerDatabase,
         CancellationToken ct
-    )
-    {
-        await scopeFactory.RunInScopeAsync(
+    ) =>
+        scopeFactory.RunInScopeAsync(
             new RetentionExecutionContext.System(RetentionSystemWork.Readiness),
             services => ValidateStoredEntityIdentitiesAsync(
                 services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext).Database,
@@ -1178,9 +1363,8 @@ internal sealed class RetentionRuntimeReadinessValidator(
             ),
             ct
         );
-    }
 
-    private static async Task ValidateStoredEntityIdentitiesAsync(
+    private async Task ValidateStoredEntityIdentitiesAsync(
         DatabaseFacade systemDatabase,
         Guid[] registered,
         RelationalObjectName holdsTable,
@@ -1192,25 +1376,13 @@ internal sealed class RetentionRuntimeReadinessValidator(
         await systemDatabase.OpenConnectionAsync(ct);
         try
         {
-            // Only the database is compared: the System scope may run under another role.
-            if ((await ReadServerSessionAsync(systemDatabase, holdsTable, ct)).Database != callerDatabase)
-            {
-                throw new RetentionConfigurationException([
-                    "Cohort's readiness scope resolved a DbContext that reaches a different database from the calling scope's. Cohort checks holds across tenants in a System(Readiness) scope, so every scope must reach the same database.",
-                ]);
-            }
+            await ValidateReadinessScopeCoreAsync(systemDatabase, holdsTable, callerDatabase, ct);
 
-            await using var command = new SqlParams { ["registered"] = registered }.CreateCommand(
+            var statement = RetentionHoldSql.StoredEntityIdentities(CohortStoreTables.FromModel(db.Model), registered);
+            await using var command = statement.Parameters.CreateCommand(
                 systemDatabase.GetDbConnection(),
                 null,
-                $"""
-                SELECT hold."RetentionEntityId", pg_catalog.count(*)
-                FROM {holds} AS hold
-                WHERE NOT (hold."RetentionEntityId" = ANY(@registered))
-                  AND {RetentionHoldSql.ActivePredicate("hold")}
-                GROUP BY hold."RetentionEntityId"
-                ORDER BY hold."RetentionEntityId"
-                """
+                statement.Sql
             );
 
             var errors = new List<string>();
@@ -1238,11 +1410,83 @@ internal sealed class RetentionRuntimeReadinessValidator(
     }
 
     /// <summary>
+    /// The database the caller's own connection reaches, read fresh through this validator's
+    /// context: inside the caller's or the run's transaction when it has one, read-only. The hold
+    /// guard reads it before it opens its <c>System(Readiness)</c> scope, so no statement of the
+    /// caller's connection runs inside that scope's hook, and passes it to
+    /// <see cref="ValidateReadinessScopeAsync"/>. Nothing is remembered: a server restart, a
+    /// failover, or a recreated holds table changes what <see cref="ServerDatabaseIdentity"/> says.
+    /// </summary>
+    internal async Task<ServerDatabaseIdentity> ReadCallerDatabaseAsync(CancellationToken ct) =>
+        (await ReadServerSessionAsync(db.Database, CohortStoreTables.FromModel(db.Model).RetentionHolds, ct)).Database;
+
+    /// <summary>
+    /// The hold guard's check of its own <c>System(Readiness)</c> scope before it reads tenantless
+    /// holds: <paramref name="systemDatabase"/> (the scope's context, connection open) must reach
+    /// <paramref name="callerDatabase"/>, and the Readiness group's statements are explained under
+    /// that session's role, a pass kept per role. Runs no model pass and keeps no state on the
+    /// entry; a pass already recorded costs the session read.
+    /// </summary>
+    internal Task ValidateReadinessScopeAsync(
+        DatabaseFacade systemDatabase,
+        ServerDatabaseIdentity callerDatabase,
+        CancellationToken ct
+    ) =>
+        ValidateReadinessScopeCoreAsync(
+            systemDatabase,
+            CohortStoreTables.FromModel(db.Model).RetentionHolds,
+            callerDatabase,
+            ct
+        );
+
+    // Reads the System(Readiness) scope's session once, refuses a different database from the
+    // caller's, and explains the Readiness group under that session's role. Takes no Gate: the
+    // stored-identities step runs it while the model pass holds the entry's, which isn't
+    // re-entrant. The connection is open.
+    private async Task ValidateReadinessScopeCoreAsync(
+        DatabaseFacade systemDatabase,
+        RelationalObjectName holdsTable,
+        ServerDatabaseIdentity callerDatabase,
+        CancellationToken ct
+    )
+    {
+        // Only the database is compared: the System scope may run under another role.
+        var session = await ReadServerSessionAsync(systemDatabase, holdsTable, ct);
+        if (session.Database != callerDatabase)
+        {
+            throw new RetentionConfigurationException([
+                "Cohort's readiness scope resolved a DbContext that reaches a different database from the calling scope's. Cohort checks holds across tenants in a System(Readiness) scope, so every scope must reach the same database.",
+            ]);
+        }
+
+        var readinessStatements = statementReadiness.EnumerateReadiness();
+        await RunSharedAsync(
+            GroupKey(session, "Readiness", new GroupStatements(readinessStatements, StatementInputs(readinessStatements))),
+            async () =>
+            {
+                var refused = await statementReadiness.ExplainAsync(
+                    systemDatabase,
+                    readinessStatements,
+                    session.Role,
+                    RetentionStatementReadiness.ReadinessScope,
+                    tolerateInsufficientPrivilege: false,
+                    ct
+                );
+                if (refused.Count != 0)
+                {
+                    throw new RetentionConfigurationException(refused);
+                }
+            },
+            recordInsideTransaction: true
+        );
+    }
+
+    /// <summary>
     /// Which database a connection reaches, as the server sees it. Connection strings
     /// spell one database many ways (<c>localhost</c> or <c>127.0.0.1</c>, a pooler or the direct
     /// port), so the database name and OID, the server's start time, and the holds table's OID
     /// decide sameness instead. Also reads the session's role and search path (<c>$user</c>
-    /// expanded), which the statement check is keyed by. Reads in the database's current
+    /// expanded), which the group passes are keyed by. Reads in the database's current
     /// transaction when it has one.
     /// </summary>
     private static async Task<ServerSession> ReadServerSessionAsync(
@@ -1256,7 +1500,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
         {
             // The holds table's OID comes from the catalog by schema and name, not to_regclass:
             // resolving a name needs USAGE on its schema, and a role without it must reach the
-            // statement check, which refuses it by name.
+            // group pass, which refuses it by name.
             await using var command = new SqlParams
             {
                 ["holds_schema"] = holdsTable.Schema,
@@ -1265,6 +1509,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 database.GetDbConnection(),
                 database.CurrentTransaction?.GetDbTransaction(),
                 """
+                /* cohort catalog */
                 SELECT pg_catalog.current_database()::text,
                        (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())::bigint,
                        pg_catalog.pg_postmaster_start_time(),
@@ -1408,9 +1653,23 @@ internal sealed class RetentionRuntimeReadinessState
     internal void RecordPassed(RetentionReadinessCheckKey key) => passed.TryAdd(key, 0);
 }
 
+/// <summary>
+/// One group's statements as enumerated, and the inputs a pass over them is keyed by (the
+/// statements by entity, name, text, and parameter types).
+/// </summary>
+internal sealed record GroupStatements(IReadOnlyList<ReadinessStatement> Statements, object[] Inputs);
+
 internal sealed class RetentionRuntimeReadinessEntry
 {
     internal SemaphoreSlim Gate { get; } = new(1, 1);
 
-    internal volatile bool Validated;
+    /// <summary>The model pass passed outside a caller's transaction.</summary>
+    internal volatile bool ModelValidated;
+
+    /// <summary>
+    /// Each group's statements, enumerated once per entry and kept only when they were enumerated
+    /// outside a caller's transaction. Keyed by the group record, so a pruning group's scope is
+    /// part of the key.
+    /// </summary>
+    internal ConcurrentDictionary<RetentionStatementGroup, GroupStatements> Enumerations { get; } = new();
 }

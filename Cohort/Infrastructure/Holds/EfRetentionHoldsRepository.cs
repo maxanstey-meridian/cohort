@@ -11,9 +11,6 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Infrastructure.Holds;
 
-// Raw SQL interpolates only identifiers quoted from the EF model; values are parameters.
-#pragma warning disable EF1002
-
 internal sealed class EfRetentionHoldsRepository(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
     RetentionTargetResolver targetResolver,
@@ -34,7 +31,7 @@ internal sealed class EfRetentionHoldsRepository(
 
         // Readiness first: resolving the target reads the Cohort mapping, which readiness refuses
         // with its aggregated message when it is missing.
-        await readinessValidator.ValidateAsync(ct);
+        await readinessValidator.ValidateAsync(RetentionStatementGroup.Holds, ct);
         // A hold with an unknown stable identity or record-id format the sweep-side NOT EXISTS
         // match never hits would look persisted while protecting nothing. Fail loudly instead.
         var entry = targetResolver.ResolveTarget(request.RetentionEntityId);
@@ -71,33 +68,23 @@ internal sealed class EfRetentionHoldsRepository(
             await ValidateTargetRowAsync(entry, recordId, request, transaction, ct);
             await LockCoveredRowsAsync(entry, recordId, request.TenantId, transaction, ct);
 
-            await using var command = new SqlParams
-            {
-                ["holdId"] = request.HoldId,
-                ["retentionEntityId"] = request.RetentionEntityId,
-                ["recordId"] = recordId,
-                ["tenantId"] = request.TenantId,
-                ["reason"] = request.Reason,
-                ["createdAt"] = request.CreatedAt,
-                ["expiresAt"] = request.ExpiresAt,
-            }.CreateCommand(
+            // An expiry the database clock has already reached would store a hold that never
+            // protects. The statement refuses it by row count, not a SQL error, so a caller-owned
+            // transaction stays usable.
+            var create = RetentionHoldSql.BuildCreateHold(
+                Tables,
+                request.HoldId,
+                request.RetentionEntityId,
+                recordId,
+                request.TenantId,
+                request.Reason,
+                request.CreatedAt,
+                request.ExpiresAt
+            );
+            await using var command = create.Parameters.CreateCommand(
                 db.Database.GetDbConnection(),
                 transaction,
-                // An expiry the database clock has already reached would store a hold that never
-                // protects. Refuse it by row count, not a SQL error, so a caller-owned transaction
-                // stays usable. CAST: an untyped NULL can't be inferred in IS NULL.
-                $"""
-                INSERT INTO {PostgreSqlIdentifier.Format(Tables.RetentionHolds)}
-                    ("HoldId", "RetentionEntityId", "RecordId", "TenantId", "Reason", "CreatedAt", "ExpiresAt", "RemovedAt")
-                SELECT
-                    @holdId, @retentionEntityId, @recordId, @tenantId, @reason,
-                    -- A hold is active from the moment it commits; never let an application clock
-                    -- ahead of Postgres defer that.
-                    LEAST(@createdAt, {DatabaseClock.Sql}),
-                    CAST(@expiresAt AS timestamptz), NULL
-                WHERE CAST(@expiresAt AS timestamptz) IS NULL
-                   OR CAST(@expiresAt AS timestamptz) > {DatabaseClock.Sql}
-                """
+                create.Sql
             );
             if (await command.ExecuteNonQueryAsync(ct) == 0)
             {
@@ -128,10 +115,11 @@ internal sealed class EfRetentionHoldsRepository(
         CancellationToken ct
     )
     {
-        await using var command = new SqlParams().CreateCommand(
+        var statement = CohortStatements.TransactionIsolation();
+        await using var command = statement.Parameters.CreateCommand(
             db.Database.GetDbConnection(),
             transaction,
-            "SELECT pg_catalog.current_setting('transaction_isolation')"
+            statement.Sql
         );
         var isolation = (string?)await command.ExecuteScalarAsync(ct);
         // PostgreSQL accepts READ UNCOMMITTED and runs it as READ COMMITTED.
@@ -204,15 +192,11 @@ internal sealed class EfRetentionHoldsRepository(
 
     public async Task RemoveAsync(Guid holdId, DateTimeOffset removedAt, CancellationToken ct)
     {
-        await readinessValidator.ValidateAsync(ct);
+        await readinessValidator.ValidateAsync(RetentionStatementGroup.Holds, ct);
+        var remove = RetentionHoldSql.BuildRemoveHold(Tables, holdId, removedAt.ToUniversalTime());
         var removed = await db.Database.ExecuteSqlRawAsync(
-            $"""
-            UPDATE {PostgreSqlIdentifier.Format(Tables.RetentionHolds)}
-            SET "RemovedAt" = @removedAt
-            WHERE "HoldId" = @holdId
-              AND "RemovedAt" IS NULL
-            """,
-            new SqlParams { ["holdId"] = holdId, ["removedAt"] = removedAt.ToUniversalTime() }.ToDbParameters(db.Database.GetDbConnection()),
+            remove.Sql,
+            remove.Parameters.ToDbParameters(db.Database.GetDbConnection()),
             ct
         );
         if (removed == 0)
@@ -225,19 +209,15 @@ internal sealed class EfRetentionHoldsRepository(
 
     public async Task<IReadOnlyList<RetentionHold>> ListActiveAsync(CancellationToken ct)
     {
-        await readinessValidator.ValidateAsync(ct);
+        await readinessValidator.ValidateAsync(RetentionStatementGroup.Holds, ct);
         await db.Database.OpenConnectionAsync(ct);
         try
         {
-            await using var command = new SqlParams().CreateCommand(
+            var list = RetentionHoldSql.BuildActiveHolds(Tables);
+            await using var command = list.Parameters.CreateCommand(
                 db.Database.GetDbConnection(),
                 db.Database.CurrentTransaction?.GetDbTransaction(),
-                $"""
-                SELECT "HoldId", "RetentionEntityId", "RecordId", "TenantId", "Reason", "CreatedAt", "ExpiresAt", "RemovedAt"
-                FROM {PostgreSqlIdentifier.Format(Tables.RetentionHolds)} AS hold
-                WHERE {RetentionHoldSql.ActivePredicate("hold")}
-                ORDER BY "RetentionEntityId", "RecordId", "HoldId"
-                """
+                list.Sql
             );
 
             return await ReadHoldsAsync(command, ct);
@@ -316,7 +296,7 @@ internal sealed class EfRetentionHoldsRepository(
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(recordId);
         // Readiness first, as in CreateAsync: resolving the target reads the Cohort mapping.
-        await readinessValidator.ValidateAsync(ct);
+        await readinessValidator.ValidateAsync(RetentionStatementGroup.Holds, ct);
         var entry = targetResolver.ResolveTarget(retentionEntityId);
         RetentionTargetResolver.ValidateTenantOwnership(entry, tenantId, "Retention hold");
 
@@ -361,7 +341,7 @@ internal sealed class EfRetentionHoldsRepository(
 
         var entities = tenantId is null ? SweepEntityScope.TenantlessOnly : SweepEntityScope.TenantedOnly;
         // After readiness, like erasure: startup validation fills the state the check reads.
-        await readinessValidator.ValidateAsync(ct);
+        await readinessValidator.ValidateAsync(RetentionStatementGroup.Holds, ct);
         var validation = validationState.For(db.Model);
         ErasureSubjectValidation.Validate(validation, registry, subjectKind, subject, entities, "the hold lookup");
 

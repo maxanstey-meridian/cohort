@@ -1,4 +1,7 @@
+using System.Diagnostics.CodeAnalysis;
+
 using Cohort.Domain;
+using Cohort.Infrastructure;
 
 namespace Cohort.Hosting;
 
@@ -66,4 +69,26 @@ public sealed class CohortOptions
     public HistoryPruningOptions HistoryPruning { get; init; } = new();
 
     public CohortConventions Conventions { get; init; } = new();
+
+    /// <summary>
+    /// Whether the scheduled worker runs occurrences: the kill switch is off and a schedule is
+    /// set. The worker loop, startup's readiness check, and nothing else decide it.
+    /// </summary>
+    [MemberNotNullWhen(true, nameof(Schedule))]
+    internal bool WorkerRuns => !KillSwitch && !string.IsNullOrWhiteSpace(Schedule);
+
+    /// <summary>
+    /// What history pruning prunes, or null when nothing is pruned (the kill switch is on, or no
+    /// retention is set): settled runs, inactive holds, and whether it reads the database clock,
+    /// which it does to find the schedule's current occurrence when a schedule is set. Readiness
+    /// checks pruning for exactly these statements.
+    /// </summary>
+    internal PruningScope? PruningScope =>
+        KillSwitch || !HistoryPruning.Enabled
+            ? null
+            : new PruningScope(
+                HistoryPruning.PrunesRuns,
+                HistoryPruning.PrunesHolds,
+                !string.IsNullOrWhiteSpace(Schedule)
+            );
 }

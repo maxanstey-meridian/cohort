@@ -244,6 +244,7 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
+            /* cohort catalog */
             SELECT requested.role, relation.oid
             FROM ROWS FROM (
                 pg_catalog.unnest(@roles),
@@ -282,6 +283,7 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
+            /* cohort catalog */
             SELECT attrelid, attname, typname, atttypmod, NOT attnotnull,
                    attidentity <> '' OR COALESCE(
                         pg_catalog.pg_get_expr(attrdef.adbin, attrdef.adrelid) LIKE 'nextval(%',
@@ -329,6 +331,7 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
+            /* cohort catalog */
             SELECT i.indrelid, i.indisunique, i.indisprimary, i.indimmediate,
                    -- An expression key (attnum 0) reads as NULL, so it still occupies its position.
                    ARRAY(SELECT a.attname
@@ -373,6 +376,7 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
+            /* cohort catalog */
             SELECT conrelid, conname, convalidated
             FROM pg_catalog.pg_constraint
             WHERE contype = 'c'
@@ -407,6 +411,7 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
+            /* cohort catalog */
             SELECT c.conrelid,
                    ARRAY(SELECT a.attname FROM pg_catalog.unnest(c.conkey) WITH ORDINALITY AS key(attnum, position)
                          JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = key.attnum

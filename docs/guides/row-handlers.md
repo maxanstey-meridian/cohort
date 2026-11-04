@@ -285,6 +285,31 @@ await dispatcher.RequeueDeadLetteredAsync(handlerId: Guid.Parse("0b6f5e43-…"))
 - The kill switch doesn't stop a requeue; the requeued work runs on the next flush, or once
   the poller is back on.
 
+### Privileges
+
+Readiness checks each role for the statements of the operation it runs, before that operation
+writes anything:
+
+- **Sweeps and erasures.** With a row handler or a dependents step registered, the role of the
+  sweep or erasure also needs `INSERT` on `sweep_row_handler_status`, where it queues the
+  work. A host with neither (per-row `Anonymise` alone, say) needs no grant on that table
+  for sweeps. If `sweep_row_handler_status.Id` or `sweep_run_row_detail.Id` is a serial column
+  rather than an identity column, the role needs `USAGE` on its sequence.
+- **The dispatcher** runs as `System(RowDispatch)` and needs `SELECT` and `UPDATE` on
+  `sweep_run`, `sweep_run_row_detail`, and `sweep_row_handler_status`, and nothing on your
+  tables. It is checked at startup while the kill switch is off, and whenever `FlushAsync` or
+  `RequeueDeadLetteredAsync` is called.
+- **The payload scrub** runs as `System(RowDispatch)` too, needs `SELECT` and `UPDATE` on
+  `sweep_run_row_detail`, and is checked separately and first, so a dispatcher refused for a
+  missing privilege can't keep a snapshot past `PayloadRetention`. It runs with the kill
+  switch on.
+
+At startup a refusal stops the host. After an options reload, or for a role that first
+reaches readiness later, `FlushAsync` and `RequeueDeadLetteredAsync` throw a
+`RetentionConfigurationException` (after `FlushAsync` has scrubbed), and the background poller
+logs it and retries on its next poll. The scrub keeps running, and sweeps under a role that
+holds its own privileges carry on. See [Startup Validation](/reference/startup-validation#statements).
+
 ## Snapshots and personal data
 
 Snapshots can hold pre-anonymisation personal data, so Cohort keeps them as briefly as it

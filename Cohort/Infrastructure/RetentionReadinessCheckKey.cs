@@ -5,10 +5,11 @@ namespace Cohort.Infrastructure;
 /// <summary>
 /// The readiness checks whose success is recorded by value, per database, under what each reads.
 /// The anonymise-target check isn't one: its outcome depends on session state no key can capture,
-/// so it runs again for each model instance. <see cref="Statements"/> is keyed first by the
-/// session's role and search path: PostgreSQL decides privileges by role, and resolves an
-/// unqualified type name (a domain, <c>citext</c>) through the path, so a pass under one role or
-/// path says nothing about another's.
+/// so it runs again for each model instance. <see cref="Statements"/> is keyed by group, role,
+/// and search path: the group is the operation whose statements were explained (its kind and,
+/// for pruning, its scope), PostgreSQL decides privileges by role, and resolves an unqualified
+/// type name (a domain, <c>citext</c>) through the path, so a pass under one role or path says
+/// nothing about another's, and a pass for one group says nothing about another's.
 /// </summary>
 internal enum RetentionReadinessCheck
 {

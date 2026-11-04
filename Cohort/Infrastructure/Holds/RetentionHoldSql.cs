@@ -19,13 +19,110 @@ internal static class RetentionHoldSql
             """;
     }
 
-    internal static string BuildActiveTenantlessHoldIds(RelationalObjectName holdsTable) =>
-        $"""
-        SELECT hold."HoldId"
-        FROM {PostgreSqlIdentifier.Format(holdsTable)} AS hold
-        WHERE hold."TenantId" IS NULL
-          AND {ActivePredicate("hold")}
-        """;
+    /// <summary>H9: the ids of every active hold on a tenantless row.</summary>
+    internal static SweepStatement BuildActiveTenantlessHoldIds(RelationalObjectName holdsTable) =>
+        CohortStatements.Statement(
+            "active-tenantless-holds",
+            $"""
+            SELECT hold."HoldId"
+            FROM {PostgreSqlIdentifier.Format(holdsTable)} AS hold
+            WHERE hold."TenantId" IS NULL
+              AND {ActivePredicate("hold")}
+            """,
+            new SqlParams(),
+            holdsTable
+        );
+
+    /// <summary>
+    /// H10: the stored entity identities that no retained entity registers, with the number of
+    /// active holds that name each. <paramref name="registered"/> (a <c>Guid[]</c>) is bound as given.
+    /// </summary>
+    internal static SweepStatement StoredEntityIdentities(CohortStoreTables tables, object? registered) =>
+        CohortStatements.Statement(
+            "stored-entity-identities",
+            $"""
+            SELECT hold."RetentionEntityId", pg_catalog.count(*)
+            FROM {PostgreSqlIdentifier.Format(tables.RetentionHolds)} AS hold
+            WHERE NOT (hold."RetentionEntityId" = ANY(@registered))
+              AND {ActivePredicate("hold")}
+            GROUP BY hold."RetentionEntityId"
+            ORDER BY hold."RetentionEntityId"
+            """,
+            new SqlParams { ["registered"] = registered },
+            tables.RetentionHolds
+        );
+
+    /// <summary>
+    /// H1: stores a hold, or no row when its expiry has already passed on the database clock (it
+    /// would persist while protecting nothing; refused by row count, not a SQL error, so a
+    /// caller-owned transaction stays usable). <paramref name="recordId"/> (canonical text) and
+    /// <paramref name="reason"/> are bound as given, so a check can pass typed NULLs.
+    /// </summary>
+    internal static SweepStatement BuildCreateHold(
+        CohortStoreTables tables,
+        Guid holdId,
+        Guid retentionEntityId,
+        object? recordId,
+        Guid? tenantId,
+        object? reason,
+        DateTimeOffset createdAt,
+        DateTimeOffset? expiresAt
+    ) =>
+        // CAST: an untyped NULL can't be inferred in IS NULL.
+        CohortStatements.Statement(
+            "create-hold",
+            $"""
+            INSERT INTO {PostgreSqlIdentifier.Format(tables.RetentionHolds)}
+                ("HoldId", "RetentionEntityId", "RecordId", "TenantId", "Reason", "CreatedAt", "ExpiresAt", "RemovedAt")
+            SELECT
+                @holdId, @retentionEntityId, @recordId, @tenantId, @reason,
+                -- A hold is active from the moment it commits; never let an application clock
+                -- ahead of Postgres defer that.
+                LEAST(@createdAt, {DatabaseClock.Sql}),
+                CAST(@expiresAt AS timestamptz), NULL
+            WHERE CAST(@expiresAt AS timestamptz) IS NULL
+               OR CAST(@expiresAt AS timestamptz) > {DatabaseClock.Sql}
+            """,
+            new SqlParams
+            {
+                ["holdId"] = holdId,
+                ["retentionEntityId"] = retentionEntityId,
+                ["recordId"] = recordId,
+                ["tenantId"] = tenantId,
+                ["reason"] = reason,
+                ["createdAt"] = createdAt,
+                ["expiresAt"] = expiresAt,
+            },
+            tables.RetentionHolds
+        );
+
+    /// <summary>H2: ends a hold that is still standing.</summary>
+    internal static SweepStatement BuildRemoveHold(CohortStoreTables tables, Guid holdId, DateTimeOffset removedAt) =>
+        CohortStatements.Statement(
+            "remove-hold",
+            $"""
+            UPDATE {PostgreSqlIdentifier.Format(tables.RetentionHolds)}
+            SET "RemovedAt" = @removedAt
+            WHERE "HoldId" = @holdId
+              AND "RemovedAt" IS NULL
+            """,
+            new SqlParams { ["holdId"] = holdId, ["removedAt"] = removedAt },
+            tables.RetentionHolds
+        );
+
+    /// <summary>H3: every active hold, in <c>ListActiveAsync</c>'s order.</summary>
+    internal static SweepStatement BuildActiveHolds(CohortStoreTables tables) =>
+        CohortStatements.Statement(
+            "active-holds",
+            $"""
+            SELECT "HoldId", "RetentionEntityId", "RecordId", "TenantId", "Reason", "CreatedAt", "ExpiresAt", "RemovedAt"
+            FROM {PostgreSqlIdentifier.Format(tables.RetentionHolds)} AS hold
+            WHERE {ActivePredicate("hold")}
+            ORDER BY "RetentionEntityId", "RecordId", "HoldId"
+            """,
+            new SqlParams(),
+            tables.RetentionHolds
+        );
 
     /// <summary>
     /// One parenthesised boolean that is true only when no active hold covers the row of
@@ -642,14 +739,14 @@ internal static class RetentionHoldSql
     // ------------------------------------------------------------------------------------
 
     /// <summary>
-    /// Every statement a hold call on one row of <paramref name="entry"/> can issue: the target
-    /// row's lock, both covering reads, the record id's canonicalisation when the run issues it,
-    /// and the covered rows' locks when the entity has covered paths. The values are bound as
-    /// given: <paramref name="recordId"/> (text), and <paramref name="tenantId"/>, bound for a
-    /// tenanted entity only. <paramref name="entries"/> is the registry's entries, for the covered
-    /// rows' sort order.
+    /// Every host-table statement the holds repository can issue on one row of
+    /// <paramref name="entry"/>: the target row's lock, both covering reads, the record id's
+    /// canonicalisation when the repository issues it, and the covered rows' locks when the entity
+    /// has covered paths. The values are bound as given: <paramref name="recordId"/> (text), and
+    /// <paramref name="tenantId"/>, bound for a tenanted entity only. <paramref name="entries"/> is
+    /// the registry's entries, for the covered rows' sort order.
     /// </summary>
-    internal static IReadOnlyList<SweepStatement> ForEntity(
+    internal static IReadOnlyList<SweepStatement> ForHolds(
         RelationalObjectName holdsTable,
         RetentionEntry entry,
         IEnumerable<RetentionEntry> entries,
@@ -669,6 +766,29 @@ internal static class RetentionHoldSql
         }
 
         statements.AddRange(BuildCoveredRowLocks(entry, entries, recordId, tenantId));
+        return statements;
+    }
+
+    /// <summary>
+    /// Every host-table statement the deletion port can issue on one row of
+    /// <paramref name="entry"/>: the record id's canonicalisation when it issues it, and the
+    /// existence read of the holds that cover the row. It takes no row lock. The values are bound as
+    /// <see cref="ForHolds"/> binds them.
+    /// </summary>
+    internal static IReadOnlyList<SweepStatement> ForDeletion(
+        RelationalObjectName holdsTable,
+        RetentionEntry entry,
+        object? recordId,
+        object? tenantId
+    )
+    {
+        var statements = new List<SweepStatement>();
+        if (RetentionTargetResolver.CanonicaliseStatement(entry, recordId) is { } canonicalise)
+        {
+            statements.Add(canonicalise);
+        }
+
+        statements.Add(BuildAnyCoveringHold(holdsTable, entry, recordId, tenantId));
         return statements;
     }
 

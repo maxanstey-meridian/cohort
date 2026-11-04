@@ -58,11 +58,15 @@ skipped startup validation still can't run against a missing or outdated schema.
 Readiness validates once per model and connection string, then trusts the result: each
 database check keeps its success, unless it passed inside the caller's transaction, under what
 it read, so later contexts, including new copies of the same EF model, don't run it again. The
-anonymise-target check is the exception and runs once for each copy of the model. Because
-readiness runs once, only the role of the first operation to reach it is checked, so a role
-switched later (by `SET ROLE` in an execution-scope hook, say) is never checked. The statement
-check's pass is shared between copies of the model only for the same database, role, and search
-path, since privileges depend on the role and type names resolve through the path. A schema that
+anonymise-target check is the exception and runs once for each copy of the model. The
+statement check is not once per model: each operation's statements are checked under the role
+of the scope that sends them, the first time that role reaches readiness, so a role switched
+later (by `SET ROLE` in an execution-scope hook, say) is checked when it first reaches
+readiness. Its pass is shared between copies of the model only for the same group of
+statements, database, role, and search path, since privileges depend on the role and type
+names resolve through the path. It covers Cohort's own tables and the functions it calls as
+well as your retained tables (see
+[Startup validation](/reference/startup-validation#statements)). A schema that
 drifts after that isn't refused by readiness; the run fails at the statement the change
 breaks. A change readiness would refuse, made while the application runs, is caught when it
 next starts.
@@ -108,7 +112,11 @@ retained entity identities, in its own `System(Readiness)` scope, whichever oper
 triggered readiness. That scope must reach the same database as the caller; it reads only
 through its connection, so its model may differ. The server decides that (database name and
 OID, server start time, and the holds table), so `localhost` versus `127.0.0.1`, or a pooler
-versus a direct port, is fine.
+versus a direct port, is fine. The check that reads tenantless holds before
+`IRetentionDeletion` or a dependents step runs applies the same rules to its own
+`System(Readiness)` scope each time: it must reach the caller's database, and its role is
+checked for its reads when it first reaches that check, even if a scope hook switched it
+after readiness passed.
 
 The fix is to restore `[RetentionEntityId("old id")]` on the entity. If the change is
 deliberate, re-point the holds as part of deploying the new identity:

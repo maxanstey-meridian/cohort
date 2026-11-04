@@ -35,10 +35,11 @@ namespace Cohort.Sample.Tests;
 //
 // Every scope kind runs as a role of its own (ScopeRoles: the tenant, the tenantless pass, the
 // readiness scope, the dispatcher, the worker, the pruner, and the caller's own scope, which has
-// no execution context), and every port operation runs under roles no other operation uses: where
-// two operations would share a scope kind's role, one runs on a host of its own over the same
-// database, or as a tenant of its own. Every role gets the same grants and the same search path,
-// so the texts the pass explained as one role are the texts any other scope's builders produce.
+// no execution context). A scenario lists the roles of the scopes that run its operations, kept
+// apart from the readiness, dispatcher, scrub, and pruner roles, so a statement only the pass
+// or one of those scopes runs never counts as an operation's. Every role gets the same grants
+// and the same search path, so the texts the pass explained as one role are the texts any other
+// scope's builders produce.
 // The test's own SQL (seeding, reads) goes through an unintercepted
 // context or a raw connection, so it runs as the connecting superuser and is never judged; a
 // statement it must send on a connection Cohort's scopes share starts "/* host */". Host SQL a
@@ -61,7 +62,6 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
     private const string Explain = "EXPLAIN ";
     private const string CanonicalText = "SELECT CAST(";
     private const string Schedule = "0 0 3 * * *";
-    private const string ModelPass = "Model pass";
     private static readonly DateTimeOffset AsOf = DateTimeOffset.UtcNow;
 
     // Statements EXPLAIN cannot plan and that need no privilege.
@@ -103,14 +103,13 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             );
     }
 
-    // Every port operation runs under roles no other operation uses, so the reach ledger can tell
-    // an over-wide group from a right one: a statement only one operation sends, wrongly added to
-    // another operation's group, would otherwise read as reached through the operation that does
-    // send it. A scope kind has one role per ScopeRoles, so the operations that share a kind
-    // (erasures and the sweeps' tenantless pass, erasures in the caller's transaction, holds, and
-    // deletions all run as the caller or the tenantless pass) get a host of their own over the
-    // same database, with roles of their own: this host sweeps, previews, holds, runs the worker,
-    // and prunes; the erasure host only erases; the deletion host only deletes.
+    // The operations' roles (sweeps, erasures, previews, holds, deletions, and the worker) are
+    // the roles claim 6 judges a builder's execution by. They exclude the readiness, dispatcher,
+    // scrub, and pruner roles, so the pass's own work and the other scopes' statements never
+    // count as reach. A scope kind has one role per ScopeRoles, so the erasures and the
+    // deletions run on a host of their own over the same database, with roles of their own:
+    // this host sweeps, previews, holds, runs the worker, and prunes; the erasure host only
+    // erases (its provider writes row-level audit); the deletion host only deletes.
     private async Task PlainRunsAsync(ReachLedger ledger)
     {
         await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
@@ -123,7 +122,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         await roles.GrantAsync(database);
         await erasureRoles.GrantAsync(database);
         await deletionRoles.GrantAsync(database);
-        // A role that only previews: no other operation explains the preview's counts under it.
+        // A role that only previews: the preview's counts run under a role of their own.
         var previewRole = await roles.AddTenantRoleAsync(database, tenants.Previewed);
         using var host = new CohortTestHost(
             database.ConnectionString,
@@ -379,17 +378,21 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             action => host.RunWithServicesAsync(action),
             runsReachTenantless: true,
             [
-                new Reach("Sweep", roles.Tenant, roles.TenantlessPass),
-                new Reach(
-                    "Erasure",
-                    erasureRoles.Tenant,
-                    erasureRoles.TenantlessPass,
-                    erasureRoles.Caller
-                ),
-                new Reach("Preview", previewRole),
-                new Reach("Holds", roles.Caller),
-                new Reach("Deletion", deletionRoles.Caller),
-                new Reach("Worker", roles.WorkerCoordination),
+                // Sweeps.
+                roles.Tenant,
+                roles.TenantlessPass,
+                // Erasures.
+                erasureRoles.Tenant,
+                erasureRoles.TenantlessPass,
+                erasureRoles.Caller,
+                // Previews.
+                previewRole,
+                // Holds.
+                roles.Caller,
+                // Deletions.
+                deletionRoles.Caller,
+                // The worker.
+                roles.WorkerCoordination,
             ],
             AnchoredCursor,
             SubjectCount,
@@ -400,8 +403,8 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
     private async Task RowHandlerHostAsync(ReachLedger ledger)
     {
         await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
-        // The payload scrub gets a dispatcher role of its own: a poll under the kill switch
-        // scrubs and returns before any dispatch statement.
+        // The payload scrub gets a dispatcher role of its own, outside the operation roles: a
+        // poll under the kill switch scrubs and returns before any dispatch statement.
         await using var scrubRoles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
         await using var database = await MigratedSampleDatabaseAsync();
         var tenants = new CoverageTenants();
@@ -409,7 +412,8 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         await SeedAsync(database, tenants);
         await roles.GrantAsync(database);
         await scrubRoles.GrantAsync(database);
-        // A role that only erases: this host's sweeps run as other tenants.
+        // A role that only erases: this host's sweeps run as other tenants, so the erasure's
+        // role is one of the operation roles.
         var erasureRole = await roles.AddTenantRoleAsync(database, tenants.WithoutLegalMinimum);
         using var host = new CohortTestHost(
             database.ConnectionString,
@@ -526,9 +530,10 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             action => host.RunWithServicesAsync(action),
             runsReachTenantless: false,
             [
-                new Reach("Sweep", roles.Tenant),
-                new Reach("Erasure", erasureRole),
-                new Reach("Holds", roles.Caller),
+                // Sweeps, then erasures, then holds.
+                roles.Tenant,
+                erasureRole,
+                roles.Caller,
             ],
             AnchoredCursor
         );
@@ -624,9 +629,10 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             action => host.RunWithServicesAsync(action),
             runsReachTenantless: true,
             [
-                new Reach("Sweep", roles.Tenant),
-                new Reach("Erasure", erasureRole),
-                new Reach("Holds", roles.Caller),
+                // Sweeps, then erasures, then holds.
+                roles.Tenant,
+                erasureRole,
+                roles.Caller,
             ],
             AnchoredCursor,
             StillDue
@@ -777,10 +783,11 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             action => WithServicesAsync(services, action),
             runsReachTenantless: true,
             [
-                new Reach("Sweep", roles.Tenant),
-                new Reach("Holds", roles.Caller),
-                new Reach("Deletion", deletionRoles.Caller),
-                new Reach("Worker", roles.WorkerCoordination),
+                // Sweeps, then holds, deletions, and the worker.
+                roles.Tenant,
+                roles.Caller,
+                deletionRoles.Caller,
+                roles.WorkerCoordination,
             ],
             AnchoredCursor,
             TenantCoverage,
@@ -868,8 +875,9 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             action => WithServicesAsync(services, action),
             runsReachTenantless: true,
             [
-                new Reach("Sweep", roles.Tenant),
-                new Reach("Holds", roles.Caller),
+                // Sweeps, then holds.
+                roles.Tenant,
+                roles.Caller,
             ],
             AnchoredCursor,
             CoveredRowLocks
@@ -963,8 +971,9 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             action => WithServicesAsync(services, action),
             runsReachTenantless: false,
             [
-                new Reach("Erasure", roles.Tenant),
-                new Reach("Holds", roles.Caller),
+                // Erasures, then holds.
+                roles.Tenant,
+                roles.Caller,
             ]
         );
     }
@@ -1082,14 +1091,16 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
     //      under whichever role explained them. Statements against Cohort's own tables, transaction
     //      control, catalog reads, and host SQL are not judged;
     //   6. every builder in the model pass's enumeration (one for the scenario's model) was
-    //      executed under the role of one of the scenario's reach items, counted by builder name
-    //      and matched by PostgreSQL's query identifier (the builder's, from EXPLAIN (VERBOSE,
-    //      FORMAT JSON), against the one pg_stat_statements recorded for an execution): its
-    //      per-strategy and per-entity variants are covered by claim 5, which every sent text must
-    //      meet. Only the guard's attribution forms are exempt: they are explained so that a
-    //      refusal names its entity, and no operation sends them. So the pass explains nothing
-    //      that no operation sends. The reach items give each operation roles of its own (the
-    //      proof fails, naming the role and both items, if two reach items list the same role).
+    //      executed under the role of a scope that ran one of the scenario's operations
+    //      (`operationRoles`), counted by builder name and matched by PostgreSQL's query
+    //      identifier (the builder's, from EXPLAIN (VERBOSE, FORMAT JSON), against the one
+    //      pg_stat_statements recorded for an execution): its per-strategy and per-entity variants
+    //      are covered by claim 5, which every sent text must meet. Only the guard's attribution
+    //      forms are exempt: they are explained so that a refusal names its entity, and no
+    //      operation sends them. So the pass explains nothing that no operation sends. The
+    //      operation roles are kept apart from the readiness, dispatcher, scrub, and pruner roles,
+    //      so a statement only the pass or one of those scopes runs never counts as an
+    //      operation's.
     private async Task AssertEveryStatementIsExplainedAsync<TContext>(
         TemporaryDatabase database,
         IReadOnlyList<ScopeRoles> roleSets,
@@ -1097,26 +1108,13 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         ReachLedger ledger,
         Func<Func<IServiceProvider, Task>, Task> withServices,
         bool runsReachTenantless,
-        IReadOnlyList<Reach> reach,
+        IReadOnlyList<string> operationRoles,
         params Family[] reached
     )
         where TContext : DbContext
     {
-        // Each reach item's roles belong to its operation alone, so a role's statements are those
-        // of one operation (see claim 6).
-        reach
-            .SelectMany((item, index) => reach.Skip(index + 1).Select(other => (item, other)))
-            .SelectMany(pair =>
-                pair.item.Roles.Intersect(pair.other.Roles)
-                    .Select(role =>
-                        $"{roleSets.First(roles => roles.Names.Contains(role)).Describe(role)} is listed for both {pair.item.Label} and {pair.other.Label}"
-                    )
-            )
-            .Should()
-            .BeEmpty("a reach item's roles must be used by no other item in the same model");
-
         var hostTables = ModelTables<TContext>(database, _ => true);
-        // The retained tables this group's runs reach: a tenantless entity is reached only by a
+        // The retained tables this scenario's runs reach: a tenantless entity is reached only by a
         // tenantless run or a statement that spans the model.
         var retainedTables = ModelTables<TContext>(
             database,
@@ -1186,7 +1184,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
                     .Select(family => family.Name)
             )
             .Should()
-            .BeEmpty("the group was built to reach these statement families, and no run executed them");
+            .BeEmpty("the scenario was built to reach these statement families, and no run executed them");
         runStatements
             .Where(statement => IsOnHostTable(statement) || IsCanonicalText(statement))
             .Where(statement => !explained.Contains(statement.Query))
@@ -1201,7 +1199,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         IReadOnlyList<ReadinessStatement> enumerated = [];
         await withServices(async services => enumerated = await EnumerateAsync(services));
         var executedHere = executed
-            .Where(statement => reach.Any(item => item.Roles.Contains(statement.Role)))
+            .Where(statement => operationRoles.Contains(statement.Role))
             .Select(statement => statement.QueryId)
             .ToHashSet();
         // The guard's attribution forms are explained so that a refusal names its entity, and
@@ -1223,7 +1221,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
                 }
             }
 
-            ledger.Record(ModelPass, builder.Key, ReadableSql(builder.First().Sql), executedByBuilder);
+            ledger.Record(builder.Key, ReadableSql(builder.First().Sql), executedByBuilder);
         }
     }
 
@@ -1252,16 +1250,16 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
     private static string ReadableSql(string sql) =>
         string.Join(' ', sql.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
 
-    // What each model's pass enumerated and what its runs executed, united by label and builder
-    // name: a builder counts as reached when some model executed one of its statements under the
-    // role of a scope that ran one of the scenario's operations.
+    // What each model's pass enumerated and what its runs executed, united by builder name: a
+    // builder counts as reached when some model executed one of its statements under the role of
+    // a scope that ran one of that scenario's operations.
     private sealed class ReachLedger
     {
-        private readonly Dictionary<(string Group, string Builder), (string Text, bool Reached)> builders = [];
+        private readonly Dictionary<string, (string Text, bool Reached)> builders = [];
 
-        public void Record(string group, string builder, string text, bool reached)
+        public void Record(string builder, string text, bool reached)
         {
-            builders[(group, builder)] = builders.TryGetValue((group, builder), out var seen)
+            builders[builder] = builders.TryGetValue(builder, out var seen)
                 ? (seen.Text, seen.Reached || reached)
                 : (text, reached);
         }
@@ -1269,9 +1267,8 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         public IEnumerable<string> Unreached() =>
             builders
                 .Where(pair => !pair.Value.Reached)
-                .OrderBy(pair => pair.Key.Group, StringComparer.Ordinal)
-                .ThenBy(pair => pair.Key.Builder, StringComparer.Ordinal)
-                .Select(pair => $"{pair.Key.Group}: {pair.Key.Builder}: {pair.Value.Text}");
+                .OrderBy(pair => pair.Key, StringComparer.Ordinal)
+                .Select(pair => $"{pair.Key}: {pair.Value.Text}");
     }
 
     // The statements the model pass explains, as a scope of the host would enumerate them.
@@ -1322,9 +1319,6 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
     private sealed record Family(string Name, Func<string, bool> IsSent);
 
     private sealed record Recording(long Deallocations);
-
-    // One operation of a scenario, and the roles of the scopes that ran it.
-    private sealed record Reach(string Label, params string[] Roles);
 
     // S5: the keyset after the first batch, `(anchor, record id) > ($n, $n)`.
     private static readonly Family AnchoredCursor = new(

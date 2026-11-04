@@ -39,19 +39,21 @@ A hold on a row also holds the rows a host declares related to it.
   the scope's subject is a {type}.").
 - Readiness keeps its results per EF model instance without holding the model. The entry is
   keyed by the connection string without its password, so tenants a pooler routes by user name
-  or options under one host, port, and database name each get their own readiness, and a
-  rebuilt copy of a model is checked again. Cohort no longer keeps every model alive. The
+  or options under one host, port, and database name each get their own readiness. Cohort no
+  longer keeps every model alive. The
   `System(Readiness)` scope must reach the caller's database but may run a different model,
   since it reads only through its connection; the refusal now says 'a different database'.
-  Readiness reads the database's identity from the server once for each model instance and
-  connection it validates, one extra round trip. Readiness runs once per EF model instance and
-  connection string: a pass is recorded only outside a transaction (the stored-identity check,
-  which runs on its own connection, is recorded inside one too), so a host that validates at
-  startup pays no round trip per call, except the hold guard's database check before it reads
-  tenantless holds. Inside your transaction with no pass recorded, each call runs the pass
-  again. Startup runs the pass in `System(Readiness)`, then in the scope of each subsystem that
-  will run (`System(RowDispatch)` always, `System(WorkerCoordination)` when the worker runs,
-  `System(HistoryPruning)` when pruning is set), and a refusal stops the host.
+  Readiness runs once per EF model instance and connection string: a pass records nothing
+  until it completes, and is recorded only outside a transaction (the stored-identities check
+  alone is recorded on its own, inside one too, but only when its `System(Readiness)` scope ran
+  on a connection other than the caller's), so a host that validates at startup pays no round
+  trip per call, except the hold guard's database check before it reads tenantless holds.
+  Inside your transaction with no pass recorded, each call runs the pass again. Startup calls
+  readiness in `System(Readiness)`, then in each subsystem's scope that will run
+  (`System(RowDispatch)` always, `System(WorkerCoordination)` when the worker runs,
+  `System(HistoryPruning)` when a pruning retention is set and the kill switch is off): each
+  scope's context gets the provider and Multiplexing checks, and the pass itself when it runs
+  another model instance or connection string. A refusal stops the host.
 - Readiness asks PostgreSQL to analyse and plan, without running, the statements Cohort sends
   against the host's retained tables for the host's model and declared strategies (sweeps,
   previews, erasures for each subject kind, holds, deletion checks, and the tenant-coverage
@@ -64,10 +66,9 @@ A hold on a row also holds the rows a host declares related to it.
   search path, so a fault that session can't reach surfaces at the statement, under the
   session that sends it: a schema the role can't use, a child table it can't read, a
   publication's replica-identity rule behind a missing privilege, and a type another search
-  path resolves differently. What each scope's role needs to run its statements is `SELECT`
-  and `UPDATE` on the retained tables, `DELETE` where `Purge` is declared, `SELECT` on
-  `retention_holds`, `sweep_run_row_detail`, and the child table of any foreign key that
-  blocks a purge, and `USAGE` on the schemas of all of those tables. The refusal
+  path resolves differently. No grant changed net of 0.11.0; see
+  [Tenant Isolation](https://maxanstey-meridian.github.io/cohort/guides/tenant-isolation#grants)
+  for what each scope's role needs. The refusal
   carries PostgreSQL's SQLSTATE and message. It also refuses a nullable tenant column, a
   nullable soft-delete flag, and an anonymised-at column that is NOT NULL, since each makes
   rows silently never match. Readiness also refuses an anchor, deleted-at, or anonymised-at

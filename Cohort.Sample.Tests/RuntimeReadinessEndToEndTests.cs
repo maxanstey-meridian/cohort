@@ -200,6 +200,41 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         ((long)(await count.ExecuteScalarAsync())!).Should().Be(2);
     }
 
+    // The retained-columns rule skips a column the database lacks and leaves it to the statements
+    // check. A pass refused there has not vouched for it, so the column added back later (nullable
+    // tenant, naive-timestamp anchor) must still meet the rule on the same host.
+    // Make-fail: RunModelPassAsync records `ModelValidated`-style progress before the Statements
+    // check (the retained-columns check recorded as it passes).
+    [Theory]
+    [InlineData("TenantId", "uuid", "which is nullable in the database")]
+    [InlineData("CreatedAt", "timestamp without time zone", "which is timestamp without time zone in the database")]
+    public async Task Readiness_applies_the_retained_columns_rule_to_a_column_added_after_a_refused_pass(
+        string column,
+        string addedAs,
+        string message
+    )
+    {
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await ExecuteAsync(database, $"""ALTER TABLE public.soft_delete_records DROP COLUMN "{column}" CASCADE""");
+        using var host = new CohortTestHost(database.ConnectionString);
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var call = () => host.RunSweepAsync(tenant);
+
+        (await call.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                RefusesWith(error, typeof(SoftDeleteRecord), "42703", $"column target.{column} does not exist")
+            );
+
+        await ExecuteAsync(database, $"""ALTER TABLE public.soft_delete_records ADD COLUMN "{column}" {addedAs}""");
+
+        (await call.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                error.Contains(typeof(SoftDeleteRecord).FullName!, StringComparison.Ordinal)
+                && error.Contains($"member {column}", StringComparison.Ordinal)
+                && error.Contains(message, StringComparison.Ordinal)
+            );
+    }
+
     [Fact]
     public async Task Direct_sweep_refuses_a_0_9_schema_until_the_resolved_period_migration_is_applied()
     {
@@ -1228,7 +1263,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     // fails with PostgreSQL's 42501: the deletion fails and the row is still there.
     // Make-fail: RetentionHoldGuard.ReadsTenantlessHolds returns false (the deletion succeeds).
     [Fact]
-    public async Task A_readiness_role_switched_after_the_model_pass_cannot_read_holds_and_the_held_row_stays()
+    public async Task A_readiness_role_switched_after_the_model_pass_cannot_read_holds_and_the_row_stays()
     {
         await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
         await using var database = await MigratedTemporaryDatabaseAsync();
@@ -1305,7 +1340,8 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     // failure comes from the iteration's read-back of the ledger, after the passes: each pass
     // runs in its own tenant or tenantless scope, under that scope's role, not the coordination
     // role's, so passes run before the read fails.
-    // Make-fail: the role is granted SELECT on sweep_run back (the iteration no longer fails).
+    // Make-fail: RetentionWorker.RunLockedIterationAsync catches and swallows the exception from
+    // the ledger read-back (it returns Pending), and the iteration no longer fails.
     [Fact]
     public async Task The_worker_fails_under_a_role_that_cannot_read_the_ledger()
     {
@@ -1438,6 +1474,38 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         // and open no scope of their own.
         var logged = new[] { RetentionSystemWork.Readiness }.Concat(expected);
         executionScope.Ran.Should().Equal(logged.Select(work => new RetentionExecutionContext.System(work)));
+    }
+
+    // A subsystem scope whose context has an entry of its own is validated at startup, so a fault
+    // only that scope's database has refuses the host: here System(RowDispatch) reaches a second
+    // migrated database (and, through the model cache key, a model instance of its own) where a
+    // retained column is gone, while System(Readiness) reaches the sound one. The scope log
+    // can't show this, because a subsystem call that shares the Readiness entry opens nothing.
+    // Make-fail: RetentionValidationHostedService.ValidateAsync skips the validator call for any
+    // work but Readiness (startup passes).
+    [Fact]
+    public async Task Startup_refuses_a_host_whose_subsystem_scope_reaches_a_database_with_a_schema_fault()
+    {
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await using var dispatchDatabase = await MigratedTemporaryDatabaseAsync();
+        await ExecuteAsync(dispatchDatabase, """ALTER TABLE public.soft_delete_records DROP COLUMN "DeletedAt" """);
+        var dispatchStarted = false;
+        await using var provider = BuildSystemRoutedProvider(
+            database.ConnectionString,
+            work =>
+            {
+                dispatchStarted |= work == RetentionSystemWork.RowDispatch;
+                return dispatchStarted ? dispatchDatabase.ConnectionString : null;
+            },
+            options => options.ReplaceService<IModelCacheKeyFactory, ConnectionStringModelCacheKeyFactory>()
+        );
+
+        var start = () => StartValidationAsync(provider);
+
+        (await start.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().Contain(error =>
+                RefusesWith(error, typeof(SoftDeleteRecord), "42703", "\"DeletedAt\"")
+            );
     }
 
     private CohortTestHost RoleHost(
@@ -1646,8 +1714,8 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     // transaction on the first error: each EXPLAIN is followed by a rollback to a savepoint, so a
     // refusal leaves the caller's transaction as usable as it found it. A wrapped DbConnection
     // can't batch, so its statements go one at a time with a savepoint loop of their own. The
-    // erasure runs in the caller's own transaction and sends the statements that read the column
-    // (a hold listing sends none of them).
+    // model pass explains every operation's statements, so any call refuses the model; the
+    // erasure is the call here that runs in the caller's own transaction.
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -3237,6 +3305,13 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         string callerConnectionString,
         Func<string?> systemConnectionString,
         Action<DbContextOptionsBuilder>? configureContext = null
+    ) => BuildSystemRoutedProvider(callerConnectionString, _ => systemConnectionString(), configureContext);
+
+    // A system route that sees the work: null routes that work nowhere.
+    private static ServiceProvider BuildSystemRoutedProvider(
+        string callerConnectionString,
+        Func<RetentionSystemWork, string?> systemConnectionString,
+        Action<DbContextOptionsBuilder>? configureContext = null
     )
     {
         var services = new ServiceCollection();
@@ -3290,12 +3365,12 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         }
     }
 
-    private sealed class SystemWorkRoutingScope(DatabaseRoute route, Func<string?> systemConnectionString)
+    private sealed class SystemWorkRoutingScope(DatabaseRoute route, Func<RetentionSystemWork, string?> systemConnectionString)
         : IRetentionExecutionScope
     {
         public Task RunAsync(RetentionExecutionContext context, Func<Task> work, CancellationToken ct)
         {
-            if (context is RetentionExecutionContext.System && systemConnectionString() is { } routed)
+            if (context is RetentionExecutionContext.System system && systemConnectionString(system.Work) is { } routed)
             {
                 route.ConnectionString = routed;
             }

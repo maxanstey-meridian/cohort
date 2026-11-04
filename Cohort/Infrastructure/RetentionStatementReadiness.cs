@@ -89,8 +89,7 @@ internal sealed class ReadinessStatement(
 
     internal List<RelationalObjectName> Relations { get; } = [];
 
-    internal static string EntityName(Type? entity) =>
-        entity is null ? "" : entity.FullName ?? entity.Name;
+    internal static string EntityName(Type entity) => entity.FullName ?? entity.Name;
 }
 
 /// <summary>
@@ -144,7 +143,6 @@ internal sealed class RetentionStatementReadiness(
         var set = new StatementSet();
         AddScopes(set, scopes);
         AddGuard(set, tables, entries);
-        AddPreviewCounts(set, scopes.Where(scope => !scope.Erasure));
         AddHolds(set, tables, entries);
         foreach (var entry in entries)
         {
@@ -167,12 +165,7 @@ internal sealed class RetentionStatementReadiness(
     }
 
     // One sweep or erasure scope readiness explains, and the operation a refusal names for it.
-    private sealed record ScopeToExplain(
-        SweepScope Scope,
-        Strategy Strategy,
-        string Operation,
-        bool Erasure
-    );
+    private sealed record ScopeToExplain(SweepScope Scope, Strategy Strategy, string Operation);
 
     // The sweep scopes and the erasure scopes of every entity with a declared category, each
     // strategy it declares. The blocking keys of the Purge scopes are read in one catalog read
@@ -211,8 +204,7 @@ internal sealed class RetentionStatementReadiness(
                                 settings.TimeZone
                             ),
                             strategy,
-                            $"sweeping with {strategy}",
-                            Erasure: false
+                            $"sweeping with {strategy}"
                         )
                     );
                 }
@@ -234,8 +226,7 @@ internal sealed class RetentionStatementReadiness(
                                     settings.TimeZone
                                 ),
                                 strategy,
-                                $"erasing subjects of kind '{kind.Kind}'",
-                                Erasure: true
+                                $"erasing subjects of kind '{kind.Kind}'"
                             )
                         );
                     }
@@ -255,7 +246,7 @@ internal sealed class RetentionStatementReadiness(
     // Every host-table statement a sweep or an erasure issues (`ForScope`).
     private void AddScopes(StatementSet set, IEnumerable<ScopeToExplain> scopes)
     {
-        foreach (var (scope, strategy, operation, _) in scopes)
+        foreach (var (scope, strategy, operation) in scopes)
         {
             set.Add(
                 SweepStatements.ForScope(
@@ -267,23 +258,6 @@ internal sealed class RetentionStatementReadiness(
                 ),
                 operation
             );
-        }
-    }
-
-    // What a preview counts (`RetentionPreviewService`): the prediction, and the NULL-anchor
-    // count when the scope has a cutoff.
-    private static void AddPreviewCounts(StatementSet set, IEnumerable<ScopeToExplain> scopes)
-    {
-        foreach (var (scope, strategy, operation, _) in scopes)
-        {
-            set.Add([SweepStatements.CountPredicted(scope, strategy)], operation);
-            if (SweepStatements.CountsNullAnchor(scope))
-            {
-                set.Add(
-                    [SweepStatements.CountByAnchor(scope, strategy, SweepCount.NullAnchor)],
-                    operation
-                );
-            }
         }
     }
 

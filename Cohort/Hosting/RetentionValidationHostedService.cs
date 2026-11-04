@@ -8,8 +8,9 @@ namespace Cohort.Hosting;
 
 /// <summary>
 /// Readiness at host startup. It runs the model pass in <see cref="RetentionSystemWork.Readiness"/>,
-/// then again in the scope of each background subsystem that will run, so that scope's own
-/// context is checked too: the payload scrub and the row-handler dispatcher
+/// then validates the context of each background subsystem scope that will run: the provider and
+/// connection checks always, and the model pass when that context is a model instance or
+/// connection string not yet validated. The scopes are the payload scrub and the row-handler dispatcher
 /// (<see cref="RetentionSystemWork.RowDispatch"/>), the worker
 /// (<see cref="RetentionSystemWork.WorkerCoordination"/>, when <see cref="CohortOptions.WorkerRuns"/>),
 /// and history pruning (<see cref="RetentionSystemWork.HistoryPruning"/>, when

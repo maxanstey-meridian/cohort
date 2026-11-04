@@ -54,7 +54,7 @@ internal sealed class EfRetentionAuditWriter(
         };
     }
 
-    /// <summary>R1: records a run as Started.</summary>
+    /// <summary>Records a run as Started.</summary>
     internal static SweepStatement StartedStatement(CohortStoreTables tables, SweepEvent.Started started)
     {
         var sweepRun = PostgreSqlIdentifier.Format(tables.SweepRun);
@@ -79,7 +79,7 @@ internal sealed class EfRetentionAuditWriter(
         );
     }
 
-    /// <summary>S1: records an entity's summary, replacing the progress rows written so far.</summary>
+    /// <summary>Records an entity's summary, replacing the progress rows written so far.</summary>
     internal static SweepStatement EntitySummaryStatement(CohortStoreTables tables, SweepEvent.EntitySummary summary)
     {
         var entitySummary = PostgreSqlIdentifier.Format(tables.SweepRunEntitySummary);
@@ -133,7 +133,7 @@ internal sealed class EfRetentionAuditWriter(
     }
 
     /// <summary>
-    /// S2 and R2: adds a batch to an entity's summary and to the run's total, in one statement.
+    /// Adds a batch to an entity's summary and to the run's total, in one statement.
     /// </summary>
     internal static SweepStatement EntityProgressStatement(CohortStoreTables tables, SweepEvent.EntityProgress progress)
     {
@@ -186,7 +186,7 @@ internal sealed class EfRetentionAuditWriter(
     }
 
     /// <summary>
-    /// D1: records one mutated row. <paramref name="recordId"/> is the row's canonical text.
+    /// Records one mutated row. <paramref name="recordId"/> is the row's canonical text.
     /// </summary>
     internal static SweepStatement RowDetailStatement(
         CohortStoreTables tables,
@@ -224,7 +224,7 @@ internal sealed class EfRetentionAuditWriter(
     }
 
     /// <summary>
-    /// R3: settles a Started run. A real run's total is the sum of its committed progress, so
+    /// Settles a Started run. A real run's total is the sum of its committed progress, so
     /// only a dry run takes <paramref name="totalAffected"/>.
     /// </summary>
     internal static SweepStatement TerminalStatement(

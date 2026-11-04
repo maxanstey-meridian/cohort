@@ -215,9 +215,20 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
         // dependents step. The model has a tenantless retained entity, so before the step runs
         // the hold guard reads tenantless holds through its own System(Readiness) scope. Nothing
         // validated the model before: the model pass first runs inside the caller's transaction.
+        // The recording scope hook shows the path was taken: the erasure opens exactly two
+        // System(Readiness) scopes, the model pass's stored-identities read and the guard's
+        // tenantless-holds read, and both run on the connection that carries the caller's
+        // transaction, so neither may begin a transaction of its own.
+        // Make-fail: RetentionHoldGuard.ReadsTenantlessHolds returns false (the guard's scope
+        // never opens, so one Readiness scope is logged, not two).
+        // Make-fail: RetentionHoldGuard.ReadSystemTenantlessHoldsAsync begins a transaction on its
+        // scope's context (`systemDb.Database.BeginTransactionAsync`) before the read: the
+        // erasure fails (its entity failure is an InvalidOperationException, the connection
+        // already carrying the caller's transaction), so the result assertion goes red.
         await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
         var hostInterceptor = new CommitCountingInterceptor();
         var probe = new DependentsStepProbe();
+        var executionScope = new RecordingExecutionScope();
         await using var hostConnection = new Npgsql.NpgsqlConnection(database.ConnectionString);
         var services = new ServiceCollection();
         services.AddLogging();
@@ -225,7 +236,7 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
         services.AddSingleton<IRetentionRuleProvider>(
             new SingleCategoryRepository("caller-erasure", new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge))
         );
-        services.AddSingleton(RetentionExecutionScope.Unisolated);
+        services.AddSingleton<IRetentionExecutionScope>(executionScope);
         services.AddSingleton(probe);
         services.AddCohort<SharedConnectionDbContext>();
         services.AddRetentionDependents<SharedConnectionRecord, RecordingDependentsStep>();
@@ -260,8 +271,75 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
 
         hostInterceptor.Commits.Should().Be(commitsBefore + 1);
         probe.Rows.Should().Equal(recordId);
+        executionScope.Ran.OfType<RetentionExecutionContext.System>().Should().Equal(
+            new RetentionExecutionContext.System(RetentionSystemWork.Readiness),
+            new RetentionExecutionContext.System(RetentionSystemWork.Readiness)
+        );
         await using var check = provider.CreateAsyncScope();
         (await check.ServiceProvider.GetRequiredService<SharedConnectionDbContext>().Records.CountAsync()).Should().Be(0);
+    }
+
+    [Fact]
+    public async Task A_hold_check_that_read_the_callers_uncommitted_writes_on_the_one_connection_is_not_kept()
+    {
+        // A host that gives every context one connection: the stored-identities read of the
+        // model pass runs on the caller's connection, inside the caller's transaction, so it sees
+        // the caller's uncommitted writes. Here the caller ends the only hold on an identity no
+        // retained entity registers, so the check passes inside the transaction, and the
+        // transaction rolls back. The pass must not be remembered: the same call outside a
+        // transaction finds the hold active again and is refused.
+        // Make-fail: RetentionRuntimeReadinessValidator.RunModelPassAsync sets
+        // `StoredEntityIdentitiesPassed = true` whatever `ownConnection` is (the second call
+        // passes).
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using var hostConnection = new Npgsql.NpgsqlConnection(database.ConnectionString);
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
+        services.AddSingleton<IRetentionRuleProvider>(
+            new SingleCategoryRepository("caller-erasure", new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge))
+        );
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
+        services.AddCohort<SharedConnectionDbContext>();
+        services.AddDbContextPool<SharedConnectionDbContext>(options => options.UseNpgsql(hostConnection));
+
+        await using var provider = services.BuildServiceProvider(validateScopes: true);
+        await using (var scope = provider.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<SharedConnectionDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            var holdId = Guid.NewGuid();
+            var orphanedEntity = Guid.NewGuid();
+            await db.Database.ExecuteSqlAsync(
+                $"""
+                INSERT INTO "retention_holds"
+                    ("HoldId", "RetentionEntityId", "RecordId", "TenantId", "Reason", "CreatedAt", "ExpiresAt", "RemovedAt")
+                VALUES ({holdId}, {orphanedEntity}, 'row', NULL, 'litigation', {DateTimeOffset.UtcNow.AddDays(-1)}, NULL, NULL)
+                """
+            );
+        }
+
+        await using (var scope = provider.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<SharedConnectionDbContext>();
+            await using var transaction = await db.Database.BeginTransactionAsync();
+            await db.Database.ExecuteSqlRawAsync(
+                """UPDATE "retention_holds" SET "RemovedAt" = pg_catalog.statement_timestamp()"""
+            );
+
+            var inside = () => scope.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>().ListActiveAsync(CancellationToken.None);
+
+            await inside.Should().NotThrowAsync("the only hold is ended inside the transaction");
+            await transaction.RollbackAsync();
+        }
+
+        await using var outside = provider.CreateAsyncScope();
+        var after = () => outside.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>().ListActiveAsync(CancellationToken.None);
+
+        (await after.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                error.Contains("is not registered by any retained entity", StringComparison.Ordinal)
+            );
     }
 
     [Fact]
@@ -565,6 +643,19 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
             (await db.Records.AsNoTracking().AnyAsync(record => record.Id == row.Id, ct)).Should().BeTrue();
             probe.Connections.Add(db.Database.GetDbConnection());
             probe.Contexts.Add(db);
+        }
+    }
+
+    private sealed class RecordingExecutionScope : IRetentionExecutionScope
+    {
+        private readonly System.Collections.Concurrent.ConcurrentQueue<RetentionExecutionContext> ran = new();
+
+        public IReadOnlyCollection<RetentionExecutionContext> Ran => ran;
+
+        public Task RunAsync(RetentionExecutionContext context, Func<Task> work, CancellationToken ct)
+        {
+            ran.Enqueue(context);
+            return work();
         }
     }
 

@@ -123,14 +123,15 @@ values are bound as typed `NULL`s, so that text carries no subject data. Postgre
 - a column the database generates (a generated column, or an identity column
   `GENERATED ALWAYS`), which takes no `UPDATE` (`428C9`);
 - a cast type the database doesn't know, resolved through the session's search path
-  (`42704`);
+  (`42704`).
+
 Readiness doesn't refuse a privilege the database role lacks (`42501`): the check needs none,
 and a role that can't run a statement fails at that statement, under the role that sends it,
 before the statement writes. The statements are explained as the session that first validates
 the model sees them, with that session's role and search path, so a fault only another role or
 path reaches surfaces at the statement in the same way:
 
-- a schema the role has no `USAGE` on is raised while PostgreSQL looks up a name, so that
+- a missing `USAGE` on a schema is raised while PostgreSQL looks up a name, so that
   statement's columns go unchecked;
 - the blocking-key read below keeps only the child tables the role can `SELECT`, so the
   statements explained are that role's;
@@ -190,20 +191,25 @@ At startup, the model pass runs in the `System(Readiness)` scope, then in the sc
 subsystem that will run, so that scope's own context is checked too: `System(RowDispatch)`
 always (the payload scrub and the dispatcher run whether or not a row handler is registered),
 `System(WorkerCoordination)` when the worker runs (the kill switch off and a `Schedule` set),
-and `System(HistoryPruning)` when a pruning retention is set. A refusal stops the host. The
-pass runs once for each model instance and connection string, so a later scope that shares both
-opens no further work. The stored-identities step opens its own `System(Readiness)` scope once
-for each model instance and connection string. A refusal after startup (a scope that reaches a model or connection string startup
-didn't check, say) throws a `RetentionConfigurationException` from the call that reached
-readiness. The dispatcher, worker, and pruner log it and retry, and sweeps, previews, and the
-other operations carry on.
+and `System(HistoryPruning)` when a pruning retention is set and the kill switch is off. A
+refusal stops the host. The pass runs once for each model instance and connection string, so a
+later scope that shares both does no further work beyond the provider and Multiplexing checks.
+A refusal after startup (a scope that reaches a model or connection string startup didn't
+check, say) throws a `RetentionConfigurationException` from the call that reached readiness.
+The dispatcher, worker, and pruner log it and retry, and sweeps, previews, and the other
+operations carry on.
 
-A pass is recorded on its model instance and connection string only outside a caller's
-transaction; the stored-identities check, which runs on its own connection, is recorded inside
-one too. Once the model has passed, every later call returns with no round trip, except the
-check for tenantless holds, which reads the caller's database and its own `System(Readiness)`
-scope's before it reads them. Inside a caller's transaction with no pass recorded, each call
-runs the pass again. See [Readiness](/reference/schema#readiness).
+A pass records nothing until it completes, so a pass refused partway starts again from its
+first check on the next call. A completed pass is recorded on its model instance and connection
+string only outside a caller's transaction. The one check recorded on its own is the
+stored-identities check, which also records inside a caller's transaction, but only when its
+`System(Readiness)` scope ran on a connection other than the caller's: on a host that gives
+every context one connection, that read would see the caller's uncommitted hold writes. Once
+the model has passed, every later call returns with no round trip, except the check for
+tenantless holds, which reads the caller's database and its own `System(Readiness)` scope's
+before it reads them. Inside a caller's transaction with no pass recorded, each call runs the
+pass again, skipping the stored-identities check if that one was recorded. See
+[Readiness](/reference/schema#readiness).
 
 ### Rules
 

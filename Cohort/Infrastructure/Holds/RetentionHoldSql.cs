@@ -19,7 +19,7 @@ internal static class RetentionHoldSql
             """;
     }
 
-    /// <summary>H9: the ids of every active hold on a tenantless row.</summary>
+    /// <summary>The ids of every active hold on a tenantless row.</summary>
     internal static SweepStatement BuildActiveTenantlessHoldIds(RelationalObjectName holdsTable) =>
         CohortStatements.Statement(
             "active-tenantless-holds",
@@ -34,7 +34,7 @@ internal static class RetentionHoldSql
         );
 
     /// <summary>
-    /// H10: the stored entity identities that no retained entity registers, with the number of
+    /// The stored entity identities that no retained entity registers, with the number of
     /// active holds that name each. <paramref name="registered"/> is the registered identities.
     /// </summary>
     internal static SweepStatement StoredEntityIdentities(CohortStoreTables tables, Guid[] registered) =>
@@ -53,7 +53,7 @@ internal static class RetentionHoldSql
         );
 
     /// <summary>
-    /// H1: stores a hold, or no row when its expiry has already passed on the database clock (it
+    /// Stores a hold, or no row when its expiry has already passed on the database clock (it
     /// would persist while protecting nothing; refused by row count, not a SQL error, so a
     /// caller-owned transaction stays usable). <paramref name="recordId"/> is the row's canonical
     /// text.
@@ -96,7 +96,7 @@ internal static class RetentionHoldSql
             tables.RetentionHolds
         );
 
-    /// <summary>H2: ends a hold that is still standing.</summary>
+    /// <summary>Ends a hold that is still standing.</summary>
     internal static SweepStatement BuildRemoveHold(CohortStoreTables tables, Guid holdId, DateTimeOffset removedAt) =>
         CohortStatements.Statement(
             "remove-hold",
@@ -110,7 +110,7 @@ internal static class RetentionHoldSql
             tables.RetentionHolds
         );
 
-    /// <summary>H3: every active hold, in <c>ListActiveAsync</c>'s order.</summary>
+    /// <summary>Every active hold, in <c>ListActiveAsync</c>'s order.</summary>
     internal static SweepStatement BuildActiveHolds(CohortStoreTables tables) =>
         CohortStatements.Statement(
             "active-holds",
@@ -180,14 +180,14 @@ internal static class RetentionHoldSql
     /// <c>ListActiveAsync</c>. A direct hold counts even when its row is gone (the record id is
     /// canonical text, matched by parameter); a path starts from the row itself, which must belong
     /// to <paramref name="tenantId"/> when the entity is tenanted. The record id
-    /// (canonical text) and the tenant id (a <see cref="Guid"/>, bound only for a tenanted entity)
-    /// are bound as given, so a check can pass typed NULLs.
+    /// (canonical text) is bound as given, so a check can pass a typed NULL; the tenant id is
+    /// bound only for a tenanted entity.
     /// </summary>
     internal static SweepStatement BuildCoveringHolds(
         RelationalObjectName holdsTable,
         RetentionEntry entry,
         object? canonicalRecordId,
-        object? tenantId
+        Guid? tenantId
     )
     {
         var (union, parameters) = CoveringHoldsForRecord(holdsTable, entry, canonicalRecordId, tenantId, "UNION");
@@ -214,7 +214,7 @@ internal static class RetentionHoldSql
         RelationalObjectName holdsTable,
         RetentionEntry entry,
         object? canonicalRecordId,
-        object? tenantId
+        Guid? tenantId
     )
     {
         var (union, parameters) = CoveringHoldsForRecord(holdsTable, entry, canonicalRecordId, tenantId, "UNION ALL");
@@ -237,7 +237,7 @@ internal static class RetentionHoldSql
         RelationalObjectName holdsTable,
         RetentionEntry entry,
         object? canonicalRecordId,
-        object? tenantId,
+        Guid? tenantId,
         string setOperator
     )
     {
@@ -279,13 +279,12 @@ internal static class RetentionHoldSql
     /// or tenantless entities), directly or through a holder path. Age, legal minimum and
     /// strategy eligibility play no part. Ordered like <see cref="BuildCoveringHolds"/>. Null when
     /// <paramref name="starts"/> is empty: nothing to read. <paramref name="tenantId"/> is bound
-    /// as given when it isn't null, so a check passes a typed NULL for a tenanted split and null
-    /// for a tenantless one.
+    /// when it isn't null: a tenanted split passes the tenant id, a tenantless one null.
     /// </summary>
     internal static SweepStatement? BuildCoveringHoldsForSubject(
         RelationalObjectName holdsTable,
         IReadOnlyList<(RetentionEntry Entry, ErasureSubjectPredicate Subject)> starts,
-        object? tenantId
+        Guid? tenantId
     )
     {
         if (starts.Count == 0)
@@ -505,7 +504,7 @@ internal static class RetentionHoldSql
         RetentionEntry entry,
         IEnumerable<RetentionEntry> entries,
         object? recordId,
-        object? tenantId
+        Guid? tenantId
     )
     {
         var byEntity = entries.ToDictionary(candidate => candidate.RetentionEntityId);
@@ -751,7 +750,7 @@ internal static class RetentionHoldSql
         RetentionEntry entry,
         IEnumerable<RetentionEntry> entries,
         object? recordId,
-        object? tenantId
+        Guid? tenantId
     )
     {
         var statements = new List<SweepStatement>
@@ -779,7 +778,7 @@ internal static class RetentionHoldSql
         RelationalObjectName holdsTable,
         RetentionEntry entry,
         object? recordId,
-        object? tenantId
+        Guid? tenantId
     )
     {
         var statements = new List<SweepStatement>();
@@ -801,7 +800,7 @@ internal static class RetentionHoldSql
     internal static IReadOnlyList<SweepStatement> ForSubjectKind(
         RelationalObjectName holdsTable,
         IReadOnlyList<(RetentionEntry Entry, ErasureSubjectPredicate Subject)> starts,
-        object? tenantId
+        Guid? tenantId
     )
     {
         var tenanted = starts.Where(start => SweepEntityScope.TenantedOnly.Includes(start.Entry)).ToList();

@@ -289,7 +289,7 @@ internal sealed class EfRetentionHoldsRepository(
         Guid retentionEntityId,
         string recordId,
         Guid? tenantId,
-        Func<RelationalObjectName, RetentionEntry, object?, object?, SweepStatement> build,
+        Func<RelationalObjectName, RetentionEntry, object?, Guid?, SweepStatement> build,
         Func<DbCommand, Task<TResult>> read,
         CancellationToken ct
     )

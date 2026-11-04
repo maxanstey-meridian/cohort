@@ -56,14 +56,14 @@ The application services and the dispatcher check readiness themselves, so a hos
 skipped startup validation still can't run against a missing or outdated schema.
 
 Readiness validates once per EF model instance and connection string, then trusts the result:
-each check keeps its success on the model's entry, unless it passed inside the caller's
-transaction (the stored-identities check, which runs on its own connection, is kept inside
-one too), so later contexts of the same model instance don't run it again. A rebuilt copy of
-the model is a new instance and is checked again, and so is the same model under another
-connection string (another user name or options, say; the password isn't part of it). The
-anonymise-target check keeps nothing on its own, since it reads session state, so it runs on
-every model pass. The statement check is one
-more step of the pass: it explains the statements Cohort sends against your retained tables
+a pass records nothing until it completes, and a completed pass outside a caller's transaction
+is kept on the model's entry, so later contexts of the same model instance don't run it again.
+The stored-identities check alone is kept on its own, inside a caller's transaction too, but
+only when its `System(Readiness)` scope ran on a connection other than the caller's. A rebuilt
+copy of the model is a new instance and is checked again, and so is the same model under
+another connection string (another user name or options, say; the password isn't part of it).
+The anonymise-target check reads session state, so it runs on every model pass. The statement
+check is the last step of the pass: it explains the statements Cohort sends against your retained tables
 (see [Startup validation](/reference/startup-validation#statements)), as the session that
 reaches the pass first sees them, with that session's role and search path, and it needs no
 privileges. A schema that drifts after that isn't refused by readiness; the run fails at the

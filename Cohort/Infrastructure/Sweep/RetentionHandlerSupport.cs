@@ -343,7 +343,7 @@ internal static class RetentionHandlerSupport
     }
 
     /// <summary>
-    /// D2: records a mutated row with its captured payload and returns the row's id.
+    /// Records a mutated row with its captured payload and returns the row's id.
     /// <paramref name="recordId"/> is the row's canonical text.
     /// </summary>
     internal static SweepStatement RowDetailWithPayloadStatement(
@@ -382,7 +382,7 @@ internal static class RetentionHandlerSupport
         );
 
     /// <summary>
-    /// T1: queues a handler status for a row detail.
+    /// Queues a handler status for a row detail.
     /// </summary>
     internal static SweepStatement HandlerStatusStatement(
         CohortStoreTables tables,

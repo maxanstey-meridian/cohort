@@ -69,7 +69,7 @@ internal static class HistoryPruningSql
     }
 
     /// <summary>
-    /// R8: the oldest settled runs eligible for pruning, locked with <c>FOR UPDATE SKIP
+    /// The oldest settled runs eligible for pruning, locked with <c>FOR UPDATE SKIP
     /// LOCKED</c>. A null cutoff or occurrence binds as SQL NULL.
     /// </summary>
     internal static SweepStatement EligibleRunsStatement(
@@ -110,7 +110,7 @@ internal static class HistoryPruningSql
             tables.SweepRowHandlerStatus
         );
 
-    /// <summary>D8: deletes the row details of the pruned runs (handler statuses cascade).</summary>
+    /// <summary>Deletes the row details of the pruned runs (handler statuses cascade).</summary>
     internal static SweepStatement DeleteRowDetailsStatement(CohortStoreTables tables, Guid[] sweepIds) =>
         CohortStatements.Statement(
             "prune-row-details",
@@ -119,7 +119,7 @@ internal static class HistoryPruningSql
             tables.SweepRunRowDetail
         );
 
-    /// <summary>S3: deletes the entity summaries of the pruned runs.</summary>
+    /// <summary>Deletes the entity summaries of the pruned runs.</summary>
     internal static SweepStatement DeleteEntitySummariesStatement(CohortStoreTables tables, Guid[] sweepIds) =>
         CohortStatements.Statement(
             "prune-entity-summaries",
@@ -128,7 +128,7 @@ internal static class HistoryPruningSql
             tables.SweepRunEntitySummary
         );
 
-    /// <summary>R9: deletes the pruned runs.</summary>
+    /// <summary>Deletes the pruned runs.</summary>
     internal static SweepStatement DeleteRunsStatement(CohortStoreTables tables, Guid[] sweepIds) =>
         CohortStatements.Statement(
             "prune-runs",
@@ -138,7 +138,7 @@ internal static class HistoryPruningSql
         );
 
     /// <summary>
-    /// H11: deletes up to <paramref name="batchSize"/> holds whose earlier of <c>RemovedAt</c>
+    /// Deletes up to <paramref name="batchSize"/> holds whose earlier of <c>RemovedAt</c>
     /// and <c>ExpiresAt</c> is before the cutoff. The eligibility test reads only the hold's own
     /// columns, so the lock re-evaluates it against the latest committed version of each
     /// claimed row.

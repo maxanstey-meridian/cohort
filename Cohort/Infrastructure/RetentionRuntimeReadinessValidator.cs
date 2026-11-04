@@ -120,7 +120,6 @@ internal sealed class RetentionRuntimeReadinessValidator(
         var facade = db.Database;
         await startupValidator.ValidateAsync(ct);
         var storeTables = CohortStoreTables.FromModel(db.Model);
-        var callerDatabase = await ReadServerDatabaseAsync(facade, storeTables.RetentionHolds, ct);
 
         // Order matters. Startup validation runs first, so a model with a retained entity and no
         // or partial Cohort table mapping gets startup validation's aggregated refusal before
@@ -133,67 +132,38 @@ internal sealed class RetentionRuntimeReadinessValidator(
         // every statement Cohort sends against the retained tables owns existence, analysable
         // types, writability, cast types, and assignability, and it runs once the rules above,
         // which skip a missing table or column, have passed.
-        // A check the entry has passed is skipped, inside a caller's transaction too.
-        await RunCheckAsync(
-            readiness,
-            RetentionReadinessCheck.ServerVersion,
-            () => ValidateServerVersionAsync(facade, ct)
-        );
-        await RunCheckAsync(
-            readiness,
-            RetentionReadinessCheck.Schema,
-            () => schemaValidator.ValidateAsync(storeTables, facade, ct)
-        );
-        await RunCheckAsync(
-            readiness,
-            RetentionReadinessCheck.RetainedRelations,
-            () => ValidateRetainedRelationsAsync(facade, RetainedRelationRows(), ct)
-        );
-        await RunCheckAsync(
-            readiness,
-            RetentionReadinessCheck.HoldRelationLinkColumns,
-            () => ValidateHoldRelationLinkColumnsAsync(facade, HoldLinkRows(), ct)
-        );
-        await RunCheckAsync(
-            readiness,
-            RetentionReadinessCheck.RetainedColumns,
-            () => ValidateRetainedColumnsAsync(facade, RetainedColumnRows(), ct)
-        );
-        // Not recorded: what this reads is session state, so it runs on every pass.
+        // Nothing is recorded until the pass gets through the statements: the rules above skip a
+        // missing table or column, so a pass refused at the statements hasn't vouched for them,
+        // and a column added later must meet them. The one exception is the stored-identities
+        // check, which depends on no other check and is recorded on its own.
+        await ValidateServerVersionAsync(facade, ct);
+        await schemaValidator.ValidateAsync(storeTables, facade, ct);
+        await ValidateRetainedRelationsAsync(facade, RetainedRelationRows(), ct);
+        await ValidateHoldRelationLinkColumnsAsync(facade, HoldLinkRows(), ct);
+        await ValidateRetainedColumnsAsync(facade, RetainedColumnRows(), ct);
+        // What this reads is session state, so it runs on every pass.
         await ValidateAnonymiseTargetsAsync(ct);
-        var registered = registry.Scan().Values.Select(entry => entry.RetentionEntityId).Order().ToArray();
-        // The hold check runs on its own connection, outside the caller's transaction, so its
-        // success stands whatever transaction the caller is in. The checks above read through
-        // the caller's connection, and one that passed inside a transaction may have seen
-        // DDL that rolls back, so those are recorded only without one.
-        await RunCheckAsync(
-            readiness,
-            RetentionReadinessCheck.StoredEntityIdentities,
-            () => ValidateStoredEntityIdentitiesAsync(storeTables.RetentionHolds, registered, callerDatabase, ct),
-            recordInsideTransaction: true
-        );
-        await RunCheckAsync(readiness, RetentionReadinessCheck.Statements, () => ValidateStatementsAsync(facade, ct));
-    }
-
-    // Runs a check unless the entry already passed it; records the pass. A failure is never
-    // recorded. Called under the entry's Gate.
-    private async Task RunCheckAsync(
-        RetentionRuntimeReadinessEntry readiness,
-        RetentionReadinessCheck check,
-        Func<Task> run,
-        bool recordInsideTransaction = false
-    )
-    {
-        if (readiness.Passed.Contains(check))
+        if (!readiness.StoredEntityIdentitiesPassed)
         {
-            return;
+            var registered = registry.Scan().Values.Select(entry => entry.RetentionEntityId).Order().ToArray();
+            var callerDatabase = await ReadServerDatabaseAsync(facade, storeTables.RetentionHolds, ct);
+            var ownConnection = await ValidateStoredEntityIdentitiesAsync(
+                storeTables.RetentionHolds,
+                registered,
+                callerDatabase,
+                ct
+            );
+            // Inside a caller's transaction the pass is recorded only when the scope read on a
+            // connection of its own. On a host that gives every context one connection the read
+            // ran inside the caller's transaction and saw its uncommitted hold writes, which may
+            // roll back.
+            if (ownConnection || facade.CurrentTransaction is null)
+            {
+                readiness.StoredEntityIdentitiesPassed = true;
+            }
         }
 
-        await run();
-        if (recordInsideTransaction || db.Database.CurrentTransaction is null)
-        {
-            readiness.Passed.Add(check);
-        }
+        await ValidateStatementsAsync(facade, ct);
     }
 
     /// <summary>
@@ -1155,9 +1125,11 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// tenant's holds under row-level security. It also runs when no entity is retained, since
     /// removing the last <c>[Retain]</c> orphans holds the same way. The scope's context is used
     /// only through its connection, so its model doesn't matter, but it must reach the caller's
-    /// database. Its success is recorded on the entry, and stands whatever transaction the caller
-    /// is in, since it never reads through the caller's connection; a recorded pass skips the
-    /// scope altogether.
+    /// database. Its success is recorded on the entry, and a recorded pass skips the scope
+    /// altogether. Inside a caller's transaction it is recorded only when the scope read on a
+    /// connection of its own (the returned flag): on a host that gives every context one
+    /// connection, the read runs inside the caller's transaction and sees its uncommitted hold
+    /// writes. Returns whether the scope's connection is a different object from the caller's.
     /// <para>
     /// That scope's database is compared with the caller's before the read
     /// (<see cref="ValidateReadinessScopeAsync"/>). The read itself, under the role of this
@@ -1168,7 +1140,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// checked when it first does.
     /// </para>
     /// </summary>
-    private Task ValidateStoredEntityIdentitiesAsync(
+    private Task<bool> ValidateStoredEntityIdentitiesAsync(
         RelationalObjectName holdsTable,
         Guid[] registered,
         ServerDatabaseIdentity callerDatabase,
@@ -1186,7 +1158,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
             ct
         );
 
-    private async Task ValidateStoredEntityIdentitiesAsync(
+    private async Task<bool> ValidateStoredEntityIdentitiesAsync(
         DatabaseFacade systemDatabase,
         Guid[] registered,
         RelationalObjectName holdsTable,
@@ -1224,6 +1196,8 @@ internal sealed class RetentionRuntimeReadinessValidator(
             {
                 throw new RetentionConfigurationException(errors);
             }
+
+            return !ReferenceEquals(systemDatabase.GetDbConnection(), db.Database.GetDbConnection());
         }
         finally
         {
@@ -1429,24 +1403,10 @@ internal sealed class RetentionRuntimeReadinessState
 }
 
 /// <summary>
-/// The model pass's checks that an entry remembers having passed. The anonymise-target check
-/// isn't one: its outcome depends on session state, so it runs on every pass.
-/// </summary>
-internal enum RetentionReadinessCheck
-{
-    ServerVersion,
-    Schema,
-    RetainedRelations,
-    HoldRelationLinkColumns,
-    Statements,
-    RetainedColumns,
-    StoredEntityIdentities,
-}
-
-/// <summary>
 /// What readiness remembers for one model instance and connection string: whether the whole model
-/// pass passed outside a caller's transaction, and which of its checks passed (so a pass that
-/// failed partway, or ran inside a transaction, isn't repeated for the checks that stand).
+/// pass passed outside a caller's transaction. A pass records nothing until it completes, since
+/// its rules skip what the statements check refuses. The stored-identities check alone is
+/// recorded on its own.
 /// </summary>
 internal sealed class RetentionRuntimeReadinessEntry
 {
@@ -1456,9 +1416,9 @@ internal sealed class RetentionRuntimeReadinessEntry
     internal volatile bool ModelValidated;
 
     /// <summary>
-    /// The checks that passed, each recorded outside a caller's transaction (stored identities,
-    /// which run on their own connection, inside one too). Read and written under
+    /// The stored-identities check passed: outside a caller's transaction, or inside one when its
+    /// scope read on a connection other than the caller's. Read and written under
     /// <see cref="Gate"/>.
     /// </summary>
-    internal HashSet<RetentionReadinessCheck> Passed { get; } = [];
+    internal bool StoredEntityIdentitiesPassed;
 }

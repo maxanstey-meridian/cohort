@@ -85,8 +85,10 @@ internal sealed class RetentionWorker(
         }
         catch (Exception ex)
         {
-            // Nothing reached the ledger (readiness, the tenant source or the lock connection
-            // failed), so no attempt is used up: an outage retries until the next occurrence.
+            // The iteration failed before any pass ran (readiness, the tenant source, or the lock
+            // connection), or at the ledger read-back after them. Either way each pass's attempts
+            // are its own runs, which the engine re-reads under the pass lock, so the retry
+            // reruns only what is still owed.
             logger.LogError(
                 ex,
                 "Cohort worker iteration failed. The worker stays alive and retries after {RetryDelay}, or at the next occurrence if that comes first.",

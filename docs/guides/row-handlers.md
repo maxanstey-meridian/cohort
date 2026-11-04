@@ -299,9 +299,9 @@ missing one fails at the statement, with PostgreSQL's `42501`.
   `sweep_run`, `sweep_run_row_detail`, and `sweep_row_handler_status`, and nothing on your
   tables.
 - **The payload scrub** runs as `System(RowDispatch)` too, needs `SELECT` and `UPDATE` on
-  `sweep_run_row_detail`, and runs first in each flush and poll, so a dispatcher that fails for
-  a missing privilege can't keep a snapshot past `PayloadRetention`. It runs with the kill
-  switch on.
+  `sweep_run_row_detail`, and runs first in each flush, and in a poll once its hourly gate is
+  due, so a dispatcher that fails for a missing privilege can't keep a snapshot past
+  `PayloadRetention`. It runs with the kill switch on.
 
 A background poll whose scrub fails (a missing grant, say) leaves the scrub's hourly gate
 unspent, so the next poll tries it again. `FlushAsync` and `RequeueDeadLetteredAsync` throw

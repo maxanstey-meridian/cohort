@@ -222,14 +222,16 @@ default. The identity columns behind `sweep_run_row_detail.Id` and
 `sweep_row_handler_status.Id` need no separate sequence grant; a serial column in their place
 needs `USAGE` on its sequence.
 
-Readiness checks none of these grants. PostgreSQL refuses a missing one at the statement that
+Readiness checks none of these grants ahead of time; its own read of `retention_holds` fails
+with `42501` like any other statement. PostgreSQL refuses a missing grant at the statement that
 needs it, with its own `42501`, and what that costs depends on where the statement runs:
 
-- In a sweep, or inside one entity of an erasure with `ErasureTransaction.Caller`, the
-  entity's work rolls back and the entity settles `PartiallyFailed`.
+- In a sweep or an erasure, a statement inside one entity's work fails that entity: its work
+  rolls back and the run settles `PartiallyFailed`.
+- Elsewhere, outside your transaction (a run's start, a preview, a hold call,
+  `IRetentionDeletion`), the call throws PostgreSQL's `42501` before it writes.
 - In a statement outside the entity's savepoint inside your transaction (the run's start and
-  settle, the isolation check, the blocking-key read, and any hold call), PostgreSQL aborts
-  that transaction.
+  settle, the isolation check, and any hold call), PostgreSQL aborts that transaction.
 - A run whose role can't settle it stays `Started` until abandoned-run recovery marks it
   `Failed`.
 

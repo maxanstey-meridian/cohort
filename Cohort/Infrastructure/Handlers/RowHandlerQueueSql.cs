@@ -38,7 +38,7 @@ internal static class RowHandlerQueueSql
         """;
 
     /// <summary>
-    /// Q1: the queue's remaining work: claims in flight, pending rows, and dead-lettered rows
+    /// The queue's remaining work: claims in flight, pending rows, and dead-lettered rows
     /// that still hold a snapshot to requeue. Raw SQL, not LINQ: EF emits an unqualified COUNT
     /// that a search_path decoy can shadow.
     /// </summary>
@@ -84,7 +84,7 @@ internal static class RowHandlerQueueSql
     }
 
     /// <summary>
-    /// Q2: requeues every dead-lettered handler of each row that still holds its snapshot,
+    /// Requeues every dead-lettered handler of each row that still holds its snapshot,
     /// optionally only rows of <paramref name="sweepId"/> with a dead-lettered
     /// <paramref name="handlerId"/>. One text covers all four combinations: the two booleans
     /// switch each filter off.
@@ -154,7 +154,7 @@ internal static class RowHandlerQueueSql
             ct
         );
 
-    /// <summary>Q3: clears every captured snapshot taken before <paramref name="cutoff"/>.</summary>
+    /// <summary>Clears every captured snapshot taken before <paramref name="cutoff"/>.</summary>
     internal static SweepStatement ScrubExpiredPayloadsStatement(CohortStoreTables tables, DateTimeOffset cutoff) =>
         CohortStatements.Statement(
             "payload-scrub",
@@ -172,7 +172,7 @@ internal static class RowHandlerQueueSql
         ExecuteAsync(db, ScrubExpiredPayloadsStatement(CohortStoreTables.FromModel(db.Model), cutoff), ct);
 
     /// <summary>
-    /// Q4: clears a row detail's captured snapshot once every handler for that row has
+    /// Clears a row detail's captured snapshot once every handler for that row has
     /// succeeded.
     /// </summary>
     internal static SweepStatement ClearDeliveredPayloadStatement(CohortStoreTables tables, long rowDetailId) =>
@@ -205,7 +205,7 @@ internal static class RowHandlerQueueSql
         );
 
     /// <summary>
-    /// Q5: one page of claims held since <paramref name="leaseCutoff"/> or earlier, in
+    /// One page of claims held since <paramref name="leaseCutoff"/> or earlier, in
     /// (<c>ClaimedAt</c>, <c>Id</c>) order after <paramref name="after"/> (from the start when
     /// null).
     /// </summary>
@@ -269,7 +269,7 @@ internal static class RowHandlerQueueSql
     }
 
     /// <summary>
-    /// Q6: locks one status row if it is still in flight under <paramref name="claimToken"/>,
+    /// Locks one status row if it is still in flight under <paramref name="claimToken"/>,
     /// skipping one a claim or another recovery holds.
     /// </summary>
     internal static SweepStatement ReclaimLockStatement(CohortStoreTables tables, long statusId, Guid claimToken) =>
@@ -371,7 +371,7 @@ internal static class RowHandlerQueueSql
         ExecuteAsync(db, RequeueInterruptedStatement(CohortStoreTables.FromModel(db.Model), claimToken), ct);
 
     /// <summary>
-    /// T5: puts back in the queue every claim <paramref name="claimToken"/> still holds.
+    /// Puts back in the queue every claim <paramref name="claimToken"/> still holds.
     /// </summary>
     internal static SweepStatement RequeueInterruptedStatement(CohortStoreTables tables, Guid claimToken) =>
         CohortStatements.Statement(
@@ -386,7 +386,7 @@ internal static class RowHandlerQueueSql
         );
 
     /// <summary>
-    /// T2: claims up to <paramref name="limit"/> due rows under <paramref name="claimToken"/> and
+    /// Claims up to <paramref name="limit"/> due rows under <paramref name="claimToken"/> and
     /// returns them with their row details, locking the due rows with <c>SKIP LOCKED</c>.
     /// </summary>
     internal static SweepStatement ClaimStatement(
@@ -598,7 +598,7 @@ internal static class RowHandlerQueueSql
         );
 
     /// <summary>
-    /// T6: dead-letters every pending or in-flight handler of the row detail after
+    /// Dead-letters every pending or in-flight handler of the row detail after
     /// <paramref name="statusId"/>, which can never run now, with <paramref name="reason"/> as
     /// their error.
     /// </summary>
@@ -630,7 +630,7 @@ internal static class RowHandlerQueueSql
         );
 
     /// <summary>
-    /// T4: updates this handler row only while the delivery still owns its claim: a reclaim
+    /// Updates this handler row only while the delivery still owns its claim: a reclaim
     /// replaces the token, so a stale delivery matches nothing. <paramref name="at"/> is the
     /// completion time, or the next attempt's for a retry or a requeue; <paramref name="lastError"/>
     /// is only a retry's or a dead letter's. Raw SQL rather than

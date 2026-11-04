@@ -80,7 +80,7 @@ internal static class RetentionRunLedgerSql
         }
     }
 
-    /// <summary>R4: the runs left <c>Started</c> at or before <paramref name="cutoff"/>, oldest first.</summary>
+    /// <summary>The runs left <c>Started</c> at or before <paramref name="cutoff"/>, oldest first.</summary>
     internal static SweepStatement AbandonedRunsStatement(CohortStoreTables tables, DateTimeOffset cutoff) =>
         CohortStatements.Statement(
             "abandoned-runs",
@@ -94,7 +94,7 @@ internal static class RetentionRunLedgerSql
         );
 
     /// <summary>
-    /// R5: settles an abandoned run as failed, at <paramref name="now"/> (the settled time, and
+    /// Settles an abandoned run as failed, at <paramref name="now"/> (the settled time, and
     /// the start of its duration), with <paramref name="error"/> as its error.
     /// </summary>
     internal static SweepStatement AbandonedRunFailedStatement(
@@ -122,7 +122,7 @@ internal static class RetentionRunLedgerSql
         );
 
     /// <summary>
-    /// R6: the scheduled runs of one kind since <paramref name="occurrence"/>, per pass, or for
+    /// The scheduled runs of one kind since <paramref name="occurrence"/>, per pass, or for
     /// only <paramref name="tenantId"/>'s pass when one is given (the clause and its parameter
     /// exist only then).
     /// </summary>

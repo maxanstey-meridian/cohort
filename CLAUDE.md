@@ -44,7 +44,7 @@ Cohort/                 — the library. No tests of its own.
 │   ├── Handlers/       — RowHandlerQueueSql (the row-handler queue's statements)
 │   ├── RetentionRunLedgerSql, HistoryPruningSql — the worker's ledger, abandoned-run recovery, history pruning
 │   ├── RetentionStatementReadiness — readiness's statement check: explains every statement Cohort sends against host tables, once per model and connection string (recorded outside a transaction), tolerating missing privileges
-│   ├── CohortStatements — `Statement`, the one shape every SQL builder returns, and `TransactionIsolation()`
+│   ├── CohortStatements — `Statement` (the `SweepStatement` factory for statements against Cohort's own tables and functions) and `TransactionIsolation()`
 │   ├── Audit/          — EfRetentionAuditWriter
 │   └── Migrations/     — CohortModelBuilder (ConfigureCohortTables extension)
 └── Hosting/            — CohortOptions, RetentionWorker, RetentionRowDispatcher, AddCohort<TContext>()

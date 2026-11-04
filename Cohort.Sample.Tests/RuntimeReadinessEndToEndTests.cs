@@ -689,7 +689,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             );
     }
 
-    // T5a: a model copy is a new entry, so its stored-identity check runs. A copy that no longer
+    // A model copy is a new entry, so its stored-identity check runs. A copy that no longer
     // registers an entity with an active hold is refused for the orphaned hold, not passed with
     // that hold silently matching nothing.
     // Make-fail: key the readiness state by connection string alone, dropping the per-IModel
@@ -728,7 +728,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             );
     }
 
-    // T5b: a copy that maps a hold relation's link member to another column is checked on it.
+    // A copy that maps a hold relation's link member to another column is checked on it.
     [Fact]
     public async Task A_model_copy_that_maps_a_hold_relation_link_elsewhere_is_checked_again()
     {
@@ -754,7 +754,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             );
     }
 
-    // T5c: a copy that writes its soft-delete flag to another column is checked on that column.
+    // A copy that writes its soft-delete flag to another column is checked on that column.
     [Fact]
     public async Task A_model_copy_that_writes_a_marker_to_a_referenced_column_is_checked_again()
     {
@@ -793,7 +793,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             );
     }
 
-    // A1: one model instance reaches one database under two connection strings that differ in
+    // One model instance reaches one database under two connection strings that differ in
     // what a pooler can route by (user name, options), and each is validated: the model's entry
     // is keyed by the connection string without its password. The anonymise check runs on every
     // pass and is never recorded, so only a recorded pass on the entry could skip it.

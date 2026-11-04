@@ -65,7 +65,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             services =>
             {
                 services.AddSingleton(entries);
-                services.AddScoped<IRetentionExecutionScope, RecordingExecutionScope>();
+                services.AddScoped<IRetentionExecutionScope, FlowExecutionScope>();
                 services.AddScoped<IRetentionTenantSource>(_ => new FixedTenantSource([tenantA, tenantB]));
             }
         );
@@ -104,7 +104,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             services =>
             {
                 services.AddSingleton(entries);
-                services.AddScoped<IRetentionExecutionScope, RecordingExecutionScope>();
+                services.AddScoped<IRetentionExecutionScope, FlowExecutionScope>();
                 services.AddScoped<IRetentionTenantSource>(_ => new FixedTenantSource([tenantA]));
             }
         );
@@ -169,7 +169,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             services =>
             {
                 services.AddSingleton(entries);
-                services.AddScoped<IRetentionExecutionScope, RecordingExecutionScope>();
+                services.AddScoped<IRetentionExecutionScope, FlowExecutionScope>();
             }
         );
         var services = host.Services;
@@ -249,7 +249,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             services =>
             {
                 services.AddSingleton(entries);
-                services.AddScoped<IRetentionExecutionScope, RecordingExecutionScope>();
+                services.AddScoped<IRetentionExecutionScope, FlowExecutionScope>();
             }
         );
 
@@ -307,7 +307,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             {
                 services.AddSingleton(entries);
                 services.AddSingleton(observations);
-                services.AddScoped<IRetentionExecutionScope, RecordingExecutionScope>();
+                services.AddScoped<IRetentionExecutionScope, FlowExecutionScope>();
                 services.AddRowHandler<RlsNote, SessionObservingNoteHandler>();
             }
         );
@@ -365,7 +365,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             {
                 services.AddSingleton(entries);
                 services.AddSingleton(observations);
-                services.AddScoped<IRetentionExecutionScope, RecordingExecutionScope>();
+                services.AddScoped<IRetentionExecutionScope, FlowExecutionScope>();
                 services.AddRowHandler<RlsNote, SessionObservingNoteHandler>();
                 services.AddRowHandler<RlsLog, SessionObservingLogHandler>();
             }
@@ -432,7 +432,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             {
                 services.AddSingleton(new EntryLog());
                 services.AddSingleton(observations);
-                services.AddScoped<IRetentionExecutionScope, RecordingExecutionScope>();
+                services.AddScoped<IRetentionExecutionScope, FlowExecutionScope>();
                 services.AddRetentionDependents<RlsNote, TouchingNoteStep>();
             }
         );
@@ -470,7 +470,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             services =>
             {
                 services.AddSingleton(entries);
-                services.AddScoped<IRetentionExecutionScope, RecordingExecutionScope>();
+                services.AddScoped<IRetentionExecutionScope, FlowExecutionScope>();
             },
             new Dictionary<string, string?> { ["Cohort:HistoryPruning:SucceededRunRetention"] = "90.00:00:00" }
         );
@@ -494,7 +494,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             services =>
             {
                 services.AddSingleton(entries);
-                services.AddScoped<IRetentionExecutionScope, RecordingExecutionScope>();
+                services.AddScoped<IRetentionExecutionScope, FlowExecutionScope>();
             }
         );
 
@@ -532,7 +532,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             services =>
             {
                 services.AddSingleton(entries);
-                services.AddScoped<IRetentionExecutionScope, RecordingExecutionScope>();
+                services.AddScoped<IRetentionExecutionScope, FlowExecutionScope>();
             }
         );
 
@@ -561,7 +561,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             services =>
             {
                 services.AddSingleton(new EntryLog());
-                services.AddScoped<IRetentionExecutionScope, RecordingExecutionScope>();
+                services.AddScoped<IRetentionExecutionScope, FlowExecutionScope>();
             }
         );
         await using var scope = host.Services.CreateAsyncScope();
@@ -601,7 +601,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             services =>
             {
                 services.AddSingleton(new EntryLog());
-                services.AddScoped<IRetentionExecutionScope, RecordingExecutionScope>();
+                services.AddScoped<IRetentionExecutionScope, FlowExecutionScope>();
             }
         );
         await using var scope = host.Services.CreateAsyncScope();
@@ -641,7 +641,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             services =>
             {
                 services.AddSingleton(new EntryLog());
-                services.AddScoped<IRetentionExecutionScope, RecordingExecutionScope>();
+                services.AddScoped<IRetentionExecutionScope, FlowExecutionScope>();
             }
         );
         await using var scope = host.Services.CreateAsyncScope();
@@ -972,7 +972,8 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
         }
     }
 
-    private sealed class RecordingExecutionScope(EntryLog entries) : IRetentionExecutionScope
+    /// <summary>Runs the work in the scope's flow, and logs each context it is asked to enter.</summary>
+    private sealed class FlowExecutionScope(EntryLog entries) : IRetentionExecutionScope
     {
         public Task RunAsync(RetentionExecutionContext context, Func<Task> work, CancellationToken ct)
         {

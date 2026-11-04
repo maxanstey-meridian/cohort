@@ -70,7 +70,7 @@ internal sealed class RetentionHistoryPruner(
     /// </summary>
     internal async Task<RetentionHistoryPruneResult> PruneAsync(CancellationToken ct = default)
     {
-        // One reading of the options decides what is pruned and what readiness checks.
+        // One reading of the options decides what is pruned.
         var current = options.Current;
         if (current.PruningScope is not { } scope)
         {
@@ -84,7 +84,7 @@ internal sealed class RetentionHistoryPruner(
             {
                 await services
                     .GetRequiredService<RetentionRuntimeReadinessValidator>()
-                    .ValidateAsync(RetentionStatementGroup.Pruning(scope), ct);
+                    .ValidateAsync(ct);
                 return await CurrentOccurrenceAsync(
                     services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext),
                     scope,

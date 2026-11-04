@@ -41,7 +41,7 @@ internal sealed class RetentionErasureService(
             ? await ValidateCallerTransactionAsync(ct)
             : null;
 
-        await readinessValidator.ValidateAsync(RetentionStatementGroup.Erasure, ct);
+        await readinessValidator.ValidateAsync(ct);
         // Refused before any run exists: a kind no retained entity declares would erase nothing.
         var validation = validationState.For(db.Model);
         ErasureSubjectValidation.Validate(

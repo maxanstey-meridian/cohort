@@ -95,14 +95,13 @@ internal static class RetentionRunLedgerSql
 
     /// <summary>
     /// R5: settles an abandoned run as failed, at <paramref name="now"/> (the settled time, and
-    /// the start of its duration). <paramref name="error"/> is bound as given, so a check can
-    /// pass a typed NULL.
+    /// the start of its duration), with <paramref name="error"/> as its error.
     /// </summary>
     internal static SweepStatement AbandonedRunFailedStatement(
         CohortStoreTables tables,
         Guid sweepId,
         DateTimeOffset now,
-        object? error
+        string error
     ) =>
         CohortStatements.Statement(
             "abandoned-run-failed",

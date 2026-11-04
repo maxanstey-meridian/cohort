@@ -8,6 +8,12 @@ using Microsoft.EntityFrameworkCore;
 
 namespace Cohort.Infrastructure;
 
+/// <summary>
+/// What one history-pruning pass prunes: settled runs, inactive holds, and whether it reads the
+/// database clock, which it does to find the schedule's current occurrence when a schedule is set.
+/// </summary>
+internal sealed record PruningScope(bool Runs, bool Holds, bool ReadsClock);
+
 // The only interpolations in this file's raw SQL are Cohort's own table names, quoted from
 // the EF model; every value is a named parameter.
 

@@ -288,7 +288,7 @@ internal sealed class RetentionWorker(
     {
         await services
             .GetRequiredService<RetentionRuntimeReadinessValidator>()
-            .ValidateAsync(RetentionStatementGroup.Worker, ct);
+            .ValidateAsync(ct);
         var db = services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext);
 
         // The advisory lock is session-scoped, so this coordination connection stays open for

@@ -54,8 +54,8 @@ they report.
 
 ## Privileges
 
-The pruner runs as `System(HistoryPruning)`, and readiness checks that role for exactly the
-statements the retentions you set send, before the pruner deletes anything:
+The pruner runs as `System(HistoryPruning)`, and that role needs exactly the privileges the
+statements of the retentions you set send:
 
 - `SucceededRunRetention` or `FailedRunRetention`: `SELECT`, `UPDATE`, and `DELETE` on
   `sweep_run` (the batch is claimed `FOR UPDATE SKIP LOCKED`); `SELECT` and `DELETE` on
@@ -64,9 +64,8 @@ statements the retentions you set send, before the pruner deletes anything:
   details, so it needs no `DELETE`.
 - `InactiveHoldRetention`: `SELECT`, `UPDATE`, and `DELETE` on `retention_holds`.
 
-A host that sets only `InactiveHoldRetention` needs no `DELETE` on the run tables, and pruning
-is checked for nothing while no retention is set or the kill switch is on. At startup a
-missing privilege stops the host. If an options reload turns a retention on later, the next
-pass is refused with a `RetentionConfigurationException` before any delete, logged as a failed
-pass and retried an hour later, while sweeps and the other operations carry on. See
+A host that sets only `InactiveHoldRetention` needs no `DELETE` on the run tables: the pruner
+prunes holds and leaves runs alone. Readiness doesn't check these privileges. A pass whose
+role lacks one fails at the statement with PostgreSQL's `42501`, logged as a failed pass and
+retried an hour later, while sweeps and the other operations carry on. See
 [Startup Validation](/reference/startup-validation#statements).

@@ -51,7 +51,7 @@ RetentionExecutionContext.System(RetentionSystemWork Work)
 | Row-handler dispatch: claim, settle, recovery and payload scrub | `System(RowDispatch)` |
 | Each `OnAfterAsync` delivery, in its own scope | `Tenant` of the row, or `System(TenantlessPass)` for a tenantless row |
 | History pruning | `System(HistoryPruning)` |
-| Startup readiness | `System(Readiness)` |
+| Startup readiness | `System(Readiness)`, then the `System` scope of each subsystem that will run (`RowDispatch`, `WorkerCoordination`, `HistoryPruning`) |
 | Readiness's cross-tenant hold check, whichever operation runs readiness first | `System(Readiness)` |
 | The check, by `IRetentionDeletion` and by each batch with a dependents step, that its scope sees every hold on a tenantless row, in a model with tenantless entities | `System(Readiness)` |
 
@@ -190,13 +190,10 @@ headroom.
 
 ## Grants
 
-Readiness asks PostgreSQL to plan, without running (`EXPLAIN`), the statements each operation
-sends, grouped by operation, under the role
-of the scope that sends them, the first time that role reaches readiness. So each scope's role
-needs only the privileges of the groups it runs, on Cohort's five tables and on your retained
-tables, and a role that lacks one is refused before the operation writes anything:
+Each scope's role needs only the privileges of the operations it runs, on Cohort's five tables
+and on your retained tables:
 
-| Group | Sent in | Needs on Cohort's tables |
+| Operation | Sent in | Needs on Cohort's tables |
 |---|---|---|
 | Sweeps, dry runs, and scheduled passes | `Tenant`, or `System(TenantlessPass)` | `SELECT`, `INSERT`, `UPDATE` on `sweep_run` and `sweep_run_entity_summary`; `SELECT`, `INSERT` on `sweep_run_row_detail`; `SELECT` on `retention_holds`; `INSERT` on `sweep_row_handler_status` with a row handler or dependents step |
 | Erasures | `Tenant`, or `System(TenantlessPass)`; your own scope for `ErasureTransaction.Caller` | The same as sweeps |
@@ -221,13 +218,21 @@ blocked. The worker needs only `SELECT` on each tenanted retained table. Readine
 dispatch, and history pruning need nothing on your retained tables. Every role needs `USAGE` on
 the schemas of the tables it touches. See [Startup Validation](/reference/startup-validation#statements) for the
 full list, including `EXECUTE` on the PostgreSQL functions Cohort calls, which PUBLIC holds by
-default.
+default. The identity columns behind `sweep_run_row_detail.Id` and
+`sweep_row_handler_status.Id` need no separate sequence grant; a serial column in their place
+needs `USAGE` on its sequence.
 
-A tenant's or your own scope's role is checked at its first use, not at startup: a second
-tenant's role, or a role a scope hook switches to later, is checked when it first reaches
-readiness. Startup does check the payload scrub, the dispatcher (while the kill switch is
-off), the worker (when it runs), and pruning (for the retentions set), each in its own scope
-under its own role. The identity
-columns behind `sweep_run_row_detail.Id` and `sweep_row_handler_status.Id` need no separate
-sequence grant; a serial column in their place needs `USAGE` on its sequence, which readiness
-checks. See [Upgrading to 0.12.0](/reference/startup-validation#upgrading-to-0-12-0).
+Readiness checks none of these grants. PostgreSQL refuses a missing one at the statement that
+needs it, with its own `42501`, and what that costs depends on where the statement runs:
+
+- In a sweep, or inside one entity of an erasure with `ErasureTransaction.Caller`, the
+  entity's work rolls back and the entity settles `PartiallyFailed`.
+- In a statement outside the entity's savepoint inside your transaction (the run's start and
+  settle, the isolation check, the blocking-key read, and any hold call), PostgreSQL aborts
+  that transaction.
+- A run whose role can't settle it stays `Started` until abandoned-run recovery marks it
+  `Failed`.
+
+A scheduled worker whose coordination role can't read `sweep_run` runs its passes, each under
+its own scope's role, then fails the iteration with `42501` when it reads the ledger back. The
+worker logs the failure, stays alive, and tries again.

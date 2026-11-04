@@ -96,18 +96,21 @@ That is the statements against the host's retained tables, for the host's model 
 strategies its categories declare: sweeps, previews, and dry runs; erasures, for each subject
 kind an entity maps, with and without a legal minimum; holds and their deletion check; and the
 worker's tenant-coverage scan. Some of them also read Cohort's `retention_holds` and
-`sweep_run_row_detail` tables. It is also the statements against Cohort's own five tables and
-the PostgreSQL functions it calls: recording runs, holds, the row-handler queue and its
-payload scrub, abandoned-run recovery, the worker's ledger, history pruning, the advisory
-locks, the database clock, and the read of a transaction's isolation level. Only transaction
-control and Cohort's catalog reads (which read only `pg_catalog`) aren't explained. Cohort
-builds each statement with the code the runs execute, so what readiness explains is what a run
-sends, and it refuses what PostgreSQL refuses, for every column those statements use. The
+`sweep_run_row_detail` tables. Cohort builds each statement with the code the runs execute, so
+what readiness explains is what a run sends, and it refuses what PostgreSQL refuses, for every
+column those statements use. Statements against Cohort's own five tables and the PostgreSQL
+functions it calls aren't explained: a role that lacks a privilege on them fails at the
+statement.
+
+Readiness explains all of these statements together, once for the model. A schema fault in any
+of them refuses every operation on the model, not only the one that sends the statement. The
 error holds one entry per entity, with PostgreSQL's SQLSTATE and message, the operations that
-send the statement, the statement text around the error, and the tables it reads. A refusal
-of a statement that reads no host table gets one more entry, headed "Cohort's own tables and
-functions", that names the operation. Data-only values are bound as typed `NULL`s, so that
-text carries no subject data. PostgreSQL refuses:
+send the statement, and the tables it reads, in the form `Retained entity MyApp.Order:
+PostgreSQL refused statements Cohort sends. 42703: column … does not exist (while sweeping
+with Purge, guarding held rows; reading public.orders). Apply the host application's pending EF Core migrations, or
+map the entity to what the database has.` A refusal of a statement that spans entities, with
+none of an entity's own refused, is one error headed "Across retained entities". Data-only
+values are bound as typed `NULL`s, so that text carries no subject data. PostgreSQL refuses:
 
 - a table or column the statements read or write that the database doesn't have (`42P01`,
   `42703`): a retained table, a record-ID, anchor, tenant, soft-delete, deleted-at, or
@@ -121,15 +124,22 @@ text carries no subject data. PostgreSQL refuses:
   `GENERATED ALWAYS`), which takes no `UPDATE` (`428C9`);
 - a cast type the database doesn't know, resolved through the session's search path
   (`42704`);
-- a privilege the database role lacks (`42501`). Each scope's role must be able to run the
-  statements of the operation it runs, and only those (the table below). On the retained
-  tables that is `SELECT`; `UPDATE` where a statement locks rows (`FOR UPDATE` and
-  `FOR SHARE` need it, as `SoftDelete` and `Anonymise` do); `DELETE` where `Purge` is
-  declared; and `USAGE` on each schema those tables and Cohort's live in. A role that can't
-  prove it is permitted is refused, not skipped.
+Readiness doesn't refuse a privilege the database role lacks (`42501`): the check needs none,
+and a role that can't run a statement fails at that statement, under the role that sends it,
+before the statement writes. The statements are explained as the session that first validates
+the model sees them, with that session's role and search path, so a fault only another role or
+path reaches surfaces at the statement in the same way:
 
-`SELECT` on the child table of a foreign key that blocks a purge is not one of those
-privileges: it changes what a run does, and no role is refused for lacking it. With it, a purge
+- a schema the role has no `USAGE` on is raised while PostgreSQL looks up a name, so that
+  statement's columns go unchecked;
+- the blocking-key read below keeps only the child tables the role can `SELECT`, so the
+  statements explained are that role's;
+- a publication's replica-identity refusal (`55000`) is raised after the permission check, so
+  a role without the privilege doesn't reveal it;
+- an unqualified type name (a domain, `citext`) resolves through the session's search path.
+
+`SELECT` on the child table of a foreign key that blocks a purge changes what a run does, and
+no role is refused for lacking it. With it, a purge
 leaves out the rows that child still references, unless the entity has a dependents step (its
 rows are always tried, whatever the role can read). Without it, that key is left out: a sweep
 or an erasure tries the row, the constraint refuses the delete, and the row is counted as
@@ -137,12 +147,14 @@ blocked (a sweep still succeeds and the next run tries the row again; an erasure
 `PartiallyFailed` with `rows-blocked`, as it does with `SELECT`). A preview or a dry run
 doesn't try the row: it counts it as due, not blocked.
 
-Statements are grouped by the operation that sends them, and each group is checked under the
-role of the scope that sends it ([Tenant Isolation](/guides/tenant-isolation#grants) says which
-scope that is). A role needs the privileges of the groups it runs, not of the others: a
-preview role needs only `SELECT`, and a dispatcher needs no write on your tables.
+What each scope's role needs to run its operation, and only that
+([Tenant Isolation](/guides/tenant-isolation#grants) says which scope that is), is below: a
+preview role needs only `SELECT`, and a dispatcher needs no write on your tables. On the
+retained tables that is `SELECT`; `UPDATE` where a statement locks rows (`FOR UPDATE` and
+`FOR SHARE` need it, as `SoftDelete` and `Anonymise` do); `DELETE` where `Purge` is declared;
+and `USAGE` on each schema those tables and Cohort's live in.
 
-| Group | Cohort's tables | Functions | Your retained tables |
+| Operation | Cohort's tables | Functions | Your retained tables |
 |---|---|---|---|
 | **Sweep**: sweeps, dry runs, and scheduled passes | `sweep_run` and `sweep_run_entity_summary`: `SELECT`, `INSERT`, `UPDATE`. `sweep_run_row_detail`: `SELECT`, `INSERT`. `retention_holds`: `SELECT`. `sweep_row_handler_status`: `INSERT`, when a row handler or a dependents step is registered | `pg_advisory_lock`, `pg_advisory_unlock`, `pg_try_advisory_lock` (the pass lock), the entity lock, the clock | `SELECT`, `UPDATE`; `DELETE` where `Purge` is declared |
 | **Erasure** | As Sweep | `pg_advisory_lock`, `pg_advisory_unlock`, the entity lock, the clock, `current_setting` | As Sweep |
@@ -157,49 +169,41 @@ preview role needs only `SELECT`, and a dispatcher needs no write on your tables
 
 In the table, "the entity lock" is
 `pg_advisory_xact_lock` over `hashtextextended`; and "the clock" is `statement_timestamp`,
-which every read of holds calls inline to decide which are active. The Sweep and Erasure
-groups' check that a run still holds its locks reads the `pg_locks` view (and calls `pg_backend_pid`), which
-PUBLIC can read by default.
+which every read of holds calls inline to decide which are active. The check, in sweeps and
+erasures, that a run still holds its locks reads the `pg_locks` view (and calls
+`pg_backend_pid`), which PUBLIC can read by default.
 
-Two more things are checked that no table privilege covers:
+Two more grants no table privilege covers:
 
 - `USAGE` on the sequence behind a serial `Id` column of `sweep_run_row_detail`, and of
-  `sweep_row_handler_status` when a row handler or a dependents step is registered, in the
-  Sweep and Erasure groups. An identity column, which Cohort's own tables use, needs no grant.
-  A serial column's default calls `nextval`, which `EXPLAIN` never runs, so readiness reads
-  the sequence from the catalog and refuses a role that holds neither `USAGE` nor `UPDATE` on
-  it. The refusal names the table, column, sequence, and role.
+  `sweep_row_handler_status` when a row handler or a dependents step is registered, for
+  sweeps and erasures. An identity column, which Cohort's own tables use, needs no grant. A
+  serial column's default calls `nextval`, so the insert fails at the statement for a role
+  that holds neither `USAGE` nor `UPDATE` on the sequence.
 - `EXECUTE` on the functions in the table. PUBLIC holds it by default, and a database that
-  revokes it from a role is refused, naming the function.
+  revokes it from a role fails at the call.
 
-Each group other than Readiness is checked the first time its own operation runs under a given
-role, before that operation writes anything. The Dispatch, Worker, and
-Pruning groups are checked only when they run: Dispatch while the kill switch is off (and when
-`FlushAsync` or `RequeueDeadLetteredAsync` is called), Worker when the worker runs (the kill
-switch off and a `Schedule` set), and Pruning only for the retentions that are set, so a host
-that prunes only inactive holds needs no `DELETE` on `sweep_run`. The Scrub group runs even
-with the kill switch on, and a poll or flush checks it before it checks Dispatch, so a refusal
-of the dispatcher's privileges never keeps a payload past its retention.
+History pruning needs only what the retentions you set send, so a host that prunes only
+inactive holds needs no `DELETE` on `sweep_run`.
 
-At startup, each subsystem that will run is checked in its own scope, under its own role, and
-a refusal stops the host. The Dispatch group is checked even when no row handler is
-registered, since the dispatcher always runs. Startup also explains the statements of the
-Sweep, Erasure, Preview, Holds, and Deletion groups under the `System(Readiness)` role, but
-only as an early report of schema faults (a missing column, a wrong type, a generated column):
-it doesn't refuse a missing privilege, since those roles belong to scopes startup can't take
-on. Each such role is checked when it first reaches readiness. A refusal after startup (an
-options reload that turns pruning on, say, or a tenant role that was never checked) throws a
-`RetentionConfigurationException` from the call that reached readiness. The dispatcher,
-worker, and pruner log it and retry, and sweeps, previews, and the other operations carry on.
+At startup, the model pass runs in the `System(Readiness)` scope, then in the scope of each
+subsystem that will run, so that scope's own context is checked too: `System(RowDispatch)`
+always (the payload scrub and the dispatcher run whether or not a row handler is registered),
+`System(WorkerCoordination)` when the worker runs (the kill switch off and a `Schedule` set),
+and `System(HistoryPruning)` when a pruning retention is set. A refusal stops the host. The
+pass runs once for each model instance and connection string, so a later scope that shares both
+opens no further work. The stored-identities step opens its own `System(Readiness)` scope once
+for each model instance and connection string. A refusal after startup (a scope that reaches a model or connection string startup
+didn't check, say) throws a `RetentionConfigurationException` from the call that reached
+readiness. The dispatcher, worker, and pruner log it and retry, and sweeps, previews, and the
+other operations carry on.
 
-A pass of one of those groups is kept per database, role, and search path, so a role that
-reaches readiness later, such as a second tenant's, is checked then. The Readiness group is
-checked under the `System(Readiness)` role, both in readiness's own scope and in the scope the
-check for tenantless holds opens before it reads them, so a role that scope reaches only
-later is checked when it first does. A call outside a transaction that finds its pass
-recorded costs one read of the session's role. Inside a caller's transaction nothing is
-recorded, so each call there explains its group again: one round trip, no data read. See
-[Readiness](/reference/schema#readiness).
+A pass is recorded on its model instance and connection string only outside a caller's
+transaction; the stored-identities check, which runs on its own connection, is recorded inside
+one too. Once the model has passed, every later call returns with no round trip, except the
+check for tenantless holds, which reads the caller's database and its own `System(Readiness)`
+scope's before it reads them. Inside a caller's transaction with no pass recorded, each call
+runs the pass again. See [Readiness](/reference/schema#readiness).
 
 ### Rules
 
@@ -310,31 +314,9 @@ checked. Readiness also checks each link column against the real table
 ::: warning Breaking change
 0.12.0 asks PostgreSQL to check the statements Cohort sends against your tables, and refuses
 more of what it finds at startup and at readiness. There is no Cohort schema change and no
-migration, but your own tables, roles, and EF model may need one. Each message names the
-entity and column it refuses.
+migration, but your own tables and EF model may need one. Each message names the entity and
+column it refuses.
 
-- A role that lacks a privilege the statements need is refused at readiness instead of failing
-  the first run that needs it, and that now covers Cohort's own tables, its sequences, and the
-  PostgreSQL functions it calls as well as yours. Each scope's role is checked, for the
-  statements of the operation it runs, the first time it reaches readiness, so a host that
-  splits roles (a role for each tenant, say) gives each role only what its own operation
-  needs. Give each role:
-
-  | Role | Cohort's tables | Your retained tables |
-  |---|---|---|
-  | Sweeps and erasures (a tenant, `System(TenantlessPass)`, or, for an erasure in your transaction, your own role) | `sweep_run` and `sweep_run_entity_summary`: `SELECT`, `INSERT`, `UPDATE`. `sweep_run_row_detail`: `SELECT`, `INSERT`. `retention_holds`: `SELECT`. `sweep_row_handler_status`: `INSERT`, with a row handler or dependents step. `USAGE` on the sequence of a serial `Id` | `SELECT`, `UPDATE`; `DELETE` where `Purge` is declared |
-  | Previews | `retention_holds`: `SELECT` | `SELECT` |
-  | Holds (the caller's role) | `retention_holds`: `SELECT`, `INSERT`, `UPDATE` | `SELECT`, `UPDATE` |
-  | `IRetentionDeletion` (the caller's role) | `retention_holds`: `SELECT` | `SELECT` |
-  | `System(Readiness)` | `retention_holds`: `SELECT` | None |
-  | `System(RowDispatch)` | Scrub: `sweep_run_row_detail` `SELECT`, `UPDATE`. Dispatch: `sweep_run`, `sweep_run_row_detail`, and `sweep_row_handler_status`: `SELECT`, `UPDATE` | None |
-  | `System(WorkerCoordination)` | `sweep_run`: `SELECT` | `SELECT` on each tenanted retained table |
-  | `System(HistoryPruning)` | Per retention set: see [Statements](#statements) | None |
-
-  Every role also needs `USAGE` on the schemas of the tables it touches, and `EXECUTE` on
-  the functions Cohort calls (the advisory-lock functions, `hashtextextended`,
-  `statement_timestamp`, and `current_setting`), which PUBLIC holds by default
-  ([Statements](#statements)). See [Tenant Isolation](/guides/tenant-isolation#grants).
 - A tenant column that is nullable in the database: make it `NOT NULL`. A `NULL` tenant never
   matches any tenant's run, erasure, or hold, so those rows were silently never swept.
 - A soft-delete flag that is nullable, on an entity whose category may soft-delete: make it

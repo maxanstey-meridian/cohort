@@ -62,12 +62,12 @@ internal static class RetentionTenantCoverage
     /// <summary>
     /// S12: the scan for one entity, or null when the run issues none: a tenantless entity, or a
     /// category whose declared strategies act on no row (only Exempt). <paramref name="sourceTenantIds"/>
-    /// (a <c>Guid[]</c>) is bound as given.
+    /// are the tenants a row may belong to without being a gap.
     /// </summary>
     internal static SweepStatement? Statement(
         RetentionEntry entry,
         IReadOnlyDictionary<string, RetentionCategoryCapabilities> capabilities,
-        object? sourceTenantIds
+        Guid[] sourceTenantIds
     )
     {
         if (entry.Tenant is not { } tenant)

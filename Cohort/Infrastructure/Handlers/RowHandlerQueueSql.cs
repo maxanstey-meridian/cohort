@@ -599,15 +599,15 @@ internal static class RowHandlerQueueSql
 
     /// <summary>
     /// T6: dead-letters every pending or in-flight handler of the row detail after
-    /// <paramref name="statusId"/>, which can never run now. <paramref name="reason"/> is bound as
-    /// given, so a check can pass a typed NULL.
+    /// <paramref name="statusId"/>, which can never run now, with <paramref name="reason"/> as
+    /// their error.
     /// </summary>
     internal static SweepStatement DeadLetterDependentsStatement(
         CohortStoreTables tables,
         long rowDetailId,
         long statusId,
         DateTimeOffset now,
-        object? reason
+        string reason
     ) =>
         CohortStatements.Statement(
             "dead-letter-dependents",
@@ -633,7 +633,7 @@ internal static class RowHandlerQueueSql
     /// T4: updates this handler row only while the delivery still owns its claim: a reclaim
     /// replaces the token, so a stale delivery matches nothing. <paramref name="at"/> is the
     /// completion time, or the next attempt's for a retry or a requeue; <paramref name="lastError"/>
-    /// is bound as given and only a retry or a dead letter has one. Raw SQL rather than
+    /// is only a retry's or a dead letter's. Raw SQL rather than
     /// ExecuteUpdateAsync: Cohort builds against EF Core 9, and EF Core 10 replaced the setter
     /// types, so a compiled ExecuteUpdateAsync call fails to load on EF Core 10 hosts.
     /// </summary>
@@ -643,7 +643,7 @@ internal static class RowHandlerQueueSql
         long statusId,
         Guid claimToken,
         DateTimeOffset at,
-        object? lastError
+        string? lastError
     )
     {
         var (name, assignments, state) = form switch
@@ -699,7 +699,7 @@ internal static class RowHandlerQueueSql
         long statusId,
         Guid claimToken,
         DateTimeOffset at,
-        object? lastError,
+        string? lastError,
         CancellationToken ct
     ) =>
         ExecuteAsync(

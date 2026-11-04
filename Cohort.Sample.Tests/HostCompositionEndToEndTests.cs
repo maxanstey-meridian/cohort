@@ -207,6 +207,64 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task A_caller_erasure_with_a_dependents_step_reads_tenantless_holds_on_the_one_connection_the_host_supplies()
+    {
+        // Same host as the theory's (pooled: true, "connection") row: one connection, supplied to
+        // every pooled context, so a System(Readiness) scope's context sits on the connection
+        // that carries the caller's transaction. Three things differ. The erased entity has a
+        // dependents step. The model has a tenantless retained entity, so before the step runs
+        // the hold guard reads tenantless holds through its own System(Readiness) scope. Nothing
+        // validated the model before: the model pass first runs inside the caller's transaction.
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        var hostInterceptor = new CommitCountingInterceptor();
+        var probe = new DependentsStepProbe();
+        await using var hostConnection = new Npgsql.NpgsqlConnection(database.ConnectionString);
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
+        services.AddSingleton<IRetentionRuleProvider>(
+            new SingleCategoryRepository("caller-erasure", new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Purge))
+        );
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
+        services.AddSingleton(probe);
+        services.AddCohort<SharedConnectionDbContext>();
+        services.AddRetentionDependents<SharedConnectionRecord, RecordingDependentsStep>();
+        services.AddDbContextPool<SharedConnectionDbContext>(options =>
+            options.UseNpgsql(hostConnection).AddInterceptors(hostInterceptor)
+        );
+
+        await using var provider = services.BuildServiceProvider(validateScopes: true);
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var recordId = Guid.NewGuid();
+        await using (var scope = provider.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<SharedConnectionDbContext>();
+            await db.Database.EnsureCreatedAsync();
+            db.Records.Add(new SharedConnectionRecord { Id = recordId, TenantId = tenant.Id, SubjectId = subject, CreatedAt = DateTimeOffset.UtcNow.AddDays(-1) });
+            await db.SaveChangesAsync();
+        }
+
+        var commitsBefore = hostInterceptor.Commits;
+        await using (var scope = provider.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<SharedConnectionDbContext>();
+            await using var transaction = await db.Database.BeginTransactionAsync();
+            var result = await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(tenant, new ErasureScope("user", subject), transaction: ErasureTransaction.Caller)
+            );
+            result.EntityFailures.Should().BeEmpty();
+            result.Counts.Should().ContainSingle(count => count.EntityType == typeof(SharedConnectionRecord)).Which.Affected.Should().Be(1);
+            await transaction.CommitAsync();
+        }
+
+        hostInterceptor.Commits.Should().Be(commitsBefore + 1);
+        probe.Rows.Should().Equal(recordId);
+        await using var check = provider.CreateAsyncScope();
+        (await check.ServiceProvider.GetRequiredService<SharedConnectionDbContext>().Records.CountAsync()).Should().Be(0);
+    }
+
+    [Fact]
     public async Task The_Hosts_Execution_Scope_Wraps_Cohorts_Work_So_Its_Async_Flow_Reaches_It()
     {
         // A host sets its tenant (or a Sluice flow) in an AsyncLocal around the work; host code
@@ -545,6 +603,57 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
         [ErasureSubject("user")]
         public Guid? SubjectId { get; set; }
 
+        public DateTimeOffset CreatedAt { get; set; }
+    }
+
+    private sealed class DependentsStepProbe
+    {
+        public List<Guid> Rows { get; } = [];
+    }
+
+    [RowHandlerId("5c0f7d2e-6a9b-4c0e-9d41-2f6f3a8b7e11")]
+    private sealed class RecordingDependentsStep(DependentsStepProbe probe) : IRetentionDependents<SharedConnectionRecord>
+    {
+        public Task RetireAsync(SharedConnectionRecord row, RetentionDependentsContext ctx, CancellationToken ct)
+        {
+            probe.Rows.Add(row.Id);
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class SharedConnectionDbContext(DbContextOptions<SharedConnectionDbContext> options)
+        : DbContext(options)
+    {
+        public DbSet<SharedConnectionRecord> Records => Set<SharedConnectionRecord>();
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<SharedConnectionRecord>().ToTable("shared_connection_records").HasKey(record => record.Id);
+            modelBuilder.Entity<SharedConnectionTenantless>().ToTable("shared_connection_tenantless").HasKey(row => row.Id);
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    [Retain("caller-erasure", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-0000000000c4")]
+    private sealed class SharedConnectionRecord
+    {
+        public Guid Id { get; set; }
+        public Guid TenantId { get; set; }
+
+        [ErasureSubject("user")]
+        public Guid? SubjectId { get; set; }
+
+        public DateTimeOffset CreatedAt { get; set; }
+    }
+
+    // Its presence makes the hold guard read tenantless holds.
+    [RetentionTenantless]
+    [Retain("caller-erasure", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-0000000000c5")]
+    private sealed class SharedConnectionTenantless
+    {
+        public Guid Id { get; set; }
         public DateTimeOffset CreatedAt { get; set; }
     }
 

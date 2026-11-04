@@ -37,54 +37,49 @@ A hold on a row also holds the rows a host declares related to it.
   accepts `READ UNCOMMITTED` (PostgreSQL runs it as `READ COMMITTED`; 0.11.0 refused it). An
   erasure's wrong-type subject message now reads "…but the subject is a {type}." (it was "…but
   the scope's subject is a {type}.").
-- Readiness keeps its results per EF model instance without holding the model, and keeps each
-  database check's success under exactly what that check reads. Shared passes are keyed by the
-  database the server reports (its name and OID, the server's start time, and the holds table),
-  and a model's own entry by the connection string without its password, so tenants a pooler
-  routes by user name or options under one host, port, and database name each get their own
-  readiness. A host whose EF model cache can't hold its models (many context types, or a model
-  per tenant) no longer repeats readiness's catalog checks or its `System(Readiness)` scope for
-  every context once one copy of the model has passed: only the anonymise-target check, whose
-  result can depend on session settings, runs again for each copy. Cohort no longer keeps every
-  model alive. The `System(Readiness)` scope must reach the caller's database but may run a
-  different model, since it reads only through its connection; the refusal now says 'a
-  different database'. Readiness reads the database's identity from the server once for each
-  model copy and connection it hasn't validated, one extra round trip.
+- Readiness keeps its results per EF model instance without holding the model. The entry is
+  keyed by the connection string without its password, so tenants a pooler routes by user name
+  or options under one host, port, and database name each get their own readiness, and a
+  rebuilt copy of a model is checked again. Cohort no longer keeps every model alive. The
+  `System(Readiness)` scope must reach the caller's database but may run a different model,
+  since it reads only through its connection; the refusal now says 'a different database'.
+  Readiness reads the database's identity from the server once for each model instance and
+  connection it validates, one extra round trip. Readiness runs once per EF model instance and
+  connection string: a pass is recorded only outside a transaction (the stored-identity check,
+  which runs on its own connection, is recorded inside one too), so a host that validates at
+  startup pays no round trip per call, except the hold guard's database check before it reads
+  tenantless holds. Inside your transaction with no pass recorded, each call runs the pass
+  again. Startup runs the pass in `System(Readiness)`, then in the scope of each subsystem that
+  will run (`System(RowDispatch)` always, `System(WorkerCoordination)` when the worker runs,
+  `System(HistoryPruning)` when pruning is set), and a refusal stops the host.
 - Readiness asks PostgreSQL to analyse and plan, without running, the statements Cohort sends
   against the host's retained tables for the host's model and declared strategies (sweeps,
   previews, erasures for each subject kind, holds, deletion checks, and the tenant-coverage
   scan), and refuses what PostgreSQL refuses: a missing table or column, including
   erasure-subject columns, a type a statement can't compare or assign, a column the database
-  generates, an unknown cast type, or a privilege the database role lacks for one of those
-  statements. The role of the scope that sends them must hold the privileges they need
-  (`SELECT` and `UPDATE` on the retained tables, `DELETE` where `Purge` is declared, `SELECT` on
-  `retention_holds`, `sweep_run_row_detail`, and the child table of any foreign key that blocks
-  a purge, and `USAGE` on the schemas of all of those tables). The refusal
+  generates, or an unknown cast type. The statement check needs no privileges: a missing one
+  is tolerated there and fails at the statement that needs it, as in 0.11.0. A schema fault in
+  any of the statements it explains refuses every operation on the model. The statements are
+  checked as the session that first validates the model sees them, with its role and its
+  search path, so a fault that session can't reach surfaces at the statement, under the
+  session that sends it: a schema the role can't use, a child table it can't read, a
+  publication's replica-identity rule behind a missing privilege, and a type another search
+  path resolves differently. What each scope's role needs to run its statements is `SELECT`
+  and `UPDATE` on the retained tables, `DELETE` where `Purge` is declared, `SELECT` on
+  `retention_holds`, `sweep_run_row_detail`, and the child table of any foreign key that
+  blocks a purge, and `USAGE` on the schemas of all of those tables. The refusal
   carries PostgreSQL's SQLSTATE and message. It also refuses a nullable tenant column, a
   nullable soft-delete flag, and an anonymised-at column that is NOT NULL, since each makes
   rows silently never match. Readiness also refuses an anchor, deleted-at, or anonymised-at
   column the database types as `timestamp without time zone`, seen through any domains. Startup
   refuses an anonymised-at marker with a default or value generation mapped in the EF model,
-  since EF then never writes it NULL and every row is born marked as anonymised. The statement
-  check's success is kept per database, role, and search path, and each scope's role is checked,
-  for the statements that scope sends, the first time it reaches readiness. Before,
+  since EF then never writes it NULL and every row is born marked as anonymised. Before,
   a run over such a database failed at the statement, silently skipped rows (or, for the mapped
   default, never anonymised them), or, for a timestamp without time zone, drifted with the
   session TimeZone.
   Breaking: the refusal texts for a missing table or column, a mistyped column, a generated
   column, and a missing link column are now PostgreSQL's (one error per entity, with its
-  SQLSTATE, message, and the statement text around the error), and a host whose role lacks a
-  privilege for one of those statements is refused at readiness instead of failing the first
-  run that needs it.
-- Readiness also explains the statements Cohort sends against its own tables and the
-  PostgreSQL functions it calls, grouped by the scope that sends them and checked under that
-  scope's role, and refuses a role that lacks a privilege for them, including `USAGE` on the
-  sequence behind a serial `Id` column. The row-handler dispatcher, the worker, and history
-  pruning are checked only when they run, pruning only for the retentions it prunes: at
-  startup a refusal stops the host; later (after an options reload, say) the refused subsystem
-  logs it and does nothing while runs carry on, and the payload scrub still runs. Breaking: a
-  role that can't write Cohort's tables is refused at readiness instead of failing the first
-  statement that writes them.
+  SQLSTATE and message).
 
 Upgrade: [Legal Holds](https://maxanstey-meridian.github.io/cohort/guides/legal-holds#upgrading-to-0-12-0)
 and [Startup Validation](https://maxanstey-meridian.github.io/cohort/reference/startup-validation#upgrading-to-0-12-0).

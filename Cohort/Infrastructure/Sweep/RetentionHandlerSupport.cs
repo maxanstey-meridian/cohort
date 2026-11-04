@@ -22,8 +22,7 @@ internal static class RetentionHandlerSupport
 
     /// <summary>
     /// Whether a run records handler bookkeeping (the row-detail payload and the handler status)
-    /// for <paramref name="entityType"/>: it has handlers or a dependents step. The run decides
-    /// it here, and readiness asks the same question.
+    /// for <paramref name="entityType"/>: it has handlers or a dependents step.
     /// </summary>
     public static bool RecordsHandlerBookkeeping(
         IEnumerable<IRetentionHandlerRegistration> handlerRegistrations,
@@ -345,8 +344,7 @@ internal static class RetentionHandlerSupport
 
     /// <summary>
     /// D2: records a mutated row with its captured payload and returns the row's id.
-    /// <paramref name="recordId"/> (canonical text) and <paramref name="capturedPayload"/> are
-    /// bound as given, so a check can pass typed NULLs.
+    /// <paramref name="recordId"/> is the row's canonical text.
     /// </summary>
     internal static SweepStatement RowDetailWithPayloadStatement(
         CohortStoreTables tables,
@@ -354,11 +352,11 @@ internal static class RetentionHandlerSupport
         DateTimeOffset at,
         Type entityType,
         Guid retentionEntityId,
-        object? recordId,
+        string recordId,
         string category,
         Strategy strategy,
         Guid tenantId,
-        object? capturedPayload
+        string? capturedPayload
     ) =>
         CohortStatements.Statement(
             "row-detail-with-payload",
@@ -384,8 +382,7 @@ internal static class RetentionHandlerSupport
         );
 
     /// <summary>
-    /// T1: queues a handler status for a row detail. <paramref name="lastError"/> is bound as
-    /// given, so a check can pass a typed NULL.
+    /// T1: queues a handler status for a row detail.
     /// </summary>
     internal static SweepStatement HandlerStatusStatement(
         CohortStoreTables tables,
@@ -396,7 +393,7 @@ internal static class RetentionHandlerSupport
         int attempt,
         DateTimeOffset at,
         DateTimeOffset? completedAt,
-        object? lastError
+        string? lastError
     ) =>
         CohortStatements.Statement(
             "handler-status",

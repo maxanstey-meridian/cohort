@@ -204,8 +204,8 @@ internal sealed class RetentionHoldGuard(
                 await systemDb.Database.OpenConnectionAsync(ct);
                 try
                 {
-                    // A scope that reaches another database, or runs as a role the model pass
-                    // never saw, is refused here rather than failing the read below.
+                    // A scope that reaches another database sees none of the caller's holds, so it
+                    // is refused here. A role that can't read the holds table fails the read below.
                     await readinessValidator.ValidateReadinessScopeAsync(systemDb.Database, callerDatabase, ct);
                     return await ReadActiveTenantlessHoldsAsync(systemDb.Database.GetDbConnection(), null, ct);
                 }

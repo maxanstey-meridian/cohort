@@ -35,9 +35,9 @@ internal static class RetentionHoldSql
 
     /// <summary>
     /// H10: the stored entity identities that no retained entity registers, with the number of
-    /// active holds that name each. <paramref name="registered"/> (a <c>Guid[]</c>) is bound as given.
+    /// active holds that name each. <paramref name="registered"/> is the registered identities.
     /// </summary>
-    internal static SweepStatement StoredEntityIdentities(CohortStoreTables tables, object? registered) =>
+    internal static SweepStatement StoredEntityIdentities(CohortStoreTables tables, Guid[] registered) =>
         CohortStatements.Statement(
             "stored-entity-identities",
             $"""
@@ -55,16 +55,16 @@ internal static class RetentionHoldSql
     /// <summary>
     /// H1: stores a hold, or no row when its expiry has already passed on the database clock (it
     /// would persist while protecting nothing; refused by row count, not a SQL error, so a
-    /// caller-owned transaction stays usable). <paramref name="recordId"/> (canonical text) and
-    /// <paramref name="reason"/> are bound as given, so a check can pass typed NULLs.
+    /// caller-owned transaction stays usable). <paramref name="recordId"/> is the row's canonical
+    /// text.
     /// </summary>
     internal static SweepStatement BuildCreateHold(
         CohortStoreTables tables,
         Guid holdId,
         Guid retentionEntityId,
-        object? recordId,
+        string recordId,
         Guid? tenantId,
-        object? reason,
+        string reason,
         DateTimeOffset createdAt,
         DateTimeOffset? expiresAt
     ) =>
@@ -845,10 +845,10 @@ internal static class RetentionHoldSql
             statements.Add(
                 BuildHeldRowVersions(holdsTable, [entry], baselineHoldIds)!
                     with
-                    {
-                        Name = "held-row-versions-of-entity",
-                        Entity = entry.EntityType,
-                    }
+                {
+                    Name = "held-row-versions-of-entity",
+                    Entity = entry.EntityType,
+                }
             );
             statements.Add(
                 BuildHeldRowRereads(

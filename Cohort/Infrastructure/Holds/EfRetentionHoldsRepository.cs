@@ -31,7 +31,7 @@ internal sealed class EfRetentionHoldsRepository(
 
         // Readiness first: resolving the target reads the Cohort mapping, which readiness refuses
         // with its aggregated message when it is missing.
-        await readinessValidator.ValidateAsync(RetentionStatementGroup.Holds, ct);
+        await readinessValidator.ValidateAsync(ct);
         // A hold with an unknown stable identity or record-id format the sweep-side NOT EXISTS
         // match never hits would look persisted while protecting nothing. Fail loudly instead.
         var entry = targetResolver.ResolveTarget(request.RetentionEntityId);
@@ -192,7 +192,7 @@ internal sealed class EfRetentionHoldsRepository(
 
     public async Task RemoveAsync(Guid holdId, DateTimeOffset removedAt, CancellationToken ct)
     {
-        await readinessValidator.ValidateAsync(RetentionStatementGroup.Holds, ct);
+        await readinessValidator.ValidateAsync(ct);
         var remove = RetentionHoldSql.BuildRemoveHold(Tables, holdId, removedAt.ToUniversalTime());
         var removed = await db.Database.ExecuteSqlRawAsync(
             remove.Sql,
@@ -209,7 +209,7 @@ internal sealed class EfRetentionHoldsRepository(
 
     public async Task<IReadOnlyList<RetentionHold>> ListActiveAsync(CancellationToken ct)
     {
-        await readinessValidator.ValidateAsync(RetentionStatementGroup.Holds, ct);
+        await readinessValidator.ValidateAsync(ct);
         await db.Database.OpenConnectionAsync(ct);
         try
         {
@@ -296,7 +296,7 @@ internal sealed class EfRetentionHoldsRepository(
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(recordId);
         // Readiness first, as in CreateAsync: resolving the target reads the Cohort mapping.
-        await readinessValidator.ValidateAsync(RetentionStatementGroup.Holds, ct);
+        await readinessValidator.ValidateAsync(ct);
         var entry = targetResolver.ResolveTarget(retentionEntityId);
         RetentionTargetResolver.ValidateTenantOwnership(entry, tenantId, "Retention hold");
 
@@ -341,7 +341,7 @@ internal sealed class EfRetentionHoldsRepository(
 
         var entities = tenantId is null ? SweepEntityScope.TenantlessOnly : SweepEntityScope.TenantedOnly;
         // After readiness, like erasure: startup validation fills the state the check reads.
-        await readinessValidator.ValidateAsync(RetentionStatementGroup.Holds, ct);
+        await readinessValidator.ValidateAsync(ct);
         var validation = validationState.For(db.Model);
         ErasureSubjectValidation.Validate(validation, registry, subjectKind, subject, entities, "the hold lookup");
 

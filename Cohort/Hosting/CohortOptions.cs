@@ -72,7 +72,7 @@ public sealed class CohortOptions
 
     /// <summary>
     /// Whether the scheduled worker runs occurrences: the kill switch is off and a schedule is
-    /// set. The worker loop, startup's readiness check, and nothing else decide it.
+    /// set. The worker loop, startup's validation of the worker's scope, and nothing else decide it.
     /// </summary>
     [MemberNotNullWhen(true, nameof(Schedule))]
     internal bool WorkerRuns => !KillSwitch && !string.IsNullOrWhiteSpace(Schedule);
@@ -80,8 +80,7 @@ public sealed class CohortOptions
     /// <summary>
     /// What history pruning prunes, or null when nothing is pruned (the kill switch is on, or no
     /// retention is set): settled runs, inactive holds, and whether it reads the database clock,
-    /// which it does to find the schedule's current occurrence when a schedule is set. Readiness
-    /// checks pruning for exactly these statements.
+    /// which it does to find the schedule's current occurrence when a schedule is set.
     /// </summary>
     internal PruningScope? PruningScope =>
         KillSwitch || !HistoryPruning.Enabled

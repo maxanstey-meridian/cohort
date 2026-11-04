@@ -1,14 +1,17 @@
 using System.Data.Common;
 using System.Runtime.ExceptionServices;
-using System.Text;
+
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure.Holds;
 using Cohort.Infrastructure.Sweep;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Storage;
+
 using Npgsql;
+
 using NpgsqlTypes;
 
 namespace Cohort.Infrastructure;
@@ -60,232 +63,6 @@ internal static class ReadinessParameters
 }
 
 /// <summary>
-/// The part of a statement's text PostgreSQL's error position points at. The position indexes the
-/// text the server received, which is <c>EXPLAIN </c> followed by the statement with each
-/// <c>@name</c> rewritten to <c>$n</c> by Npgsql, whose rewriter is internal. This mirrors it so
-/// that the excerpt lands on the right column; it never changes what is sent.
-/// </summary>
-internal static class ReadinessExcerpt
-{
-    private const string Prefix = "EXPLAIN ";
-    private const int CharactersBefore = 30;
-    private const int CharactersAfter = 30;
-
-    /// <summary>
-    /// About 60 characters of the rewritten statement around <paramref name="position"/> (the
-    /// server's 1-based character offset into <c>EXPLAIN </c> plus the rewritten text), with
-    /// whitespace runs collapsed to one space. Empty when the position isn't inside the statement.
-    /// </summary>
-    internal static string At(string sql, IReadOnlyCollection<string> names, int position)
-    {
-        var text = Rewrite(sql, names);
-        var characters = position - 1 - Prefix.Length;
-        if (characters < 0)
-        {
-            return "";
-        }
-
-        var index = Utf16Offset(text, characters);
-        if (index >= text.Length)
-        {
-            return "";
-        }
-
-        var start = Math.Max(0, index - CharactersBefore);
-        var end = Math.Min(text.Length, index + CharactersAfter);
-        return string.Join(
-            ' ',
-            text[start..end].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
-        );
-    }
-
-    /// <summary>
-    /// The statement as Npgsql sends it: each <c>@name</c> or <c>:name</c> in
-    /// <paramref name="names"/> becomes <c>$n</c>, numbered by first appearance with a repeat
-    /// reusing its number. A name reads greedily (letters, digits, <c>_</c>, <c>.</c>); a name not
-    /// in the collection stays as written; quoted identifiers, literals, comments, and dollar
-    /// quotes are skipped.
-    /// </summary>
-    private static string Rewrite(string sql, IReadOnlyCollection<string> names)
-    {
-        var known = new HashSet<string>(names, StringComparer.OrdinalIgnoreCase);
-        var numbers = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        var text = new StringBuilder(sql.Length);
-        var at = 0;
-        while (at < sql.Length)
-        {
-            var current = sql[at];
-            var next = at + 1 < sql.Length ? sql[at + 1] : '\0';
-            var previous = at > 0 ? sql[at - 1] : '\0';
-            switch (current)
-            {
-                case '\'':
-                    at = CopyQuoted(sql, at, text, backslashEscapes: IsEscapeString(sql, at));
-                    break;
-                case '"':
-                    at = CopyQuoted(sql, at, text, backslashEscapes: false);
-                    break;
-                case '-' when next == '-':
-                    at = CopyThrough(
-                        sql,
-                        at,
-                        text,
-                        sql.IndexOf('\n', at) is var lineEnd and >= 0 ? lineEnd + 1 : sql.Length
-                    );
-                    break;
-                case '/' when next == '*':
-                    at = CopyBlockComment(sql, at, text);
-                    break;
-                case '$'
-                    when !IsIdentifierChar(previous)
-                        && DollarQuoteEnd(sql, at) is var quoteEnd and >= 0:
-                    at = CopyThrough(sql, at, text, quoteEnd);
-                    break;
-                case '@' or ':' when previous != current && IsParameterNameChar(next):
-                    var end = at + 1;
-                    while (end < sql.Length && IsParameterNameChar(sql[end]))
-                    {
-                        end++;
-                    }
-
-                    var name = sql[(at + 1)..end];
-                    if (known.Contains(name))
-                    {
-                        if (!numbers.TryGetValue(name, out var number))
-                        {
-                            number = numbers.Count + 1;
-                            numbers[name] = number;
-                        }
-
-                        text.Append('$').Append(number);
-                    }
-                    else
-                    {
-                        text.Append(sql, at, end - at);
-                    }
-
-                    at = end;
-                    break;
-                default:
-                    text.Append(current);
-                    at++;
-                    break;
-            }
-        }
-
-        return text.ToString();
-    }
-
-    private static bool IsParameterNameChar(char c) =>
-        c == '_' || c == '.' || (c < 128 ? char.IsAsciiLetterOrDigit(c) : char.IsLetterOrDigit(c));
-
-    private static bool IsIdentifierChar(char c) => c == '_' || c == '$' || char.IsLetterOrDigit(c);
-
-    // E'...' reads a backslash as an escape.
-    private static bool IsEscapeString(string sql, int quote) =>
-        quote > 0
-        && (sql[quote - 1] is 'e' or 'E')
-        && (quote == 1 || !IsIdentifierChar(sql[quote - 2]));
-
-    private static int CopyQuoted(string sql, int start, StringBuilder text, bool backslashEscapes)
-    {
-        var quote = sql[start];
-        text.Append(quote);
-        var at = start + 1;
-        while (at < sql.Length)
-        {
-            var c = sql[at++];
-            text.Append(c);
-            if (backslashEscapes && c == '\\' && at < sql.Length)
-            {
-                text.Append(sql[at++]);
-            }
-            else if (c == quote)
-            {
-                if (at < sql.Length && sql[at] == quote)
-                {
-                    text.Append(sql[at++]);
-                    continue;
-                }
-
-                return at;
-            }
-        }
-
-        return at;
-    }
-
-    private static int CopyThrough(string sql, int start, StringBuilder text, int end)
-    {
-        text.Append(sql, start, end - start);
-        return end;
-    }
-
-    // Block comments nest in PostgreSQL.
-    private static int CopyBlockComment(string sql, int start, StringBuilder text)
-    {
-        var depth = 1;
-        var at = start + 2;
-        while (at < sql.Length && depth > 0)
-        {
-            if (sql[at] == '/' && at + 1 < sql.Length && sql[at + 1] == '*')
-            {
-                depth++;
-                at += 2;
-            }
-            else if (sql[at] == '*' && at + 1 < sql.Length && sql[at + 1] == '/')
-            {
-                depth--;
-                at += 2;
-            }
-            else
-            {
-                at++;
-            }
-        }
-
-        text.Append(sql, start, at - start);
-        return at;
-    }
-
-    // Where the dollar-quoted string starting at `start` ends, or -1 when `$` there isn't one
-    // (`$1` is a positional parameter).
-    private static int DollarQuoteEnd(string sql, int start)
-    {
-        var tagEnd = start + 1;
-        while (tagEnd < sql.Length && (char.IsLetterOrDigit(sql[tagEnd]) || sql[tagEnd] == '_'))
-        {
-            tagEnd++;
-        }
-
-        if (
-            tagEnd >= sql.Length
-            || sql[tagEnd] != '$'
-            || (tagEnd > start + 1 && char.IsDigit(sql[start + 1]))
-        )
-        {
-            return -1;
-        }
-
-        var tag = sql[start..(tagEnd + 1)];
-        var close = sql.IndexOf(tag, tagEnd + 1, StringComparison.Ordinal);
-        return close < 0 ? sql.Length : close + tag.Length;
-    }
-
-    // The server counts characters (code points); .NET indexes UTF-16 units.
-    private static int Utf16Offset(string text, int characters)
-    {
-        var index = 0;
-        for (var counted = 0; counted < characters && index < text.Length; counted++)
-        {
-            index += char.IsHighSurrogate(text[index]) && index + 1 < text.Length ? 2 : 1;
-        }
-
-        return index;
-    }
-}
-
-/// <summary>
 /// One statement readiness explains: the text and parameters a run sends, with every entity and
 /// operation that issues it and the tables it reads. Statements with the same text and parameter
 /// types are one.
@@ -312,35 +89,19 @@ internal sealed class ReadinessStatement(
 
     internal List<RelationalObjectName> Relations { get; } = [];
 
-    internal ReadinessStatementInput Input =>
-        new(
-            Name,
-            string.Join(',', Entities.Select(EntityName).Order(StringComparer.Ordinal)),
-            Sql,
-            ParameterTypes
-        );
-
     internal static string EntityName(Type? entity) =>
         entity is null ? "" : entity.FullName ?? entity.Name;
 }
 
-/// <summary>A statement as a readiness key holds it: values only.</summary>
-internal sealed record ReadinessStatementInput(
-    string Name,
-    string Entity,
-    string Sql,
-    string ParameterTypes
-);
-
 /// <summary>
-/// Readiness for the statements Cohort sends, against the host's tables and its own. For one
-/// <see cref="RetentionStatementGroup"/> (the statements one operation sends, checked under the
-/// role of the scope that sends them) it builds every statement the operation can issue for the
-/// host's model and the strategies its categories declare, through the builders the run itself
-/// executes, and asks PostgreSQL to analyse and plan each one (<c>EXPLAIN</c>, which runs
-/// nothing). What PostgreSQL refuses is what readiness refuses: a missing table or column, a
-/// comparison or assignment the types can't make, a column the database generates, an unknown
-/// cast type, a privilege the session's role lacks.
+/// Readiness for the statements Cohort sends against the host's retained tables. It builds every
+/// such statement any operation can issue for the host's model and the strategies its categories
+/// declare, through the builders the run itself executes, and asks PostgreSQL to analyse and plan
+/// each one (<c>EXPLAIN</c>, which runs nothing). What PostgreSQL refuses is what readiness
+/// refuses: a missing table or column, a comparison or assignment the types can't make, a column
+/// the database generates, an unknown cast type. A privilege the session's role lacks (42501) is
+/// not refused here: PostgreSQL refuses it at the statement, under the role that sends it.
+/// Statements against Cohort's own tables and the functions it calls are not explained.
 /// </summary>
 internal sealed class RetentionStatementReadiness(
     DbContext db,
@@ -366,198 +127,65 @@ internal sealed class RetentionStatementReadiness(
     private static readonly RetentionPeriod OneYear = new(Years: 1);
 
     /// <summary>
-    /// The groups a port operation sends: sweeps, erasures, previews, hold calls, and deletions.
-    /// Each runs in a scope startup can't take on, so each is checked when its role first reaches
-    /// readiness; startup only explains them under its own role, as an early report.
-    /// </summary>
-    internal static IReadOnlyList<RetentionStatementGroup> PortGroups { get; } =
-        [
-            RetentionStatementGroup.Sweep,
-            RetentionStatementGroup.Erasure,
-            RetentionStatementGroup.Preview,
-            RetentionStatementGroup.Holds,
-            RetentionStatementGroup.Deletion,
-        ];
-
-    /// <summary>
-    /// What a refusal calls the operation a group's statements belong to ("PostgreSQL refused
-    /// statements Cohort sends in sweeps").
-    /// </summary>
-    internal static string ScopeOf(RetentionStatementGroup group) =>
-        group.Kind switch
-        {
-            RetentionStatementGroupKind.Sweep => "sweeps",
-            RetentionStatementGroupKind.Erasure => "erasures",
-            RetentionStatementGroupKind.Preview => "previews",
-            RetentionStatementGroupKind.Holds => "hold calls",
-            RetentionStatementGroupKind.Deletion => "deletions",
-            RetentionStatementGroupKind.Scrub => "the payload scrub",
-            RetentionStatementGroupKind.Dispatch => "row-handler dispatch",
-            RetentionStatementGroupKind.Worker => "the scheduled worker",
-            RetentionStatementGroupKind.Pruning => "history pruning",
-            _ => throw new ArgumentOutOfRangeException(nameof(group), group.Kind, null),
-        };
-
-    /// <summary>What a refusal calls readiness's own scope.</summary>
-    internal const string ReadinessScope = "readiness";
-
-    /// <summary>
-    /// Every statement the group's operation can issue for the model, de-duplicated, in a fixed
-    /// order: the host-table statements, then the statements against Cohort's own tables and the
-    /// functions it calls. Reads the blocking foreign keys of the Purge scopes through the
-    /// database's connection, as a run does.
+    /// Every statement against the host's retained tables that any operation can issue for the
+    /// model, de-duplicated, each with every operation that sends it: the sweep and erasure
+    /// scopes, the held-row guard, the preview counts, the holds repository's reads and locks, a
+    /// deletion's hold check, and the worker's tenant-coverage scan (S12). Reads the blocking
+    /// foreign keys of the Purge scopes once, through the database's connection, as a run does.
     /// </summary>
     internal async Task<IReadOnlyList<ReadinessStatement>> EnumerateAsync(
-        RetentionStatementGroup group,
         IReadOnlyDictionary<string, RetentionCategoryCapabilities> capabilities,
         CancellationToken ct
     )
     {
         var entries = registry.Scan().Values.ToList();
         var tables = CohortStoreTables.FromModel(db.Model);
-        var values = ValuesFor(entries);
-        var guardReadsTenantlessHolds = RetentionHoldGuard.ReadsTenantlessHolds(entries);
-        var anyDependentsStep = entries.Any(entry => dependentsRegistrations.HasStep(entry.EntityType));
+        var scopes = await ScopesAsync(entries, capabilities, ct);
         var set = new StatementSet();
-        switch (group.Kind)
+        AddScopes(set, scopes);
+        AddGuard(set, tables, entries);
+        AddPreviewCounts(set, scopes.Where(scope => !scope.Erasure));
+        AddHolds(set, tables, entries);
+        foreach (var entry in entries)
         {
-            case RetentionStatementGroupKind.Sweep:
-                await AddScopesAsync(set, entries, capabilities, erasure: false, ct);
-                AddGuard(set, tables, entries, anyDependentsStep);
-                set.AddCohort(
-                    CohortStatements.ForSweep(
-                        tables,
-                        HandlerBookkeeping(entries),
-                        guardReadsTenantlessHolds && anyDependentsStep,
-                        values
-                    )
-                );
-                break;
-            case RetentionStatementGroupKind.Erasure:
-                await AddScopesAsync(set, entries, capabilities, erasure: true, ct);
-                AddGuard(set, tables, entries, anyDependentsStep);
-                set.AddCohort(
-                    CohortStatements.ForErasure(
-                        tables,
-                        HandlerBookkeeping(entries),
-                        guardReadsTenantlessHolds && anyDependentsStep,
-                        values
-                    )
-                );
-                break;
-            case RetentionStatementGroupKind.Preview:
-                AddPreviewCounts(set, await SweepScopesAsync(entries, capabilities, ct));
-                set.AddCohort(CohortStatements.ForPreview());
-                break;
-            case RetentionStatementGroupKind.Holds:
-                AddHolds(set, tables, entries);
-                set.AddCohort(CohortStatements.ForHolds(tables, values));
-                break;
-            case RetentionStatementGroupKind.Deletion:
-                foreach (var entry in entries)
-                {
-                    set.Add(
-                        RetentionHoldSql.ForDeletion(
-                            tables.RetentionHolds,
-                            entry,
-                            new ReadinessTypedNull(typeof(string)),
-                            entry.Tenant is null ? null : ReadinessTenantId
-                        ),
-                        "checking a deletion"
-                    );
-                }
-
-                AddGuard(set, tables, entries, include: true);
-                set.AddCohort(CohortStatements.ForDeletion(tables, guardReadsTenantlessHolds, values));
-                break;
-            case RetentionStatementGroupKind.Scrub:
-                set.AddCohort(CohortStatements.ForScrub(tables, values));
-                break;
-            case RetentionStatementGroupKind.Dispatch:
-                set.AddCohort(CohortStatements.ForDispatch(tables, values));
-                break;
-            case RetentionStatementGroupKind.Worker:
-                set.AddCohort(CohortStatements.ForWorker(tables, entries, capabilities, values));
-                break;
-            case RetentionStatementGroupKind.Pruning:
-                set.AddCohort(CohortStatements.ForPruning(tables, group.PruningScope!, values));
-                break;
-            default:
-                throw new ArgumentOutOfRangeException(nameof(group), group.Kind, null);
+            set.Add(
+                RetentionHoldSql.ForDeletion(
+                    tables.RetentionHolds,
+                    entry,
+                    new ReadinessTypedNull(typeof(string)),
+                    entry.Tenant is null ? null : ReadinessTenantId
+                ),
+                "checking a deletion"
+            );
+            if (RetentionTenantCoverage.Statement(entry, capabilities, Array.Empty<Guid>()) is { } scan)
+            {
+                set.Add([scan], "the scheduled worker");
+            }
         }
 
         return set.Statements;
     }
 
-    /// <summary>
-    /// What readiness reads in its own <c>System(Readiness)</c> scope: the stored entity
-    /// identities and, when a retained entity is tenantless, the tenantless holds. It belongs to
-    /// no caller's group, so it is built apart.
-    /// </summary>
-    internal IReadOnlyList<ReadinessStatement> EnumerateReadiness()
-    {
-        var entries = registry.Scan().Values.ToList();
-        var set = new StatementSet();
-        set.AddCohort(
-            CohortStatements.ForReadiness(
-                CohortStoreTables.FromModel(db.Model),
-                RetentionHoldGuard.ReadsTenantlessHolds(entries),
-                ValuesFor(entries)
-            )
-        );
-        return set.Statements;
-    }
+    // One sweep or erasure scope readiness explains, and the operation a refusal names for it.
+    private sealed record ScopeToExplain(
+        SweepScope Scope,
+        Strategy Strategy,
+        string Operation,
+        bool Erasure
+    );
 
-    // Whether a run records handler bookkeeping (D2 and T1) for some entity, the run's own answer.
-    private bool HandlerBookkeeping() => HandlerBookkeeping(registry.Scan().Values);
-
-    private bool HandlerBookkeeping(IEnumerable<RetentionEntry> entries) =>
-        entries.Any(entry =>
-            RetentionHandlerSupport.RecordsHandlerBookkeeping(
-                handlerRegistrations,
-                dependentsRegistrations,
-                entry.EntityType
-            )
-        );
-
-    // The values the Cohort-table statements bind: readiness's tenant, and one retained entity's
-    // identity (the first by name) for the statements that name an entity.
-    private static CohortStatementValues ValuesFor(IReadOnlyList<RetentionEntry> entries)
-    {
-        var first = entries
-            .OrderBy(entry => entry.EntityType.FullName, StringComparer.Ordinal)
-            .FirstOrDefault();
-        return first is null
-            ? new CohortStatementValues(
-                ReadinessTenantId,
-                typeof(RetentionStatementReadiness),
-                new Guid("c0de0000-0000-0000-0000-000000000006"),
-                "readiness"
-            )
-            : new CohortStatementValues(
-                ReadinessTenantId,
-                first.EntityType,
-                first.RetentionEntityId,
-                first.Category
-            );
-    }
-
-    // The sweep scopes (and, with erasure, the erasure scopes) of every entity with a declared
-    // category, each strategy it declares. The blocking keys of the Purge scopes are read in one
-    // catalog read, as a run reads them.
-    private async Task<
-        List<(SweepScope Scope, Strategy Strategy, string Operation)>
-    > ScopesAsync(
+    // The sweep scopes and the erasure scopes of every entity with a declared category, each
+    // strategy it declares. The blocking keys of the Purge scopes are read in one catalog read
+    // over all of them, as a run reads them.
+    private async Task<List<ScopeToExplain>> ScopesAsync(
         IReadOnlyList<RetentionEntry> entries,
         IReadOnlyDictionary<string, RetentionCategoryCapabilities> capabilities,
-        bool sweeps,
-        bool erasures,
         CancellationToken ct
     )
     {
         var validation = validationState.For(db.Model);
         var now = DateTimeOffset.UtcNow;
-        var scopes = new List<(SweepScope Scope, Strategy Strategy, string Operation)>();
+        var scopes = new List<ScopeToExplain>();
         foreach (var entry in entries)
         {
             if (!capabilities.TryGetValue(entry.Category, out var declared))
@@ -571,11 +199,11 @@ internal sealed class RetentionStatementReadiness(
                 : [];
             foreach (var strategy in declared.Strategies.Order())
             {
-                if (sweeps && strategy != Strategy.Exempt)
+                if (strategy != Strategy.Exempt)
                 {
                     var context = new RetentionResolutionContext(entry.Category, tenant, now);
                     scopes.Add(
-                        (
+                        new ScopeToExplain(
                             SweepScope.ForSweep(
                                 entry,
                                 new RetentionRule(OneYear, strategy),
@@ -583,14 +211,10 @@ internal sealed class RetentionStatementReadiness(
                                 settings.TimeZone
                             ),
                             strategy,
-                            $"sweeping with {strategy}"
+                            $"sweeping with {strategy}",
+                            Erasure: false
                         )
                     );
-                }
-
-                if (!erasures)
-                {
-                    continue;
                 }
 
                 // SoftDelete included: AllowSoftDeleteAsErasure is per request.
@@ -600,7 +224,7 @@ internal sealed class RetentionStatementReadiness(
                     {
                         var rule = new RetentionRule(OneYear, strategy, legalMinimum);
                         scopes.Add(
-                            (
+                            new ScopeToExplain(
                                 SweepScope.ForErasure(
                                     entry,
                                     rule,
@@ -610,7 +234,8 @@ internal sealed class RetentionStatementReadiness(
                                     settings.TimeZone
                                 ),
                                 strategy,
-                                $"erasing subjects of kind '{kind.Kind}'"
+                                $"erasing subjects of kind '{kind.Kind}'",
+                                Erasure: true
                             )
                         );
                     }
@@ -624,33 +249,13 @@ internal sealed class RetentionStatementReadiness(
             entry => dependentsRegistrations.HasStep(entry.EntityType),
             ct
         );
-        return [.. scopes.Select((scope, index) => (attached[index], scope.Strategy, scope.Operation))];
+        return [.. scopes.Select((scope, index) => scope with { Scope = attached[index] })];
     }
 
-    private Task<List<(SweepScope Scope, Strategy Strategy, string Operation)>> SweepScopesAsync(
-        IReadOnlyList<RetentionEntry> entries,
-        IReadOnlyDictionary<string, RetentionCategoryCapabilities> capabilities,
-        CancellationToken ct
-    ) => ScopesAsync(entries, capabilities, sweeps: true, erasures: false, ct);
-
     // Every host-table statement a sweep or an erasure issues (`ForScope`).
-    private async Task AddScopesAsync(
-        StatementSet set,
-        IReadOnlyList<RetentionEntry> entries,
-        IReadOnlyDictionary<string, RetentionCategoryCapabilities> capabilities,
-        bool erasure,
-        CancellationToken ct
-    )
+    private void AddScopes(StatementSet set, IEnumerable<ScopeToExplain> scopes)
     {
-        foreach (
-            var (scope, strategy, operation) in await ScopesAsync(
-                entries,
-                capabilities,
-                sweeps: !erasure,
-                erasures: erasure,
-                ct
-            )
-        )
+        foreach (var (scope, strategy, operation, _) in scopes)
         {
             set.Add(
                 SweepStatements.ForScope(
@@ -667,12 +272,9 @@ internal sealed class RetentionStatementReadiness(
 
     // What a preview counts (`RetentionPreviewService`): the prediction, and the NULL-anchor
     // count when the scope has a cutoff.
-    private static void AddPreviewCounts(
-        StatementSet set,
-        List<(SweepScope Scope, Strategy Strategy, string Operation)> scopes
-    )
+    private static void AddPreviewCounts(StatementSet set, IEnumerable<ScopeToExplain> scopes)
     {
-        foreach (var (scope, strategy, operation) in scopes)
+        foreach (var (scope, strategy, operation, _) in scopes)
         {
             set.Add([SweepStatements.CountPredicted(scope, strategy)], operation);
             if (SweepStatements.CountsNullAnchor(scope))
@@ -686,20 +288,14 @@ internal sealed class RetentionStatementReadiness(
     }
 
     // The held-row guard's forms (`ForModel`: the one read over every entity, and the per-entity
-    // forms that tell which entity a refusal comes from), for the groups that run it. A sweep or
-    // an erasure runs it only for a dependents step; a deletion always does.
+    // forms that tell which entity a refusal comes from). A sweep or an erasure runs it only for
+    // a dependents step; a deletion always does, so it is always explained.
     private static void AddGuard(
         StatementSet set,
         CohortStoreTables tables,
-        IReadOnlyList<RetentionEntry> entries,
-        bool include
+        IReadOnlyList<RetentionEntry> entries
     )
     {
-        if (!include)
-        {
-            return;
-        }
-
         set.Add(
             RetentionHoldSql.ForModel(
                 tables.RetentionHolds,
@@ -767,21 +363,19 @@ internal sealed class RetentionStatementReadiness(
     /// <summary>
     /// Asks PostgreSQL to explain every statement over <paramref name="database"/>, in its current
     /// transaction or in one opened here and rolled back, and returns one error per entity for
-    /// what it refused, then one for the statements that read none of the host's tables
-    /// (<see cref="Describe"/>). Over an <see cref="NpgsqlConnection"/> it is one round trip, with
+    /// what it refused, or one for the statements that span entities when no entity's own
+    /// statement was refused (<see cref="Describe"/>). Over an <see cref="NpgsqlConnection"/> it is one round trip, with
     /// an error barrier and a rollback to a savepoint after each statement so every refusal is
     /// reported and the transaction stays usable; over any other connection (a wrapper can't
-    /// batch) the same commands run one at a time. <paramref name="scope"/> names the operation
-    /// whose role is checked. With <paramref name="tolerateInsufficientPrivilege"/>, a refusal
-    /// for a privilege the role lacks (42501) is not reported: startup's early check of the port
-    /// groups, whose roles belong to scopes it can't take on.
+    /// batch) the same commands run one at a time. A refusal for a privilege the session's role
+    /// lacks (42501) is never reported: PostgreSQL refuses it at the statement, under the role
+    /// that sends it, and the permission check runs after the faults readiness is after (a
+    /// missing column, a wrong type) but before the executor-start ones, so a role without the
+    /// privilege leaves those unchecked.
     /// </summary>
     internal async Task<IReadOnlyList<string>> ExplainAsync(
         DatabaseFacade database,
         IReadOnlyList<ReadinessStatement> statements,
-        string role,
-        string scope,
-        bool tolerateInsufficientPrivilege,
         CancellationToken ct
     )
     {
@@ -809,119 +403,15 @@ internal sealed class RetentionStatementReadiness(
                 await ownTransaction.RollbackAsync(ct);
             }
 
-            if (tolerateInsufficientPrivilege)
-            {
-                refusals.RemoveAll(refusal =>
-                    refusal.Failure.SqlState == PostgresErrorCodes.InsufficientPrivilege
-                );
-            }
-
-            return refusals.Count == 0
-                ? []
-                : Describe(
-                    refusals,
-                    role,
-                    scope,
-                    CohortTables(CohortStoreTables.FromModel(db.Model))
-                );
-        }
-        finally
-        {
-            await database.CloseConnectionAsync();
-        }
-    }
-
-    /// <summary>
-    /// Refuses a serial <c>Id</c> default whose sequence the role can't use. <c>EXPLAIN</c> never
-    /// calls <c>nextval</c>, so a missing sequence privilege shows only when a row is inserted.
-    /// The columns are <c>sweep_run_row_detail.Id</c>, always, since the row detail's insert
-    /// depends on a rule readiness can't see, and <c>sweep_row_handler_status.Id</c> when a run
-    /// records handler bookkeeping. The sequence is found from the column's default expression
-    /// (<c>pg_depend</c>); an identity column has none and needs no grant. A role needs
-    /// <c>USAGE</c> or <c>UPDATE</c> on a sequence to call <c>nextval</c>.
-    /// </summary>
-    internal async Task<IReadOnlyList<string>> CheckSequencesAsync(
-        DatabaseFacade database,
-        string role,
-        CancellationToken ct
-    )
-    {
-        const string column = "Id";
-        var tables = CohortStoreTables.FromModel(db.Model);
-        var checkedTables = new List<RelationalObjectName> { tables.SweepRunRowDetail };
-        if (HandlerBookkeeping())
-        {
-            checkedTables.Add(tables.SweepRowHandlerStatus);
-        }
-
-        var errors = new List<string>();
-        await database.OpenConnectionAsync(ct);
-        try
-        {
-            await using var command = new SqlParams
-            {
-                ["schemas"] = checkedTables.Select(table => table.Schema).ToArray(),
-                ["tables"] = checkedTables.Select(table => table.Name).ToArray(),
-                ["column"] = column,
-            }.CreateCommand(
-                database.GetDbConnection(),
-                database.CurrentTransaction?.GetDbTransaction(),
-                """
-                /* cohort catalog */
-                SELECT requested.ordinal,
-                       sequence_namespace.nspname,
-                       sequence_class.relname
-                FROM ROWS FROM (
-                    pg_catalog.unnest(@schemas),
-                    pg_catalog.unnest(@tables)
-                ) WITH ORDINALITY AS requested(schema_name, table_name, ordinal)
-                JOIN pg_catalog.pg_namespace namespace ON namespace.nspname = requested.schema_name
-                JOIN pg_catalog.pg_class relation
-                  ON relation.relnamespace = namespace.oid AND relation.relname = requested.table_name
-                JOIN pg_catalog.pg_attribute attribute
-                  ON attribute.attrelid = relation.oid
-                 AND attribute.attname = @column
-                 AND attribute.attnum > 0
-                 AND NOT attribute.attisdropped
-                JOIN pg_catalog.pg_attrdef default_expression
-                  ON default_expression.adrelid = attribute.attrelid
-                 AND default_expression.adnum = attribute.attnum
-                JOIN pg_catalog.pg_depend dependency
-                  ON dependency.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass
-                 AND dependency.objid = default_expression.oid
-                 AND dependency.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
-                JOIN pg_catalog.pg_class sequence_class ON sequence_class.oid = dependency.refobjid
-                JOIN pg_catalog.pg_namespace sequence_namespace
-                  ON sequence_namespace.oid = sequence_class.relnamespace
-                -- The default also depends on its own column (a table, which the privilege
-                -- function refuses), so the kind is checked in the CASE, which orders it first.
-                WHERE sequence_class.relkind = 'S'
-                  AND CASE WHEN sequence_class.relkind = 'S'
-                           THEN NOT (
-                               pg_catalog.has_sequence_privilege(sequence_class.oid, 'USAGE')
-                               OR pg_catalog.has_sequence_privilege(sequence_class.oid, 'UPDATE')
-                           )
-                           ELSE false
-                      END
-                ORDER BY requested.ordinal
-                """
+            refusals.RemoveAll(refusal =>
+                refusal.Failure.SqlState == PostgresErrorCodes.InsufficientPrivilege
             );
-            await using var reader = await command.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct))
-            {
-                var table = checkedTables[(int)reader.GetInt64(0) - 1];
-                var sequence = new RelationalObjectName(reader.GetString(1), reader.GetString(2));
-                errors.Add(
-                    $"Cohort's own tables and functions: {PostgreSqlIdentifier.Format(table)}.{PostgreSqlIdentifier.Quote(column)} takes its default from the sequence {PostgreSqlIdentifier.Format(sequence)}, and the database role '{role}' holds neither USAGE nor UPDATE on it, so every row Cohort inserts there would fail. Grant USAGE on the sequence, or make the column an identity column."
-                );
-            }
+            return refusals.Count == 0 ? [] : Describe(refusals);
         }
         finally
         {
             await database.CloseConnectionAsync();
         }
-
-        return errors;
     }
 
     private static async Task<List<Refusal>> ExplainInBatchAsync(
@@ -1098,35 +588,16 @@ internal sealed class RetentionStatementReadiness(
 
         internal HashSet<string> Operations { get; } = new(StringComparer.Ordinal);
 
-        internal HashSet<string> Excerpts { get; } = new(StringComparer.Ordinal);
-
         internal HashSet<RelationalObjectName> Relations { get; } = [];
     }
 
-    private static HashSet<RelationalObjectName> CohortTables(CohortStoreTables tables) =>
-        [
-            tables.RetentionHolds,
-            tables.SweepRun,
-            tables.SweepRunEntitySummary,
-            tables.SweepRunRowDetail,
-            tables.SweepRowHandlerStatus,
-        ];
-
     // One error per entity, holding every distinct (SQLSTATE, message) its statements drew. A
     // refusal from a statement that spans entities is reported, as one error, only when no
-    // entity's own statement was refused. A refusal from a statement that names no entity and
-    // reads no host table (Cohort's own tables and the functions it calls) is reported as one
-    // more error, whether or not an entity's was.
-    private static List<string> Describe(
-        List<Refusal> refusals,
-        string role,
-        string scope,
-        HashSet<RelationalObjectName> cohortTables
-    )
+    // entity's own statement was refused.
+    private static List<string> Describe(List<Refusal> refusals)
     {
         var byEntity = new Dictionary<Type, Dictionary<(string, string), Cause>>();
         var across = new Dictionary<(string, string), Cause>();
-        var cohort = new Dictionary<(string, string), Cause>();
         foreach (var refusal in refusals)
         {
             var statement = refusal.Statement;
@@ -1134,9 +605,7 @@ internal sealed class RetentionStatementReadiness(
             var targets = new List<Dictionary<(string, string), Cause>>();
             if (entities.Count == 0)
             {
-                targets.Add(
-                    statement.Relations.All(cohortTables.Contains) ? cohort : across
-                );
+                targets.Add(across);
             }
 
             foreach (var entity in entities)
@@ -1156,27 +625,20 @@ internal sealed class RetentionStatementReadiness(
         }
 
         const string Remedy =
-            "Apply the host application's pending EF Core migrations, map the entity to what the database has, or grant the database role the privileges Cohort needs.";
+            "Apply the host application's pending EF Core migrations, or map the entity to what the database has.";
         var errors = new List<string>();
         if (byEntity.Count > 0)
         {
             errors.AddRange(
                 byEntity.Select(pair =>
-                    $"Retained entity {ReadinessStatement.EntityName(pair.Key)}: PostgreSQL refused statements Cohort sends. {string.Join(' ', pair.Value.Values.Select(cause => DescribeCause(cause, role)))} {Remedy}"
+                    $"Retained entity {ReadinessStatement.EntityName(pair.Key)}: PostgreSQL refused statements Cohort sends. {string.Join(' ', pair.Value.Values.Select(DescribeCause))} {Remedy}"
                 )
             );
         }
         else if (across.Count > 0)
         {
             errors.Add(
-                $"Across retained entities: PostgreSQL refused statements Cohort sends. {string.Join(' ', across.Values.Select(cause => DescribeCause(cause, role)))} {Remedy}"
-            );
-        }
-
-        if (cohort.Count > 0)
-        {
-            errors.Add(
-                $"Cohort's own tables and functions: PostgreSQL refused statements Cohort sends in {scope}. {string.Join(' ', cohort.Values.Select(cause => DescribeCause(cause, role)))} Grant the database role the privileges Cohort needs on its tables, sequences, and functions."
+                $"Across retained entities: PostgreSQL refused statements Cohort sends. {string.Join(' ', across.Values.Select(DescribeCause))} {Remedy}"
             );
         }
 
@@ -1196,26 +658,12 @@ internal sealed class RetentionStatementReadiness(
 
             cause.Operations.UnionWith(statement.Operations);
             cause.Relations.UnionWith(statement.Relations);
-            if (
-                ReadinessExcerpt.At(statement.Sql, statement.Parameters.Keys, failure.Position) is
-                { Length: > 0 } excerpt
-            )
-            {
-                cause.Excerpts.Add(excerpt);
-            }
         }
     }
 
-    private static string DescribeCause(Cause cause, string role)
+    private static string DescribeCause(Cause cause)
     {
         var parts = new List<string> { $"while {string.Join(", ", cause.Operations)}" };
-        if (cause.Excerpts.Count > 0)
-        {
-            parts.Add(
-                $"near {string.Join(" and ", cause.Excerpts.Take(3).Select(excerpt => $"`{excerpt}`"))}"
-            );
-        }
-
         if (cause.Relations.Count > 0)
         {
             parts.Add(
@@ -1223,11 +671,7 @@ internal sealed class RetentionStatementReadiness(
             );
         }
 
-        var privilege =
-            cause.SqlState == PostgresErrorCodes.InsufficientPrivilege
-                ? $" The database role '{role}' lacks this privilege."
-                : "";
-        return $"{cause.SqlState}: {cause.Message} ({string.Join("; ", parts)}).{privilege}";
+        return $"{cause.SqlState}: {cause.Message} ({string.Join("; ", parts)}).";
     }
 
     /// <summary>The run's own path predicate, from the registrations the run reads.</summary>
@@ -1317,61 +761,6 @@ internal sealed class RetentionStatementReadiness(
         > byText = [];
 
         internal List<ReadinessStatement> Statements { get; } = [];
-
-        /// <summary>
-        /// Adds statements from <see cref="CohortStatements"/>, each under the operation label
-        /// its builder belongs to.
-        /// </summary>
-        internal void AddCohort(IEnumerable<SweepStatement> statements)
-        {
-            foreach (var statement in statements)
-            {
-                Add([statement], OperationOf(statement.Name));
-            }
-        }
-
-        // The operation a refusal of a Cohort-table or function statement names.
-        private static string OperationOf(string name) =>
-            name switch
-            {
-                "run-started" or "entity-summary" or "entity-progress" or "row-detail" or "run-settled" =>
-                    "recording runs",
-                "row-detail-with-payload" or "handler-status" => "queueing row handlers",
-                "create-hold" or "remove-hold" or "active-holds" =>
-                    "creating, removing, or listing holds",
-                "active-tenantless-holds" => "reading tenantless holds",
-                "stored-entity-identities" => "checking stored entity identities",
-                "run-committed" => "confirming a run committed",
-                "entity-lock"
-                or "advisory-lock"
-                or "advisory-try-lock"
-                or "advisory-unlock"
-                or "advisory-lock-all"
-                or "advisory-unlock-all"
-                or "advisory-locks-held" => "taking or releasing Cohort's locks",
-                "database-clock" => "reading the database clock",
-                "transaction-isolation" => "checking the transaction's isolation",
-                "payload-scrub" => "scrubbing captured payloads",
-                "remaining-work"
-                or "requeue-dead-lettered"
-                or "delivered-payload-clear"
-                or "expired-claims"
-                or "reclaim-lock"
-                or "claim-handlers"
-                or "requeue-interrupted"
-                or "dead-letter-dependents" => "dispatching row handlers",
-                _ when name.StartsWith("handler-status-", StringComparison.Ordinal) =>
-                    "dispatching row handlers",
-                "abandoned-runs" or "abandoned-run-failed" => "recovering abandoned runs",
-                "occurrence-ledger" => "reading the worker's ledger",
-                "eligible-runs" or "prune-row-details" or "prune-entity-summaries" or "prune-runs" =>
-                    "pruning settled runs",
-                "prune-holds" => "pruning inactive holds",
-                "tenant-coverage" => "scanning for tenants outside the worker's tenant source",
-                _ => throw new InvalidOperationException(
-                    $"Cohort statement '{name}' has no readiness operation label."
-                ),
-            };
 
         internal void Add(IEnumerable<SweepStatement> statements, string operation)
         {

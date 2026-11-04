@@ -46,8 +46,8 @@ public sealed class HeldWithReadinessEndToEndTests(PostgresFixture fixture)
         var act = () => SweepAsync(services);
 
         // The hold statements of both ends of the link read the column, so PostgreSQL refuses both
-        // ends' statements; the declaring entity's error carries the column (42703) and the table
-        // the statements read.
+        // ends' statements; the declaring entity's error carries PostgreSQL's own message for the
+        // dropped column (42703, "<alias>.<column> does not exist") and the table the statements read.
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle(error =>
             error.StartsWith(
@@ -55,7 +55,7 @@ public sealed class HeldWithReadinessEndToEndTests(PostgresFixture fixture)
                 StringComparison.Ordinal
             )
             && error.Contains(" 42703: column ", StringComparison.Ordinal)
-            && error.Contains($"\"{column}\"", StringComparison.Ordinal)
+            && error.Contains($".{column} does not exist", StringComparison.Ordinal)
             && error.Contains($"\"public\".\"{table}\"", StringComparison.Ordinal)
         );
     }

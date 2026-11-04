@@ -10,7 +10,7 @@ namespace Cohort.Infrastructure.Audit;
 /// <summary>
 /// Writes the audit ledger. Statements run on the scoped DbContext, so they join the
 /// caller's transaction when there is one. Each statement is built by a static builder
-/// (<see cref="StartedStatement"/> and its siblings) that readiness explains as the run sends it.
+/// (<see cref="StartedStatement"/> and its siblings).
 /// </summary>
 internal sealed class EfRetentionAuditWriter(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db
@@ -186,8 +186,7 @@ internal sealed class EfRetentionAuditWriter(
     }
 
     /// <summary>
-    /// D1: records one mutated row. <paramref name="recordId"/> is bound as given (the row's
-    /// canonical text in a run), so a check can pass a typed NULL.
+    /// D1: records one mutated row. <paramref name="recordId"/> is the row's canonical text.
     /// </summary>
     internal static SweepStatement RowDetailStatement(
         CohortStoreTables tables,
@@ -195,7 +194,7 @@ internal sealed class EfRetentionAuditWriter(
         DateTimeOffset at,
         Type entityType,
         Guid retentionEntityId,
-        object? recordId,
+        string recordId,
         string category,
         Strategy strategy,
         Guid tenantId
@@ -226,8 +225,7 @@ internal sealed class EfRetentionAuditWriter(
 
     /// <summary>
     /// R3: settles a Started run. A real run's total is the sum of its committed progress, so
-    /// only a dry run takes <paramref name="totalAffected"/>. <paramref name="error"/> is bound
-    /// as given, so a check can pass a typed NULL.
+    /// only a dry run takes <paramref name="totalAffected"/>.
     /// </summary>
     internal static SweepStatement TerminalStatement(
         CohortStoreTables tables,
@@ -236,7 +234,7 @@ internal sealed class EfRetentionAuditWriter(
         DateTimeOffset settledAt,
         TimeSpan? duration,
         long? totalAffected,
-        object? error
+        string? error
     )
     {
         var sweepRun = PostgreSqlIdentifier.Format(tables.SweepRun);

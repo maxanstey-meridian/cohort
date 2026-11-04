@@ -1,17 +1,20 @@
 using System.Data.Common;
+
 using Cohort.Application;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+
 using Npgsql;
 
 namespace Cohort.Sample.Tests;
 
 /// <summary>
-/// One non-superuser database role per kind of scope Cohort creates, so a test can give each
-/// scope its own privileges and readiness checks each scope's statements under the role that
-/// sends them. <see cref="Install{TContext}"/> adds two things to a host: an
+/// One non-superuser database role per kind of scope Cohort creates, so a test can tell which
+/// scope sent a statement (the role is on the session that ran it) and can narrow one scope's
+/// grants without touching another's. <see cref="Install{TContext}"/> adds two things to a host: an
 /// <see cref="IRetentionExecutionScope"/> that keeps the work's context in an
 /// <see cref="AsyncLocal{T}"/> (as <c>RowLevelSecurityEndToEndTests</c> does), and a connection
 /// interceptor that runs <c>SET ROLE</c> for that context whenever a connection opens (as its
@@ -60,7 +63,7 @@ internal sealed class ScopeRoles : IAsyncDisposable
 
     public string HistoryPruning { get; }
 
-    public IEnumerable<string> All =>
+    private IEnumerable<string> All =>
         [
             Caller,
             Tenant,
@@ -125,8 +128,8 @@ internal sealed class ScopeRoles : IAsyncDisposable
 
     /// <summary>
     /// A second role for <see cref="RetentionSystemWork.Readiness"/>, granted as the others are
-    /// and then denied <c>SELECT</c> on <c>retention_holds</c>. Call it after readiness has
-    /// passed: every later <c>System(Readiness)</c> scope runs as it.
+    /// and then denied <c>SELECT</c> on <c>retention_holds</c>. Call it after the model pass has
+    /// been recorded: every later <c>System(Readiness)</c> scope runs as it.
     /// </summary>
     public async Task<string> UseReadinessRoleAsync(TemporaryDatabase database)
     {
@@ -139,7 +142,7 @@ internal sealed class ScopeRoles : IAsyncDisposable
     }
 
     /// <summary>The role a scope's work runs as: its tenant's own role if it has one.</summary>
-    public string RoleFor(RetentionExecutionContext? context) =>
+    private string RoleFor(RetentionExecutionContext? context) =>
         context switch
         {
             null => Caller,

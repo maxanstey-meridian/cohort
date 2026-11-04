@@ -287,8 +287,8 @@ await dispatcher.RequeueDeadLetteredAsync(handlerId: Guid.Parse("0b6f5e43-…"))
 
 ### Privileges
 
-Readiness checks each role for the statements of the operation it runs, before that operation
-writes anything:
+Each role needs the privileges of the operation it runs. Readiness doesn't check them: a
+missing one fails at the statement, with PostgreSQL's `42501`.
 
 - **Sweeps and erasures.** With a row handler or a dependents step registered, the role of the
   sweep or erasure also needs `INSERT` on `sweep_row_handler_status`, where it queues the
@@ -297,18 +297,16 @@ writes anything:
   rather than an identity column, the role needs `USAGE` on its sequence.
 - **The dispatcher** runs as `System(RowDispatch)` and needs `SELECT` and `UPDATE` on
   `sweep_run`, `sweep_run_row_detail`, and `sweep_row_handler_status`, and nothing on your
-  tables. It is checked at startup while the kill switch is off, and whenever `FlushAsync` or
-  `RequeueDeadLetteredAsync` is called.
+  tables.
 - **The payload scrub** runs as `System(RowDispatch)` too, needs `SELECT` and `UPDATE` on
-  `sweep_run_row_detail`, and is checked separately and first, so a dispatcher refused for a
-  missing privilege can't keep a snapshot past `PayloadRetention`. It runs with the kill
+  `sweep_run_row_detail`, and runs first in each flush and poll, so a dispatcher that fails for
+  a missing privilege can't keep a snapshot past `PayloadRetention`. It runs with the kill
   switch on.
 
-At startup a refusal stops the host. After an options reload, or for a role that first
-reaches readiness later, `FlushAsync` and `RequeueDeadLetteredAsync` throw a
-`RetentionConfigurationException` (after `FlushAsync` has scrubbed), and the background poller
-logs it and retries on its next poll. The scrub keeps running, and sweeps under a role that
-holds its own privileges carry on. See [Startup Validation](/reference/startup-validation#statements).
+A background poll whose scrub fails (a missing grant, say) leaves the scrub's hourly gate
+unspent, so the next poll tries it again. `FlushAsync` and `RequeueDeadLetteredAsync` throw
+the failure, and the background poller logs it and retries on its next poll. Sweeps under a
+role that holds its own privileges carry on. See [Startup Validation](/reference/startup-validation#statements).
 
 ## Snapshots and personal data
 

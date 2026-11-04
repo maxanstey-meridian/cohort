@@ -32,7 +32,7 @@ internal sealed class RetentionPreviewService(
         var tenant = request.RunTenant;
         var entities = SweepEntityScopes.For(tenant);
 
-        await readinessValidator.ValidateAsync(RetentionStatementGroup.Preview, ct);
+        await readinessValidator.ValidateAsync(ct);
         // A preview changes nothing, so it resolves its time as a dry run: any requested
         // time is allowed, later ones included.
         var (now, startedAt) = await DatabaseClock.ResolveRunTimeAsync(db, request.At, dryRun: true, ct);

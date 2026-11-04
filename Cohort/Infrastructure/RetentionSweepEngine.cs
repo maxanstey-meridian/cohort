@@ -40,7 +40,7 @@ internal sealed class RetentionSweepEngine(
         CancellationToken ct = default
     )
     {
-        await readinessValidator.ValidateAsync(RetentionStatementGroup.Sweep, ct);
+        await readinessValidator.ValidateAsync(ct);
         return await RunSweepAsync(tenant, at, SweepTriggerKind.Manual, scope, dryRun, passLockKey: null, ct);
     }
 
@@ -128,7 +128,7 @@ internal sealed class RetentionSweepEngine(
     )
     {
         // Readiness refuses a multiplexed connection, which can't hold a session lock.
-        await readinessValidator.ValidateAsync(RetentionStatementGroup.Sweep, ct);
+        await readinessValidator.ValidateAsync(ct);
         var sweepRun = CohortStoreTables.FromModel(db.Model).SweepRun;
         var passLockKey = RetentionRunAdvisoryLock.ScheduledPassKeyFor(sweepRun, pass.TenantId, pass.DryRun);
         await db.Database.OpenConnectionAsync(ct);

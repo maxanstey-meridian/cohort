@@ -1438,39 +1438,63 @@ internal sealed class RetentionRuntimeReadinessValidator(
         CancellationToken ct
     )
     {
-        // Only the database is compared: the System scope may run under another role.
-        var session = await ReadServerSessionAsync(
-            systemDatabase,
-            CohortStoreTables.FromModel(db.Model).RetentionHolds,
-            ct
-        );
-        if (session.Database != callerDatabase)
+        // A host that gives every context one connection puts this scope's context on the
+        // caller's physical connection, which carries the caller's transaction. The context
+        // doesn't know that transaction, and the explain would begin one of its own, so it joins
+        // the caller's for the session read and the explain, as a handler scope's context does.
+        var callerTransaction = db.Database.CurrentTransaction;
+        var joinsCallerTransaction =
+            callerTransaction is not null
+            && systemDatabase.CurrentTransaction is null
+            && ReferenceEquals(systemDatabase.GetDbConnection(), db.Database.GetDbConnection());
+        if (joinsCallerTransaction)
         {
-            throw new RetentionConfigurationException([
-                "Cohort's readiness scope resolved a DbContext that reaches a different database from the calling scope's. Cohort checks holds across tenants in a System(Readiness) scope, so every scope must reach the same database.",
-            ]);
+            await systemDatabase.UseTransactionAsync(callerTransaction!.GetDbTransaction(), ct);
         }
 
-        var readinessStatements = statementReadiness.EnumerateReadiness();
-        await RunSharedAsync(
-            GroupKey(session, "Readiness", new GroupStatements(readinessStatements, StatementInputs(readinessStatements))),
-            async () =>
+        try
+        {
+            // Only the database is compared: the System scope may run under another role.
+            var session = await ReadServerSessionAsync(
+                systemDatabase,
+                CohortStoreTables.FromModel(db.Model).RetentionHolds,
+                ct
+            );
+            if (session.Database != callerDatabase)
             {
-                var refused = await statementReadiness.ExplainAsync(
-                    systemDatabase,
-                    readinessStatements,
-                    session.Role,
-                    RetentionStatementReadiness.ReadinessScope,
-                    tolerateInsufficientPrivilege: false,
-                    ct
-                );
-                if (refused.Count != 0)
+                throw new RetentionConfigurationException([
+                    "Cohort's readiness scope resolved a DbContext that reaches a different database from the calling scope's. Cohort checks holds across tenants in a System(Readiness) scope, so every scope must reach the same database.",
+                ]);
+            }
+
+            var readinessStatements = statementReadiness.EnumerateReadiness();
+            await RunSharedAsync(
+                GroupKey(session, "Readiness", new GroupStatements(readinessStatements, StatementInputs(readinessStatements))),
+                async () =>
                 {
-                    throw new RetentionConfigurationException(refused);
-                }
-            },
-            recordInsideTransaction: true
-        );
+                    var refused = await statementReadiness.ExplainAsync(
+                        systemDatabase,
+                        readinessStatements,
+                        session.Role,
+                        RetentionStatementReadiness.ReadinessScope,
+                        tolerateInsufficientPrivilege: false,
+                        ct
+                    );
+                    if (refused.Count != 0)
+                    {
+                        throw new RetentionConfigurationException(refused);
+                    }
+                },
+                recordInsideTransaction: true
+            );
+        }
+        finally
+        {
+            if (joinsCallerTransaction)
+            {
+                await systemDatabase.UseTransactionAsync(null, CancellationToken.None);
+            }
+        }
     }
 
     /// <summary>

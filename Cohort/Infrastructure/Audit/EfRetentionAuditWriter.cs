@@ -7,10 +7,6 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace Cohort.Infrastructure.Audit;
 
-// Cohort's run tables may be adopted by host entity types, so they are written with raw SQL
-// rather than typed LINQ. Interpolations are table names quoted from the EF model only.
-#pragma warning disable EF1002
-
 /// <summary>
 /// Writes the audit ledger. Statements run on the scoped DbContext, so they join the
 /// caller's transaction when there is one. Each statement is built by a static builder

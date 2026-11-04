@@ -96,41 +96,42 @@ internal sealed record CohortStatementValues(
 )
 {
     /// <summary>The run every statement of a group names.</summary>
-    internal Guid SweepId { get; init; } = new("c0de0000-0000-0000-0000-000000000002");
+    internal Guid SweepId { get; } = new("c0de0000-0000-0000-0000-000000000002");
 
-    internal Guid HoldId { get; init; } = new("c0de0000-0000-0000-0000-000000000003");
+    internal Guid HoldId { get; } = new("c0de0000-0000-0000-0000-000000000003");
 
     /// <summary>The handler a requeue is limited to.</summary>
-    internal Guid HandlerId { get; init; } = new("c0de0000-0000-0000-0000-000000000004");
+    internal Guid HandlerId { get; } = new("c0de0000-0000-0000-0000-000000000004");
 
     /// <summary>The token a handler claim is made and owned under.</summary>
-    internal Guid ClaimToken { get; init; } = new("c0de0000-0000-0000-0000-000000000005");
+    internal Guid ClaimToken { get; } = new("c0de0000-0000-0000-0000-000000000005");
 
     /// <summary>The id of the row detail a handler status belongs to.</summary>
-    internal long RowDetailId { get; init; } = 1;
+    internal long RowDetailId { get; } = 1;
 
     /// <summary>The id of the handler status a claim, settlement, or delivery lock names.</summary>
-    internal long StatusId { get; init; } = 1;
+    internal long StatusId { get; } = 1;
 
     /// <summary>The time every timestamp and cutoff is bound to.</summary>
-    internal DateTimeOffset Now { get; init; } = DateTimeOffset.UtcNow;
+    internal DateTimeOffset Now { get; } = DateTimeOffset.UtcNow;
 
     /// <summary>The string a lock key is hashed from.</summary>
-    internal string LockKey { get; init; } = "readiness";
+    internal string LockKey { get; } = "readiness";
 
-    internal object? RecordId { get; init; } = new ReadinessTypedNull(typeof(string));
+    internal object? RecordId { get; } = new ReadinessTypedNull(typeof(string));
 
-    internal object? CapturedPayload { get; init; } = new ReadinessTypedNull(typeof(string));
+    internal object? CapturedPayload { get; } = new ReadinessTypedNull(typeof(string));
 
-    internal object? Reason { get; init; } = new ReadinessTypedNull(typeof(string));
+    internal object? Reason { get; } = new ReadinessTypedNull(typeof(string));
 
-    internal object? Error { get; init; } = new ReadinessTypedNull(typeof(string));
+    internal object? Error { get; } = new ReadinessTypedNull(typeof(string));
 }
 
 /// <summary>
 /// Every statement Cohort sends against its own five tables and the PostgreSQL functions it calls,
 /// per port group: the same builders the run executes, over <see cref="CohortStatementValues"/>.
-/// The host-table statements of a group are not here.
+/// The host-table statements of a group are not here, except the worker's tenant-coverage scan,
+/// which only the worker sends.
 /// </summary>
 internal static class CohortStatements
 {
@@ -155,14 +156,14 @@ internal static class CohortStatements
 
     /// <summary>
     /// What a sweep, a dry run, or a scheduled pass sends: run recording (R1, S1, S2 with R2, D1,
-    /// R3, and, with <paramref name="handlerBookkeeping"/>, D2 and T1), H9 when a retained entity is
-    /// tenantless, the pass ledger read with a tenant (R6), the run lock, the pass lock, the
-    /// entity lock, the held-locks check, and the clock.
+    /// R3, and, with <paramref name="handlerBookkeeping"/>, D2 and T1), H9 when the hold guard
+    /// reads tenantless holds with a dependents step, the pass ledger read with a tenant (R6), the
+    /// run lock, the pass lock, the entity lock, the held-locks check, and the clock.
     /// </summary>
     internal static IReadOnlyList<SweepStatement> ForSweep(
         CohortStoreTables tables,
         bool handlerBookkeeping,
-        bool tenantlessRetained,
+        bool guardReadsTenantlessHolds,
         CohortStatementValues values
     )
     {
@@ -179,7 +180,7 @@ internal static class CohortStatements
             statements,
             tables,
             handlerBookkeeping,
-            tenantlessRetained,
+            guardReadsTenantlessHolds,
             values,
             [runKey, passKey]
         );
@@ -196,15 +197,16 @@ internal static class CohortStatements
     }
 
     /// <summary>
-    /// What an erasure sends: run recording, H9 when a retained entity is tenantless, the run lock
-    /// and its unlock, the entity lock, the held-locks check over the run's key alone (an erasure
-    /// takes no pass lock and reads no ledger occurrence), the clock, the commit check of a run
-    /// in the caller's transaction (R7), and the caller's isolation level.
+    /// What an erasure sends: run recording, H9 when the hold guard reads tenantless holds with a
+    /// dependents step, the run lock and its unlock, the entity lock, the held-locks check over
+    /// the run's key alone (an erasure takes no pass lock and reads no ledger occurrence), the
+    /// clock, the commit check of a run in the caller's transaction (R7), and the caller's
+    /// isolation level.
     /// </summary>
     internal static IReadOnlyList<SweepStatement> ForErasure(
         CohortStoreTables tables,
         bool handlerBookkeeping,
-        bool tenantlessRetained,
+        bool guardReadsTenantlessHolds,
         CohortStatementValues values
     )
     {
@@ -213,7 +215,7 @@ internal static class CohortStatements
             statements,
             tables,
             handlerBookkeeping,
-            tenantlessRetained,
+            guardReadsTenantlessHolds,
             values,
             [RetentionRunAdvisoryLock.KeyFor(values.SweepId)]
         );
@@ -532,7 +534,6 @@ internal static class CohortStatements
             return;
         }
 
-        const long rowDetailId = 1;
         statements.Add(
             RetentionHandlerSupport.RowDetailWithPayloadStatement(
                 tables,
@@ -550,7 +551,7 @@ internal static class CohortStatements
         statements.Add(
             RetentionHandlerSupport.HandlerStatusStatement(
                 tables,
-                rowDetailId,
+                values.RowDetailId,
                 values.LockKey,
                 RowHandlerDispatchPhase.Immediate,
                 SweepRowHandlerDispatchState.DeadLettered,
@@ -574,8 +575,8 @@ internal static class CohortStatements
         }
     }
 
-    // The run lock and its unlock, the scheduled pass's try-lock, the held-locks check over both,
-    // and the entity lock, each over a key from the run's own key functions.
+    // The run lock and its unlock, the held-locks check over the given keys, and the entity lock,
+    // each over a key from the run's own key functions.
     private static void AddRun(
         List<SweepStatement> statements,
         CohortStoreTables tables,

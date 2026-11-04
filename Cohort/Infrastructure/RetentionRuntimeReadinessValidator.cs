@@ -66,7 +66,8 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// belong to scopes startup can't take on, so a privilege the role lacks (42501) is not
     /// reported here; a missing column, a wrong type, or a generated column is. The sequence rule
     /// is about privilege and is skipped too. Nothing is recorded as a pass, so each port's role
-    /// still gets its strict group pass when it first reaches readiness.
+    /// still gets its strict group pass when it first reaches readiness. The statements it
+    /// enumerates are kept under this scope's role only, so no other role reuses them.
     /// </summary>
     public async Task ValidateAtStartupAsync(CancellationToken ct = default)
     {
@@ -83,7 +84,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
             var errors = new List<string>();
             foreach (var group in RetentionStatementReadiness.PortGroups)
             {
-                var enumerated = await EnumerateGroupAsync(readiness, group, ct);
+                var enumerated = await EnumerateGroupAsync(readiness, group, session.Role, ct);
                 errors.AddRange(
                     await statementReadiness.ExplainAsync(
                         facade,
@@ -286,7 +287,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
             known
             ?? await ReadServerSessionAsync(facade, CohortStoreTables.FromModel(db.Model).RetentionHolds, ct);
         if (
-            readiness.Enumerations.TryGetValue(group, out var kept)
+            readiness.Enumerations.TryGetValue((group, session.Role), out var kept)
             && state.HasPassed(GroupKey(session, group, kept))
         )
         {
@@ -296,7 +297,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
         await readiness.Gate.WaitAsync(ct);
         try
         {
-            var enumerated = await EnumerateGroupAsync(readiness, group, ct);
+            var enumerated = await EnumerateGroupAsync(readiness, group, session.Role, ct);
             await RunSharedAsync(
                 GroupKey(session, group, enumerated),
                 async () =>
@@ -329,15 +330,18 @@ internal sealed class RetentionRuntimeReadinessValidator(
         }
     }
 
-    // The group's statements, enumerated once per entry and kept, but only when they were
-    // enumerated outside a caller's transaction, the rule a recorded pass follows.
+    // The group's statements, enumerated once per entry and role and kept, but only when they
+    // were enumerated outside a caller's transaction, the rule a recorded pass follows. The role
+    // is the enumerating session's: the blocking-key read keeps only the child tables that role
+    // can SELECT, so a statement's text, and with it the set a pass explains, depends on it.
     private async Task<GroupStatements> EnumerateGroupAsync(
         RetentionRuntimeReadinessEntry readiness,
         RetentionStatementGroup group,
+        string role,
         CancellationToken ct
     )
     {
-        if (readiness.Enumerations.TryGetValue(group, out var kept))
+        if (readiness.Enumerations.TryGetValue((group, role), out var kept))
         {
             return kept;
         }
@@ -359,7 +363,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
         var enumerated = new GroupStatements(statements, StatementInputs(statements));
         if (facade.CurrentTransaction is null)
         {
-            readiness.Enumerations[group] = enumerated;
+            readiness.Enumerations[(group, role)] = enumerated;
         }
 
         return enumerated;
@@ -1376,7 +1380,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
         await systemDatabase.OpenConnectionAsync(ct);
         try
         {
-            await ValidateReadinessScopeCoreAsync(systemDatabase, holdsTable, callerDatabase, ct);
+            await ValidateReadinessScopeAsync(systemDatabase, callerDatabase, ct);
 
             var statement = RetentionHoldSql.StoredEntityIdentities(CohortStoreTables.FromModel(db.Model), registered);
             await using var command = statement.Parameters.CreateCommand(
@@ -1425,33 +1429,21 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// holds: <paramref name="systemDatabase"/> (the scope's context, connection open) must reach
     /// <paramref name="callerDatabase"/>, and the Readiness group's statements are explained under
     /// that session's role, a pass kept per role. Runs no model pass and keeps no state on the
-    /// entry; a pass already recorded costs the session read.
+    /// entry; a pass already recorded costs the session read. Takes no Gate: the stored-identities
+    /// step runs it while the model pass holds the entry's, which isn't re-entrant.
     /// </summary>
-    internal Task ValidateReadinessScopeAsync(
+    internal async Task ValidateReadinessScopeAsync(
         DatabaseFacade systemDatabase,
-        ServerDatabaseIdentity callerDatabase,
-        CancellationToken ct
-    ) =>
-        ValidateReadinessScopeCoreAsync(
-            systemDatabase,
-            CohortStoreTables.FromModel(db.Model).RetentionHolds,
-            callerDatabase,
-            ct
-        );
-
-    // Reads the System(Readiness) scope's session once, refuses a different database from the
-    // caller's, and explains the Readiness group under that session's role. Takes no Gate: the
-    // stored-identities step runs it while the model pass holds the entry's, which isn't
-    // re-entrant. The connection is open.
-    private async Task ValidateReadinessScopeCoreAsync(
-        DatabaseFacade systemDatabase,
-        RelationalObjectName holdsTable,
         ServerDatabaseIdentity callerDatabase,
         CancellationToken ct
     )
     {
         // Only the database is compared: the System scope may run under another role.
-        var session = await ReadServerSessionAsync(systemDatabase, holdsTable, ct);
+        var session = await ReadServerSessionAsync(
+            systemDatabase,
+            CohortStoreTables.FromModel(db.Model).RetentionHolds,
+            ct
+        );
         if (session.Database != callerDatabase)
         {
             throw new RetentionConfigurationException([
@@ -1667,9 +1659,11 @@ internal sealed class RetentionRuntimeReadinessEntry
     internal volatile bool ModelValidated;
 
     /// <summary>
-    /// Each group's statements, enumerated once per entry and kept only when they were enumerated
-    /// outside a caller's transaction. Keyed by the group record, so a pruning group's scope is
-    /// part of the key.
+    /// Each group's statements, enumerated once per entry and role and kept only when they were
+    /// enumerated outside a caller's transaction. Keyed by the group record, so a pruning group's
+    /// scope is part of the key, and by the enumerating session's role, since the blocking-key
+    /// read drops the child tables that role can't SELECT and so changes the statements' text.
     /// </summary>
-    internal ConcurrentDictionary<RetentionStatementGroup, GroupStatements> Enumerations { get; } = new();
+    internal ConcurrentDictionary<(RetentionStatementGroup Group, string Role), GroupStatements> Enumerations { get; } =
+        new();
 }

@@ -620,7 +620,7 @@ internal sealed class RetentionRowDispatcher(
             claimed.Attempt
         );
 
-    // Once per poll or flush, not per statement: the result is cached after the first pass.
+    // Per group, once or twice per poll or flush; a recorded group pass costs one session read.
     private Task ValidateReadinessAsync(RetentionStatementGroup group, CancellationToken ct) =>
         scopeFactory.RunInScopeAsync(
             RowDispatch,

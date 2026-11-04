@@ -28,7 +28,9 @@ namespace Cohort.Sample.Tests;
 //
 // Every scope kind runs as a role of its own (ScopeRoles: the tenant, the tenantless pass, the
 // readiness scope, the dispatcher, the worker, the pruner, and the caller's own scope, which has
-// no execution context). The test's own SQL (seeding, reads) goes through an unintercepted
+// no execution context), and every port operation runs under roles no other operation uses: where
+// two operations would share a scope kind's role, one runs on a host of its own over the same
+// database, or as a tenant of its own. The test's own SQL (seeding, reads) goes through an unintercepted
 // context or a raw connection, so it runs as the connecting superuser and is never judged; a
 // statement it must send on a connection Cohort's scopes share starts "/* host */". Host SQL a
 // step runs is marked the same way. Catalog reads start "/* cohort catalog */" and transaction
@@ -91,14 +93,26 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             );
     }
 
+    // Every port operation runs under roles no other operation uses, so the reach ledger can tell
+    // an over-wide group from a right one: a statement only one operation sends, wrongly added to
+    // another operation's group, would otherwise read as reached through the operation that does
+    // send it. A scope kind has one role per ScopeRoles, so the operations that share a kind
+    // (erasures and the sweeps' tenantless pass, erasures in the caller's transaction, holds, and
+    // deletions all run as the caller or the tenantless pass) get a host of their own over the
+    // same database, with roles of their own: this host sweeps, previews, holds, runs the worker,
+    // and prunes; the erasure host only erases; the deletion host only deletes.
     private async Task PlainRunsAsync(ReachLedger ledger)
     {
         await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
+        await using var erasureRoles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
+        await using var deletionRoles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
         await using var database = await MigratedSampleDatabaseAsync();
         var tenants = new CoverageTenants();
         await SeedAsync(database, tenants);
         await SeedPrunableHistoryAsync(database);
         await roles.GrantAsync(database);
+        await erasureRoles.GrantAsync(database);
+        await deletionRoles.GrantAsync(database);
         // A role that only previews: no other operation explains the preview's counts under it.
         var previewRole = await roles.AddTenantRoleAsync(database, tenants.Previewed);
         using var host = new CohortTestHost(
@@ -110,6 +124,18 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
                 roles.Install<SampleDbContext>(services);
                 services.AddScoped<IRetentionTenantSource>(_ => new FixedTenantSource(tenants.All));
             }
+        );
+        using var erasureHost = new CohortTestHost(
+            database.ConnectionString,
+            new CoverageRuleProvider(tenants, auditRows: true),
+            BatchSizeOne,
+            services => erasureRoles.Install<SampleDbContext>(services)
+        );
+        using var deletionHost = new CohortTestHost(
+            database.ConnectionString,
+            new CoverageRuleProvider(tenants),
+            BatchSizeOne,
+            services => deletionRoles.Install<SampleDbContext>(services)
         );
 
         var recording = await StartRecordingAsync(database);
@@ -142,7 +168,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         // Erasure: each kind, with a legal minimum (a cutoff) and without (none), the tenantless
         // entities, and an Exempt rule, which only counts the subject's rows. A dry run first.
         (
-            await host.RunErasureAsync(
+            await erasureHost.RunErasureAsync(
                 Tenant(tenants.WithLegalMinimum),
                 new ErasureScope("user", tenants.Subject, allowSoftDeleteAsErasure: true, dryRun: true),
                 AsOf
@@ -152,13 +178,13 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             .BeEmpty();
         foreach (var kind in new[] { "user", "person" })
         {
-            await EraseAsync(host, tenants.WithLegalMinimum, kind, tenants.Subject);
-            await EraseAsync(host, tenants.WithoutLegalMinimum, kind, tenants.Subject);
+            await EraseAsync(erasureHost, tenants.WithLegalMinimum, kind, tenants.Subject);
+            await EraseAsync(erasureHost, tenants.WithoutLegalMinimum, kind, tenants.Subject);
         }
 
-        await EraseAsync(host, tenants.Exempted, "user", tenants.Subject);
+        await EraseAsync(erasureHost, tenants.Exempted, "user", tenants.Subject);
         (
-            await host.RunWithServicesAsync(services =>
+            await erasureHost.RunWithServicesAsync(services =>
                 services
                     .GetRequiredService<IRetentionErasureService>()
                     .ExecuteAsync(
@@ -175,7 +201,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
 
         // An erasure in the caller's own transaction: the run's statements go through the
         // caller's scope and role, and its commit is confirmed afterwards (R7).
-        await host.RunWithServicesAsync(async services =>
+        await erasureHost.RunWithServicesAsync(async services =>
         {
             var db = services.GetRequiredService<SampleDbContext>();
             await using var transaction = await db.Database.BeginTransactionAsync();
@@ -194,13 +220,13 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             await transaction.CommitAsync();
         });
 
-        // Holds, and the deletion check.
+        // Holds, and the deletion check, which runs on the deletion host.
+        var held = await FirstNoteIdAsync(database, tenants.Held);
+        var free = await FirstNoteIdAsync(database, tenants.Swept);
+        var holdId = Guid.NewGuid();
         await host.RunWithServicesAsync(async services =>
         {
             var holds = services.GetRequiredService<IRetentionHoldsRepository>();
-            var held = await FirstNoteIdAsync(database, tenants.Held);
-            var free = await FirstNoteIdAsync(database, tenants.Swept);
-            var holdId = Guid.NewGuid();
             await holds.CreateAsync(
                 new RetentionHoldRequest(
                     holdId,
@@ -249,7 +275,10 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
                 null,
                 CancellationToken.None
             );
+        });
 
+        await deletionHost.RunWithServicesAsync(async services =>
+        {
             var deletion = services.GetRequiredService<IRetentionDeletion>();
             (
                 await deletion.ExecuteAsync(
@@ -267,35 +296,51 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             )
                 .Should()
                 .Be(RetentionDeletionOutcome.Executed);
-            await holds.RemoveAsync(holdId, AsOf, CancellationToken.None);
-
-            // A tenantless entity's row with an active tenantless hold on another of its rows:
-            // the guard reads the tenantless holds in the readiness scope (H9), finds one, and
-            // reads them again in the caller's scope.
-            var logIdentity = RetentionEntityIdentity.For<TenantlessLog>();
-            var (heldLog, freeLog) = await TwoTenantlessLogIdsAsync(database);
-            var logHold = Guid.NewGuid();
-            await holds.CreateAsync(
-                new RetentionHoldRequest(
-                    logHold,
-                    logIdentity,
-                    heldLog.ToString(),
-                    null,
-                    "coverage",
-                    AsOf
-                ),
-                CancellationToken.None
-            );
-            (
-                await deletion.ExecuteAsync(
-                    [new RetentionTarget(logIdentity, freeLog.ToString(), null)],
-                    _ => Task.CompletedTask
-                )
-            )
-                .Should()
-                .Be(RetentionDeletionOutcome.Executed);
-            await holds.RemoveAsync(logHold, AsOf, CancellationToken.None);
         });
+        await host.RunWithServicesAsync(services =>
+            services
+                .GetRequiredService<IRetentionHoldsRepository>()
+                .RemoveAsync(holdId, AsOf, CancellationToken.None)
+        );
+
+        // A tenantless entity's row with an active tenantless hold on another of its rows: the
+        // guard reads the tenantless holds in the readiness scope (H9), finds one, and reads them
+        // again in the caller's scope.
+        var logIdentity = RetentionEntityIdentity.For<TenantlessLog>();
+        var (heldLog, freeLog) = await TwoTenantlessLogIdsAsync(database);
+        var logHold = Guid.NewGuid();
+        await host.RunWithServicesAsync(services =>
+            services
+                .GetRequiredService<IRetentionHoldsRepository>()
+                .CreateAsync(
+                    new RetentionHoldRequest(
+                        logHold,
+                        logIdentity,
+                        heldLog.ToString(),
+                        null,
+                        "coverage",
+                        AsOf
+                    ),
+                    CancellationToken.None
+                )
+        );
+        (
+            await deletionHost.RunWithServicesAsync(services =>
+                services
+                    .GetRequiredService<IRetentionDeletion>()
+                    .ExecuteAsync(
+                        [new RetentionTarget(logIdentity, freeLog.ToString(), null)],
+                        _ => Task.CompletedTask
+                    )
+            )
+        )
+            .Should()
+            .Be(RetentionDeletionOutcome.Executed);
+        await host.RunWithServicesAsync(services =>
+            services
+                .GetRequiredService<IRetentionHoldsRepository>()
+                .RemoveAsync(logHold, AsOf, CancellationToken.None)
+        );
 
         // The worker's iteration: the clock, the tenant-coverage scan, the ledger, and a
         // scheduled pass for every tenant and the tenantless pass.
@@ -319,17 +364,22 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         // entity reaches S5's cursor, the Exempt erasure S4, and the worker's scan S12.
         await AssertEveryStatementIsExplainedAsync<SampleDbContext>(
             database,
-            roles,
+            [roles, erasureRoles, deletionRoles],
             recording,
             ledger,
             action => host.RunWithServicesAsync(action),
             runsReachTenantless: true,
             [
                 new Reach(RetentionStatementGroup.Sweep, roles.Tenant, roles.TenantlessPass),
-                new Reach(RetentionStatementGroup.Erasure, roles.Tenant, roles.TenantlessPass, roles.Caller),
-                new Reach(RetentionStatementGroup.Preview, roles.Tenant, previewRole),
+                new Reach(
+                    RetentionStatementGroup.Erasure,
+                    erasureRoles.Tenant,
+                    erasureRoles.TenantlessPass,
+                    erasureRoles.Caller
+                ),
+                new Reach(RetentionStatementGroup.Preview, previewRole),
                 new Reach(RetentionStatementGroup.Holds, roles.Caller),
-                new Reach(RetentionStatementGroup.Deletion, roles.Caller),
+                new Reach(RetentionStatementGroup.Deletion, deletionRoles.Caller),
                 new Reach(RetentionStatementGroup.Worker, roles.WorkerCoordination),
                 new Reach(
                     RetentionStatementGroup.Pruning(new PruningScope(true, true, true)),
@@ -351,6 +401,8 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         var sink = new CoverageHandlerSink();
         await SeedAsync(database, tenants);
         await roles.GrantAsync(database);
+        // A role that only erases: this host's sweeps run as other tenants.
+        var erasureRole = await roles.AddTenantRoleAsync(database, tenants.WithoutLegalMinimum);
         using var host = new CohortTestHost(
             database.ConnectionString,
             new CoverageRuleProvider(tenants),
@@ -441,14 +493,14 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         // Only tenanted runs: the tenantless tables are not reached.
         await AssertEveryStatementIsExplainedAsync<SampleDbContext>(
             database,
-            roles,
+            [roles],
             recording,
             ledger,
             action => host.RunWithServicesAsync(action),
             runsReachTenantless: false,
             [
                 new Reach(RetentionStatementGroup.Sweep, roles.Tenant),
-                new Reach(RetentionStatementGroup.Erasure, roles.Tenant),
+                new Reach(RetentionStatementGroup.Erasure, erasureRole),
                 new Reach(RetentionStatementGroup.Holds, roles.Caller),
                 new Reach(RetentionStatementGroup.Scrub, roles.RowDispatch),
                 new Reach(RetentionStatementGroup.Dispatch, roles.RowDispatch),
@@ -522,6 +574,9 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
                 && failure.Contains(typeof(Note).FullName!, StringComparison.Ordinal)
             );
         // The erasure meets the same key: it leaves the note with the child unchanged, blocked.
+        // The tenant's scopes run as a role of their own from here on, so only the erasure runs
+        // as it.
+        var erasureRole = await roles.AddTenantRoleAsync(database, tenants.Swept);
         (
             await host.RunErasureAsync(
                 Tenant(tenants.Swept),
@@ -539,14 +594,14 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         // tenantless tables appear too.
         await AssertEveryStatementIsExplainedAsync<SampleDbContext>(
             database,
-            roles,
+            [roles],
             recording,
             ledger,
             action => host.RunWithServicesAsync(action),
             runsReachTenantless: true,
             [
                 new Reach(RetentionStatementGroup.Sweep, roles.Tenant),
-                new Reach(RetentionStatementGroup.Erasure, roles.Tenant),
+                new Reach(RetentionStatementGroup.Erasure, erasureRole),
                 new Reach(RetentionStatementGroup.Holds, roles.Caller),
                 Reach.ForReadiness(roles.Readiness),
             ],
@@ -555,9 +610,12 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         );
     }
 
+    // Holds and deletions run as the caller, so deletions get a host of their own over the same
+    // database, with roles of their own (as in PlainRunsAsync).
     private async Task HoldRelationModelAsync(ReachLedger ledger)
     {
         await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
+        await using var deletionRoles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
         await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
         var tenant = Guid.NewGuid();
         await using var services = HeldWithReadinessEndToEndTests.BuildServices(
@@ -571,9 +629,20 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             },
             configuration: BatchSizeOne
         );
+        await using var deletionServices = HeldWithReadinessEndToEndTests.BuildServices(
+            database.ConnectionString,
+            configure: collection =>
+            {
+                deletionRoles.Install<HeldWithReadinessEndToEndTests.HeldWithReadinessDbContext>(collection);
+                collection.RemoveAll<IRetentionRuleProvider>();
+                collection.AddSingleton<IRetentionRuleProvider>(new PerRowAuditedHeldWithRuleProvider());
+            },
+            configuration: BatchSizeOne
+        );
         await EnsureCreatedAsync(database);
         await SeedHeldWithAsync(database, tenant);
         await roles.GrantAsync(database);
+        await deletionRoles.GrantAsync(database);
 
         var recording = await StartRecordingAsync(database);
         await using (var scope = services.CreateAsyncScope())
@@ -622,8 +691,10 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             )
                 .Should()
                 .ContainSingle();
+            await using var deletionScope = deletionServices.CreateAsyncScope();
+            var deletionProvider = deletionScope.ServiceProvider;
             (
-                await provider
+                await deletionProvider
                     .GetRequiredService<IRetentionDeletion>()
                     .ExecuteAsync(
                         [new RetentionTarget(LinkIdentity, HeldWithIds.Link.ToString(), tenant)],
@@ -636,13 +707,15 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             // An unheld note whose callback cuts the link the case's hold covers: the guard reads
             // the held rows after the callback, rereads the link by record id to see why it is
             // gone, and refuses the deletion.
+            var deletionDb =
+                deletionProvider.GetRequiredService<HeldWithReadinessEndToEndTests.HeldWithReadinessDbContext>();
             var cutLink = () =>
-                provider
+                deletionProvider
                     .GetRequiredService<IRetentionDeletion>()
                     .ExecuteAsync(
                         [new RetentionTarget(NoteIdentity, "note-0", tenant)],
                         ct =>
-                            heldWithDb.Database.ExecuteSqlAsync(
+                            deletionDb.Database.ExecuteSqlAsync(
                                 $"/* host */ DELETE FROM public.held_with_links WHERE \"Id\" = {HeldWithIds.Link}",
                                 ct
                             )
@@ -675,7 +748,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
 
         await AssertEveryStatementIsExplainedAsync<HeldWithReadinessEndToEndTests.HeldWithReadinessDbContext>(
             database,
-            roles,
+            [roles, deletionRoles],
             recording,
             ledger,
             action => WithServicesAsync(services, action),
@@ -683,7 +756,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             [
                 new Reach(RetentionStatementGroup.Sweep, roles.Tenant),
                 new Reach(RetentionStatementGroup.Holds, roles.Caller),
-                new Reach(RetentionStatementGroup.Deletion, roles.Caller),
+                new Reach(RetentionStatementGroup.Deletion, deletionRoles.Caller),
                 new Reach(RetentionStatementGroup.Worker, roles.WorkerCoordination),
                 Reach.ForReadiness(roles.Readiness),
             ],
@@ -767,7 +840,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
 
         await AssertEveryStatementIsExplainedAsync<HeldWithReadinessEndToEndTests.HeldWithReadinessDbContext>(
             database,
-            roles,
+            [roles],
             recording,
             ledger,
             action => WithServicesAsync(services, action),
@@ -863,7 +936,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
 
         await AssertEveryStatementIsExplainedAsync<ErasureModelDbContext>(
             database,
-            roles,
+            [roles],
             recording,
             ledger,
             action => WithServicesAsync(services, action),
@@ -992,10 +1065,13 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
     //      pg_stat_statements recorded for an execution): its per-strategy and per-entity
     //      variants are covered by claim 5, which every sent text must meet. Only the guard's
     //      attribution forms are exempt: they are explained so that a refusal names its entity,
-    //      and no operation sends them.
+    //      and no operation sends them. A group's reach lists only roles that no other
+    //      operation's group lists in the same model (a model gives each operation roles of its
+    //      own), so a statement only another operation sends, added to this group's enumeration,
+    //      is not executed under them and shows up here.
     private async Task AssertEveryStatementIsExplainedAsync<TContext>(
         TemporaryDatabase database,
-        ScopeRoles roles,
+        IReadOnlyList<ScopeRoles> roleSets,
         Recording recording,
         ReachLedger ledger,
         Func<Func<IServiceProvider, Task>, Task> withServices,
@@ -1017,7 +1093,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
                     || type.GetCustomAttribute<RetentionTenantlessAttribute>() is null
                 )
         );
-        var recorded = await RecordedStatementsAsync(database, roles);
+        var recorded = await RecordedStatementsAsync(database, roleSets);
         (await DeallocationsAsync(database))
             .Should()
             .Be(
@@ -1076,7 +1152,9 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             .BeEmpty("the group was built to reach these statement families, and no run executed them");
         runStatements
             .Where(statement => !explained.Contains((statement.Role, statement.Query)))
-            .Select(statement => $"{roles.Describe(statement.Role)}: {statement.Query}")
+            .Select(statement =>
+                $"{roleSets.First(roles => roles.Names.Contains(statement.Role)).Describe(statement.Role)}: {statement.Query}"
+            )
             .Should()
             .BeEmpty(
                 "readiness must EXPLAIN every statement a scope sends under that scope's role; these were sent and never explained"
@@ -1324,7 +1402,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
     // (type loading, setup, the test's SQL) are not in it.
     private static async Task<List<Recorded>> RecordedStatementsAsync(
         TemporaryDatabase database,
-        ScopeRoles roles
+        IReadOnlyList<ScopeRoles> roleSets
     )
     {
         await using var connection = new NpgsqlConnection(database.ConnectionString);
@@ -1339,7 +1417,10 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             """,
             connection
         );
-        command.Parameters.AddWithValue("roles", roles.Names.ToArray());
+        command.Parameters.AddWithValue(
+            "roles",
+            roleSets.SelectMany(roles => roles.Names).ToArray()
+        );
         var statements = new List<Recorded>();
         await using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
@@ -1675,7 +1756,11 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             Task.FromResult<IReadOnlyList<TenantContext>>([.. tenantIds.Select(Tenant)]);
     }
 
-    private sealed class CoverageRuleProvider(CoverageTenants tenants) : IRetentionRuleProvider
+    // With auditRows, every rule asks for a row detail per row (D1), which the erasure host needs:
+    // the sweeps' per-row category is the sample's only one that asks, and it has no erasure
+    // subject.
+    private sealed class CoverageRuleProvider(CoverageTenants tenants, bool auditRows = false)
+        : IRetentionRuleProvider
     {
         private readonly SampleRetentionRuleProvider inner = new();
 
@@ -1695,18 +1780,24 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
                 return null;
             }
 
+            var audit = auditRows ? AuditRowDetail.PerRow : rule.AuditRowDetail;
             if (context.Category == "tombstone-anonymise" && context.Tenant.Id == tenants.Exempted)
             {
-                return new RetentionRule(rule.Period, Strategy.Exempt);
+                return new RetentionRule(rule.Period, Strategy.Exempt, AuditRowDetail: audit);
             }
 
             if (context.Category == "soft-delete-or-anonymise" && context.Tenant.Id == tenants.Anonymising)
             {
-                return new RetentionRule(rule.Period, Strategy.Anonymise);
+                return new RetentionRule(rule.Period, Strategy.Anonymise, AuditRowDetail: audit);
             }
 
-            return context.Tenant.Id == tenants.WithLegalMinimum
-                ? new RetentionRule(rule.Period, rule.Strategy, new RetentionPeriod(Days: 1))
+            if (context.Tenant.Id == tenants.WithLegalMinimum)
+            {
+                return new RetentionRule(rule.Period, rule.Strategy, new RetentionPeriod(Days: 1), audit);
+            }
+
+            return auditRows
+                ? new RetentionRule(rule.Period, rule.Strategy, rule.LegalMin, audit, rule.Provenance)
                 : rule;
         }
     }

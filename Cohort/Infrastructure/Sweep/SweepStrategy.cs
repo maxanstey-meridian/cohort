@@ -156,7 +156,13 @@ internal abstract class SweepStrategy(
         var hasHandlers = RetentionHandlerSupport.HasHandlers(handlerRegistrations, scope.Entry.EntityType);
         var hasStep = dependentsRegistrations.HasStep(scope.Entry.EntityType);
         var rowByRow = SweepStatements.TakesRowByRowPath(HandlesStrategy, hasHandlers, hasStep, mutation.RowByRow);
-        if (!hasHandlers && !hasStep)
+        if (
+            !RetentionHandlerSupport.RecordsHandlerBookkeeping(
+                handlerRegistrations,
+                dependentsRegistrations,
+                scope.Entry.EntityType
+            )
+        )
         {
             return await MutateAsync(scope, conn, transaction, candidates, mutation, rowByRow, handlerScope: null, execution, ct);
         }

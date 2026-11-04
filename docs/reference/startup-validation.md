@@ -136,16 +136,23 @@ preview role needs only `SELECT`, and a dispatcher needs no write on your tables
 
 | Group | Cohort's tables | Functions | Your retained tables |
 |---|---|---|---|
-| **Sweep**: sweeps, dry runs, and scheduled passes | `sweep_run` and `sweep_run_entity_summary`: `SELECT`, `INSERT`, `UPDATE`. `sweep_run_row_detail`: `SELECT`, `INSERT`. `retention_holds`: `SELECT`. `sweep_row_handler_status`: `INSERT`, when a row handler or a dependents step is registered | The advisory locks, the entity lock, `pg_locks`, the clock | `SELECT`, `UPDATE`; `DELETE` where `Purge` is declared; `SELECT` on the child table of a foreign key that blocks a purge |
+| **Sweep**: sweeps, dry runs, and scheduled passes | `sweep_run` and `sweep_run_entity_summary`: `SELECT`, `INSERT`, `UPDATE`. `sweep_run_row_detail`: `SELECT`, `INSERT`. `retention_holds`: `SELECT`. `sweep_row_handler_status`: `INSERT`, when a row handler or a dependents step is registered | The advisory locks, the entity lock, the clock | `SELECT`, `UPDATE`; `DELETE` where `Purge` is declared; `SELECT` on the child table of a foreign key that blocks a purge |
 | **Erasure** | As Sweep | As Sweep without the pass lock, plus `current_setting` | As Sweep |
 | **Preview** | `retention_holds`: `SELECT` | The clock | `SELECT`, and `SELECT` on the child table of a foreign key that blocks a purge |
-| **Holds**: `IRetentionHoldsRepository` | `retention_holds`: `SELECT`, `INSERT`, `UPDATE` | The entity lock, `current_setting` | `SELECT`, `UPDATE` (the rows a hold locks `FOR SHARE`) |
-| **Deletion**: `IRetentionDeletion` | `retention_holds`: `SELECT` | The entity lock | `SELECT` |
-| **Readiness**: the `System(Readiness)` scope's own reads | `retention_holds`: `SELECT` | None | None |
+| **Holds**: `IRetentionHoldsRepository` | `retention_holds`: `SELECT`, `INSERT`, `UPDATE` | The entity lock, the clock, `current_setting` | `SELECT`, `UPDATE` (the rows a hold locks `FOR SHARE`) |
+| **Deletion**: `IRetentionDeletion` | `retention_holds`: `SELECT` | The entity lock, the clock | `SELECT` |
+| **Readiness**: the `System(Readiness)` scope's own reads | `retention_holds`: `SELECT` | The clock | None |
 | **Scrub**: the payload-retention scrub | `sweep_run_row_detail`: `SELECT`, `UPDATE` | None | None |
 | **Dispatch**: the row-handler dispatcher | `sweep_run`, `sweep_run_row_detail`, and `sweep_row_handler_status`: `SELECT`, `UPDATE` | The advisory locks | None |
 | **Worker**: the scheduled worker's coordination | `sweep_run`: `SELECT` | The advisory locks, the clock | `SELECT` on each tenanted retained table |
 | **Pruning**: history pruning, for the retentions set | Runs: `sweep_run` `SELECT`, `UPDATE`, `DELETE`; `sweep_run_row_detail` and `sweep_run_entity_summary` `SELECT`, `DELETE`; `sweep_row_handler_status` `SELECT`. Holds: `retention_holds` `SELECT`, `UPDATE`, `DELETE` | The clock, when a `Schedule` is set | None |
+
+In the table, "the advisory locks" are `pg_advisory_lock`, `pg_try_advisory_lock`,
+`pg_advisory_unlock`, and `pg_advisory_unlock_all`; "the entity lock" is
+`pg_advisory_xact_lock` over `hashtextextended`; and "the clock" is `statement_timestamp`,
+which every read of holds calls inline to decide which are active. The Sweep and Erasure
+groups' check that a run still holds its locks reads the `pg_locks` view (and calls `pg_backend_pid`), which
+PUBLIC can read by default.
 
 Two more things are checked that no table privilege covers:
 
@@ -158,8 +165,8 @@ Two more things are checked that no table privilege covers:
 - `EXECUTE` on the functions in the table. PUBLIC holds it by default, and a database that
   revokes it from a role is refused, naming the function.
 
-Each group other than Readiness is checked the first time its role reaches readiness,
-whichever operation that is, before that operation writes anything. The Dispatch, Worker, and
+Each group other than Readiness is checked the first time its own operation runs under a given
+role, before that operation writes anything. The Dispatch, Worker, and
 Pruning groups are checked only when they run: Dispatch while the kill switch is off (and when
 `FlushAsync` or `RequeueDeadLetteredAsync` is called), Worker when the worker runs (the kill
 switch off and a `Schedule` set), and Pruning only for the retentions that are set, so a host
@@ -318,7 +325,8 @@ entity and column it refuses.
   | `System(HistoryPruning)` | Per retention set: see [Statements](#statements) | None |
 
   Every role also needs `USAGE` on the schemas of the tables it touches, and `EXECUTE` on the
-  advisory-lock and clock functions, which PUBLIC holds by default
+  the functions Cohort calls (the advisory-lock functions, `hashtextextended`,
+  `statement_timestamp`, and `current_setting`), which PUBLIC holds by default
   ([Statements](#statements)). See [Tenant Isolation](/guides/tenant-isolation#grants).
 - A tenant column that is nullable in the database: make it `NOT NULL`. A `NULL` tenant never
   matches any tenant's run, erasure, or hold, so those rows were silently never swept.

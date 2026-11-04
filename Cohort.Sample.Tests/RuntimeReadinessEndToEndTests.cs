@@ -1423,7 +1423,8 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         }
         else
         {
-            await act.Should().NotThrowAsync();
+            // A sweep records a failure per entity rather than throwing.
+            (await host.RunSweepAsync(NewTenant())).EntityFailures.Should().BeEmpty();
         }
     }
 
@@ -1449,6 +1450,90 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
                 && error.Contains(" in sweeps. ", StringComparison.Ordinal)
                 && error.Contains($"The database role '{roles.Tenant}' lacks this privilege", StringComparison.Ordinal)
             );
+    }
+
+    // A caller role that manages holds and nothing else: SELECT, INSERT, and UPDATE on
+    // retention_holds, SELECT and UPDATE (the row locks) on the host's tables, and nothing on the
+    // run, summary, row-detail, and handler-status tables. Every holds operation passes: the
+    // Holds group sends none of the sweep's recording.
+    // Make-fail: the Holds group enumerates the Sweep group's Cohort statements
+    // (CohortStatements.ForSweep in place of ForHolds); the first hold call is refused for a
+    // write to sweep_run.
+    [Fact]
+    public async Task A_holds_only_role_can_manage_holds()
+    {
+        await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await roles.GrantAsync(database);
+        await ExecuteAsync(
+            database,
+            $"""
+            REVOKE ALL ON ALL TABLES IN SCHEMA public FROM "{roles.Caller}";
+            GRANT SELECT, UPDATE ON ALL TABLES IN SCHEMA public TO "{roles.Caller}";
+            REVOKE ALL ON public.sweep_run, public.sweep_run_entity_summary, public.sweep_run_row_detail,
+                public.sweep_row_handler_status FROM "{roles.Caller}";
+            GRANT INSERT ON public.retention_holds TO "{roles.Caller}"
+            """
+        );
+        var tenant = NewTenant();
+        var subject = Guid.NewGuid();
+        var note = await SeedNoteAsync(database.ConnectionString, tenant.Id, subject);
+        using var host = RoleHost(database, roles);
+        var holdId = Guid.NewGuid();
+        var recordId = note.ToString();
+
+        await host.RunWithServicesAsync(services => services.GetRequiredService<IRetentionHoldsRepository>().CreateAsync(
+            new RetentionHoldRequest(holdId, Note.RetentionIdentity, recordId, tenant.Id, "litigation", DateTimeOffset.UtcNow),
+            CancellationToken.None
+        ));
+        (await host.RunWithServicesAsync(services => services.GetRequiredService<IRetentionHoldsRepository>().ListActiveAsync(CancellationToken.None)))
+            .Should().ContainSingle(hold => hold.HoldId == holdId);
+        (await host.RunWithServicesAsync(services => services.GetRequiredService<IRetentionHoldsRepository>()
+            .HasActiveHoldAsync(Note.RetentionIdentity, recordId, tenant.Id, CancellationToken.None))).Should().BeTrue();
+        (await host.RunWithServicesAsync(services => services.GetRequiredService<IRetentionHoldsRepository>()
+            .ListCoveringAsync(Note.RetentionIdentity, recordId, tenant.Id, CancellationToken.None)))
+            .Should().ContainSingle(hold => hold.HoldId == holdId);
+        (await host.RunWithServicesAsync(services => services.GetRequiredService<IRetentionHoldsRepository>()
+            .ListCoveringSubjectAsync("user", subject, tenant.Id, CancellationToken.None)))
+            .Should().ContainSingle(hold => hold.HoldId == holdId);
+        await host.RunWithServicesAsync(services => services.GetRequiredService<IRetentionHoldsRepository>()
+            .RemoveAsync(holdId, DateTimeOffset.UtcNow, CancellationToken.None));
+        (await host.RunWithServicesAsync(services => services.GetRequiredService<IRetentionHoldsRepository>().ListActiveAsync(CancellationToken.None)))
+            .Should().BeEmpty();
+        (await CountAsync(database, "sweep_run")).Should().Be(0, "a hold call records no run");
+    }
+
+    // A caller role that can only read retention_holds and the host's tables passes a deletion
+    // of an unheld row: the Deletion group sends none of the sweep's recording, and the guard
+    // reads holds only.
+    // Make-fail: the Deletion group enumerates the Sweep group's Cohort statements
+    // (CohortStatements.ForSweep in place of ForDeletion); the deletion is refused for a write
+    // to sweep_run.
+    [Fact]
+    public async Task A_select_only_role_can_delete_an_unheld_row()
+    {
+        await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await roles.GrantAsync(database);
+        await ExecuteAsync(
+            database,
+            $"""
+            REVOKE ALL ON ALL TABLES IN SCHEMA public FROM "{roles.Caller}";
+            GRANT SELECT ON ALL TABLES IN SCHEMA public TO "{roles.Caller}";
+            REVOKE ALL ON public.sweep_run, public.sweep_run_entity_summary, public.sweep_run_row_detail,
+                public.sweep_row_handler_status FROM "{roles.Caller}"
+            """
+        );
+        var tenant = NewTenant();
+        var note = await SeedNoteAsync(database.ConnectionString, tenant.Id, Guid.NewGuid());
+        using var host = RoleHost(database, roles);
+
+        var outcome = await host.RunWithServicesAsync(services => services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+            [new RetentionTarget(Note.RetentionIdentity, note.ToString(), tenant.Id)],
+            _ => Task.CompletedTask
+        ));
+
+        outcome.Should().Be(RetentionDeletionOutcome.Executed);
     }
 
     // A System(Readiness) role that only reads passes startup, even with a serial row-detail Id
@@ -1632,12 +1717,53 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         await flush.Should().NotThrowAsync();
     }
 
+    // A purge drops the blocking-key clause for a child table its role cannot SELECT, so the
+    // statements a group sends, and the ones readiness explains, depend on the role. A role that
+    // cannot read the child is checked for the statements it would send (which never name the
+    // child), not for another role's, whether that role is a tenant's that swept first or the
+    // readiness scope's startup check.
+    // Make-fail: Enumerations keyed by the group alone (the second role is refused 42501 on the
+    // child table).
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_role_that_cannot_read_a_blocking_child_is_checked_for_its_own_statements(
+        bool startupFirst
+    )
+    {
+        await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
+        await using var database = await MigratedTemporaryDatabaseAsync();
+        await ExecuteAsync(
+            database,
+            """CREATE TABLE public.note_children ("NoteId" uuid NOT NULL REFERENCES public.notes ("Id"))"""
+        );
+        await roles.GrantAsync(database);
+        var reader = NewTenant();
+        await roles.AddTenantRoleAsync(database, reader.Id);
+        await ExecuteAsync(database, $"REVOKE SELECT ON public.note_children FROM \"{roles.Tenant}\"");
+        using var host = RoleHost(database, roles);
+
+        if (startupFirst)
+        {
+            await host.RunWithServicesAsync(services => StartValidationAsync(services));
+        }
+        else
+        {
+            (await host.RunSweepAsync(reader)).EntityFailures.Should().BeEmpty();
+        }
+
+        (await host.RunSweepAsync(NewTenant())).EntityFailures.Should().BeEmpty();
+    }
+
     // A dispatcher role that cannot claim work is refused in the Cohort error, from FlushAsync
     // and from a poll alike, but only after the payload scrub has run: personal data never
     // outlives its retention because the dispatcher's statements are refused. The tenant
     // role's sweeps are untouched.
+    // A refused scrub leaves the poll's hourly gate unspent, and under the kill switch the poll
+    // scrubs without checking Dispatch.
     // Make-fails: Dispatch not validated by FlushAsync and PollAsync; then Dispatch validated
-    // before the scrub in both.
+    // before the scrub in both; then PollAsync's Scrub validation moved below
+    // lastPayloadScrubAt = now; then its Dispatch validation moved above the kill-switch return.
     [Fact]
     public async Task The_dispatcher_is_refused_under_a_role_that_cannot_claim_work()
     {
@@ -1663,6 +1789,38 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             );
         (await CapturedPayloadAsync(database, viaFlush)).Should().BeNull("flush scrubbed before it refused");
         (await host.RunSweepAsync(NewTenant())).EntityFailures.Should().BeEmpty();
+
+        // A poll whose scrub is refused leaves the hourly gate unspent: once the role can scrub,
+        // the next poll does, though its dispatcher statements are still refused.
+        await ExecuteAsync(database, $"REVOKE UPDATE ON public.sweep_run_row_detail FROM \"{roles.RowDispatch}\"");
+        using var scrubHost = RoleHost(database, roles);
+        var viaRefusedScrub = await SeedExpiredPayloadAsync(database);
+        var scrubPoll = () => scrubHost.RunWithServicesAsync(services => services.GetRequiredService<RetentionRowDispatcher>().PollAsync(CancellationToken.None));
+
+        (await scrubPoll.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                RefusesCohortTables(error, "the payload scrub", roles.RowDispatch, "sweep_run_row_detail")
+            );
+        (await CapturedPayloadAsync(database, viaRefusedScrub)).Should().NotBeNull("the refused scrub changed nothing");
+        await ExecuteAsync(database, $"GRANT UPDATE ON public.sweep_run_row_detail TO \"{roles.RowDispatch}\"");
+        (await scrubPoll.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                RefusesCohortTables(error, "row-handler dispatch", roles.RowDispatch, "sweep_row_handler_status")
+            );
+        (await CapturedPayloadAsync(database, viaRefusedScrub)).Should().BeNull("the refused poll did not spend the scrub's hourly gate");
+
+        // Under the kill switch the dispatcher doesn't run, so a refusal of its statements stops
+        // nothing: the poll scrubs and returns.
+        using var killedHost = RoleHost(
+            database,
+            roles,
+            configuration: new Dictionary<string, string?> { [$"{CohortOptions.SectionName}:KillSwitch"] = "true" }
+        );
+        var underKillSwitch = await SeedExpiredPayloadAsync(database);
+        var killedPoll = () => killedHost.RunWithServicesAsync(services => services.GetRequiredService<RetentionRowDispatcher>().PollAsync(CancellationToken.None));
+
+        await killedPoll.Should().NotThrowAsync();
+        (await CapturedPayloadAsync(database, underKillSwitch)).Should().BeNull("the kill switch never keeps a payload past its retention");
     }
 
     // The worker's ledger read is the worker's group, checked when an iteration starts, before
@@ -1752,13 +1910,21 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
                 RefusesCohortTables(error, "history pruning", roles.HistoryPruning, "sweep_run")
             );
         (await CountAsync(database, "sweep_run")).Should().Be(1, "nothing was deleted");
+        if (pruningCase == PruningCase.RunsConfigured)
+        {
+            // The reload case already pruned its inactive hold.
+            (await CountAsync(database, "retention_holds")).Should().Be(1, "refused before any delete, holds included");
+        }
     }
 
     // Startup checks, in its own scope and under its own role, each background subsystem that
-    // will run: a dispatcher role that cannot claim work stops the host; a pruner role without
-    // DELETE does not while pruning is off.
+    // will run: a dispatcher role that cannot claim work stops the host, unless the kill switch
+    // is on (the dispatcher doesn't run); a worker role that cannot read the ledger stops a host
+    // with a schedule, unless the kill switch is on (the worker doesn't run); a pruner role
+    // without DELETE does not while pruning is off.
     // Make-fails: the startup groups skipped (RetentionValidationHostedService); then Pruning
-    // checked unconditionally.
+    // checked unconditionally; then the Worker check deleted; then Dispatch checked whatever the
+    // kill switch says.
     [Fact]
     public async Task Startup_checks_each_group_that_will_run_in_its_own_scope()
     {
@@ -1772,15 +1938,37 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         using var pruningOff = RoleHost(database, roles);
         await pruningOff.RunWithServicesAsync(services => StartValidationAsync(services));
 
+        await ExecuteAsync(database, $"REVOKE SELECT ON public.sweep_run FROM \"{roles.WorkerCoordination}\"");
+        var scheduled = new Dictionary<string, string?> { [$"{CohortOptions.SectionName}:Schedule"] = "0 0 0 * * *" };
+        var scheduledKilled = new Dictionary<string, string?>(scheduled) { [$"{CohortOptions.SectionName}:KillSwitch"] = "true" };
+        using var worker = RoleHost(database, roles, configuration: scheduled);
+        using var workerKilled = RoleHost(database, roles, configuration: scheduledKilled);
+
+        var startWorker = () => worker.RunWithServicesAsync(services => StartValidationAsync(services));
+        var startWorkerKilled = () => workerKilled.RunWithServicesAsync(services => StartValidationAsync(services));
+
+        (await startWorker.Should().ThrowAsync<RetentionConfigurationException>())
+            .Which.Errors.Should().ContainSingle(error =>
+                RefusesCohortTables(error, "the scheduled worker", roles.WorkerCoordination, "sweep_run")
+            );
+        await startWorkerKilled.Should().NotThrowAsync("the worker does not run under the kill switch");
+
         await ExecuteAsync(database, $"REVOKE UPDATE ON public.sweep_row_handler_status FROM \"{roles.RowDispatch}\"");
         using var host = RoleHost(database, roles);
+        using var dispatcherKilled = RoleHost(
+            database,
+            roles,
+            configuration: new Dictionary<string, string?> { [$"{CohortOptions.SectionName}:KillSwitch"] = "true" }
+        );
 
         var start = () => host.RunWithServicesAsync(services => StartValidationAsync(services));
+        var startDispatcherKilled = () => dispatcherKilled.RunWithServicesAsync(services => StartValidationAsync(services));
 
         (await start.Should().ThrowAsync<RetentionConfigurationException>())
             .Which.Errors.Should().ContainSingle(error =>
                 RefusesCohortTables(error, "row-handler dispatch", roles.RowDispatch, "sweep_row_handler_status")
             );
+        await startDispatcherKilled.Should().NotThrowAsync("the dispatcher does not run under the kill switch");
     }
 
     private CohortTestHost RoleHost(
@@ -1813,6 +2001,24 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         db.TenantlessLogs.Add(log);
         await db.SaveChangesAsync();
         return log.Id;
+    }
+
+    private static async Task<Guid> SeedNoteAsync(string connectionString, Guid tenantId, Guid subjectId)
+    {
+        await using var db = new SampleDbContext(
+            new DbContextOptionsBuilder<SampleDbContext>().UseNpgsql(connectionString).Options
+        );
+        var note = new Note
+        {
+            Id = Guid.NewGuid(),
+            TenantId = tenantId,
+            SubjectId = subjectId,
+            CreatedAt = DateTimeOffset.UtcNow,
+            Body = "readiness",
+        };
+        db.Notes.Add(note);
+        await db.SaveChangesAsync();
+        return note.Id;
     }
 
     private static async Task<bool> TenantlessLogExistsAsync(string connectionString, Guid id)
@@ -3230,6 +3436,27 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             error.Contains(typeof(AnonymiseNullIntegerRecord).FullName!, StringComparison.Ordinal)
             && error.Contains("member Label", StringComparison.Ordinal)
             && error.Contains("uses Null but the column is NOT NULL", StringComparison.Ordinal)
+        );
+    }
+
+    // A method other than Null passes the model pass, so the group pass explains the UPDATE and
+    // PostgreSQL refuses an identity column GENERATED ALWAYS (428C9).
+    // Make-fail: the column is a plain integer; nothing refuses it.
+    [Fact]
+    public async Task Readiness_refuses_a_fixed_literal_into_an_identity_column_generated_always()
+    {
+        await using var database = await AnonymiseTargetDatabaseAsync(
+            """
+            ALTER TABLE public.anonymise_numeric_code_records DROP COLUMN "Code";
+            ALTER TABLE public.anonymise_numeric_code_records ADD COLUMN "Code" integer GENERATED ALWAYS AS IDENTITY
+            """
+        );
+        await using var provider = BuildAnonymiseTargetProvider(database.ConnectionString);
+
+        var errors = await ReadinessErrorsAsync(provider);
+
+        errors.Should().ContainSingle(error =>
+            RefusesWith(error, typeof(AnonymiseNumericCodeRecord), "428C9", "column \"Code\" can only be updated to DEFAULT")
         );
     }
 

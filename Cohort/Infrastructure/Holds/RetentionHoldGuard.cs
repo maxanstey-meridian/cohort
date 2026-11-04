@@ -25,6 +25,14 @@ internal sealed class RetentionHoldGuard(
 )
 {
     /// <summary>
+    /// Whether the guard reads tenantless holds: when the model has a tenantless retained entity.
+    /// Any work can reach a tenantless row (a cascade, raw SQL), so this follows the model, not
+    /// what the work names.
+    /// </summary>
+    internal static bool ReadsTenantlessHolds(IEnumerable<RetentionEntry> entries) =>
+        entries.Any(entry => entry.Tenant is null);
+
+    /// <summary>
     /// The hold checks see only the holds the caller's scope can read. A tenant scope whose
     /// holds policy hides NULL-tenant holds would pass a held tenantless row as unheld, so when
     /// the model has a tenantless retained entity the caller must see every active tenantless
@@ -37,9 +45,7 @@ internal sealed class RetentionHoldGuard(
         CancellationToken ct
     )
     {
-        // Any work can reach a tenantless row (a cascade, raw SQL), so the check follows the
-        // model, not what the work names.
-        if (!registry.Scan().Values.Any(entry => entry.Tenant is null))
+        if (!ReadsTenantlessHolds(registry.Scan().Values))
         {
             return;
         }

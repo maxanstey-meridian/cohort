@@ -60,7 +60,8 @@ statements the retentions you set send, before the pruner deletes anything:
 - `SucceededRunRetention` or `FailedRunRetention`: `SELECT`, `UPDATE`, and `DELETE` on
   `sweep_run` (the batch is claimed `FOR UPDATE SKIP LOCKED`); `SELECT` and `DELETE` on
   `sweep_run_row_detail` and `sweep_run_entity_summary`; and `SELECT` on
-  `sweep_row_handler_status`, whose rows go with their run's row details.
+  `sweep_row_handler_status`, whose rows the foreign key's cascade deletes with their row
+  details, so it needs no `DELETE`.
 - `InactiveHoldRetention`: `SELECT`, `UPDATE`, and `DELETE` on `retention_holds`.
 
 A host that sets only `InactiveHoldRetention` needs no `DELETE` on the run tables, and pruning

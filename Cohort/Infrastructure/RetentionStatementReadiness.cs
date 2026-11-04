@@ -416,7 +416,7 @@ internal sealed class RetentionStatementReadiness(
         var entries = registry.Scan().Values.ToList();
         var tables = CohortStoreTables.FromModel(db.Model);
         var values = ValuesFor(entries);
-        var tenantlessRetained = entries.Any(entry => entry.Tenant is null);
+        var guardReadsTenantlessHolds = RetentionHoldGuard.ReadsTenantlessHolds(entries);
         var anyDependentsStep = entries.Any(entry => dependentsRegistrations.HasStep(entry.EntityType));
         var set = new StatementSet();
         switch (group.Kind)
@@ -428,7 +428,7 @@ internal sealed class RetentionStatementReadiness(
                     CohortStatements.ForSweep(
                         tables,
                         HandlerBookkeeping(entries),
-                        tenantlessRetained && anyDependentsStep,
+                        guardReadsTenantlessHolds && anyDependentsStep,
                         values
                     )
                 );
@@ -440,7 +440,7 @@ internal sealed class RetentionStatementReadiness(
                     CohortStatements.ForErasure(
                         tables,
                         HandlerBookkeeping(entries),
-                        tenantlessRetained && anyDependentsStep,
+                        guardReadsTenantlessHolds && anyDependentsStep,
                         values
                     )
                 );
@@ -468,7 +468,7 @@ internal sealed class RetentionStatementReadiness(
                 }
 
                 AddGuard(set, tables, entries, include: true);
-                set.AddCohort(CohortStatements.ForDeletion(tables, tenantlessRetained, values));
+                set.AddCohort(CohortStatements.ForDeletion(tables, guardReadsTenantlessHolds, values));
                 break;
             case RetentionStatementGroupKind.Scrub:
                 set.AddCohort(CohortStatements.ForScrub(tables, values));
@@ -501,23 +501,23 @@ internal sealed class RetentionStatementReadiness(
         set.AddCohort(
             CohortStatements.ForReadiness(
                 CohortStoreTables.FromModel(db.Model),
-                entries.Any(entry => entry.Tenant is null),
+                RetentionHoldGuard.ReadsTenantlessHolds(entries),
                 ValuesFor(entries)
             )
         );
         return set.Statements;
     }
 
-    /// <summary>
-    /// Whether a run records handler bookkeeping (D2 and T1) for some entity: it has handlers or a
-    /// dependents step, the run's own helpers' answer.
-    /// </summary>
-    internal bool HandlerBookkeeping() => HandlerBookkeeping(registry.Scan().Values);
+    // Whether a run records handler bookkeeping (D2 and T1) for some entity, the run's own answer.
+    private bool HandlerBookkeeping() => HandlerBookkeeping(registry.Scan().Values);
 
     private bool HandlerBookkeeping(IEnumerable<RetentionEntry> entries) =>
         entries.Any(entry =>
-            RetentionHandlerSupport.HasHandlers(handlerRegistrations, entry.EntityType)
-            || dependentsRegistrations.HasStep(entry.EntityType)
+            RetentionHandlerSupport.RecordsHandlerBookkeeping(
+                handlerRegistrations,
+                dependentsRegistrations,
+                entry.EntityType
+            )
         );
 
     // The values the Cohort-table statements bind: readiness's tenant, and one retained entity's

@@ -190,7 +190,8 @@ headroom.
 
 ## Grants
 
-Readiness explains the statements each operation sends, grouped by operation, under the role
+Readiness asks PostgreSQL to plan, without running (`EXPLAIN`), the statements each operation
+sends, grouped by operation, under the role
 of the scope that sends them, the first time that role reaches readiness. So each scope's role
 needs only the privileges of the groups it runs, on Cohort's five tables and on your retained
 tables, and a role that lacks one is refused before the operation writes anything:
@@ -206,13 +207,15 @@ tables, and a role that lacks one is refused before the operation writes anythin
 | Payload scrub | `System(RowDispatch)` | `SELECT`, `UPDATE` on `sweep_run_row_detail` |
 | Row-handler dispatch | `System(RowDispatch)` | `SELECT`, `UPDATE` on `sweep_run`, `sweep_run_row_detail`, and `sweep_row_handler_status` |
 | The scheduled worker's lock, ledger, and tenant coverage check | `System(WorkerCoordination)` | `SELECT` on `sweep_run` |
-| History pruning | `System(HistoryPruning)` | Per retention set (`DELETE` on the run tables only when run retention is set; `UPDATE`, `DELETE` on `retention_holds` only when hold retention is) |
+| History pruning | `System(HistoryPruning)` | Per retention set. Run retention: `SELECT`, `UPDATE`, `DELETE` on `sweep_run`; `SELECT`, `DELETE` on `sweep_run_row_detail` and `sweep_run_entity_summary`; `SELECT` on `sweep_row_handler_status`. Hold retention: `SELECT`, `UPDATE`, `DELETE` on `retention_holds` |
 
-On your retained tables the same roles need `SELECT`, and `UPDATE` where they lock rows
-(sweeps, erasures, and holds); sweeps and erasures also need `DELETE` where `Purge` is declared
-and `SELECT` on the child table of any foreign key that blocks a purge. The worker needs only
-`SELECT` on each tenanted retained table. Every role needs `USAGE` on the schemas of the
-tables it touches. See [Startup Validation](/reference/startup-validation#statements) for the
+On your retained tables, the roles of sweeps, erasures, previews, holds, and `IRetentionDeletion`
+need `SELECT`; sweeps, erasures, and holds also need `UPDATE`, where they lock rows. Sweeps and
+erasures need `DELETE` where `Purge` is declared, and sweeps, erasures, and previews need
+`SELECT` on the child table of any foreign key that blocks a purge. The worker needs only
+`SELECT` on each tenanted retained table. Readiness's own reads, the payload scrub, row-handler
+dispatch, and history pruning need nothing on your retained tables. Every role needs `USAGE` on
+the schemas of the tables it touches. See [Startup Validation](/reference/startup-validation#statements) for the
 full list, including `EXECUTE` on the PostgreSQL functions Cohort calls, which PUBLIC holds by
 default.
 

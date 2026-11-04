@@ -21,6 +21,17 @@ internal static class RetentionHandlerSupport
         registrations.Any(registration => registration.EntityType == entityType);
 
     /// <summary>
+    /// Whether a run records handler bookkeeping (the row-detail payload and the handler status)
+    /// for <paramref name="entityType"/>: it has handlers or a dependents step. The run decides
+    /// it here, and readiness asks the same question.
+    /// </summary>
+    public static bool RecordsHandlerBookkeeping(
+        IEnumerable<IRetentionHandlerRegistration> handlerRegistrations,
+        IEnumerable<IRetentionDependentsRegistration> dependentsRegistrations,
+        Type entityType
+    ) => HasHandlers(handlerRegistrations, entityType) || dependentsRegistrations.HasStep(entityType);
+
+    /// <summary>
     /// The handlers registered with <c>AddRowHandler</c> for <paramref name="entityType"/>,
     /// in priority order. Validation refuses a handler service in the host's
     /// <see cref="IServiceCollection"/> that <c>AddRowHandler</c> didn't register

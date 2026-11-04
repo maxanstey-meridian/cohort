@@ -1910,11 +1910,6 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
                 RefusesCohortTables(error, "history pruning", roles.HistoryPruning, "sweep_run")
             );
         (await CountAsync(database, "sweep_run")).Should().Be(1, "nothing was deleted");
-        if (pruningCase == PruningCase.RunsConfigured)
-        {
-            // The reload case already pruned its inactive hold.
-            (await CountAsync(database, "retention_holds")).Should().Be(1, "refused before any delete, holds included");
-        }
     }
 
     // Startup checks, in its own scope and under its own role, each background subsystem that

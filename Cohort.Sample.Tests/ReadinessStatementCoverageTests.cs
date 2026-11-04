@@ -149,7 +149,6 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         (await SweepAsync(host, tenants.Swept, dryRun: true))
             .EntityFailures.Should()
             .BeEmpty();
-        await host.RunPreviewAsync(Tenant(tenants.Swept), AsOf);
         await host.RunPreviewAsync(Tenant(tenants.Previewed), AsOf);
         (await SweepAsync(host, tenants.Swept, dryRun: false)).EntityFailures.Should().BeEmpty();
         // The tenant whose rule for the soft-delete-or-anonymise category resolves to
@@ -396,11 +395,15 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
     private async Task RowHandlerHostAsync(ReachLedger ledger)
     {
         await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
+        // The payload scrub gets a dispatcher role of its own: a poll under the kill switch
+        // scrubs and returns before any dispatch statement.
+        await using var scrubRoles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
         await using var database = await MigratedSampleDatabaseAsync();
         var tenants = new CoverageTenants();
         var sink = new CoverageHandlerSink();
         await SeedAsync(database, tenants);
         await roles.GrantAsync(database);
+        await scrubRoles.GrantAsync(database);
         // A role that only erases: this host's sweeps run as other tenants.
         var erasureRole = await roles.AddTenantRoleAsync(database, tenants.WithoutLegalMinimum);
         using var host = new CohortTestHost(
@@ -413,6 +416,20 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             services =>
             {
                 roles.Install<SampleDbContext>(services);
+                services.AddSingleton(sink);
+                services.AddRowHandler<Note, CoverageNoteHandler>();
+            }
+        );
+        using var scrubHost = new CohortTestHost(
+            database.ConnectionString,
+            new CoverageRuleProvider(tenants),
+            new Dictionary<string, string?>(BatchSizeOne)
+            {
+                [$"{CohortOptions.SectionName}:KillSwitch"] = "true",
+            },
+            services =>
+            {
+                scrubRoles.Install<SampleDbContext>(services);
                 services.AddSingleton(sink);
                 services.AddRowHandler<Note, CoverageNoteHandler>();
             }
@@ -461,6 +478,11 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             """
         );
 
+        // A poll under the kill switch only scrubs (Q3), under the scrub host's dispatcher role.
+        await scrubHost.RunWithServicesAsync(services =>
+            services.GetRequiredService<RetentionRowDispatcher>().PollAsync(CancellationToken.None)
+        );
+
         // The flush recovers the run, reclaims the claims, scrubs, then delivers what is left:
         // the first delivery fails and retries (the sink makes it so), the rest succeed.
         await host.RunWithServicesAsync(services =>
@@ -493,7 +515,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         // Only tenanted runs: the tenantless tables are not reached.
         await AssertEveryStatementIsExplainedAsync<SampleDbContext>(
             database,
-            [roles],
+            [roles, scrubRoles],
             recording,
             ledger,
             action => host.RunWithServicesAsync(action),
@@ -502,7 +524,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
                 new Reach(RetentionStatementGroup.Sweep, roles.Tenant),
                 new Reach(RetentionStatementGroup.Erasure, erasureRole),
                 new Reach(RetentionStatementGroup.Holds, roles.Caller),
-                new Reach(RetentionStatementGroup.Scrub, roles.RowDispatch),
+                new Reach(RetentionStatementGroup.Scrub, scrubRoles.RowDispatch),
                 new Reach(RetentionStatementGroup.Dispatch, roles.RowDispatch),
                 Reach.ForReadiness(roles.Readiness),
             ],
@@ -1067,8 +1089,9 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
     //      attribution forms are exempt: they are explained so that a refusal names its entity,
     //      and no operation sends them. A group's reach lists only roles that no other
     //      operation's group lists in the same model (a model gives each operation roles of its
-    //      own), so a statement only another operation sends, added to this group's enumeration,
-    //      is not executed under them and shows up here.
+    //      own, and the proof fails, naming the role and both groups, if two reach items list the
+    //      same role), so a statement only another operation sends, added to this group's
+    //      enumeration, is not executed under them and shows up here.
     private async Task AssertEveryStatementIsExplainedAsync<TContext>(
         TemporaryDatabase database,
         IReadOnlyList<ScopeRoles> roleSets,
@@ -1081,6 +1104,20 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
     )
         where TContext : DbContext
     {
+        // Each reach item's roles belong to its operation alone, or the ledger could not tell an
+        // over-wide group from a right one (see claim 6). A scrub-only builder wrongly added to
+        // Dispatch's group still can't be caught: a dispatch always scrubs first.
+        reach
+            .SelectMany((item, index) => reach.Skip(index + 1).Select(other => (item, other)))
+            .SelectMany(pair =>
+                pair.item.Roles.Intersect(pair.other.Roles)
+                    .Select(role =>
+                        $"{roleSets.First(roles => roles.Names.Contains(role)).Describe(role)} is listed for both {pair.item.Label} and {pair.other.Label}"
+                    )
+            )
+            .Should()
+            .BeEmpty("a reach item's roles must be used by no other item in the same model");
+
         var hostTables = ModelTables<TContext>(database, _ => true);
         // The retained tables this group's runs reach: a tenantless entity is reached only by a
         // tenantless run or a statement that spans the model.

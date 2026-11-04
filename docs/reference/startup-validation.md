@@ -125,9 +125,17 @@ text carries no subject data. PostgreSQL refuses:
   statements of the operation it runs, and only those (the table below). On the retained
   tables that is `SELECT`; `UPDATE` where a statement locks rows (`FOR UPDATE` and
   `FOR SHARE` need it, as `SoftDelete` and `Anonymise` do); `DELETE` where `Purge` is
-  declared; `SELECT` on the child table of any foreign key that blocks a purge; and `USAGE` on
-  each schema those tables and Cohort's live in. A role that can't prove it is permitted is
-  refused, not skipped.
+  declared; and `USAGE` on each schema those tables and Cohort's live in. A role that can't
+  prove it is permitted is refused, not skipped.
+
+`SELECT` on the child table of a foreign key that blocks a purge is not one of those
+privileges: it changes what a run does, and no role is refused for lacking it. With it, a purge
+leaves out the rows that child still references, unless the entity has a dependents step (its
+rows are always tried, whatever the role can read). Without it, that key is left out: a sweep
+or an erasure tries the row, the constraint refuses the delete, and the row is counted as
+blocked (a sweep still succeeds and the next run tries the row again; an erasure settles
+`PartiallyFailed` with `rows-blocked`, as it does with `SELECT`). A preview or a dry run
+doesn't try the row: it counts it as due, not blocked.
 
 Statements are grouped by the operation that sends them, and each group is checked under the
 role of the scope that sends it ([Tenant Isolation](/guides/tenant-isolation#grants) says which
@@ -136,19 +144,18 @@ preview role needs only `SELECT`, and a dispatcher needs no write on your tables
 
 | Group | Cohort's tables | Functions | Your retained tables |
 |---|---|---|---|
-| **Sweep**: sweeps, dry runs, and scheduled passes | `sweep_run` and `sweep_run_entity_summary`: `SELECT`, `INSERT`, `UPDATE`. `sweep_run_row_detail`: `SELECT`, `INSERT`. `retention_holds`: `SELECT`. `sweep_row_handler_status`: `INSERT`, when a row handler or a dependents step is registered | The advisory locks, the entity lock, the clock | `SELECT`, `UPDATE`; `DELETE` where `Purge` is declared; `SELECT` on the child table of a foreign key that blocks a purge |
-| **Erasure** | As Sweep | As Sweep without the pass lock, plus `current_setting` | As Sweep |
-| **Preview** | `retention_holds`: `SELECT` | The clock | `SELECT`, and `SELECT` on the child table of a foreign key that blocks a purge |
+| **Sweep**: sweeps, dry runs, and scheduled passes | `sweep_run` and `sweep_run_entity_summary`: `SELECT`, `INSERT`, `UPDATE`. `sweep_run_row_detail`: `SELECT`, `INSERT`. `retention_holds`: `SELECT`. `sweep_row_handler_status`: `INSERT`, when a row handler or a dependents step is registered | `pg_advisory_lock`, `pg_advisory_unlock`, `pg_try_advisory_lock` (the pass lock), the entity lock, the clock | `SELECT`, `UPDATE`; `DELETE` where `Purge` is declared |
+| **Erasure** | As Sweep | `pg_advisory_lock`, `pg_advisory_unlock`, the entity lock, the clock, `current_setting` | As Sweep |
+| **Preview** | `retention_holds`: `SELECT` | The clock | `SELECT` |
 | **Holds**: `IRetentionHoldsRepository` | `retention_holds`: `SELECT`, `INSERT`, `UPDATE` | The entity lock, the clock, `current_setting` | `SELECT`, `UPDATE` (the rows a hold locks `FOR SHARE`) |
 | **Deletion**: `IRetentionDeletion` | `retention_holds`: `SELECT` | The entity lock, the clock | `SELECT` |
 | **Readiness**: the `System(Readiness)` scope's own reads | `retention_holds`: `SELECT` | The clock | None |
 | **Scrub**: the payload-retention scrub | `sweep_run_row_detail`: `SELECT`, `UPDATE` | None | None |
-| **Dispatch**: the row-handler dispatcher | `sweep_run`, `sweep_run_row_detail`, and `sweep_row_handler_status`: `SELECT`, `UPDATE` | The advisory locks | None |
-| **Worker**: the scheduled worker's coordination | `sweep_run`: `SELECT` | The advisory locks, the clock | `SELECT` on each tenanted retained table |
+| **Dispatch**: the row-handler dispatcher | `sweep_run`, `sweep_run_row_detail`, and `sweep_row_handler_status`: `SELECT`, `UPDATE` | `pg_advisory_lock`, `pg_try_advisory_lock`, `pg_advisory_unlock`, `pg_advisory_unlock_all` | None |
+| **Worker**: the scheduled worker's coordination | `sweep_run`: `SELECT` | `pg_try_advisory_lock`, `pg_advisory_unlock_all`, the clock | `SELECT` on each tenanted retained table |
 | **Pruning**: history pruning, for the retentions set | Runs: `sweep_run` `SELECT`, `UPDATE`, `DELETE`; `sweep_run_row_detail` and `sweep_run_entity_summary` `SELECT`, `DELETE`; `sweep_row_handler_status` `SELECT`. Holds: `retention_holds` `SELECT`, `UPDATE`, `DELETE` | The clock, when a `Schedule` is set | None |
 
-In the table, "the advisory locks" are `pg_advisory_lock`, `pg_try_advisory_lock`,
-`pg_advisory_unlock`, and `pg_advisory_unlock_all`; "the entity lock" is
+In the table, "the entity lock" is
 `pg_advisory_xact_lock` over `hashtextextended`; and "the clock" is `statement_timestamp`,
 which every read of holds calls inline to decide which are active. The Sweep and Erasure
 groups' check that a run still holds its locks reads the `pg_locks` view (and calls `pg_backend_pid`), which
@@ -315,8 +322,8 @@ entity and column it refuses.
 
   | Role | Cohort's tables | Your retained tables |
   |---|---|---|
-  | Sweeps and erasures (a tenant, `System(TenantlessPass)`, or, for an erasure in your transaction, your own role) | `sweep_run` and `sweep_run_entity_summary`: `SELECT`, `INSERT`, `UPDATE`. `sweep_run_row_detail`: `SELECT`, `INSERT`. `retention_holds`: `SELECT`. `sweep_row_handler_status`: `INSERT`, with a row handler or dependents step. `USAGE` on the sequence of a serial `Id` | `SELECT`, `UPDATE`; `DELETE` where `Purge` is declared; `SELECT` on the child table of any foreign key that blocks a purge |
-  | Previews | `retention_holds`: `SELECT` | `SELECT`, and the same child tables |
+  | Sweeps and erasures (a tenant, `System(TenantlessPass)`, or, for an erasure in your transaction, your own role) | `sweep_run` and `sweep_run_entity_summary`: `SELECT`, `INSERT`, `UPDATE`. `sweep_run_row_detail`: `SELECT`, `INSERT`. `retention_holds`: `SELECT`. `sweep_row_handler_status`: `INSERT`, with a row handler or dependents step. `USAGE` on the sequence of a serial `Id` | `SELECT`, `UPDATE`; `DELETE` where `Purge` is declared |
+  | Previews | `retention_holds`: `SELECT` | `SELECT` |
   | Holds (the caller's role) | `retention_holds`: `SELECT`, `INSERT`, `UPDATE` | `SELECT`, `UPDATE` |
   | `IRetentionDeletion` (the caller's role) | `retention_holds`: `SELECT` | `SELECT` |
   | `System(Readiness)` | `retention_holds`: `SELECT` | None |
@@ -324,7 +331,7 @@ entity and column it refuses.
   | `System(WorkerCoordination)` | `sweep_run`: `SELECT` | `SELECT` on each tenanted retained table |
   | `System(HistoryPruning)` | Per retention set: see [Statements](#statements) | None |
 
-  Every role also needs `USAGE` on the schemas of the tables it touches, and `EXECUTE` on the
+  Every role also needs `USAGE` on the schemas of the tables it touches, and `EXECUTE` on
   the functions Cohort calls (the advisory-lock functions, `hashtextextended`,
   `statement_timestamp`, and `current_setting`), which PUBLIC holds by default
   ([Statements](#statements)). See [Tenant Isolation](/guides/tenant-isolation#grants).

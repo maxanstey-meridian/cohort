@@ -211,9 +211,13 @@ tables, and a role that lacks one is refused before the operation writes anythin
 
 On your retained tables, the roles of sweeps, erasures, previews, holds, and `IRetentionDeletion`
 need `SELECT`; sweeps, erasures, and holds also need `UPDATE`, where they lock rows. Sweeps and
-erasures need `DELETE` where `Purge` is declared, and sweeps, erasures, and previews need
-`SELECT` on the child table of any foreign key that blocks a purge. The worker needs only
-`SELECT` on each tenanted retained table. Readiness's own reads, the payload scrub, row-handler
+erasures need `DELETE` where `Purge` is declared. `SELECT` on the child table of a foreign key
+that blocks a purge is optional: with it, a purge leaves out the rows that child still
+references, unless the entity has a dependents step; without it, a sweep or an erasure tries
+the row and the constraint refuses the delete, and the row is counted as blocked (a sweep still
+succeeds and the next run tries it again; an erasure settles `PartiallyFailed` with
+`rows-blocked`, as it does with `SELECT`). A preview or a dry run counts such a row as due, not
+blocked. The worker needs only `SELECT` on each tenanted retained table. Readiness's own reads, the payload scrub, row-handler
 dispatch, and history pruning need nothing on your retained tables. Every role needs `USAGE` on
 the schemas of the tables it touches. See [Startup Validation](/reference/startup-validation#statements) for the
 full list, including `EXECUTE` on the PostgreSQL functions Cohort calls, which PUBLIC holds by

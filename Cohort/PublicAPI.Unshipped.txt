@@ -1,11 +1,1 @@
 #nullable enable
-Cohort.Domain.HeldWithAttribute
-Cohort.Domain.HeldWithAttribute.HeldWithAttribute(System.Type! relatedType, string! linkMember) -> void
-Cohort.Domain.HeldWithAttribute.LinkMember.get -> string!
-Cohort.Domain.HeldWithAttribute.RelatedType.get -> System.Type!
-Cohort.Domain.HeldWithReferencingAttribute
-Cohort.Domain.HeldWithReferencingAttribute.HeldWithReferencingAttribute(System.Type! relatedType, string! linkMember) -> void
-Cohort.Domain.HeldWithReferencingAttribute.LinkMember.get -> string!
-Cohort.Domain.HeldWithReferencingAttribute.RelatedType.get -> System.Type!
-Cohort.Application.IRetentionHoldsRepository.ListCoveringAsync(System.Guid retentionEntityId, string! recordId, System.Guid? tenantId, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task<System.Collections.Generic.IReadOnlyList<Cohort.Domain.RetentionHold!>!>!
-Cohort.Application.IRetentionHoldsRepository.ListCoveringSubjectAsync(string! subjectKind, object! subject, System.Guid? tenantId, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task<System.Collections.Generic.IReadOnlyList<Cohort.Domain.RetentionHold!>!>!

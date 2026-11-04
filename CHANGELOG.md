@@ -2,7 +2,7 @@
 
 Breaking changes come with upgrade steps in the guide that covers them.
 
-## 0.12.0 (unreleased, breaking)
+## 0.12.0 (2026-11-04, breaking)
 
 A hold on a row also holds the rows a host declares related to it.
 

@@ -16,6 +16,8 @@ Cohort.Application.IRetentionHandler<TEntity>.OnAfterAsync(Cohort.Domain.Retenti
 Cohort.Application.IRetentionHandler<TEntity>.OnBeforeAsync(TEntity row, Cohort.Domain.RetentionBeforeContext! ctx, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task!
 Cohort.Application.IRetentionHoldsRepository
 Cohort.Application.IRetentionHoldsRepository.CreateAsync(Cohort.Domain.RetentionHoldRequest! request, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task!
+Cohort.Application.IRetentionHoldsRepository.ListCoveringAsync(System.Guid retentionEntityId, string! recordId, System.Guid? tenantId, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task<System.Collections.Generic.IReadOnlyList<Cohort.Domain.RetentionHold!>!>!
+Cohort.Application.IRetentionHoldsRepository.ListCoveringSubjectAsync(string! subjectKind, object! subject, System.Guid? tenantId, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task<System.Collections.Generic.IReadOnlyList<Cohort.Domain.RetentionHold!>!>!
 Cohort.Application.IRetentionHoldsRepository.RemoveAsync(System.Guid holdId, System.DateTimeOffset removedAt, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task!
 Cohort.Application.IRetentionPreview
 Cohort.Application.IRetentionPreview.ExecuteAsync(Cohort.Application.RetentionPreviewRequest! request, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Cohort.Domain.RetentionSweepResult!>!
@@ -237,6 +239,14 @@ Cohort.Domain.ErasureSubjectAttribute.Kind.get -> string!
 Cohort.Domain.ExemptFromRetentionAttribute
 Cohort.Domain.ExemptFromRetentionAttribute.ExemptFromRetentionAttribute(string! reason) -> void
 Cohort.Domain.ExemptFromRetentionAttribute.Reason.get -> string!
+Cohort.Domain.HeldWithAttribute
+Cohort.Domain.HeldWithAttribute.HeldWithAttribute(System.Type! relatedType, string! linkMember) -> void
+Cohort.Domain.HeldWithAttribute.LinkMember.get -> string!
+Cohort.Domain.HeldWithAttribute.RelatedType.get -> System.Type!
+Cohort.Domain.HeldWithReferencingAttribute
+Cohort.Domain.HeldWithReferencingAttribute.HeldWithReferencingAttribute(System.Type! relatedType, string! linkMember) -> void
+Cohort.Domain.HeldWithReferencingAttribute.LinkMember.get -> string!
+Cohort.Domain.HeldWithReferencingAttribute.RelatedType.get -> System.Type!
 Cohort.Domain.RetainAttribute
 Cohort.Domain.RetainAttribute.AnchorMember.get -> string!
 Cohort.Domain.RetainAttribute.AuditRowDetail.get -> Cohort.Domain.AuditRowDetail

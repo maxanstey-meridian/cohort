@@ -282,17 +282,57 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
     [Fact]
     public async Task A_hold_check_that_read_the_callers_uncommitted_writes_on_the_one_connection_is_not_kept()
     {
-        // A host that gives every context one connection: the stored-identities read of the
-        // model pass runs on the caller's connection, inside the caller's transaction, so it sees
-        // the caller's uncommitted writes. Here the caller ends the only hold on an identity no
-        // retained entity registers, so the check passes inside the transaction, and the
-        // transaction rolls back. The pass must not be remembered: the same call outside a
-        // transaction finds the hold active again and is refused.
+        // A host that gives every context one connection object.
         // Make-fail: RetentionRuntimeReadinessValidator.RunModelPassAsync sets
-        // `StoredEntityIdentitiesPassed = true` whatever `ownConnection` is (the second call
+        // `StoredEntityIdentitiesPassed = true` whatever `ownSession` is (the second call
         // passes).
         await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
         await using var hostConnection = new Npgsql.NpgsqlConnection(database.ConnectionString);
+
+        await AssertUncommittedHoldCheckIsNotKeptAsync(
+            database.ConnectionString,
+            services => services.AddDbContextPool<SharedConnectionDbContext>(options => options.UseNpgsql(hostConnection))
+        );
+    }
+
+    [Fact]
+    public async Task A_hold_check_that_read_the_callers_uncommitted_writes_through_a_wrapper_over_the_one_session_is_not_kept()
+    {
+        // A host whose contexts share one session through different connection objects: each DI
+        // scope gets its own DbConnection wrapper over the one shared NpgsqlConnection (a
+        // per-scope profiler or unit-of-work wrapper). The System(Readiness) scope's wrapper is
+        // not the caller's object, but it runs in the caller's backend, so it still sees the
+        // caller's uncommitted writes.
+        // Make-fail: the stored-identities step returns
+        // `!ReferenceEquals(systemDatabase.GetDbConnection(), db.Database.GetDbConnection())`
+        // in place of `scopePid != callerPid` (the second call passes).
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using var sharedConnection = new Npgsql.NpgsqlConnection(database.ConnectionString);
+        var wrappers = new List<PassThroughConnection>();
+
+        await AssertUncommittedHoldCheckIsNotKeptAsync(
+            database.ConnectionString,
+            services => services.AddDbContext<SharedConnectionDbContext>(options =>
+            {
+                var wrapper = new PassThroughConnection(sharedConnection, ownsInner: false);
+                wrappers.Add(wrapper);
+                options.UseNpgsql(wrapper);
+            })
+        );
+
+        wrappers.Should().HaveCountGreaterThan(2, "each scope, the System(Readiness) one included, has a wrapper of its own");
+    }
+
+    // The stored-identities read of the model pass runs in the caller's session, inside the
+    // caller's transaction, so it sees the caller's uncommitted writes. Here the caller ends the
+    // only hold on an identity no retained entity registers, so the check passes inside the
+    // transaction, and the transaction rolls back. The pass must not be remembered: the same call
+    // outside a transaction finds the hold active again and is refused.
+    private static async Task AssertUncommittedHoldCheckIsNotKeptAsync(
+        string connectionString,
+        Action<ServiceCollection> addContext
+    )
+    {
         var services = new ServiceCollection();
         services.AddLogging();
         services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
@@ -301,16 +341,19 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
         );
         services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<SharedConnectionDbContext>();
-        services.AddDbContextPool<SharedConnectionDbContext>(options => options.UseNpgsql(hostConnection));
+        addContext(services);
 
         await using var provider = services.BuildServiceProvider(validateScopes: true);
-        await using (var scope = provider.CreateAsyncScope())
+        // Set up on a context of its own: EF's database creator needs an NpgsqlConnection, which
+        // a wrapper is not.
+        await using (var setup = new SharedConnectionDbContext(
+            new DbContextOptionsBuilder<SharedConnectionDbContext>().UseNpgsql(connectionString).Options
+        ))
         {
-            var db = scope.ServiceProvider.GetRequiredService<SharedConnectionDbContext>();
-            await db.Database.EnsureCreatedAsync();
+            await setup.Database.EnsureCreatedAsync();
             var holdId = Guid.NewGuid();
             var orphanedEntity = Guid.NewGuid();
-            await db.Database.ExecuteSqlAsync(
+            await setup.Database.ExecuteSqlAsync(
                 $"""
                 INSERT INTO "retention_holds"
                     ("HoldId", "RetentionEntityId", "RecordId", "TenantId", "Reason", "CreatedAt", "ExpiresAt", "RemovedAt")
@@ -643,19 +686,6 @@ public sealed class HostCompositionEndToEndTests(PostgresFixture fixture)
             (await db.Records.AsNoTracking().AnyAsync(record => record.Id == row.Id, ct)).Should().BeTrue();
             probe.Connections.Add(db.Database.GetDbConnection());
             probe.Contexts.Add(db);
-        }
-    }
-
-    private sealed class RecordingExecutionScope : IRetentionExecutionScope
-    {
-        private readonly System.Collections.Concurrent.ConcurrentQueue<RetentionExecutionContext> ran = new();
-
-        public IReadOnlyCollection<RetentionExecutionContext> Ran => ran;
-
-        public Task RunAsync(RetentionExecutionContext context, Func<Task> work, CancellationToken ct)
-        {
-            ran.Enqueue(context);
-            return work();
         }
     }
 

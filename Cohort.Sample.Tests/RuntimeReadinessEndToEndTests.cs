@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Data;
 using System.Data.Common;
 using System.Globalization;
@@ -645,7 +644,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         )).Should().BeFalse();
     }
 
-    // T3: Cohort's per-model state dies with the model.
+    // Cohort's per-model state dies with the model.
     [Fact]
     public async Task Cohort_keeps_no_model_alive_after_its_context()
     {
@@ -664,7 +663,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         model.IsAlive.Should().BeFalse("readiness's and validation's per-model state is held weakly");
     }
 
-    // T5: a model copy is a new entry, so it is checked on what it reads, not passed on the first
+    // A model copy is a new entry, so it is checked on what it reads, not passed on the first
     // copy's recorded pass.
     // Make-fail: key the readiness state by connection string alone, dropping the per-IModel
     // entry (the copy then finds the first copy's recorded pass and is not refused).
@@ -1673,11 +1672,11 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         return (long)(await command.ExecuteScalarAsync())!;
     }
 
-    // T6: a check that passed inside a caller's transaction may have seen DDL that rolls back,
+    // A check that passed inside a caller's transaction may have seen DDL that rolls back,
     // so the pass is not recorded. Both calls run on one model instance (one entry), so only the
     // transaction rule can make the second call run the check again.
-    // Make-fail: ValidateAsync sets ModelValidated whatever the transaction, and RunCheckAsync
-    // records every check inside one.
+    // Make-fail: ValidateAsync sets ModelValidated whatever the transaction (the second call
+    // passes).
     [Fact]
     public async Task A_check_passed_inside_a_caller_transaction_is_not_kept()
     {
@@ -1934,7 +1933,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         }
     }
 
-    // T7: the anonymise check reads session state no key captures, so every model copy runs it.
+    // The anonymise check reads session state no key captures, so every model copy runs it.
     [Fact]
     public async Task A_rebuilt_copy_runs_the_anonymise_check_again()
     {
@@ -3352,19 +3351,6 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             );
     }
 
-    private sealed class RecordingExecutionScope : IRetentionExecutionScope
-    {
-        private readonly ConcurrentQueue<RetentionExecutionContext> ran = new();
-
-        public IReadOnlyCollection<RetentionExecutionContext> Ran => ran;
-
-        public Task RunAsync(RetentionExecutionContext context, Func<Task> work, CancellationToken ct)
-        {
-            ran.Enqueue(context);
-            return work();
-        }
-    }
-
     private sealed class SystemWorkRoutingScope(DatabaseRoute route, Func<RetentionSystemWork, string?> systemConnectionString)
         : IRetentionExecutionScope
     {
@@ -3647,177 +3633,6 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             RetentionResolutionContext context,
             CancellationToken ct
         ) => inner.ResolveAsync(context, ct);
-    }
-
-    // A wrapper that forwards to an NpgsqlConnection and is not one itself, as a profiler's is.
-    // connectionStringSuffix is appended to the string it reports, as a wrapper's own settings are.
-    private sealed class PassThroughConnection(NpgsqlConnection inner, string connectionStringSuffix = "")
-        : DbConnection
-    {
-        [System.Diagnostics.CodeAnalysis.AllowNull]
-        public override string ConnectionString
-        {
-            get => inner.ConnectionString + connectionStringSuffix;
-            set => inner.ConnectionString = value;
-        }
-
-        public override string Database => inner.Database;
-
-        public override string DataSource => inner.DataSource;
-
-        public override string ServerVersion => inner.ServerVersion;
-
-        public override ConnectionState State => inner.State;
-
-        public override void ChangeDatabase(string databaseName) => inner.ChangeDatabase(databaseName);
-
-        public override void Open() => inner.Open();
-
-        public override Task OpenAsync(CancellationToken cancellationToken) => inner.OpenAsync(cancellationToken);
-
-        public override void Close() => inner.Close();
-
-        protected override DbCommand CreateDbCommand() => new PassThroughCommand(this, inner.CreateCommand());
-
-        protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel) =>
-            new PassThroughTransaction(this, inner.BeginTransaction(isolationLevel));
-
-        public override ValueTask DisposeAsync() => inner.DisposeAsync();
-
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-            {
-                inner.Dispose();
-            }
-
-            base.Dispose(disposing);
-        }
-    }
-
-    // The transaction and command of that wrapper, as a profiler's are: neither is an Npgsql type,
-    // so a caller's transaction on the wrapper is not an NpgsqlTransaction and readiness explains
-    // its statements one at a time, in that transaction.
-    private sealed class PassThroughTransaction(PassThroughConnection connection, NpgsqlTransaction inner)
-        : DbTransaction
-    {
-        internal NpgsqlTransaction Inner => inner;
-
-        protected override DbConnection DbConnection => connection;
-
-        public override IsolationLevel IsolationLevel => inner.IsolationLevel;
-
-        public override void Commit() => inner.Commit();
-
-        public override void Rollback() => inner.Rollback();
-
-        public override Task CommitAsync(CancellationToken cancellationToken = default) =>
-            inner.CommitAsync(cancellationToken);
-
-        public override Task RollbackAsync(CancellationToken cancellationToken = default) =>
-            inner.RollbackAsync(cancellationToken);
-
-        public override ValueTask DisposeAsync() => inner.DisposeAsync();
-
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-            {
-                inner.Dispose();
-            }
-
-            base.Dispose(disposing);
-        }
-    }
-
-    private sealed class PassThroughCommand(PassThroughConnection connection, NpgsqlCommand inner) : DbCommand
-    {
-        private PassThroughTransaction? transaction;
-
-        [System.Diagnostics.CodeAnalysis.AllowNull]
-        public override string CommandText
-        {
-            get => inner.CommandText;
-            set => inner.CommandText = value;
-        }
-
-        public override int CommandTimeout
-        {
-            get => inner.CommandTimeout;
-            set => inner.CommandTimeout = value;
-        }
-
-        public override CommandType CommandType
-        {
-            get => inner.CommandType;
-            set => inner.CommandType = value;
-        }
-
-        public override bool DesignTimeVisible
-        {
-            get => inner.DesignTimeVisible;
-            set => inner.DesignTimeVisible = value;
-        }
-
-        public override UpdateRowSource UpdatedRowSource
-        {
-            get => inner.UpdatedRowSource;
-            set => inner.UpdatedRowSource = value;
-        }
-
-        protected override DbConnection? DbConnection
-        {
-            get => connection;
-            set { }
-        }
-
-        protected override DbParameterCollection DbParameterCollection => inner.Parameters;
-
-        protected override DbTransaction? DbTransaction
-        {
-            get => transaction;
-            set
-            {
-                transaction = (PassThroughTransaction?)value;
-                inner.Transaction = transaction?.Inner;
-            }
-        }
-
-        public override void Cancel() => inner.Cancel();
-
-        public override int ExecuteNonQuery() => inner.ExecuteNonQuery();
-
-        public override object? ExecuteScalar() => inner.ExecuteScalar();
-
-        public override void Prepare() => inner.Prepare();
-
-        public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken) =>
-            inner.ExecuteNonQueryAsync(cancellationToken);
-
-        public override Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken) =>
-            inner.ExecuteScalarAsync(cancellationToken);
-
-        protected override DbParameter CreateDbParameter() => inner.CreateParameter();
-
-        protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior) =>
-            inner.ExecuteReader(behavior);
-
-        protected override async Task<DbDataReader> ExecuteDbDataReaderAsync(
-            CommandBehavior behavior,
-            CancellationToken cancellationToken
-        ) => await inner.ExecuteReaderAsync(behavior, cancellationToken);
-
-        public override ValueTask DisposeAsync() => inner.DisposeAsync();
-
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-            {
-                inner.Dispose();
-            }
-
-            base.Dispose(disposing);
-        }
     }
 
     private sealed class DatabaseRoute(string connectionString)

@@ -69,13 +69,14 @@ internal sealed class RetentionRuntimeReadinessValidator(
             ? new NpgsqlConnectionStringBuilder(connection.ConnectionString)
             : TryParseConnectionString(connection.ConnectionString);
         ValidateSessionLocks(parsed);
-        // The model instance the context runs has its own entry (its passed checks and its gate),
-        // keyed by the connection string without its password. The password stays out because it
-        // is a secret that a rotating token would turn into one entry per token, and because
-        // Npgsql drops it once the connection opens. The key still carries everything else a
-        // pooler can route by under one host, port, and database name (user, options); two
-        // spellings of one database each validate once. A string Npgsql rejects keys by a generic
-        // parse without its password keys, or by the raw string if even that parse rejects it.
+        // The model instance the context runs has its own entry (whether its pass completed, its
+        // stored-identities check, and its gate), keyed by the connection string without its
+        // password. The password stays out because it is a secret that a rotating token would
+        // turn into one entry per token, and because Npgsql drops it once the connection opens.
+        // The key still carries everything else a pooler can route by under one host, port, and
+        // database name (user, options); two spellings of one database each validate once. A
+        // string Npgsql rejects keys by a generic parse without its password keys, or by the raw
+        // string if even that parse rejects it.
         // A rebuilt copy of a model is a new instance, so it is checked again.
         string entryKey;
         if (parsed is null)
@@ -146,18 +147,19 @@ internal sealed class RetentionRuntimeReadinessValidator(
         if (!readiness.StoredEntityIdentitiesPassed)
         {
             var registered = registry.Scan().Values.Select(entry => entry.RetentionEntityId).Order().ToArray();
-            var callerDatabase = await ReadServerDatabaseAsync(facade, storeTables.RetentionHolds, ct);
-            var ownConnection = await ValidateStoredEntityIdentitiesAsync(
+            var (callerDatabase, callerPid) = await ReadServerDatabaseAsync(facade, storeTables.RetentionHolds, ct);
+            var ownSession = await ValidateStoredEntityIdentitiesAsync(
                 storeTables.RetentionHolds,
                 registered,
                 callerDatabase,
+                callerPid,
                 ct
             );
-            // Inside a caller's transaction the pass is recorded only when the scope read on a
-            // connection of its own. On a host that gives every context one connection the read
-            // ran inside the caller's transaction and saw its uncommitted hold writes, which may
-            // roll back.
-            if (ownConnection || facade.CurrentTransaction is null)
+            // Inside a caller's transaction the pass is recorded only when the scope read in a
+            // session of its own. On a host that gives every context one session (one connection,
+            // or different connection objects over one) the read ran inside the caller's
+            // transaction and saw its uncommitted hold writes, which may roll back.
+            if (ownSession || facade.CurrentTransaction is null)
             {
                 readiness.StoredEntityIdentitiesPassed = true;
             }
@@ -1126,10 +1128,11 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// removing the last <c>[Retain]</c> orphans holds the same way. The scope's context is used
     /// only through its connection, so its model doesn't matter, but it must reach the caller's
     /// database. Its success is recorded on the entry, and a recorded pass skips the scope
-    /// altogether. Inside a caller's transaction it is recorded only when the scope read on a
-    /// connection of its own (the returned flag): on a host that gives every context one
-    /// connection, the read runs inside the caller's transaction and sees its uncommitted hold
-    /// writes. Returns whether the scope's connection is a different object from the caller's.
+    /// altogether. Inside a caller's transaction it is recorded only when the scope read in a
+    /// session of its own (the returned flag): on a host that gives every context one session,
+    /// whatever connection objects it uses, the read runs inside the caller's transaction and sees
+    /// its uncommitted hold writes. Returns whether the scope's PostgreSQL backend is a different
+    /// one from the caller's.
     /// <para>
     /// That scope's database is compared with the caller's before the read
     /// (<see cref="ValidateReadinessScopeAsync"/>). The read itself, under the role of this
@@ -1144,6 +1147,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
         RelationalObjectName holdsTable,
         Guid[] registered,
         ServerDatabaseIdentity callerDatabase,
+        int callerPid,
         CancellationToken ct
     ) =>
         scopeFactory.RunInScopeAsync(
@@ -1153,6 +1157,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 registered,
                 holdsTable,
                 callerDatabase,
+                callerPid,
                 ct
             ),
             ct
@@ -1163,6 +1168,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
         Guid[] registered,
         RelationalObjectName holdsTable,
         ServerDatabaseIdentity callerDatabase,
+        int callerPid,
         CancellationToken ct
     )
     {
@@ -1170,7 +1176,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
         await systemDatabase.OpenConnectionAsync(ct);
         try
         {
-            await ValidateReadinessScopeAsync(systemDatabase, callerDatabase, ct);
+            var scopePid = await ValidateReadinessScopeAsync(systemDatabase, callerDatabase, ct);
 
             var statement = RetentionHoldSql.StoredEntityIdentities(CohortStoreTables.FromModel(db.Model), registered);
             await using var command = statement.Parameters.CreateCommand(
@@ -1197,7 +1203,9 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 throw new RetentionConfigurationException(errors);
             }
 
-            return !ReferenceEquals(systemDatabase.GetDbConnection(), db.Database.GetDbConnection());
+            // Decided on the server: backends can't see each other's uncommitted writes, and two
+            // connection objects over one session (a per-scope wrapper) are one backend.
+            return scopePid != callerPid;
         }
         finally
         {
@@ -1213,8 +1221,8 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// <see cref="ValidateReadinessScopeAsync"/>. Nothing is remembered: a server restart, a
     /// failover, or a recreated holds table changes what <see cref="ServerDatabaseIdentity"/> says.
     /// </summary>
-    internal Task<ServerDatabaseIdentity> ReadCallerDatabaseAsync(CancellationToken ct) =>
-        ReadServerDatabaseAsync(db.Database, CohortStoreTables.FromModel(db.Model).RetentionHolds, ct);
+    internal async Task<ServerDatabaseIdentity> ReadCallerDatabaseAsync(CancellationToken ct) =>
+        (await ReadServerDatabaseAsync(db.Database, CohortStoreTables.FromModel(db.Model).RetentionHolds, ct)).Database;
 
     /// <summary>
     /// The hold guard's check of its own <c>System(Readiness)</c> scope before it reads tenantless
@@ -1224,16 +1232,17 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// under the scope's role, raises PostgreSQL's 42501 when the role can't read the holds
     /// table). It runs no model pass and keeps no state on the entry. Takes no Gate: the
     /// stored-identities step runs it while the model pass holds the entry's, which isn't
-    /// re-entrant.
+    /// re-entrant. Returns the PostgreSQL backend the scope's connection runs in, read with the
+    /// database, for the stored-identities step to compare with the caller's.
     /// </summary>
-    internal async Task ValidateReadinessScopeAsync(
+    internal async Task<int> ValidateReadinessScopeAsync(
         DatabaseFacade systemDatabase,
         ServerDatabaseIdentity callerDatabase,
         CancellationToken ct
     )
     {
         // Only the database is compared: the System scope may run under another role.
-        var database = await ReadServerDatabaseAsync(
+        var (database, backendPid) = await ReadServerDatabaseAsync(
             systemDatabase,
             CohortStoreTables.FromModel(db.Model).RetentionHolds,
             ct
@@ -1244,15 +1253,20 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 "Cohort's readiness scope resolved a DbContext that reaches a different database from the calling scope's. Cohort checks holds across tenants in a System(Readiness) scope, so every scope must reach the same database.",
             ]);
         }
+
+        return backendPid;
     }
 
     /// <summary>
     /// Which database a connection reaches, as the server sees it. Connection strings
     /// spell one database many ways (<c>localhost</c> or <c>127.0.0.1</c>, a pooler or the direct
     /// port), so the database name and OID, the server's start time, and the holds table's OID
-    /// decide sameness instead. Reads in the database's current transaction when it has one.
+    /// decide sameness instead. Reads in the database's current transaction when it has one. The
+    /// backend's process id comes in the same statement, beside the identity rather than inside
+    /// it: two scopes may reach one database, and the stored-identities step needs to know whether
+    /// they also share a session.
     /// </summary>
-    private static async Task<ServerDatabaseIdentity> ReadServerDatabaseAsync(
+    private static async Task<(ServerDatabaseIdentity Database, int BackendPid)> ReadServerDatabaseAsync(
         DatabaseFacade database,
         RelationalObjectName holdsTable,
         CancellationToken ct
@@ -1279,16 +1293,20 @@ internal sealed class RetentionRuntimeReadinessValidator(
                        (SELECT relation.oid
                         FROM pg_catalog.pg_class relation
                         JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
-                        WHERE namespace.nspname = @holds_schema AND relation.relname = @holds_name)::bigint
+                        WHERE namespace.nspname = @holds_schema AND relation.relname = @holds_name)::bigint,
+                       pg_catalog.pg_backend_pid()
                 """
             );
             await using var reader = await command.ExecuteReaderAsync(ct);
             await reader.ReadAsync(ct);
-            return new ServerDatabaseIdentity(
-                reader.GetString(0),
-                reader.GetInt64(1),
-                reader.GetFieldValue<DateTime>(2),
-                reader.IsDBNull(3) ? null : reader.GetInt64(3)
+            return (
+                new ServerDatabaseIdentity(
+                    reader.GetString(0),
+                    reader.GetInt64(1),
+                    reader.GetFieldValue<DateTime>(2),
+                    reader.IsDBNull(3) ? null : reader.GetInt64(3)
+                ),
+                reader.GetInt32(4)
             );
         }
         finally
@@ -1417,7 +1435,7 @@ internal sealed class RetentionRuntimeReadinessEntry
 
     /// <summary>
     /// The stored-identities check passed: outside a caller's transaction, or inside one when its
-    /// scope read on a connection other than the caller's. Read and written under
+    /// scope read in a session (backend) other than the caller's. Read and written under
     /// <see cref="Gate"/>.
     /// </summary>
     internal bool StoredEntityIdentitiesPassed;

@@ -203,8 +203,9 @@ A pass records nothing until it completes, so a pass refused partway starts agai
 first check on the next call. A completed pass is recorded on its model instance and connection
 string only outside a caller's transaction. The one check recorded on its own is the
 stored-identities check, which also records inside a caller's transaction, but only when its
-`System(Readiness)` scope ran on a connection other than the caller's: on a host that gives
-every context one connection, that read would see the caller's uncommitted hold writes. Once
+`System(Readiness)` scope ran in a session (a PostgreSQL backend) other than the caller's: on a
+host that gives every context one session, whether as one connection object or as several over
+one connection, that read would see the caller's uncommitted hold writes. Once
 the model has passed, every later call returns with no round trip, except the check for
 tenantless holds, which reads the caller's database and its own `System(Readiness)` scope's
 before it reads them. Inside a caller's transaction with no pass recorded, each call runs the

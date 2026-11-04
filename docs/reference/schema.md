@@ -59,7 +59,7 @@ Readiness validates once per EF model instance and connection string, then trust
 a pass records nothing until it completes, and a completed pass outside a caller's transaction
 is kept on the model's entry, so later contexts of the same model instance don't run it again.
 The stored-identities check alone is kept on its own, inside a caller's transaction too, but
-only when its `System(Readiness)` scope ran on a connection other than the caller's. A rebuilt
+only when its `System(Readiness)` scope ran in a session (a PostgreSQL backend) other than the caller's. A rebuilt
 copy of the model is a new instance and is checked again, and so is the same model under
 another connection string (another user name or options, say; the password isn't part of it).
 The anonymise-target check reads session state, so it runs on every model pass. The statement

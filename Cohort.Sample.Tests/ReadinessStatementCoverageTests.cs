@@ -208,7 +208,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             .BeEmpty();
 
         // An erasure in the caller's own transaction: the run's statements go through the
-        // caller's scope and role, and its commit is confirmed afterwards (R7).
+        // caller's scope and role, and its commit is confirmed afterwards (the run-committed check).
         await erasureHost.RunWithServicesAsync(async services =>
         {
             var db = services.GetRequiredService<SampleDbContext>();
@@ -312,7 +312,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         );
 
         // A tenantless entity's row with an active tenantless hold on another of its rows: the
-        // guard reads the tenantless holds in the readiness scope (H9), finds one, and reads them
+        // guard reads the tenantless holds in the readiness scope (the tenantless-holds read), finds one, and reads them
         // again in the caller's scope.
         var logIdentity = RetentionEntityIdentity.For<TenantlessLog>();
         var (heldLog, freeLog) = await TwoTenantlessLogIdsAsync(database);
@@ -360,8 +360,8 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
                 .RunScheduledIterationAsync(Schedule, dryRun: false, settled: null, CancellationToken.None)
         );
 
-        // Pruning both retentions under a schedule: settled runs (R8, D8, S3, R9), inactive holds
-        // (H11), and the clock for the schedule's current occurrence.
+        // Pruning both retentions under a schedule: settled runs (the eligible-runs read and the
+        // row-detail, entity-summary, and run deletes), inactive holds (the hold delete), and the clock for the schedule's current occurrence.
         var pruned = await host.RunWithServicesAsync(services =>
             services.GetRequiredService<RetentionHistoryPruner>().PruneAsync()
         );
@@ -487,7 +487,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             """
         );
 
-        // A poll under the kill switch only scrubs (Q3), under the scrub host's dispatcher role.
+        // A poll under the kill switch only scrubs (the payload scrub), under the scrub host's dispatcher role.
         await scrubHost.RunWithServicesAsync(services =>
             services.GetRequiredService<RetentionRowDispatcher>().PollAsync(CancellationToken.None)
         );
@@ -510,7 +510,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             services.GetRequiredService<RetentionRowDispatcher>().PollAsync(CancellationToken.None)
         );
 
-        // A flush cancelled while a handler runs requeues the delivery it interrupted (T5).
+        // A flush cancelled while a handler runs requeues the delivery it interrupted (the interrupted-delivery requeue).
         sink.BlockDeliveries = true;
         (await SweepAsync(host, tenants.WithLegalMinimum, dryRun: false)).EntityFailures.Should().BeEmpty();
         using var cancellation = new CancellationTokenSource();
@@ -1772,7 +1772,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             Task.FromResult<IReadOnlyList<TenantContext>>([.. tenantIds.Select(Tenant)]);
     }
 
-    // With auditRows, every rule asks for a row detail per row (D1), which the erasure host needs:
+    // With auditRows, every rule asks for a row detail per row, which the erasure host needs:
     // the sweeps' per-row category is the sample's only one that asks, and it has no erasure
     // subject.
     private sealed class CoverageRuleProvider(CoverageTenants tenants, bool auditRows = false)
@@ -1961,7 +1961,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
     }
 
     // The hold relation model's category, with a per-row audit, so every run writes a row detail
-    // (D1, which only the rule's AuditRowDetail asks for).
+    // (which only the rule's AuditRowDetail asks for).
     private sealed class PerRowAuditedHeldWithRuleProvider : IRetentionRuleProvider
     {
         public RetentionCategoryCapabilities? GetCapabilities(string category) =>

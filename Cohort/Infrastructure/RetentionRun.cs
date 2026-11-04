@@ -691,7 +691,7 @@ internal sealed class RetentionRun(
         return await command.ExecuteScalarAsync(CancellationToken.None) is true;
     }
 
-    /// <summary>R7: whether the run's ledger row exists.</summary>
+    /// <summary>Whether the run's ledger row exists.</summary>
     internal static SweepStatement CommittedStatement(CohortStoreTables tables, Guid sweepId) =>
         CohortStatements.Statement(
             "run-committed",

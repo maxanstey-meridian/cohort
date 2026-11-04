@@ -46,7 +46,7 @@ A hold on a row also holds the rows a host declares related to it.
   Readiness runs once per EF model instance and connection string: a pass records nothing
   until it completes, and is recorded only outside a transaction (the stored-identities check
   alone is recorded on its own, inside one too, but only when its `System(Readiness)` scope ran
-  on a connection other than the caller's), so a host that validates at startup pays no round
+  in a session other than the caller's), so a host that validates at startup pays no round
   trip per call, except the hold guard's database check before it reads tenantless holds.
   Inside your transaction with no pass recorded, each call runs the pass again. Startup calls
   readiness in `System(Readiness)`, then in each subsystem's scope that will run

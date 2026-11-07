@@ -27,18 +27,37 @@ namespace Cohort.Sample.Migrations
             // Before 0.11.0 a run whose step skipped rows settled Succeeded; it settles
             // PartiallyFailed now, and the failed-run retention keeps it.
             //
-            // With row_security off, a role a row-level-security policy applies to fails at the
-            // backfill instead of copying nothing under a policy with no tenant set. The backfill,
-            // the run rewrite, and the drops are one DO statement, so that failure aborts the
-            // drops too, however the SQL is applied: a runner that carries on after an error has
-            // no later statement to run. SET LOCAL lasts to the end of the enclosing transaction,
-            // which under EF is every pending migration's, so the block's last line puts
-            // row_security back before anything after it.
+            // Only the tables' owner can run this (it drops a table and a column), and row-level
+            // security applies to an owner only on a table forced to it. Under a forced tenant
+            // policy with no tenant set, the backfill would see no rows and the drop would lose
+            // every skipped row's error, so the block lifts FORCE for its own statements and puts
+            // it back on the two tables that remain. The backfill, the run rewrite, and the drops
+            // are one DO statement, so none of it runs unless all of it does, however the SQL is
+            // applied.
             migrationBuilder.Sql(
                 """
                 DO $$
+                DECLARE
+                    run_forced boolean;
+                    detail_forced boolean;
+                    status_forced boolean;
                 BEGIN
-                    SET LOCAL row_security = off;
+                    SELECT relforcerowsecurity INTO run_forced
+                    FROM pg_catalog.pg_class WHERE oid = '"public"."sweep_run"'::regclass;
+                    SELECT relforcerowsecurity INTO detail_forced
+                    FROM pg_catalog.pg_class WHERE oid = '"public"."sweep_run_row_detail"'::regclass;
+                    SELECT relforcerowsecurity INTO status_forced
+                    FROM pg_catalog.pg_class WHERE oid = '"public"."sweep_row_handler_status"'::regclass;
+
+                    IF run_forced THEN
+                        ALTER TABLE "public"."sweep_run" NO FORCE ROW LEVEL SECURITY;
+                    END IF;
+                    IF detail_forced THEN
+                        ALTER TABLE "public"."sweep_run_row_detail" NO FORCE ROW LEVEL SECURITY;
+                    END IF;
+                    IF status_forced THEN
+                        ALTER TABLE "public"."sweep_row_handler_status" NO FORCE ROW LEVEL SECURITY;
+                    END IF;
 
                     UPDATE "public"."sweep_run_row_detail" AS detail
                     SET "Failure" = status."LastError"
@@ -62,7 +81,12 @@ namespace Cohort.Sample.Migrations
 
                     ALTER TABLE "public"."sweep_run_row_detail" DROP COLUMN "CapturedPayload";
 
-                    SET LOCAL row_security TO DEFAULT;
+                    IF run_forced THEN
+                        ALTER TABLE "public"."sweep_run" FORCE ROW LEVEL SECURITY;
+                    END IF;
+                    IF detail_forced THEN
+                        ALTER TABLE "public"."sweep_run_row_detail" FORCE ROW LEVEL SECURITY;
+                    END IF;
                 END
                 $$;
                 """);

@@ -116,14 +116,11 @@ Upgrading from 0.11.0:
    error into it, marks each `Succeeded` run with a skipped row as `PartiallyFailed` (before
    0.11.0 such a run settled `Succeeded`), then drops the table and the column. The SQL is in
    [Dependents and After-Commit Work](https://maxanstey-meridian.github.io/cohort/guides/row-handlers#upgrading-from-row-handlers).
-   If you set `FORCE ROW LEVEL SECURITY` on Cohort's tables, as
+   Run it as the tables' owner. If you set `FORCE ROW LEVEL SECURITY` on Cohort's tables, as
    [Row-level security](https://maxanstey-meridian.github.io/cohort/reference/schema#row-level-security)
-   asks when your connecting role owns them, run this migration as a superuser or a role with
-   `BYPASSRLS`, or run `ALTER TABLE … NO FORCE ROW LEVEL SECURITY` on `sweep_run`,
-   `sweep_run_row_detail`, and `sweep_row_handler_status` first, then `FORCE` `sweep_run` and
-   `sweep_run_row_detail` again afterwards (the migration drops the third): row-level security
-   applies to the owner of a `FORCE`d table, so the migration fails before anything is dropped.
-   Without `FORCE`, the tables' owner runs it as it is.
+   asks when your connecting role owns them, the migration lifts `FORCE` for its own statements
+   and forces `sweep_run` and `sweep_run_row_detail` again before it ends, so the backfill sees
+   every row.
 4. Move `Cohort:RowHandlerDispatch:SweepSettleTimeout` to `Cohort:SweepSettleTimeout`. The old
    key is ignored.
 5. If your host doesn't run hosted services, call `IRetentionRunRecovery.RecoverAsync` where

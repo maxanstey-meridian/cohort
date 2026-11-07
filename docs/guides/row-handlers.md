@@ -285,8 +285,27 @@ context (`RetentionSystemWork.RowDispatch`), the `Cohort:RowHandlerDispatch` opt
    migrationBuilder.Sql(
        """
        DO $$
+       DECLARE
+           run_forced boolean;
+           detail_forced boolean;
+           status_forced boolean;
        BEGIN
-           SET LOCAL row_security = off;
+           SELECT relforcerowsecurity INTO run_forced
+           FROM pg_catalog.pg_class WHERE oid = '"public"."sweep_run"'::regclass;
+           SELECT relforcerowsecurity INTO detail_forced
+           FROM pg_catalog.pg_class WHERE oid = '"public"."sweep_run_row_detail"'::regclass;
+           SELECT relforcerowsecurity INTO status_forced
+           FROM pg_catalog.pg_class WHERE oid = '"public"."sweep_row_handler_status"'::regclass;
+
+           IF run_forced THEN
+               ALTER TABLE "public"."sweep_run" NO FORCE ROW LEVEL SECURITY;
+           END IF;
+           IF detail_forced THEN
+               ALTER TABLE "public"."sweep_run_row_detail" NO FORCE ROW LEVEL SECURITY;
+           END IF;
+           IF status_forced THEN
+               ALTER TABLE "public"."sweep_row_handler_status" NO FORCE ROW LEVEL SECURITY;
+           END IF;
 
            UPDATE "public"."sweep_run_row_detail" AS detail
            SET "Failure" = status."LastError"
@@ -310,7 +329,12 @@ context (`RetentionSystemWork.RowDispatch`), the `Cohort:RowHandlerDispatch` opt
 
            ALTER TABLE "public"."sweep_run_row_detail" DROP COLUMN "CapturedPayload";
 
-           SET LOCAL row_security TO DEFAULT;
+           IF run_forced THEN
+               ALTER TABLE "public"."sweep_run" FORCE ROW LEVEL SECURITY;
+           END IF;
+           IF detail_forced THEN
+               ALTER TABLE "public"."sweep_run_row_detail" FORCE ROW LEVEL SECURITY;
+           END IF;
        END
        $$;
        """);
@@ -326,16 +350,13 @@ context (`RetentionSystemWork.RowDispatch`), the `Cohort:RowHandlerDispatch` opt
    pruning would delete it at the succeeded-run retention rather than keep it for the
    failed-run retention.
 
-   If you set `FORCE ROW LEVEL SECURITY` on Cohort's tables, as
+   Run the migration as the tables' owner, which it needs to drop a table and a column. If you
+   set `FORCE ROW LEVEL SECURITY` on Cohort's tables, as
    [Row-level security](/reference/schema#row-level-security) asks when your connecting role
-   owns them, run this migration as a superuser or a role with `BYPASSRLS`, or run
-   `ALTER TABLE … NO FORCE ROW LEVEL SECURITY` on `sweep_run`, `sweep_run_row_detail`, and
-   `sweep_row_handler_status` first, then `FORCE` `sweep_run` and `sweep_run_row_detail` again
-   afterwards (the migration drops the third): row-level security applies to the owner of a
-   `FORCE`d table, so the migration fails before anything is dropped.
-   Without `FORCE`, the tables' owner runs it as it is. The backfill and the drops run as one
-   statement with `row_security` off, so it fails rather than copying nothing, whichever way the
-   migration is applied.
+   owns them, row-level security applies to that owner and the backfill would see no rows, so
+   the block lifts `FORCE` for its own statements and forces `sweep_run` and
+   `sweep_run_row_detail` again before it ends. The block is one statement, so none of it runs
+   unless all of it does, whichever way the migration is applied.
 4. Move `Cohort:RowHandlerDispatch:SweepSettleTimeout` to `Cohort:SweepSettleTimeout`. The old
    key is ignored.
 5. If your host doesn't run hosted services, call `IRetentionRunRecovery.RecoverAsync` where

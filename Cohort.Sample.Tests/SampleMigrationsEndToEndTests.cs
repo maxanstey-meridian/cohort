@@ -4,7 +4,6 @@ using Cohort.Sample.Migrations;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
-using Microsoft.EntityFrameworkCore.Migrations.Operations;
 
 using Npgsql;
 
@@ -424,10 +423,10 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
 
     // A host that follows schema.md's row-level-security guide forces its tenant policies on the
     // tables its connecting role owns. Run as that owner with no tenant set, the backfill would
-    // see no rows, copy nothing, and the drop would lose every skipped row's error. With
-    // row_security off, the policy makes the backfill fail instead, before the drop.
+    // see no rows and the drop would lose every skipped row's error, so the migration lifts FORCE
+    // for its own statements and forces the two remaining tables again before it ends.
     [Fact]
-    public async Task Remove_Row_Handler_Queue_Migration_Fails_Before_The_Drop_Under_Forced_Row_Level_Security()
+    public async Task Remove_Row_Handler_Queue_Migration_Copies_Under_Forced_Row_Level_Security_And_Forces_The_Tables_Again()
     {
         var sweepId = Guid.NewGuid();
         var ownerConnectionString = await SetUpForcedRowLevelSecurityBeforeQueueRemovalAsync(sweepId);
@@ -438,26 +437,17 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
             )
         )
         {
-            var thrown = await db
-                .Database.GetService<IMigrator>()
-                .Invoking(migrator => migrator.MigrateAsync())
-                .Should()
-                .ThrowAsync<PostgresException>();
-            thrown.Which.SqlState.Should().Be("42501");
-            thrown.Which.MessageText.Should().Contain("row-level security policy");
+            await db.Database.GetService<IMigrator>().MigrateAsync();
         }
 
-        (await GetColumnsAsync("sweep_row_handler_status")).Should().NotBeEmpty("the migration fails before the drop");
-        (await ReadHandlerStatusLastErrorAsync(sweepId)).Should().Be(ForcedRowLevelSecuritySkippedError);
+        await AssertQueueRemovedUnderForcedRowLevelSecurityAsync(sweepId);
     }
 
-    // A script runner that carries on after an error (psql's default) sends each of a
-    // migration's statements outside a transaction. This one applies every Up() operation of the
-    // migration itself, one command each, and carries on past a failure. The backfill, the run
-    // rewrite, and the drops are one DO statement, so the backfill's failure under the forced
-    // policy leaves nothing for the runner to drop afterwards.
+    // A script runner sends each of a migration's statements outside a transaction. This one
+    // applies every Up() operation of the migration itself, one command each, as the forced
+    // owner: the DO block lifts and restores FORCE the same way without EF's transaction.
     [Fact]
-    public async Task Remove_Row_Handler_Queue_Migration_Sql_Drops_Nothing_Under_Forced_Row_Level_Security_Outside_A_Transaction()
+    public async Task Remove_Row_Handler_Queue_Migration_Sql_Copies_Under_Forced_Row_Level_Security_Outside_A_Transaction()
     {
         var sweepId = Guid.NewGuid();
         var ownerConnectionString = await SetUpForcedRowLevelSecurityBeforeQueueRemovalAsync(sweepId);
@@ -467,7 +457,6 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
             commands = db.GetService<IMigrationsSqlGenerator>().Generate(new RemoveRowHandlerQueue().UpOperations);
         }
 
-        var failures = new List<Exception>();
         await using (var owner = new NpgsqlConnection(ownerConnectionString))
         {
             await owner.OpenAsync();
@@ -475,64 +464,11 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
             {
                 await using var command = owner.CreateCommand();
                 command.CommandText = migrationCommand.CommandText;
-                try
-                {
-                    await command.ExecuteNonQueryAsync();
-                }
-                catch (Exception exception)
-                {
-                    failures.Add(exception);
-                }
+                await command.ExecuteNonQueryAsync();
             }
         }
 
-        (await GetColumnsAsync("sweep_row_handler_status")).Should().NotBeEmpty("the drop runs only if the backfill did");
-        (await ReadHandlerStatusLastErrorAsync(sweepId)).Should().Be(ForcedRowLevelSecuritySkippedError);
-        (await GetColumnsAsync("sweep_run_row_detail")).Should().ContainKey("CapturedPayload");
-        var postgres = failures.Should().ContainSingle().Which.Should().BeOfType<PostgresException>().Subject;
-        postgres.SqlState.Should().Be("42501");
-        postgres.MessageText.Should().Contain("row-level security policy");
-    }
-
-    // EF applies every pending migration in one transaction, and SET LOCAL lasts to its end, not
-    // the DO statement's. A later statement in that transaction must see row_security as it was,
-    // or a role a policy applies to fails a read the policy would have filtered. The setting ends
-    // at commit, so only a read inside the transaction can see it.
-    [Fact]
-    public async Task Remove_Row_Handler_Queue_Migration_Sql_Puts_Row_Security_Back_Inside_The_Enclosing_Transaction()
-    {
-        var migration = new RemoveRowHandlerQueue();
-        IReadOnlyList<MigrationCommand> addFailure;
-        await using (var db = new SampleDbContext(CreateOptions()))
-        {
-            await db.Database.GetService<IMigrator>().MigrateAsync(LastMigrationWithHandlerStatus);
-            addFailure = db.GetService<IMigrationsSqlGenerator>()
-                .Generate(migration.UpOperations.Where(operation => operation is not SqlOperation).ToList());
-        }
-
-        await using var connection = new NpgsqlConnection(connectionString);
-        await connection.OpenAsync();
-        await using var transaction = await connection.BeginTransactionAsync();
-        foreach (var migrationCommand in addFailure)
-        {
-            await using var command = new NpgsqlCommand(migrationCommand.CommandText, connection, transaction);
-            await command.ExecuteNonQueryAsync();
-        }
-
-        await using (
-            var block = new NpgsqlCommand(
-                migration.UpOperations.OfType<SqlOperation>().Single().Sql,
-                connection,
-                transaction
-            )
-        )
-        {
-            await block.ExecuteNonQueryAsync();
-        }
-
-        await using var show = new NpgsqlCommand("SHOW row_security", connection, transaction);
-        (await show.ExecuteScalarAsync()).Should().Be("on");
-        await transaction.RollbackAsync();
+        await AssertQueueRemovedUnderForcedRowLevelSecurityAsync(sweepId);
     }
 
     // Migrates to the last schema with the handler queue, seeds one row a failing step skipped,
@@ -630,19 +566,27 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
     }
 
     // Reads as the fixture's superuser, which row-level security doesn't apply to.
-    private async Task<object?> ReadHandlerStatusLastErrorAsync(Guid sweepId)
+    private async Task AssertQueueRemovedUnderForcedRowLevelSecurityAsync(Guid sweepId)
     {
         await using var verify = new NpgsqlConnection(connectionString);
         await verify.OpenAsync();
         await using var read = verify.CreateCommand();
         read.CommandText = """
-            SELECT status."LastError"
-            FROM "sweep_row_handler_status" AS status
-            INNER JOIN "sweep_run_row_detail" AS detail ON detail."Id" = status."SweepRunRowDetailId"
+            SELECT detail."Failure",
+                (SELECT relforcerowsecurity FROM pg_catalog.pg_class WHERE oid = 'public.sweep_run'::regclass),
+                (SELECT relforcerowsecurity FROM pg_catalog.pg_class WHERE oid = 'public.sweep_run_row_detail'::regclass),
+                to_regclass('public.sweep_row_handler_status') IS NULL
+            FROM "sweep_run_row_detail" AS detail
             WHERE detail."SweepId" = @sweepId
             """;
         read.Parameters.AddWithValue("sweepId", sweepId);
-        return await read.ExecuteScalarAsync();
+        await using var reader = await read.ExecuteReaderAsync();
+        (await reader.ReadAsync()).Should().BeTrue();
+        (reader.IsDBNull(0) ? null : reader.GetString(0))
+            .Should().Be(ForcedRowLevelSecuritySkippedError, "the backfill sees the row under the forced policy");
+        reader.GetBoolean(1).Should().BeTrue("the migration forces sweep_run again");
+        reader.GetBoolean(2).Should().BeTrue("the migration forces sweep_run_row_detail again");
+        reader.GetBoolean(3).Should().BeTrue("the migration drops the status table");
     }
 
     [Theory]

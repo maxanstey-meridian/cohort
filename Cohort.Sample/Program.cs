@@ -11,7 +11,8 @@ using Microsoft.Extensions.Logging;
 
 var builder = Host.CreateApplicationBuilder(args);
 builder.Services.AddSampleRetentionServices();
-// Dogfoods after-commit work through the host's outbox: each retired note's step writes a message in the run's transaction.
+// Each retired note's step writes a message to the sample's outbox in the run's transaction.
+// The sample only deposits: nothing delivers the messages, so no after-commit work runs.
 builder.Services.AddRetentionDependents<Note, NoteOutboxStep>(retiresReferencingRows: false);
 
 var host = builder.Build();

@@ -97,7 +97,7 @@ public static class ServiceCollectionExtensions
         services.TryAddSingleton<RetentionValidationState>();
         // The collection itself, read when Cohort validates: AddRetentionDependents and the
         // host's own step registrations may come after AddCohort.
-        services.AddSingleton(new RetentionHandlerServiceRegistrations(services));
+        services.AddSingleton(new RetentionDependentsServiceRegistrations(services));
         services.TryAddScoped<RetentionStartupValidator>();
         services.TryAddScoped<CohortSchemaValidator>();
         services.TryAddSingleton<RetentionRuntimeReadinessState>();
@@ -147,9 +147,9 @@ public static class ServiceCollectionExtensions
     {
         ArgumentNullException.ThrowIfNull(services);
 
-        var entityStep = new RetentionHandlerServiceRegistrations(services)
+        var entityStep = new RetentionDependentsServiceRegistrations(services)
             .DependentsRegistrations()
-            .FirstOrDefault(registration => registration.EntityType == typeof(TEntity));
+            .StepFor(typeof(TEntity));
         if (entityStep is not null && entityStep.StepType != typeof(TStep))
         {
             throw new InvalidOperationException(

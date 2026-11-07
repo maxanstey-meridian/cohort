@@ -43,7 +43,7 @@ See [Running Retention](/guides/running-retention) for how the worker uses them.
 | Key | Default | Description |
 |---|---|---|
 | `HistoryPruning:SucceededRunRetention` | `null` | How long a succeeded run is kept after it settled. `null` keeps it forever. |
-| `HistoryPruning:FailedRunRetention` | `null` | How long a `Failed`, `PartiallyFailed` or `Cancelled` run is kept after it settled. `null` keeps it forever. |
+| `HistoryPruning:FailedRunRetention` | `null` | How long a `Failed`, `PartiallyFailed`, or `Cancelled` run is kept after it settled. `null` keeps it forever. |
 | `HistoryPruning:InactiveHoldRetention` | `null` | How long a removed or expired hold is kept after it stopped protecting. `null` keeps it forever. |
 
 Each must be at least 1 day when set. See [History Pruning](/guides/history-pruning).

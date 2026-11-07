@@ -109,7 +109,7 @@ public sealed class RetentionStartupValidatorTests
                 [],
                 new RetentionValidationState(),
                 new ErasureSubjectMetadataResolver(db),
-                new RetentionHandlerServiceRegistrations(new ServiceCollection())
+                new RetentionDependentsServiceRegistrations(new ServiceCollection())
             ).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
@@ -147,7 +147,7 @@ public sealed class RetentionStartupValidatorTests
                 [],
                 new RetentionValidationState(),
                 new ErasureSubjectMetadataResolver(db),
-                new RetentionHandlerServiceRegistrations(new ServiceCollection())
+                new RetentionDependentsServiceRegistrations(new ServiceCollection())
             ).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
@@ -177,7 +177,7 @@ public sealed class RetentionStartupValidatorTests
                 [],
                 new RetentionValidationState(),
                 new ErasureSubjectMetadataResolver(db),
-                new RetentionHandlerServiceRegistrations(new ServiceCollection())
+                new RetentionDependentsServiceRegistrations(new ServiceCollection())
             ).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
@@ -435,7 +435,7 @@ public sealed class RetentionStartupValidatorTests
                 [new TestAnonymiseValueFactory()],
                 new RetentionValidationState(),
                 new ErasureSubjectMetadataResolver(db),
-                new RetentionHandlerServiceRegistrations(new ServiceCollection())
+                new RetentionDependentsServiceRegistrations(new ServiceCollection())
             ).ValidateAsync();
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
@@ -704,7 +704,7 @@ public sealed class RetentionStartupValidatorTests
     [InlineData("factory", "isn't registered with AddRetentionDependents alone")]
     [InlineData("duplicate", "is registered 2 times")]
     [InlineData("step-service-removed", "service was removed or replaced")]
-    public async Task ValidateAsync_Refuses_Row_Work_That_Would_Never_Run(string registration, string? refusal)
+    public async Task ValidateAsync_Refuses_A_Step_That_Would_Never_Run(string registration, string? refusal)
     {
         var options = new DbContextOptionsBuilder<DependentsDbContext>()
             .UseNpgsqlMetadataModel($"startup-validator-dependents-{Guid.NewGuid()}")
@@ -782,7 +782,7 @@ public sealed class RetentionStartupValidatorTests
             [new GuidTombstoneFactory(), new OriginalValueTombstoneFactory()],
             new RetentionValidationState(),
             new ErasureSubjectMetadataResolver(db),
-            new RetentionHandlerServiceRegistrations(services ?? new ServiceCollection())
+            new RetentionDependentsServiceRegistrations(services ?? new ServiceCollection())
         );
     }
 

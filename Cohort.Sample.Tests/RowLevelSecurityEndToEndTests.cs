@@ -43,6 +43,8 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
         new RetentionExecutionContext.System(RetentionSystemWork.HistoryPruning);
     private static readonly RetentionExecutionContext Readiness =
         new RetentionExecutionContext.System(RetentionSystemWork.Readiness);
+    private static readonly RetentionExecutionContext Recovery =
+        new RetentionExecutionContext.System(RetentionSystemWork.Recovery);
 
     [Fact]
     public async Task Worker_Sweeps_Each_Tenant_As_That_Tenant()
@@ -439,6 +441,39 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task A_Tenantless_Step_Runs_As_The_Owner_With_No_Tenant()
+    {
+        // The step's batch gets a scope of its own, entered as the tenantless pass, whose hold
+        // guard reads tenantless holds in a Readiness scope; the step then reads the session of
+        // the run's connection, which the run's own tenantless pass opened.
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await CreateSchemaWithPoliciesAsync(database.ConnectionString);
+        await SeedAsync(database.ConnectionString, [], [Log("log-expired")]);
+        var entries = new EntryLog();
+        var observations = new StepObservations();
+        using var host = BuildHost(
+            database.ConnectionString,
+            services =>
+            {
+                services.AddSingleton(entries);
+                services.AddSingleton(observations);
+                services.AddScoped<IRetentionExecutionScope, FlowExecutionScope>();
+                services.AddRetentionDependents<RlsLog, SessionObservingLogStep>(retiresReferencingRows: false);
+            }
+        );
+
+        var result = await host.Services.GetRequiredService<IRetentionSweep>()
+            .ExecuteAsync(RetentionSweepRequest.Tenantless(AsOf));
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(RlsLog)).Which.Affected.Should().Be(1);
+        entries.Ran.Should().Equal(TenantlessPass, Readiness, TenantlessPass, Readiness);
+        var owner = await LoadSuperuserNameAsync(database.ConnectionString);
+        observations.Seen.Should().Equal(new SessionObservation("step:log-expired", "", owner));
+        (await LoadLogPayloadsAsync(database.ConnectionString)).Should().BeEmpty();
+    }
+
+    [Fact]
     public async Task History_Pruning_Runs_As_System_And_Prunes_Every_Tenants_History()
     {
         await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
@@ -464,6 +499,35 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
         entries.Ran.Take(2).Should().Equal(HistoryPruning, Readiness);
         entries.Ran.Skip(2).Should().NotBeEmpty().And.OnlyContain(context => context == HistoryPruning);
         (await LoadRunsAsync(database.ConnectionString)).Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task Abandoned_Run_Recovery_Runs_As_System_And_Settles_Every_Tenants_Runs()
+    {
+        // As a tenant, or as no one, the policies would hide the stale runs and leave them Started.
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        var tenantA = Guid.NewGuid();
+        var tenantB = Guid.NewGuid();
+        await CreateSchemaWithPoliciesAsync(database.ConnectionString);
+        await SeedStartedRunAsync(database.ConnectionString, tenantA, DateTimeOffset.UtcNow.AddDays(-1));
+        await SeedStartedRunAsync(database.ConnectionString, tenantB, DateTimeOffset.UtcNow.AddDays(-1));
+        var entries = new EntryLog();
+        using var host = BuildHost(
+            database.ConnectionString,
+            services =>
+            {
+                services.AddSingleton(entries);
+                services.AddScoped<IRetentionExecutionScope, FlowExecutionScope>();
+            }
+        );
+
+        await host.Services.GetRequiredService<IRetentionRunRecovery>().RecoverAsync();
+
+        entries.Ran.Should().Equal(Recovery, Readiness);
+        (await LoadRunsAsync(database.ConnectionString)).Should().BeEquivalentTo([
+            new RunRow(tenantA, SweepRunStatus.Failed),
+            new RunRow(tenantB, SweepRunStatus.Failed),
+        ]);
     }
 
     [Fact]
@@ -843,6 +907,32 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
         await command.ExecuteNonQueryAsync();
     }
 
+    private static async Task SeedStartedRunAsync(string connectionString, Guid tenantId, DateTimeOffset startedAt)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO "sweep_run" ("SweepId", "StartedAt", "Status", "TriggerKind", "DryRun", "TenantId", "TotalAffected")
+            VALUES (@sweepId, @startedAt, @status, @trigger, FALSE, @tenantId, 0)
+            """;
+        command.Parameters.AddWithValue("sweepId", Guid.NewGuid());
+        command.Parameters.AddWithValue("startedAt", startedAt);
+        command.Parameters.AddWithValue("status", (int)SweepRunStatus.Started);
+        command.Parameters.AddWithValue("trigger", (int)SweepTriggerKind.Manual);
+        command.Parameters.AddWithValue("tenantId", tenantId);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<string> LoadSuperuserNameAsync(string connectionString)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT current_user";
+        return (string)(await command.ExecuteScalarAsync())!;
+    }
+
     private static async Task<List<string>> LoadNoteBodiesAsync(string connectionString)
     {
         await using var db = CreateOwnerContext(connectionString);
@@ -905,8 +995,6 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
         public IReadOnlyList<RetentionExecutionContext> Ran => [.. ran];
 
         public void Add(RetentionExecutionContext context) => ran.Enqueue(context);
-
-        public void Clear() => ran.Clear();
     }
 
     private sealed class StepObservations
@@ -1023,6 +1111,13 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
     {
         public async Task RetireAsync(RlsNote row, RetentionDependentsContext ctx, CancellationToken ct) =>
             observations.Add(await ObserveAsync(db, $"step:{row.Body}", ct));
+    }
+
+    private sealed class SessionObservingLogStep(RlsDbContext db, StepObservations observations)
+        : IRetentionDependents<RlsLog>
+    {
+        public async Task RetireAsync(RlsLog row, RetentionDependentsContext ctx, CancellationToken ct) =>
+            observations.Add(await ObserveAsync(db, $"step:{row.Payload}", ct));
     }
 
     private sealed class FailingNoteStep : IRetentionDependents<RlsNote>

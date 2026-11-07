@@ -115,10 +115,10 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
                 foreach (var indexRequirement in table.RequiredIndexes)
                 {
                     // A required unique index must be exactly that constraint; a recommended one
-                    // only serves lookups, which any index on the same keys does.
+                    // only serves lookups, which any full (not partial) index on the same keys does.
                     if (indexes.Any(index => index.TableId == tableId
                         && index.Columns.SequenceEqual(indexRequirement.Columns)
-                        && index.Predicate == NormalizePredicate(indexRequirement.Predicate)
+                        && index.Predicate is null
                         && (!indexRequirement.Unique || index.Unique && index.Immediate && !index.Primary)))
                     {
                         continue;
@@ -170,14 +170,14 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
                         && foreignKey.ReferencedColumns.SequenceEqual(
                             foreignKeyRequirement.PrincipalColumns
                         )
-                        && foreignKey.DeleteAction == foreignKeyRequirement.CatalogDeleteAction
+                        && foreignKey.DeleteAction == CohortSchemaContract.RestrictDeleteAction
                         && foreignKey.Validated))
                     {
                         var principalTable = CohortSchemaContract
                             .GetTable(foreignKeyRequirement.PrincipalTable)
                             .ResolveStoreTable(storeTables);
                         missing.Add(
-                            $"foreign key capability '{table.Role}({string.Join(", ", foreignKeyRequirement.Columns)}) -> {foreignKeyRequirement.PrincipalTable}({string.Join(", ", foreignKeyRequirement.PrincipalColumns)}) ON DELETE {DescribeDeleteAction(foreignKeyRequirement.CatalogDeleteAction)}' on tables '{PostgreSqlIdentifier.Format(mappedTable)}' -> '{PostgreSqlIdentifier.Format(principalTable)}'"
+                            $"foreign key capability '{table.Role}({string.Join(", ", foreignKeyRequirement.Columns)}) -> {foreignKeyRequirement.PrincipalTable}({string.Join(", ", foreignKeyRequirement.PrincipalColumns)}) ON DELETE RESTRICT' on tables '{PostgreSqlIdentifier.Format(mappedTable)}' -> '{PostgreSqlIdentifier.Format(principalTable)}'"
                         );
                     }
                 }
@@ -219,19 +219,6 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
         {
             await database.CloseConnectionAsync();
         }
-    }
-
-    private static string DescribeDeleteAction(char deleteAction)
-    {
-        return deleteAction switch
-        {
-            'a' => "NO ACTION",
-            'r' => "RESTRICT",
-            'c' => "CASCADE",
-            'n' => "SET NULL",
-            'd' => "SET DEFAULT",
-            _ => throw new ArgumentOutOfRangeException(nameof(deleteAction)),
-        };
     }
 
     private static async Task<Dictionary<string, uint>> ResolveTablesAsync(
@@ -359,7 +346,7 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
                 reader.GetBoolean(2),
                 reader.GetBoolean(3),
                 reader.GetFieldValue<string?[]>(4),
-                NormalizePredicate(reader.IsDBNull(5) ? null : reader.GetString(5))
+                reader.IsDBNull(5) ? null : reader.GetString(5)
             ));
         }
 
@@ -471,16 +458,6 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
         parameter.ParameterName = "tableIds";
         parameter.Value = tableIds.Select(id => (long)id).ToArray();
         command.Parameters.Add(parameter);
-    }
-
-    // A required index predicate must use only pg_catalog names and no style-dependent literals:
-    // pg_get_expr's output depends on search_path and IntervalStyle, and this check's pass is
-    // shared across sessions (readiness records it by value, per database).
-    private static string? NormalizePredicate(string? predicate)
-    {
-        return predicate is null
-            ? null
-            : new string(predicate.Where(char.IsLetterOrDigit).ToArray()).ToUpperInvariant();
     }
 
     private static bool IsCompatibleType(string required, ColumnStructure actual)

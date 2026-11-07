@@ -106,7 +106,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
             // Cohort's own work never enlists in a caller's ambient System.Transactions
             // transaction. The pass runs on the caller's context: under suppression its closed
             // connection opens unenlisted, so the pass never joins the ambient transaction or
-            // begins one of its own inside it. The recording rule below is unchanged.
+            // begins one of its own inside it.
             using (new TransactionScope(TransactionScopeOption.Suppress, TransactionScopeAsyncFlowOption.Enabled))
             {
                 await RunModelPassAsync(readiness, ct);

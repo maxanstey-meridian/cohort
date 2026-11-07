@@ -425,7 +425,8 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
         var expectedIndexes = CohortSchemaContract.Tables.SelectMany(table =>
                 new[] { $"{table.Role}|p|{string.Join(",", table.PrimaryKey)}" }
                     .Concat(table.RequiredIndexes.Select(index =>
-                        $"{table.Role}|{(index.Unique ? "u" : "n")}|{string.Join(",", index.Columns)}|{NormalizeIndexPredicate(index.Predicate)}"
+                        // The empty last field: every index Cohort requires is full, not partial.
+                        $"{table.Role}|{(index.Unique ? "u" : "n")}|{string.Join(",", index.Columns)}|"
                     ))
             )
             .Order(StringComparer.Ordinal)
@@ -466,7 +467,7 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
 
         var expectedForeignKeys = CohortSchemaContract.Tables.SelectMany(table =>
                 table.RequiredForeignKeys.Select(foreignKey =>
-                    $"{table.Role}|{string.Join(",", foreignKey.Columns)}|{foreignKey.PrincipalTable}|{string.Join(",", foreignKey.PrincipalColumns)}|{foreignKey.CatalogDeleteAction}"
+                    $"{table.Role}|{string.Join(",", foreignKey.Columns)}|{foreignKey.PrincipalTable}|{string.Join(",", foreignKey.PrincipalColumns)}|{CohortSchemaContract.RestrictDeleteAction}"
                 )
             ).Order(StringComparer.Ordinal).ToArray();
         var actualForeignKeys = await ReadCatalogSignaturesAsync(connection, """
@@ -490,10 +491,6 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
             """);
         actualForeignKeys.Should().Equal(expectedForeignKeys);
     }
-
-    private static string NormalizeIndexPredicate(string? predicate) => predicate is null
-        ? ""
-        : new string(predicate.Where(char.IsLetterOrDigit).ToArray()).ToUpperInvariant();
 
     private static async Task<string[]> ReadCatalogSignaturesAsync(
         NpgsqlConnection connection,

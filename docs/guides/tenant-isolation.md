@@ -2,7 +2,7 @@
 
 If your host isolates tenants inside the database, for example with PostgreSQL row-level
 security, Cohort's own work has to run under that isolation too. Cohort creates its own DI
-scopes for sweeps, previews, erasures, dependents steps, recovery, pruning and readiness, so it
+scopes for sweeps, previews, erasures, dependents steps, recovery, pruning, and readiness, so it
 tells you whose work each one does through `IRetentionExecutionScope`. Your hook configures
 the scope, typically by telling its DbContext which tenant it serves.
 
@@ -67,7 +67,7 @@ System work deliberately spans tenants, or touches tables that have no tenant:
 |---|---|
 | `Readiness` | Catalog checks, and integrity checks across every tenant |
 | `WorkerCoordination` | The worker's advisory lock, occurrence ledger, tenant source and tenant coverage check |
-| `TenantlessPass` | Sweeps, previews, erasures and dependents steps for `[RetentionTenantless]` entities |
+| `TenantlessPass` | Sweeps, previews, erasures, and dependents steps for `[RetentionTenantless]` entities |
 | `Recovery` | Settling every tenant's abandoned runs as `Failed` |
 | `HistoryPruning` | Pruning Cohort's run history and inactive holds |
 

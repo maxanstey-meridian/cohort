@@ -151,9 +151,9 @@ internal abstract class SweepStrategy(
     )
     {
         var mutation = CreateMutation(scope);
-        var hasStep = dependentsRegistrations.HasStep(scope.Entry.EntityType);
-        var rowByRow = SweepStatements.TakesRowByRowPath(HandlesStrategy, hasStep, mutation.RowByRow);
-        if (!hasStep)
+        var registration = dependentsRegistrations.StepFor(scope.Entry.EntityType);
+        var rowByRow = SweepStatements.TakesRowByRowPath(HandlesStrategy, registration is not null, mutation.RowByRow);
+        if (registration is null)
         {
             return await MutateAsync(scope, conn, transaction, candidates, mutation, rowByRow, stepScope: null, execution, ct);
         }
@@ -174,20 +174,17 @@ internal abstract class SweepStrategy(
                 try
                 {
                     await stepDb.Database.UseTransactionAsync(transaction, ct);
-                    var stepScope = new RetentionHandlerScope(
+                    var stepScope = new RetentionDependentsScope(
                         stepDb,
-                        RetentionHandlerSupport.ResolveDependents(stepServices, scope.Entry.EntityType)
+                        RetentionDependentsSteps.ResolveDependents(stepServices, registration)
                     );
-                    if (stepScope.Dependents is { } step)
-                    {
-                        // The guard reads only the holds this scope can see.
-                        await holdGuard.EnsureTenantlessHoldsVisibleAsync(
-                            conn,
-                            transaction,
-                            $"Dependents step {step.StepType.FullName}",
-                            ct
-                        );
-                    }
+                    // The guard reads only the holds this scope can see.
+                    await holdGuard.EnsureTenantlessHoldsVisibleAsync(
+                        conn,
+                        transaction,
+                        $"Dependents step {stepScope.Dependents.StepType.FullName}",
+                        ct
+                    );
 
                     return await MutateAsync(scope, conn, transaction, candidates, mutation, rowByRow, stepScope, execution, ct);
                 }
@@ -231,7 +228,7 @@ internal abstract class SweepStrategy(
         IReadOnlyList<string> candidates,
         SweepMutation mutation,
         bool rowByRow,
-        RetentionHandlerScope? stepScope,
+        RetentionDependentsScope? stepScope,
         SweepMutationContext execution,
         CancellationToken ct
     )
@@ -317,7 +314,7 @@ internal abstract class SweepStrategy(
         DbTransaction transaction,
         IReadOnlyList<string> candidates,
         SweepMutation mutation,
-        RetentionHandlerScope? stepScope,
+        RetentionDependentsScope? stepScope,
         SweepMutationContext execution,
         CancellationToken ct
     )
@@ -334,7 +331,6 @@ internal abstract class SweepStrategy(
         var recordIdProperty = db.Model.FindEntityType(typeof(TEntity))!.FindProperty(entry.RecordId.RecordIdMember)!;
         var recordIdGetter = recordIdProperty.GetGetter();
         var recordIdConverter = recordIdProperty.GetTypeMapping().Converter;
-        var step = stepScope?.Dependents;
 
         var affected = new List<string>();
         var skipped = 0;
@@ -356,7 +352,7 @@ internal abstract class SweepStrategy(
             // One savepoint for the step and the mutation: whatever undoes one undoes both, so
             // a row's dependents are never retired without it.
             await transaction.SaveAsync(MutationSavepoint, CancellationToken.None);
-            if (step is not null)
+            if (stepScope is not null)
             {
                 var dependents = new RetentionDependentsContext(
                     execution.SweepId,
@@ -368,8 +364,8 @@ internal abstract class SweepStrategy(
                 var stepFailure = await RetireDependentsAsync(
                     conn,
                     transaction,
-                    stepScope!.Db,
-                    step,
+                    stepScope.Db,
+                    stepScope.Dependents,
                     (TEntity)row,
                     dependents,
                     execution,
@@ -403,7 +399,7 @@ internal abstract class SweepStrategy(
                 // statement's own WHERE again, the step had taken it out of scope; otherwise a
                 // hold landed after the row was loaded, and the engine counts it as held.
                 await RollBackSavepointAsync(transaction, MutationSavepoint);
-                if (step is not null && await IsStillDueAsync(scope, conn, transaction, recordKey, ct))
+                if (stepScope is not null && await IsStillDueAsync(scope, conn, transaction, recordKey, ct))
                 {
                     skipped++;
                     await PersistSkippedAsync(
@@ -412,7 +408,10 @@ internal abstract class SweepStrategy(
                         transaction,
                         execution,
                         recordKey,
-                        BeforeMutationFailure.FromReason(step, BeforeMutationFailure.DependentsChangedRowReason),
+                        BeforeMutationFailure.FromReason(
+                            stepScope.Dependents,
+                            BeforeMutationFailure.DependentsChangedRowReason
+                        ),
                         ct
                     );
                 }
@@ -446,7 +445,7 @@ internal abstract class SweepStrategy(
     {
         var entry = scope.Entry;
         var skippedId = await RecordIdSql.CanonicalizeAsync(conn, transaction, entry, recordKey, ct);
-        await RetentionHandlerSupport.PersistBeforeFailureAsync(
+        await RetentionDependentsSteps.PersistBeforeFailureAsync(
             conn,
             transaction,
             execution,
@@ -496,7 +495,7 @@ internal abstract class SweepStrategy(
                 return BeforeMutationFailure.FromException(step, ex);
             }
 
-            if (RetentionHandlerSupport.HasUnsavedChanges(stepDb))
+            if (RetentionDependentsSteps.HasUnsavedChanges(stepDb))
             {
                 return BeforeMutationFailure.FromReason(step, BeforeMutationFailure.DependentsUnsavedChangesReason);
             }

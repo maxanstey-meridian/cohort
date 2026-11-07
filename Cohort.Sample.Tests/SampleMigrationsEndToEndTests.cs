@@ -1,8 +1,10 @@
 using Cohort.Sample.Entities;
+using Cohort.Sample.Migrations;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
+using Microsoft.EntityFrameworkCore.Migrations.Operations;
 
 using Npgsql;
 
@@ -13,6 +15,9 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
 {
     // The last migration whose schema still has sweep_row_handler_status; the next drops it.
     private const string LastMigrationWithHandlerStatus = "20261107150342_AddSampleOutbox";
+
+    private const string ForcedRowLevelSecuritySkippedError =
+        "type=System.InvalidOperationException;code=;diagnosticId=0123456789abcdef";
 
     private static readonly (string EntityType, Guid RetentionEntityId)[] StableEntityMappings =
     [
@@ -56,6 +61,9 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
     ];
 
     private readonly string databaseName = $"cohort_migration_{Guid.NewGuid():N}";
+    // Roles are cluster-wide and can't be dropped while they own the test database's tables, so
+    // they go after the database.
+    private readonly List<string> roles = [];
     private string connectionString = "";
 
     public async Task InitializeAsync()
@@ -78,30 +86,43 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
 
     public async Task DisposeAsync()
     {
-        if (string.IsNullOrWhiteSpace(connectionString))
-        {
-            return;
-        }
-
         var adminConnectionString = CreateAdminConnectionString(fixture.ConnectionString);
-
-        await using var connection = new NpgsqlConnection(adminConnectionString);
-        await connection.OpenAsync();
-
-        await using (var terminate = connection.CreateCommand())
+        try
         {
-            terminate.CommandText = $"""
-                SELECT pg_terminate_backend(pid)
-                FROM pg_stat_activity
-                WHERE datname = '{databaseName}'
-                  AND pid <> pg_backend_pid()
-                """;
-            await terminate.ExecuteNonQueryAsync();
-        }
+            if (string.IsNullOrWhiteSpace(connectionString))
+            {
+                return;
+            }
 
-        await using var drop = connection.CreateCommand();
-        drop.CommandText = $"DROP DATABASE IF EXISTS \"{databaseName}\"";
-        await drop.ExecuteNonQueryAsync();
+            await using var connection = new NpgsqlConnection(adminConnectionString);
+            await connection.OpenAsync();
+
+            await using (var terminate = connection.CreateCommand())
+            {
+                terminate.CommandText = $"""
+                    SELECT pg_terminate_backend(pid)
+                    FROM pg_stat_activity
+                    WHERE datname = '{databaseName}'
+                      AND pid <> pg_backend_pid()
+                    """;
+                await terminate.ExecuteNonQueryAsync();
+            }
+
+            await using var drop = connection.CreateCommand();
+            drop.CommandText = $"DROP DATABASE IF EXISTS \"{databaseName}\"";
+            await drop.ExecuteNonQueryAsync();
+        }
+        finally
+        {
+            foreach (var role in roles)
+            {
+                await using var connection = new NpgsqlConnection(adminConnectionString);
+                await connection.OpenAsync();
+                await using var dropRole = connection.CreateCommand();
+                dropRole.CommandText = $"DROP ROLE IF EXISTS \"{role}\"";
+                await dropRole.ExecuteNonQueryAsync();
+            }
+        }
     }
 
     [Fact]
@@ -256,6 +277,11 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
     // (a handler that succeeded) or Attempt (a dead-letter on a later attempt), so each of those
     // terms is needed too. A dead-letter can't carry a claim (CK_sweep_row_handler_status_Claim),
     // so no seed can differ only in ClaimedAt.
+    //
+    // Before 0.11.0 a run whose step skipped rows settled Succeeded, and the migration moves it
+    // to PartiallyFailed, as a run with skipped rows settles now. A Succeeded run whose only
+    // dead-letter is an after-commit one has no skipped row and stays Succeeded, and a Failed run
+    // with a skipped row stays Failed.
     [Fact]
     public async Task Remove_Row_Handler_Queue_Migration_Moves_Only_A_Skipped_Rows_Error_Into_Failure()
     {
@@ -263,8 +289,12 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
         const string afterCommitError = "type=System.TimeoutException;code=;diagnosticId=fedcba9876543210";
         const string succeededError = "type=System.TimeoutException;code=;diagnosticId=00000000000000aa";
         const string retriedError = "type=System.TimeoutException;code=;diagnosticId=00000000000000bb";
+        const string failedRunError = "reason=entity-failed";
         var options = CreateOptions();
         var sweepId = Guid.NewGuid();
+        var legacySkippedSweepId = Guid.NewGuid();
+        var legacyAfterCommitSweepId = Guid.NewGuid();
+        var failedSweepId = Guid.NewGuid();
         var tenantId = Guid.NewGuid();
         var queuedAt = new DateTimeOffset(2026, 10, 30, 3, 0, 0, TimeSpan.Zero);
 
@@ -279,7 +309,11 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
                 command.CommandText = """
                     INSERT INTO "sweep_run"
                         ("SweepId", "StartedAt", "Status", "SettledAt", "Duration", "TriggerKind", "DryRun", "TenantId", "TotalAffected", "Error")
-                    VALUES (@sweepId, @queuedAt, 2, @queuedAt + INTERVAL '1 minute', INTERVAL '1 minute', 2, FALSE, @tenantId, 1, 'reason=rows-skipped');
+                    VALUES
+                        (@sweepId, @queuedAt, 2, @queuedAt + INTERVAL '1 minute', INTERVAL '1 minute', 2, FALSE, @tenantId, 1, 'reason=rows-skipped'),
+                        (@legacySkippedSweepId, @queuedAt, 1, @queuedAt + INTERVAL '1 minute', INTERVAL '1 minute', 2, FALSE, @tenantId, 0, NULL),
+                        (@legacyAfterCommitSweepId, @queuedAt, 1, @queuedAt + INTERVAL '1 minute', INTERVAL '1 minute', 2, FALSE, @tenantId, 1, NULL),
+                        (@failedSweepId, @queuedAt, 3, @queuedAt + INTERVAL '1 minute', INTERVAL '1 minute', 2, FALSE, @tenantId, 0, @failedRunError);
 
                     WITH details AS (
                         INSERT INTO "sweep_run_row_detail"
@@ -288,7 +322,10 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
                             (@sweepId, @queuedAt, 'Cohort.Sample.Entities.Note', @entityId, 'skipped-record', 'short-lived', 0, @tenantId, NULL),
                             (@sweepId, @queuedAt, 'Cohort.Sample.Entities.Note', @entityId, 'mutated-record', 'short-lived', 0, @tenantId, NULL),
                             (@sweepId, @queuedAt, 'Cohort.Sample.Entities.Note', @entityId, 'succeeded-record', 'short-lived', 0, @tenantId, NULL),
-                            (@sweepId, @queuedAt, 'Cohort.Sample.Entities.Note', @entityId, 'retried-record', 'short-lived', 0, @tenantId, NULL)
+                            (@sweepId, @queuedAt, 'Cohort.Sample.Entities.Note', @entityId, 'retried-record', 'short-lived', 0, @tenantId, NULL),
+                            (@legacySkippedSweepId, @queuedAt, 'Cohort.Sample.Entities.Note', @entityId, 'legacy-skipped-record', 'short-lived', 0, @tenantId, NULL),
+                            (@legacyAfterCommitSweepId, @queuedAt, 'Cohort.Sample.Entities.Note', @entityId, 'legacy-mutated-record', 'short-lived', 0, @tenantId, NULL),
+                            (@failedSweepId, @queuedAt, 'Cohort.Sample.Entities.Note', @entityId, 'failed-run-skipped-record', 'short-lived', 0, @tenantId, NULL)
                         RETURNING "Id", "RecordId"
                     )
                     INSERT INTO "sweep_row_handler_status"
@@ -300,11 +337,18 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
                         ('skipped-record', 'Legacy.Step', 3, 1, INTERVAL '0 seconds', @skippedError),
                         ('mutated-record', 'Legacy.Handler', 3, 1, INTERVAL '2 seconds', @afterCommitError),
                         ('succeeded-record', 'Legacy.Handler', 2, 1, INTERVAL '0 seconds', @succeededError),
-                        ('retried-record', 'Legacy.Handler', 3, 2, INTERVAL '0 seconds', @retriedError)
+                        ('retried-record', 'Legacy.Handler', 3, 2, INTERVAL '0 seconds', @retriedError),
+                        ('legacy-skipped-record', 'Legacy.Handler', 3, 1, INTERVAL '0 seconds', @skippedError),
+                        ('legacy-mutated-record', 'Legacy.Handler', 3, 1, INTERVAL '2 seconds', @afterCommitError),
+                        ('failed-run-skipped-record', 'Legacy.Step', 3, 1, INTERVAL '0 seconds', @skippedError)
                     ) AS seed (record_id, handler_type, state, attempt, completed_after, last_error)
                         ON seed.record_id = details."RecordId";
                     """;
                 command.Parameters.AddWithValue("sweepId", sweepId);
+                command.Parameters.AddWithValue("legacySkippedSweepId", legacySkippedSweepId);
+                command.Parameters.AddWithValue("legacyAfterCommitSweepId", legacyAfterCommitSweepId);
+                command.Parameters.AddWithValue("failedSweepId", failedSweepId);
+                command.Parameters.AddWithValue("failedRunError", failedRunError);
                 command.Parameters.AddWithValue("tenantId", tenantId);
                 command.Parameters.AddWithValue("queuedAt", queuedAt);
                 command.Parameters.AddWithValue("entityId", Note.RetentionIdentity);
@@ -345,7 +389,260 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
                 ("skipped-record", skippedError),
                 ("succeeded-record", null)
             );
+
+        await using var readRuns = verify.CreateCommand();
+        readRuns.CommandText = """
+            SELECT "SweepId", "Status", "Error"
+            FROM "sweep_run"
+            WHERE "SweepId" = ANY(@sweepIds)
+            """;
+        readRuns.Parameters.AddWithValue(
+            "sweepIds",
+            new[] { sweepId, legacySkippedSweepId, legacyAfterCommitSweepId, failedSweepId }
+        );
+        var runs = new Dictionary<Guid, (int Status, string? Error)>();
+        await using (var reader = await readRuns.ExecuteReaderAsync())
+        {
+            while (await reader.ReadAsync())
+            {
+                runs[reader.GetGuid(0)] = (reader.GetInt32(1), reader.IsDBNull(2) ? null : reader.GetString(2));
+            }
+        }
+
+        runs.Should()
+            .BeEquivalentTo(
+                new Dictionary<Guid, (int Status, string? Error)>
+                {
+                    [sweepId] = (2, "reason=rows-skipped"),
+                    [legacySkippedSweepId] = (2, "reason=rows-skipped"),
+                    [legacyAfterCommitSweepId] = (1, null),
+                    [failedSweepId] = (3, failedRunError),
+                }
+            );
         (await GetColumnsAsync("sweep_row_handler_status")).Should().BeEmpty("the migration drops the table");
+    }
+
+    // A host that follows schema.md's row-level-security guide forces its tenant policies on the
+    // tables its connecting role owns. Run as that owner with no tenant set, the backfill would
+    // see no rows, copy nothing, and the drop would lose every skipped row's error. With
+    // row_security off, the policy makes the backfill fail instead, before the drop.
+    [Fact]
+    public async Task Remove_Row_Handler_Queue_Migration_Fails_Before_The_Drop_Under_Forced_Row_Level_Security()
+    {
+        var sweepId = Guid.NewGuid();
+        var ownerConnectionString = await SetUpForcedRowLevelSecurityBeforeQueueRemovalAsync(sweepId);
+
+        await using (
+            var db = new SampleDbContext(
+                new DbContextOptionsBuilder<SampleDbContext>().UseNpgsql(ownerConnectionString).Options
+            )
+        )
+        {
+            var thrown = await db
+                .Database.GetService<IMigrator>()
+                .Invoking(migrator => migrator.MigrateAsync())
+                .Should()
+                .ThrowAsync<PostgresException>();
+            thrown.Which.SqlState.Should().Be("42501");
+            thrown.Which.MessageText.Should().Contain("row-level security policy");
+        }
+
+        (await GetColumnsAsync("sweep_row_handler_status")).Should().NotBeEmpty("the migration fails before the drop");
+        (await ReadHandlerStatusLastErrorAsync(sweepId)).Should().Be(ForcedRowLevelSecuritySkippedError);
+    }
+
+    // A script runner that carries on after an error (psql's default) sends each of a
+    // migration's statements outside a transaction. This one applies every Up() operation of the
+    // migration itself, one command each, and carries on past a failure. The backfill, the run
+    // rewrite, and the drops are one DO statement, so the backfill's failure under the forced
+    // policy leaves nothing for the runner to drop afterwards.
+    [Fact]
+    public async Task Remove_Row_Handler_Queue_Migration_Sql_Drops_Nothing_Under_Forced_Row_Level_Security_Outside_A_Transaction()
+    {
+        var sweepId = Guid.NewGuid();
+        var ownerConnectionString = await SetUpForcedRowLevelSecurityBeforeQueueRemovalAsync(sweepId);
+        IReadOnlyList<MigrationCommand> commands;
+        await using (var db = new SampleDbContext(CreateOptions()))
+        {
+            commands = db.GetService<IMigrationsSqlGenerator>().Generate(new RemoveRowHandlerQueue().UpOperations);
+        }
+
+        var failures = new List<Exception>();
+        await using (var owner = new NpgsqlConnection(ownerConnectionString))
+        {
+            await owner.OpenAsync();
+            foreach (var migrationCommand in commands)
+            {
+                await using var command = owner.CreateCommand();
+                command.CommandText = migrationCommand.CommandText;
+                try
+                {
+                    await command.ExecuteNonQueryAsync();
+                }
+                catch (Exception exception)
+                {
+                    failures.Add(exception);
+                }
+            }
+        }
+
+        (await GetColumnsAsync("sweep_row_handler_status")).Should().NotBeEmpty("the drop runs only if the backfill did");
+        (await ReadHandlerStatusLastErrorAsync(sweepId)).Should().Be(ForcedRowLevelSecuritySkippedError);
+        (await GetColumnsAsync("sweep_run_row_detail")).Should().ContainKey("CapturedPayload");
+        var postgres = failures.Should().ContainSingle().Which.Should().BeOfType<PostgresException>().Subject;
+        postgres.SqlState.Should().Be("42501");
+        postgres.MessageText.Should().Contain("row-level security policy");
+    }
+
+    // EF applies every pending migration in one transaction, and SET LOCAL lasts to its end, not
+    // the DO statement's. A later statement in that transaction must see row_security as it was,
+    // or a role a policy applies to fails a read the policy would have filtered. The setting ends
+    // at commit, so only a read inside the transaction can see it.
+    [Fact]
+    public async Task Remove_Row_Handler_Queue_Migration_Sql_Puts_Row_Security_Back_Inside_The_Enclosing_Transaction()
+    {
+        var migration = new RemoveRowHandlerQueue();
+        IReadOnlyList<MigrationCommand> addFailure;
+        await using (var db = new SampleDbContext(CreateOptions()))
+        {
+            await db.Database.GetService<IMigrator>().MigrateAsync(LastMigrationWithHandlerStatus);
+            addFailure = db.GetService<IMigrationsSqlGenerator>()
+                .Generate(migration.UpOperations.Where(operation => operation is not SqlOperation).ToList());
+        }
+
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var transaction = await connection.BeginTransactionAsync();
+        foreach (var migrationCommand in addFailure)
+        {
+            await using var command = new NpgsqlCommand(migrationCommand.CommandText, connection, transaction);
+            await command.ExecuteNonQueryAsync();
+        }
+
+        await using (
+            var block = new NpgsqlCommand(
+                migration.UpOperations.OfType<SqlOperation>().Single().Sql,
+                connection,
+                transaction
+            )
+        )
+        {
+            await block.ExecuteNonQueryAsync();
+        }
+
+        await using var show = new NpgsqlCommand("SHOW row_security", connection, transaction);
+        (await show.ExecuteScalarAsync()).Should().Be("on");
+        await transaction.RollbackAsync();
+    }
+
+    // Migrates to the last schema with the handler queue, seeds one row a failing step skipped,
+    // and hands the three ledger tables to a new NOSUPERUSER NOBYPASSRLS role with tenant
+    // policies forced on them, as schema.md's row-level-security guide sets up. Returns the
+    // owner role's connection string; no tenant is set on it.
+    private async Task<string> SetUpForcedRowLevelSecurityBeforeQueueRemovalAsync(Guid sweepId)
+    {
+        const string skippedError = ForcedRowLevelSecuritySkippedError;
+        var role = $"cohort_migration_owner_{Guid.NewGuid():N}";
+        const string password = "migration-owner-password";
+        var tenantId = Guid.NewGuid();
+        var queuedAt = new DateTimeOffset(2026, 10, 30, 3, 0, 0, TimeSpan.Zero);
+
+        await using (var db = new SampleDbContext(CreateOptions()))
+        {
+            await db.Database.GetService<IMigrator>().MigrateAsync(LastMigrationWithHandlerStatus);
+        }
+
+        await using (var connection = new NpgsqlConnection(connectionString))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                INSERT INTO "sweep_run"
+                    ("SweepId", "StartedAt", "Status", "SettledAt", "Duration", "TriggerKind", "DryRun", "TenantId", "TotalAffected", "Error")
+                VALUES (@sweepId, @queuedAt, 2, @queuedAt + INTERVAL '1 minute', INTERVAL '1 minute', 2, FALSE, @tenantId, 0, 'reason=rows-skipped');
+
+                WITH detail AS (
+                    INSERT INTO "sweep_run_row_detail"
+                        ("SweepId", "At", "EntityType", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId", "CapturedPayload")
+                    VALUES (@sweepId, @queuedAt, 'Cohort.Sample.Entities.Note', @entityId, 'skipped-record', 'short-lived', 0, @tenantId, NULL)
+                    RETURNING "Id"
+                )
+                INSERT INTO "sweep_row_handler_status"
+                    ("SweepRunRowDetailId", "HandlerType", "DispatchPhase", "State", "Attempt", "QueuedAt", "NextAttemptAt", "ClaimedAt", "ClaimToken", "CompletedAt", "LastError")
+                SELECT detail."Id", 'Legacy.Step', 0, 3, 1, @queuedAt, @queuedAt, NULL, NULL, @queuedAt, @skippedError
+                FROM detail;
+                """;
+            command.Parameters.AddWithValue("sweepId", sweepId);
+            command.Parameters.AddWithValue("tenantId", tenantId);
+            command.Parameters.AddWithValue("queuedAt", queuedAt);
+            command.Parameters.AddWithValue("entityId", Note.RetentionIdentity);
+            command.Parameters.AddWithValue("skippedError", skippedError);
+            await command.ExecuteNonQueryAsync();
+        }
+
+        await using (var admin = new NpgsqlConnection(CreateAdminConnectionString(fixture.ConnectionString)))
+        {
+            await admin.OpenAsync();
+            await using var createRole = admin.CreateCommand();
+            createRole.CommandText =
+                $"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}' NOSUPERUSER NOBYPASSRLS";
+            await createRole.ExecuteNonQueryAsync();
+            roles.Add(role);
+        }
+
+        await using (var connection = new NpgsqlConnection(connectionString))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"""
+                ALTER TABLE public.sweep_run OWNER TO "{role}";
+                ALTER TABLE public.sweep_run_row_detail OWNER TO "{role}";
+                ALTER TABLE public.sweep_row_handler_status OWNER TO "{role}";
+
+                ALTER TABLE public.sweep_run ENABLE ROW LEVEL SECURITY;
+                ALTER TABLE public.sweep_run FORCE ROW LEVEL SECURITY;
+                ALTER TABLE public.sweep_run_row_detail ENABLE ROW LEVEL SECURITY;
+                ALTER TABLE public.sweep_run_row_detail FORCE ROW LEVEL SECURITY;
+                ALTER TABLE public.sweep_row_handler_status ENABLE ROW LEVEL SECURITY;
+                ALTER TABLE public.sweep_row_handler_status FORCE ROW LEVEL SECURITY;
+
+                CREATE POLICY tenant_isolation ON public.sweep_run
+                  USING ("TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+                CREATE POLICY tenant_isolation ON public.sweep_run_row_detail
+                  USING ("TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+                CREATE POLICY tenant_isolation ON public.sweep_row_handler_status
+                  USING (EXISTS (
+                    SELECT 1 FROM public.sweep_run_row_detail detail
+                    WHERE detail."Id" = sweep_row_handler_status."SweepRunRowDetailId"
+                      AND detail."TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid));
+
+                GRANT CREATE ON SCHEMA public TO "{role}";
+                GRANT SELECT, INSERT, UPDATE ON public."__EFMigrationsHistory" TO "{role}";
+                """;
+            await command.ExecuteNonQueryAsync();
+        }
+
+        return new NpgsqlConnectionStringBuilder(connectionString)
+        {
+            Username = role,
+            Password = password,
+        }.ConnectionString;
+    }
+
+    // Reads as the fixture's superuser, which row-level security doesn't apply to.
+    private async Task<object?> ReadHandlerStatusLastErrorAsync(Guid sweepId)
+    {
+        await using var verify = new NpgsqlConnection(connectionString);
+        await verify.OpenAsync();
+        await using var read = verify.CreateCommand();
+        read.CommandText = """
+            SELECT status."LastError"
+            FROM "sweep_row_handler_status" AS status
+            INNER JOIN "sweep_run_row_detail" AS detail ON detail."Id" = status."SweepRunRowDetailId"
+            WHERE detail."SweepId" = @sweepId
+            """;
+        read.Parameters.AddWithValue("sweepId", sweepId);
+        return await read.ExecuteScalarAsync();
     }
 
     [Theory]

@@ -22,7 +22,7 @@ namespace Cohort.Sample.Tests;
 // their own database with a test-local model: a Purge parent referenced through RESTRICT keys by
 // an unretained and a retained child, and an Anonymise parent whose retained audit events
 // copy its values, as Casebridge's do. The tracked-graph tests use a model of their own, whose
-// step changes its context without saving; the sample-entity tests run on the shared fixture.
+// step leaves changes on its context; the sample-entity tests run on the shared fixture.
 // A failing step's row is recorded once, in the row detail's Failure.
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -62,6 +62,36 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
             (referencedId.ToString(), (string?)null),
             (plainId.ToString(), (string?)null),
         ]);
+    }
+
+    // What a step can put in an outbox message: the run, the row's category and strategy, the
+    // tenant, and the time the batch stamps the row's own detail with.
+    [Fact]
+    public async Task A_Step_Is_Told_The_Run_It_Retires_Its_Row_For()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
+        var script = new StepScript();
+        await using var services = BuildServiceProvider(database.ConnectionString, script);
+        var tenantId = Guid.NewGuid();
+        var parentId = Guid.NewGuid();
+        await SeedAsync(services, db => db.Parents.Add(Parent(parentId, tenantId, AsOf.AddDays(-100))));
+
+        var result = await SweepAsync(services, tenantId);
+
+        result.EntityFailures.Should().BeEmpty();
+        var detailAt = (await QueryAsync(
+            database.ConnectionString,
+            "SELECT \"At\" FROM \"sweep_run_row_detail\" WHERE \"SweepId\" = @sweepId AND \"RecordId\" = @recordId",
+            reader => reader.GetFieldValue<DateTimeOffset>(0),
+            ("sweepId", result.SweepId),
+            ("recordId", parentId.ToString())
+        )).Should().ContainSingle().Subject;
+        var ctx = script.RunContexts.Should().ContainSingle().Subject;
+        ctx.SweepId.Should().Be(result.SweepId);
+        ctx.Category.Should().Be("dependents-purge");
+        ctx.Strategy.Should().Be(Strategy.Purge);
+        ctx.TenantId.Should().Be(tenantId);
+        ctx.At.Should().Be(detailAt);
     }
 
     [Fact]
@@ -478,11 +508,13 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
         (await CountAsync(database.ConnectionString, "dependents_plain_children")).Should().Be(0);
     }
 
-    // The read-only refusal a handler's context gave has no step analogue: a step's context is
-    // read-write, so a step that saves succeeds.
     [Theory]
     [InlineData(TrackedGraphStep.StagingBody, UnsavedChanges, false)]
     [InlineData(TrackedGraphStep.StagingBody, UnsavedChanges, true)]
+    // A save the database refuses leaves its entry tracked and fails only its row: later rows
+    // of the batch still run.
+    [InlineData(TrackedGraphStep.FailedSaveBody, ForeignKeyRefusal, false)]
+    [InlineData(TrackedGraphStep.FailedSaveBody, ForeignKeyRefusal, true)]
     // Change detection itself throws on a changed key: still the step's unsaved change.
     [InlineData(TrackedGraphStep.KeyChangingBody, UnsavedChanges, false)]
     [InlineData(TrackedGraphStep.KeyChangingBody, UnsavedChanges, true)]
@@ -987,6 +1019,8 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
     }
 
     private const string UnsavedChanges = "^reason=dependents-unsaved-changes$";
+    private const string ForeignKeyRefusal =
+        "^type=Npgsql\\.PostgresException;code=sqlstate:23503;diagnosticId=[0-9a-f]{32}$";
 
     private static readonly Guid AuditEventEntityId = Guid.Parse("00000000-0000-0000-0003-000000000005");
     private static readonly Guid RetainedChildEntityId = Guid.Parse("00000000-0000-0000-0003-000000000003");
@@ -1290,10 +1324,13 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
 
         public ConcurrentQueue<DbContext> Contexts { get; } = new();
 
-        public void Called(DbContext db)
+        public ConcurrentQueue<RetentionDependentsContext> RunContexts { get; } = new();
+
+        public void Called(DbContext db, RetentionDependentsContext ctx)
         {
             Interlocked.Increment(ref calls);
             Contexts.Enqueue(db);
+            RunContexts.Enqueue(ctx);
         }
     }
 
@@ -1301,7 +1338,7 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
     {
         public Task RetireAsync(ADependentsParent row, RetentionDependentsContext ctx, CancellationToken ct)
         {
-            script.Called(db);
+            script.Called(db, ctx);
             return script.Parent(row, db, ct);
         }
     }
@@ -1310,7 +1347,7 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
     {
         public Task RetireAsync(AAnonymisedParent row, RetentionDependentsContext ctx, CancellationToken ct)
         {
-            script.Called(db);
+            script.Called(db, ctx);
             return script.Anonymised(row, db, ct);
         }
     }
@@ -1600,14 +1637,16 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
     }
 
     /// <summary>
-    /// Changes its own context in one way, chosen by the row's body, without saving: the kinds
-    /// of change that once leaked into the caller's context.
+    /// Changes its own context in one way, chosen by the row's body, and leaves the change
+    /// unsaved or saves it where the database refuses it: the kinds of change that once leaked
+    /// into the caller's context.
     /// </summary>
     private sealed class TrackedGraphStep(TrackedGraphDbContext db, TrackedGraphProbe probe)
         : IRetentionDependents<TrackedGraphRecord>
     {
         public const string BystanderBody = "bystander";
         public const string StagingBody = "stage-before-delete";
+        public const string FailedSaveBody = "save-before-delete";
         public const string KeyChangingBody = "change-key-before-delete";
         public const string EditingBody = "edit-before-delete";
         public const string UndetectedEditBody = "edit-undetected-before-delete";
@@ -1623,6 +1662,11 @@ public sealed class RetentionDependentsEndToEndTests(PostgresFixture fixture)
             {
                 case StagingBody:
                     db.Records.Add(new TrackedGraphRecord { Id = Guid.NewGuid(), TenantId = row.TenantId, Body = "staged-by-step" });
+                    break;
+                case FailedSaveBody:
+                    // No such folder: the save is refused (23503) and leaves its entry Added.
+                    db.Comments.Add(new TrackedGraphComment { Id = Guid.NewGuid(), FolderId = Guid.NewGuid() });
+                    await db.SaveChangesAsync(ct);
                     break;
                 case KeyChangingBody:
                     (await BystanderAsync(ct)).Id = Guid.NewGuid();

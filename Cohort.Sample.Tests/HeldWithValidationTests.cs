@@ -278,7 +278,7 @@ public sealed class HeldWithValidationTests
             [],
             new RetentionValidationState(),
             new ErasureSubjectMetadataResolver(db),
-            new RetentionHandlerServiceRegistrations(new ServiceCollection())
+            new RetentionDependentsServiceRegistrations(new ServiceCollection())
         );
 
     private sealed class PurgeCategoryProvider : ITestRetentionRuleProvider

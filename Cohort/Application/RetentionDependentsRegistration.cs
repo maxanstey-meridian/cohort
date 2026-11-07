@@ -45,7 +45,9 @@ internal static class RetentionDependentsRegistrations
     /// <c>retiresReferencingRows</c> true: that step may retire what references a row, so purge
     /// tries the row and a reference left after the step blocks it at the database. Otherwise
     /// purge keeps the blocking-key pre-filter and counts a still-referenced row blocked
-    /// without trying it. The run, the preview, and readiness all ask here, so they can't drift.
+    /// without trying it. The run, the preview, and readiness all reach it through
+    /// <c>ReferencingForeignKeySql.AttachAsync</c>, which takes the registrations themselves,
+    /// so they can't drift.
     /// </summary>
     public static bool RetiresReferencingRows(
         this IEnumerable<IRetentionDependentsRegistration> registrations,

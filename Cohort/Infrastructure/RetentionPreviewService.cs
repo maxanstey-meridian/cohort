@@ -68,7 +68,7 @@ internal sealed class RetentionPreviewService(
             var attached = await ReferencingForeignKeySql.AttachAsync(
                 connection,
                 plan,
-                entry => dependentsRegistrations.RetiresReferencingRows(entry.EntityType),
+                dependentsRegistrations,
                 ct
             );
             foreach (var scope in attached)

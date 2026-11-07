@@ -23,7 +23,7 @@ A settled run is deleted, with its `sweep_run_entity_summary` and `sweep_run_row
 rows, once its `SettledAt` is older than its retention:
 
 - A run that settled `Succeeded` uses `SucceededRunRetention`.
-- A run that settled `Failed`, `PartiallyFailed` or `Cancelled` uses `FailedRunRetention`.
+- A run that settled `Failed`, `PartiallyFailed`, or `Cancelled` uses `FailedRunRetention`.
   That lets you keep failure evidence longer, or shorter, than routine history. A run whose
   [dependents step](/guides/row-handlers#retiring-a-rows-dependents) skipped rows settles
   `PartiallyFailed`, so the row details that record why are kept this long too.

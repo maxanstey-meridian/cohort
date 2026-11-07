@@ -9,6 +9,8 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
+using Npgsql;
+
 namespace Cohort.Sample.Tests;
 
 // Cohort's own work never enlists in a caller's ambient System.Transactions transaction. Each
@@ -17,9 +19,10 @@ namespace Cohort.Sample.Tests;
 // anything that joined it rolls back.
 // A cold call is the first readiness call for the model and connection string (a fresh
 // TemporaryDatabase); a warm call follows one made outside any scope.
-// Make-fails: remove the suppression in RetentionExecutionScopes.RunInScopeAsync (both sweeps and
-// the owned erasure go red), then the one around RetentionRuntimeReadinessValidator's model pass
-// (both cold hold listing tests go red). With both removed, the cold preview goes red too.
+// Make-fails: remove the suppression in RetentionExecutionScopes.RunInScopeAsync (both sweeps, the
+// owned erasure, and the recovery go red), then the one around
+// RetentionRuntimeReadinessValidator's model pass (both cold hold listing tests go red). With
+// both removed, the cold preview goes red too.
 // Two tests check holds; neither pins the recording rule, which other tests pin under an EF
 // transaction.
 // An_owned_erasure_inside_an_ambient_transaction_reads_the_committed_hold_and_refuses pins that an
@@ -104,6 +107,21 @@ public sealed class AmbientTransactionEndToEndTests(PostgresFixture fixture)
         result.Counts.Should().ContainSingle(count => count.Strategy == Strategy.Purge).Which.Affected.Should().Be(2);
         await AssertRowsLeftAsync(services, tenant.Id, 0);
         await AssertRunSucceededAsync(services, result.SweepId);
+    }
+
+    [Fact]
+    public async Task A_cold_recovery_inside_an_ambient_transaction_fails_an_abandoned_run_and_is_not_undone_when_the_scope_is_disposed()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using var services = BuildServiceProvider(database.ConnectionString);
+        var sweepId = await SeedStartedRunAsync(services, database.ConnectionString, DateTimeOffset.UtcNow.AddDays(-1));
+
+        using (new TransactionScope(TransactionScopeAsyncFlowOption.Enabled))
+        {
+            await services.GetRequiredService<IRetentionRunRecovery>().RecoverAsync();
+        }
+
+        await AssertRunSettledAsync(services, sweepId, SweepRunStatus.Failed);
     }
 
     [Fact]
@@ -267,14 +285,42 @@ public sealed class AmbientTransactionEndToEndTests(PostgresFixture fixture)
         (await db.Records.CountAsync(record => record.TenantId == tenantId)).Should().Be(expected);
     }
 
-    private static async Task AssertRunSucceededAsync(ServiceProvider services, Guid sweepId)
+    // A run left Started at startedAt, whose owner is gone (no session holds its run lock).
+    private static async Task<Guid> SeedStartedRunAsync(ServiceProvider services, string connectionString, DateTimeOffset startedAt)
+    {
+        await using (var setup = services.CreateAsyncScope())
+        {
+            await setup.ServiceProvider.GetRequiredService<AmbientDbContext>().Database.EnsureCreatedAsync();
+        }
+
+        var sweepId = Guid.NewGuid();
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO "sweep_run" ("SweepId", "StartedAt", "Status", "TriggerKind", "DryRun", "TenantId", "TotalAffected")
+            VALUES (@sweepId, @startedAt, @status, @trigger, FALSE, @tenantId, 0)
+            """;
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        command.Parameters.AddWithValue("startedAt", startedAt);
+        command.Parameters.AddWithValue("status", (int)SweepRunStatus.Started);
+        command.Parameters.AddWithValue("trigger", (int)SweepTriggerKind.Manual);
+        command.Parameters.AddWithValue("tenantId", Guid.NewGuid());
+        await command.ExecuteNonQueryAsync();
+        return sweepId;
+    }
+
+    private static Task AssertRunSucceededAsync(ServiceProvider services, Guid sweepId) =>
+        AssertRunSettledAsync(services, sweepId, SweepRunStatus.Succeeded);
+
+    private static async Task AssertRunSettledAsync(ServiceProvider services, Guid sweepId, SweepRunStatus expected)
     {
         await using var scope = services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AmbientDbContext>();
         (await db.Database
             .SqlQuery<int>($"""SELECT "Status" AS "Value" FROM "sweep_run" WHERE "SweepId" = {sweepId} AND "SettledAt" IS NOT NULL""")
             .ToListAsync())
-            .Should().Equal((int)SweepRunStatus.Succeeded);
+            .Should().Equal((int)expected);
     }
 
     private static async Task AssertRunCountAsync(ServiceProvider services, long expected)

@@ -11,23 +11,20 @@ using Microsoft.Extensions.Logging;
 
 namespace Cohort.Infrastructure.Sweep;
 
-internal static class RetentionHandlerSupport
+internal static class RetentionDependentsSteps
 {
     /// <summary>
-    /// The dependents step registered with <c>AddRetentionDependents</c> for
-    /// <paramref name="entityType"/>, or null without one. A step the provider resolves
-    /// without that registration (another container's) is refused, and so is a registration
-    /// the provider resolves no step for: its rows would be mutated without their dependents
-    /// retired.
+    /// The dependents step <paramref name="registration"/> names, resolved from
+    /// <paramref name="services"/>. A step the provider resolves that the registration
+    /// doesn't name (another container's) is refused, and so is a registration the provider
+    /// resolves no step for: its rows would be mutated without their dependents retired.
     /// </summary>
-    public static ResolvedRetentionDependents? ResolveDependents(IServiceProvider services, Type entityType)
+    public static ResolvedRetentionDependents ResolveDependents(
+        IServiceProvider services,
+        IRetentionDependentsRegistration registration
+    )
     {
-        var registration = services.GetServices<IRetentionDependentsRegistration>().StepFor(entityType);
-        if (registration is null)
-        {
-            return null;
-        }
-
+        var entityType = registration.EntityType;
         var stepInterface = typeof(IRetentionDependents<>).MakeGenericType(entityType);
         var steps = ((IEnumerable)services.GetRequiredService(typeof(IEnumerable<>).MakeGenericType(stepInterface)))
             .Cast<object>()
@@ -36,7 +33,7 @@ internal static class RetentionHandlerSupport
         if (stray is not null)
         {
             throw new RetentionConfigurationException(
-                [RetentionHandlerServiceRegistrations.DependentsNotRegisteredError(
+                [RetentionDependentsServiceRegistrations.DependentsNotRegisteredError(
                     $"Dependents step {stray.GetType().FullName}, resolved as IRetentionDependents<{entityType.FullName}>,")]
             );
         }
@@ -137,58 +134,43 @@ internal static class RetentionHandlerSupport
 /// <c>AddRetentionDependents</c> makes a dependents step: an
 /// <see cref="IRetentionDependents{TEntity}"/> service it didn't register would never run
 /// while its rows are still mutated, and one registered twice would run twice per row. Read
-/// from the descriptors alone, so nothing is constructed to find out. The collection is complete by the time the
-/// provider that resolves this exists.
+/// from the descriptors alone, so nothing is constructed to find out. The collection is
+/// complete by the time the provider that resolves this exists.
 /// </summary>
-internal sealed class RetentionHandlerServiceRegistrations(IServiceCollection services)
+internal sealed class RetentionDependentsServiceRegistrations(IServiceCollection services)
 {
     /// <summary>
     /// Every dependents step service the host registered some other way than with
     /// <c>AddRetentionDependents</c>, or more than once, and every registration whose service
     /// was later removed or replaced.
     /// </summary>
-    public IReadOnlyList<string> FindInvalidStepServices() =>
-    [
-        .. FindInvalidServices(
-            typeof(IRetentionDependents<>),
-            "Dependents step",
-            DependentsRegistrations().Select(registration => (registration.EntityType, registration.StepType)).ToHashSet(),
-            DependentsNotRegisteredError,
-            "AddRetentionDependents<TEntity, TStep>"
-        ),
-    ];
-
-    private IEnumerable<string> FindInvalidServices(
-        Type serviceDefinition,
-        string role,
-        HashSet<(Type Entity, Type Implementation)> registrations,
-        Func<string, string> notRegisteredError,
-        string registrationMethod
-    )
+    public IReadOnlyList<string> FindInvalidStepServices()
     {
-        var serviceName = serviceDefinition.Name[..serviceDefinition.Name.IndexOf('`')];
-        var method = registrationMethod[..registrationMethod.IndexOf('<')];
+        var registrations = DependentsRegistrations()
+            .Select(registration => (Entity: registration.EntityType, Implementation: registration.StepType))
+            .ToHashSet();
+        var errors = new List<string>();
         var registeredServices = new List<(Type Entity, Type Implementation)>();
         var refusedServices = new HashSet<(Type Entity, Type Implementation)>();
         foreach (var descriptor in services.Where(descriptor =>
                      descriptor.ServiceType.IsGenericType
-                     && descriptor.ServiceType.GetGenericTypeDefinition() == serviceDefinition))
+                     && descriptor.ServiceType.GetGenericTypeDefinition() == typeof(IRetentionDependents<>)))
         {
             var entity = descriptor.ServiceType.IsGenericTypeDefinition ? null : descriptor.ServiceType.GenericTypeArguments[0];
-            var service = entity is null ? $"{serviceName}<>" : $"{serviceName}<{entity.FullName}>";
+            var service = entity is null ? "IRetentionDependents<>" : $"IRetentionDependents<{entity.FullName}>";
 
-            // Only the registration method's own shape, scoped by type, runs in each batch's
-            // scope. A singleton or instance registered first makes that method's add a
-            // no-op, so a matching registration isn't enough.
+            // Only AddRetentionDependents's own shape, scoped by type, runs in each batch's
+            // scope. A singleton or instance registered first makes its add a no-op, so a
+            // matching registration isn't enough.
             var registered = descriptor switch
             {
                 { IsKeyedService: true } => $"A keyed {service} service",
                 { ImplementationFactory: not null } => $"A factory-registered {service} service",
                 { ImplementationInstance: { } instance } => $"An instance of {instance.GetType().FullName}, registered as {service},",
                 { Lifetime: not ServiceLifetime.Scoped } =>
-                    $"{role} {descriptor.ImplementationType!.FullName}, registered as a {descriptor.Lifetime.ToString().ToLowerInvariant()} {service},",
+                    $"Dependents step {descriptor.ImplementationType!.FullName}, registered as a {descriptor.Lifetime.ToString().ToLowerInvariant()} {service},",
                 _ when entity is not null && registrations.Contains((entity, descriptor.ImplementationType!)) => null,
-                _ => $"{role} {descriptor.ImplementationType!.FullName}, registered as {service},",
+                _ => $"Dependents step {descriptor.ImplementationType!.FullName}, registered as {service},",
             };
             if (registered is null)
             {
@@ -206,16 +188,17 @@ internal sealed class RetentionHandlerServiceRegistrations(IServiceCollection se
                 refusedServices.Add((entity, implementation));
             }
 
-            yield return notRegisteredError(registered);
+            errors.Add(DependentsNotRegisteredError(registered));
         }
 
         foreach (var duplicate in registeredServices.GroupBy(pair => pair).Where(group => group.Count() > 1))
         {
-            yield return
-                $"{role} {duplicate.Key.Implementation.FullName} is registered {duplicate.Count()} times as {serviceName}<{duplicate.Key.Entity.FullName}>, so it would run {duplicate.Count()} times per row. Register it once, with {method}.";
+            errors.Add(
+                $"Dependents step {duplicate.Key.Implementation.FullName} is registered {duplicate.Count()} times as IRetentionDependents<{duplicate.Key.Entity.FullName}>, so it would run {duplicate.Count()} times per row. Register it once, with AddRetentionDependents."
+            );
         }
 
-        // A service removed or replaced after the registration method ran leaves its
+        // A service removed or replaced after AddRetentionDependents ran leaves its
         // registration behind, so its rows would be mutated without it. One refused above in
         // the wrong shape is already reported.
         foreach (var (entity, implementation) in registrations
@@ -224,10 +207,13 @@ internal sealed class RetentionHandlerServiceRegistrations(IServiceCollection se
                      .OrderBy(pair => pair.Implementation.FullName, StringComparer.Ordinal)
                      .ThenBy(pair => pair.Entity.FullName, StringComparer.Ordinal))
         {
-            yield return
-                $"{role} {implementation.FullName} is registered for {entity.FullName} with {method}, but its scoped {serviceName}<{entity.FullName}> service was removed or replaced, so it wouldn't run in each batch's scope, or at all while its rows are still swept or erased. "
-                + $"Register it only with services.{registrationMethod}() and leave the service it adds in place.";
+            errors.Add(
+                $"Dependents step {implementation.FullName} is registered for {entity.FullName} with AddRetentionDependents, but its scoped IRetentionDependents<{entity.FullName}> service was removed or replaced, so it wouldn't run in each batch's scope, or at all while its rows are still swept or erased. "
+                    + "Register it only with services.AddRetentionDependents<TEntity, TStep>() and leave the service it adds in place."
+            );
         }
+
+        return errors;
     }
 
     public IRetentionDependentsRegistration[] DependentsRegistrations() =>
@@ -256,7 +242,7 @@ internal sealed class ResolvedRetentionDependents(object instance)
 /// One batch's dependents step, and the context it was resolved with: a scope of its own
 /// whose context is on the run's connection and transaction, never the run's context.
 /// </summary>
-internal sealed record RetentionHandlerScope(DbContext Db, ResolvedRetentionDependents? Dependents);
+internal sealed record RetentionDependentsScope(DbContext Db, ResolvedRetentionDependents Dependents);
 
 /// <summary>
 /// What failed a row before its mutation: the dependents step, and either the exception or

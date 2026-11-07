@@ -81,10 +81,6 @@ public static class CohortModelBuilder
         foreach (var index in table.RequiredIndexes)
         {
             var indexBuilder = builder.HasIndex(index.Columns.ToArray()).IsUnique(index.Unique);
-            if (index.Predicate is not null)
-            {
-                indexBuilder.HasFilter(index.Predicate);
-            }
             if (index.Name is not null)
             {
                 indexBuilder.HasDatabaseName(index.Name);
@@ -123,12 +119,7 @@ public static class CohortModelBuilder
                 .WithMany()
                 .HasForeignKey(foreignKey.Columns.ToArray())
                 .HasPrincipalKey(foreignKey.PrincipalColumns.ToArray())
-                .OnDelete(foreignKey.DeleteAction switch
-                {
-                    CohortSchemaContract.ForeignKeyDeleteAction.Restrict => DeleteBehavior.Restrict,
-                    CohortSchemaContract.ForeignKeyDeleteAction.Cascade => DeleteBehavior.Cascade,
-                    _ => throw new ArgumentOutOfRangeException(nameof(foreignKey.DeleteAction)),
-                });
+                .OnDelete(DeleteBehavior.Restrict);
         }
     }
 

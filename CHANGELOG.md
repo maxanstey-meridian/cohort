@@ -88,9 +88,9 @@ Removed (breaking): Cohort no longer runs row handlers or keeps a durable work q
 - Gone: `IRetentionHandler<T>`, `AddRowHandler`, `IRetentionRowDispatcher` and
   `RowDispatcherFlushResult`, `RowHandlerDispatchPhase`, `RetentionBeforeContext`,
   `RetentionAfterContext<T>`, `[RowHandlerPriority]`, `[RowHandlerId]`,
-  `RowHandlerDispatchOptions` and `CohortOptions.RowHandlerDispatch` (the
-  `Cohort:RowHandlerDispatch` section), along with the `sweep_row_handler_status` table and the
-  `CapturedPayload` column.
+  `RetentionSystemWork.RowDispatch`, `RowHandlerDispatchOptions` and
+  `CohortOptions.RowHandlerDispatch` (the `Cohort:RowHandlerDispatch` section), along with the
+  `sweep_row_handler_status` table and the `CapturedPayload` column.
 - Do after-commit work from the entity's dependents step instead. Write a message to your own
   outbox through the DbContext the step receives. The step runs in Cohort's transaction, so
   the message commits and rolls back with the row.
@@ -98,9 +98,11 @@ Removed (breaking): Cohort no longer runs row handlers or keeps a durable work q
 
 Upgrading from 0.11.0:
 
-1. On your current version, drain queued handler work (`FlushAsync` until nothing is
-   pending), and requeue or export dead-lettered work you still need. Whatever is left is
-   dropped with the table.
+1. On 0.11.0, set `Cohort:KillSwitch` to `true`, which stops scheduled sweeps and leaves
+   `FlushAsync` running, and make no explicit sweep or erasure call until 0.12.0 is deployed
+   (on 0.11.0 those still queue handler work). Then drain queued handler work (`FlushAsync`
+   until its result is `Settled`, waiting out retry backoff between calls), and requeue or
+   export dead-lettered work you still need. Whatever is left is dropped with the table.
 2. Move each handler to the entity's dependents step, depositing to your outbox, and remove
    its `[RowHandlerId]`. Pass `retiresReferencingRows: false` when the step only deposits. A
    step differs from a handler:
@@ -111,20 +113,28 @@ Upgrading from 0.11.0:
    - on a model with a tenantless entity, each batch checks that its scope can read
      tenantless holds, and refuses the batch if it can't.
 3. Add a migration. It adds `sweep_run_row_detail.Failure`, copies each skipped row's recorded
-   error into it (the SQL is in
-   [Dependents and After-Commit Work](https://maxanstey-meridian.github.io/cohort/guides/row-handlers#upgrading-from-row-handlers)),
-   then drops the table and the column.
+   error into it, marks each `Succeeded` run with a skipped row as `PartiallyFailed` (before
+   0.11.0 such a run settled `Succeeded`), then drops the table and the column. The SQL is in
+   [Dependents and After-Commit Work](https://maxanstey-meridian.github.io/cohort/guides/row-handlers#upgrading-from-row-handlers).
+   Run this migration as a superuser or a role with `BYPASSRLS`, or, if you enabled row-level
+   security and the role owns the tables, lift `FORCE ROW LEVEL SECURITY` for it: a role a
+   policy applies to fails the migration before anything is dropped.
 4. Move `Cohort:RowHandlerDispatch:SweepSettleTimeout` to `Cohort:SweepSettleTimeout`. The old
    key is ignored.
 5. If your host doesn't run hosted services, call `IRetentionRunRecovery.RecoverAsync` where
    you called `FlushAsync`.
+6. Once 0.12.0 runs, set `Cohort:KillSwitch` back to `false`.
 
 Changed (breaking):
 
 - Abandoned-run recovery runs in its own background service, once a minute, and skips while
   the kill switch is on. Its timeout is now `Cohort:SweepSettleTimeout`, and its execution
-  context is `RetentionSystemWork.Recovery`.
+  context is `RetentionSystemWork.Recovery`, which replaces `RowDispatch`: move your execution
+  scope's `RowDispatch` arm to it (it needs `SELECT` and `UPDATE` on `sweep_run`).
 - A failing dependents step's skipped row is recorded in `sweep_run_row_detail.Failure`.
+- `AddRetentionDependents<TEntity, TStep>` has one overload, with
+  `bool retiresReferencingRows = true`, in place of 0.11.0's: source still compiles, but a
+  library built against 0.11.0 breaks at the binary level, so recompile it against 0.12.0.
 
 Added:
 
@@ -137,8 +147,8 @@ Fixed:
 
 - Sweeps, previews, owned erasures, and abandoned-run recovery no longer throw under an ambient
   `System.Transactions` transaction (a `TransactionScope`, which Npgsql enlists in by default):
-  they and readiness now run outside it, so their work commits on its own and never enlists in
-  yours.
+  they, and the readiness check they run, now run outside it, so their work commits on its own
+  and never enlists in yours.
 
 Upgrade: [Legal Holds](https://maxanstey-meridian.github.io/cohort/guides/legal-holds#upgrading-to-0-12-0),
 [Startup Validation](https://maxanstey-meridian.github.io/cohort/reference/startup-validation#upgrading-to-0-12-0),

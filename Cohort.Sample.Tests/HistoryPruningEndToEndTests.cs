@@ -30,7 +30,10 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
         var failedInsideItsRetention = await SeedRunAsync(SweepRunStatus.Failed, Now.AddDays(-100));
         var oldFailed = await SeedRunAsync(SweepRunStatus.Failed, Now.AddDays(-200));
         var oldPartiallyFailed = await SeedRunAsync(SweepRunStatus.PartiallyFailed, Now.AddDays(-200));
+        // Skipped rows and cancelled work keep their evidence until the failed cutoff.
+        var partiallyFailedInsideItsRetention = await SeedRunAsync(SweepRunStatus.PartiallyFailed, Now.AddDays(-100));
         var oldCancelled = await SeedRunAsync(SweepRunStatus.Cancelled, Now.AddDays(-200));
+        var cancelledInsideItsRetention = await SeedRunAsync(SweepRunStatus.Cancelled, Now.AddDays(-100));
         var unsettled = await SeedRunAsync(SweepRunStatus.Started, settledAt: null, startedAt: Now.AddDays(-500));
 
         using var host = CreateHost(succeededRunRetention: "90.00:00:00", failedRunRetention: "180.00:00:00");
@@ -39,7 +42,13 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
         result.Should().Be(new RetentionHistoryPruneResult(Runs: 4, Holds: 0));
         (await LoadRunIdsAsync())
             .Should()
-            .BeEquivalentTo([recentSucceeded, failedInsideItsRetention, unsettled]);
+            .BeEquivalentTo([
+                recentSucceeded,
+                failedInsideItsRetention,
+                partiallyFailedInsideItsRetention,
+                cancelledInsideItsRetention,
+                unsettled,
+            ]);
         (await CountDependentRowsAsync(oldSucceeded)).Should().Be(0);
         (await CountDependentRowsAsync(oldFailed)).Should().Be(0);
         (await CountDependentRowsAsync(oldPartiallyFailed)).Should().Be(0);

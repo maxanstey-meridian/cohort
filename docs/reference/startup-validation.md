@@ -159,7 +159,7 @@ and `USAGE` on each schema those tables and Cohort's live in.
 | **Readiness**: the `System(Readiness)` scope's own reads | `retention_holds`: `SELECT` | The clock | None |
 | **Recovery**: abandoned-run recovery | `sweep_run`: `SELECT`, `UPDATE` | `pg_try_advisory_lock`, `pg_advisory_unlock` (the run lock), the clock | None |
 | **Worker**: the scheduled worker's coordination | `sweep_run`: `SELECT` | `pg_try_advisory_lock`, `pg_advisory_unlock_all`, the clock | `SELECT` on each tenanted retained table |
-| **Pruning**: history pruning, for the retentions set | Runs: `sweep_run` `SELECT`, `UPDATE`, `DELETE`; `sweep_run_row_detail` and `sweep_run_entity_summary` `SELECT`, `DELETE`. Holds: `retention_holds` `SELECT`, `UPDATE`, `DELETE` | The clock, when a `Schedule` is set | None |
+| **Pruning**: history pruning, for the retentions set | Runs: `sweep_run` `SELECT`, `UPDATE`, `DELETE`; `sweep_run_row_detail` and `sweep_run_entity_summary` `SELECT`, `DELETE`. Holds: `retention_holds` `SELECT`, `UPDATE`, `DELETE` | The clock | None |
 
 In the table, "the entity lock" is
 `pg_advisory_xact_lock` over `hashtextextended`; and "the clock" is `statement_timestamp`,

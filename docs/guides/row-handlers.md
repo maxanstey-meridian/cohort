@@ -35,7 +35,7 @@ row, the run's `TenantId`, and `At`, the database time the batch stamps its rows
 - **One step per entity.** `AddRetentionDependents` refuses a second class for an entity, so
   compose several kinds of dependents in one class. It's the only way to register a step:
   startup refuses an `IRetentionDependents<T>` service in any other shape (a singleton,
-  transient, instance, factory, keyed or open-generic service, one registered twice, or one
+  transient, instance, factory, keyed, or open-generic service, one registered twice, or one
   whose registration was removed or replaced after `AddRetentionDependents` added it), and
   names the step. These checks read the `IServiceCollection`, so register steps with
   `AddRetentionDependents` even when a third-party container builds the provider. Calling it
@@ -122,7 +122,8 @@ depends on `retiresReferencingRows`:
   can't clear runs the step once per run, rolled back each time.
 - **`false`** says it doesn't, for a step that only writes to an outbox, say. Purge keeps the
   up-front filter for that entity: a still-referenced row is left out and counted blocked, and
-  its step never runs. Previews and dry runs count it blocked too.
+  its step never runs. Previews and dry runs count it blocked too. (This needs `SELECT` on the
+  child table; see [Grants](/guides/tenant-isolation#grants).)
 
 ```csharp
 builder.Services.AddRetentionDependents<Note, NoteOutboxStep>(retiresReferencingRows: false);
@@ -141,12 +142,22 @@ the child in the parent's dependents step, which can then write the child's mess
 ## After-commit work through your outbox {#after-commit-work-through-your-outbox}
 
 Work outside the database (delete a blob, tell another system) mustn't run inside the batch:
-it would survive a rollback, and could run for a row that's then blocked, skipped or held.
-Cohort keeps no work queue for it. Instead, the step writes a message to your own outbox
-through the `DbContext` it's handed. The message commits with the row's change and rolls back
-with it, and your outbox delivers it once the transaction has committed.
+it would survive a rollback, and could run for a row that's then blocked, skipped, or held.
+Cohort keeps no work queue for it. Instead, the step writes a message to your outbox through
+the `DbContext` it's handed, to be delivered once the transaction has committed.
 
-Cohort's sample does this with a plain outbox table. The step, `Cohort.Sample/NoteOutboxStep.cs`:
+A maintained outbox delivers the message,
+[Brighter](https://github.com/BrighterCommand/Brighter)'s for one; don't write the relay or its
+retries yourself. Whichever you use, its write must join the context's current transaction, so
+its transaction provider must resolve the same scoped `DbContext` Cohort hands the step (for
+Brighter, check that `PostgreSqlEntityFrameworkTransactionProvider<TContext>` does in your
+registration). Depositing only writes the outbox, so configure its sweeper or relay to publish
+committed messages.
+
+Cohort's half of the contract is that the step's write commits and rolls back with the row.
+Cohort's sample pins it with a stand-in outbox table that it only writes to: nothing in the
+sample delivers its messages. Its step, `Cohort.Sample/NoteOutboxStep.cs`, is the shape of a
+step that deposits, not an outbox to copy:
 
 ```csharp
 public sealed class NoteOutboxStep(SampleDbContext db) : IRetentionDependents<Note>
@@ -211,70 +222,9 @@ builder.Services.AddRetentionDependents<Note, NoteOutboxStep>(retiresReferencing
   constraint refuses, a row whose step fails, and every row of a batch that rolls back leave
   no message. A held row runs no step, so it writes none. In a caller-transaction erasure the
   message commits only if you commit.
-- **Delivery is your outbox's.** Whatever relays the outbox (a poller, a library's sweeper)
-  runs after the commit, at least once, so make what it calls idempotent. The outbox table is
-  yours: leave it unretained, or give it a retention of its own.
-
-### Brighter
-
-[Brighter](https://github.com/BrighterCommand/Brighter)'s outbox fits, given one
-requirement: the outbox write must join the context's current transaction, through a
-transaction provider that resolves the same scoped context Cohort hands the step. Brighter's
-`PostgreSqlEntityFrameworkTransactionProvider<TContext>` takes the context through its
-constructor, so the step injects both the context and the provider from the batch's scope.
-
-Cohort neither compiles nor tests this snippet; `AppDbContext`, `Attachment`, and
-`DeleteAttachmentBlob` are placeholders. The producer configuration:
-
-```csharp
-brighter.AddProducers(producerOptions =>
-{
-    producerOptions.ProducerRegistry = producerRegistry;
-    producerOptions.Outbox = new PostgreSqlOutbox(databaseConfiguration);
-    producerOptions.TransactionProvider =
-        typeof(PostgreSqlEntityFrameworkTransactionProvider<AppDbContext>);
-    producerOptions.ConnectionProvider = typeof(PostgreSqlConnectionProvider);
-});
-```
-
-The step deposits the message after the same `CurrentTransaction` check:
-
-```csharp
-public sealed class DeleteAttachmentBlob(Guid id, string blobName) : Command(id)
-{
-    public string BlobName { get; } = blobName;
-}
-
-public sealed class AttachmentOutboxStep(
-    AppDbContext db,
-    IAmACommandProcessor commandProcessor,
-    IAmABoxTransactionProvider<DbTransaction> transactionProvider
-) : IRetentionDependents<Attachment>
-{
-    public async Task RetireAsync(Attachment row, RetentionDependentsContext ctx, CancellationToken ct)
-    {
-        if (db.Database.CurrentTransaction is null)
-        {
-            throw new InvalidOperationException(
-                "AttachmentOutboxStep deposits only inside the transaction that retires the attachment."
-            );
-        }
-
-        await commandProcessor.DepositPostAsync(
-            new DeleteAttachmentBlob(Guid.NewGuid(), row.BlobName),
-            transactionProvider,
-            cancellationToken: ct
-        );
-    }
-}
-```
-
-```csharp
-builder.Services.AddRetentionDependents<Attachment, AttachmentOutboxStep>(retiresReferencingRows: false);
-```
-
-Brighter then publishes the deposited message after the commit, and the handler that deletes
-the blob runs wherever your consumers run.
+- **Delivery is your outbox's.** Its sweeper or relay runs after the commit, at least once, so
+  make what it calls idempotent. The outbox table is yours: leave it unretained, or give it a
+  retention of its own.
 
 ## Recovering abandoned runs {#recovering-abandoned-runs}
 
@@ -298,12 +248,16 @@ first, as every Cohort operation does. See [Crash recovery](/misc/how-it-works#c
 ## Upgrading from row handlers {#upgrading-from-row-handlers}
 
 0.12.0 removes row handlers (`IRetentionHandler<T>`, `AddRowHandler`, `[RowHandlerPriority]`,
-`[RowHandlerId]`), the dispatcher (`IRetentionRowDispatcher`, `FlushAsync`), the
-`Cohort:RowHandlerDispatch` options, the `sweep_row_handler_status` table, and the
-`sweep_run_row_detail.CapturedPayload` column. From 0.11.0:
+`[RowHandlerId]`), the dispatcher (`IRetentionRowDispatcher`, `FlushAsync`), its execution
+context (`RetentionSystemWork.RowDispatch`), the `Cohort:RowHandlerDispatch` options, the
+`sweep_row_handler_status` table, and the `sweep_run_row_detail.CapturedPayload` column. From
+0.11.0:
 
-1. On 0.11.0, drain queued handler work (`FlushAsync` until nothing is pending), and requeue
-   or export dead-lettered work you still need. Whatever is left is dropped with the table.
+1. On 0.11.0, set `Cohort:KillSwitch` to `true`, which stops scheduled sweeps and leaves
+   `FlushAsync` running, and make no explicit sweep or erasure call until 0.12.0 is deployed
+   (on 0.11.0 those still queue handler work). Then drain queued handler work (`FlushAsync`
+   until its result is `Settled`, waiting out retry backoff between calls), and requeue or
+   export dead-lettered work you still need. Whatever is left is dropped with the table.
 2. Move each handler to the entity's dependents step, depositing to your outbox
    ([above](#after-commit-work-through-your-outbox)), and remove its `[RowHandlerId]` (a step
    carries none now). Pass `retiresReferencingRows: false` when the step only deposits. A step
@@ -330,32 +284,58 @@ first, as every Cohort operation does. See [Crash recovery](/misc/how-it-works#c
 
    migrationBuilder.Sql(
        """
-       UPDATE "public"."sweep_run_row_detail" AS detail
-       SET "Failure" = status."LastError"
-       FROM "public"."sweep_row_handler_status" AS status
-       WHERE status."SweepRunRowDetailId" = detail."Id"
-         AND status."State" = 3
-         AND status."Attempt" = 1
-         AND status."ClaimedAt" IS NULL
-         AND status."CompletedAt" = status."QueuedAt";
+       DO $$
+       BEGIN
+           SET LOCAL row_security = off;
+
+           UPDATE "public"."sweep_run_row_detail" AS detail
+           SET "Failure" = status."LastError"
+           FROM "public"."sweep_row_handler_status" AS status
+           WHERE status."SweepRunRowDetailId" = detail."Id"
+             AND status."State" = 3
+             AND status."Attempt" = 1
+             AND status."ClaimedAt" IS NULL
+             AND status."CompletedAt" = status."QueuedAt";
+
+           UPDATE "public"."sweep_run" AS run
+           SET "Status" = 2,
+               "Error" = COALESCE(run."Error", 'reason=rows-skipped')
+           WHERE run."Status" = 1
+             AND EXISTS (
+                 SELECT 1 FROM "public"."sweep_run_row_detail" AS detail
+                 WHERE detail."SweepId" = run."SweepId" AND detail."Failure" IS NOT NULL
+             );
+
+           DROP TABLE "public"."sweep_row_handler_status";
+
+           ALTER TABLE "public"."sweep_run_row_detail" DROP COLUMN "CapturedPayload";
+
+           SET LOCAL row_security TO DEFAULT;
+       END
+       $$;
        """);
-
-   migrationBuilder.DropTable(
-       name: "sweep_row_handler_status",
-       schema: "public");
-
-   migrationBuilder.DropColumn(
-       name: "CapturedPayload",
-       schema: "public",
-       table: "sweep_run_row_detail");
    ```
 
-   Write your Cohort schema where the sample has `public`, if you passed one to
-   `ConfigureCohortTables`. The `UPDATE` copies the error of each row a failing dependents
-   step skipped: 0.11.0 recorded that as a dead-lettered status (`State` 3) queued and
-   completed at one database-clock instant and never claimed. A dead-lettered `OnAfterAsync`
-   delivery belongs to a row that was changed, so its row detail keeps `Failure` `NULL`.
+   Write your Cohort schema wherever the sample has `public`, all through the `Sql` block too, if
+   you passed one to `ConfigureCohortTables`. The first `UPDATE` copies the error of each row a failing
+   `OnBeforeAsync` handler or dependents step skipped: 0.11.0 recorded that as a dead-lettered status (`State` 3) queued
+   and completed at one database-clock instant and never claimed. A dead-lettered
+   `OnAfterAsync` delivery belongs to a row that was changed, so its row detail keeps `Failure`
+   `NULL`. The second marks each `Succeeded` run (`Status` 1) with a skipped row as
+   `PartiallyFailed` (`Status` 2): before 0.11.0 such a run settled `Succeeded`, and history
+   pruning would delete it at the succeeded-run retention rather than keep it for the
+   failed-run retention.
+
+   Run this migration as a superuser or a role with `BYPASSRLS`, or, if you
+   [enabled row-level security](/reference/schema#row-level-security) and the role owns the
+   tables, lift `FORCE ROW LEVEL SECURITY` for it. The backfill and the drops run as one
+   statement with `row_security` off, so a role a policy applies to fails the migration before
+   anything is dropped, rather than copying nothing, whichever way the migration is applied.
 4. Move `Cohort:RowHandlerDispatch:SweepSettleTimeout` to `Cohort:SweepSettleTimeout`. The old
    key is ignored.
 5. If your host doesn't run hosted services, call `IRetentionRunRecovery.RecoverAsync` where
    you called `FlushAsync` ([above](#recovering-abandoned-runs)).
+6. If your `IRetentionExecutionScope` has a `RetentionSystemWork.RowDispatch` arm, move it to
+   `RetentionSystemWork.Recovery`, which replaces it for abandoned-run recovery. Its role needs
+   `SELECT` and `UPDATE` on `sweep_run` (see [Grants](/guides/tenant-isolation#grants)).
+7. Once 0.12.0 runs, set `Cohort:KillSwitch` back to `false`.

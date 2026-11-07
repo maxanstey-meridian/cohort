@@ -329,8 +329,9 @@ the transaction, so call it when the context has no transaction open.
 ## Upgrading to 0.12.0
 
 ::: warning Breaking change
-0.12.0 lets a hold cover related rows and judges those rows wherever it judges holds. There is
-no schema change and no migration.
+0.12.0 lets a hold cover related rows and judges those rows wherever it judges holds. The hold
+change itself needs no schema change or migration; 0.12.0 as a whole does: see
+[Dependents and After-Commit Work](/guides/row-handlers#upgrading-from-row-handlers).
 
 - `IRetentionHoldsRepository` gains `ListCoveringAsync` and `ListCoveringSubjectAsync`. A host
   that implements the interface (a test double, a decorator) must add both. A host that only

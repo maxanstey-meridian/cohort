@@ -23,31 +23,56 @@ namespace Cohort.Sample.Migrations
             // status queued, and completed, at one database-clock instant, never claimed; its
             // error moves to the row detail. An after-commit dead-letter belongs to a mutated
             // row, so its row detail keeps Failure NULL.
+            //
+            // Before 0.11.0 a run whose step skipped rows settled Succeeded; it settles
+            // PartiallyFailed now, and the failed-run retention keeps it.
+            //
+            // With row_security off, a role a row-level-security policy applies to fails at the
+            // backfill instead of copying nothing under a policy with no tenant set. The backfill,
+            // the run rewrite, and the drops are one DO statement, so that failure aborts the
+            // drops too, however the SQL is applied: a runner that carries on after an error has
+            // no later statement to run. SET LOCAL lasts to the end of the enclosing transaction,
+            // which under EF is every pending migration's, so the block's last line puts
+            // row_security back before anything after it.
             migrationBuilder.Sql(
                 """
-                UPDATE "public"."sweep_run_row_detail" AS detail
-                SET "Failure" = status."LastError"
-                FROM "public"."sweep_row_handler_status" AS status
-                WHERE status."SweepRunRowDetailId" = detail."Id"
-                  AND status."State" = 3
-                  AND status."Attempt" = 1
-                  AND status."ClaimedAt" IS NULL
-                  AND status."CompletedAt" = status."QueuedAt";
+                DO $$
+                BEGIN
+                    SET LOCAL row_security = off;
+
+                    UPDATE "public"."sweep_run_row_detail" AS detail
+                    SET "Failure" = status."LastError"
+                    FROM "public"."sweep_row_handler_status" AS status
+                    WHERE status."SweepRunRowDetailId" = detail."Id"
+                      AND status."State" = 3
+                      AND status."Attempt" = 1
+                      AND status."ClaimedAt" IS NULL
+                      AND status."CompletedAt" = status."QueuedAt";
+
+                    UPDATE "public"."sweep_run" AS run
+                    SET "Status" = 2,
+                        "Error" = COALESCE(run."Error", 'reason=rows-skipped')
+                    WHERE run."Status" = 1
+                      AND EXISTS (
+                          SELECT 1 FROM "public"."sweep_run_row_detail" AS detail
+                          WHERE detail."SweepId" = run."SweepId" AND detail."Failure" IS NOT NULL
+                      );
+
+                    DROP TABLE "public"."sweep_row_handler_status";
+
+                    ALTER TABLE "public"."sweep_run_row_detail" DROP COLUMN "CapturedPayload";
+
+                    SET LOCAL row_security TO DEFAULT;
+                END
+                $$;
                 """);
-
-            migrationBuilder.DropTable(
-                name: "sweep_row_handler_status",
-                schema: "public");
-
-            migrationBuilder.DropColumn(
-                name: "CapturedPayload",
-                schema: "public",
-                table: "sweep_run_row_detail");
         }
 
         /// <inheritdoc />
         protected override void Down(MigrationBuilder migrationBuilder)
         {
+            // The runs Up() moved from Succeeded to PartiallyFailed stay PartiallyFailed: a run Up()
+            // rewrote can't be told apart from one that settled PartiallyFailed with skipped rows.
             migrationBuilder.AddColumn<string>(
                 name: "CapturedPayload",
                 schema: "public",

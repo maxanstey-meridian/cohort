@@ -73,9 +73,10 @@ have open on it. See
 - Caller times (`now`, `createdAt`, `expiresAt`, `removedAt`, ...) can carry any offset.
   Cohort normalises them to UTC at the boundary.
 - The calls that own their work (a sweep, a preview, an `ErasureTransaction.Owned` erasure,
-  and `IRetentionRunRecovery.RecoverAsync`), and readiness, run outside an ambient
-  `System.Transactions` transaction (a `TransactionScope`), so they never enlist in it: their
-  work commits on its own, and disposing your scope without `Complete()` doesn't undo it.
+  and `IRetentionRunRecovery.RecoverAsync`), including the readiness check each runs, run
+  outside an ambient `System.Transactions` transaction (a `TransactionScope`), so they never
+  enlist in it: their work commits on its own, and disposing your scope without `Complete()`
+  doesn't undo it.
 
 These services also check PostgreSQL, model and schema readiness themselves, so they're safe
 to call from a host that never ran Cohort's startup validation.

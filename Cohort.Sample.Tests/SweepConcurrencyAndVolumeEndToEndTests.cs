@@ -237,8 +237,7 @@ public sealed class SweepConcurrencyAndVolumeEndToEndTests(PostgresFixture fixtu
             .Where(count => count.EntityType == typeof(Note))
             .Sum(count => count.Affected).Should().Be(expiredRows);
         results.Should().AllSatisfy(result => result.EntityFailures.Should().BeEmpty());
-        // A row both engines loaded runs the step in each; only one deletes it.
-        runs.Count.Should().BeGreaterThanOrEqualTo(expiredRows, "both engines took the row-by-row path");
+        runs.Count.Should().Be(expiredRows, "each row's lock is held by one engine while its step runs");
         var evidence = await ReadSweepLedgerAsync(objectSuffix);
         evidence.Should().HaveCount(expiredRows);
         evidence.Select(row => row.BackendId).Distinct().Should().HaveCount(2);

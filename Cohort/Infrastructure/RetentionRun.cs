@@ -209,7 +209,7 @@ internal sealed class RetentionRun(
         plan = await ReferencingForeignKeySql.AttachAsync(
             db.Database.GetDbConnection(),
             plan,
-            entry => dependentsRegistrations.RetiresReferencingRows(entry.EntityType),
+            dependentsRegistrations,
             ct
         );
         foreach (var scope in RetentionExecutionPlanOrderer.Order(db, plan, scope => scope.Entry, logger))

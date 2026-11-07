@@ -77,23 +77,22 @@ internal sealed class RetentionHistoryPruner(
         }
 
         var pruning = current.HistoryPruning;
-        var currentOccurrence = await scopeFactory.RunInScopeAsync(
+        var (now, currentOccurrence) = await scopeFactory.RunInScopeAsync(
             HistoryPruning,
             async services =>
             {
                 await services
                     .GetRequiredService<RetentionRuntimeReadinessValidator>()
                     .ValidateAsync(ct);
-                return await CurrentOccurrenceAsync(
+                var databaseNow = await DatabaseClock.NowAsync(
                     services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext),
-                    current.Schedule,
                     ct
                 );
+                return (databaseNow, CurrentOccurrence(current.Schedule, databaseNow));
             },
             ct
         );
 
-        var now = DateTimeOffset.UtcNow;
         var succeededCutoff = Cutoff(now, pruning.SucceededRunRetention);
         var failedCutoff = Cutoff(now, pruning.FailedRunRetention);
 
@@ -159,18 +158,14 @@ internal sealed class RetentionHistoryPruner(
         );
 
     /// <summary>
-    /// The latest occurrence of <paramref name="schedule"/> at or before the database clock,
-    /// the occurrence the worker is catching up; null, without reading the clock, when no
+    /// The latest occurrence of <paramref name="schedule"/> at or before
+    /// <paramref name="databaseNow"/>, the occurrence the worker is catching up; null when no
     /// schedule is set.
     /// </summary>
-    private static async Task<DateTimeOffset?> CurrentOccurrenceAsync(
-        DbContext db,
-        string? schedule,
-        CancellationToken ct
-    ) =>
+    private static DateTimeOffset? CurrentOccurrence(string? schedule, DateTimeOffset databaseNow) =>
         string.IsNullOrWhiteSpace(schedule)
             ? null
-            : CohortScheduleParser.GetPreviousOccurrence(schedule, await DatabaseClock.NowAsync(db, ct));
+            : CohortScheduleParser.GetPreviousOccurrence(schedule, databaseNow);
 
     /// <summary>
     /// One batch of inactive holds; see <see cref="HistoryPruningSql.PruneHoldBatchAsync"/>.

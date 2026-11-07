@@ -236,7 +236,7 @@ internal sealed class RetentionStatementReadiness(
         var attached = await ReferencingForeignKeySql.AttachAsync(
             db.Database.GetDbConnection(),
             scopes.Select(scope => scope.Scope).ToArray(),
-            entry => dependentsRegistrations.RetiresReferencingRows(entry.EntityType),
+            dependentsRegistrations,
             ct
         );
         return [.. scopes.Select((scope, index) => scope with { Scope = attached[index] })];

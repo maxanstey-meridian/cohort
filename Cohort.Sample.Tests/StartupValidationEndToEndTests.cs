@@ -80,6 +80,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     [InlineData("factory")]
     [InlineData("duplicate")]
     [InlineData("singleton-first")]
+    [InlineData("instance-first")]
     [InlineData("factory-first")]
     [InlineData("service-removed")]
     [InlineData("keyed")]
@@ -114,6 +115,10 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
                 builder.Services.AddSingleton<IRetentionDependents<Note>, UnconstructableNoteStep>();
                 builder.Services.AddRetentionDependents<Note, UnconstructableNoteStep>();
                 break;
+            case "instance-first":
+                builder.Services.AddSingleton<IRetentionDependents<Note>>(new InstanceNoteStep());
+                builder.Services.AddRetentionDependents<Note, InstanceNoteStep>();
+                break;
             case "factory-first":
                 builder.Services.AddScoped<IRetentionDependents<Note>, UnconstructableNoteStep>(_ => new UnconstructableNoteStep());
                 builder.Services.AddRetentionDependents<Note, UnconstructableNoteStep>();
@@ -141,7 +146,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         {
             "factory" or "factory-first" or "keyed" => $"IRetentionDependents<{typeof(Note).FullName}>",
             "open-generic" => "IRetentionDependents<>",
-            "instance" => typeof(InstanceNoteStep).FullName!,
+            "instance" or "instance-first" => typeof(InstanceNoteStep).FullName!,
             _ => typeof(UnconstructableNoteStep).FullName!,
         };
         foreach (var act in new[] { start, sweep })
@@ -168,8 +173,9 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         services.AddScoped<IRetentionDependents<Note>, StrayNoteStep>();
         using var provider = services.BuildServiceProvider();
         using var scope = provider.CreateScope();
+        var registration = scope.ServiceProvider.GetServices<IRetentionDependentsRegistration>().Single();
 
-        var act = () => RetentionHandlerSupport.ResolveDependents(scope.ServiceProvider, typeof(Note));
+        var act = () => RetentionDependentsSteps.ResolveDependents(scope.ServiceProvider, registration);
 
         act.Should().Throw<RetentionConfigurationException>()
             .Which.Errors.Should().ContainSingle(error =>
@@ -198,8 +204,9 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
 
         using var provider = services.BuildServiceProvider();
         using var scope = provider.CreateScope();
+        var dependentsRegistration = scope.ServiceProvider.GetServices<IRetentionDependentsRegistration>().Single();
 
-        var act = () => RetentionHandlerSupport.ResolveDependents(scope.ServiceProvider, typeof(Note));
+        var act = () => RetentionDependentsSteps.ResolveDependents(scope.ServiceProvider, dependentsRegistration);
 
         act.Should().Throw<RetentionConfigurationException>()
             .Which.Errors.Should().ContainSingle(error =>

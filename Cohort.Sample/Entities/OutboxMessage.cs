@@ -1,8 +1,10 @@
 namespace Cohort.Sample.Entities;
 
 /// <summary>
-/// The sample host's own outbox: a message written by a dependents step commits with the row it
-/// retires and rolls back with it. Unretained, so Cohort never sweeps it.
+/// A stand-in outbox table that pins Cohort's half of the contract: a message written by a
+/// dependents step commits with the row it retires and rolls back with it. The sample only
+/// deposits: nothing delivers the messages, a job a real host leaves to a maintained outbox.
+/// Unretained, so Cohort never sweeps it.
 /// </summary>
 public sealed class OutboxMessage
 {

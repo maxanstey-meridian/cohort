@@ -108,7 +108,7 @@ internal static class CohortSchemaContract
             [new(["SweepId"])],
             ForeignKeys:
             [
-                new(["SweepId"], CohortTableNames.SweepRun, ["SweepId"], ForeignKeyDeleteAction.Restrict),
+                new(["SweepId"], CohortTableNames.SweepRun, ["SweepId"]),
             ]
         ),
         new(
@@ -139,7 +139,7 @@ internal static class CohortSchemaContract
             ],
             ForeignKeys:
             [
-                new(["SweepId"], CohortTableNames.SweepRun, ["SweepId"], ForeignKeyDeleteAction.Restrict),
+                new(["SweepId"], CohortTableNames.SweepRun, ["SweepId"]),
             ]
         ),
     ];
@@ -189,32 +189,20 @@ internal static class CohortSchemaContract
     internal sealed record IndexRequirement(
         IReadOnlyList<string> Columns,
         bool Unique = false,
-        string? Predicate = null,
         string? Name = null
     );
 
     internal sealed record CheckConstraintRequirement(string Name, string Sql);
 
+    // Every foreign key Cohort requires is ON DELETE RESTRICT, which pg_constraint.confdeltype
+    // records as 'r'.
+    internal const char RestrictDeleteAction = 'r';
+
     internal sealed record ForeignKeyRequirement(
         IReadOnlyList<string> Columns,
         string PrincipalTable,
-        IReadOnlyList<string> PrincipalColumns,
-        ForeignKeyDeleteAction DeleteAction
-    )
-    {
-        internal char CatalogDeleteAction => DeleteAction switch
-        {
-            ForeignKeyDeleteAction.Restrict => 'r',
-            ForeignKeyDeleteAction.Cascade => 'c',
-            _ => throw new ArgumentOutOfRangeException(nameof(DeleteAction)),
-        };
-    }
-
-    internal enum ForeignKeyDeleteAction
-    {
-        Restrict,
-        Cascade,
-    }
+        IReadOnlyList<string> PrincipalColumns
+    );
 }
 
 internal static class CohortTableNames

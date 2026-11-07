@@ -166,8 +166,8 @@ writing summaries that record 0 for counts it never measured. Summaries written 
 upgrade keep 0 in all three: those counts weren't measured, so read them as unknown for runs
 that started before you upgraded.
 
-A run whose dependents step skipped rows now settles `PartiallyFailed` instead of `Succeeded`,
-with a `rows-skipped` reason, so alerts on run status will see these runs.
+A run whose row handlers skipped rows settled `PartiallyFailed` instead of `Succeeded` from
+0.11.0, with a `rows-skipped` reason, so alerts on run status saw these runs.
 
 A row a database constraint refuses no longer fails its whole entity. It's counted in
 `BlockedCount`, the rest of the entity is swept, and a sweep whose only leftovers are

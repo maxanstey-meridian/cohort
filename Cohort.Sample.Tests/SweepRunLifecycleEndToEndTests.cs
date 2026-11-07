@@ -10,6 +10,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -120,6 +121,30 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Recovery_Waits_Out_The_Settle_Timeout_The_Host_Configures()
+    {
+        // No owner holds the run's lock, so only the settle timeout decides: the default hour
+        // leaves a ten-minute-old run Started, and a configured five minutes fails it.
+        var sweepId = await SeedStartedRunAsync(DateTimeOffset.UtcNow.AddMinutes(-10));
+        using (var defaultHost = new CohortTestHost(ConnectionString))
+        {
+            await RecoverAsync(defaultHost);
+        }
+
+        (await LoadRunStatusAsync(sweepId)).Should().Be(SweepRunStatus.Started);
+
+        using var configuredHost = new CohortTestHost(
+            ConnectionString,
+            configurationOverrides: new Dictionary<string, string?> { ["Cohort:SweepSettleTimeout"] = "00:05:00" }
+        );
+        await RecoverAsync(configuredHost);
+
+        (await LoadRunStatusAndErrorAsync(sweepId))
+            .Should()
+            .Be((SweepRunStatus.Failed, "Run owner exited before writing a terminal audit event."));
+    }
+
+    [Fact]
     public async Task The_Hosted_Recovery_Fails_An_Abandoned_Run_When_The_Host_Starts()
     {
         var sweepId = await SeedStartedRunAsync(DateTimeOffset.UtcNow.AddDays(-1));
@@ -146,7 +171,8 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
     {
         var sweepId = await SeedStartedRunAsync(DateTimeOffset.UtcNow.AddDays(-1));
         var logs = new CapturingLogProvider();
-        using var app = BuildRecoveryHost(logs, killSwitch: true);
+        var executionScope = new RecordingExecutionScope();
+        using var app = BuildRecoveryHost(logs, killSwitch: true, executionScope);
 
         await app.StartAsync();
         try
@@ -163,6 +189,9 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
             await app.StopAsync();
         }
 
+        // A recovery opens its scope before it can be cancelled, so even one stopped before it
+        // committed shows here. Startup checks no Recovery scope under the kill switch.
+        executionScope.Ran.Should().NotContain(new RetentionExecutionContext.System(RetentionSystemWork.Recovery));
         (await LoadRunStatusAsync(sweepId)).Should().Be(SweepRunStatus.Started);
     }
 
@@ -176,7 +205,11 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
     /// appsettings.json, copied into the test output, sets the default level to Information,
     /// and configuration overrides the minimum level, so the level is set there.
     /// </summary>
-    private IHost BuildRecoveryHost(CapturingLogProvider logs, bool killSwitch)
+    private IHost BuildRecoveryHost(
+        CapturingLogProvider logs,
+        bool killSwitch,
+        IRetentionExecutionScope? executionScope = null
+    )
     {
         var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder();
         builder.Configuration.AddInMemoryCollection(
@@ -189,6 +222,12 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
         );
         builder.Logging.AddProvider(logs);
         builder.Services.AddSampleRetentionServices();
+        if (executionScope is not null)
+        {
+            builder.Services.RemoveAll<IRetentionExecutionScope>();
+            builder.Services.AddSingleton(executionScope);
+        }
+
         return builder.Build();
     }
 

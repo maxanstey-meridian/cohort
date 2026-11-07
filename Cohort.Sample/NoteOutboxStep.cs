@@ -5,9 +5,9 @@ using Cohort.Sample.Entities;
 namespace Cohort.Sample;
 
 /// <summary>
-/// Tells the rest of the system that a note was retired, through the sample's own outbox: the
-/// message is written in the transaction that retires the note, so it commits and rolls back
-/// with it.
+/// Deposits a message saying a note was retired in the sample's stand-in outbox, in the
+/// transaction that retires the note, so it commits and rolls back with it. The sample only
+/// deposits: nothing delivers the message.
 /// </summary>
 public sealed class NoteOutboxStep(SampleDbContext db) : IRetentionDependents<Note>
 {

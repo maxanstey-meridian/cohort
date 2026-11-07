@@ -19,7 +19,7 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
     : IntegrationTestBase(fixture)
 {
     [Fact]
-    public async Task Row_By_Row_Erasure_Rechecks_Subject_After_Waiting_For_The_Row()
+    public async Task Erasure_Rechecks_Subject_After_Waiting_For_The_Row()
     {
         var tenantId = Guid.NewGuid();
         var originalSubjectId = Guid.NewGuid();
@@ -45,7 +45,6 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
             await db.SaveChangesAsync();
         }
 
-        // A dependents step puts the entity on the row-by-row path.
         using var stepHost = new CohortTestHost(
             GetConnectionString(),
             configureServices: services =>

@@ -20,7 +20,7 @@ internal sealed partial class RetentionStartupValidator(
     IEnumerable<IAnonymiseValueFactory> anonymiseValueFactories,
     RetentionValidationState validationState,
     ErasureSubjectMetadataResolver erasureSubjectMetadataResolver,
-    RetentionHandlerServiceRegistrations stepServices
+    RetentionDependentsServiceRegistrations stepServices
 )
 {
     // Instance field, not static: NullabilityInfoContext is documented as not thread-safe,
@@ -254,7 +254,7 @@ internal sealed partial class RetentionStartupValidator(
                 }
             }
 
-            ValidateRowWorkTargetsRetainedEntities(errors);
+            ValidateStepsTargetRetainedEntities(errors);
             ValidateErasureSubjectKinds(validation, errors);
             ValidateHoldRelations(retainedEntries, errors);
 
@@ -331,7 +331,7 @@ internal sealed partial class RetentionStartupValidator(
 
     // A step runs only where Cohort mutates a row, so one on an entity Cohort never retains
     // would never run.
-    private void ValidateRowWorkTargetsRetainedEntities(List<string> errors)
+    private void ValidateStepsTargetRetainedEntities(List<string> errors)
     {
         var retained = db.Model.GetEntityTypes()
             .Select(entityType => entityType.ClrType)

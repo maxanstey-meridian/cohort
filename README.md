@@ -163,7 +163,8 @@ the run is written to Cohort's ledger.
   `IRetentionDeletion` lets your own deletes respect holds too.
 - [Dependents and after-commit work](https://maxanstey-meridian.github.io/cohort/guides/row-handlers):
   retire a row's child rows and audit copies in its own transaction, and write a message to
-  your own outbox there, so blob cleanup and events commit with the row and roll back with it.
+  your own outbox there. The message commits with the row and rolls back with it, and your
+  outbox runs the blob cleanup or sends the event after the commit.
 - [Audit observers](https://maxanstey-meridian.github.io/cohort/guides/audit-trail): export
   each committed run event to your own systems.
 - [History pruning](https://maxanstey-meridian.github.io/cohort/guides/history-pruning):

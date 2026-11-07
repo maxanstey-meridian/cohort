@@ -1,5 +1,6 @@
 using System.Data.Common;
 
+using Cohort.Application;
 using Cohort.Domain;
 
 namespace Cohort.Infrastructure.Sweep;
@@ -24,23 +25,22 @@ internal static class ReferencingForeignKeySql
     /// per run. Only a deletion is blocked by a reference: the other strategies keep the row.
     /// A child table the session can't read is left out, so the sweep never fails on it;
     /// the database still refuses the delete, and that row is blocked when it is tried.
-    /// <paramref name="retiresReferencingRows"/> is
-    /// <c>RetentionDependentsRegistrations.RetiresReferencingRows</c>: an entity whose dependents
-    /// step was registered as retiring the rows that reference it gets none, so its rows are
-    /// tried, and a row still referenced after the step is blocked by the constraint itself.
-    /// Every other Purge entity, a step registered with <c>retiresReferencingRows: false</c>
-    /// included, keeps the pre-filter: a still-referenced row is left out up front and
-    /// counted blocked.
+    /// An entity whose dependents step was registered as retiring the rows that reference it
+    /// gets none, so its rows are tried, and a row still referenced after the step is blocked
+    /// by the constraint itself. Every other Purge entity, a step registered with
+    /// <c>retiresReferencingRows: false</c> included, keeps the pre-filter: a still-referenced
+    /// row is left out up front and counted blocked.
     /// </summary>
     public static async Task<IReadOnlyList<SweepScope>> AttachAsync(
         DbConnection connection,
         IReadOnlyList<SweepScope> plan,
-        Func<RetentionEntry, bool> retiresReferencingRows,
+        IEnumerable<IRetentionDependentsRegistration> dependentsRegistrations,
         CancellationToken ct
     )
     {
         bool Blockable(SweepScope scope) =>
-            scope.Rule.Strategy == Strategy.Purge && !retiresReferencingRows(scope.Entry);
+            scope.Rule.Strategy == Strategy.Purge
+            && !dependentsRegistrations.RetiresReferencingRows(scope.Entry.EntityType);
 
         var tables = plan
             .Where(Blockable)

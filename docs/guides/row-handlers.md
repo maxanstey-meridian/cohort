@@ -326,11 +326,16 @@ context (`RetentionSystemWork.RowDispatch`), the `Cohort:RowHandlerDispatch` opt
    pruning would delete it at the succeeded-run retention rather than keep it for the
    failed-run retention.
 
-   Run this migration as a superuser or a role with `BYPASSRLS`, or, if you
-   [enabled row-level security](/reference/schema#row-level-security) and the role owns the
-   tables, lift `FORCE ROW LEVEL SECURITY` for it. The backfill and the drops run as one
-   statement with `row_security` off, so a role a policy applies to fails the migration before
-   anything is dropped, rather than copying nothing, whichever way the migration is applied.
+   If you set `FORCE ROW LEVEL SECURITY` on Cohort's tables, as
+   [Row-level security](/reference/schema#row-level-security) asks when your connecting role
+   owns them, run this migration as a superuser or a role with `BYPASSRLS`, or run
+   `ALTER TABLE … NO FORCE ROW LEVEL SECURITY` on `sweep_run`, `sweep_run_row_detail`, and
+   `sweep_row_handler_status` first, then `FORCE` `sweep_run` and `sweep_run_row_detail` again
+   afterwards (the migration drops the third): row-level security applies to the owner of a
+   `FORCE`d table, so the migration fails before anything is dropped.
+   Without `FORCE`, the tables' owner runs it as it is. The backfill and the drops run as one
+   statement with `row_security` off, so it fails rather than copying nothing, whichever way the
+   migration is applied.
 4. Move `Cohort:RowHandlerDispatch:SweepSettleTimeout` to `Cohort:SweepSettleTimeout`. The old
    key is ignored.
 5. If your host doesn't run hosted services, call `IRetentionRunRecovery.RecoverAsync` where

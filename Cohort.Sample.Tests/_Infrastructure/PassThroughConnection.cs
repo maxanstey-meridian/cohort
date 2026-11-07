@@ -10,12 +10,15 @@ namespace Cohort.Sample.Tests;
 /// profiler's or a per-scope unit-of-work wrapper is. <paramref name="connectionStringSuffix"/>
 /// is appended to the string it reports, as a wrapper's own settings are. Disposing it disposes
 /// the inner connection unless <paramref name="ownsInner"/> is false, as when several wrappers
-/// share one connection.
+/// share one connection. <paramref name="rewriteCommandText"/>, when given, rewrites the text of
+/// every command made on it before it reaches the server, for a test that has to change a
+/// statement Cohort sends on raw ADO.NET, below EF's command interceptors.
 /// </summary>
 internal sealed class PassThroughConnection(
     NpgsqlConnection inner,
     string connectionStringSuffix = "",
-    bool ownsInner = true
+    bool ownsInner = true,
+    Func<string, string>? rewriteCommandText = null
 ) : DbConnection
 {
     [System.Diagnostics.CodeAnalysis.AllowNull]
@@ -41,7 +44,8 @@ internal sealed class PassThroughConnection(
 
     public override void Close() => inner.Close();
 
-    protected override DbCommand CreateDbCommand() => new PassThroughCommand(this, inner.CreateCommand());
+    protected override DbCommand CreateDbCommand() =>
+        new PassThroughCommand(this, inner.CreateCommand(), rewriteCommandText);
 
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel) =>
         new PassThroughTransaction(this, inner.BeginTransaction(isolationLevel));
@@ -94,7 +98,11 @@ internal sealed class PassThroughTransaction(PassThroughConnection connection, N
     }
 }
 
-internal sealed class PassThroughCommand(PassThroughConnection connection, NpgsqlCommand inner) : DbCommand
+internal sealed class PassThroughCommand(
+    PassThroughConnection connection,
+    NpgsqlCommand inner,
+    Func<string, string>? rewriteCommandText
+) : DbCommand
 {
     private PassThroughTransaction? transaction;
 
@@ -102,7 +110,9 @@ internal sealed class PassThroughCommand(PassThroughConnection connection, Npgsq
     public override string CommandText
     {
         get => inner.CommandText;
-        set => inner.CommandText = value;
+        set => inner.CommandText = value is not null && rewriteCommandText is not null
+            ? rewriteCommandText(value)
+            : value;
     }
 
     public override int CommandTimeout

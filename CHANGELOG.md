@@ -116,9 +116,14 @@ Upgrading from 0.11.0:
    error into it, marks each `Succeeded` run with a skipped row as `PartiallyFailed` (before
    0.11.0 such a run settled `Succeeded`), then drops the table and the column. The SQL is in
    [Dependents and After-Commit Work](https://maxanstey-meridian.github.io/cohort/guides/row-handlers#upgrading-from-row-handlers).
-   Run this migration as a superuser or a role with `BYPASSRLS`, or, if you enabled row-level
-   security and the role owns the tables, lift `FORCE ROW LEVEL SECURITY` for it: a role a
-   policy applies to fails the migration before anything is dropped.
+   If you set `FORCE ROW LEVEL SECURITY` on Cohort's tables, as
+   [Row-level security](https://maxanstey-meridian.github.io/cohort/reference/schema#row-level-security)
+   asks when your connecting role owns them, run this migration as a superuser or a role with
+   `BYPASSRLS`, or run `ALTER TABLE … NO FORCE ROW LEVEL SECURITY` on `sweep_run`,
+   `sweep_run_row_detail`, and `sweep_row_handler_status` first, then `FORCE` `sweep_run` and
+   `sweep_run_row_detail` again afterwards (the migration drops the third): row-level security
+   applies to the owner of a `FORCE`d table, so the migration fails before anything is dropped.
+   Without `FORCE`, the tables' owner runs it as it is.
 4. Move `Cohort:RowHandlerDispatch:SweepSettleTimeout` to `Cohort:SweepSettleTimeout`. The old
    key is ignored.
 5. If your host doesn't run hosted services, call `IRetentionRunRecovery.RecoverAsync` where
@@ -149,6 +154,9 @@ Fixed:
   `System.Transactions` transaction (a `TransactionScope`, which Npgsql enlists in by default):
   they, and the readiness check they run, now run outside it, so their work commits on its own
   and never enlists in yours.
+- History pruning ages runs and holds against the database clock, the clock that stamps
+  `SettledAt` and judges whether a hold protects, instead of the host's. It reads the clock on
+  every pass, with or without a `Schedule`.
 
 Upgrade: [Legal Holds](https://maxanstey-meridian.github.io/cohort/guides/legal-holds#upgrading-to-0-12-0),
 [Startup Validation](https://maxanstey-meridian.github.io/cohort/reference/startup-validation#upgrading-to-0-12-0),

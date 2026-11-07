@@ -173,6 +173,38 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Prune_Ages_Runs_And_Holds_Against_The_Database_Clock()
+    {
+        // The database clock runs 30 days behind the host's here, so a run and a hold that
+        // stopped 100 days ago by the host's clock are 70 days old by the database's.
+        var run = await SeedRunAsync(SweepRunStatus.Succeeded, Now.AddDays(-100));
+        var hold = await SeedHoldAsync(expiresAt: null, removedAt: Now.AddDays(-100));
+
+        using var host = CreateHost(
+            succeededRunRetention: "90.00:00:00",
+            inactiveHoldRetention: "90.00:00:00",
+            // Cohort reads the database clock on raw ADO.NET, below EF's command interceptors,
+            // so the read is moved on the context's connection. No other statement matches.
+            configureServices: services => services.ConfigureDbContext<SampleDbContext>((_, options) =>
+                options.UseNpgsql(
+                    new PassThroughConnection(
+                        new NpgsqlConnection(ConnectionString),
+                        rewriteCommandText: text => text == "SELECT pg_catalog.statement_timestamp()"
+                            ? "SELECT pg_catalog.statement_timestamp() - INTERVAL '30 days'"
+                            : text
+                    ),
+                    contextOwnsConnection: true
+                )
+            )
+        );
+        var result = await PruneAsync(host);
+
+        result.Should().Be(new RetentionHistoryPruneResult(Runs: 0, Holds: 0));
+        (await LoadRunIdsAsync()).Should().BeEquivalentTo([run]);
+        (await LoadHoldIdsAsync()).Should().BeEquivalentTo([hold]);
+    }
+
+    [Fact]
     public async Task Prune_Works_Through_A_Backlog_In_Batches_In_One_Pass()
     {
         const int backlog = RetentionHistoryPruner.BatchSize + 1;
@@ -288,7 +320,8 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
         string? failedRunRetention = null,
         string? inactiveHoldRetention = null,
         bool killSwitch = false,
-        string? schedule = null
+        string? schedule = null,
+        Action<IServiceCollection>? configureServices = null
     )
     {
         var settings = new Dictionary<string, string?>
@@ -309,7 +342,11 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
             settings["Cohort:HistoryPruning:InactiveHoldRetention"] = inactiveHoldRetention;
         }
 
-        return new CohortTestHost(ConnectionString, configurationOverrides: settings);
+        return new CohortTestHost(
+            ConnectionString,
+            configurationOverrides: settings,
+            configureServices: configureServices
+        );
     }
 
     private static Task<RetentionHistoryPruneResult> PruneAsync(CohortTestHost host) =>

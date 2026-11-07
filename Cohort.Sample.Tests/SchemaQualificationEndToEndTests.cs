@@ -183,9 +183,6 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
                 now
             );
 
-            (await services.GetRequiredService<IRetentionRowDispatcher>().FlushAsync())
-                .Should().Be(new RowDispatcherFlushResult(0, 0, 0));
-
             await using var connection = new NpgsqlConnection(connectionString);
             await connection.OpenAsync();
             await using var command = connection.CreateCommand();
@@ -193,7 +190,6 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
                 SELECT
                     (SELECT pg_catalog.count(*) FROM "{{Escape(CohortSchema)}}"."sweep_run"),
                     (SELECT pg_catalog.count(*) FROM "{{Escape(CohortSchema)}}"."sweep_run_row_detail"),
-                    (SELECT pg_catalog.count(*) FROM "{{Escape(CohortSchema)}}"."sweep_row_handler_status"),
                     (SELECT pg_catalog.count(*) FROM public."sweep_run"),
                     (SELECT pg_catalog.count(*) FROM public."{{Escape(RecordsTable)}}")
                 """;
@@ -201,9 +197,8 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
             await reader.ReadAsync();
             reader.GetInt64(0).Should().Be(2);
             reader.GetInt64(1).Should().Be(6);
-            reader.GetInt64(2).Should().Be(6);
-            reader.GetInt64(3).Should().Be(0);
-            reader.GetInt64(4).Should().Be(1);
+            reader.GetInt64(2).Should().Be(0);
+            reader.GetInt64(3).Should().Be(1);
         }
         finally
         {
@@ -279,17 +274,13 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
                     ("SweepId", "At", "EntityType", "RetentionEntityId", "Category", "TenantId", "Strategy", "ResolvedMonths", "ResolvedDays", "Affected", "HeldCount", "SkippedCount", "NullAnchorCount", "RetainedCount", "DeferredCount", "BlockedCount", "RuleSource", "RuleReason")
                 VALUES (@sweepId, @settledAt, @entityType, @retentionEntityId, 'qualified', @tenantId, 0, 0, 30, 1, 0, 0, 0, 0, 0, 0, 'historical', 'before move');
                 INSERT INTO public.sweep_run_row_detail
-                    ("Id", "SweepId", "At", "EntityType", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId", "CapturedPayload")
-                VALUES (900001, @sweepId, @settledAt, @entityType, @retentionEntityId, @recordId, 'qualified', 0, @tenantId, NULL);
-                INSERT INTO public.sweep_row_handler_status
-                    ("Id", "SweepRunRowDetailId", "HandlerType", "DispatchPhase", "State", "Attempt", "QueuedAt", "NextAttemptAt", "ClaimedAt", "ClaimToken", "CompletedAt", "LastError")
-                VALUES (900001, 900001, 'historical-handler', 0, 2, 1, @createdAt, @createdAt, NULL, NULL, @settledAt, @historicalLastError);
+                    ("Id", "SweepId", "At", "EntityType", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId", "Failure")
+                VALUES (900001, @sweepId, @settledAt, @entityType, @retentionEntityId, @recordId, 'qualified', 0, @tenantId, @historicalFailure);
 
                 ALTER TABLE public.retention_holds SET SCHEMA "{{Escape(CohortSchema)}}";
                 ALTER TABLE public.sweep_run SET SCHEMA "{{Escape(CohortSchema)}}";
                 ALTER TABLE public.sweep_run_entity_summary SET SCHEMA "{{Escape(CohortSchema)}}";
                 ALTER TABLE public.sweep_run_row_detail SET SCHEMA "{{Escape(CohortSchema)}}";
-                ALTER TABLE public.sweep_row_handler_status SET SCHEMA "{{Escape(CohortSchema)}}";
                 CREATE TABLE public.sweep_run ("SweepId" uuid PRIMARY KEY);
                 """;
             command.Parameters.AddWithValue("holdId", holdId);
@@ -301,7 +292,7 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
             command.Parameters.AddWithValue("sweepId", historicalSweepId);
             command.Parameters.AddWithValue("entityType", typeof(QualifiedRecord).FullName!);
             command.Parameters.AddWithValue("historicalError", "historical error before move");
-            command.Parameters.AddWithValue("historicalLastError", "historical handler error before move");
+            command.Parameters.AddWithValue("historicalFailure", "historical step failure before move");
             await command.ExecuteNonQueryAsync();
         }
 
@@ -347,8 +338,6 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
         erasure.Counts.Should().ContainSingle(count =>
             count.EntityType == typeof(QualifiedRecord) && count.Affected == 1
         );
-        (await services.GetRequiredService<IRetentionRowDispatcher>().FlushAsync()).Settled
-            .Should().BeTrue();
 
         await using (var connection = new NpgsqlConnection(connectionString))
         {
@@ -365,16 +354,12 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
                        summary."RuleSource", summary."RuleReason",
                        detail."Id", detail."SweepId", detail."At", detail."EntityType",
                        detail."RetentionEntityId", detail."RecordId", detail."Category", detail."Strategy",
-                       detail."TenantId", detail."CapturedPayload",
-                       status."Id", status."SweepRunRowDetailId", status."HandlerType", status."DispatchPhase",
-                       status."State", status."Attempt", status."QueuedAt", status."NextAttemptAt",
-                       status."ClaimedAt", status."ClaimToken", status."CompletedAt", status."LastError",
+                       detail."TenantId", detail."Failure",
                        (SELECT pg_catalog.count(*) FROM public.sweep_run)
                 FROM "{{Escape(CohortSchema)}}".sweep_run run
                 JOIN "{{Escape(CohortSchema)}}".retention_holds hold ON hold."HoldId" = @holdId
                 JOIN "{{Escape(CohortSchema)}}".sweep_run_entity_summary summary ON summary."SweepId" = run."SweepId"
                 JOIN "{{Escape(CohortSchema)}}".sweep_run_row_detail detail ON detail."SweepId" = run."SweepId"
-                JOIN "{{Escape(CohortSchema)}}".sweep_row_handler_status status ON status."SweepRunRowDetailId" = detail."Id"
                 WHERE run."SweepId" = @sweepId
                 """;
             verify.Parameters.AddWithValue("holdId", holdId);
@@ -425,20 +410,8 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
             reader.GetString(39).Should().Be("qualified");
             reader.GetInt32(40).Should().Be(0);
             reader.GetGuid(41).Should().Be(tenantId);
-            reader.IsDBNull(42).Should().BeTrue();
-            reader.GetInt64(43).Should().Be(900001);
-            reader.GetInt64(44).Should().Be(900001);
-            reader.GetString(45).Should().Be("historical-handler");
-            reader.GetInt32(46).Should().Be(0);
-            reader.GetInt32(47).Should().Be(2);
-            reader.GetInt32(48).Should().Be(1);
-            reader.GetFieldValue<DateTimeOffset>(49).Should().Be(createdAt);
-            reader.GetFieldValue<DateTimeOffset>(50).Should().Be(createdAt);
-            reader.IsDBNull(51).Should().BeTrue();
-            reader.IsDBNull(52).Should().BeTrue();
-            reader.GetFieldValue<DateTimeOffset>(53).Should().Be(settledAt);
-            reader.GetString(54).Should().Be("historical handler error before move");
-            reader.GetInt64(55).Should().Be(0);
+            reader.GetString(42).Should().Be("historical step failure before move");
+            reader.GetInt64(43).Should().Be(0);
         }
 
         await AssertExactMovedSchemaContractAsync(connectionString);
@@ -550,9 +523,11 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
         services.AddSingleton<IRetentionRuleProvider, QualifiedRuleProvider>();
         services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<QualifiedDbContext>();
-        services.AddRowHandler<QualifiedRecord, QualifiedRecordHandler>();
-        services.AddRowHandler<QualifiedSoftDeleteRecord, QualifiedSoftDeleteRecordHandler>();
-        services.AddRowHandler<QualifiedAnonymiseRecord, QualifiedAnonymiseRecordHandler>();
+        // Steps put every entity on the row-by-row path, with a per-batch scope, under the
+        // custom schemas.
+        services.AddRetentionDependents<QualifiedRecord, QualifiedRecordStep>(retiresReferencingRows: false);
+        services.AddRetentionDependents<QualifiedSoftDeleteRecord, QualifiedSoftDeleteRecordStep>(retiresReferencingRows: false);
+        services.AddRetentionDependents<QualifiedAnonymiseRecord, QualifiedAnonymiseRecordStep>(retiresReferencingRows: false);
         return services.BuildServiceProvider(validateScopes: true);
     }
 
@@ -673,8 +648,8 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
             await prepare.ExecuteNonQueryAsync();
         }
 
-        var dispatcher = services.GetRequiredService<IRetentionRowDispatcher>();
-        await dispatcher.FlushAsync();
+        var recovery = services.GetRequiredService<IRetentionRunRecovery>();
+        await recovery.RecoverAsync();
         (await ReadRunStatusAsync(connectionString, sweepId)).Should().Be(SweepRunStatus.Started);
 
         await using (var release = owner.CreateCommand())
@@ -684,7 +659,7 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
             (await release.ExecuteScalarAsync()).Should().Be(true);
         }
 
-        await dispatcher.FlushAsync();
+        await recovery.RecoverAsync();
         (await ReadRunStatusAsync(connectionString, sweepId)).Should().Be(SweepRunStatus.Failed);
     }
 
@@ -819,14 +794,23 @@ public sealed class SchemaQualificationEndToEndTests(PostgresFixture fixture)
         );
     }
 
-    [RowHandlerId("9b02adec-1b04-45d2-a8cb-779a9cbfe865")]
-    private sealed class QualifiedRecordHandler : IRetentionHandler<QualifiedRecord>;
-    [RowHandlerId("b21a48c6-aa34-4aa7-8ac2-0587d2f10780")]
-    private sealed class QualifiedSoftDeleteRecordHandler
-        : IRetentionHandler<QualifiedSoftDeleteRecord>;
-    [RowHandlerId("8bbc5be0-5752-40dd-9b9a-96d4aaa29cae")]
-    private sealed class QualifiedAnonymiseRecordHandler
-        : IRetentionHandler<QualifiedAnonymiseRecord>;
+    private sealed class QualifiedRecordStep : IRetentionDependents<QualifiedRecord>
+    {
+        public Task RetireAsync(QualifiedRecord row, RetentionDependentsContext ctx, CancellationToken ct) =>
+            Task.CompletedTask;
+    }
+
+    private sealed class QualifiedSoftDeleteRecordStep : IRetentionDependents<QualifiedSoftDeleteRecord>
+    {
+        public Task RetireAsync(QualifiedSoftDeleteRecord row, RetentionDependentsContext ctx, CancellationToken ct) =>
+            Task.CompletedTask;
+    }
+
+    private sealed class QualifiedAnonymiseRecordStep : IRetentionDependents<QualifiedAnonymiseRecord>
+    {
+        public Task RetireAsync(QualifiedAnonymiseRecord row, RetentionDependentsContext ctx, CancellationToken ct) =>
+            Task.CompletedTask;
+    }
 
     [Retain("qualified-soft-delete", nameof(CreatedAt), AuditRowDetail = AuditRowDetail.PerRow)]
     [RetentionEntityId("58eafbe2-d98b-474b-aa51-47c514216480")]

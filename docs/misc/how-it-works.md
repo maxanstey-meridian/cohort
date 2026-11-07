@@ -32,11 +32,10 @@ expressed in SQL.
    `FOR UPDATE SKIP LOCKED` in batches of `SweepBatchSize` (an erasure waits for locked rows
    instead). A purge also leaves out rows still referenced through a `RESTRICT` or
    `NO ACTION` foreign key, read from `pg_catalog`, unless the entity has a
-   [dependents step](/guides/row-handlers#retiring-a-rows-dependents). Each batch runs any
-   `OnBeforeAsync` handlers, each in a read-only savepoint that is always rolled back, then
-   the entity's dependents step and the row's mutation under one savepoint, so a refused
-   mutation undoes the step. It writes its audit rows and queues handler work, then
-   **commits on its own**. A large backlog never
+   [dependents step](/guides/row-handlers#retiring-a-rows-dependents) registered as retiring
+   the rows that reference it. Each batch runs the entity's dependents step and the row's
+   mutation under one savepoint, so a refused mutation undoes the step. It writes its audit
+   rows, then **commits on its own**. A large backlog never
    sits in one unbounded transaction, and a failure loses only the current batch. A batch
    checks its constraints immediately, so a deferred constraint fails at its statement, not
    at `COMMIT`.
@@ -49,11 +48,11 @@ Along the way:
   `EntityFailures` on the result), and the run carries on with the remaining entities.
 - Each batch continues after the last row the previous batch reached, in the order rows are
   selected (anchor, then record ID), so a row is tried again only if its anchor moves past
-  the run's position, and a batch costs the same however many rows came before it. Rows
-  skipped by a failing `OnBeforeAsync` or dependents step are dead-lettered once and left for the next run, so
-  a failing row can't spin the batch loop or block the eligible rows behind it. Skipped rows
-  make the run `PartiallyFailed`, with a `rows-skipped` reason in `Error` and
-  `EntityFailures`.
+  the run's position, and a batch costs the same however many rows came before it. A row
+  skipped by a failing dependents step is recorded once, in a row detail whose `Failure` says
+  why, and left for the next run, so a failing row can't spin the batch loop or block the
+  eligible rows behind it. Skipped rows make the run `PartiallyFailed`, with a `rows-skipped`
+  reason in `Error` and `EntityFailures`.
 - A row an integrity constraint refuses (any SQLSTATE class 23 error: a foreign key, a check,
   a unique index, a constraint trigger) is blocked, not fatal. The batch's statement is
   bisected under savepoints until the refused rows are found, or on the row-by-row path each
@@ -89,9 +88,14 @@ Along the way:
 
 ## Crash recovery
 
-A run left `Started` by a crashed process is marked failed after
-`RowHandlerDispatch:SweepSettleTimeout`, by the dispatcher. It only does that once it can take
-the run's lock, so a live run is never recovered.
+A run left `Started` by a crashed process is marked `Failed` once it is older than
+`Cohort:SweepSettleTimeout` (an hour by default), by the recovery service. It only does that
+once it can take the run's lock, so a live run is never recovered. The cutoff and the
+recovered run's `SettledAt` come from the database clock, as a live run's do. The service
+recovers when the host starts and then once a minute, and skips while the kill switch is on.
+A host that doesn't run hosted services (a console job, a function) calls
+`IRetentionRunRecovery.RecoverAsync` instead, which ignores the kill switch; see
+[Dependents and After-Commit Work](/guides/row-handlers#recovering-abandoned-runs).
 
 A scheduled run that crashed, or a scheduled pass that never started because its process died
 first, doesn't claim its occurrence: the worker reruns that pass, whether the run is still
@@ -101,12 +105,13 @@ succeeded don't rerun. See [Occurrences](/guides/running-retention#occurrences).
 
 ## After commit
 
-Two things happen once a batch commits:
+Once a batch commits, **audit observers** receive the committed events. This is best effort
+and in-process. See [Audit Trail](/guides/audit-trail).
 
-- **Audit observers** receive the committed events. This is best effort and in-process. See
-  [Audit Trail](/guides/audit-trail).
-- **The dispatcher** claims queued handler work from `sweep_row_handler_status` and runs
-  `OnAfterAsync`. This is durable and at-least-once. See [Row Handlers](/guides/row-handlers).
+Cohort keeps no work queue of its own. Work outside the database (delete a blob, tell another
+system) goes through your own outbox: the entity's dependents step writes the message in the
+batch's transaction, so it commits with the row, and your outbox delivers it. See
+[Dependents and After-Commit Work](/guides/row-handlers#after-commit-work-through-your-outbox).
 
 ## Hosted services
 
@@ -115,7 +120,7 @@ Two things happen once a batch commits:
 | Service | Does |
 |---|---|
 | Worker | Runs scheduled sweeps when `Schedule` is set |
-| Dispatcher | Delivers row-handler work, recovers abandoned runs, and scrubs expired snapshots |
+| Recovery | Recovers abandoned runs as `Failed`, when the host starts and then once a minute; skips while the kill switch is on |
 | History pruner | Prunes old runs and inactive holds when [configured](/guides/history-pruning) |
 
-Each one is idle until its feature is configured or has work to do.
+The worker and the pruner are idle until their feature is configured.

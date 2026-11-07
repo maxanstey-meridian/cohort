@@ -58,7 +58,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     [InlineData(PublicDatabaseOperation.Sweep)]
     [InlineData(PublicDatabaseOperation.Erasure)]
     [InlineData(PublicDatabaseOperation.CreateHold)]
-    [InlineData(PublicDatabaseOperation.FlushDispatcher)]
+    [InlineData(PublicDatabaseOperation.RecoverRuns)]
     public async Task Direct_public_database_operations_reject_an_unmigrated_schema(
         PublicDatabaseOperation operation
     )
@@ -81,7 +81,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     [InlineData(PublicDatabaseOperation.Preview)]
     [InlineData(PublicDatabaseOperation.Erasure)]
     [InlineData(PublicDatabaseOperation.CreateHold)]
-    [InlineData(PublicDatabaseOperation.FlushDispatcher)]
+    [InlineData(PublicDatabaseOperation.RecoverRuns)]
     public async Task Direct_public_database_operations_refuse_a_multiplexed_connection(
         PublicDatabaseOperation operation
     )
@@ -1107,8 +1107,10 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
 
     // A caller role that manages holds and nothing else: SELECT, INSERT, and UPDATE on
     // retention_holds, SELECT and UPDATE (the row locks) on the host's tables, and nothing on the
-    // run, summary, row-detail, and handler-status tables. Every holds operation passes: a hold
-    // call sends none of the sweep's recording.
+    // run, summary, and row-detail tables. Every holds operation passes: a hold call sends none
+    // of the sweep's recording. The hold is removed at the database clock's time, the clock
+    // ListActiveAsync judges RemovedAt by, so a host clock ahead of the server's can't leave it
+    // active.
     // Make-fail: EfRetentionHoldsRepository.CreateAsync runs one more statement, a write on
     // sweep_run (DELETE FROM public.sweep_run WHERE FALSE) after its readiness call; the first
     // hold call fails with PostgreSQL's 42501.
@@ -1123,8 +1125,8 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             $"""
             REVOKE ALL ON ALL TABLES IN SCHEMA public FROM "{roles.Caller}";
             GRANT SELECT, UPDATE ON ALL TABLES IN SCHEMA public TO "{roles.Caller}";
-            REVOKE ALL ON public.sweep_run, public.sweep_run_entity_summary, public.sweep_run_row_detail,
-                public.sweep_row_handler_status FROM "{roles.Caller}";
+            REVOKE ALL ON public.sweep_run, public.sweep_run_entity_summary, public.sweep_run_row_detail
+                FROM "{roles.Caller}";
             GRANT INSERT ON public.retention_holds TO "{roles.Caller}"
             """
         );
@@ -1149,8 +1151,9 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         (await host.RunWithServicesAsync(services => services.GetRequiredService<IRetentionHoldsRepository>()
             .ListCoveringSubjectAsync("user", subject, tenant.Id, CancellationToken.None)))
             .Should().ContainSingle(hold => hold.HoldId == holdId);
+        var removedAt = await DatabaseNowAsync(database);
         await host.RunWithServicesAsync(services => services.GetRequiredService<IRetentionHoldsRepository>()
-            .RemoveAsync(holdId, DateTimeOffset.UtcNow, CancellationToken.None));
+            .RemoveAsync(holdId, removedAt, CancellationToken.None));
         (await host.RunWithServicesAsync(services => services.GetRequiredService<IRetentionHoldsRepository>().ListActiveAsync(CancellationToken.None)))
             .Should().BeEmpty();
         (await CountAsync(database, "sweep_run")).Should().Be(0, "a hold call records no run");
@@ -1173,8 +1176,8 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
             $"""
             REVOKE ALL ON ALL TABLES IN SCHEMA public FROM "{roles.Caller}";
             GRANT SELECT ON ALL TABLES IN SCHEMA public TO "{roles.Caller}";
-            REVOKE ALL ON public.sweep_run, public.sweep_run_entity_summary, public.sweep_run_row_detail,
-                public.sweep_row_handler_status FROM "{roles.Caller}"
+            REVOKE ALL ON public.sweep_run, public.sweep_run_entity_summary, public.sweep_run_row_detail
+                FROM "{roles.Caller}"
             """
         );
         var tenant = NewTenant();
@@ -1280,61 +1283,6 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         (await TenantlessLogExistsAsync(database.ConnectionString, second)).Should().BeTrue();
     }
 
-    // A dispatcher role that cannot claim work fails with PostgreSQL's 42501 at the claim, from
-    // FlushAsync and from a poll alike, but only after the payload scrub has run: personal data
-    // never outlives its retention because the dispatcher's claim fails. The tenant role's
-    // sweeps are untouched.
-    // A scrub that fails leaves the poll's hourly gate unspent, so the next poll retries it, and
-    // under the kill switch the poll scrubs and returns before it claims anything.
-    // Make-fail: PollAsync sets lastPayloadScrubAt before ScrubExpiredPayloadsAsync (the retry
-    // finds the gate spent, so the payload stays).
-    [Fact]
-    public async Task The_dispatcher_fails_at_the_claim_under_a_role_that_cannot_claim_work()
-    {
-        await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
-        await using var database = await MigratedTemporaryDatabaseAsync();
-        await roles.GrantAsync(database);
-        await ExecuteAsync(database, $"REVOKE UPDATE ON public.sweep_row_handler_status FROM \"{roles.RowDispatch}\"");
-        using var host = RoleHost(database, roles);
-        var viaPoll = await SeedExpiredPayloadAsync(database);
-
-        var poll = () => host.RunWithServicesAsync(services => services.GetRequiredService<RetentionRowDispatcher>().PollAsync(CancellationToken.None));
-        var flush = () => host.RunWithServicesAsync(services => services.GetRequiredService<IRetentionRowDispatcher>().FlushAsync());
-
-        await ShouldBeDeniedAsync(poll, "sweep_row_handler_status");
-        (await CapturedPayloadAsync(database, viaPoll)).Should().BeNull("the poll scrubbed before it failed");
-        var viaFlush = await SeedExpiredPayloadAsync(database);
-        await ShouldBeDeniedAsync(flush, "sweep_row_handler_status");
-        (await CapturedPayloadAsync(database, viaFlush)).Should().BeNull("flush scrubbed before it failed");
-        (await host.RunSweepAsync(NewTenant())).EntityFailures.Should().BeEmpty();
-
-        // A poll whose scrub fails leaves the hourly gate unspent: once the role can scrub, the
-        // next poll does, though its claim still fails.
-        await ExecuteAsync(database, $"REVOKE UPDATE ON public.sweep_run_row_detail FROM \"{roles.RowDispatch}\"");
-        using var scrubHost = RoleHost(database, roles);
-        var viaFailedScrub = await SeedExpiredPayloadAsync(database);
-        var scrubPoll = () => scrubHost.RunWithServicesAsync(services => services.GetRequiredService<RetentionRowDispatcher>().PollAsync(CancellationToken.None));
-
-        await ShouldBeDeniedAsync(scrubPoll, "sweep_run_row_detail");
-        (await CapturedPayloadAsync(database, viaFailedScrub)).Should().NotBeNull("the failed scrub changed nothing");
-        await ExecuteAsync(database, $"GRANT UPDATE ON public.sweep_run_row_detail TO \"{roles.RowDispatch}\"");
-        await ShouldBeDeniedAsync(scrubPoll, "sweep_row_handler_status");
-        (await CapturedPayloadAsync(database, viaFailedScrub)).Should().BeNull("the failed poll did not spend the scrub's hourly gate");
-
-        // Under the kill switch the dispatcher doesn't run, so its failing claim stops nothing:
-        // the poll scrubs and returns.
-        using var killedHost = RoleHost(
-            database,
-            roles,
-            configuration: new Dictionary<string, string?> { [$"{CohortOptions.SectionName}:KillSwitch"] = "true" }
-        );
-        var underKillSwitch = await SeedExpiredPayloadAsync(database);
-        var killedPoll = () => killedHost.RunWithServicesAsync(services => services.GetRequiredService<RetentionRowDispatcher>().PollAsync(CancellationToken.None));
-
-        await killedPoll.Should().NotThrowAsync();
-        (await CapturedPayloadAsync(database, underKillSwitch)).Should().BeNull("the kill switch never keeps a payload past its retention");
-    }
-
     // A worker role that cannot read the ledger fails the iteration with PostgreSQL's 42501. The
     // failure comes from the iteration's read-back of the ledger, after the passes: each pass
     // runs in its own tenant or tenantless scope, under that scope's role, not the coordination
@@ -1400,13 +1348,13 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     }
 
     // Startup runs the model pass in System(Readiness), then in each background subsystem's
-    // scope that will run, so that scope's own context is checked too: RowDispatch always,
-    // WorkerCoordination only when the worker runs (a schedule is set and the kill switch is
-    // off), HistoryPruning only when pruning is set (a retention is set and the kill switch is
-    // off). The scope log records the scopes the hosted service opens, in order.
+    // scope that will run, so that scope's own context is checked too: Recovery whenever the
+    // kill switch is off, WorkerCoordination only when the worker runs (a schedule is set and the
+    // kill switch is off), HistoryPruning only when pruning is set (a retention is set and the
+    // kill switch is off). The scope log records the scopes the hosted service opens, in order.
     // Make-fails, each its own run, each in RetentionValidationHostedService.StartAsync: the
-    // RowDispatch call dropped; the HistoryPruning call made unconditional; the
-    // WorkerCoordination call dropped.
+    // Recovery call dropped; the Recovery call made unconditional; the HistoryPruning call made
+    // unconditional; the WorkerCoordination call dropped.
     [Theory]
     [InlineData(StartupSubsystems.WorkerAndPruning)]
     [InlineData(StartupSubsystems.NoSchedule)]
@@ -1425,7 +1373,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
                 new[]
                 {
                     RetentionSystemWork.Readiness,
-                    RetentionSystemWork.RowDispatch,
+                    RetentionSystemWork.Recovery,
                     RetentionSystemWork.WorkerCoordination,
                     RetentionSystemWork.HistoryPruning,
                 }
@@ -1435,7 +1383,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
                 new[]
                 {
                     RetentionSystemWork.Readiness,
-                    RetentionSystemWork.RowDispatch,
+                    RetentionSystemWork.Recovery,
                     RetentionSystemWork.HistoryPruning,
                 }
             ),
@@ -1444,13 +1392,14 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
                 new[]
                 {
                     RetentionSystemWork.Readiness,
-                    RetentionSystemWork.RowDispatch,
+                    RetentionSystemWork.Recovery,
                     RetentionSystemWork.WorkerCoordination,
                 }
             ),
+            // The background recovery skips under the kill switch, so its scope isn't checked.
             StartupSubsystems.KillSwitch => (
                 new Dictionary<string, string?> { [schedule] = "0 0 0 * * *", [pruning] = "1.00:00:00", [killSwitch] = "true" },
-                new[] { RetentionSystemWork.Readiness, RetentionSystemWork.RowDispatch }
+                new[] { RetentionSystemWork.Readiness }
             ),
             _ => throw new ArgumentOutOfRangeException(nameof(subsystems)),
         };
@@ -1476,7 +1425,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     }
 
     // A subsystem scope whose context has an entry of its own is validated at startup, so a fault
-    // only that scope's database has refuses the host: here System(RowDispatch) reaches a second
+    // only that scope's database has refuses the host: here System(Recovery) reaches a second
     // migrated database (and, through the model cache key, a model instance of its own) where a
     // retained column is gone, while System(Readiness) reaches the sound one. The scope log
     // can't show this, because a subsystem call that shares the Readiness entry opens nothing.
@@ -1486,15 +1435,15 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
     public async Task Startup_refuses_a_host_whose_subsystem_scope_reaches_a_database_with_a_schema_fault()
     {
         await using var database = await MigratedTemporaryDatabaseAsync();
-        await using var dispatchDatabase = await MigratedTemporaryDatabaseAsync();
-        await ExecuteAsync(dispatchDatabase, """ALTER TABLE public.soft_delete_records DROP COLUMN "DeletedAt" """);
-        var dispatchStarted = false;
+        await using var recoveryDatabase = await MigratedTemporaryDatabaseAsync();
+        await ExecuteAsync(recoveryDatabase, """ALTER TABLE public.soft_delete_records DROP COLUMN "DeletedAt" """);
+        var recoveryStarted = false;
         await using var provider = BuildSystemRoutedProvider(
             database.ConnectionString,
             work =>
             {
-                dispatchStarted |= work == RetentionSystemWork.RowDispatch;
-                return dispatchStarted ? dispatchDatabase.ConnectionString : null;
+                recoveryStarted |= work == RetentionSystemWork.Recovery;
+                return recoveryStarted ? recoveryDatabase.ConnectionString : null;
             },
             options => options.ReplaceService<IModelCacheKeyFactory, ConnectionStringModelCacheKeyFactory>()
         );
@@ -1589,43 +1538,6 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         thrown.MessageText.Should().Be($"permission denied for table {table}");
     }
 
-    // A run's row detail whose captured payload is past PayloadRetention (30 days by default).
-    private static async Task<long> SeedExpiredPayloadAsync(TemporaryDatabase database)
-    {
-        var sweepId = Guid.NewGuid();
-        var at = DateTimeOffset.UtcNow.AddDays(-60);
-        await using var connection = new NpgsqlConnection(database.ConnectionString);
-        await connection.OpenAsync();
-        await using var command = connection.CreateCommand();
-        command.CommandText = """
-            INSERT INTO "sweep_run"
-                ("SweepId", "StartedAt", "Status", "SettledAt", "Duration", "TriggerKind", "DryRun", "TenantId", "TotalAffected")
-            VALUES (@sweepId, @at, 1, @at, INTERVAL '0', 2, FALSE, @tenantId, 1);
-            INSERT INTO "sweep_run_row_detail"
-                ("SweepId", "At", "EntityType", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId", "CapturedPayload")
-            VALUES (@sweepId, @at, 'Cohort.Sample.Entities.Note', @entityId, @recordId, 'short-lived', 0, @tenantId, '{"body":"personal"}')
-            RETURNING "Id";
-            """;
-        command.Parameters.AddWithValue("sweepId", sweepId);
-        command.Parameters.AddWithValue("at", at);
-        command.Parameters.AddWithValue("tenantId", Guid.NewGuid());
-        command.Parameters.AddWithValue("entityId", Note.RetentionIdentity);
-        command.Parameters.AddWithValue("recordId", Guid.NewGuid().ToString());
-        return Convert.ToInt64(await command.ExecuteScalarAsync(), CultureInfo.InvariantCulture);
-    }
-
-    private static async Task<string?> CapturedPayloadAsync(TemporaryDatabase database, long rowDetailId)
-    {
-        await using var connection = new NpgsqlConnection(database.ConnectionString);
-        await connection.OpenAsync();
-        await using var command = new NpgsqlCommand(
-            """SELECT "CapturedPayload" FROM "sweep_run_row_detail" WHERE "Id" = @id""",
-            connection
-        );
-        command.Parameters.AddWithValue("id", rowDetailId);
-        return await command.ExecuteScalarAsync() as string;
-    }
-
     private static async Task SeedSettledRunAsync(TemporaryDatabase database, DateTimeOffset settledAt)
     {
         await using var connection = new NpgsqlConnection(database.ConnectionString);
@@ -1670,6 +1582,15 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         await connection.OpenAsync();
         await using var command = new NpgsqlCommand($"""SELECT count(*) FROM public."{table}" """, connection);
         return (long)(await command.ExecuteScalarAsync())!;
+    }
+
+    /// <summary>The database clock, which Cohort's hold reads judge a hold's times by.</summary>
+    private static async Task<DateTimeOffset> DatabaseNowAsync(TemporaryDatabase database)
+    {
+        await using var connection = new NpgsqlConnection(database.ConnectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand("SELECT statement_timestamp()", connection);
+        return new DateTimeOffset((DateTime)(await command.ExecuteScalarAsync())!);
     }
 
     // A check that passed inside a caller's transaction may have seen DDL that rolls back,
@@ -3589,8 +3510,8 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
                         ct
                     );
                     break;
-                case PublicDatabaseOperation.FlushDispatcher:
-                    await services.GetRequiredService<IRetentionRowDispatcher>().FlushAsync(ct);
+                case PublicDatabaseOperation.RecoverRuns:
+                    await services.GetRequiredService<IRetentionRunRecovery>().RecoverAsync(ct);
                     break;
                 default:
                     throw new ArgumentOutOfRangeException(nameof(operation));
@@ -3613,7 +3534,7 @@ public sealed class RuntimeReadinessEndToEndTests(PostgresFixture fixture)
         Preview,
         Erasure,
         CreateHold,
-        FlushDispatcher,
+        RecoverRuns,
     }
 
     private sealed class CountingRuleProvider : IRetentionRuleProvider

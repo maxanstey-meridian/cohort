@@ -9,7 +9,7 @@ These are the deliberate limits of Cohort, so you don't discover them in product
 - **PostgreSQL 16 or later.** Startup checks anonymised columns with `pg_input_is_valid`,
   which PostgreSQL 16 added; an older server is refused.
 - **Session advisory locks need a session of their own.** The worker, each scheduled pass,
-  each run and each row-handler delivery hold PostgreSQL session advisory locks, so they need
+  each run and abandoned-run recovery hold PostgreSQL session advisory locks, so they need
   direct connections or session-mode pooling. A transaction-mode pooler (PgBouncer's
   `pool_mode = transaction`) hands the session to someone else between transactions, and the
   locks stop meaning anything. Npgsql `Multiplexing=true` does the same inside one process, so
@@ -48,7 +48,7 @@ These are the deliberate limits of Cohort, so you don't discover them in product
 
 ## Tenant isolation
 
-- System work spans tenants by design. The worker's coordination, row-handler dispatch,
+- System work spans tenants by design. The worker's coordination, abandoned-run recovery,
   history pruning and readiness read and write every tenant's Cohort rows. Your
   `IRetentionExecutionScope` decides how a system scope is authorised and audited. See
   [Tenant Isolation](/guides/tenant-isolation).
@@ -58,11 +58,12 @@ These are the deliberate limits of Cohort, so you don't discover them in product
 
 ## Delivery
 
-- Row-handler `OnAfterAsync` is at-least-once, not exactly-once. Handlers must be idempotent.
-- A handler that ignores its cancellation token holds its row, and the row's later handlers,
-  until it returns. If its dispatcher's database session is lost while it runs (a failover,
-  or an idle-session timeout), the lock goes with it and the work can be reclaimed and run
-  again. Fence downstream writes on `ctx.Attempt` if that matters to you.
+- Cohort keeps no work queue. Work outside the database goes through your own outbox, written
+  by the entity's dependents step in the batch's transaction; delivering it is your outbox's
+  job. See [Dependents and After-Commit Work](/guides/row-handlers#after-commit-work-through-your-outbox).
+- A row PostgreSQL deletes through an `ON DELETE CASCADE` foreign key gets no hook. A child
+  that owns anything outside the database needs a `Restrict` foreign key and retiring in its
+  parent's dependents step.
 - Audit observers are best effort, with no durable outbox. Integrations that must not miss an
   event should read the ledger tables or use CDC.
 

@@ -60,13 +60,15 @@ internal sealed class RetentionPreviewService(
                 plan.Add(SweepScope.ForSweep(entry, rule, context, timeZone));
             }
 
-            // The blocking keys for every scope in one catalog read, as a run reads them. A
-            // step entity's referenced rows count as eligible: the preview predicts that its
-            // step clears them, the only prediction possible without running host code.
+            // The blocking keys for every scope in one catalog read, as a run reads them. The
+            // referenced rows of an entity whose step was registered as retiring them (the
+            // default) count as eligible: the preview predicts that its step clears them, the
+            // only prediction possible without running host code. A step registered with
+            // retiresReferencingRows: false keeps the pre-filter, so they count blocked.
             var attached = await ReferencingForeignKeySql.AttachAsync(
                 connection,
                 plan,
-                entry => dependentsRegistrations.HasStep(entry.EntityType),
+                entry => dependentsRegistrations.RetiresReferencingRows(entry.EntityType),
                 ct
             );
             foreach (var scope in attached)

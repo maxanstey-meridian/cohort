@@ -9,13 +9,12 @@ using Microsoft.Extensions.Logging;
 namespace Cohort.Hosting;
 
 /// <summary>
-/// Opt-in pruning of Cohort's own history: settled runs (with their entity summaries, row
-/// details and handler statuses) past <see cref="HistoryPruningOptions.SucceededRunRetention"/>
+/// Opt-in pruning of Cohort's own history: settled runs (with their entity summaries and row
+/// details) past <see cref="HistoryPruningOptions.SucceededRunRetention"/>
 /// or <see cref="HistoryPruningOptions.FailedRunRetention"/>, and holds that stopped protecting
 /// longer ago than <see cref="HistoryPruningOptions.InactiveHoldRetention"/>. A run is never
-/// pruned while any of its handler work is pending or in flight, or while any of its rows still
-/// holds a captured snapshot (requeueable dead-lettered work), nor while it is a scheduled run of
-/// the schedule's current occurrence (the worker's ledger for it), and nothing is pruned while
+/// pruned while it is a scheduled run of the schedule's current occurrence (the worker's ledger
+/// for it), and nothing is pruned while
 /// <see cref="CohortOptions.KillSwitch"/> is on. Each batch commits on its own and claims with
 /// <c>SKIP LOCKED</c>, so replicas prune disjoint batches.
 /// </summary>
@@ -35,7 +34,7 @@ internal sealed class RetentionHistoryPruner(
     {
         while (!stoppingToken.IsCancellationRequested)
         {
-            if (options.Current.HistoryPruning.Enabled)
+            if (options.Current.PrunerRuns)
             {
                 try
                 {
@@ -72,7 +71,7 @@ internal sealed class RetentionHistoryPruner(
     {
         // One reading of the options decides what is pruned.
         var current = options.Current;
-        if (current.PruningScope is not { } scope)
+        if (!current.PrunerRuns)
         {
             return new RetentionHistoryPruneResult(0, 0);
         }
@@ -87,7 +86,6 @@ internal sealed class RetentionHistoryPruner(
                     .ValidateAsync(ct);
                 return await CurrentOccurrenceAsync(
                     services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext),
-                    scope,
                     current.Schedule,
                     ct
                 );
@@ -100,7 +98,7 @@ internal sealed class RetentionHistoryPruner(
         var failedCutoff = Cutoff(now, pruning.FailedRunRetention);
 
         long runs = 0;
-        if (scope.Runs)
+        if (pruning.PrunesRuns)
         {
             int deleted;
             do
@@ -113,10 +111,9 @@ internal sealed class RetentionHistoryPruner(
         }
 
         long holds = 0;
-        if (scope.Holds && !options.Current.KillSwitch)
+        if (pruning.InactiveHoldRetention is { } holdRetention && !options.Current.KillSwitch)
         {
-            // The scope has holds exactly when the hold retention is set.
-            var holdCutoff = Cutoff(now, pruning.InactiveHoldRetention)!.Value;
+            var holdCutoff = OperationalTime.SubtractSaturating(now, holdRetention);
             int deleted;
             do
             {
@@ -163,18 +160,17 @@ internal sealed class RetentionHistoryPruner(
 
     /// <summary>
     /// The latest occurrence of <paramref name="schedule"/> at or before the database clock,
-    /// the occurrence the worker is catching up; null when <paramref name="scope"/> doesn't read
-    /// the clock (no schedule).
+    /// the occurrence the worker is catching up; null, without reading the clock, when no
+    /// schedule is set.
     /// </summary>
     private static async Task<DateTimeOffset?> CurrentOccurrenceAsync(
         DbContext db,
-        PruningScope scope,
         string? schedule,
         CancellationToken ct
     ) =>
-        scope.ReadsClock
-            ? CohortScheduleParser.GetPreviousOccurrence(schedule!, await DatabaseClock.NowAsync(db, ct))
-            : null;
+        string.IsNullOrWhiteSpace(schedule)
+            ? null
+            : CohortScheduleParser.GetPreviousOccurrence(schedule, await DatabaseClock.NowAsync(db, ct));
 
     /// <summary>
     /// One batch of inactive holds; see <see cref="HistoryPruningSql.PruneHoldBatchAsync"/>.

@@ -144,8 +144,7 @@ public sealed class ErasureCorpusTests(PostgresFixture fixture) : IntegrationTes
             SELECT jsonb_build_object(
                 'runs', (SELECT COALESCE(jsonb_agg(to_jsonb(row) ORDER BY row."SweepId"), '[]'::jsonb) FROM "sweep_run" row),
                 'summaries', (SELECT COALESCE(jsonb_agg(to_jsonb(row) ORDER BY row."SweepId", row."RetentionEntityId", row."Category", row."TenantId", row."Strategy"), '[]'::jsonb) FROM "sweep_run_entity_summary" row),
-                'details', (SELECT COALESCE(jsonb_agg(to_jsonb(row) ORDER BY row."Id"), '[]'::jsonb) FROM "sweep_run_row_detail" row),
-                'statuses', (SELECT COALESCE(jsonb_agg(to_jsonb(row) ORDER BY row."Id"), '[]'::jsonb) FROM "sweep_row_handler_status" row)
+                'details', (SELECT COALESCE(jsonb_agg(to_jsonb(row) ORDER BY row."Id"), '[]'::jsonb) FROM "sweep_run_row_detail" row)
             )::text
             """;
         return (string)(await command.ExecuteScalarAsync())!;
@@ -159,11 +158,10 @@ public sealed class ErasureCorpusTests(PostgresFixture fixture) : IntegrationTes
         command.CommandText = """
             SELECT run."Status", run."TriggerKind", run."DryRun", run."TenantId", run."TotalAffected", run."Error",
                    COUNT(summary.*), COALESCE(SUM(summary."Affected"), 0),
-                   COUNT(detail.*), COUNT(status.*)
+                   COUNT(detail.*)
             FROM "sweep_run" run
             LEFT JOIN "sweep_run_entity_summary" summary ON summary."SweepId" = run."SweepId"
             LEFT JOIN "sweep_run_row_detail" detail ON detail."SweepId" = run."SweepId"
-            LEFT JOIN "sweep_row_handler_status" status ON status."SweepRunRowDetailId" = detail."Id"
             WHERE run."SweepId" = @sweepId
             GROUP BY run."SweepId"
             """;
@@ -179,7 +177,6 @@ public sealed class ErasureCorpusTests(PostgresFixture fixture) : IntegrationTes
         reader.GetInt64(6).Should().Be(4);
         reader.GetInt64(7).Should().Be(3);
         reader.GetInt64(8).Should().Be(0);
-        reader.GetInt64(9).Should().Be(0);
 
         await reader.DisposeAsync();
         await using var identities = connection.CreateCommand();

@@ -23,19 +23,24 @@ internal static class ReferencingForeignKeySql
     /// Gives every Purge scope the foreign keys that would block deleting its rows, read once
     /// per run. Only a deletion is blocked by a reference: the other strategies keep the row.
     /// A child table the session can't read is left out, so the sweep never fails on it;
-    /// the database still refuses the delete, and that row is blocked when it is tried. An
-    /// entity <paramref name="hasDependents"/> gets none: its step may retire what references
-    /// a row, so its rows are tried, and a row still referenced after the step is blocked by
-    /// the constraint itself.
+    /// the database still refuses the delete, and that row is blocked when it is tried.
+    /// <paramref name="retiresReferencingRows"/> is
+    /// <c>RetentionDependentsRegistrations.RetiresReferencingRows</c>: an entity whose dependents
+    /// step was registered as retiring the rows that reference it gets none, so its rows are
+    /// tried, and a row still referenced after the step is blocked by the constraint itself.
+    /// Every other Purge entity, a step registered with <c>retiresReferencingRows: false</c>
+    /// included, keeps the pre-filter: a still-referenced row is left out up front and
+    /// counted blocked.
     /// </summary>
     public static async Task<IReadOnlyList<SweepScope>> AttachAsync(
         DbConnection connection,
         IReadOnlyList<SweepScope> plan,
-        Func<RetentionEntry, bool> hasDependents,
+        Func<RetentionEntry, bool> retiresReferencingRows,
         CancellationToken ct
     )
     {
-        bool Blockable(SweepScope scope) => scope.Rule.Strategy == Strategy.Purge && !hasDependents(scope.Entry);
+        bool Blockable(SweepScope scope) =>
+            scope.Rule.Strategy == Strategy.Purge && !retiresReferencingRows(scope.Entry);
 
         var tables = plan
             .Where(Blockable)

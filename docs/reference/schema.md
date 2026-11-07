@@ -1,7 +1,7 @@
 # Schema & Migrations
 
-Cohort stores its ledger, holds, and handler queue in five tables in your database. You own
-them: they're part of your EF model and your migrations.
+Cohort stores its ledger and holds in four tables in your database. You own them: they're
+part of your EF model and your migrations.
 
 ## Tables
 
@@ -9,8 +9,7 @@ them: they're part of your EF model and your migrations.
 |---|---|
 | `sweep_run` | One row per sweep or erasure run |
 | `sweep_run_entity_summary` | Per-entity counts for each run |
-| `sweep_run_row_detail` | Per-row audit records and captured handler snapshots |
-| `sweep_row_handler_status` | The row-handler queue: state, attempts, claims, errors |
+| `sweep_run_row_detail` | Per-row audit records, and the rows a failing [dependents step](/guides/row-handlers#retiring-a-rows-dependents) skipped, with why in `Failure` |
 | `retention_holds` | Legal holds |
 
 ## Adding them to your model
@@ -23,7 +22,7 @@ protected override void OnModelCreating(ModelBuilder modelBuilder)
 }
 ```
 
-The parameterless overload maps all five tables to `public`. Pass a schema to map them all
+The parameterless overload maps all four tables to `public`. Pass a schema to map them all
 somewhere else, together:
 
 ```csharp
@@ -52,7 +51,7 @@ default, that version would record it instead of failing.
 A missing performance-only index is logged as a warning rather than failing. Any index on
 the same key columns counts, unique or not.
 
-The application services and the dispatcher check readiness themselves, so a host that
+The application services and abandoned-run recovery check readiness themselves, so a host that
 skipped startup validation still can't run against a missing or outdated schema.
 
 Readiness validates once per EF model instance and connection string, then trusts the result:
@@ -82,7 +81,7 @@ Two identities run through these tables, and they're deliberately different:
 
 - **`RetentionEntityId`** is the stable UUID you assign to a retained entity type with
   `[RetentionEntityId]`. It survives CLR and table renames, and correlates rules, holds,
-  summaries, row details, and handler work. `EntityType` on audit rows is readable diagnostic
+  summaries, and row details. `EntityType` on audit rows is readable diagnostic
   metadata only.
 - **`RecordId`** is one row's canonical PostgreSQL text identity, `CAST(key AS text)`. Cohort
   stores it as `text` in holds and row details, and compares it with the row's own key cast.
@@ -143,7 +142,6 @@ them is a breaking change, recorded in the changelog like any other change to th
 | `sweep_run` | `TenantId uuid` | `00000000-0000-0000-0000-000000000000` (`Guid.Empty`) is a tenantless pass or erasure |
 | `sweep_run_entity_summary` | `TenantId uuid` | `Guid.Empty`, as above |
 | `sweep_run_row_detail` | `TenantId uuid` | `Guid.Empty`, as above |
-| `sweep_row_handler_status` | none | Reached through `SweepRunRowDetailId` → `sweep_run_row_detail.TenantId` |
 
 Cohort only touches `Guid.Empty` rows in system scopes, so tenant policies shouldn't match
 them. `NULL` holds are different: tenant scopes read them but never write them. A host that
@@ -168,11 +166,6 @@ CREATE POLICY holds_read ON public.retention_holds FOR SELECT
   USING ("TenantId" IS NULL OR "TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
 CREATE POLICY holds_write ON public.retention_holds FOR ALL
   USING ("TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
-CREATE POLICY tenant_isolation ON public.sweep_row_handler_status
-  USING (EXISTS (
-    SELECT 1 FROM public.sweep_run_row_detail detail
-    WHERE detail."Id" = sweep_row_handler_status."SweepRunRowDetailId"
-      AND detail."TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid));
 ```
 
 Permissive policies combine with `OR`, but only those for the command at hand: a `SELECT`

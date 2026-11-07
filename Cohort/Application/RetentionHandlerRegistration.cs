@@ -1,43 +1,18 @@
 namespace Cohort.Application;
 
-internal interface IRetentionHandlerRegistration
-{
-    internal Type EntityType { get; }
-
-    internal Type HandlerType { get; }
-
-    internal RowHandlerDispatchPhase DispatchPhase { get; }
-
-    internal Guid Identity { get; }
-}
-
-// Closed over the entity/handler pair so each AddRowHandler call registers a distinct
-// implementation type. TryAddEnumerable dedupes instance descriptors by the instance's
-// concrete type; a single shared registration type would silently drop the dispatch
-// phase of every AddRowHandler call after the first.
-internal sealed record RetentionHandlerRegistration<TEntity, THandler>(
-    RowHandlerDispatchPhase DispatchPhase,
-    Guid Identity
-) : IRetentionHandlerRegistration
-    where THandler : IRetentionHandler<TEntity>
-{
-    public Type EntityType { get; } = typeof(TEntity);
-
-    public Type HandlerType { get; } = typeof(THandler);
-}
-
 internal interface IRetentionDependentsRegistration
 {
     internal Type EntityType { get; }
 
     internal Type StepType { get; }
 
-    internal Guid Identity { get; }
+    internal bool RetiresReferencingRows { get; }
 }
 
-// Closed over the entity/step pair for the same reason as RetentionHandlerRegistration:
-// TryAddEnumerable dedupes instance descriptors by the instance's concrete type.
-internal sealed record RetentionDependentsRegistration<TEntity, TStep>(Guid Identity)
+// Closed over the entity/step pair so each AddRetentionDependents call registers a distinct
+// implementation type: TryAddEnumerable dedupes instance descriptors by the instance's
+// concrete type.
+internal sealed record RetentionDependentsRegistration<TEntity, TStep>(bool RetiresReferencingRows)
     : IRetentionDependentsRegistration
     where TStep : IRetentionDependents<TEntity>
 {
@@ -63,4 +38,17 @@ internal static class RetentionDependentsRegistrations
     /// </summary>
     public static bool HasStep(this IEnumerable<IRetentionDependentsRegistration> registrations, Type entityType) =>
         registrations.StepFor(entityType) is not null;
+
+    /// <summary>
+    /// The one answer to "does purge leave this entity's still-referenced rows out up front".
+    /// True only when <paramref name="entityType"/> has a dependents step registered with
+    /// <c>retiresReferencingRows</c> true: that step may retire what references a row, so purge
+    /// tries the row and a reference left after the step blocks it at the database. Otherwise
+    /// purge keeps the blocking-key pre-filter and counts a still-referenced row blocked
+    /// without trying it. The run, the preview, and readiness all ask here, so they can't drift.
+    /// </summary>
+    public static bool RetiresReferencingRows(
+        this IEnumerable<IRetentionDependentsRegistration> registrations,
+        Type entityType
+    ) => registrations.StepFor(entityType) is { RetiresReferencingRows: true };
 }

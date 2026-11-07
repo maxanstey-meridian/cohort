@@ -1,7 +1,6 @@
 using System.Diagnostics.CodeAnalysis;
 
 using Cohort.Domain;
-using Cohort.Infrastructure;
 
 namespace Cohort.Hosting;
 
@@ -26,7 +25,8 @@ public sealed class CohortOptions
     /// Stops the scheduled worker: the pass in progress is cancelled (its current batch rolls
     /// back and the run settles <c>Cancelled</c>), the rest of that occurrence is skipped, and
     /// no occurrence starts while it is on. Turning it off catches up the most recent
-    /// occurrence straight away.
+    /// occurrence straight away. The background abandoned-run recovery skips while it is on;
+    /// an explicit <see cref="Application.IRetentionRunRecovery.RecoverAsync"/> call doesn't.
     /// </summary>
     public bool KillSwitch { get; init; }
 
@@ -58,9 +58,13 @@ public sealed class CohortOptions
     /// </summary>
     public int SweepBatchSize { get; init; } = 5000;
 
-    public AuditObserverOptions AuditObservers { get; init; } = new();
+    /// <summary>
+    /// A run left Started longer than this is recovered as Failed, once Cohort proves that no
+    /// process still owns its run lock. At least 1 minute.
+    /// </summary>
+    public TimeSpan SweepSettleTimeout { get; init; } = TimeSpan.FromHours(1);
 
-    public RowHandlerDispatchOptions RowHandlerDispatch { get; init; } = new();
+    public AuditObserverOptions AuditObservers { get; init; } = new();
 
     /// <summary>
     /// Opt-in pruning of settled run history and inactive holds. Nothing is pruned unless
@@ -78,16 +82,9 @@ public sealed class CohortOptions
     internal bool WorkerRuns => !KillSwitch && !string.IsNullOrWhiteSpace(Schedule);
 
     /// <summary>
-    /// What history pruning prunes, or null when nothing is pruned (the kill switch is on, or no
-    /// retention is set): settled runs, inactive holds, and whether it reads the database clock,
-    /// which it does to find the schedule's current occurrence when a schedule is set.
+    /// Whether history pruning runs: the kill switch is off and a retention is set. The pruner
+    /// loop, each pruning pass, startup's validation of the pruner's scope, and nothing else
+    /// decide it.
     /// </summary>
-    internal PruningScope? PruningScope =>
-        KillSwitch || !HistoryPruning.Enabled
-            ? null
-            : new PruningScope(
-                HistoryPruning.PrunesRuns,
-                HistoryPruning.PrunesHolds,
-                !string.IsNullOrWhiteSpace(Schedule)
-            );
+    internal bool PrunerRuns => !KillSwitch && HistoryPruning.Enabled;
 }

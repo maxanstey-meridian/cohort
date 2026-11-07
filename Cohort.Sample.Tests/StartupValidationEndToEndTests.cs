@@ -11,7 +11,6 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Options;
 
 namespace Cohort.Sample.Tests;
 
@@ -71,123 +70,10 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
             );
     }
 
-    // Only AddRowHandler makes a row handler: a handler service it didn't register would
-    // never run while its rows are still mutated, so startup refuses it, and so does a
-    // sweep's own readiness check on a host that was never started. Nothing is constructed
-    // to find out: the handler's constructor throws.
-    [Theory]
-    [InlineData("type")]
-    [InlineData("instance")]
-    [InlineData("factory")]
-    [InlineData("duplicate")]
-    [InlineData("singleton-first")]
-    [InlineData("instance-first")]
-    [InlineData("factory-first")]
-    [InlineData("service-removed")]
-    [InlineData("keyed")]
-    [InlineData("open-generic")]
-    public async Task Validation_Refuses_A_Handler_Service_Not_Registered_With_AddRowHandler(string registration)
-    {
-        var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder();
-        builder.Configuration.AddInMemoryCollection(
-            new Dictionary<string, string?>
-            {
-                [$"{SampleOptions.SectionName}:{nameof(SampleOptions.ConnectionString)}"] =
-                    connectionString,
-            }
-        );
-        builder.Services.AddSampleRetentionServices();
-        switch (registration)
-        {
-            case "type":
-                builder.Services.AddScoped<IRetentionHandler<Note>, UnconstructableNoteHandler>();
-                break;
-            case "instance":
-                builder.Services.AddSingleton<IRetentionHandler<Note>>(new InstanceNoteHandler());
-                break;
-            case "factory":
-                builder.Services.AddScoped<IRetentionHandler<Note>>(_ => new UnconstructableNoteHandler());
-                break;
-            case "duplicate":
-                builder.Services.AddRowHandler<Note, UnconstructableNoteHandler>();
-                builder.Services.AddScoped<IRetentionHandler<Note>, UnconstructableNoteHandler>();
-                break;
-            // A singleton or instance registered first makes AddRowHandler's own add a no-op.
-            case "singleton-first":
-                builder.Services.AddSingleton<IRetentionHandler<Note>, UnconstructableNoteHandler>();
-                builder.Services.AddRowHandler<Note, UnconstructableNoteHandler>();
-                break;
-            case "instance-first":
-                builder.Services.AddSingleton<IRetentionHandler<Note>>(new InstanceNoteHandler());
-                builder.Services.AddRowHandler<Note, InstanceNoteHandler>();
-                break;
-            case "factory-first":
-                builder.Services.AddScoped<IRetentionHandler<Note>, UnconstructableNoteHandler>(_ => new UnconstructableNoteHandler());
-                builder.Services.AddRowHandler<Note, UnconstructableNoteHandler>();
-                break;
-            // Removed after AddRowHandler ran: its registration stays behind.
-            case "service-removed":
-                builder.Services.AddRowHandler<Note, UnconstructableNoteHandler>();
-                builder.Services.RemoveAll<IRetentionHandler<Note>>();
-                break;
-            case "keyed":
-                builder.Services.AddKeyedScoped<IRetentionHandler<Note>, UnconstructableNoteHandler>("k");
-                break;
-            case "open-generic":
-                builder.Services.AddScoped(typeof(IRetentionHandler<>), typeof(OpenHandler<>));
-                break;
-        }
-
-        using var host = builder.Build();
-
-        var start = () => host.StartAsync();
-        var sweep = () =>
-            host.Services.GetRequiredService<IRetentionSweep>()
-                .ExecuteAsync(RetentionSweepRequest.Tenantless(dryRun: true));
-
-        var named = registration switch
-        {
-            "factory" or "factory-first" or "keyed" => $"IRetentionHandler<{typeof(Note).FullName}>",
-            "open-generic" => "IRetentionHandler<>",
-            "instance" or "instance-first" => typeof(InstanceNoteHandler).FullName!,
-            _ => typeof(UnconstructableNoteHandler).FullName!,
-        };
-        foreach (var act in new[] { start, sweep })
-        {
-            var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
-            exception
-                .Which.Errors.Should()
-                .ContainSingle(error =>
-                    error.Contains(named, StringComparison.Ordinal)
-                    && error.Contains("AddRowHandler", StringComparison.Ordinal)
-                );
-        }
-
-        UnconstructableNoteHandler.Constructed.Should().BeFalse();
-    }
-
-    // A container can resolve a handler the IServiceCollection scan never saw; resolving it
-    // refuses it the same way instead of failing on a missing registration.
-    [Fact]
-    public void Resolving_A_Handler_Without_A_Registration_Refuses_It()
-    {
-        var services = new ServiceCollection();
-        services.AddRowHandler<Note, InstanceNoteHandler>();
-        services.AddScoped<IRetentionHandler<Note>, StrayNoteHandler>();
-        using var provider = services.BuildServiceProvider();
-        using var scope = provider.CreateScope();
-
-        var act = () => RetentionHandlerSupport.ResolveHandlers(scope.ServiceProvider, typeof(Note));
-
-        act.Should().Throw<RetentionConfigurationException>()
-            .Which.Errors.Should().ContainSingle(error =>
-                error.Contains(typeof(StrayNoteHandler).FullName!, StringComparison.Ordinal)
-                && error.Contains("AddRowHandler", StringComparison.Ordinal)
-            );
-    }
-
-    // The same for a dependents step: only AddRetentionDependents makes one, and startup and a
-    // never-started host's own readiness check refuse any other shape without constructing it.
+    // Only AddRetentionDependents makes a dependents step: a step service it didn't register
+    // would never run while its rows are still mutated, so startup refuses it, and so does a
+    // sweep's own readiness check on a host that was never started. Nothing is constructed to
+    // find out: the step's constructor throws.
     [Theory]
     [InlineData("type")]
     [InlineData("instance")]
@@ -272,6 +158,8 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         UnconstructableNoteStep.Constructed.Should().BeFalse();
     }
 
+    // A container can resolve a step the IServiceCollection scan never saw; resolving it
+    // refuses it the same way instead of failing on a missing registration.
     [Fact]
     public void Resolving_A_Step_Without_A_Registration_Refuses_It()
     {
@@ -317,52 +205,6 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
             .Which.Errors.Should().ContainSingle(error =>
                 error.Contains(typeof(InstanceNoteStep).FullName!, StringComparison.Ordinal)
                 && error.Contains($"resolves {resolved} IRetentionDependents", StringComparison.Ordinal)
-            );
-    }
-
-    // The scrub clock starts when a row is mutated and a row's handlers run one after another,
-    // so PayloadRetention has to cover every handler's retry schedule on the busiest entity.
-    // Each schedule here is 30 minutes and 10 seconds: one 30-minute claim plus one poll.
-    [Theory]
-    [InlineData(1, true)]
-    [InlineData(2, false)]
-    public void Options_Refuse_A_PayloadRetention_The_Row_Handlers_Of_One_Entity_Outlast(
-        int handlerCount,
-        bool accepted
-    )
-    {
-        var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder();
-        builder.Configuration.AddInMemoryCollection(
-            new Dictionary<string, string?>
-            {
-                [$"{SampleOptions.SectionName}:{nameof(SampleOptions.ConnectionString)}"] = connectionString,
-                [$"{CohortOptions.SectionName}:RowHandlerDispatch:PayloadRetention"] = "01:00:00",
-                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxAttempts"] = "1",
-                [$"{CohortOptions.SectionName}:RowHandlerDispatch:ClaimTimeout"] = "00:30:00",
-            }
-        );
-        builder.Services.AddSampleRetentionServices();
-        builder.Services.AddRowHandler<Note, InstanceNoteHandler>();
-        if (handlerCount == 2)
-        {
-            builder.Services.AddRowHandler<Note, SecondNoteHandler>();
-        }
-
-        using var host = builder.Build();
-
-        var options = () => host.Services.GetRequiredService<IOptions<CohortOptions>>().Value;
-
-        if (accepted)
-        {
-            options.Should().NotThrow();
-            return;
-        }
-
-        options.Should().Throw<OptionsValidationException>()
-            .Which.Failures.Should().ContainSingle(failure =>
-                failure.Contains("PayloadRetention", StringComparison.Ordinal)
-                && failure.Contains(typeof(Note).FullName!, StringComparison.Ordinal)
-                && failure.Contains("2 row handlers", StringComparison.Ordinal)
             );
     }
 
@@ -487,27 +329,6 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
             Task.FromResult<RetentionRule?>(new RetentionRule(new RetentionPeriod(Days: 30), Strategy.Anonymise));
     }
 
-    [RowHandlerId("3a4e2f9b-7c61-4d08-b5e2-91f0c6d7a843")]
-    private sealed class SecondNoteHandler : IRetentionHandler<Note>;
-
-    [RowHandlerId("c70b90fd-ebbb-4631-8ce9-6f11d4bf7081")]
-    private sealed class UnconstructableNoteHandler : IRetentionHandler<Note>
-    {
-        public static bool Constructed { get; private set; }
-
-        public UnconstructableNoteHandler()
-        {
-            Constructed = true;
-            throw new InvalidOperationException("Startup must not construct a row handler.");
-        }
-    }
-
-    [RowHandlerId("d0f60a6d-922d-46c0-8100-c4a358f7802b")]
-    private sealed class InstanceNoteHandler : IRetentionHandler<Note>;
-
-    private sealed class StrayNoteHandler : IRetentionHandler<Note>;
-
-    [RowHandlerId("b4137b7d-6960-43b5-9cbe-560cc7af6a63")]
     private sealed class UnconstructableNoteStep : IRetentionDependents<Note>
     {
         public static bool Constructed { get; private set; }
@@ -521,7 +342,6 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
         public Task RetireAsync(Note row, RetentionDependentsContext ctx, CancellationToken ct) => Task.CompletedTask;
     }
 
-    [RowHandlerId("8e903300-3e52-4f2c-98c8-4c9976907fed")]
     private sealed class InstanceNoteStep : IRetentionDependents<Note>
     {
         public Task RetireAsync(Note row, RetentionDependentsContext ctx, CancellationToken ct) => Task.CompletedTask;
@@ -536,8 +356,6 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     {
         public Task RetireAsync(TEntity row, RetentionDependentsContext ctx, CancellationToken ct) => Task.CompletedTask;
     }
-
-    private sealed class OpenHandler<TEntity> : IRetentionHandler<TEntity>;
 
     private sealed class MultiStrategyRuleProvider : IRetentionRuleProvider
     {

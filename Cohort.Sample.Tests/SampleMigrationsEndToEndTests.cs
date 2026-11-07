@@ -11,6 +11,9 @@ namespace Cohort.Sample.Tests;
 [Collection("Integration")]
 public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAsyncLifetime
 {
+    // The last migration whose schema still has sweep_row_handler_status; the next drops it.
+    private const string LastMigrationWithHandlerStatus = "20261107150342_AddSampleOutbox";
+
     private static readonly (string EntityType, Guid RetentionEntityId)[] StableEntityMappings =
     [
         ("Cohort.Sample.Entities.Note", Guid.Parse("a3f467fe-c5d0-4f17-9897-83c373cc1dc8")),
@@ -180,7 +183,7 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
     }
 
     [Fact]
-    public async Task Current_Migration_Preserves_Historical_Error_And_LastError_Bytes()
+    public async Task Later_Migrations_Preserve_Historical_Error_And_LastError_Bytes()
     {
         const string historicalError = "legacy Error: quote=' slash=\\ tab=\t line1\nline2 trailing  ";
         const string historicalLastError =
@@ -213,7 +216,7 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
                 sweepId
             );
 
-            await migrator.MigrateAsync();
+            await migrator.MigrateAsync(LastMigrationWithHandlerStatus);
         }
 
         await using var connection = new NpgsqlConnection(connectionString);
@@ -241,6 +244,108 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
             .GetFieldValue<byte[]>(3)
             .Should()
             .Equal(System.Text.Encoding.UTF8.GetBytes(historicalLastError));
+    }
+
+    // A 0.11.0 database holds a row a failing dependents step skipped as a row detail plus a
+    // dead-lettered status, written by PersistBeforeFailureAsync: State 3, Attempt 1, never
+    // claimed, and QueuedAt, NextAttemptAt, and CompletedAt from one database-clock instant. An
+    // after-commit handler dead-lettered on its first attempt, its payload scrubbed, differs only
+    // in its CompletedAt, the host clock at dead-letter time. The migration that drops the table
+    // moves the first's LastError into Failure and leaves the second's row detail, a mutated
+    // row's, NULL. Two more statuses share the skipped row's instants and differ only in State
+    // (a handler that succeeded) or Attempt (a dead-letter on a later attempt), so each of those
+    // terms is needed too. A dead-letter can't carry a claim (CK_sweep_row_handler_status_Claim),
+    // so no seed can differ only in ClaimedAt.
+    [Fact]
+    public async Task Remove_Row_Handler_Queue_Migration_Moves_Only_A_Skipped_Rows_Error_Into_Failure()
+    {
+        const string skippedError = "type=System.InvalidOperationException;code=;diagnosticId=0123456789abcdef";
+        const string afterCommitError = "type=System.TimeoutException;code=;diagnosticId=fedcba9876543210";
+        const string succeededError = "type=System.TimeoutException;code=;diagnosticId=00000000000000aa";
+        const string retriedError = "type=System.TimeoutException;code=;diagnosticId=00000000000000bb";
+        var options = CreateOptions();
+        var sweepId = Guid.NewGuid();
+        var tenantId = Guid.NewGuid();
+        var queuedAt = new DateTimeOffset(2026, 10, 30, 3, 0, 0, TimeSpan.Zero);
+
+        await using (var db = new SampleDbContext(options))
+        {
+            var migrator = db.Database.GetService<IMigrator>();
+            await migrator.MigrateAsync(LastMigrationWithHandlerStatus);
+            await using (var connection = new NpgsqlConnection(connectionString))
+            {
+                await connection.OpenAsync();
+                await using var command = connection.CreateCommand();
+                command.CommandText = """
+                    INSERT INTO "sweep_run"
+                        ("SweepId", "StartedAt", "Status", "SettledAt", "Duration", "TriggerKind", "DryRun", "TenantId", "TotalAffected", "Error")
+                    VALUES (@sweepId, @queuedAt, 2, @queuedAt + INTERVAL '1 minute', INTERVAL '1 minute', 2, FALSE, @tenantId, 1, 'reason=rows-skipped');
+
+                    WITH details AS (
+                        INSERT INTO "sweep_run_row_detail"
+                            ("SweepId", "At", "EntityType", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId", "CapturedPayload")
+                        VALUES
+                            (@sweepId, @queuedAt, 'Cohort.Sample.Entities.Note', @entityId, 'skipped-record', 'short-lived', 0, @tenantId, NULL),
+                            (@sweepId, @queuedAt, 'Cohort.Sample.Entities.Note', @entityId, 'mutated-record', 'short-lived', 0, @tenantId, NULL),
+                            (@sweepId, @queuedAt, 'Cohort.Sample.Entities.Note', @entityId, 'succeeded-record', 'short-lived', 0, @tenantId, NULL),
+                            (@sweepId, @queuedAt, 'Cohort.Sample.Entities.Note', @entityId, 'retried-record', 'short-lived', 0, @tenantId, NULL)
+                        RETURNING "Id", "RecordId"
+                    )
+                    INSERT INTO "sweep_row_handler_status"
+                        ("SweepRunRowDetailId", "HandlerType", "DispatchPhase", "State", "Attempt", "QueuedAt", "NextAttemptAt", "ClaimedAt", "ClaimToken", "CompletedAt", "LastError")
+                    SELECT details."Id", seed.handler_type, 0, seed.state, seed.attempt, @queuedAt, @queuedAt, NULL, NULL,
+                           @queuedAt + seed.completed_after, seed.last_error
+                    FROM details
+                    JOIN (VALUES
+                        ('skipped-record', 'Legacy.Step', 3, 1, INTERVAL '0 seconds', @skippedError),
+                        ('mutated-record', 'Legacy.Handler', 3, 1, INTERVAL '2 seconds', @afterCommitError),
+                        ('succeeded-record', 'Legacy.Handler', 2, 1, INTERVAL '0 seconds', @succeededError),
+                        ('retried-record', 'Legacy.Handler', 3, 2, INTERVAL '0 seconds', @retriedError)
+                    ) AS seed (record_id, handler_type, state, attempt, completed_after, last_error)
+                        ON seed.record_id = details."RecordId";
+                    """;
+                command.Parameters.AddWithValue("sweepId", sweepId);
+                command.Parameters.AddWithValue("tenantId", tenantId);
+                command.Parameters.AddWithValue("queuedAt", queuedAt);
+                command.Parameters.AddWithValue("entityId", Note.RetentionIdentity);
+                command.Parameters.AddWithValue("skippedError", skippedError);
+                command.Parameters.AddWithValue("afterCommitError", afterCommitError);
+                command.Parameters.AddWithValue("succeededError", succeededError);
+                command.Parameters.AddWithValue("retriedError", retriedError);
+                await command.ExecuteNonQueryAsync();
+            }
+
+            await migrator.MigrateAsync();
+        }
+
+        await using var verify = new NpgsqlConnection(connectionString);
+        await verify.OpenAsync();
+        await using var read = verify.CreateCommand();
+        read.CommandText = """
+            SELECT "RecordId", "Failure"
+            FROM "sweep_run_row_detail"
+            WHERE "SweepId" = @sweepId
+            ORDER BY "RecordId"
+            """;
+        read.Parameters.AddWithValue("sweepId", sweepId);
+        var failures = new List<(string RecordId, string? Failure)>();
+        await using (var reader = await read.ExecuteReaderAsync())
+        {
+            while (await reader.ReadAsync())
+            {
+                failures.Add((reader.GetString(0), reader.IsDBNull(1) ? null : reader.GetString(1)));
+            }
+        }
+
+        failures
+            .Should()
+            .Equal(
+                ("mutated-record", null),
+                ("retried-record", null),
+                ("skipped-record", skippedError),
+                ("succeeded-record", null)
+            );
+        (await GetColumnsAsync("sweep_row_handler_status")).Should().BeEmpty("the migration drops the table");
     }
 
     [Theory]
@@ -466,9 +571,10 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
         rowDetailColumns["Id"].DataType.Should().Be("bigint");
         rowDetailColumns["Id"].IsNullable.Should().BeFalse();
         rowDetailColumns["Id"].IdentityGeneration.Should().Be("BY DEFAULT");
-        rowDetailColumns.Should().ContainKey("CapturedPayload");
-        rowDetailColumns["CapturedPayload"].DataType.Should().Be("text");
-        rowDetailColumns["CapturedPayload"].IsNullable.Should().BeTrue();
+        rowDetailColumns.Should().ContainKey("Failure");
+        rowDetailColumns["Failure"].DataType.Should().Be("text");
+        rowDetailColumns["Failure"].IsNullable.Should().BeTrue();
+        rowDetailColumns.Should().NotContainKey("CapturedPayload");
         rowDetailColumns["RetentionEntityId"].DataType.Should().Be("uuid");
         rowDetailColumns["RetentionEntityId"].IsNullable.Should().BeFalse();
         rowDetailColumns["RecordId"].DataType.Should().Be("text");
@@ -478,56 +584,14 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
         rowDetailColumns.Should().NotContainKey("RuleReason");
         (await GetPrimaryKeyColumnsAsync("sweep_run_row_detail")).Should().Equal("Id");
 
-        var handlerStatusColumns = await GetColumnsAsync("sweep_row_handler_status");
-        handlerStatusColumns
-            .Should()
-            .ContainKeys(
-                "Id",
-                "SweepRunRowDetailId",
-                "HandlerType",
-                "DispatchPhase",
-                "State",
-                "Attempt",
-                "QueuedAt",
-                "NextAttemptAt",
-                "ClaimedAt",
-                "ClaimToken",
-                "CompletedAt",
-                "LastError"
-            );
-        handlerStatusColumns["Id"].DataType.Should().Be("bigint");
-        handlerStatusColumns["Id"].IsNullable.Should().BeFalse();
-        handlerStatusColumns["Id"].IdentityGeneration.Should().Be("BY DEFAULT");
-        handlerStatusColumns["SweepRunRowDetailId"].DataType.Should().Be("bigint");
-        handlerStatusColumns["SweepRunRowDetailId"].IsNullable.Should().BeFalse();
-        handlerStatusColumns["HandlerType"].DataType.Should().Be("text");
-        handlerStatusColumns["HandlerType"].IsNullable.Should().BeFalse();
-        handlerStatusColumns["DispatchPhase"].DataType.Should().Be("integer");
-        handlerStatusColumns["DispatchPhase"].IsNullable.Should().BeFalse();
-        handlerStatusColumns["State"].DataType.Should().Be("integer");
-        handlerStatusColumns["State"].IsNullable.Should().BeFalse();
-        handlerStatusColumns["Attempt"].DataType.Should().Be("integer");
-        handlerStatusColumns["Attempt"].IsNullable.Should().BeFalse();
-        handlerStatusColumns["QueuedAt"].DataType.Should().Be("timestamp with time zone");
-        handlerStatusColumns["QueuedAt"].IsNullable.Should().BeFalse();
-        handlerStatusColumns["NextAttemptAt"].DataType.Should().Be("timestamp with time zone");
-        handlerStatusColumns["NextAttemptAt"].IsNullable.Should().BeFalse();
-        handlerStatusColumns["ClaimedAt"].DataType.Should().Be("timestamp with time zone");
-        handlerStatusColumns["ClaimedAt"].IsNullable.Should().BeTrue();
-        handlerStatusColumns["ClaimToken"].DataType.Should().Be("uuid");
-        handlerStatusColumns["ClaimToken"].IsNullable.Should().BeTrue();
-        handlerStatusColumns["CompletedAt"].DataType.Should().Be("timestamp with time zone");
-        handlerStatusColumns["CompletedAt"].IsNullable.Should().BeTrue();
-        handlerStatusColumns["LastError"].DataType.Should().Be("text");
-        handlerStatusColumns["LastError"].IsNullable.Should().BeTrue();
-        (await GetPrimaryKeyColumnsAsync("sweep_row_handler_status")).Should().Equal("Id");
+        (await GetColumnsAsync("sweep_row_handler_status")).Should().BeEmpty("the row-handler queue's table is gone");
 
         (
             await HasForeignKeyAsync(
-                "sweep_row_handler_status",
-                "SweepRunRowDetailId",
                 "sweep_run_row_detail",
-                "Id"
+                "SweepId",
+                "sweep_run",
+                "SweepId"
             )
         )
             .Should()
@@ -543,26 +607,6 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
                     StringComparison.Ordinal
                 )
                 && !index.Contains(" WHERE ", StringComparison.Ordinal)
-            );
-
-        var handlerStatusIndexes = await GetIndexDefinitionsAsync("sweep_row_handler_status");
-        handlerStatusIndexes
-            .Should()
-            .Contain(index =>
-                index.Contains("CREATE UNIQUE INDEX", StringComparison.Ordinal)
-                && index.Contains(
-                    "(\"SweepRunRowDetailId\", \"HandlerType\")",
-                    StringComparison.Ordinal
-                )
-            );
-        handlerStatusIndexes
-            .Should()
-            .Contain(index =>
-                index.Contains("CREATE INDEX", StringComparison.Ordinal)
-                && index.Contains(
-                    "(\"State\", \"NextAttemptAt\", \"Id\")",
-                    StringComparison.Ordinal
-                )
             );
 
         var holdIndexes = await GetIndexDefinitionsAsync("retention_holds");

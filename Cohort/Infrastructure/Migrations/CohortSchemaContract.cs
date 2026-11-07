@@ -1,8 +1,5 @@
 #nullable enable
 
-using Cohort.Application;
-using Cohort.Infrastructure.Handlers;
-
 namespace Cohort.Infrastructure.Migrations;
 
 internal static class CohortSchemaContract
@@ -128,7 +125,8 @@ internal static class CohortSchemaContract
                 Column<string>("Category", "text"),
                 Column<int>("Strategy", "integer", "int4"),
                 Column<Guid>("TenantId", "uuid"),
-                Column<string?>("CapturedPayload", "text", nullable: true),
+                // Null for a mutated row; for a row a failing dependents step skipped, why.
+                Column<string?>("Failure", "text", nullable: true),
             ],
             ["Id"],
             [
@@ -142,48 +140,6 @@ internal static class CohortSchemaContract
             ForeignKeys:
             [
                 new(["SweepId"], CohortTableNames.SweepRun, ["SweepId"], ForeignKeyDeleteAction.Restrict),
-            ]
-        ),
-        new(
-            CohortTableNames.SweepRowHandlerStatus,
-            SharedTypeName: null,
-            static tables => tables.SweepRowHandlerStatus,
-            [
-                Column<long>("Id", "bigint", "int8", generated: true),
-                Column<long>("SweepRunRowDetailId", "bigint", "int8"),
-                Column<string>("HandlerType", "text"),
-                Column<RowHandlerDispatchPhase>("DispatchPhase", "integer", "int4"),
-                Column<SweepRowHandlerDispatchState>("State", "integer", "int4"),
-                Column<int>("Attempt", "integer", "int4"),
-                Column<DateTimeOffset>("QueuedAt", "timestamp with time zone", "timestamptz"),
-                Column<DateTimeOffset>("NextAttemptAt", "timestamp with time zone", "timestamptz"),
-                Column<DateTimeOffset?>("ClaimedAt", "timestamp with time zone", "timestamptz", nullable: true),
-                Column<Guid?>("ClaimToken", "uuid", nullable: true),
-                Column<DateTimeOffset?>("CompletedAt", "timestamp with time zone", "timestamptz", nullable: true),
-                Column<string?>("LastError", "text", nullable: true),
-            ],
-            ["Id"],
-            [
-                new(["SweepRunRowDetailId", "HandlerType"], Unique: true),
-                new(["State", "NextAttemptAt", "Id"]),
-            ],
-            [
-                new(
-                    "CK_sweep_row_handler_status_Claim",
-                    "(\"State\" = 1 AND \"ClaimedAt\" IS NOT NULL AND \"ClaimToken\" IS NOT NULL) OR (\"State\" <> 1 AND \"ClaimedAt\" IS NULL AND \"ClaimToken\" IS NULL)"
-                ),
-                new(
-                    "CK_sweep_row_handler_status_Completion",
-                    "(\"State\" IN (2, 3) AND \"CompletedAt\" IS NOT NULL) OR (\"State\" IN (0, 1) AND \"CompletedAt\" IS NULL)"
-                ),
-            ],
-            [
-                new(
-                    ["SweepRunRowDetailId"],
-                    CohortTableNames.SweepRunRowDetail,
-                    ["Id"],
-                    ForeignKeyDeleteAction.Cascade
-                ),
             ]
         ),
     ];
@@ -205,7 +161,7 @@ internal static class CohortSchemaContract
 
     internal sealed record TableRequirement(
         string Role,
-        string? SharedTypeName,
+        string SharedTypeName,
         Func<CohortStoreTables, RelationalObjectName> ResolveStoreTable,
         IReadOnlyList<ColumnRequirement> Columns,
         IReadOnlyList<string> PrimaryKey,
@@ -267,7 +223,6 @@ internal static class CohortTableNames
     internal const string SweepRun = "sweep_run";
     internal const string SweepRunEntitySummary = "sweep_run_entity_summary";
     internal const string SweepRunRowDetail = "sweep_run_row_detail";
-    internal const string SweepRowHandlerStatus = "sweep_row_handler_status";
 }
 
 internal static class CohortSharedTypeNames

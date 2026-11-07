@@ -10,14 +10,14 @@ so the ledger and the data never disagree.
 |---|---|
 | `sweep_run` | Run: trigger kind, erasure subject kind (erasures only, never the subject), status, dry-run flag, tenant, start and settle times, error |
 | `sweep_run_entity_summary` | Entity, category, tenant and strategy within a run |
-| `sweep_run_row_detail` | Mutated row, when per-row detail is on |
+| `sweep_run_row_detail` | Mutated row, when per-row detail is on; and every row a failing dependents step skipped, with why in `Failure` |
 
 A run commits its `Started` row before any mutation. A terminal event then sets `Status` to
 `Succeeded`, `PartiallyFailed`, `Failed` or `Cancelled` and records `SettledAt`. Every time
 the ledger records comes from the database clock.
 
 `PartiallyFailed` means the run finished but left work it should have done: an entity failed,
-a row handler's `OnBeforeAsync` or an entity's dependents step skipped rows, or an erasure left rows deferred or blocked.
+an entity's dependents step skipped rows, or an erasure left rows deferred or blocked.
 `Error` then lists one line per cause, the same lines as the result's `EntityFailures`; rows
 left behind read `reason=rows-skipped;entityType=…;count=n` (`rows-missed`, `rows-blocked` for
 an erasure). A sweep's deferred and blocked rows don't count, since its next run retries
@@ -33,8 +33,7 @@ Summary rows carry:
 - strategy
 - affected count
 - held count
-- skipped count: rows left unchanged because a row handler's `OnBeforeAsync` or its
-  dependents step failed
+- skipped count: rows left unchanged because the entity's dependents step failed
 - null-anchor count
 - retained count, erasure only: the subject's rows the rule keeps, younger than the legal
   minimum or under an `Exempt` rule
@@ -69,7 +68,13 @@ or on the entity, which overrides the rule:
 ```
 
 An entity left at the default `Inherit` follows its rule. A rule defaults to `SummaryOnly`.
-Each row detail records the row's canonical `RecordId` and `TenantId`.
+Each row detail records the row's canonical `RecordId` and `TenantId`. A mutated row's
+`Failure` is `NULL`.
+
+Whatever the setting, a row a failing [dependents step](/guides/row-handlers#retiring-a-rows-dependents)
+skipped gets a row detail too, with a `Failure` that says why: a
+[sanitized diagnostic](#failure-diagnostics) for an exception, or `reason=…` for a failure
+Cohort found itself. It isn't a `RowDetail` event, so observers see mutated rows only.
 
 ## Audit observers
 
@@ -131,7 +136,7 @@ involved, so the envelope reads `type=Cohort.Refusal;code=cohort:…`:
 
 Neither touched a row. See [Running Retention](/guides/running-retention#tenants).
 
-Only diagnostic `Error` and `LastError` text is sanitized. Exception messages, stack traces,
+Only diagnostic text (the run's `Error` and a skipped row's `Failure`) is sanitized. Exception messages, stack traces,
 SQL values and subject identifiers are kept out of it, but the deliberately identifying
 `RecordId` and `TenantId` fields stay in row-detail events. Structured logs keep the original
 exception under the same diagnostic ID, so you can still diagnose it from protected logs.
@@ -161,7 +166,7 @@ writing summaries that record 0 for counts it never measured. Summaries written 
 upgrade keep 0 in all three: those counts weren't measured, so read them as unknown for runs
 that started before you upgraded.
 
-A run whose row handlers skipped rows now settles `PartiallyFailed` instead of `Succeeded`,
+A run whose dependents step skipped rows now settles `PartiallyFailed` instead of `Succeeded`,
 with a `rows-skipped` reason, so alerts on run status will see these runs.
 
 A row a database constraint refuses no longer fails its whole entity. It's counted in

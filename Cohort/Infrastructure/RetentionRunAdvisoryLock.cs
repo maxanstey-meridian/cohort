@@ -8,10 +8,9 @@ using Cohort.Infrastructure.Sweep;
 namespace Cohort.Infrastructure;
 
 /// <summary>
-/// Session-level PostgreSQL advisory locks that mark a live run, worker, scheduled pass or
-/// row-handler delivery. They live as long as the session that took them, so they need direct
-/// connections or session-mode pooling: a transaction-mode pooler hands the session to someone
-/// else, and Npgsql multiplexing runs each command outside a transaction on whichever session
+/// Session-level PostgreSQL advisory locks that mark a live run, worker or scheduled pass. They
+/// live as long as the session that took them, so they need direct connections or
+/// session-mode pooling: a transaction-mode pooler hands the session to someone else, and Npgsql multiplexing runs each command outside a transaction on whichever session
 /// is free (readiness refuses a multiplexed connection).
 /// </summary>
 internal static class RetentionRunAdvisoryLock
@@ -41,14 +40,6 @@ internal static class RetentionRunAdvisoryLock
     internal static long ScheduledPassKeyFor(RelationalObjectName sweepRun, Guid tenantId, bool dryRun) =>
         HashKey($"cohort-scheduled-pass:{PostgreSqlIdentifier.Format(sweepRun)}:{tenantId:D}:{(dryRun ? "dry" : "real")}");
 
-    /// <summary>
-    /// The key a dispatcher holds while it runs one row-handler status. Status ids are only
-    /// unique within one install's <c>sweep_row_handler_status</c> table, so the key is derived
-    /// from the schema-qualified table as well, the same way as <see cref="WorkerKeyFor"/>.
-    /// </summary>
-    internal static long RowHandlerKeyFor(RelationalObjectName statusTable, long statusId) =>
-        HashKey($"cohort-row-handler:{PostgreSqlIdentifier.Format(statusTable)}:{statusId}");
-
     internal static SweepStatement LockStatement(long key) =>
         CohortStatements.Statement("advisory-lock", "SELECT pg_catalog.pg_advisory_lock(@key)", new SqlParams { ["key"] = key });
 
@@ -64,14 +55,6 @@ internal static class RetentionRunAdvisoryLock
             "advisory-unlock",
             "SELECT pg_catalog.pg_advisory_unlock(@key)",
             new SqlParams { ["key"] = key }
-        );
-
-    /// <summary>Takes every key in key order, as <see cref="AcquireAllAsync"/> does.</summary>
-    internal static SweepStatement LockAllStatement(IReadOnlyCollection<long> keys) =>
-        CohortStatements.Statement(
-            "advisory-lock-all",
-            "SELECT pg_catalog.pg_advisory_lock(k) FROM pg_catalog.unnest(@keys) AS k ORDER BY k",
-            new SqlParams { ["keys"] = keys.ToArray() }
         );
 
     /// <summary>Releases every session advisory lock the connection holds.</summary>
@@ -112,22 +95,6 @@ internal static class RetentionRunAdvisoryLock
                 $"PostgreSQL reported that Cohort advisory lock {key} was not owned by this connection."
             );
         }
-    }
-
-    /// <summary>
-    /// Takes every key on the connection, in key order so two sessions taking overlapping sets
-    /// can't deadlock, inside <paramref name="transaction"/>. A session lock survives the
-    /// transaction's commit, and also its rollback, so a caller whose transaction fails must
-    /// still release them.
-    /// </summary>
-    internal static async Task AcquireAllAsync(
-        DbConnection connection,
-        DbTransaction transaction,
-        IReadOnlyCollection<long> keys,
-        CancellationToken ct
-    )
-    {
-        await ExecuteNonQueryAsync(connection, transaction, LockAllStatement(keys), ct);
     }
 
     /// <summary>Releases every session advisory lock the connection holds.</summary>

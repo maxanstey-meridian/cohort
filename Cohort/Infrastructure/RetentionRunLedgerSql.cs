@@ -12,8 +12,8 @@ namespace Cohort.Infrastructure;
 // the EF model; every value is a named parameter.
 
 /// <summary>
-/// The <c>sweep_run</c> ledger reads and writes the scheduled worker and the row-handler
-/// dispatcher own.
+/// The <c>sweep_run</c> ledger reads and writes the scheduled worker and abandoned-run recovery
+/// own.
 /// </summary>
 internal static class RetentionRunLedgerSql
 {

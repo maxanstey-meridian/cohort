@@ -11,7 +11,7 @@ namespace Cohort.Infrastructure;
 /// sweep and preview ports do, so it never shares the caller's DbContext. A
 /// <see cref="ErasureTransaction.Caller"/> erasure runs on this scope's DbContext and joins its
 /// open transaction; the host already set that scope up, so the hook isn't called for the
-/// erasure itself. Each batch with row handlers still gets its own scope through the hook,
+/// erasure itself. Each batch with a dependents step still gets its own scope through the hook,
 /// on the caller's connection and inside its transaction (see <c>SweepStrategy.ExecuteAsync</c>).
 /// </summary>
 internal sealed class RetentionErasureEntryPoint(

@@ -130,9 +130,9 @@ Ordinary `Period` never delays erasure. Legal minimums, holds and Exempt rules d
   entity, since the cause is then the rule or the schema, unless the refusals differ between
   rows or are a foreign key refusing a purge. A foreign key refusing the value an anonymise
   writes is the rule's, so it still fails the entity. A Purge entity with a
-  [dependents step](/guides/row-handlers#retiring-a-rows-dependents) tries its referenced
-  rows anyway: the step can retire what references them, and a row still referenced after it
-  is blocked.
+  [dependents step](/guides/row-handlers#retiring-a-rows-dependents) registered as retiring
+  the rows that reference it (the default) tries its referenced rows anyway: the step can
+  retire what references them, and a row still referenced after it is blocked.
 - Active holds always block erasure. A row is held when a hold names it, or when it's linked
   by a `[HeldWith]` or `[HeldWithReferencing]` relation to a row a hold covers, so a person's
   link row on a held Case is held and stays. To ask before erasing whether any of a subject's
@@ -148,15 +148,16 @@ counts don't overlap:
 | `HeldCount` | an active hold covers them, directly or through a [hold relation](/guides/legal-holds#holding-related-rows) |
 | `NullAnchorCount` | their anchor is null, so a legal-minimum cutoff never matches them |
 | `RetainedCount` | the rule keeps them: younger than the legal minimum, or every row under an `Exempt` rule |
-| `SkippedCount` | a row handler's `OnBeforeAsync` or its dependents step failed, so the row was left unchanged |
+| `SkippedCount` | the entity's dependents step failed, so the row was left unchanged |
 | `DeferredCount` | they came into scope mid-run behind the rows the run had already passed (a hold ended, a reference went, an anchor moved earlier), so the next run handles them |
 | `BlockedCount` | a database constraint stopped Cohort changing them |
 
 `ErasureResult.Complete` reads them for you. It is `true` only when no entity failed and every
 one of those counts is zero, so nothing of the subject remains in the requested scope. A dry
 run's `Complete` says whether the real run would be, except that it never runs a
-[dependents step](/guides/row-handlers#retiring-a-rows-dependents): it predicts that the step
-clears a Purge row's references, so it counts those rows as erased, not blocked.
+[dependents step](/guides/row-handlers#retiring-a-rows-dependents): it predicts that a step
+registered as retiring the rows that reference its entity clears a Purge row's references, so
+it counts those rows as erased, not blocked.
 
 Skipped, deferred and blocked rows also make the run `PartiallyFailed`: each adds a plain
 reason to `EntityFailures` and to the run's `Error`, such as
@@ -187,7 +188,7 @@ any row. `ErasureResult.DryRun` tells you which kind of run it was. It never set
 `Complete` and the counts. It never runs a
 [dependents step](/guides/row-handlers#retiring-a-rows-dependents), so a referenced row of a
 Purge entity with one counts as erased, on the prediction that its step clears the
-references.
+references, unless the step was registered with `retiresReferencingRows: false`.
 
 ## How it runs
 
@@ -281,24 +282,24 @@ What changes compared with an ordinary erasure:
   [Tenant Isolation](/guides/tenant-isolation)). `CommitAsync` is the supported path: a
   synchronous `Commit()` blocks while observers are told, each for up to
   `AuditObservers:Timeout` per event.
-- **Row handlers run after the commit; a dependents step runs inside it.** `OnBeforeAsync`
-  runs inside your transaction, in a read-only savepoint, and a
+- **A dependents step runs inside your transaction.** A
   [dependents step](/guides/row-handlers#retiring-a-rows-dependents) runs read-write inside
-  it, under the row's own savepoint. Neither runs on your `DbContext`: they get their own
-  scope and context, on your connection and transaction, and whatever they track is discarded
-  after each row. Your context's change tracker is never touched. Their other scoped services
-  are fresh instances, not yours (see [row handlers](/guides/row-handlers)).
-  `OnAfterAsync` work is queued in the same transaction, so the dispatcher only sees it once
-  you commit, and a rollback discards it.
+  it, under the row's own savepoint. It doesn't run on your `DbContext`: it gets its own scope
+  and context, on your connection and transaction, and whatever it tracks is discarded after
+  each row. Your context's change tracker is never touched. Its other scoped services are
+  fresh instances, not yours. A message it writes to your outbox commits only when you
+  commit, and a rollback discards it (see
+  [After-commit work through your outbox](/guides/row-handlers#after-commit-work-through-your-outbox)).
 - **Your deferred constraints stay deferred.** Cohort doesn't change your transaction's
   constraint mode, so a change of Cohort's that breaks a deferred constraint fails your
   `COMMIT`, not the row, and is not counted as blocked.
 - **Your change tracker isn't refreshed.** The erasure changes rows with SQL, so entities
   your context already tracks keep their old values. Load and change your own rows before
   erasing, or call `ChangeTracker.Clear()` after.
-- **Your execution scope is called only for row handlers or a dependents step.** The erasure
-  runs in your scope, under whatever tenant isolation you already applied to it. Each batch
-  with row handlers or a dependents step gets its own scope, run as the request's tenant, on your already-open connection. See [Tenant Isolation](/guides/tenant-isolation).
+- **Your execution scope is called only for a dependents step.** The erasure runs in your
+  scope, under whatever tenant isolation you already applied to it. Each batch with a
+  dependents step gets its own scope, run as the request's tenant, on your already-open
+  connection. See [Tenant Isolation](/guides/tenant-isolation).
 
 A dry run with `Caller` is allowed. It writes its audit rows into your transaction and
 changes nothing else.

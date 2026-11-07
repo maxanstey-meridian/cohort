@@ -107,7 +107,6 @@ internal sealed class RetentionStatementReadiness(
     RetentionRegistry registry,
     RetentionValidationState validationState,
     AnonymiseAssignmentResolver assignments,
-    IEnumerable<IRetentionHandlerRegistration> handlerRegistrations,
     IEnumerable<IRetentionDependentsRegistration> dependentsRegistrations,
     IRetentionExecutionSettings settings
 )
@@ -237,7 +236,7 @@ internal sealed class RetentionStatementReadiness(
         var attached = await ReferencingForeignKeySql.AttachAsync(
             db.Database.GetDbConnection(),
             scopes.Select(scope => scope.Scope).ToArray(),
-            entry => dependentsRegistrations.HasStep(entry.EntityType),
+            entry => dependentsRegistrations.RetiresReferencingRows(entry.EntityType),
             ct
         );
         return [.. scopes.Select((scope, index) => scope with { Scope = attached[index] })];
@@ -651,14 +650,10 @@ internal sealed class RetentionStatementReadiness(
     /// <summary>The run's own path predicate, from the registrations the run reads.</summary>
     private SweepPath PathOf(RetentionEntry entry, Strategy strategy)
     {
-        var hasHandlers = RetentionHandlerSupport.HasHandlers(
-            handlerRegistrations,
-            entry.EntityType
-        );
         var hasStep = dependentsRegistrations.HasStep(entry.EntityType);
         var perRow = strategy == Strategy.Anonymise && assignments.RequiresPerRowExecution(entry);
         return new SweepPath(
-            SweepStatements.TakesRowByRowPath(strategy, hasHandlers, hasStep, perRow),
+            SweepStatements.TakesRowByRowPath(strategy, hasStep, perRow),
             hasStep
         );
     }

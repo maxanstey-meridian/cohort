@@ -23,7 +23,7 @@ public sealed class CohortTableAdoptionTests
             .GetEntityTypes()
             .Where(entityType => CohortTableNames.Contains(entityType.GetTableName()))
             .Should()
-            .HaveCount(5)
+            .HaveCount(4)
             .And.OnlyContain(entityType => entityType.GetSchema() == schema);
     }
 

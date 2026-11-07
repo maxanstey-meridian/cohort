@@ -23,24 +23,16 @@ entity and the problem.
 - `[RetentionTenantless]` isn't combined with a tenant property. Otherwise the tenant property
   would win and the marker would be silently ignored.
 
-## Row handlers and dependents steps
+## Dependents steps
 
-- Every [row handler](/guides/row-handlers) carries a `[RowHandlerId]` holding a non-empty
-  UUID, and no two handler classes share an id, whatever their entities. `AddRowHandler`
-  refuses a missing, malformed, or shared id when it's called, naming the handler, and an id
-  another class uses as a dependents step. One class keeps its one id for every entity it's
-  registered for, as a handler or as a step.
-- Every `IRetentionHandler<T>` service is registered once, through `AddRowHandler`, as
-  scoped. A handler registered any other way is refused and named, and so is one whose
-  service was removed or replaced after `AddRowHandler` added it: it would never run.
-- Every [dependents step](/guides/row-handlers#retiring-a-rows-dependents) carries a
-  `[RowHandlerId]` in the same id space: `AddRetentionDependents` refuses a missing or
-  malformed id, an id another step or handler class uses, and a second step for an entity.
+- An entity has at most one [dependents step](/guides/row-handlers#retiring-a-rows-dependents):
+  `AddRetentionDependents` refuses a second step class for an entity when it's called, and a
+  repeat call for the same entity and step with a different `retiresReferencingRows`.
 - Every `IRetentionDependents<T>` service is registered once, through
   `AddRetentionDependents`, as scoped. A step registered any other way is refused and named,
   and so is one whose service was removed or replaced after `AddRetentionDependents` added it.
-- A row handler or dependents step registered for an entity that isn't a `[Retain]` entity in
-  the `DbContext` model is refused and named: it would never run.
+- A dependents step registered for an entity that isn't a `[Retain]` entity in the `DbContext`
+  model is refused and named: it would never run.
 - On a host that was never started, every Cohort operation refuses these too.
 
 ## Rules and capabilities
@@ -98,7 +90,7 @@ kind an entity maps, with and without a legal minimum; holds and their deletion 
 worker's tenant-coverage scan. Some of them also read Cohort's `retention_holds` and
 `sweep_run_row_detail` tables. Cohort builds each statement with the code the runs execute, so
 what readiness explains is what a run sends, and it refuses what PostgreSQL refuses, for every
-column those statements use. Statements against Cohort's own five tables and the PostgreSQL
+column those statements use. Statements against Cohort's own four tables and the PostgreSQL
 functions it calls aren't explained: a role that lacks a privilege on them fails at the
 statement.
 
@@ -141,8 +133,10 @@ path reaches surfaces at the statement in the same way:
 
 `SELECT` on the child table of a foreign key that blocks a purge changes what a run does, and
 no role is refused for lacking it. With it, a purge
-leaves out the rows that child still references, unless the entity has a dependents step (its
-rows are always tried, whatever the role can read). Without it, that key is left out: a sweep
+leaves out the rows that child still references, unless the entity has a dependents step
+registered as retiring the rows that reference it (its rows are always tried, whatever the role
+can read; see [Rows that reference the entity](/guides/row-handlers#rows-that-reference-the-entity)).
+Without it, that key is left out: a sweep
 or an erasure tries the row, the constraint refuses the delete, and the row is counted as
 blocked (a sweep still succeeds and the next run tries the row again; an erasure settles
 `PartiallyFailed` with `rows-blocked`, as it does with `SELECT`). A preview or a dry run
@@ -150,23 +144,22 @@ doesn't try the row: it counts it as due, not blocked.
 
 What each scope's role needs to run its operation, and only that
 ([Tenant Isolation](/guides/tenant-isolation#grants) says which scope that is), is below: a
-preview role needs only `SELECT`, and a dispatcher needs no write on your tables. On the
+preview role needs only `SELECT`, and recovery needs nothing on your tables. On the
 retained tables that is `SELECT`; `UPDATE` where a statement locks rows (`FOR UPDATE` and
 `FOR SHARE` need it, as `SoftDelete` and `Anonymise` do); `DELETE` where `Purge` is declared;
 and `USAGE` on each schema those tables and Cohort's live in.
 
 | Operation | Cohort's tables | Functions | Your retained tables |
 |---|---|---|---|
-| **Sweep**: sweeps, dry runs, and scheduled passes | `sweep_run` and `sweep_run_entity_summary`: `SELECT`, `INSERT`, `UPDATE`. `sweep_run_row_detail`: `SELECT`, `INSERT`. `retention_holds`: `SELECT`. `sweep_row_handler_status`: `INSERT`, when a row handler or a dependents step is registered | `pg_advisory_lock`, `pg_advisory_unlock`, `pg_try_advisory_lock` (the pass lock), the entity lock, the clock | `SELECT`, `UPDATE`; `DELETE` where `Purge` is declared |
+| **Sweep**: sweeps, dry runs, and scheduled passes | `sweep_run` and `sweep_run_entity_summary`: `SELECT`, `INSERT`, `UPDATE`. `sweep_run_row_detail`: `SELECT`, `INSERT`. `retention_holds`: `SELECT` | `pg_advisory_lock`, `pg_advisory_unlock`, `pg_try_advisory_lock` (the pass lock), the entity lock, the clock | `SELECT`, `UPDATE`; `DELETE` where `Purge` is declared |
 | **Erasure** | As Sweep | `pg_advisory_lock`, `pg_advisory_unlock`, the entity lock, the clock, `current_setting` | As Sweep |
 | **Preview** | `retention_holds`: `SELECT` | The clock | `SELECT` |
 | **Holds**: `IRetentionHoldsRepository` | `retention_holds`: `SELECT`, `INSERT`, `UPDATE` | The entity lock, the clock, `current_setting` | `SELECT`, `UPDATE` (the rows a hold locks `FOR SHARE`) |
 | **Deletion**: `IRetentionDeletion` | `retention_holds`: `SELECT` | The entity lock, the clock | `SELECT` |
 | **Readiness**: the `System(Readiness)` scope's own reads | `retention_holds`: `SELECT` | The clock | None |
-| **Scrub**: the payload-retention scrub | `sweep_run_row_detail`: `SELECT`, `UPDATE` | None | None |
-| **Dispatch**: the row-handler dispatcher | `sweep_run`, `sweep_run_row_detail`, and `sweep_row_handler_status`: `SELECT`, `UPDATE` | `pg_advisory_lock`, `pg_try_advisory_lock`, `pg_advisory_unlock`, `pg_advisory_unlock_all` | None |
+| **Recovery**: abandoned-run recovery | `sweep_run`: `SELECT`, `UPDATE` | `pg_try_advisory_lock`, `pg_advisory_unlock` (the run lock), the clock | None |
 | **Worker**: the scheduled worker's coordination | `sweep_run`: `SELECT` | `pg_try_advisory_lock`, `pg_advisory_unlock_all`, the clock | `SELECT` on each tenanted retained table |
-| **Pruning**: history pruning, for the retentions set | Runs: `sweep_run` `SELECT`, `UPDATE`, `DELETE`; `sweep_run_row_detail` and `sweep_run_entity_summary` `SELECT`, `DELETE`; `sweep_row_handler_status` `SELECT`. Holds: `retention_holds` `SELECT`, `UPDATE`, `DELETE` | The clock, when a `Schedule` is set | None |
+| **Pruning**: history pruning, for the retentions set | Runs: `sweep_run` `SELECT`, `UPDATE`, `DELETE`; `sweep_run_row_detail` and `sweep_run_entity_summary` `SELECT`, `DELETE`. Holds: `retention_holds` `SELECT`, `UPDATE`, `DELETE` | The clock, when a `Schedule` is set | None |
 
 In the table, "the entity lock" is
 `pg_advisory_xact_lock` over `hashtextextended`; and "the clock" is `statement_timestamp`,
@@ -176,9 +169,8 @@ erasures, that a run still holds its locks reads the `pg_locks` view (and calls
 
 Two more grants no table privilege covers:
 
-- `USAGE` on the sequence behind a serial `Id` column of `sweep_run_row_detail`, and of
-  `sweep_row_handler_status` when a row handler or a dependents step is registered, for
-  sweeps and erasures. An identity column, which Cohort's own tables use, needs no grant. A
+- `USAGE` on the sequence behind a serial `Id` column of `sweep_run_row_detail`, for sweeps
+  and erasures. An identity column, which Cohort's own tables use, needs no grant. A
   serial column's default calls `nextval`, so the insert fails at the statement for a role
   that holds neither `USAGE` nor `UPDATE` on the sequence.
 - `EXECUTE` on the functions in the table. PUBLIC holds it by default, and a database that
@@ -188,15 +180,15 @@ History pruning needs only what the retentions you set send, so a host that prun
 inactive holds needs no `DELETE` on `sweep_run`.
 
 At startup, the model pass runs in the `System(Readiness)` scope, then in the scope of each
-subsystem that will run, so that scope's own context is checked too: `System(RowDispatch)`
-always (the payload scrub and the dispatcher run whether or not a row handler is registered),
+subsystem that will run, so that scope's own context is checked too: `System(Recovery)` when
+the kill switch is off (abandoned-run recovery runs whatever else is configured),
 `System(WorkerCoordination)` when the worker runs (the kill switch off and a `Schedule` set),
 and `System(HistoryPruning)` when a pruning retention is set and the kill switch is off. A
 refusal stops the host. The pass runs once for each model instance and connection string, so a
 later scope that shares both does no further work beyond the provider and Multiplexing checks.
 A refusal after startup (a scope that reaches a model or connection string startup didn't
 check, say) throws a `RetentionConfigurationException` from the call that reached readiness.
-The dispatcher, worker, and pruner log it and retry, and sweeps, previews, and the other
+The recovery service, worker, and pruner log it and retry, and sweeps, previews, and the other
 operations carry on.
 
 A pass records nothing until it completes, so a pass refused partway starts again from its
@@ -311,18 +303,16 @@ checked. Readiness also checks each link column against the real table
 - No active hold names a `[RetentionEntityId]` that no retained entity in the model declares
   any more. Such a hold would never match its row again, so the row would lose its protection
   without an error. See [Changed entity identities](/reference/schema#changed-entity-identities).
-- [Options](/reference/configuration) are in range. With row handlers registered,
-  `RowHandlerDispatch:PayloadRetention` is longer than the retry schedule of the entity with
-  the most handlers (see [Configuration](/reference/configuration#row-handler-dispatch)), on
-  start and on every reload.
+- [Options](/reference/configuration) are in range, on start and on every reload.
 
 ## Upgrading to 0.12.0
 
 ::: warning Breaking change
 0.12.0 asks PostgreSQL to check the statements Cohort sends against your tables, and refuses
-more of what it finds at startup and at readiness. There is no Cohort schema change and no
-migration, but your own tables and EF model may need one. Each message names the entity and
-column it refuses.
+more of what it finds at startup and at readiness. Your own tables and EF model may need a
+change. Each message names the entity and column it refuses. Cohort's own schema changes too:
+readiness refuses a `sweep_run_row_detail` with no `Failure` column until you apply that
+migration (see [Dependents and After-Commit Work](/guides/row-handlers#upgrading-from-row-handlers)).
 
 - A tenant column that is nullable in the database: make it `NOT NULL`. A `NULL` tenant never
   matches any tenant's run, erasure, or hold, so those rows were silently never swept.

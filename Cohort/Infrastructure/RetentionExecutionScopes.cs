@@ -1,3 +1,5 @@
+using System.Transactions;
+
 using Cohort.Application;
 using Cohort.Domain;
 
@@ -8,7 +10,8 @@ namespace Cohort.Infrastructure;
 /// <summary>
 /// The only way Cohort creates a DI scope: create it, and run the work inside the host's
 /// <see cref="IRetentionExecutionScope"/>, so whatever the host sets up around the work (its
-/// tenant, an <see cref="AsyncLocal{T}"/> flow) encloses everything the work does.
+/// tenant, an <see cref="AsyncLocal{T}"/> flow) encloses everything the work does. The scope and
+/// its work run outside any ambient <see cref="Transaction"/>.
 /// </summary>
 internal static class RetentionExecutionScopes
 {
@@ -19,6 +22,13 @@ internal static class RetentionExecutionScopes
         CancellationToken ct
     )
     {
+        // Cohort's own work never enlists in a caller's ambient System.Transactions transaction:
+        // it commits on its own. This is the only way Cohort creates a DI scope, so suppressing
+        // here covers the sweep, the preview, owned erasure, recovery, the worker, and the pruner.
+        using var suppressAmbient = new TransactionScope(
+            TransactionScopeOption.Suppress,
+            TransactionScopeAsyncFlowOption.Enabled
+        );
         await using var scope = scopeFactory.CreateAsyncScope();
         var hook = scope.ServiceProvider.GetRequiredService<IRetentionExecutionScope>();
         var runs = 0;

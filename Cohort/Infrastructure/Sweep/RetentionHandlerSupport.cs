@@ -3,7 +3,7 @@ using System.Data.Common;
 
 using Cohort.Application;
 using Cohort.Domain;
-using Cohort.Infrastructure.Handlers;
+using Cohort.Infrastructure.Audit;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -14,77 +14,11 @@ namespace Cohort.Infrastructure.Sweep;
 internal static class RetentionHandlerSupport
 {
     /// <summary>
-    /// Whether any handler is registered for <paramref name="entityType"/>, read from the
-    /// registrations alone so no handler is constructed to find out.
-    /// </summary>
-    public static bool HasHandlers(IEnumerable<IRetentionHandlerRegistration> registrations, Type entityType) =>
-        registrations.Any(registration => registration.EntityType == entityType);
-
-    /// <summary>
-    /// Whether a run records handler bookkeeping (the row-detail payload and the handler status)
-    /// for <paramref name="entityType"/>: it has handlers or a dependents step.
-    /// </summary>
-    public static bool RecordsHandlerBookkeeping(
-        IEnumerable<IRetentionHandlerRegistration> handlerRegistrations,
-        IEnumerable<IRetentionDependentsRegistration> dependentsRegistrations,
-        Type entityType
-    ) => HasHandlers(handlerRegistrations, entityType) || dependentsRegistrations.HasStep(entityType);
-
-    /// <summary>
-    /// The handlers registered with <c>AddRowHandler</c> for <paramref name="entityType"/>,
-    /// in priority order. Validation refuses a handler service in the host's
-    /// <see cref="IServiceCollection"/> that <c>AddRowHandler</c> didn't register
-    /// (<see cref="RetentionHandlerServiceRegistrations"/>); one the provider resolves
-    /// alongside them without a registration (another container's) is refused here.
-    /// </summary>
-    public static IReadOnlyList<ResolvedRetentionHandler> ResolveHandlers(
-        IServiceProvider services,
-        Type entityType
-    )
-    {
-        var registrations = services
-            .GetServices<IRetentionHandlerRegistration>()
-            .Where(registration => registration.EntityType == entityType)
-            .ToDictionary(registration => registration.HandlerType);
-        if (registrations.Count == 0)
-        {
-            return [];
-        }
-
-        var handlerInterface = typeof(IRetentionHandler<>).MakeGenericType(entityType);
-        var registeredHandlers = (IEnumerable)services.GetRequiredService(
-            typeof(IEnumerable<>).MakeGenericType(handlerInterface)
-        );
-        return registeredHandlers
-            .Cast<object>()
-            .Select(handler =>
-            {
-                if (!registrations.TryGetValue(handler.GetType(), out var registration))
-                {
-                    throw new RetentionConfigurationException(
-                        [RetentionHandlerServiceRegistrations.NotRegisteredError(
-                            $"Row handler {handler.GetType().FullName}, resolved as IRetentionHandler<{entityType.FullName}>,")]
-                    );
-                }
-
-                return new ResolvedRetentionHandler(
-                    handler,
-                    handlerInterface,
-                    registration.DispatchPhase,
-                    registration.Identity
-                );
-            })
-            .OrderBy(handler => RowHandlerPriority.Get(handler.HandlerType))
-            .ThenBy(handler => handler.HandlerType.FullName, StringComparer.Ordinal)
-            .ToArray();
-    }
-
-    /// <summary>
     /// The dependents step registered with <c>AddRetentionDependents</c> for
-    /// <paramref name="entityType"/>, or null without one. Like <see cref="ResolveHandlers"/>,
-    /// a step the provider resolves without that registration (another container's) is
-    /// refused, and so is a registration the provider resolves no step for: its rows would
-    /// be mutated without their dependents retired.
+    /// <paramref name="entityType"/>, or null without one. A step the provider resolves
+    /// without that registration (another container's) is refused, and so is a registration
+    /// the provider resolves no step for: its rows would be mutated without their dependents
+    /// retired.
     /// </summary>
     public static ResolvedRetentionDependents? ResolveDependents(IServiceProvider services, Type entityType)
     {
@@ -114,76 +48,13 @@ internal static class RetentionHandlerSupport
             ]);
         }
 
-        return new ResolvedRetentionDependents(steps[0], registration.Identity);
-    }
-
-    /// <summary>
-    /// Runs every handler's OnBefore and captures the snapshot after each one, so a value
-    /// that cannot round-trip to OnAfter fails the handler that left it, before the row
-    /// is mutated. A handler that leaves unsaved changes on <paramref name="db"/>, the
-    /// handlers' own context, fails too: Cohort discards them, so the handler's work would
-    /// silently not happen.
-    /// </summary>
-    public static async Task<OnBeforeInvocationResult> InvokeOnBeforeAsync(
-        DbContext db,
-        IReadOnlyList<ResolvedRetentionHandler> handlers,
-        Type entityType,
-        object row,
-        RetentionBeforeContext ctx,
-        CancellationToken ct
-    )
-    {
-        var handlerAssemblies = handlers.Select(handler => handler.HandlerType.Assembly).ToArray();
-        string? capturedPayload = null;
-        foreach (var handler in handlers)
-        {
-            try
-            {
-                var invocation = handler.OnBeforeMethod.Invoke(handler.Instance, [row, ctx, ct]);
-                await (Task)invocation!;
-                if (HasUnsavedChanges(db))
-                {
-                    return OnBeforeInvocationResult.LeftUnsavedChanges(handler);
-                }
-
-                capturedPayload = RetentionSnapshotSerializer.Capture(
-                    ctx.Snapshot,
-                    entityType,
-                    handlerAssemblies
-                );
-            }
-            // Only the run's own cancellation stops the run. A handler's own (an HttpClient
-            // timeout is a TaskCanceledException) is that handler failing its row.
-            catch (System.Reflection.TargetInvocationException ex)
-                when (ex.InnerException is OperationCanceledException cancellation && ct.IsCancellationRequested)
-            {
-                throw cancellation;
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (System.Reflection.TargetInvocationException ex)
-                when (ex.InnerException is not null)
-            {
-                return new OnBeforeInvocationResult(handler, ex.InnerException);
-            }
-            catch (Exception ex)
-            {
-                return new OnBeforeInvocationResult(handler, ex);
-            }
-        }
-
-        return OnBeforeInvocationResult.Captured(
-            capturedPayload
-                ?? RetentionSnapshotSerializer.Capture(ctx.Snapshot, entityType, handlerAssemblies)
-        );
+        return new ResolvedRetentionDependents(steps[0]);
     }
 
     /// <summary>
     /// Detects explicitly, so a context with automatic detection turned off is still
-    /// checked. Detection that throws (a handler changed a tracked entity's key) is the
-    /// handler's unsaved change too.
+    /// checked. Detection that throws (a step changed a tracked entity's key) is the
+    /// step's unsaved change too.
     /// </summary>
     public static bool HasUnsavedChanges(DbContext db)
     {
@@ -199,54 +70,11 @@ internal static class RetentionHandlerSupport
     }
 
     /// <summary>
-    /// Records a mutated row with its captured snapshot payload and queues one pending status per
-    /// handler, in the mutation's transaction.
-    /// </summary>
-    public static async Task PersistCapturedRowAsync(
-        DbConnection conn,
-        DbTransaction transaction,
-        SweepMutationContext execution,
-        RetentionEntry entry,
-        Strategy strategy,
-        Guid tenantId,
-        string recordId,
-        string capturedPayload,
-        IReadOnlyList<ResolvedRetentionHandler> handlers,
-        CancellationToken ct
-    )
-    {
-        var rowDetailId = await InsertRowDetailAsync(
-            conn,
-            transaction,
-            execution,
-            entry,
-            strategy,
-            tenantId,
-            recordId,
-            capturedPayload,
-            ct
-        );
-        foreach (var handler in handlers)
-        {
-            await InsertHandlerStatusAsync(
-                conn,
-                transaction,
-                entry.CohortTables,
-                rowDetailId,
-                handler.HandlerIdentity,
-                handler.DispatchPhase,
-                execution.At,
-                failure: null,
-                ct
-            );
-        }
-    }
-
-    /// <summary>
-    /// Records a row left unmutated because an OnBefore handler or the dependents step failed
-    /// before its mutation, with that class's status dead-lettered. No snapshot is kept:
-    /// nothing will run after it. An exception is recorded as the sanitized diagnostic
-    /// envelope; a failure Cohort found itself as its plain reason.
+    /// Records a row left unmutated because the dependents step failed before its mutation:
+    /// one row detail whose <c>Failure</c> says why, in the mutation's transaction, whatever
+    /// the entity's row-detail audit level. It is not a <see cref="SweepEvent.RowDetail"/>,
+    /// so audit observers see mutated rows only. An exception is recorded as the sanitized
+    /// diagnostic envelope; a failure Cohort found itself as its plain reason.
     /// </summary>
     public static async Task PersistBeforeFailureAsync(
         DbConnection conn,
@@ -261,28 +89,15 @@ internal static class RetentionHandlerSupport
         CancellationToken ct
     )
     {
-        var rowDetailId = await InsertRowDetailAsync(
-            conn,
-            transaction,
-            execution,
-            entry,
-            strategy,
-            tenantId,
-            recordId,
-            capturedPayload: null,
-            ct
-        );
-
-        string lastError;
-        if (failed.Failure is { } failure)
+        string failure;
+        if (failed.Failure is { } exception)
         {
-            var diagnostic = RetentionFailureDiagnostic.Create(failure);
-            lastError = diagnostic.ToString();
+            var diagnostic = RetentionFailureDiagnostic.Create(exception);
+            failure = diagnostic.ToString();
             logger.LogError(
-                failure,
-                "Cohort {Role} {FailedType} failed before mutation for sweep {SweepId} and entity {EntityType}. Diagnostic {DiagnosticId}.",
-                failed.Role,
-                failed.FailedType.FullName,
+                exception,
+                "Cohort dependents step {StepType} failed before mutation for sweep {SweepId} and entity {EntityType}. Diagnostic {DiagnosticId}.",
+                failed.StepType.FullName,
                 execution.SweepId,
                 entry.EntityType.FullName,
                 diagnostic.DiagnosticIdText
@@ -290,43 +105,17 @@ internal static class RetentionHandlerSupport
         }
         else
         {
-            lastError = $"reason={failed.Reason}";
+            failure = $"reason={failed.Reason}";
             logger.LogError(
-                "Cohort {Role} {FailedType} failed before mutation for sweep {SweepId} and entity {EntityType} ({Reason}).",
-                failed.Role,
-                failed.FailedType.FullName,
+                "Cohort dependents step {StepType} failed before mutation for sweep {SweepId} and entity {EntityType} ({Reason}).",
+                failed.StepType.FullName,
                 execution.SweepId,
                 entry.EntityType.FullName,
                 failed.Reason
             );
         }
 
-        await InsertHandlerStatusAsync(
-            conn,
-            transaction,
-            entry.CohortTables,
-            rowDetailId,
-            failed.Identity,
-            failed.DispatchPhase,
-            execution.At,
-            lastError,
-            ct
-        );
-    }
-
-    private static async Task<long> InsertRowDetailAsync(
-        DbConnection conn,
-        DbTransaction transaction,
-        SweepMutationContext execution,
-        RetentionEntry entry,
-        Strategy strategy,
-        Guid tenantId,
-        string recordId,
-        string? capturedPayload,
-        CancellationToken ct
-    )
-    {
-        var statement = RowDetailWithPayloadStatement(
+        var statement = EfRetentionAuditWriter.RowDetailStatement(
             entry.CohortTables,
             execution.SweepId,
             execution.At,
@@ -336,111 +125,6 @@ internal static class RetentionHandlerSupport
             entry.Category,
             strategy,
             tenantId,
-            capturedPayload
-        );
-        await using var command = statement.Parameters.CreateCommand(conn, transaction, statement.Sql);
-        return (long)(await command.ExecuteScalarAsync(ct))!;
-    }
-
-    /// <summary>
-    /// Records a mutated row with its captured payload and returns the row's id.
-    /// <paramref name="recordId"/> is the row's canonical text.
-    /// </summary>
-    internal static SweepStatement RowDetailWithPayloadStatement(
-        CohortStoreTables tables,
-        Guid sweepId,
-        DateTimeOffset at,
-        Type entityType,
-        Guid retentionEntityId,
-        string recordId,
-        string category,
-        Strategy strategy,
-        Guid tenantId,
-        string? capturedPayload
-    ) =>
-        CohortStatements.Statement(
-            "row-detail-with-payload",
-            $"""
-            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRunRowDetail)}
-                ("SweepId", "At", "EntityType", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId", "CapturedPayload")
-            VALUES (@sweepId, @at, @entityType, @retentionEntityId, @recordId, @category, @strategy, @tenantId, @capturedPayload)
-            RETURNING "Id"
-            """,
-            new SqlParams
-            {
-                ["sweepId"] = sweepId,
-                ["at"] = at,
-                ["entityType"] = entityType.FullName ?? entityType.Name,
-                ["retentionEntityId"] = retentionEntityId,
-                ["recordId"] = recordId,
-                ["category"] = category,
-                ["strategy"] = (int)strategy,
-                ["tenantId"] = tenantId,
-                ["capturedPayload"] = capturedPayload,
-            },
-            tables.SweepRunRowDetail
-        );
-
-    /// <summary>
-    /// Queues a handler status for a row detail.
-    /// </summary>
-    internal static SweepStatement HandlerStatusStatement(
-        CohortStoreTables tables,
-        long rowDetailId,
-        string handlerType,
-        RowHandlerDispatchPhase dispatchPhase,
-        SweepRowHandlerDispatchState state,
-        int attempt,
-        DateTimeOffset at,
-        DateTimeOffset? completedAt,
-        string? lastError
-    ) =>
-        CohortStatements.Statement(
-            "handler-status",
-            $"""
-            INSERT INTO {PostgreSqlIdentifier.Format(tables.SweepRowHandlerStatus)}
-                ("SweepRunRowDetailId", "HandlerType", "DispatchPhase", "State", "Attempt", "QueuedAt", "NextAttemptAt", "ClaimedAt", "CompletedAt", "LastError")
-            VALUES (@rowDetailId, @handlerType, @dispatchPhase, @state, @attempt, @at, @at, NULL, @completedAt, @lastError)
-            """,
-            new SqlParams
-            {
-                ["rowDetailId"] = rowDetailId,
-                ["handlerType"] = handlerType,
-                ["dispatchPhase"] = (int)dispatchPhase,
-                ["state"] = (int)state,
-                ["attempt"] = attempt,
-                ["at"] = at,
-                ["completedAt"] = completedAt,
-                ["lastError"] = lastError,
-            },
-            tables.SweepRowHandlerStatus
-        );
-
-    /// <summary>
-    /// Queues a pending status, or with <paramref name="failure"/> records one already
-    /// dead-lettered on its first attempt.
-    /// </summary>
-    private static async Task InsertHandlerStatusAsync(
-        DbConnection conn,
-        DbTransaction transaction,
-        CohortStoreTables tables,
-        long rowDetailId,
-        string identity,
-        RowHandlerDispatchPhase dispatchPhase,
-        DateTimeOffset at,
-        string? failure,
-        CancellationToken ct
-    )
-    {
-        var statement = HandlerStatusStatement(
-            tables,
-            rowDetailId,
-            identity,
-            dispatchPhase,
-            failure is null ? SweepRowHandlerDispatchState.Pending : SweepRowHandlerDispatchState.DeadLettered,
-            failure is null ? 0 : 1,
-            at,
-            failure is null ? null : at,
             failure
         );
         await using var command = statement.Parameters.CreateCommand(conn, transaction, statement.Sql);
@@ -450,9 +134,8 @@ internal static class RetentionHandlerSupport
 
 /// <summary>
 /// The host's service registrations, read when Cohort validates its configuration. Only
-/// <c>AddRowHandler</c> makes a row handler, and only <c>AddRetentionDependents</c> a
-/// dependents step: an <see cref="IRetentionHandler{TEntity}"/> or
-/// <see cref="IRetentionDependents{TEntity}"/> service they didn't register would never run
+/// <c>AddRetentionDependents</c> makes a dependents step: an
+/// <see cref="IRetentionDependents{TEntity}"/> service it didn't register would never run
 /// while its rows are still mutated, and one registered twice would run twice per row. Read
 /// from the descriptors alone, so nothing is constructed to find out. The collection is complete by the time the
 /// provider that resolves this exists.
@@ -460,32 +143,12 @@ internal static class RetentionHandlerSupport
 internal sealed class RetentionHandlerServiceRegistrations(IServiceCollection services)
 {
     /// <summary>
-    /// The entity with the most row handlers, and how many: a row's handlers run one after
-    /// another, so its queued work can take that many retry schedules. Null without handlers.
+    /// Every dependents step service the host registered some other way than with
+    /// <c>AddRetentionDependents</c>, or more than once, and every registration whose service
+    /// was later removed or replaced.
     /// </summary>
-    public (Type Entity, int Count)? MostHandlersOnOneEntity() =>
-        Registrations()
-            .GroupBy(registration => registration.EntityType)
-            .Select(group => (Entity: group.Key, Count: group.Select(registration => registration.HandlerType).Distinct().Count()))
-            .OrderByDescending(entity => entity.Count)
-            .ThenBy(entity => entity.Entity.FullName, StringComparer.Ordinal)
-            .Cast<(Type Entity, int Count)?>()
-            .FirstOrDefault();
-
-    /// <summary>
-    /// Every row handler or dependents step service the host registered some other way than
-    /// with <c>AddRowHandler</c> or <c>AddRetentionDependents</c>, or more than once, and every
-    /// registration whose service was later removed or replaced.
-    /// </summary>
-    public IReadOnlyList<string> FindInvalidHandlerServices() =>
+    public IReadOnlyList<string> FindInvalidStepServices() =>
     [
-        .. FindInvalidServices(
-            typeof(IRetentionHandler<>),
-            "Row handler",
-            Registrations().Select(registration => (registration.EntityType, registration.HandlerType)).ToHashSet(),
-            NotRegisteredError,
-            "AddRowHandler<TEntity, THandler>"
-        ),
         .. FindInvalidServices(
             typeof(IRetentionDependents<>),
             "Dependents step",
@@ -567,84 +230,40 @@ internal sealed class RetentionHandlerServiceRegistrations(IServiceCollection se
         }
     }
 
-    public IRetentionHandlerRegistration[] Registrations() =>
-        RegistrationInstances<IRetentionHandlerRegistration>();
-
     public IRetentionDependentsRegistration[] DependentsRegistrations() =>
-        RegistrationInstances<IRetentionDependentsRegistration>();
-
-    private TRegistration[] RegistrationInstances<TRegistration>() =>
         services
-            .Where(descriptor => descriptor.ServiceType == typeof(TRegistration) && !descriptor.IsKeyedService)
+            .Where(descriptor => descriptor.ServiceType == typeof(IRetentionDependentsRegistration) && !descriptor.IsKeyedService)
             .Select(descriptor => descriptor.ImplementationInstance)
-            .OfType<TRegistration>()
+            .OfType<IRetentionDependentsRegistration>()
             .ToArray();
-
-    public static string NotRegisteredError(string registered) =>
-        $"{registered} isn't registered with AddRowHandler alone, so it wouldn't run in each batch's scope, or at all while its rows are still swept or erased. "
-            + "Register it only with services.AddRowHandler<TEntity, THandler>(), which lets DI construct it in each batch's scope; a row handler can't be a singleton, transient, an instance, a factory, keyed or open generic.";
 
     public static string DependentsNotRegisteredError(string registered) =>
         $"{registered} isn't registered with AddRetentionDependents alone, so it wouldn't run in each batch's scope, or at all while its rows are still swept or erased. "
             + "Register it only with services.AddRetentionDependents<TEntity, TStep>(), which lets DI construct it in each batch's scope; a dependents step can't be a singleton, transient, an instance, a factory, keyed or open generic.";
 }
 
-internal sealed class ResolvedRetentionHandler(
-    object instance,
-    Type handlerInterface,
-    RowHandlerDispatchPhase dispatchPhase,
-    Guid identity
-)
-{
-    public object Instance { get; } = instance;
-
-    public Type HandlerType { get; } = instance.GetType();
-
-    /// <summary>
-    /// What queued work is persisted and matched under: the handler's
-    /// <see cref="RowHandlerIdAttribute"/> UUID in "D" format, which survives class renames.
-    /// </summary>
-    public string HandlerIdentity { get; } = identity.ToString("D");
-
-    public RowHandlerDispatchPhase DispatchPhase { get; } = dispatchPhase;
-
-    public System.Reflection.MethodInfo OnBeforeMethod { get; } =
-        handlerInterface.GetMethod(nameof(IRetentionHandler<object>.OnBeforeAsync))
-        ?? throw new InvalidOperationException(
-            $"Could not resolve {nameof(IRetentionHandler<object>.OnBeforeAsync)} for handler interface {handlerInterface.FullName}."
-        );
-}
-
 /// <summary>
-/// The dependents step of an entity, resolved for one batch, and the
-/// <see cref="RowHandlerIdAttribute"/> UUID its failures are recorded under.
+/// The dependents step of an entity, resolved for one batch.
 /// </summary>
-internal sealed class ResolvedRetentionDependents(object instance, Guid identity)
+internal sealed class ResolvedRetentionDependents(object instance)
 {
     public object Instance { get; } = instance;
 
     public Type StepType { get; } = instance.GetType();
-
-    public string Identity { get; } = identity.ToString("D");
 }
 
 /// <summary>
-/// One batch's OnBefore handlers and dependents step, and the context they were resolved
-/// with: a scope of their own whose context is on the run's connection and transaction,
-/// never the run's context.
+/// One batch's dependents step, and the context it was resolved with: a scope of its own
+/// whose context is on the run's connection and transaction, never the run's context.
 /// </summary>
-internal sealed record RetentionHandlerScope(
-    DbContext Db,
-    IReadOnlyList<ResolvedRetentionHandler> Handlers,
-    ResolvedRetentionDependents? Dependents
-);
+internal sealed record RetentionHandlerScope(DbContext Db, ResolvedRetentionDependents? Dependents);
 
 /// <summary>
-/// What failed a row before its mutation: an OnBefore handler or the dependents step, the
-/// identity its dead-lettered status is recorded under, and either the exception or a
-/// Cohort-defined reason, which carries no handler or row data. Exactly one of the two is
-/// set, so it is built only through <see cref="FromException(ResolvedRetentionHandler, Exception)"/>
-/// or <see cref="FromReason(ResolvedRetentionHandler, string)"/> and their step overloads.
+/// What failed a row before its mutation: the dependents step, and either the exception or
+/// a Cohort-defined reason, which carries no step or row data. Exactly one of
+/// the two is set, so it is built only through
+/// <see cref="FromException(ResolvedRetentionDependents, Exception)"/> or
+/// <see cref="FromReason(ResolvedRetentionDependents, string)"/>.
 /// </summary>
 internal sealed record BeforeMutationFailure
 {
@@ -657,77 +276,22 @@ internal sealed record BeforeMutationFailure
     /// <summary>The step took its own row out of the mutation's scope.</summary>
     public const string DependentsChangedRowReason = "dependents-changed-row";
 
-    private const string HandlerRole = "row handler";
-    private const string StepRole = "dependents step";
-
-    private BeforeMutationFailure(
-        string role,
-        Type failedType,
-        string identity,
-        RowHandlerDispatchPhase dispatchPhase,
-        Exception? failure,
-        string? reason
-    )
+    private BeforeMutationFailure(Type stepType, Exception? failure, string? reason)
     {
-        Role = role;
-        FailedType = failedType;
-        Identity = identity;
-        DispatchPhase = dispatchPhase;
+        StepType = stepType;
         Failure = failure;
         Reason = reason;
     }
 
-    public string Role { get; }
-
-    public Type FailedType { get; }
-
-    public string Identity { get; }
-
-    public RowHandlerDispatchPhase DispatchPhase { get; }
+    public Type StepType { get; }
 
     public Exception? Failure { get; }
 
     public string? Reason { get; }
 
-    public static BeforeMutationFailure FromException(ResolvedRetentionHandler handler, Exception failure) =>
-        new(HandlerRole, handler.HandlerType, handler.HandlerIdentity, handler.DispatchPhase, failure, null);
-
-    public static BeforeMutationFailure FromReason(ResolvedRetentionHandler handler, string reason) =>
-        new(HandlerRole, handler.HandlerType, handler.HandlerIdentity, handler.DispatchPhase, null, reason);
-
-    // A step queues nothing, so its status has no dispatch of its own; Immediate is the default.
     public static BeforeMutationFailure FromException(ResolvedRetentionDependents step, Exception failure) =>
-        new(StepRole, step.StepType, step.Identity, RowHandlerDispatchPhase.Immediate, failure, null);
+        new(step.StepType, failure, null);
 
     public static BeforeMutationFailure FromReason(ResolvedRetentionDependents step, string reason) =>
-        new(StepRole, step.StepType, step.Identity, RowHandlerDispatchPhase.Immediate, null, reason);
-}
-
-internal sealed record OnBeforeInvocationResult(
-    ResolvedRetentionHandler? FailedHandler,
-    Exception? Failure,
-    string? CapturedPayload = null,
-    string? FailureReason = null
-)
-{
-    /// <summary>
-    /// The plain reason recorded for a handler that returned with unsaved changes on its
-    /// DbContext. Cohort-defined, so it carries no handler or row data.
-    /// </summary>
-    public const string UnsavedChangesReason = "on-before-unsaved-changes";
-
-    public static OnBeforeInvocationResult Captured(string capturedPayload) =>
-        new(null, null, capturedPayload);
-
-    public static OnBeforeInvocationResult LeftUnsavedChanges(ResolvedRetentionHandler handler) =>
-        new(handler, null, FailureReason: UnsavedChangesReason);
-
-    public bool Succeeded => FailedHandler is null;
-
-    public BeforeMutationFailure ToFailure() =>
-        FailedHandler is { } handler
-            ? Failure is not null
-                ? BeforeMutationFailure.FromException(handler, Failure)
-                : BeforeMutationFailure.FromReason(handler, FailureReason!)
-            : throw new InvalidOperationException("Only a failed OnBefore leaves a row unmutated.");
+        new(step.StepType, null, reason);
 }

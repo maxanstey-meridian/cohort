@@ -19,7 +19,7 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
     : IntegrationTestBase(fixture)
 {
     [Fact]
-    public async Task Handler_Aware_Erasure_Rechecks_Subject_After_Waiting_For_The_Row()
+    public async Task Row_By_Row_Erasure_Rechecks_Subject_After_Waiting_For_The_Row()
     {
         var tenantId = Guid.NewGuid();
         var originalSubjectId = Guid.NewGuid();
@@ -45,10 +45,11 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
             await db.SaveChangesAsync();
         }
 
-        using var handlerHost = new CohortTestHost(
+        // A dependents step puts the entity on the row-by-row path.
+        using var stepHost = new CohortTestHost(
             GetConnectionString(),
             configureServices: services =>
-                services.AddRowHandler<AnonymisedContact, SubjectRaceContactHandler>()
+                services.AddRetentionDependents<AnonymisedContact, SubjectRaceContactStep>(retiresReferencingRows: false)
         );
         await using var blocker = new NpgsqlConnection(GetConnectionString());
         await blocker.OpenAsync();
@@ -62,7 +63,7 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
             await lockCommand.ExecuteNonQueryAsync();
         }
 
-        var erasure = handlerHost.RunErasureAsync(
+        var erasure = stepHost.RunErasureAsync(
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
             new ErasureScope("user", originalSubjectId, allowSoftDeleteAsErasure: true),
             asOf
@@ -663,14 +664,17 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task Handler_Path_Anonymises_Entities_With_Complex_Properties()
+    public async Task Row_By_Row_Path_Anonymises_Entities_With_Complex_Properties()
     {
+        var runs = new StepRuns();
         await using var database = await TemporaryDatabase.CreateAsync(GetConnectionString());
         await using var provider = BuildSingleEntityProvider<ComplexAddressDbContext>(
             database.ConnectionString,
             "complex-address",
             Strategy.Anonymise,
-            services => services.AddRowHandler<ComplexAddressRecord, CountingComplexAddressHandler>()
+            services => services
+                .AddSingleton(runs)
+                .AddRetentionDependents<ComplexAddressRecord, ComplexAddressStep>(retiresReferencingRows: false)
         );
         var tenantId = Guid.NewGuid();
         var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
@@ -688,6 +692,7 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
 
         result.EntityFailures.Should().BeEmpty();
         result.Counts.Single(count => count.EntityType == typeof(ComplexAddressRecord)).Affected.Should().Be(1);
+        runs.Count.Should().Be(1, "the sweep took the row-by-row path");
     }
 
     private static ServiceProvider BuildSingleEntityProvider<TContext>(
@@ -875,8 +880,25 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
         public string Town { get; set; } = "";
     }
 
-    [RowHandlerId("8b7c6a83-876c-4d1e-bd18-0e91c5d19abe")]
-    private sealed class CountingComplexAddressHandler : IRetentionHandler<ComplexAddressRecord>;
+    // Counts the rows a step ran for. A step runs only on the row-by-row path, so a count shows
+    // the test took it.
+    private sealed class StepRuns
+    {
+        private int count;
+
+        public int Count => Volatile.Read(ref count);
+
+        public void Record() => Interlocked.Increment(ref count);
+    }
+
+    private sealed class ComplexAddressStep(StepRuns runs) : IRetentionDependents<ComplexAddressRecord>
+    {
+        public Task RetireAsync(ComplexAddressRecord row, RetentionDependentsContext ctx, CancellationToken ct)
+        {
+            runs.Record();
+            return Task.CompletedTask;
+        }
+    }
 
     private sealed class JsonbAnonymiseDbContext(DbContextOptions<JsonbAnonymiseDbContext> options)
         : DbContext(options)
@@ -1161,12 +1183,11 @@ public sealed class AnonymiseSweepEndToEndTests(PostgresFixture fixture)
     }
 }
 
-[RowHandlerId("eafe3c16-ae23-4ba1-8caf-fd7ae5bfff75")]
-file sealed class SubjectRaceContactHandler : IRetentionHandler<AnonymisedContact>
+file sealed class SubjectRaceContactStep : IRetentionDependents<AnonymisedContact>
 {
-    public Task OnBeforeAsync(
+    public Task RetireAsync(
         AnonymisedContact row,
-        RetentionBeforeContext ctx,
+        RetentionDependentsContext ctx,
         CancellationToken ct
     ) => Task.CompletedTask;
 }

@@ -42,7 +42,7 @@ internal sealed class ScopeRoles : IAsyncDisposable
         Tenant = $"cohort_tenant_{suffix}";
         TenantlessPass = $"cohort_tenantless_{suffix}";
         Readiness = $"cohort_readiness_{suffix}";
-        RowDispatch = $"cohort_dispatch_{suffix}";
+        Recovery = $"cohort_recovery_{suffix}";
         WorkerCoordination = $"cohort_worker_{suffix}";
         HistoryPruning = $"cohort_pruning_{suffix}";
     }
@@ -57,7 +57,7 @@ internal sealed class ScopeRoles : IAsyncDisposable
 
     public string Readiness { get; }
 
-    public string RowDispatch { get; }
+    public string Recovery { get; }
 
     public string WorkerCoordination { get; }
 
@@ -69,7 +69,7 @@ internal sealed class ScopeRoles : IAsyncDisposable
             Tenant,
             TenantlessPass,
             Readiness,
-            RowDispatch,
+            Recovery,
             WorkerCoordination,
             HistoryPruning,
         ];
@@ -83,7 +83,7 @@ internal sealed class ScopeRoles : IAsyncDisposable
         : role == Tenant ? "a tenant scope"
         : role == TenantlessPass ? "the tenantless pass"
         : role == Readiness ? "the readiness scope"
-        : role == RowDispatch ? "the dispatcher"
+        : role == Recovery ? "abandoned-run recovery"
         : role == WorkerCoordination ? "the worker"
         : role == HistoryPruning ? "the pruner"
         : $"the role {role}";
@@ -155,7 +155,7 @@ internal sealed class ScopeRoles : IAsyncDisposable
                 RetentionSystemWork.Readiness => switchedReadiness ?? Readiness,
                 RetentionSystemWork.WorkerCoordination => WorkerCoordination,
                 RetentionSystemWork.TenantlessPass => TenantlessPass,
-                RetentionSystemWork.RowDispatch => RowDispatch,
+                RetentionSystemWork.Recovery => Recovery,
                 RetentionSystemWork.HistoryPruning => HistoryPruning,
                 _ => throw new ArgumentOutOfRangeException(nameof(context), system.Work, null),
             },

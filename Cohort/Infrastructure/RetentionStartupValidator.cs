@@ -20,7 +20,7 @@ internal sealed partial class RetentionStartupValidator(
     IEnumerable<IAnonymiseValueFactory> anonymiseValueFactories,
     RetentionValidationState validationState,
     ErasureSubjectMetadataResolver erasureSubjectMetadataResolver,
-    RetentionHandlerServiceRegistrations handlerServices
+    RetentionHandlerServiceRegistrations stepServices
 )
 {
     // Instance field, not static: NullabilityInfoContext is documented as not thread-safe,
@@ -84,7 +84,7 @@ internal sealed partial class RetentionStartupValidator(
                     $"{nameof(IAnonymiseValueFactory)} concrete runtime type {pair.Key.FullName} is registered {pair.Value} times in DI; exactly one registration per concrete runtime type is allowed."
                 )
                 .ToList();
-            errors.AddRange(handlerServices.FindInvalidHandlerServices());
+            errors.AddRange(stepServices.FindInvalidStepServices());
             var retentionEntityIdOwners = new Dictionary<Guid, Type>();
             var retainedEntries = new List<RetentionEntry>();
 
@@ -329,8 +329,8 @@ internal sealed partial class RetentionStartupValidator(
                 .Errors
         );
 
-    // Handlers and steps run only where Cohort mutates a row, so one on an entity Cohort never
-    // retains would never run.
+    // A step runs only where Cohort mutates a row, so one on an entity Cohort never retains
+    // would never run.
     private void ValidateRowWorkTargetsRetainedEntities(List<string> errors)
     {
         var retained = db.Model.GetEntityTypes()
@@ -338,15 +338,12 @@ internal sealed partial class RetentionStartupValidator(
             .Where(clrType => clrType.GetCustomAttribute<RetainAttribute>(inherit: false) is not null)
             .ToHashSet();
         errors.AddRange(
-            handlerServices.Registrations()
-                .Select(registration => (Role: "Row handler", Type: registration.HandlerType, registration.EntityType, Method: "AddRowHandler"))
-                .Concat(handlerServices.DependentsRegistrations()
-                    .Select(registration => (Role: "Dependents step", Type: registration.StepType, registration.EntityType, Method: "AddRetentionDependents")))
+            stepServices.DependentsRegistrations()
                 .Where(registration => !retained.Contains(registration.EntityType))
                 .OrderBy(registration => registration.EntityType.FullName, StringComparer.Ordinal)
-                .ThenBy(registration => registration.Type.FullName, StringComparer.Ordinal)
+                .ThenBy(registration => registration.StepType.FullName, StringComparer.Ordinal)
                 .Select(registration =>
-                    $"{registration.Role} {registration.Type.FullName} is registered for {registration.EntityType.FullName}, which isn't a [Retain] entity in the DbContext model, so it would never run. Annotate the entity with [Retain], or remove its {registration.Method} registration."
+                    $"Dependents step {registration.StepType.FullName} is registered for {registration.EntityType.FullName}, which isn't a [Retain] entity in the DbContext model, so it would never run. Annotate the entity with [Retain], or remove its AddRetentionDependents registration."
                 )
         );
     }

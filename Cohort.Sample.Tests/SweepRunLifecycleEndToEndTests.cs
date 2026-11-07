@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Data.Common;
+using System.Diagnostics;
 
 using Cohort.Application;
 using Cohort.Domain;
@@ -7,9 +8,14 @@ using Cohort.Infrastructure;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 using Npgsql;
+
+using Xunit.Sdk;
 
 namespace Cohort.Sample.Tests;
 
@@ -35,10 +41,7 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
         try
         {
             await BackdateRunAsync(sweepId);
-            await host.RunWithServicesAsync(async services =>
-            {
-                await services.GetRequiredService<IRetentionRowDispatcher>().FlushAsync();
-            });
+            await RecoverAsync(host);
 
             (await LoadRunStatusAsync(sweepId)).Should().Be(SweepRunStatus.Started);
         }
@@ -76,9 +79,7 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
         try
         {
             await BackdateRunAsync(sweepId);
-            await host.RunWithServicesAsync(services =>
-                services.GetRequiredService<IRetentionRowDispatcher>().FlushAsync()
-            );
+            await RecoverAsync(host);
 
             (await LoadRunStatusAsync(sweepId)).Should().Be(SweepRunStatus.Started);
         }
@@ -89,6 +90,148 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
 
         (await runTask).SweepId.Should().Be(sweepId);
         (await LoadRunStatusAsync(sweepId)).Should().Be(SweepRunStatus.Succeeded);
+    }
+
+    [Fact]
+    public async Task Recovery_Fails_An_Abandoned_Run_Once_No_Owner_Holds_Its_Lock_Whatever_The_Kill_Switch_Says()
+    {
+        // An explicit call is how a host that runs no hosted services recovers, so the kill
+        // switch, which pauses only background work, doesn't stop it.
+        var sweepId = await SeedStartedRunAsync(DateTimeOffset.UtcNow.AddDays(-1));
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configurationOverrides: new Dictionary<string, string?> { ["Cohort:KillSwitch"] = "true" }
+        );
+        await using var ownerConnection = new NpgsqlConnection(ConnectionString);
+        await ownerConnection.OpenAsync();
+        var key = RetentionRunAdvisoryLock.KeyFor(sweepId);
+
+        await RetentionRunAdvisoryLock.AcquireAsync(ownerConnection, key, CancellationToken.None);
+        await RecoverAsync(host);
+
+        (await LoadRunStatusAsync(sweepId)).Should().Be(SweepRunStatus.Started);
+
+        await RetentionRunAdvisoryLock.ReleaseAsync(ownerConnection, key, CancellationToken.None);
+        await RecoverAsync(host);
+
+        (await LoadRunStatusAndErrorAsync(sweepId))
+            .Should()
+            .Be((SweepRunStatus.Failed, "Run owner exited before writing a terminal audit event."));
+    }
+
+    [Fact]
+    public async Task The_Hosted_Recovery_Fails_An_Abandoned_Run_When_The_Host_Starts()
+    {
+        var sweepId = await SeedStartedRunAsync(DateTimeOffset.UtcNow.AddDays(-1));
+        var logs = new CapturingLogProvider();
+        using var app = BuildRecoveryHost(logs, killSwitch: false);
+
+        await app.StartAsync();
+        try
+        {
+            await WaitForAsync(
+                async () => await LoadRunStatusAsync(sweepId) == SweepRunStatus.Failed,
+                "The hosted recovery did not fail the abandoned run.",
+                logs
+            );
+        }
+        finally
+        {
+            await app.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task The_Hosted_Recovery_Leaves_An_Abandoned_Run_Alone_While_The_Kill_Switch_Is_On()
+    {
+        var sweepId = await SeedStartedRunAsync(DateTimeOffset.UtcNow.AddDays(-1));
+        var logs = new CapturingLogProvider();
+        using var app = BuildRecoveryHost(logs, killSwitch: true);
+
+        await app.StartAsync();
+        try
+        {
+            await WaitForAsync(
+                () => Task.FromResult(logs.Messages.Contains(RecoverySkippedMessage)),
+                "The hosted recovery did not log that the kill switch skipped it.",
+                logs
+            );
+        }
+        finally
+        {
+            // Stopping waits for the loop to end, so nothing can recover the run after this.
+            await app.StopAsync();
+        }
+
+        (await LoadRunStatusAsync(sweepId)).Should().Be(SweepRunStatus.Started);
+    }
+
+    private const string RecoverySkippedMessage = "Cohort skipped abandoned-run recovery: the kill switch is on.";
+
+    private static Task RecoverAsync(CohortTestHost host) =>
+        host.RunWithServicesAsync(services => services.GetRequiredService<IRetentionRunRecovery>().RecoverAsync());
+
+    /// <summary>
+    /// The sample host with its hosted services, logging what Cohort logs at Debug. The sample's
+    /// appsettings.json, copied into the test output, sets the default level to Information,
+    /// and configuration overrides the minimum level, so the level is set there.
+    /// </summary>
+    private IHost BuildRecoveryHost(CapturingLogProvider logs, bool killSwitch)
+    {
+        var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder();
+        builder.Configuration.AddInMemoryCollection(
+            new Dictionary<string, string?>
+            {
+                [$"{SampleOptions.SectionName}:{nameof(SampleOptions.ConnectionString)}"] = ConnectionString,
+                ["Cohort:KillSwitch"] = killSwitch.ToString(),
+                ["Logging:LogLevel:Default"] = "Debug",
+            }
+        );
+        builder.Logging.AddProvider(logs);
+        builder.Services.AddSampleRetentionServices();
+        return builder.Build();
+    }
+
+    /// <summary>Polls <paramref name="condition"/> until it holds, or fails after 30 seconds.</summary>
+    private static async Task WaitForAsync(Func<Task<bool>> condition, string failure, CapturingLogProvider logs)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        while (!await condition())
+        {
+            if (stopwatch.Elapsed > TimeSpan.FromSeconds(30))
+            {
+                throw new XunitException($"{failure} Logged: {string.Join(" | ", logs.Messages)}");
+            }
+
+            await Task.Delay(100);
+        }
+    }
+
+    private sealed class CapturingLogProvider : ILoggerProvider
+    {
+        private readonly ConcurrentQueue<string> messages = new();
+
+        public IReadOnlyList<string> Messages => messages.ToArray();
+
+        public ILogger CreateLogger(string categoryName) => new CapturingLogger(messages);
+
+        public void Dispose() { }
+
+        private sealed class CapturingLogger(ConcurrentQueue<string> messages) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state)
+                where TState : notnull => null;
+
+            public bool IsEnabled(LogLevel logLevel) => true;
+
+            public void Log<TState>(
+                LogLevel logLevel,
+                EventId eventId,
+                TState state,
+                Exception? exception,
+                Func<TState, Exception?, string> formatter
+            ) => messages.Enqueue(formatter(state, exception));
+        }
     }
 
     [Fact]
@@ -408,6 +551,26 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
         return (Guid)(await command.ExecuteScalarAsync())!;
     }
 
+    /// <summary>A run left Started at <paramref name="startedAt"/>, whose owner is gone.</summary>
+    private async Task<Guid> SeedStartedRunAsync(DateTimeOffset startedAt)
+    {
+        var sweepId = Guid.NewGuid();
+        await using var connection = new NpgsqlConnection(ConnectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO "sweep_run" ("SweepId", "StartedAt", "Status", "TriggerKind", "DryRun", "TenantId", "TotalAffected")
+            VALUES (@sweepId, @startedAt, @status, @trigger, FALSE, @tenantId, 0)
+            """;
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        command.Parameters.AddWithValue("startedAt", startedAt);
+        command.Parameters.AddWithValue("status", (int)SweepRunStatus.Started);
+        command.Parameters.AddWithValue("trigger", (int)SweepTriggerKind.Manual);
+        command.Parameters.AddWithValue("tenantId", Guid.NewGuid());
+        await command.ExecuteNonQueryAsync();
+        return sweepId;
+    }
+
     private async Task BackdateRunAsync(Guid sweepId)
     {
         await using var connection = new NpgsqlConnection(ConnectionString);
@@ -447,6 +610,19 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
             "SELECT \"Status\" FROM \"sweep_run\" WHERE \"SweepId\" = @sweepId";
         command.Parameters.AddWithValue("sweepId", sweepId);
         return (SweepRunStatus)(int)(await command.ExecuteScalarAsync())!;
+    }
+
+    private async Task<(SweepRunStatus Status, string? Error)> LoadRunStatusAndErrorAsync(Guid sweepId)
+    {
+        await using var connection = new NpgsqlConnection(ConnectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            "SELECT \"Status\", \"Error\" FROM \"sweep_run\" WHERE \"SweepId\" = @sweepId";
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        await using var reader = await command.ExecuteReaderAsync();
+        (await reader.ReadAsync()).Should().BeTrue();
+        return ((SweepRunStatus)reader.GetInt32(0), reader.IsDBNull(1) ? null : reader.GetString(1));
     }
 
     public enum RunPath

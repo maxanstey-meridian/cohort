@@ -1,1 +1,82 @@
 #nullable enable
+*REMOVED*Cohort.Application.IRetentionHandler<TEntity>
+*REMOVED*Cohort.Application.IRetentionHandler<TEntity>.OnAfterAsync(Cohort.Domain.RetentionAfterContext<TEntity>! ctx, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task!
+*REMOVED*Cohort.Application.IRetentionHandler<TEntity>.OnBeforeAsync(TEntity row, Cohort.Domain.RetentionBeforeContext! ctx, System.Threading.CancellationToken ct) -> System.Threading.Tasks.Task!
+*REMOVED*Cohort.Application.IRetentionRowDispatcher
+*REMOVED*Cohort.Application.IRetentionRowDispatcher.FlushAsync(System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Cohort.Application.RowDispatcherFlushResult!>!
+*REMOVED*Cohort.Application.IRetentionRowDispatcher.RequeueDeadLetteredAsync(System.Guid? sweepId = null, System.Guid? handlerId = null, System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<long>!
+*REMOVED*Cohort.Application.RetentionSystemWork.RowDispatch = 3 -> Cohort.Application.RetentionSystemWork
+*REMOVED*Cohort.Application.RowDispatcherFlushResult
+*REMOVED*Cohort.Application.RowDispatcherFlushResult.<Clone>$() -> Cohort.Application.RowDispatcherFlushResult!
+*REMOVED*Cohort.Application.RowDispatcherFlushResult.DeadLetteredRequeueable.get -> long
+*REMOVED*Cohort.Application.RowDispatcherFlushResult.DeadLetteredRequeueable.init -> void
+*REMOVED*Cohort.Application.RowDispatcherFlushResult.Deconstruct(out long InFlightRemaining, out long PendingRemaining, out long DeadLetteredRequeueable) -> void
+*REMOVED*Cohort.Application.RowDispatcherFlushResult.Equals(Cohort.Application.RowDispatcherFlushResult? other) -> bool
+*REMOVED*Cohort.Application.RowDispatcherFlushResult.InFlightRemaining.get -> long
+*REMOVED*Cohort.Application.RowDispatcherFlushResult.InFlightRemaining.init -> void
+*REMOVED*Cohort.Application.RowDispatcherFlushResult.PendingRemaining.get -> long
+*REMOVED*Cohort.Application.RowDispatcherFlushResult.PendingRemaining.init -> void
+*REMOVED*Cohort.Application.RowDispatcherFlushResult.RowDispatcherFlushResult(long InFlightRemaining, long PendingRemaining, long DeadLetteredRequeueable) -> void
+*REMOVED*Cohort.Application.RowDispatcherFlushResult.Settled.get -> bool
+*REMOVED*Cohort.Application.RowHandlerDispatchPhase
+*REMOVED*Cohort.Application.RowHandlerDispatchPhase.AfterSweepSettled = 1 -> Cohort.Application.RowHandlerDispatchPhase
+*REMOVED*Cohort.Application.RowHandlerDispatchPhase.Immediate = 0 -> Cohort.Application.RowHandlerDispatchPhase
+*REMOVED*Cohort.Domain.RetentionAfterContext<TEntity>
+*REMOVED*Cohort.Domain.RetentionAfterContext<TEntity>.At.get -> System.DateTimeOffset
+*REMOVED*Cohort.Domain.RetentionAfterContext<TEntity>.Attempt.get -> int
+*REMOVED*Cohort.Domain.RetentionAfterContext<TEntity>.Category.get -> string!
+*REMOVED*Cohort.Domain.RetentionAfterContext<TEntity>.RecordId.get -> string!
+*REMOVED*Cohort.Domain.RetentionAfterContext<TEntity>.RetentionAfterContext(System.Guid sweepId, string! recordId, string! category, Cohort.Domain.Strategy strategy, System.Guid tenantId, System.DateTimeOffset at, int attempt, System.Collections.Generic.IReadOnlyDictionary<string!, object?>! snapshot) -> void
+*REMOVED*Cohort.Domain.RetentionAfterContext<TEntity>.Snapshot.get -> System.Collections.Generic.IReadOnlyDictionary<string!, object?>!
+*REMOVED*Cohort.Domain.RetentionAfterContext<TEntity>.Strategy.get -> Cohort.Domain.Strategy
+*REMOVED*Cohort.Domain.RetentionAfterContext<TEntity>.SweepId.get -> System.Guid
+*REMOVED*Cohort.Domain.RetentionAfterContext<TEntity>.TenantId.get -> System.Guid
+*REMOVED*Cohort.Domain.RetentionBeforeContext
+*REMOVED*Cohort.Domain.RetentionBeforeContext.At.get -> System.DateTimeOffset
+*REMOVED*Cohort.Domain.RetentionBeforeContext.Category.get -> string!
+*REMOVED*Cohort.Domain.RetentionBeforeContext.RetentionBeforeContext(System.Guid sweepId, string! category, Cohort.Domain.Strategy strategy, System.Guid tenantId, System.DateTimeOffset at) -> void
+*REMOVED*Cohort.Domain.RetentionBeforeContext.Snapshot.get -> System.Collections.Generic.IDictionary<string!, object?>!
+*REMOVED*Cohort.Domain.RetentionBeforeContext.Strategy.get -> Cohort.Domain.Strategy
+*REMOVED*Cohort.Domain.RetentionBeforeContext.SweepId.get -> System.Guid
+*REMOVED*Cohort.Domain.RetentionBeforeContext.TenantId.get -> System.Guid
+*REMOVED*Cohort.Domain.RowHandlerPriorityAttribute
+*REMOVED*Cohort.Domain.RowHandlerPriorityAttribute.Priority.get -> int
+*REMOVED*Cohort.Domain.RowHandlerPriorityAttribute.RowHandlerPriorityAttribute(int priority) -> void
+*REMOVED*Cohort.Domain.RowHandlerIdAttribute
+*REMOVED*Cohort.Domain.RowHandlerIdAttribute.Id.get -> System.Guid
+*REMOVED*Cohort.Domain.RowHandlerIdAttribute.RowHandlerIdAttribute(string! id) -> void
+*REMOVED*Cohort.Hosting.CohortOptions.RowHandlerDispatch.get -> Cohort.Hosting.RowHandlerDispatchOptions!
+*REMOVED*Cohort.Hosting.CohortOptions.RowHandlerDispatch.init -> void
+*REMOVED*Cohort.Hosting.RowHandlerDispatchOptions
+*REMOVED*Cohort.Hosting.RowHandlerDispatchOptions.BaseBackoff.get -> System.TimeSpan
+*REMOVED*Cohort.Hosting.RowHandlerDispatchOptions.BaseBackoff.init -> void
+*REMOVED*Cohort.Hosting.RowHandlerDispatchOptions.BatchSize.get -> int
+*REMOVED*Cohort.Hosting.RowHandlerDispatchOptions.BatchSize.init -> void
+*REMOVED*Cohort.Hosting.RowHandlerDispatchOptions.ClaimTimeout.get -> System.TimeSpan
+*REMOVED*Cohort.Hosting.RowHandlerDispatchOptions.ClaimTimeout.init -> void
+*REMOVED*Cohort.Hosting.RowHandlerDispatchOptions.MaxAttempts.get -> int
+*REMOVED*Cohort.Hosting.RowHandlerDispatchOptions.MaxAttempts.init -> void
+*REMOVED*Cohort.Hosting.RowHandlerDispatchOptions.MaxBackoff.get -> System.TimeSpan
+*REMOVED*Cohort.Hosting.RowHandlerDispatchOptions.MaxBackoff.init -> void
+*REMOVED*Cohort.Hosting.RowHandlerDispatchOptions.MaxParallelism.get -> int
+*REMOVED*Cohort.Hosting.RowHandlerDispatchOptions.MaxParallelism.init -> void
+*REMOVED*Cohort.Hosting.RowHandlerDispatchOptions.PayloadRetention.get -> System.TimeSpan
+*REMOVED*Cohort.Hosting.RowHandlerDispatchOptions.PayloadRetention.init -> void
+*REMOVED*Cohort.Hosting.RowHandlerDispatchOptions.PollInterval.get -> System.TimeSpan
+*REMOVED*Cohort.Hosting.RowHandlerDispatchOptions.PollInterval.init -> void
+*REMOVED*Cohort.Hosting.RowHandlerDispatchOptions.RowHandlerDispatchOptions() -> void
+*REMOVED*Cohort.Hosting.RowHandlerDispatchOptions.SweepSettleTimeout.get -> System.TimeSpan
+*REMOVED*Cohort.Hosting.RowHandlerDispatchOptions.SweepSettleTimeout.init -> void
+*REMOVED*override Cohort.Application.RowDispatcherFlushResult.Equals(object? obj) -> bool
+*REMOVED*override Cohort.Application.RowDispatcherFlushResult.GetHashCode() -> int
+*REMOVED*override Cohort.Application.RowDispatcherFlushResult.ToString() -> string!
+*REMOVED*static Cohort.Application.RowDispatcherFlushResult.operator !=(Cohort.Application.RowDispatcherFlushResult? left, Cohort.Application.RowDispatcherFlushResult? right) -> bool
+*REMOVED*static Cohort.Application.RowDispatcherFlushResult.operator ==(Cohort.Application.RowDispatcherFlushResult? left, Cohort.Application.RowDispatcherFlushResult? right) -> bool
+*REMOVED*static Cohort.Hosting.ServiceCollectionExtensions.AddRetentionDependents<TEntity, TStep>(this Microsoft.Extensions.DependencyInjection.IServiceCollection! services) -> Microsoft.Extensions.DependencyInjection.IServiceCollection!
+*REMOVED*static Cohort.Hosting.ServiceCollectionExtensions.AddRowHandler<TEntity, THandler>(this Microsoft.Extensions.DependencyInjection.IServiceCollection! services, Cohort.Application.RowHandlerDispatchPhase dispatchPhase = Cohort.Application.RowHandlerDispatchPhase.Immediate) -> Microsoft.Extensions.DependencyInjection.IServiceCollection!
+Cohort.Application.IRetentionRunRecovery
+Cohort.Application.IRetentionRunRecovery.RecoverAsync(System.Threading.CancellationToken ct = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+Cohort.Application.RetentionSystemWork.Recovery = 3 -> Cohort.Application.RetentionSystemWork
+Cohort.Hosting.CohortOptions.SweepSettleTimeout.get -> System.TimeSpan
+Cohort.Hosting.CohortOptions.SweepSettleTimeout.init -> void
+static Cohort.Hosting.ServiceCollectionExtensions.AddRetentionDependents<TEntity, TStep>(this Microsoft.Extensions.DependencyInjection.IServiceCollection! services, bool retiresReferencingRows = true) -> Microsoft.Extensions.DependencyInjection.IServiceCollection!

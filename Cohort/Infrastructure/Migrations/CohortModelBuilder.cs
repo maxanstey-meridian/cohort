@@ -1,6 +1,5 @@
 #nullable enable
 
-using Cohort.Infrastructure.Handlers;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata.Builders;
 
@@ -40,27 +39,14 @@ public static class CohortModelBuilder
         EntityTypeBuilder builder;
         var existing = TryFindEntityMappedToTable(modelBuilder, schema, table.Name);
 
-        if (table.Role == CohortTableNames.SweepRowHandlerStatus)
-        {
-            if (existing is not null && existing.ClrType != typeof(SweepRowHandlerStatusEntity))
-            {
-                throw new InvalidOperationException(
-                    $"Entity {existing.ClrType.FullName} is mapped to table '{table.Name}', which Cohort manages with its runtime handler-status entity. This is a table-name collision; rename the host entity's table."
-                );
-            }
-
-            builder = modelBuilder.Entity<SweepRowHandlerStatusEntity>();
-        }
-        else if (existing is not null)
+        if (existing is not null)
         {
             EnsureAdoptableKey(existing, table);
             builder = modelBuilder.Entity(existing.ClrType);
         }
         else
         {
-            builder = modelBuilder.SharedTypeEntity<Dictionary<string, object>>(
-                table.SharedTypeName!
-            );
+            builder = modelBuilder.SharedTypeEntity<Dictionary<string, object>>(table.SharedTypeName);
         }
 
         builder.ToTable(

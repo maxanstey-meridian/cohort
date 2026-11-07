@@ -29,7 +29,7 @@ export default defineConfig({
           { text: "Anonymisation", link: "/guides/anonymisation" },
           { text: "Right-to-Erasure", link: "/guides/erasure" },
           { text: "Legal Holds", link: "/guides/legal-holds" },
-          { text: "Row Handlers", link: "/guides/row-handlers" },
+          { text: "Dependents and After-Commit Work", link: "/guides/row-handlers" },
           { text: "Audit Trail", link: "/guides/audit-trail" },
           { text: "History Pruning", link: "/guides/history-pruning" },
           { text: "Tenant Isolation", link: "/guides/tenant-isolation" },

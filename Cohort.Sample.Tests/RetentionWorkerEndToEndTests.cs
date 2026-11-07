@@ -64,10 +64,15 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         await SeedOldNoteAsync(tenant.Id, "scheduled-dry-run");
 
         await host.Host.StartAsync();
+        // Assert on the run the wait saw: the every-second schedule can start another run
+        // before the host stops, and stopping cancels it, so the latest run afterwards may be
+        // that cancelled one.
+        (SweepTriggerKind Trigger, bool DryRun, SweepRunStatus Status, IReadOnlyList<string> EntityTypes)? run =
+            null;
         await WaitUntilAsync(
             async () =>
             {
-                var run = await LoadLatestRunAsync(tenant.Id);
+                run = await LoadLatestRunAsync(tenant.Id);
                 return run is { Status: SweepRunStatus.Succeeded }
                     && run.Value.EntityTypes.Contains(typeof(Note).FullName!);
             },
@@ -75,7 +80,6 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         );
         await host.Host.StopAsync();
 
-        var run = await LoadLatestRunAsync(tenant.Id);
         run.Should().NotBeNull();
         run!.Value.Trigger.Should().Be(SweepTriggerKind.Scheduled);
         run.Value.DryRun.Should().BeTrue();
@@ -809,7 +813,7 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
         );
         await SeedOldNoteAsync(tenant.Id, "recovered-run");
         var occurrence = (await DatabaseNowAsync()).AddSeconds(-1);
-        // The row dispatcher settles a Started run whose owner died as Failed.
+        // The recovery service (RetentionRunRecovery) settles a Started run whose owner died as Failed.
         await InsertScheduledRunAsync(tenant.Id, occurrence.AddMilliseconds(10), SweepRunStatus.Failed);
 
         var outcome = await GetWorker(host).RunIterationAsync(occurrence, dryRun: false, CancellationToken.None);

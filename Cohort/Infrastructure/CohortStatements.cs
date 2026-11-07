@@ -3,7 +3,7 @@ using Cohort.Infrastructure.Sweep;
 namespace Cohort.Infrastructure;
 
 /// <summary>
-/// The shape every SQL builder returns for a statement against Cohort's own five tables or a
+/// The shape every SQL builder returns for a statement against Cohort's own four tables or a
 /// PostgreSQL function it calls, and the read of a transaction's isolation level.
 /// </summary>
 internal static class CohortStatements

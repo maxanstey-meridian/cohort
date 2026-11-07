@@ -12,6 +12,7 @@ test. Both go through the same execution model.
 | `IRetentionSweep` | Runs the real sweep and records it in the ledger. |
 | `IRetentionErasureService` | Erases one subject's rows within the same rules, in Cohort's transaction or yours. See [Right-to-Erasure](/guides/erasure). |
 | `IRetentionDeletion` | Lets your own deletes take part in hold protection. See [Legal Holds](/guides/legal-holds#deleting-around-holds). |
+| `IRetentionRunRecovery` | Recovers abandoned runs now, for a host that doesn't run hosted services. See [Recovering abandoned runs](/guides/row-handlers#recovering-abandoned-runs). |
 
 ```csharp
 await services.GetRequiredService<IRetentionPreview>().PreviewAsync(tenant, ct: ct);
@@ -71,6 +72,10 @@ have open on it. See
   (`System(TenantlessPass)` for tenantless rows and requests). See [Tenant Isolation](/guides/tenant-isolation).
 - Caller times (`now`, `createdAt`, `expiresAt`, `removedAt`, ...) can carry any offset.
   Cohort normalises them to UTC at the boundary.
+- The calls that own their work (a sweep, a preview, an `ErasureTransaction.Owned` erasure,
+  and `IRetentionRunRecovery.RecoverAsync`), and readiness, run outside an ambient
+  `System.Transactions` transaction (a `TransactionScope`), so they never enlist in it: their
+  work commits on its own, and disposing your scope without `Complete()` doesn't undo it.
 
 These services also check PostgreSQL, model and schema readiness themselves, so they're safe
 to call from a host that never ran Cohort's startup validation.
@@ -161,7 +166,7 @@ occurrence at or before now. It reads what that occurrence still owes from `swee
   stop and check again after the delay, so no later pass runs first; a pass that finished
   meanwhile isn't rerun.
 - The worker runs only the pending passes, in plan order. Passes that succeeded never rerun,
-  so their row handlers don't fire twice. [History pruning](/guides/history-pruning) keeps the
+  so their dependents steps don't write their outbox messages twice. [History pruning](/guides/history-pruning) keeps the
   current occurrence's scheduled runs, so this holds with a short retention too.
 - While any pass is pending, the worker retries after `OccurrenceRetryDelay` (default 15
   minutes), or at the next occurrence if that comes sooner and supersedes it.
@@ -173,7 +178,8 @@ So no occurrence is lost:
   retried after the delay. It writes no run, so it uses no attempt, and it never stops the
   host.
 - A replica that died mid-occurrence leaves its unfinished passes pending, including ones it
-  never started. A run the row dispatcher recovered as `Failed` is pending too.
+  never started. A run [abandoned-run recovery](/misc/how-it-works#crash-recovery) settled as
+  `Failed` is pending too.
 
 Replicas of one install coordinate through Postgres advisory locks keyed on the install's
 schema-qualified `sweep_run` table. The worker lock only keeps replicas from planning an
@@ -194,8 +200,8 @@ own clock never decides which occurrence is due.
 - `KillSwitch: true` cancels the pass in progress: its current batch rolls back and the run
   settles `Cancelled`. The rest of that occurrence and future occurrences are skipped. It also
   stops [history pruning](/guides/history-pruning) after the batch in progress, and the
-  [row handler](/guides/row-handlers) dispatcher's background poller after the batch it's
-  running. `FlushAsync` and `RequeueDeadLetteredAsync` still run.
+  background [abandoned-run recovery](/misc/how-it-works#crash-recovery). An explicit
+  `IRetentionRunRecovery.RecoverAsync` call still runs.
 - Turning `KillSwitch` off catches up the most recent occurrence straight away. The cancelled
   run used no attempt.
 

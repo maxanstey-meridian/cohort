@@ -56,6 +56,11 @@ internal sealed class CohortOptionsValidator : IValidateOptions<CohortOptions>
             errors.Add("Cohort SweepBatchSize must be at least 1.");
         }
 
+        if (options.SweepSettleTimeout < TimeSpan.FromMinutes(1))
+        {
+            errors.Add("Cohort SweepSettleTimeout must be at least 1 minute.");
+        }
+
         if (options.AuditObservers is null)
         {
             errors.Add("Cohort AuditObservers cannot be null.");
@@ -104,83 +109,6 @@ internal sealed class CohortOptionsValidator : IValidateOptions<CohortOptions>
         }
 
         ValidateHistoryPruning(options.HistoryPruning, errors);
-
-        var dispatch = options.RowHandlerDispatch;
-        if (dispatch is null)
-        {
-            errors.Add("Cohort RowHandlerDispatch cannot be null.");
-            return ValidateOptionsResult.Fail(errors);
-        }
-        var errorsBeforeDispatch = errors.Count;
-        if (dispatch.PollInterval <= TimeSpan.Zero)
-        {
-            errors.Add("Cohort RowHandlerDispatch PollInterval must be greater than zero.");
-        }
-        if (dispatch.BatchSize < 1)
-        {
-            errors.Add("Cohort RowHandlerDispatch BatchSize must be at least 1.");
-        }
-        else if (dispatch.BatchSize > 10_000)
-        {
-            errors.Add("Cohort RowHandlerDispatch BatchSize must not exceed 10000.");
-        }
-        if (dispatch.MaxAttempts < 1)
-        {
-            errors.Add("Cohort RowHandlerDispatch MaxAttempts must be at least 1.");
-        }
-        else if (dispatch.MaxAttempts > 1_000)
-        {
-            errors.Add("Cohort RowHandlerDispatch MaxAttempts must not exceed 1000.");
-        }
-        if (dispatch.MaxParallelism < 1)
-        {
-            errors.Add("Cohort RowHandlerDispatch MaxParallelism must be at least 1.");
-        }
-        else if (dispatch.MaxParallelism > 256)
-        {
-            errors.Add("Cohort RowHandlerDispatch MaxParallelism must not exceed 256.");
-        }
-        if (dispatch.BaseBackoff <= TimeSpan.Zero)
-        {
-            errors.Add("Cohort RowHandlerDispatch BaseBackoff must be greater than zero.");
-        }
-        if (dispatch.MaxBackoff < dispatch.BaseBackoff)
-        {
-            errors.Add("Cohort RowHandlerDispatch MaxBackoff must be at least BaseBackoff.");
-        }
-        else if (dispatch.MaxBackoff > TimeSpan.FromDays(1))
-        {
-            errors.Add("Cohort RowHandlerDispatch MaxBackoff must not exceed 1 day.");
-        }
-        if (dispatch.ClaimTimeout < TimeSpan.FromSeconds(30))
-        {
-            errors.Add("Cohort RowHandlerDispatch ClaimTimeout must be at least 30 seconds.");
-        }
-        else if (dispatch.ClaimTimeout > TimeSpan.FromDays(1))
-        {
-            errors.Add("Cohort RowHandlerDispatch ClaimTimeout must not exceed 1 day.");
-        }
-
-        if (dispatch.SweepSettleTimeout < TimeSpan.FromMinutes(1))
-        {
-            errors.Add("Cohort RowHandlerDispatch:SweepSettleTimeout must be at least 1 minute.");
-        }
-        if (dispatch.PayloadRetention < TimeSpan.FromHours(1))
-        {
-            errors.Add("Cohort RowHandlerDispatch PayloadRetention must be at least 1 hour.");
-        }
-        else if (errors.Count == errorsBeforeDispatch)
-        {
-            // Past PayloadRetention the backstop scrubs the snapshot, so work still inside its
-            // retry schedule could never complete.
-            var span = RetentionRowDispatcher.RetryScheduleSpan(dispatch);
-            if (span >= dispatch.PayloadRetention)
-            {
-                errors.Add(
-                    $"Cohort RowHandlerDispatch PayloadRetention ({dispatch.PayloadRetention}) must be longer than a handler's retry schedule ({span}: every backoff wait for MaxAttempts attempts, capped at MaxBackoff, plus MaxAttempts times ClaimTimeout); otherwise the payload scrub ends work that is still retrying."
-                );
-            }
-        }
 
         return errors.Count == 0
             ? ValidateOptionsResult.Success

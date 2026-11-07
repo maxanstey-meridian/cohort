@@ -1,18 +1,11 @@
 using System.Data;
 
 using Cohort.Application;
-using Cohort.Infrastructure.Handlers;
 using Cohort.Infrastructure.Sweep;
 
 using Microsoft.EntityFrameworkCore;
 
 namespace Cohort.Infrastructure;
-
-/// <summary>
-/// What one history-pruning pass prunes: settled runs, inactive holds, and whether it reads the
-/// database clock, which it does to find the schedule's current occurrence when a schedule is set.
-/// </summary>
-internal sealed record PruningScope(bool Runs, bool Holds, bool ReadsClock);
 
 // The only interpolations in this file's raw SQL are Cohort's own table names, quoted from
 // the EF model; every value is a named parameter.
@@ -30,14 +23,10 @@ internal static class HistoryPruningSql
     private const int Failed = (int)SweepRunStatus.Failed;
     private const int Cancelled = (int)SweepRunStatus.Cancelled;
 
-    private const int HandlerPending = (int)SweepRowHandlerDispatchState.Pending;
-    private const int HandlerInFlight = (int)SweepRowHandlerDispatchState.InFlight;
-    private const int HandlerDeadLettered = (int)SweepRowHandlerDispatchState.DeadLettered;
-
     /// <summary>
     /// Claims up to <paramref name="batchSize"/> eligible runs under <c>FOR UPDATE SKIP
-    /// LOCKED</c>, then deletes their row details (handler statuses cascade), entity summaries
-    /// and the runs themselves in one transaction. Returns how many runs it deleted.
+    /// LOCKED</c>, then deletes their row details, entity summaries and the runs themselves in
+    /// one transaction. Returns how many runs it deleted.
     /// </summary>
     internal static async Task<int> PruneRunBatchAsync(
         DbContext db,
@@ -84,7 +73,7 @@ internal static class HistoryPruningSql
             $"""
             SELECT run."SweepId" AS "Value"
             FROM {PostgreSqlIdentifier.Format(tables.SweepRun)} AS run
-            WHERE {EligibleRunPredicate(tables.Quoted())}
+            WHERE {EligibleRunPredicate}
             ORDER BY run."SettledAt", run."SweepId"
             LIMIT @batchSize
             FOR UPDATE OF run SKIP LOCKED
@@ -98,19 +87,14 @@ internal static class HistoryPruningSql
                 ["cancelled"] = Cancelled,
                 ["succeededCutoff"] = succeededCutoff,
                 ["failedCutoff"] = failedCutoff,
-                ["handlerPending"] = HandlerPending,
-                ["handlerInFlight"] = HandlerInFlight,
-                ["handlerDeadLettered"] = HandlerDeadLettered,
                 ["batchSize"] = batchSize,
                 ["scheduled"] = (int)SweepTriggerKind.Scheduled,
                 ["currentOccurrence"] = currentOccurrence,
             },
-            tables.SweepRun,
-            tables.SweepRunRowDetail,
-            tables.SweepRowHandlerStatus
+            tables.SweepRun
         );
 
-    /// <summary>Deletes the row details of the pruned runs (handler statuses cascade).</summary>
+    /// <summary>Deletes the row details of the pruned runs.</summary>
     internal static SweepStatement DeleteRowDetailsStatement(CohortStoreTables tables, Guid[] sweepIds) =>
         CohortStatements.Statement(
             "prune-row-details",
@@ -187,51 +171,30 @@ internal static class HistoryPruningSql
 
     /// <summary>
     /// Settled-run eligibility. Named parameters: @started, @succeeded, @partiallyFailed,
-    /// @failed, @cancelled, @succeededCutoff, @failedCutoff, @handlerPending, @handlerInFlight,
-    /// @handlerDeadLettered, @scheduled, and @currentOccurrence (the schedule's current
-    /// occurrence). A null cutoff makes its comparison
-    /// null, so that class of run is never eligible. A run whose row details still hold a
-    /// snapshot is never eligible either: dead-lettered work keeps its snapshot until
-    /// <c>RowHandlerDispatch:PayloadRetention</c> so it can be requeued. That can't race a
-    /// requeue, because a requeue selects only rows that still hold a snapshot and this
-    /// predicate only runs that hold none: the two sets are disjoint. A scheduled run started
-    /// at or after the current occurrence is the worker's ledger for it, so pruning it would
-    /// rerun passes that already succeeded and give exhausted ones fresh attempts.
+    /// @failed, @cancelled, @succeededCutoff, @failedCutoff, @scheduled, and
+    /// @currentOccurrence (the schedule's current occurrence). A null cutoff makes its
+    /// comparison null, so that class of run is never eligible. A run with rows a failing
+    /// dependents step skipped settles PartiallyFailed, so the failed cutoff covers it. A
+    /// scheduled run started at or after the current occurrence is the worker's ledger for it,
+    /// so pruning it would rerun passes that already succeeded and give exhausted ones fresh
+    /// attempts.
     /// </summary>
-    private static string EligibleRunPredicate(QuotedCohortTables tables)
-    {
-        var handlerWork = $"""
-            FROM {tables.SweepRunRowDetail} AS detail
-                    INNER JOIN {tables.SweepRowHandlerStatus} AS status
-                        ON status."SweepRunRowDetailId" = detail."Id"
-                    WHERE detail."SweepId" = run."SweepId"
-            """;
-        return $"""
-            run."Status" <> @started
-                  AND (
-                      (
-                          run."Status" = @succeeded
-                          AND run."SettledAt" < CAST(@succeededCutoff AS timestamptz)
-                          AND NOT EXISTS (SELECT 1 {handlerWork} AND status."State" = @handlerDeadLettered)
-                      )
-                      OR (
-                          (
-                              run."Status" IN (@partiallyFailed, @failed, @cancelled)
-                              OR EXISTS (SELECT 1 {handlerWork} AND status."State" = @handlerDeadLettered)
-                          )
-                          AND run."SettledAt" < CAST(@failedCutoff AS timestamptz)
-                      )
+    private const string EligibleRunPredicate = """
+        run."Status" <> @started
+              AND (
+                  (
+                      run."Status" = @succeeded
+                      AND run."SettledAt" < CAST(@succeededCutoff AS timestamptz)
                   )
-                  AND NOT EXISTS (SELECT 1 {handlerWork} AND status."State" IN (@handlerPending, @handlerInFlight))
-                  AND NOT EXISTS (
-                      SELECT 1 FROM {tables.SweepRunRowDetail} AS retained
-                      WHERE retained."SweepId" = run."SweepId" AND retained."CapturedPayload" IS NOT NULL
+                  OR (
+                      run."Status" IN (@partiallyFailed, @failed, @cancelled)
+                      AND run."SettledAt" < CAST(@failedCutoff AS timestamptz)
                   )
-                  AND (
-                      CAST(@currentOccurrence AS timestamptz) IS NULL
-                      OR run."TriggerKind" <> @scheduled
-                      OR run."StartedAt" < CAST(@currentOccurrence AS timestamptz)
-                  )
-            """;
-    }
+              )
+              AND (
+                  CAST(@currentOccurrence AS timestamptz) IS NULL
+                  OR run."TriggerKind" <> @scheduled
+                  OR run."StartedAt" < CAST(@currentOccurrence AS timestamptz)
+              )
+        """;
 }

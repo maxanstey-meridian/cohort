@@ -118,8 +118,8 @@ protected override void OnModelCreating(ModelBuilder modelBuilder)
 }
 ```
 
-Then add an EF Core migration and apply it. Cohort keeps its audit ledger, holds and handler
-queue in five tables of your database. It checks that schema at startup but never creates or
+Then add an EF Core migration and apply it. Cohort keeps its audit ledger and holds in four
+tables of your database. It checks that schema at startup but never creates or
 changes it, so the migration stays yours.
 
 ## Run it
@@ -161,9 +161,9 @@ the run is written to Cohort's ledger.
   survives every strategy, and so do the rows you declare held with it (`[HeldWith]`,
   `[HeldWithReferencing]`), so a hold on a Case protects its links, Submission, and uploads.
   `IRetentionDeletion` lets your own deletes respect holds too.
-- [Row handlers](https://maxanstey-meridian.github.io/cohort/guides/row-handlers): capture a
-  row before mutation, then clean up blobs or publish events after commit, with
-  at-least-once delivery and dead-lettering.
+- [Dependents and after-commit work](https://maxanstey-meridian.github.io/cohort/guides/row-handlers):
+  retire a row's child rows and audit copies in its own transaction, and write a message to
+  your own outbox there, so blob cleanup and events commit with the row and roll back with it.
 - [Audit observers](https://maxanstey-meridian.github.io/cohort/guides/audit-trail): export
   each committed run event to your own systems.
 - [History pruning](https://maxanstey-meridian.github.io/cohort/guides/history-pruning):

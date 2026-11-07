@@ -297,7 +297,7 @@ internal sealed class RetentionWorker(
         // the whole iteration; each pass runs on its own scope's connection.
         await db.Database.OpenConnectionAsync(ct);
         // Two replicas firing at the same cron instant must not both sweep: double mutations
-        // are mostly benign, but doubled audit runs and doubled handler side effects are not.
+        // are mostly benign, but doubled audit runs are not.
         var workerLockKey = RetentionRunAdvisoryLock.WorkerKeyFor(CohortStoreTables.FromModel(db.Model).SweepRun);
         Exception? primaryException = null;
         try

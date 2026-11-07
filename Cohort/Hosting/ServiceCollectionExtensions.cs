@@ -1,5 +1,3 @@
-using System.Reflection;
-
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Infrastructure;
@@ -22,8 +20,8 @@ public static class ServiceCollectionExtensions
     {
         ArgumentNullException.ThrowIfNull(services);
 
-        // Idempotency guard: most registrations below are TryAdd*, but the dispatcher's and
-        // the history pruner's IHostedService registrations cannot be (factory descriptors
+        // Idempotency guard: most registrations below are TryAdd*, but the recovery service's
+        // and the history pruner's IHostedService registrations cannot be (factory descriptors
         // do not dedupe), and a second registration would start two loops on one instance.
         var existingRegistration = services
             .Where(descriptor => descriptor.ServiceType == typeof(CohortRegistrationMarker))
@@ -50,9 +48,6 @@ public static class ServiceCollectionExtensions
             .ValidateOnStart();
         services.TryAddEnumerable(
             ServiceDescriptor.Singleton<IValidateOptions<CohortOptions>, CohortOptionsValidator>()
-        );
-        services.TryAddEnumerable(
-            ServiceDescriptor.Singleton<IValidateOptions<CohortOptions>, RowHandlerRetryScheduleValidator>()
         );
 
         services.TryAddSingleton(sp =>
@@ -100,8 +95,8 @@ public static class ServiceCollectionExtensions
         services.TryAddScoped<RetentionRegistry>();
         services.TryAddScoped<ErasureSubjectMetadataResolver>();
         services.TryAddSingleton<RetentionValidationState>();
-        // The collection itself, read when Cohort validates: AddRowHandler and the host's
-        // own handler registrations may come after AddCohort.
+        // The collection itself, read when Cohort validates: AddRetentionDependents and the
+        // host's own step registrations may come after AddCohort.
         services.AddSingleton(new RetentionHandlerServiceRegistrations(services));
         services.TryAddScoped<RetentionStartupValidator>();
         services.TryAddScoped<CohortSchemaValidator>();
@@ -114,12 +109,12 @@ public static class ServiceCollectionExtensions
         services.TryAddEnumerable(
             ServiceDescriptor.Singleton<IHostedService, RetentionValidationHostedService>()
         );
-        services.TryAddSingleton<RetentionRowDispatcher>();
-        services.TryAddSingleton<IRetentionRowDispatcher>(sp =>
-            sp.GetRequiredService<RetentionRowDispatcher>()
+        services.TryAddSingleton<RetentionRunRecovery>();
+        services.TryAddSingleton<IRetentionRunRecovery>(sp =>
+            sp.GetRequiredService<RetentionRunRecovery>()
         );
         services.AddSingleton<IHostedService>(sp =>
-            sp.GetRequiredService<RetentionRowDispatcher>()
+            sp.GetRequiredService<RetentionRunRecovery>()
         );
         services.TryAddEnumerable(ServiceDescriptor.Singleton<IHostedService, RetentionWorker>());
         services.TryAddSingleton<RetentionHistoryPruner>();
@@ -131,107 +126,30 @@ public static class ServiceCollectionExtensions
     }
 
     /// <summary>
-    /// Registers a row handler. <typeparamref name="THandler"/> must carry
-    /// <see cref="RowHandlerIdAttribute"/>: queued handler work is persisted under that
-    /// UUID, so it survives renaming or moving the class.
-    /// </summary>
-    public static IServiceCollection AddRowHandler<TEntity, THandler>(
-        this IServiceCollection services,
-        RowHandlerDispatchPhase dispatchPhase = RowHandlerDispatchPhase.Immediate
-    )
-        where THandler : class, IRetentionHandler<TEntity>
-    {
-        ArgumentNullException.ThrowIfNull(services);
-        if (!Enum.IsDefined(dispatchPhase))
-        {
-            throw new ArgumentOutOfRangeException(
-                nameof(dispatchPhase),
-                dispatchPhase,
-                "Row handler dispatch phase must be defined."
-            );
-        }
-
-        var identity = ReadRowHandlerId(
-            typeof(THandler),
-            "Row handler",
-            "Every row handler needs a permanent UUID: queued work is persisted under it."
-        );
-
-        var existingRegistrations = new RetentionHandlerServiceRegistrations(services).Registrations();
-
-        // TryAddEnumerable would silently keep the first registration of this pair, so
-        // a repeat call with a different phase must fail loudly instead of appearing to
-        // take effect. An identical repeat stays idempotent.
-        var samePair = existingRegistrations.FirstOrDefault(registration =>
-            registration.EntityType == typeof(TEntity)
-            && registration.HandlerType == typeof(THandler)
-        );
-        if (samePair is not null && samePair.DispatchPhase != dispatchPhase)
-        {
-            throw new InvalidOperationException(
-                $"Row handler {typeof(THandler).FullName} for entity {typeof(TEntity).FullName} is already registered with dispatch phase {samePair.DispatchPhase}; this call's phase ({dispatchPhase}) would be silently ignored. Register each handler pair once."
-            );
-        }
-
-        // The id names one handler class, whatever its entity: two classes sharing it would
-        // have their work dispatched interchangeably, and a requeue by handler id would reach
-        // both. One class registered for two entities keeps its single id.
-        var identityClash = existingRegistrations.FirstOrDefault(registration =>
-            registration.HandlerType != typeof(THandler)
-            && registration.Identity == identity
-        );
-        if (identityClash is not null)
-        {
-            throw new InvalidOperationException(
-                $"Row handler id {identity} is already used by {identityClash.HandlerType.FullName}; give {typeof(THandler).FullName} its own [RowHandlerId] so queued work, and a requeue by handler id, reach only the handler that persisted it."
-            );
-        }
-
-        // One id space with dependents steps, whose failures are recorded under the same id.
-        var stepClash = new RetentionHandlerServiceRegistrations(services).DependentsRegistrations()
-            .FirstOrDefault(registration =>
-                registration.Identity == identity
-                && registration.StepType != typeof(THandler)
-            );
-        if (stepClash is not null)
-        {
-            throw new InvalidOperationException(
-                $"Row handler id {identity} is already used by the dependents step {stepClash.StepType.FullName}; give {typeof(THandler).FullName} its own [RowHandlerId]. "
-                    + "One class keeps its one id as a row handler and as a dependents step, for every entity."
-            );
-        }
-
-        services.TryAddEnumerable(ServiceDescriptor.Scoped<IRetentionHandler<TEntity>, THandler>());
-        services.TryAddEnumerable(
-            ServiceDescriptor.Singleton(
-                typeof(IRetentionHandlerRegistration),
-                new RetentionHandlerRegistration<TEntity, THandler>(dispatchPhase, identity)
-            )
-        );
-
-        return services;
-    }
-
-    /// <summary>
     /// Registers the dependents step of <typeparamref name="TEntity"/>: it retires what
     /// depends on a row in the row's own transaction, before Cohort mutates the row. One step
     /// per entity; a host with several kinds of dependents composes them in one step.
-    /// <typeparamref name="TStep"/> must carry <see cref="RowHandlerIdAttribute"/>: a step's
-    /// failure is recorded under that UUID, in the same id space as row handlers.
     /// </summary>
-    public static IServiceCollection AddRetentionDependents<TEntity, TStep>(this IServiceCollection services)
+    /// <param name="services">The host's service collection.</param>
+    /// <param name="retiresReferencingRows">
+    /// Whether the step retires the rows that reference <typeparamref name="TEntity"/>. Pass
+    /// <c>false</c> for a step that doesn't (one that only writes to an outbox, say): purge then
+    /// leaves a still-referenced row out up front and counts it blocked, rather than running
+    /// the step and failing at the database. With the default <c>true</c>, purge tries every
+    /// due row, and a row still referenced after the step is blocked by the constraint itself.
+    /// A repeat call for the same entity and step must pass the same value.
+    /// </param>
+    public static IServiceCollection AddRetentionDependents<TEntity, TStep>(
+        this IServiceCollection services,
+        bool retiresReferencingRows = true
+    )
         where TStep : class, IRetentionDependents<TEntity>
     {
         ArgumentNullException.ThrowIfNull(services);
 
-        var identity = ReadRowHandlerId(
-            typeof(TStep),
-            "Dependents step",
-            "Every dependents step needs a permanent UUID: its failures are recorded under it."
-        );
-
-        var existingSteps = new RetentionHandlerServiceRegistrations(services).DependentsRegistrations();
-        var entityStep = existingSteps.FirstOrDefault(registration => registration.EntityType == typeof(TEntity));
+        var entityStep = new RetentionHandlerServiceRegistrations(services)
+            .DependentsRegistrations()
+            .FirstOrDefault(registration => registration.EntityType == typeof(TEntity));
         if (entityStep is not null && entityStep.StepType != typeof(TStep))
         {
             throw new InvalidOperationException(
@@ -240,26 +158,13 @@ public static class ServiceCollectionExtensions
             );
         }
 
-        var stepClash = existingSteps.FirstOrDefault(registration =>
-            registration.StepType != typeof(TStep) && registration.Identity == identity
-        );
-        if (stepClash is not null)
+        // TryAddEnumerable would silently keep the first registration of this pair, so a
+        // repeat call with a different flag must fail loudly instead of appearing to take
+        // effect. An identical repeat stays idempotent.
+        if (entityStep is not null && entityStep.RetiresReferencingRows != retiresReferencingRows)
         {
             throw new InvalidOperationException(
-                $"Row handler id {identity} is already used by the dependents step {stepClash.StepType.FullName}; give {typeof(TStep).FullName} its own [RowHandlerId] so a failure recorded under it names only one class."
-            );
-        }
-
-        var handlerClash = new RetentionHandlerServiceRegistrations(services).Registrations()
-            .FirstOrDefault(registration =>
-                registration.Identity == identity
-                && registration.HandlerType != typeof(TStep)
-            );
-        if (handlerClash is not null)
-        {
-            throw new InvalidOperationException(
-                $"Row handler id {identity} is already used by the row handler {handlerClash.HandlerType.FullName}; give {typeof(TStep).FullName} its own [RowHandlerId]. "
-                    + "One class keeps its one id as a row handler and as a dependents step, for every entity."
+                $"Dependents step {typeof(TStep).FullName} for entity {typeof(TEntity).FullName} is already registered with retiresReferencingRows: {(entityStep.RetiresReferencingRows ? "true" : "false")}; this call's value ({(retiresReferencingRows ? "true" : "false")}) would be silently ignored. Register each step once."
             );
         }
 
@@ -267,32 +172,11 @@ public static class ServiceCollectionExtensions
         services.TryAddEnumerable(
             ServiceDescriptor.Singleton(
                 typeof(IRetentionDependentsRegistration),
-                new RetentionDependentsRegistration<TEntity, TStep>(identity)
+                new RetentionDependentsRegistration<TEntity, TStep>(retiresReferencingRows)
             )
         );
 
         return services;
-    }
-
-    private static Guid ReadRowHandlerId(Type type, string role, string why)
-    {
-        RowHandlerIdAttribute? idAttribute;
-        try
-        {
-            idAttribute = type.GetCustomAttribute<RowHandlerIdAttribute>(inherit: false);
-        }
-        catch (Exception ex) when (ex is ArgumentException or TargetInvocationException or CustomAttributeFormatException)
-        {
-            throw new InvalidOperationException(
-                $"{role} {type.FullName} has an invalid [RowHandlerId]: it must be a non-empty UUID.",
-                ex
-            );
-        }
-
-        return idAttribute?.Id
-            ?? throw new InvalidOperationException(
-                $"{role} {type.FullName} has no [RowHandlerId(\"<uuid>\")] attribute. {why}"
-            );
     }
 
     private sealed record CohortRegistrationMarker(Type ContextType);

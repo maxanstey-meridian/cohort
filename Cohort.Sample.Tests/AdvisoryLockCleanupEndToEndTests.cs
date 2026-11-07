@@ -71,26 +71,20 @@ public sealed class AdvisoryLockCleanupEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task A_Failed_Release_All_On_A_Lease_Connection_Does_Not_Return_Its_Delivery_Locks_To_The_Pool()
+    public async Task A_Failed_Release_All_Does_Not_Return_The_Sessions_Locks_To_The_Pool()
     {
-        // The row dispatcher's batch cleanup: the lease connection took each claimed row's
-        // delivery lock inside the claim transaction and releases them all when the batch ends.
+        // The worker's iteration cleanup: its coordination connection took session locks
+        // outside any transaction, and releases every lock it holds when the iteration ends.
         var connectionString = new NpgsqlConnectionStringBuilder(fixture.ConnectionString)
         {
-            ApplicationName = $"cohort-lease-cleanup-{Guid.NewGuid():N}",
+            ApplicationName = $"cohort-release-all-cleanup-{Guid.NewGuid():N}",
         }.ConnectionString;
-        var statusTable = new RelationalObjectName("public", "sweep_row_handler_status");
-        long[] keys =
-        [
-            RetentionRunAdvisoryLock.RowHandlerKeyFor(statusTable, Random.Shared.NextInt64(1, long.MaxValue)),
-            RetentionRunAdvisoryLock.RowHandlerKeyFor(statusTable, Random.Shared.NextInt64(1, long.MaxValue)),
-        ];
+        long[] keys = [RetentionRunAdvisoryLock.KeyFor(Guid.NewGuid()), RetentionRunAdvisoryLock.KeyFor(Guid.NewGuid())];
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync();
-        await using (var claim = await connection.BeginTransactionAsync())
+        foreach (var key in keys)
         {
-            await RetentionRunAdvisoryLock.AcquireAllAsync(connection, claim, keys, CancellationToken.None);
-            await claim.CommitAsync();
+            (await RetentionRunAdvisoryLock.TryAcquireAsync(connection, key, CancellationToken.None)).Should().BeTrue();
         }
 
         using var timedOut = new CancellationTokenSource();

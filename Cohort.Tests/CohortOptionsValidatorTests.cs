@@ -82,156 +82,23 @@ public sealed class CohortOptionsValidatorTests
             .BeTrue();
     }
 
-    [Theory]
-    [InlineData("PollInterval")]
-    [InlineData("BatchSize")]
-    [InlineData("MaxAttempts")]
-    [InlineData("MaxParallelism")]
-    [InlineData("BaseBackoff")]
-    [InlineData("MaxBackoff")]
-    [InlineData("ClaimTimeout")]
-    [InlineData("SweepSettleTimeout")]
-    [InlineData("PayloadRetention")]
-    public void Validate_Rejects_Nonsensical_Row_Handler_Dispatch_Options(string option)
+    [Fact]
+    public void Validate_Rejects_A_SweepSettleTimeout_Under_One_Minute()
     {
-        var dispatch = option switch
-        {
-            "PollInterval" => new RowHandlerDispatchOptions { PollInterval = TimeSpan.Zero },
-            "BatchSize" => new RowHandlerDispatchOptions { BatchSize = 0 },
-            "MaxAttempts" => new RowHandlerDispatchOptions { MaxAttempts = 0 },
-            "MaxParallelism" => new RowHandlerDispatchOptions { MaxParallelism = 0 },
-            "BaseBackoff" => new RowHandlerDispatchOptions { BaseBackoff = TimeSpan.Zero },
-            "MaxBackoff" => new RowHandlerDispatchOptions
-            {
-                BaseBackoff = TimeSpan.FromMinutes(2),
-                MaxBackoff = TimeSpan.FromMinutes(1),
-            },
-            "ClaimTimeout" => new RowHandlerDispatchOptions
-            {
-                ClaimTimeout = TimeSpan.FromSeconds(29),
-            },
-            "SweepSettleTimeout" => new RowHandlerDispatchOptions
-            {
-                SweepSettleTimeout = TimeSpan.FromSeconds(59),
-            },
-            "PayloadRetention" => new RowHandlerDispatchOptions
-            {
-                PayloadRetention = TimeSpan.FromMinutes(59),
-            },
-            _ => throw new ArgumentOutOfRangeException(nameof(option)),
-        };
-
         var result = new CohortOptionsValidator().Validate(
             null,
-            new CohortOptions { RowHandlerDispatch = dispatch }
+            new CohortOptions { SweepSettleTimeout = TimeSpan.FromSeconds(59) }
         );
 
         result.Failed.Should().BeTrue();
-        result.Failures.Should().ContainSingle(message => message.Contains(option));
-    }
-
-    [Theory]
-    [InlineData("BatchSize")]
-    [InlineData("MaxAttempts")]
-    [InlineData("MaxParallelism")]
-    [InlineData("MaxBackoff")]
-    [InlineData("ClaimTimeout")]
-    public void Validate_Rejects_Row_Handler_Dispatch_Options_Above_Safe_Ceilings(
-        string option
-    )
-    {
-        var dispatch = option switch
-        {
-            "BatchSize" => new RowHandlerDispatchOptions { BatchSize = 10_001 },
-            "MaxAttempts" => new RowHandlerDispatchOptions { MaxAttempts = 1_001 },
-            "MaxParallelism" => new RowHandlerDispatchOptions { MaxParallelism = 257 },
-            "MaxBackoff" => new RowHandlerDispatchOptions
-            {
-                MaxBackoff = TimeSpan.FromDays(1).Add(TimeSpan.FromTicks(1)),
-            },
-            "ClaimTimeout" => new RowHandlerDispatchOptions
-            {
-                ClaimTimeout = TimeSpan.FromDays(1).Add(TimeSpan.FromTicks(1)),
-            },
-            _ => throw new ArgumentOutOfRangeException(nameof(option)),
-        };
-
-        var result = new CohortOptionsValidator().Validate(
-            null,
-            new CohortOptions { RowHandlerDispatch = dispatch }
-        );
-
-        result.Failed.Should().BeTrue();
-        result.Failures.Should().ContainSingle(message => message.Contains(option));
-    }
-
-    [Theory]
-    [InlineData("BatchSize")]
-    [InlineData("MaxAttempts")]
-    [InlineData("MaxParallelism")]
-    [InlineData("MaxBackoff")]
-    [InlineData("ClaimTimeout")]
-    public void Validate_Accepts_Row_Handler_Dispatch_Options_At_Safe_Ceilings(string option)
-    {
-        var dispatch = option switch
-        {
-            "BatchSize" => new RowHandlerDispatchOptions { BatchSize = 10_000 },
-            // 1000 attempts retry for about 45 days, so the snapshot must outlive that.
-            "MaxAttempts" => new RowHandlerDispatchOptions
-            {
-                MaxAttempts = 1_000,
-                PayloadRetention = TimeSpan.FromDays(60),
-            },
-            "MaxParallelism" => new RowHandlerDispatchOptions { MaxParallelism = 256 },
-            "MaxBackoff" => new RowHandlerDispatchOptions
-            {
-                MaxBackoff = TimeSpan.FromDays(1),
-                PayloadRetention = TimeSpan.FromDays(60),
-            },
-            "ClaimTimeout" => new RowHandlerDispatchOptions { ClaimTimeout = TimeSpan.FromDays(1) },
-            _ => throw new ArgumentOutOfRangeException(nameof(option)),
-        };
-
-        new CohortOptionsValidator()
-            .Validate(null, new CohortOptions { RowHandlerDispatch = dispatch })
-            .Succeeded.Should()
-            .BeTrue();
+        result.Failures.Should().ContainSingle(message => message.Contains("SweepSettleTimeout"));
     }
 
     [Fact]
-    public void Validate_Rejects_A_PayloadRetention_The_Retry_Schedule_Outlasts()
-    {
-        // The defaults retry for about 17.5 hours, so a 1 hour snapshot retention would scrub
-        // work that is still retrying.
-        var result = new CohortOptionsValidator().Validate(
-            null,
-            new CohortOptions
-            {
-                RowHandlerDispatch = new RowHandlerDispatchOptions { PayloadRetention = TimeSpan.FromHours(1) },
-            }
-        );
-
-        result.Failed.Should().BeTrue();
-        result.Failures.Should().ContainSingle(message =>
-            message.Contains("PayloadRetention") && message.Contains("retry schedule")
-        );
-    }
-
-    [Fact]
-    public void Validate_Accepts_A_Short_PayloadRetention_With_A_Retry_Schedule_That_Fits()
+    public void Validate_Accepts_A_SweepSettleTimeout_Of_Exactly_One_Minute()
     {
         new CohortOptionsValidator()
-            .Validate(
-                null,
-                new CohortOptions
-                {
-                    RowHandlerDispatch = new RowHandlerDispatchOptions
-                    {
-                        MaxAttempts = 3,
-                        PayloadRetention = TimeSpan.FromHours(1),
-                    },
-                }
-            )
+            .Validate(null, new CohortOptions { SweepSettleTimeout = TimeSpan.FromMinutes(1) })
             .Succeeded.Should()
             .BeTrue();
     }

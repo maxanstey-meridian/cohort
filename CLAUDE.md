@@ -37,17 +37,16 @@ Start in `Cohort.Sample.Tests/` with a red end-to-end test. Then make it pass. T
 ```
 Cohort/                 — the library. No tests of its own.
 ├── Domain/             — pure types. Depends on NOTHING (not even EF Core).
-├── Application/        — ports + orchestration. Depends on Domain only.
+├── Application/        — ports + orchestration (IRetentionRunRecovery among the public ports). Depends on Domain only.
 ├── Infrastructure/     — EF defaults, raw SQL adapters. Depends on Application + Domain.
 │   ├── Sweep/          — SweepStrategy (one SQL pipeline for every strategy, driven by SweepScope), Purge/SoftDelete/AnonymiseSweepStrategy, SweepEligibilitySql, SweepStatements (each sweep statement's builder, shared by runs and readiness)
 │   ├── Holds/          — EfRetentionHoldsRepository, RetentionHoldSql
-│   ├── Handlers/       — RowHandlerQueueSql (the row-handler queue's statements)
 │   ├── RetentionRunLedgerSql, HistoryPruningSql — the worker's ledger, abandoned-run recovery, history pruning
 │   ├── RetentionStatementReadiness — readiness's statement check: explains every statement Cohort sends against host tables, once per model and connection string (recorded outside a transaction), tolerating missing privileges
 │   ├── CohortStatements — `Statement` (the `SweepStatement` factory for statements against Cohort's own tables and functions) and `TransactionIsolation()`
 │   ├── Audit/          — EfRetentionAuditWriter
 │   └── Migrations/     — CohortModelBuilder (ConfigureCohortTables extension)
-└── Hosting/            — CohortOptions, RetentionWorker, RetentionRowDispatcher, AddCohort<TContext>()
+└── Hosting/            — CohortOptions, RetentionWorker, RetentionRunRecovery (abandoned-run recovery: the background service and the IRetentionRunRecovery implementation), RetentionHistoryPruner, AddCohort<TContext>()
 Cohort.Tests/           — fast unit suite. No Docker. No NSubstitute.
 Cohort.Sample/          — dogfood console consumer. The thing the e2e tests exercise.
 Cohort.Sample.Tests/    — e2e suite. Testcontainers Postgres. The default test home.
@@ -62,7 +61,7 @@ The dependency rule is enforced by `using` statements, not project boundaries. R
 - **`Domain/`** depends on nothing. If a type needs `using Microsoft.EntityFrameworkCore;`, it isn't Domain. Pure functions, attributes, value records.
 - **`Application/`** depends on Domain only. Defines ports as interfaces. Orchestrates. May reference `DbContext` as a port-shaped dependency (it's the host's "here is my model" contract), but never `DbSet<T>.FromSqlRaw`, never raw SQL, never Npgsql-specific types.
 - **`Infrastructure/`** depends on Application + Domain. Implements ports. Owns raw SQL, EF query expressions, provider-specific types. Contains sweep strategies, holds repository, audit writer, and model builder.
-- **`Hosting/`** depends on Application + Infrastructure. The DI entry point (`AddCohort<TContext>`), options, and the background services (the scheduled worker and the row-handler dispatcher). Consumer-facing. Every `BackgroundService` lives here; ArchUnitNET enforces it. Hosting runs no SQL of its own; `ArchitectureBoundaryTests.Hosting_Runs_No_Sql_Of_Its_Own` enforces it.
+- **`Hosting/`** depends on Application + Infrastructure. The DI entry point (`AddCohort<TContext>`), options, and the background services (the scheduled worker, abandoned-run recovery, and the history pruner). Consumer-facing. Every `BackgroundService` lives here; ArchUnitNET enforces it. Hosting runs no SQL of its own; `ArchitectureBoundaryTests.Hosting_Runs_No_Sql_Of_Its_Own` enforces it.
 
 **Layer placement test**: if a type has no dependency on a port, an external system's shape, or a framework — it's Domain. If it does — it's Application (defines/orchestrates the port) or Infrastructure (implements one).
 
@@ -102,13 +101,13 @@ Entity record IDs can be `Guid`, integers, `numeric`, `string`/`citext`, or conv
 - **Unannotated entities are implicitly exempt.** No annotation required to opt out.
 - Entities with **both** `[Retain]` and `[ExemptFromRetention]` fail startup validation.
 - Retained owned types, shared-table mappings, entity/table splitting, and inheritance mappings are unsupported and fail startup before mutation.
-- All raw relation names are schema-qualified. `ConfigureCohortTables()` maps Cohort tables to `public`; `ConfigureCohortTables(schema)` maps all five together.
+- All raw relation names are schema-qualified. `ConfigureCohortTables()` maps Cohort tables to `public`; `ConfigureCohortTables(schema)` maps all four together.
 
 ## Runtime contracts
 
 - `IRetentionRuleProvider.GetCapabilities` declares every possible strategy; startup validates their union and runtime rejects undeclared strategies.
 - Startup validates `[ErasureSubject(kind)]` mapping, provider conversion metadata, and one CLR type per kind across the model. Erasure matches only columns of the scope's kind and refuses an undeclared kind or a wrong-type subject before a run exists; `sweep_run.ErasureSubjectKind` records the kind, never the subject.
-- `IRetentionSweep`, `IRetentionPreview`, `IRetentionErasureService`, `IRetentionHoldsRepository`, and row dispatch enforce PostgreSQL/model/schema readiness even without host startup.
+- `IRetentionSweep`, `IRetentionPreview`, `IRetentionErasureService`, `IRetentionHoldsRepository`, and `IRetentionRunRecovery` enforce PostgreSQL/model/schema readiness even without host startup.
 - The EF audit ledger is internal and unconditional. `IRetentionAuditObserver` is post-commit, bounded, isolated, and best effort.
 - Externally-derived failures use a sanitized type/code/diagnostic-ID envelope; Cohort-defined safe machine reasons may be plain. Diagnostic error text excludes subject/raw exception data, but row-detail observers deliberately receive sensitive `RecordId` and `TenantId`. Original exceptions remain only in correlated structured logs. Readiness's statement check quotes PostgreSQL's SQLSTATE and message; it binds data-only parameters as typed NULLs, so that text carries no subject data.
 

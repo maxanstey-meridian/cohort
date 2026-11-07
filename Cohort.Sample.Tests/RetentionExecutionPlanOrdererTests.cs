@@ -54,8 +54,7 @@ public sealed class RetentionExecutionPlanOrdererTests
                 new("public", CohortTableNames.RetentionHolds),
                 new("public", CohortTableNames.SweepRun),
                 new("public", CohortTableNames.SweepRunEntitySummary),
-                new("public", CohortTableNames.SweepRunRowDetail),
-                new("public", CohortTableNames.SweepRowHandlerStatus)
+                new("public", CohortTableNames.SweepRunRowDetail)
             ),
             category,
             "CreatedAt",

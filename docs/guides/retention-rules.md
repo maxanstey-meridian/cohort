@@ -31,8 +31,7 @@ non-nullable anchors for purge categories.
 ## Entity identity
 
 `[RetentionEntityId]` gives each retained entity a stable UUID. It's durable correlation
-metadata, not a display name: holds, audit summaries, row details and handler work all refer
-to it, independently of the CLR type name. Never change it when you rename or move the
+metadata, not a display name: holds, audit summaries and row details all refer to it, independently of the CLR type name. Never change it when you rename or move the
 class. Startup rejects missing, empty, malformed or duplicate identities, and readiness
 refuses to run while an active hold still names an identity the model no longer declares,
 because that hold would silently stop protecting its row. See

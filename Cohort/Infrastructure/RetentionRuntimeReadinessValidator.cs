@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Data.Common;
 using System.Runtime.CompilerServices;
+using System.Transactions;
 
 using Cohort.Application;
 using Cohort.Domain;
@@ -26,7 +27,6 @@ internal sealed class RetentionRuntimeReadinessValidator(
     IServiceScopeFactory scopeFactory,
     AnonymiseAssignmentResolver assignments,
     RetentionValidationState validationState,
-    IEnumerable<IRetentionHandlerRegistration> handlerRegistrations,
     IEnumerable<IRetentionDependentsRegistration> dependentsRegistrations,
     IRetentionExecutionSettings settings
 )
@@ -39,7 +39,6 @@ internal sealed class RetentionRuntimeReadinessValidator(
         registry,
         validationState,
         assignments,
-        handlerRegistrations,
         dependentsRegistrations,
         settings
     );
@@ -104,7 +103,15 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 return;
             }
 
-            await RunModelPassAsync(readiness, ct);
+            // Cohort's own work never enlists in a caller's ambient System.Transactions
+            // transaction. The pass runs on the caller's context: under suppression its closed
+            // connection opens unenlisted, so the pass never joins the ambient transaction or
+            // begins one of its own inside it. The recording rule below is unchanged.
+            using (new TransactionScope(TransactionScopeOption.Suppress, TransactionScopeAsyncFlowOption.Enabled))
+            {
+                await RunModelPassAsync(readiness, ct);
+            }
+
             if (facade.CurrentTransaction is null)
             {
                 readiness.ModelValidated = true;
@@ -1316,8 +1323,8 @@ internal sealed class RetentionRuntimeReadinessValidator(
     }
 
     /// <summary>
-    /// The worker, each run and each row-handler delivery hold PostgreSQL session advisory
-    /// locks. Under Npgsql multiplexing a connection is bound to a server session only inside a
+    /// The worker, each run and abandoned-run recovery hold PostgreSQL session advisory locks.
+    /// Under Npgsql multiplexing a connection is bound to a server session only inside a
     /// transaction, so a lock taken outside one stays on whichever session ran it while the
     /// unlock runs on another and finds nothing to release. Checked on every call, before the
     /// entry is looked up; it reads the builder the entry key is built from, so it costs nothing
@@ -1330,7 +1337,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
         if (settings is { Multiplexing: true })
         {
             throw new RetentionConfigurationException([
-                "Cohort can't run on an Npgsql connection with Multiplexing enabled: its worker, runs and row-handler deliveries hold PostgreSQL session advisory locks, and a multiplexed connection only keeps one server session inside a transaction, so those locks would be taken on one session and released on another. Give Cohort's DbContext a connection string without Multiplexing=true.",
+                "Cohort can't run on an Npgsql connection with Multiplexing enabled: its worker, runs and abandoned-run recovery hold PostgreSQL session advisory locks, and a multiplexed connection only keeps one server session inside a transaction, so those locks would be taken on one session and released on another. Give Cohort's DbContext a connection string without Multiplexing=true.",
             ]);
         }
     }

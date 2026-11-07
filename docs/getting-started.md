@@ -30,8 +30,8 @@ public sealed class SessionNote
 
 - `[Retain("session-notes", nameof(CreatedAt))]` puts the entity in the `session-notes`
   category and ages its rows by `CreatedAt`.
-- `[RetentionEntityId]` is the entity's permanent identity. Holds, audit rows and handler
-  work refer to it, so generate a UUID once and never change it. Readiness refuses to run
+- `[RetentionEntityId]` is the entity's permanent identity. Holds and audit rows refer to
+  it, so generate a UUID once and never change it. Readiness refuses to run
   while an active hold still uses an old identity
   ([remedy](/reference/schema#changed-entity-identities)).
 - `Id` and `TenantId` are found by convention. Other names work too, as described in
@@ -94,7 +94,7 @@ dotnet ef migrations add AddCohort
 dotnet ef database update
 ```
 
-The migration creates Cohort's five tables. Cohort checks them at startup but never creates
+The migration creates Cohort's four tables. Cohort checks them at startup but never creates
 or changes them itself. See [Schema & Migrations](/reference/schema).
 
 ## Run a sweep

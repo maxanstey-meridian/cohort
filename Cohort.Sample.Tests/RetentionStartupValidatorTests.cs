@@ -693,19 +693,17 @@ public sealed class RetentionStartupValidatorTests
         }
     }
 
-    // A dependents step or row handler runs only on a row Cohort mutates, and a step only in
-    // each batch's scope: one on an entity Cohort doesn't retain, or a step registered some
-    // other way than AddRetentionDependents, would never run. Nothing is constructed to find out.
+    // A dependents step runs only on a row Cohort mutates, and only in each batch's scope: one
+    // on an entity Cohort doesn't retain, or one registered some other way than
+    // AddRetentionDependents, would never run. Nothing is constructed to find out.
     [Theory]
     [InlineData("retained", null)]
     [InlineData("unretained", "isn't a [Retain] entity")]
-    [InlineData("unretained-handler", "isn't a [Retain] entity")]
     [InlineData("type", "isn't registered with AddRetentionDependents alone")]
     [InlineData("singleton-first", "isn't registered with AddRetentionDependents alone")]
     [InlineData("factory", "isn't registered with AddRetentionDependents alone")]
     [InlineData("duplicate", "is registered 2 times")]
     [InlineData("step-service-removed", "service was removed or replaced")]
-    [InlineData("handler-service-removed", "service was removed or replaced")]
     public async Task ValidateAsync_Refuses_Row_Work_That_Would_Never_Run(string registration, string? refusal)
     {
         var options = new DbContextOptionsBuilder<DependentsDbContext>()
@@ -729,9 +727,6 @@ public sealed class RetentionStartupValidatorTests
             case "unretained":
                 services.AddRetentionDependents<UnretainedDependentsRecord, UnretainedDependentsStep>();
                 break;
-            case "unretained-handler":
-                services.AddRowHandler<UnretainedDependentsRecord, UnretainedRecordHandler>();
-                break;
             case "type":
                 services.AddScoped<IRetentionDependents<DependentsParent>, ParentDependentsStep>();
                 break;
@@ -752,10 +747,6 @@ public sealed class RetentionStartupValidatorTests
                 services.AddRetentionDependents<DependentsParent, ParentDependentsStep>();
                 services.RemoveAll<IRetentionDependents<DependentsParent>>();
                 break;
-            case "handler-service-removed":
-                services.AddRowHandler<DependentsParent, ParentRecordHandler>();
-                services.RemoveAll<IRetentionHandler<DependentsParent>>();
-                break;
         }
 
         var act = async () => await CreateValidator(db, repository, services).ValidateAsync();
@@ -768,8 +759,7 @@ public sealed class RetentionStartupValidatorTests
 
         var named = registration switch
         {
-            _ when registration.StartsWith("unretained", StringComparison.Ordinal) => typeof(UnretainedDependentsRecord).FullName!,
-            "handler-service-removed" => $"IRetentionHandler<{typeof(DependentsParent).FullName}>",
+            "unretained" => typeof(UnretainedDependentsRecord).FullName!,
             _ => $"IRetentionDependents<{typeof(DependentsParent).FullName}>",
         };
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
@@ -1478,20 +1468,12 @@ public sealed class RetentionStartupValidatorTests
         public Guid Id { get; init; }
     }
 
-    [RowHandlerId("8e4a1c7d-3b90-4f25-b6d2-0a9e5c1f7b38")]
     private sealed class ParentDependentsStep : IRetentionDependents<DependentsParent>
     {
         public Task RetireAsync(DependentsParent row, RetentionDependentsContext ctx, CancellationToken ct) =>
             Task.CompletedTask;
     }
 
-    [RowHandlerId("2e1d5c1b-fc88-4328-b378-eaec2b3368ac")]
-    private sealed class ParentRecordHandler : IRetentionHandler<DependentsParent>;
-
-    [RowHandlerId("3cc7fcf6-67a2-46a0-bb34-c15400ac07c1")]
-    private sealed class UnretainedRecordHandler : IRetentionHandler<UnretainedDependentsRecord>;
-
-    [RowHandlerId("c1d7e94b-2a68-4f03-8b5e-6d9f0a3c2e71")]
     private sealed class UnretainedDependentsStep : IRetentionDependents<UnretainedDependentsRecord>
     {
         public Task RetireAsync(UnretainedDependentsRecord row, RetentionDependentsContext ctx, CancellationToken ct) =>

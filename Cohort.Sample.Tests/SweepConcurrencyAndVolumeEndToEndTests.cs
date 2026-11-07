@@ -166,7 +166,7 @@ public sealed class SweepConcurrencyAndVolumeEndToEndTests(PostgresFixture fixtu
     }
 
     [Fact]
-    public async Task Two_Concurrent_Handler_Aware_Engines_Report_Each_Row_Exactly_Once()
+    public async Task Two_Concurrent_Row_By_Row_Engines_Report_Each_Row_Exactly_Once()
     {
         const long gateKey = 7_310_042_121;
         const int expiredRows = 80;
@@ -181,16 +181,17 @@ public sealed class SweepConcurrencyAndVolumeEndToEndTests(PostgresFixture fixtu
                 Id = id,
                 TenantId = tenantId,
                 CreatedAt = asOf.AddDays(-120).AddSeconds(index),
-                Body = $"handler-concurrent-{index}",
+                Body = $"step-concurrent-{index}",
             }));
             await db.SaveChangesAsync();
         }
 
-        var applicationName = $"cohort-handler-concurrency-{Guid.NewGuid():N}";
+        var applicationName = $"cohort-step-concurrency-{Guid.NewGuid():N}";
         var connectionString = new NpgsqlConnectionStringBuilder(GetConnectionString())
         {
             ApplicationName = applicationName,
         }.ConnectionString;
+        var runs = new StepRuns();
         using var host = new CohortTestHost(
             connectionString,
             new SampleRetentionRuleProvider(),
@@ -198,7 +199,10 @@ public sealed class SweepConcurrencyAndVolumeEndToEndTests(PostgresFixture fixtu
             {
                 [$"{CohortOptions.SectionName}:SweepBatchSize"] = "1",
             },
-            services => services.AddRowHandler<Note, ConcurrentNoteHandler>()
+            // A dependents step puts the entity on the row-by-row path.
+            services => services
+                .AddSingleton(runs)
+                .AddRetentionDependents<Note, ConcurrentNoteStep>(retiresReferencingRows: false)
         );
         await using var gate = await HoldGateAsync(gateKey);
         await InstallMutationOverlapGateAsync("notes", "DELETE", tenantId, gateKey, objectSuffix);
@@ -233,6 +237,8 @@ public sealed class SweepConcurrencyAndVolumeEndToEndTests(PostgresFixture fixtu
             .Where(count => count.EntityType == typeof(Note))
             .Sum(count => count.Affected).Should().Be(expiredRows);
         results.Should().AllSatisfy(result => result.EntityFailures.Should().BeEmpty());
+        // A row both engines loaded runs the step in each; only one deletes it.
+        runs.Count.Should().BeGreaterThanOrEqualTo(expiredRows, "both engines took the row-by-row path");
         var evidence = await ReadSweepLedgerAsync(objectSuffix);
         evidence.Should().HaveCount(expiredRows);
         evidence.Select(row => row.BackendId).Distinct().Should().HaveCount(2);
@@ -693,8 +699,25 @@ public sealed class SweepConcurrencyAndVolumeEndToEndTests(PostgresFixture fixtu
         return entries.ToArray();
     }
 
-    [RowHandlerId("bff19ce7-59f5-4f29-b53c-9983f0f02d98")]
-    private sealed class ConcurrentNoteHandler : IRetentionHandler<Note>;
+    private sealed class ConcurrentNoteStep(StepRuns runs) : IRetentionDependents<Note>
+    {
+        public Task RetireAsync(Note row, RetentionDependentsContext ctx, CancellationToken ct)
+        {
+            runs.Record();
+            return Task.CompletedTask;
+        }
+    }
+
+    // Counts the rows a step ran for. A step runs only on the row-by-row path, so a count shows
+    // the test took it.
+    private sealed class StepRuns
+    {
+        private int count;
+
+        public int Count => Volatile.Read(ref count);
+
+        public void Record() => Interlocked.Increment(ref count);
+    }
 
     private sealed class FirstNoteProgressObserver : IRetentionAuditObserver
     {

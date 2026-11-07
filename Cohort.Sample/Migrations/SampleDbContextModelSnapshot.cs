@@ -22,65 +22,6 @@ namespace Cohort.Sample.Migrations
 
             NpgsqlModelBuilderExtensions.UseIdentityByDefaultColumns(modelBuilder);
 
-            modelBuilder.Entity("Cohort.Infrastructure.Handlers.SweepRowHandlerStatusEntity", b =>
-                {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("bigint");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
-
-                    b.Property<int>("Attempt")
-                        .HasColumnType("integer");
-
-                    b.Property<Guid?>("ClaimToken")
-                        .HasColumnType("uuid");
-
-                    b.Property<DateTimeOffset?>("ClaimedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<DateTimeOffset?>("CompletedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<int>("DispatchPhase")
-                        .HasColumnType("integer");
-
-                    b.Property<string>("HandlerType")
-                        .IsRequired()
-                        .HasColumnType("text");
-
-                    b.Property<string>("LastError")
-                        .HasColumnType("text");
-
-                    b.Property<DateTimeOffset>("NextAttemptAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<DateTimeOffset>("QueuedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<int>("State")
-                        .HasColumnType("integer");
-
-                    b.Property<long>("SweepRunRowDetailId")
-                        .HasColumnType("bigint");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("SweepRunRowDetailId", "HandlerType")
-                        .IsUnique();
-
-                    b.HasIndex("State", "NextAttemptAt", "Id");
-
-                    b.ToTable("sweep_row_handler_status", "public", t =>
-                        {
-                            t.HasCheckConstraint("CK_sweep_row_handler_status_Claim", "(\"State\" = 1 AND \"ClaimedAt\" IS NOT NULL AND \"ClaimToken\" IS NOT NULL) OR (\"State\" <> 1 AND \"ClaimedAt\" IS NULL AND \"ClaimToken\" IS NULL)");
-
-                            t.HasCheckConstraint("CK_sweep_row_handler_status_Completion", "(\"State\" IN (2, 3) AND \"CompletedAt\" IS NOT NULL) OR (\"State\" IN (0, 1) AND \"CompletedAt\" IS NULL)");
-                        });
-
-                    b.HasAnnotation("Cohort:TableRole", "sweep_row_handler_status");
-                });
-
             modelBuilder.Entity("Cohort.Sample.Entities.AnonymisedContact", b =>
                 {
                     b.Property<Guid>("Id")
@@ -305,6 +246,31 @@ namespace Cohort.Sample.Migrations
                     b.HasKey("Id");
 
                     b.ToTable("nullable_anchor_events", (string)null);
+                });
+
+            modelBuilder.Entity("Cohort.Sample.Entities.OutboxMessage", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("Payload")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<Guid>("TenantId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("Type")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("outbox_messages", (string)null);
                 });
 
             modelBuilder.Entity("Cohort.Sample.Entities.PerRowAuditedLog", b =>
@@ -603,15 +569,15 @@ namespace Cohort.Sample.Migrations
                     b.Property<DateTimeOffset>("At")
                         .HasColumnType("timestamp with time zone");
 
-                    b.Property<string>("CapturedPayload")
-                        .HasColumnType("text");
-
                     b.Property<string>("Category")
                         .IsRequired()
                         .HasColumnType("text");
 
                     b.Property<string>("EntityType")
                         .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("Failure")
                         .HasColumnType("text");
 
                     b.Property<string>("RecordId")
@@ -641,15 +607,6 @@ namespace Cohort.Sample.Migrations
                     b.ToTable("sweep_run_row_detail", "public");
 
                     b.HasAnnotation("Cohort:TableRole", "sweep_run_row_detail");
-                });
-
-            modelBuilder.Entity("Cohort.Infrastructure.Handlers.SweepRowHandlerStatusEntity", b =>
-                {
-                    b.HasOne("Cohort.SweepRunRowDetail", null)
-                        .WithMany()
-                        .HasForeignKey("SweepRunRowDetailId")
-                        .OnDelete(DeleteBehavior.Cascade)
-                        .IsRequired();
                 });
 
             modelBuilder.Entity("Cohort.SweepRunEntitySummary", b =>

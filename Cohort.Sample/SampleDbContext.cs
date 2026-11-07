@@ -21,6 +21,7 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
     public DbSet<BlobBackedFile> BlobBackedFiles => Set<BlobBackedFile>();
     public DbSet<NullableAnchorEvent> NullableAnchorEvents => Set<NullableAnchorEvent>();
     public DbSet<ExternalNumberedLog> ExternalNumberedLogs => Set<ExternalNumberedLog>();
+    public DbSet<OutboxMessage> OutboxMessages => Set<OutboxMessage>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -165,6 +166,16 @@ public sealed class SampleDbContext(DbContextOptions<SampleDbContext> options) :
             b.Property(file => file.StoragePath).IsRequired();
             b.Property(file => file.OriginalFileName).IsRequired();
             b.Property(file => file.ContentType).IsRequired();
+        });
+
+        modelBuilder.Entity<OutboxMessage>(b =>
+        {
+            b.ToTable("outbox_messages");
+            b.HasKey(message => message.Id);
+            b.Property(message => message.TenantId).IsRequired();
+            b.Property(message => message.Type).IsRequired();
+            b.Property(message => message.Payload).IsRequired();
+            b.Property(message => message.CreatedAt).IsRequired();
         });
 
         modelBuilder.Entity<HeldRecord>(b =>

@@ -20,14 +20,13 @@ namespace Cohort.Infrastructure.Sweep;
 /// are in play; <see cref="SweepEligibilitySql"/> says which of those the strategy has not
 /// yet handled, and the strategy says how it changes one (<see cref="CreateMutation"/>).
 /// Candidates are discovered, entity-locked and row-locked, then mutated in one statement,
-/// or row by row when handlers or a dependents step run or the new values depend on each row.
+/// or row by row when a dependents step runs or the new values depend on each row.
 /// A row an integrity constraint refuses is blocked rather than failing its batch: the bulk
 /// statement is bisected under savepoints to find it, and on the row-by-row path each row's
 /// change has its own savepoint, which its dependents step shares.
 /// </summary>
 internal abstract class SweepStrategy(
     DbContext db,
-    IEnumerable<IRetentionHandlerRegistration> handlerRegistrations,
     IEnumerable<IRetentionDependentsRegistration> dependentsRegistrations,
     RetentionHoldGuard holdGuard,
     IServiceScopeFactory scopeFactory,
@@ -35,7 +34,6 @@ internal abstract class SweepStrategy(
 )
 {
     private const string MutationSavepoint = "cohort_mutation";
-    private const string OnBeforeSavepoint = "cohort_on_before";
 
     private static readonly MethodInfo RowByRowMethod = typeof(SweepStrategy).GetMethod(
         nameof(ExecuteRowByRowAsync),
@@ -153,42 +151,34 @@ internal abstract class SweepStrategy(
     )
     {
         var mutation = CreateMutation(scope);
-        var hasHandlers = RetentionHandlerSupport.HasHandlers(handlerRegistrations, scope.Entry.EntityType);
         var hasStep = dependentsRegistrations.HasStep(scope.Entry.EntityType);
-        var rowByRow = SweepStatements.TakesRowByRowPath(HandlesStrategy, hasHandlers, hasStep, mutation.RowByRow);
-        if (
-            !RetentionHandlerSupport.RecordsHandlerBookkeeping(
-                handlerRegistrations,
-                dependentsRegistrations,
-                scope.Entry.EntityType
-            )
-        )
+        var rowByRow = SweepStatements.TakesRowByRowPath(HandlesStrategy, hasStep, mutation.RowByRow);
+        if (!hasStep)
         {
-            return await MutateAsync(scope, conn, transaction, candidates, mutation, rowByRow, handlerScope: null, execution, ct);
+            return await MutateAsync(scope, conn, transaction, candidates, mutation, rowByRow, stepScope: null, execution, ct);
         }
 
-        // Handlers and steps never see the run's own context, which in a caller-transaction
-        // erasure is the caller's: they get a scope of their own per batch, whose context joins
-        // the run's connection and transaction before any of them is constructed.
+        // A step never sees the run's own context, which in a caller-transaction erasure is
+        // the caller's: it gets a scope of its own per batch, whose context joins the run's
+        // connection and transaction before the step is constructed.
         return await scopeFactory.RunInScopeAsync(
             RetentionExecutionScopes.For(scope.Tenant),
-            async handlerServices =>
+            async stepServices =>
             {
-                var handlerDb = handlerServices.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext);
+                var stepDb = stepServices.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext);
                 // A hook may have opened the context to isolate it. The run's connection
                 // already carries the same tenant's isolation, and an open connection can't
                 // be swapped.
-                await handlerDb.Database.CloseConnectionAsync();
-                handlerDb.Database.SetDbConnection(conn, contextOwnsConnection: false);
+                await stepDb.Database.CloseConnectionAsync();
+                stepDb.Database.SetDbConnection(conn, contextOwnsConnection: false);
                 try
                 {
-                    await handlerDb.Database.UseTransactionAsync(transaction, ct);
-                    var handlerScope = new RetentionHandlerScope(
-                        handlerDb,
-                        hasHandlers ? RetentionHandlerSupport.ResolveHandlers(handlerServices, scope.Entry.EntityType) : [],
-                        RetentionHandlerSupport.ResolveDependents(handlerServices, scope.Entry.EntityType)
+                    await stepDb.Database.UseTransactionAsync(transaction, ct);
+                    var stepScope = new RetentionHandlerScope(
+                        stepDb,
+                        RetentionHandlerSupport.ResolveDependents(stepServices, scope.Entry.EntityType)
                     );
-                    if (handlerScope.Dependents is { } step)
+                    if (stepScope.Dependents is { } step)
                     {
                         // The guard reads only the holds this scope can see.
                         await holdGuard.EnsureTenantlessHoldsVisibleAsync(
@@ -199,12 +189,12 @@ internal abstract class SweepStrategy(
                         );
                     }
 
-                    return await MutateAsync(scope, conn, transaction, candidates, mutation, rowByRow, handlerScope, execution, ct);
+                    return await MutateAsync(scope, conn, transaction, candidates, mutation, rowByRow, stepScope, execution, ct);
                 }
                 finally
                 {
-                    await handlerDb.Database.UseTransactionAsync(null, CancellationToken.None);
-                    RestoreConfiguredConnection(handlerDb);
+                    await stepDb.Database.UseTransactionAsync(null, CancellationToken.None);
+                    RestoreConfiguredConnection(stepDb);
                 }
             },
             ct
@@ -212,25 +202,25 @@ internal abstract class SweepStrategy(
     }
 
     /// <summary>
-    /// Puts back the connection <paramref name="handlerDb"/>'s options configure. EF doesn't
+    /// Puts back the connection <paramref name="stepDb"/>'s options configure. EF doesn't
     /// reset a connection the context doesn't own when a pooled context goes back to its
     /// pool, so without this the next lease would get the run's connection. Without a
     /// configured connection or connection string (a data source), the provider creates
     /// the next one itself.
     /// </summary>
-    private static void RestoreConfiguredConnection(DbContext handlerDb)
+    private static void RestoreConfiguredConnection(DbContext stepDb)
     {
-        var configured = RelationalOptionsExtension.Extract(handlerDb.GetService<IDbContextOptions>());
+        var configured = RelationalOptionsExtension.Extract(stepDb.GetService<IDbContextOptions>());
         if (configured.Connection is not null)
         {
-            handlerDb.Database.SetDbConnection(configured.Connection, configured.IsConnectionOwned);
+            stepDb.Database.SetDbConnection(configured.Connection, configured.IsConnectionOwned);
             return;
         }
 
-        handlerDb.Database.SetDbConnection(null);
+        stepDb.Database.SetDbConnection(null);
         if (configured.ConnectionString is not null)
         {
-            handlerDb.Database.SetConnectionString(configured.ConnectionString);
+            stepDb.Database.SetConnectionString(configured.ConnectionString);
         }
     }
 
@@ -241,7 +231,7 @@ internal abstract class SweepStrategy(
         IReadOnlyList<string> candidates,
         SweepMutation mutation,
         bool rowByRow,
-        RetentionHandlerScope? handlerScope,
+        RetentionHandlerScope? stepScope,
         SweepMutationContext execution,
         CancellationToken ct
     )
@@ -267,7 +257,7 @@ internal abstract class SweepStrategy(
         return await (Task<SweepExecutionResult>)
             rowByRowMethod.Invoke(
                 this,
-                [scope, conn, transaction, candidates, mutation, handlerScope, execution, ct]
+                [scope, conn, transaction, candidates, mutation, stepScope, execution, ct]
             )!;
     }
 
@@ -327,7 +317,7 @@ internal abstract class SweepStrategy(
         DbTransaction transaction,
         IReadOnlyList<string> candidates,
         SweepMutation mutation,
-        RetentionHandlerScope? handlerScope,
+        RetentionHandlerScope? stepScope,
         SweepMutationContext execution,
         CancellationToken ct
     )
@@ -344,8 +334,7 @@ internal abstract class SweepStrategy(
         var recordIdProperty = db.Model.FindEntityType(typeof(TEntity))!.FindProperty(entry.RecordId.RecordIdMember)!;
         var recordIdGetter = recordIdProperty.GetGetter();
         var recordIdConverter = recordIdProperty.GetTypeMapping().Converter;
-        var onBefore = handlerScope is { Handlers.Count: > 0 } ? handlerScope : null;
-        var step = handlerScope?.Dependents;
+        var step = stepScope?.Dependents;
 
         var affected = new List<string>();
         var skipped = 0;
@@ -358,27 +347,6 @@ internal abstract class SweepStrategy(
                     $"Retention row for {entry.EntityType.FullName} produced an empty record id for member '{entry.RecordId.RecordIdMember}'."
                 );
             var recordKey = recordIdConverter?.ConvertToProvider(recordIdValue) ?? recordIdValue;
-
-            string? capturedPayload = null;
-            if (onBefore is not null)
-            {
-                var before = new RetentionBeforeContext(
-                    execution.SweepId,
-                    entry.Category,
-                    scope.Rule.Strategy,
-                    scope.Tenant.Id,
-                    execution.At
-                );
-                var result = await InvokeOnBeforeReadOnlyAsync(conn, transaction, onBefore, entry.EntityType, row, before, ct);
-                if (!result.Succeeded)
-                {
-                    skipped++;
-                    await PersistSkippedAsync(scope, conn, transaction, execution, recordKey, result.ToFailure(), ct);
-                    continue;
-                }
-
-                capturedPayload = result.CapturedPayload;
-            }
 
             var headParameters = new SqlParams();
             mutation.AddParameters(headParameters, row);
@@ -400,7 +368,7 @@ internal abstract class SweepStrategy(
                 var stepFailure = await RetireDependentsAsync(
                     conn,
                     transaction,
-                    handlerScope!.Db,
+                    stepScope!.Db,
                     step,
                     (TEntity)row,
                     dependents,
@@ -423,8 +391,7 @@ internal abstract class SweepStrategy(
             }
             catch (DbException ex) when (IsIntegrityViolation(ex))
             {
-                // Refused by a constraint: nothing changed, the step is undone with it, and no
-                // OnAfter work is queued.
+                // Refused by a constraint: nothing changed, and the step is undone with it.
                 await RollBackSavepointAsync(transaction, MutationSavepoint);
                 blocked.Add(await RecordIdSql.CanonicalizeAsync(conn, transaction, entry, recordKey, ct), ex);
                 continue;
@@ -454,30 +421,12 @@ internal abstract class SweepStrategy(
             }
 
             await transaction.ReleaseAsync(MutationSavepoint, CancellationToken.None);
-            if (capturedPayload is not null)
-            {
-                await RetentionHandlerSupport.PersistCapturedRowAsync(
-                    conn,
-                    transaction,
-                    execution,
-                    entry,
-                    scope.Rule.Strategy,
-                    scope.Tenant.Id,
-                    recordId,
-                    capturedPayload,
-                    onBefore!.Handlers,
-                    ct
-                );
-            }
             affected.Add(recordId);
         }
 
         LogBlocked(scope, execution, blocked);
         return new SweepExecutionResult(
             affected,
-            // Only handlers write a row detail for each mutated row; a step alone leaves the
-            // run's own row-detail audit to the engine.
-            RowDetailsPersisted: onBefore is not null,
             SkippedCount: skipped,
             CandidateCount: candidates.Count,
             BlockedRecordIds: blocked.RecordIds,
@@ -513,8 +462,8 @@ internal abstract class SweepStrategy(
 
     /// <summary>
     /// Runs the dependents step read-write inside the open mutation savepoint, and returns
-    /// why it failed, or null when the row may be mutated. Like OnBefore, only the run's own
-    /// cancellation propagates; anything else the step throws, a database error included, is
+    /// why it failed, or null when the row may be mutated. Only the run's own cancellation
+    /// propagates; anything else the step throws, a database error included, is
     /// the step failing. It also fails for unsaved changes it leaves on its context and for
     /// any change to or removal of a row under an active hold, found by diffing every visible
     /// held row's physical version before and after it (<see cref="RetentionHoldGuard"/>).
@@ -598,63 +547,6 @@ internal abstract class SweepStrategy(
         var statement = SweepStatements.IsStillDue(scope, HandlesStrategy, recordKey);
         await using var command = statement.Parameters.CreateCommand(conn, transaction, statement.Sql);
         return await command.ExecuteScalarAsync(ct) is true;
-    }
-
-    /// <summary>
-    /// Runs the OnBefore handlers inside a read-only savepoint that is always rolled back.
-    /// The handlers' context shares the sweep's connection and transaction: a database error
-    /// in one leaves the transaction usable for the rest of the batch, and a write fails
-    /// (SQLSTATE 25006) instead of committing with it. Rolling back also restores read-write
-    /// mode and releases anything the handler locked. Read-only can't reach the change
-    /// tracker, so whatever the handlers left tracked on their context is discarded after
-    /// every row.
-    /// </summary>
-    private static async Task<OnBeforeInvocationResult> InvokeOnBeforeReadOnlyAsync(
-        DbConnection conn,
-        DbTransaction transaction,
-        RetentionHandlerScope onBefore,
-        Type entityType,
-        object row,
-        RetentionBeforeContext before,
-        CancellationToken ct
-    )
-    {
-        await transaction.SaveAsync(OnBeforeSavepoint, CancellationToken.None);
-        try
-        {
-            OnBeforeInvocationResult result;
-            try
-            {
-                await using (var readOnly = new SqlParams().CreateCommand(conn, transaction, "SET LOCAL transaction_read_only = on"))
-                {
-                    await readOnly.ExecuteNonQueryAsync(ct);
-                }
-
-                result = await RetentionHandlerSupport.InvokeOnBeforeAsync(onBefore.Db, onBefore.Handlers, entityType, row, before, ct);
-            }
-            catch
-            {
-                // Cancelled, or Cohort's own statement failed: the batch is abandoned with the
-                // original exception, so a failed rollback may not replace it.
-                try
-                {
-                    await transaction.RollbackAsync(OnBeforeSavepoint, CancellationToken.None);
-                }
-                catch (Exception)
-                {
-                    // The batch transaction is discarded either way.
-                }
-
-                throw;
-            }
-
-            await RollBackSavepointAsync(transaction, OnBeforeSavepoint);
-            return result;
-        }
-        finally
-        {
-            onBefore.Db.ChangeTracker.Clear();
-        }
     }
 
     /// <summary>
@@ -748,8 +640,7 @@ internal abstract class SweepStrategy(
 
     /// <summary>
     /// Up to <paramref name="limit"/> due rows after <paramref name="after"/> in discovery's
-    /// order, and the last of them. A keyset rather than an exclusion list, after the
-    /// dispatcher's expired-claim recovery on (<c>ClaimedAt</c>, <c>Id</c>): each statement
+    /// order, and the last of them. A keyset rather than an exclusion list: each statement
     /// costs one batch however many rows the run has already passed over.
     /// </summary>
     private async Task<(List<string> RecordIds, SweepCursor? Last)> DiscoverAsync(

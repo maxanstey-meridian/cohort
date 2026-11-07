@@ -209,7 +209,7 @@ internal sealed class RetentionRun(
         plan = await ReferencingForeignKeySql.AttachAsync(
             db.Database.GetDbConnection(),
             plan,
-            entry => dependentsRegistrations.HasStep(entry.EntityType),
+            entry => dependentsRegistrations.RetiresReferencingRows(entry.EntityType),
             ct
         );
         foreach (var scope in RetentionExecutionPlanOrderer.Order(db, plan, scope => scope.Entry, logger))
@@ -544,10 +544,7 @@ internal sealed class RetentionRun(
                     foreach (var recordId in execution.AffectedRecordIds)
                     {
                         var rowDetail = new SweepEvent.RowDetail(SweepId, eventAt, entry.EntityType, entry.RetentionEntityId, recordId, entry.Category, rule.Strategy, scope.Tenant.Id);
-                        if (!execution.RowDetailsPersisted)
-                        {
-                            await auditWriter.WriteAsync(rowDetail, ct);
-                        }
+                        await auditWriter.WriteAsync(rowDetail, ct);
                         committed.Add(rowDetail);
                     }
                 }

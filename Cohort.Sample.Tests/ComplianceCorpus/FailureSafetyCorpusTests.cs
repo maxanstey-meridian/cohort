@@ -103,7 +103,7 @@ public sealed class FailureSafetyCorpusTests(PostgresFixture fixture) : Integrat
     }
 
     [Fact]
-    public async Task Handler_failure_diagnostics_exclude_personal_data_and_correlate_to_logs()
+    public async Task Step_failure_diagnostics_exclude_personal_data_and_correlate_to_logs()
     {
         var tenantId = Guid.NewGuid();
         var now = new DateTimeOffset(2026, 7, 12, 12, 0, 0, TimeSpan.Zero);
@@ -118,7 +118,7 @@ public sealed class FailureSafetyCorpusTests(PostgresFixture fixture) : Integrat
                     Id = Guid.NewGuid(),
                     TenantId = tenantId,
                     CreatedAt = now.AddDays(-60),
-                    Body = "handler diagnostic corpus",
+                    Body = "step diagnostic corpus",
                 }
             );
             await db.SaveChangesAsync();
@@ -126,15 +126,11 @@ public sealed class FailureSafetyCorpusTests(PostgresFixture fixture) : Integrat
 
         using var host = new CohortTestHost(
             ConnectionString,
-            configurationOverrides: new Dictionary<string, string?>
-            {
-                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxAttempts"] = "1",
-            },
             configureServices: services =>
             {
                 services
                     .AddSingleton(new PersonalDataSentinel(personalDataSentinel))
-                    .AddRowHandler<Note, PersonalDataFailingHandler>();
+                    .AddRetentionDependents<Note, PersonalDataFailingStep>(retiresReferencingRows: false);
                 services.AddSingleton<ILoggerProvider>(logs);
             }
         );
@@ -142,19 +138,14 @@ public sealed class FailureSafetyCorpusTests(PostgresFixture fixture) : Integrat
             new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
             now
         );
-        await host.RunWithServicesAsync(async services =>
-            await services.GetRequiredService<IRetentionRowDispatcher>().FlushAsync()
-        );
 
         await using var connection = new NpgsqlConnection(ConnectionString);
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
         command.CommandText = """
-            SELECT status."LastError"
-            FROM "sweep_row_handler_status" AS status
-            INNER JOIN "sweep_run_row_detail" AS detail
-                ON detail."Id" = status."SweepRunRowDetailId"
-            WHERE detail."SweepId" = @sweepId
+            SELECT "Failure"
+            FROM "sweep_run_row_detail"
+            WHERE "SweepId" = @sweepId
             """;
         command.Parameters.AddWithValue("sweepId", result.SweepId);
         var persistedError = (string)(await command.ExecuteScalarAsync())!;
@@ -380,11 +371,10 @@ public sealed class FailureSafetyCorpusTests(PostgresFixture fixture) : Integrat
 
     private sealed record PersonalDataSentinel(string Value);
 
-    [RowHandlerId("26a89428-788a-4c19-9627-e8e55b07b106")]
-    private sealed class PersonalDataFailingHandler(PersonalDataSentinel sentinel)
-        : IRetentionHandler<Note>
+    private sealed class PersonalDataFailingStep(PersonalDataSentinel sentinel)
+        : IRetentionDependents<Note>
     {
-        public Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct) =>
+        public Task RetireAsync(Note row, RetentionDependentsContext ctx, CancellationToken ct) =>
             throw new InvalidOperationException(sentinel.Value);
     }
 

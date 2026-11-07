@@ -272,8 +272,7 @@ public sealed class RetentionScopeCorpusTests(PostgresFixture fixture) : Integra
             SELECT jsonb_build_object(
                 'runs', (SELECT COALESCE(jsonb_agg(to_jsonb(row) ORDER BY row."SweepId"), '[]'::jsonb) FROM "sweep_run" row),
                 'summaries', (SELECT COALESCE(jsonb_agg(to_jsonb(row) ORDER BY row."SweepId", row."RetentionEntityId", row."Category", row."TenantId", row."Strategy"), '[]'::jsonb) FROM "sweep_run_entity_summary" row),
-                'details', (SELECT COALESCE(jsonb_agg(to_jsonb(row) ORDER BY row."Id"), '[]'::jsonb) FROM "sweep_run_row_detail" row),
-                'statuses', (SELECT COALESCE(jsonb_agg(to_jsonb(row) ORDER BY row."Id"), '[]'::jsonb) FROM "sweep_row_handler_status" row)
+                'details', (SELECT COALESCE(jsonb_agg(to_jsonb(row) ORDER BY row."Id"), '[]'::jsonb) FROM "sweep_run_row_detail" row)
             )::text
             """;
         return (string)(await command.ExecuteScalarAsync())!;

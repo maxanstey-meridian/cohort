@@ -1007,11 +1007,10 @@ public sealed class HeldWithEndToEndTests(PostgresFixture fixture)
         await connection.OpenAsync();
         await using var command = new NpgsqlCommand(
             """
-            SELECT status."LastError"
-            FROM "sweep_row_handler_status" AS status
-            INNER JOIN "sweep_run_row_detail" AS detail ON detail."Id" = status."SweepRunRowDetailId"
+            SELECT detail."Failure"
+            FROM "sweep_run_row_detail" AS detail
             WHERE detail."SweepId" = @sweepId
-              AND status."LastError" IS NOT NULL
+              AND detail."Failure" IS NOT NULL
             """,
             connection
         );
@@ -1502,7 +1501,6 @@ public sealed class HeldWithEndToEndTests(PostgresFixture fixture)
             (_, _, _) => Task.CompletedTask;
     }
 
-    [RowHandlerId("6c1f0a52-2d4b-4f3e-9a67-1b8e5d0c7a41")]
     private sealed class LinkStep(HeldWithDbContext db, StepScript script) : IRetentionDependents<ZCaseLink>
     {
         public Task RetireAsync(ZCaseLink row, RetentionDependentsContext ctx, CancellationToken ct) =>

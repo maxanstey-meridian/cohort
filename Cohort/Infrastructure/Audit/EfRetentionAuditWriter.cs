@@ -40,7 +40,8 @@ internal sealed class EfRetentionAuditWriter(
                     rowDetail.RecordId,
                     rowDetail.Category,
                     rowDetail.Strategy,
-                    rowDetail.TenantId
+                    rowDetail.TenantId,
+                    failure: null
                 ),
                 ct
             ),
@@ -186,7 +187,9 @@ internal sealed class EfRetentionAuditWriter(
     }
 
     /// <summary>
-    /// Records one mutated row. <paramref name="recordId"/> is the row's canonical text.
+    /// Records one row. <paramref name="recordId"/> is the row's canonical text.
+    /// <paramref name="failure"/> is null for a mutated row; for a row a failing dependents
+    /// step left unmutated, it says why.
     /// </summary>
     internal static SweepStatement RowDetailStatement(
         CohortStoreTables tables,
@@ -197,7 +200,8 @@ internal sealed class EfRetentionAuditWriter(
         string recordId,
         string category,
         Strategy strategy,
-        Guid tenantId
+        Guid tenantId,
+        string? failure
     )
     {
         var rowDetail = PostgreSqlIdentifier.Format(tables.SweepRunRowDetail);
@@ -205,8 +209,8 @@ internal sealed class EfRetentionAuditWriter(
             "row-detail",
             $"""
             INSERT INTO {rowDetail}
-                ("SweepId", "At", "EntityType", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId")
-            VALUES (@sweepId, @at, @entityType, @retentionEntityId, @recordId, @category, @strategy, @tenantId)
+                ("SweepId", "At", "EntityType", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId", "Failure")
+            VALUES (@sweepId, @at, @entityType, @retentionEntityId, @recordId, @category, @strategy, @tenantId, @failure)
             """,
             new SqlParams
             {
@@ -218,6 +222,7 @@ internal sealed class EfRetentionAuditWriter(
                 ["category"] = category,
                 ["strategy"] = (int)strategy,
                 ["tenantId"] = tenantId,
+                ["failure"] = failure,
             },
             tables.SweepRunRowDetail
         );

@@ -10,12 +10,11 @@ namespace Cohort.Infrastructure.Sweep;
 
 internal sealed class PurgeSweepStrategy(
     [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
-    IEnumerable<IRetentionHandlerRegistration> handlerRegistrations,
     IEnumerable<IRetentionDependentsRegistration> dependentsRegistrations,
     RetentionHoldGuard holdGuard,
     IServiceScopeFactory scopeFactory,
     ILogger<PurgeSweepStrategy> logger
-) : SweepStrategy(db, handlerRegistrations, dependentsRegistrations, holdGuard, scopeFactory, logger)
+) : SweepStrategy(db, dependentsRegistrations, holdGuard, scopeFactory, logger)
 {
     public override Strategy HandlesStrategy => Strategy.Purge;
 

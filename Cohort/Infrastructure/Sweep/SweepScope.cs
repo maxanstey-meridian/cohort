@@ -61,7 +61,7 @@ internal sealed record SweepScope(
 
     /// <summary>
     /// Foreign keys whose referencing rows keep a row from being deleted (Purge only, and
-    /// none for an entity with a dependents step; see
+    /// none for an entity whose dependents step retires the rows that reference it; see
     /// <see cref="ReferencingForeignKeySql.AttachAsync"/>). Referenced rows are left out of
     /// the candidates and counted as blocked.
     /// </summary>

@@ -9,8 +9,7 @@ internal sealed record CohortStoreTables(
     RelationalObjectName RetentionHolds,
     RelationalObjectName SweepRun,
     RelationalObjectName SweepRunEntitySummary,
-    RelationalObjectName SweepRunRowDetail,
-    RelationalObjectName SweepRowHandlerStatus
+    RelationalObjectName SweepRunRowDetail
 )
 {
     internal const string TableRoleAnnotation = "Cohort:TableRole";
@@ -30,7 +29,7 @@ internal sealed record CohortStoreTables(
         if (mappedRoles != CohortSchemaContract.TableNames.Count)
         {
             throw new InvalidOperationException(
-                "The EF model contains a partial Cohort table mapping. Configure all five Cohort tables together."
+                "The EF model contains a partial Cohort table mapping. Configure all four Cohort tables together."
             );
         }
 
@@ -38,20 +37,9 @@ internal sealed record CohortStoreTables(
             Resolve(model, CohortTableNames.RetentionHolds),
             Resolve(model, CohortTableNames.SweepRun),
             Resolve(model, CohortTableNames.SweepRunEntitySummary),
-            Resolve(model, CohortTableNames.SweepRunRowDetail),
-            Resolve(model, CohortTableNames.SweepRowHandlerStatus)
+            Resolve(model, CohortTableNames.SweepRunRowDetail)
         );
     }
-
-    /// <summary>The five tables as quoted, schema-qualified SQL identifiers.</summary>
-    internal QuotedCohortTables Quoted() =>
-        new(
-            PostgreSqlIdentifier.Format(RetentionHolds),
-            PostgreSqlIdentifier.Format(SweepRun),
-            PostgreSqlIdentifier.Format(SweepRunEntitySummary),
-            PostgreSqlIdentifier.Format(SweepRunRowDetail),
-            PostgreSqlIdentifier.Format(SweepRowHandlerStatus)
-        );
 
     private static RelationalObjectName Resolve(IModel model, string role)
     {
@@ -66,14 +54,3 @@ internal sealed record CohortStoreTables(
         );
     }
 }
-
-/// <summary>
-/// Cohort's tables as quoted, schema-qualified identifiers, ready to interpolate into raw SQL.
-/// </summary>
-internal sealed record QuotedCohortTables(
-    string RetentionHolds,
-    string SweepRun,
-    string SweepRunEntitySummary,
-    string SweepRunRowDetail,
-    string SweepRowHandlerStatus
-);

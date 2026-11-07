@@ -2,7 +2,7 @@
 
 If your host isolates tenants inside the database, for example with PostgreSQL row-level
 security, Cohort's own work has to run under that isolation too. Cohort creates its own DI
-scopes for sweeps, previews, erasures, row-handler deliveries, pruning and readiness, so it
+scopes for sweeps, previews, erasures, dependents steps, recovery, pruning and readiness, so it
 tells you whose work each one does through `IRetentionExecutionScope`. Your hook configures
 the scope, typically by telling its DbContext which tenant it serves.
 
@@ -43,15 +43,14 @@ RetentionExecutionContext.System(RetentionSystemWork Work)
 | Where | Context |
 |---|---|
 | `IRetentionSweep`, `IRetentionPreview` | `Tenant` for a tenanted request, `System(TenantlessPass)` for a tenantless one |
-| `IRetentionErasureService` | `Tenant` for a tenanted request, `System(TenantlessPass)` for a tenantless one. Not called for the erasure itself with `ErasureTransaction.Caller`: that erasure runs in your scope, which you already set up (its row-handler batches, below, still are) |
-| Each batch's `OnBeforeAsync` handlers and dependents step, in their own scope on the run's connection and transaction, `Caller` erasures included | `Tenant` of the run, or `System(TenantlessPass)` for a tenantless one |
+| `IRetentionErasureService` | `Tenant` for a tenanted request, `System(TenantlessPass)` for a tenantless one. Not called for the erasure itself with `ErasureTransaction.Caller`: that erasure runs in your scope, which you already set up (its batches with a dependents step, below, still are) |
+| Each batch's dependents step, in its own scope on the run's connection and transaction, `Caller` erasures included | `Tenant` of the run, or `System(TenantlessPass)` for a tenantless one |
 | Scheduled worker iteration: its lock, occurrence ledger, tenant source and tenant coverage check (which reads the tenant column of every retained tenanted table, across tenants) | `System(WorkerCoordination)` |
 | A refused scheduled pass (a tenant missing from the source or returned with conflicting contexts), recorded as a `Failed` run | `Tenant` of the refused tenant |
 | Each scheduled pass, in its own scope | `Tenant`, or `System(TenantlessPass)` for the tenantless pass |
-| Row-handler dispatch: claim, settle, recovery and payload scrub | `System(RowDispatch)` |
-| Each `OnAfterAsync` delivery, in its own scope | `Tenant` of the row, or `System(TenantlessPass)` for a tenantless row |
+| Abandoned-run recovery, by the background service or `IRetentionRunRecovery` | `System(Recovery)` |
 | History pruning | `System(HistoryPruning)` |
-| Startup readiness | `System(Readiness)`, then the `System` scope of each subsystem that will run (`RowDispatch`, `WorkerCoordination`, `HistoryPruning`) |
+| Startup readiness | `System(Readiness)`, then the `System` scope of each subsystem that will run (`Recovery`, `WorkerCoordination`, `HistoryPruning`) |
 | Readiness's cross-tenant hold check, whichever operation runs readiness first | `System(Readiness)` |
 | The check, by `IRetentionDeletion` and by each batch with a dependents step, that its scope sees every hold on a tenantless row, in a model with tenantless entities | `System(Readiness)` |
 
@@ -68,8 +67,8 @@ System work deliberately spans tenants, or touches tables that have no tenant:
 |---|---|
 | `Readiness` | Catalog checks, and integrity checks across every tenant |
 | `WorkerCoordination` | The worker's advisory lock, occurrence ledger, tenant source and tenant coverage check |
-| `TenantlessPass` | Sweeps, previews, erasures and handler deliveries for `[RetentionTenantless]` entities |
-| `RowDispatch` | Claiming, settling, recovering, requeuing and scrubbing every tenant's queued handler work |
+| `TenantlessPass` | Sweeps, previews, erasures and dependents steps for `[RetentionTenantless]` entities |
+| `Recovery` | Settling every tenant's abandoned runs as `Failed` |
 | `HistoryPruning` | Pruning Cohort's run history and inactive holds |
 
 How you carry out `System` is up to you, as long as the scope can read and write across
@@ -83,19 +82,16 @@ tenant".
   context. Different work gets a new scope.
 - **Calls nest.** Each scheduled pass runs inside the worker's `WorkerCoordination` work,
   readiness's `System(Readiness)` check can run inside any operation's work, and each batch
-  with row handlers or a dependents step runs its own scope, for the run's tenant, inside the sweep's or erasure's
-  work (inside your own scope for a `Caller` erasure). Each `OnAfterAsync` delivery runs its
-  own scope, for the row's tenant, inside the dispatcher's `System(RowDispatch)` work for its
-  batch, which holds the batch's delivery locks. An inner call's
+  with a dependents step runs its own scope, for the run's tenant, inside the sweep's or
+  erasure's work (inside your own scope for a `Caller` erasure). An inner call's
   context wholly replaces the outer one for its work: set it, don't merge it. Restore anything
   you change outside the scope's own services when the work returns, as a `using` block or
   `try`/`finally` does; an `AsyncLocal` set in the hook is restored for you.
-- **Tenanted work only runs as `Tenant`.** Each batch's `OnBeforeAsync` handlers and
-  dependents step get their own scope, run as the batch's tenant, and are resolved inside that
-  work. Each `OnAfterAsync` delivery gets its own scope, run as the row's tenant, and the
-  handler is resolved inside that work. No host code runs under `System` against tenanted rows. Handlers
-  and steps for tenantless entities run under `System(TenantlessPass)`, against rows no tenant owns.
-- **A row-handler or dependents scope's context uses the run's connection.** If your hook opened the
+- **Tenanted work only runs as `Tenant`.** Each batch's dependents step gets its own scope,
+  run as the batch's tenant, and is resolved inside that work. No host code runs under
+  `System` against tenanted rows. Steps for tenantless entities run under
+  `System(TenantlessPass)`, against rows no tenant owns.
+- **A dependents scope's context uses the run's connection.** If your hook opened the
   scope's context, Cohort closes that connection and points the context at the run's, which
   your hook already isolated for the same tenant (or your own, for `ErasureTransaction.Caller`).
   Isolation you apply when a connection opens covers both.
@@ -182,7 +178,7 @@ transaction-pooling PgBouncer they would leak between clients, and Cohort's sess
 locks would not hold either. Npgsql resets session state when a connection returns to its
 pool.
 
-Each scope uses its own connection, except a batch's row-handler and dependents scope, which
+Each scope uses its own connection, except a batch's dependents scope, which
 uses the run's connection and transaction. The worker holds its coordination connection for the
 whole iteration and opens another for each pass, and the first readiness check can take one
 more in its own `System(Readiness)` scope. A pool of one connection hangs the worker; leave
@@ -190,37 +186,35 @@ headroom.
 
 ## Grants
 
-Each scope's role needs only the privileges of the operations it runs, on Cohort's five tables
+Each scope's role needs only the privileges of the operations it runs, on Cohort's four tables
 and on your retained tables:
 
 | Operation | Sent in | Needs on Cohort's tables |
 |---|---|---|
-| Sweeps, dry runs, and scheduled passes | `Tenant`, or `System(TenantlessPass)` | `SELECT`, `INSERT`, `UPDATE` on `sweep_run` and `sweep_run_entity_summary`; `SELECT`, `INSERT` on `sweep_run_row_detail`; `SELECT` on `retention_holds`; `INSERT` on `sweep_row_handler_status` with a row handler or dependents step |
+| Sweeps, dry runs, and scheduled passes | `Tenant`, or `System(TenantlessPass)` | `SELECT`, `INSERT`, `UPDATE` on `sweep_run` and `sweep_run_entity_summary`; `SELECT`, `INSERT` on `sweep_run_row_detail`; `SELECT` on `retention_holds` |
 | Erasures | `Tenant`, or `System(TenantlessPass)`; your own scope for `ErasureTransaction.Caller` | The same as sweeps |
 | Previews | `Tenant`, or `System(TenantlessPass)` | `SELECT` on `retention_holds` |
 | `IRetentionHoldsRepository` | Your scope | `SELECT`, `INSERT`, `UPDATE` on `retention_holds` |
 | `IRetentionDeletion` | Your scope | `SELECT` on `retention_holds` |
 | Readiness's own reads | `System(Readiness)` | `SELECT` on `retention_holds` |
-| Payload scrub | `System(RowDispatch)` | `SELECT`, `UPDATE` on `sweep_run_row_detail` |
-| Row-handler dispatch | `System(RowDispatch)` | `SELECT`, `UPDATE` on `sweep_run`, `sweep_run_row_detail`, and `sweep_row_handler_status` |
+| Abandoned-run recovery | `System(Recovery)` | `SELECT`, `UPDATE` on `sweep_run` |
 | The scheduled worker's lock, ledger, and tenant coverage check | `System(WorkerCoordination)` | `SELECT` on `sweep_run` |
-| History pruning | `System(HistoryPruning)` | Per retention set. Run retention: `SELECT`, `UPDATE`, `DELETE` on `sweep_run`; `SELECT`, `DELETE` on `sweep_run_row_detail` and `sweep_run_entity_summary`; `SELECT` on `sweep_row_handler_status`. Hold retention: `SELECT`, `UPDATE`, `DELETE` on `retention_holds` |
+| History pruning | `System(HistoryPruning)` | Per retention set. Run retention: `SELECT`, `UPDATE`, `DELETE` on `sweep_run`; `SELECT`, `DELETE` on `sweep_run_row_detail` and `sweep_run_entity_summary`. Hold retention: `SELECT`, `UPDATE`, `DELETE` on `retention_holds` |
 
 On your retained tables, the roles of sweeps, erasures, previews, holds, and `IRetentionDeletion`
 need `SELECT`; sweeps, erasures, and holds also need `UPDATE`, where they lock rows. Sweeps and
 erasures need `DELETE` where `Purge` is declared. `SELECT` on the child table of a foreign key
 that blocks a purge is optional: with it, a purge leaves out the rows that child still
-references, unless the entity has a dependents step; without it, a sweep or an erasure tries
+references, unless the entity has a dependents step registered as retiring them; without it, a sweep or an erasure tries
 the row and the constraint refuses the delete, and the row is counted as blocked (a sweep still
 succeeds and the next run tries it again; an erasure settles `PartiallyFailed` with
 `rows-blocked`, as it does with `SELECT`). A preview or a dry run counts such a row as due, not
-blocked. The worker needs only `SELECT` on each tenanted retained table. Readiness's own reads, the payload scrub, row-handler
-dispatch, and history pruning need nothing on your retained tables. Every role needs `USAGE` on
+blocked. The worker needs only `SELECT` on each tenanted retained table. Readiness's own reads,
+abandoned-run recovery, and history pruning need nothing on your retained tables. Every role needs `USAGE` on
 the schemas of the tables it touches. See [Startup Validation](/reference/startup-validation#statements) for the
 full list, including `EXECUTE` on the PostgreSQL functions Cohort calls, which PUBLIC holds by
-default. The identity columns behind `sweep_run_row_detail.Id` and
-`sweep_row_handler_status.Id` need no separate sequence grant; a serial column in their place
-needs `USAGE` on its sequence.
+default. The identity column behind `sweep_run_row_detail.Id` needs no separate sequence
+grant; a serial column in its place needs `USAGE` on its sequence.
 
 Readiness checks none of these grants ahead of time; its own read of `retention_holds` fails
 with `42501` like any other statement. PostgreSQL refuses a missing grant at the statement that

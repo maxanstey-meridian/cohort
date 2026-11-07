@@ -3,7 +3,6 @@ using System.Diagnostics;
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
-using Cohort.Infrastructure.Handlers;
 using Cohort.Sample.Entities;
 
 using Microsoft.EntityFrameworkCore;
@@ -98,132 +97,6 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
         using (var unscheduled = CreateHost(succeededRunRetention: "1.00:00:00", failedRunRetention: "1.00:00:00"))
         {
             (await PruneAsync(unscheduled)).Runs.Should().Be(2);
-        }
-        (await LoadRunIdsAsync()).Should().BeEmpty();
-    }
-
-    [Fact]
-    public async Task Prune_Keeps_A_Real_Run_Until_Its_Handler_Work_Has_Succeeded()
-    {
-        var tenantId = Guid.NewGuid();
-        await using (var db = Host.CreateDbContext())
-        {
-            db.Notes.Add(
-                new Note
-                {
-                    Id = Guid.NewGuid(),
-                    TenantId = tenantId,
-                    CreatedAt = Now.AddDays(-120),
-                    Body = "handled",
-                }
-            );
-            await db.SaveChangesAsync();
-        }
-
-        using var host = CreateHost(
-            succeededRunRetention: "90.00:00:00",
-            failedRunRetention: "90.00:00:00",
-            configureServices: services => services.AddRowHandler<Note, PruningNoteHandler>()
-        );
-        var sweep = await host.RunSweepAsync(
-            new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
-            Now
-        );
-        await BackdateSettledAtAsync(sweep.SweepId, Now.AddDays(-100));
-
-        (await PruneAsync(host)).Runs.Should().Be(0);
-        (await LoadRunIdsAsync()).Should().Contain(sweep.SweepId);
-        (await LoadHandlerStatesAsync(sweep.SweepId))
-            .Should()
-            .Equal(SweepRowHandlerDispatchState.Pending);
-
-        await host.RunWithServicesAsync(services =>
-            services.GetRequiredService<IRetentionRowDispatcher>().FlushAsync()
-        );
-        (await LoadHandlerStatesAsync(sweep.SweepId))
-            .Should()
-            .Equal(SweepRowHandlerDispatchState.Succeeded);
-
-        (await PruneAsync(host)).Runs.Should().Be(1);
-        (await LoadRunIdsAsync()).Should().NotContain(sweep.SweepId);
-        (await CountDependentRowsAsync(sweep.SweepId)).Should().Be(0);
-    }
-
-    [Theory]
-    [InlineData(nameof(SweepRowHandlerDispatchState.Pending))]
-    [InlineData(nameof(SweepRowHandlerDispatchState.InFlight))]
-    public async Task Prune_Never_Deletes_A_Run_With_Unfinished_Handler_Work(string unfinishedState)
-    {
-        var unfinished = Enum.Parse<SweepRowHandlerDispatchState>(unfinishedState);
-        var succeeded = await SeedRunAsync(SweepRunStatus.Succeeded, Now.AddDays(-400), unfinished);
-        var failed = await SeedRunAsync(SweepRunStatus.Failed, Now.AddDays(-400), unfinished);
-
-        using var host = CreateHost(succeededRunRetention: "1.00:00:00", failedRunRetention: "1.00:00:00");
-        (await PruneAsync(host)).Runs.Should().Be(0);
-
-        (await LoadRunIdsAsync()).Should().BeEquivalentTo([succeeded, failed]);
-        (await CountDependentRowsAsync(succeeded)).Should().Be(3);
-    }
-
-    [Fact]
-    public async Task Prune_Keeps_A_Succeeded_Run_With_DeadLettered_Handler_Work_For_The_Failed_Retention()
-    {
-        var deadLettered = await SeedRunAsync(
-            SweepRunStatus.Succeeded,
-            Now.AddDays(-100),
-            SweepRowHandlerDispatchState.DeadLettered
-        );
-        var handled = await SeedRunAsync(
-            SweepRunStatus.Succeeded,
-            Now.AddDays(-100),
-            SweepRowHandlerDispatchState.Succeeded
-        );
-
-        using (var host = CreateHost(succeededRunRetention: "90.00:00:00", failedRunRetention: "180.00:00:00"))
-        {
-            (await PruneAsync(host)).Runs.Should().Be(1);
-        }
-        (await LoadRunIdsAsync()).Should().BeEquivalentTo([deadLettered]);
-
-        using (var host = CreateHost(succeededRunRetention: "90.00:00:00", failedRunRetention: "90.00:00:00"))
-        {
-            (await PruneAsync(host)).Runs.Should().Be(1);
-        }
-        (await LoadRunIdsAsync()).Should().BeEmpty();
-        (await CountDependentRowsAsync(deadLettered)).Should().Be(0);
-        (await CountDependentRowsAsync(handled)).Should().Be(0);
-    }
-
-    [Fact]
-    public async Task Prune_Keeps_A_Run_Whose_Dead_Lettered_Work_Still_Has_Its_Snapshot()
-    {
-        // Dead-lettered work keeps its snapshot so it can be requeued; pruning the run would
-        // cascade to that row detail and lose the work before PayloadRetention ends.
-        var requeueable = await SeedRunAsync(
-            SweepRunStatus.Succeeded,
-            Now.AddDays(-100),
-            SweepRowHandlerDispatchState.DeadLettered,
-            capturedPayload: "{}"
-        );
-
-        using (var host = CreateHost(succeededRunRetention: "90.00:00:00", failedRunRetention: "90.00:00:00"))
-        {
-            (await PruneAsync(host)).Runs.Should().Be(0);
-        }
-        (await LoadRunIdsAsync()).Should().BeEquivalentTo([requeueable]);
-
-        // Once the payload-retention scrub clears the snapshot, the run is pruned as usual.
-        await using (var connection = new NpgsqlConnection(ConnectionString))
-        {
-            await connection.OpenAsync();
-            await using var command = connection.CreateCommand();
-            command.CommandText = """UPDATE "sweep_run_row_detail" SET "CapturedPayload" = NULL""";
-            await command.ExecuteNonQueryAsync();
-        }
-
-        using (var host = CreateHost(succeededRunRetention: "90.00:00:00", failedRunRetention: "90.00:00:00"))
-        {
-            (await PruneAsync(host)).Runs.Should().Be(1);
         }
         (await LoadRunIdsAsync()).Should().BeEmpty();
     }
@@ -406,7 +279,6 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
         string? failedRunRetention = null,
         string? inactiveHoldRetention = null,
         bool killSwitch = false,
-        Action<IServiceCollection>? configureServices = null,
         string? schedule = null
     )
     {
@@ -428,11 +300,7 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
             settings["Cohort:HistoryPruning:InactiveHoldRetention"] = inactiveHoldRetention;
         }
 
-        return new CohortTestHost(
-            ConnectionString,
-            configurationOverrides: settings,
-            configureServices: configureServices
-        );
+        return new CohortTestHost(ConnectionString, configurationOverrides: settings);
     }
 
     private static Task<RetentionHistoryPruneResult> PruneAsync(CohortTestHost host) =>
@@ -440,16 +308,11 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
             services.GetRequiredService<RetentionHistoryPruner>().PruneAsync()
         );
 
-    /// <summary>
-    /// Seeds a run with one entity summary and one row detail, plus a handler status in
-    /// <paramref name="handlerState"/> when given.
-    /// </summary>
+    /// <summary>Seeds a run with one entity summary and one row detail.</summary>
     private async Task<Guid> SeedRunAsync(
         SweepRunStatus status,
         DateTimeOffset? settledAt,
-        SweepRowHandlerDispatchState? handlerState = null,
         DateTimeOffset? startedAt = null,
-        string? capturedPayload = null,
         SweepTriggerKind trigger = SweepTriggerKind.Manual
     )
     {
@@ -471,21 +334,9 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
             VALUES (@sweepId, @startedAt, 'Cohort.Sample.Entities.Note', @entityId, 'short-lived', @tenantId, @strategy,
                     0, 30, 1, 0, 0, 0, 0, 0, 0);
 
-            WITH detail AS (
-                INSERT INTO "sweep_run_row_detail"
-                    ("SweepId", "At", "EntityType", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId", "CapturedPayload")
-                VALUES (@sweepId, @startedAt, 'Cohort.Sample.Entities.Note', @entityId, @recordId, 'short-lived', @strategy, @tenantId, @capturedPayload)
-                RETURNING "Id"
-            )
-            INSERT INTO "sweep_row_handler_status"
-                ("SweepRunRowDetailId", "HandlerType", "DispatchPhase", "State", "Attempt", "QueuedAt", "NextAttemptAt",
-                 "ClaimedAt", "ClaimToken", "CompletedAt")
-            SELECT detail."Id", 'pruning-test-handler', 0, @handlerState, 1, @startedAt, @startedAt,
-                   CASE WHEN @handlerState = @inFlight THEN @startedAt END,
-                   CASE WHEN @handlerState = @inFlight THEN gen_random_uuid() END,
-                   CASE WHEN @handlerState IN (@succeeded, @deadLettered) THEN @startedAt END
-            FROM detail
-            WHERE @handlerState IS NOT NULL;
+            INSERT INTO "sweep_run_row_detail"
+                ("SweepId", "At", "EntityType", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId")
+            VALUES (@sweepId, @startedAt, 'Cohort.Sample.Entities.Note', @entityId, @recordId, 'short-lived', @strategy, @tenantId);
             """;
         command.Parameters.AddWithValue("sweepId", sweepId);
         command.Parameters.AddWithValue("startedAt", started);
@@ -499,17 +350,6 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
         command.Parameters.AddWithValue("entityId", Note.RetentionIdentity);
         command.Parameters.AddWithValue("recordId", Guid.NewGuid().ToString());
         command.Parameters.AddWithValue("strategy", (int)Strategy.Purge);
-        command.Parameters.Add(new NpgsqlParameter("handlerState", NpgsqlTypes.NpgsqlDbType.Integer)
-        {
-            Value = handlerState is null ? DBNull.Value : (int)handlerState.Value,
-        });
-        command.Parameters.Add(new NpgsqlParameter("capturedPayload", NpgsqlTypes.NpgsqlDbType.Text)
-        {
-            Value = (object?)capturedPayload ?? DBNull.Value,
-        });
-        command.Parameters.AddWithValue("inFlight", (int)SweepRowHandlerDispatchState.InFlight);
-        command.Parameters.AddWithValue("succeeded", (int)SweepRowHandlerDispatchState.Succeeded);
-        command.Parameters.AddWithValue("deadLettered", (int)SweepRowHandlerDispatchState.DeadLettered);
         await command.ExecuteNonQueryAsync();
         return sweepId;
     }
@@ -547,21 +387,6 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
         return holdId;
     }
 
-    private async Task BackdateSettledAtAsync(Guid sweepId, DateTimeOffset settledAt)
-    {
-        await using var connection = new NpgsqlConnection(ConnectionString);
-        await connection.OpenAsync();
-        await using var command = connection.CreateCommand();
-        command.CommandText = """
-            UPDATE "sweep_run"
-            SET "StartedAt" = @settledAt - INTERVAL '1 minute', "SettledAt" = @settledAt, "Duration" = INTERVAL '1 minute'
-            WHERE "SweepId" = @sweepId
-            """;
-        command.Parameters.AddWithValue("sweepId", sweepId);
-        command.Parameters.AddWithValue("settledAt", settledAt);
-        (await command.ExecuteNonQueryAsync()).Should().Be(1);
-    }
-
     private async Task<List<Guid>> LoadRunIdsAsync() =>
         await QueryGuidsAsync("""SELECT "SweepId" FROM "sweep_run" """);
 
@@ -583,29 +408,7 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
         return ids;
     }
 
-    private async Task<List<SweepRowHandlerDispatchState>> LoadHandlerStatesAsync(Guid sweepId)
-    {
-        await using var connection = new NpgsqlConnection(ConnectionString);
-        await connection.OpenAsync();
-        await using var command = connection.CreateCommand();
-        command.CommandText = """
-            SELECT status."State"
-            FROM "sweep_row_handler_status" AS status
-            INNER JOIN "sweep_run_row_detail" AS detail ON detail."Id" = status."SweepRunRowDetailId"
-            WHERE detail."SweepId" = @sweepId
-            ORDER BY status."Id"
-            """;
-        command.Parameters.AddWithValue("sweepId", sweepId);
-        var states = new List<SweepRowHandlerDispatchState>();
-        await using var reader = await command.ExecuteReaderAsync();
-        while (await reader.ReadAsync())
-        {
-            states.Add((SweepRowHandlerDispatchState)reader.GetInt32(0));
-        }
-        return states;
-    }
-
-    /// <summary>Entity summaries, row details and handler statuses still referencing the run.</summary>
+    /// <summary>Entity summaries and row details still referencing the run.</summary>
     private async Task<long> CountDependentRowsAsync(Guid sweepId)
     {
         await using var connection = new NpgsqlConnection(ConnectionString);
@@ -615,15 +418,8 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
             SELECT
                 (SELECT count(*) FROM "sweep_run_entity_summary" WHERE "SweepId" = @sweepId)
                 + (SELECT count(*) FROM "sweep_run_row_detail" WHERE "SweepId" = @sweepId)
-                + (SELECT count(*)
-                   FROM "sweep_row_handler_status" AS status
-                   INNER JOIN "sweep_run_row_detail" AS detail ON detail."Id" = status."SweepRunRowDetailId"
-                   WHERE detail."SweepId" = @sweepId)
             """;
         command.Parameters.AddWithValue("sweepId", sweepId);
         return (long)(await command.ExecuteScalarAsync())!;
     }
 }
-
-[RowHandlerId("d6b29e21-05d6-49da-94d1-66f189929ce9")]
-file sealed class PruningNoteHandler : IRetentionHandler<Note>;

@@ -1,8 +1,9 @@
 namespace Cohort.Domain;
 
 /// <summary>
-/// What a dependents step knows about the run retiring its row: the same facts as
-/// <see cref="RetentionBeforeContext"/>, without a snapshot, because the step hands nothing on.
+/// What a dependents step knows about the run retiring its row: the run, the row's category,
+/// the strategy about to mutate it, the run's tenant, and the database time the batch stamps
+/// its rows with. A step that writes to an outbox can put these in its message.
 /// </summary>
 public sealed class RetentionDependentsContext
 {

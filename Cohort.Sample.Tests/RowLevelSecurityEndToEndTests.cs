@@ -4,7 +4,6 @@ using System.Data.Common;
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
-using Cohort.Infrastructure.Handlers;
 using Cohort.Infrastructure.Migrations;
 
 using Microsoft.EntityFrameworkCore;
@@ -19,7 +18,7 @@ namespace Cohort.Sample.Tests;
 
 // ─── End-to-end test (copied from PurgeSweepStrategyTests) ──────────────────
 //
-// Real PostgreSQL row-level security over a host table, a tenantless table and Cohort's five
+// Real PostgreSQL row-level security over a host table, a tenantless table and Cohort's four
 // tables, applied the way a host would: an EF connection interceptor reads whose work is
 // being done and sets the role and tenant when the connection opens. The host's
 // IRetentionExecutionScope sets it in an AsyncLocal around the work (a caller's own scope sets
@@ -40,8 +39,6 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
         new RetentionExecutionContext.System(RetentionSystemWork.WorkerCoordination);
     private static readonly RetentionExecutionContext TenantlessPass =
         new RetentionExecutionContext.System(RetentionSystemWork.TenantlessPass);
-    private static readonly RetentionExecutionContext RowDispatch =
-        new RetentionExecutionContext.System(RetentionSystemWork.RowDispatch);
     private static readonly RetentionExecutionContext HistoryPruning =
         new RetentionExecutionContext.System(RetentionSystemWork.HistoryPruning);
     private static readonly RetentionExecutionContext Readiness =
@@ -282,25 +279,27 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
         (await LoadRunsAsync(database.ConnectionString)).Should().BeEquivalentTo([
             new RunRow(tenantA, SweepRunStatus.Succeeded),
         ]);
-        // The caller's scope carries its own tenant: without handlers, Cohort never ran its work
-        // through the hook.
+        // The caller's scope carries its own tenant: without a dependents step, Cohort never ran
+        // its work through the hook.
         entries.Ran.Should().NotContain(context => context is RetentionExecutionContext.Tenant);
     }
 
     [Fact]
-    public async Task Caller_Transaction_Erasure_Runs_Each_Handled_Batch_Through_The_Hook_On_The_Callers_Connection()
+    public async Task Caller_Transaction_Erasure_Runs_Each_Step_Batch_Through_The_Hook_On_The_Callers_Connection()
     {
         await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
         var tenantA = Guid.NewGuid();
         var subject = Guid.NewGuid();
-        await CreateSchemaWithPoliciesAsync(database.ConnectionString);
+        // The model has a tenantless entity, so the step's hold guard needs the batch's scope to
+        // see tenantless holds.
+        await CreateSchemaWithPoliciesAsync(database.ConnectionString, tenantsReadTenantlessHolds: true);
         await SeedAsync(
             database.ConnectionString,
             [Note(tenantA, "a-subject", AsOf.AddDays(-1), subject), Note(tenantA, "a-other", AsOf.AddDays(-1))],
             []
         );
         var entries = new EntryLog();
-        var observations = new HandlerObservations();
+        var observations = new StepObservations();
         using var host = BuildHost(
             database.ConnectionString,
             services =>
@@ -308,7 +307,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
                 services.AddSingleton(entries);
                 services.AddSingleton(observations);
                 services.AddScoped<IRetentionExecutionScope, FlowExecutionScope>();
-                services.AddRowHandler<RlsNote, SessionObservingNoteHandler>();
+                services.AddRetentionDependents<RlsNote, SessionObservingNoteStep>(retiresReferencingRows: false);
             }
         );
 
@@ -331,79 +330,63 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             result.Counts.Should().ContainSingle(count => count.EntityType == typeof(RlsNote)).Which.Affected.Should().Be(1);
         }
 
-        // One handled batch, run through the hook as the request's tenant, and the handler's
-        // own context read inside the caller's transaction, under its role and tenant.
+        // One step batch, run through the hook as the request's tenant, and the step's own
+        // context read inside the caller's transaction, under its role and tenant.
         entries.Ran.Where(context => context is RetentionExecutionContext.Tenant)
             .Should()
             .Equal(new RetentionExecutionContext.Tenant(tenantA));
         observations.Seen.Should().Equal(
-            new SessionObservation("before:a-subject", tenantA.ToString(), TenantRole, "caller-request")
+            new SessionObservation("step:a-subject", tenantA.ToString(), TenantRole, "caller-request")
         );
         (await LoadNoteBodiesAsync(database.ConnectionString)).Should().Equal("a-other");
     }
 
     [Fact]
-    public async Task Row_Handler_Delivery_Runs_As_The_Rows_Tenant()
+    public async Task A_Failing_Steps_Row_Detail_Is_Written_As_The_Rows_Tenant()
     {
         // Also settles the grants: the tenant role has table privileges only, with no grant on
-        // the identity sequences behind sweep_run_row_detail.Id and sweep_row_handler_status.Id,
-        // and its passes still write both.
+        // the identity sequence behind sweep_run_row_detail.Id, and a skipped row's detail is
+        // still written, under the row-detail policy. A superuser's write would pass the policy
+        // too, so the table records who wrote each row.
         await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
         var tenantA = Guid.NewGuid();
         var tenantB = Guid.NewGuid();
-        await CreateSchemaWithPoliciesAsync(database.ConnectionString);
-        await SeedAsync(
-            database.ConnectionString,
-            [Note(tenantA, "a-expired"), Note(tenantB, "b-expired")],
-            [Log("log-expired")]
-        );
-        var entries = new EntryLog();
-        var observations = new HandlerObservations();
+        await CreateSchemaWithPoliciesAsync(database.ConnectionString, tenantsReadTenantlessHolds: true);
+        await using (var owner = CreateOwnerContext(database.ConnectionString))
+        {
+            await owner.Database.ExecuteSqlRawAsync(
+                """ALTER TABLE public.sweep_run_row_detail ADD COLUMN "WrittenBy" text DEFAULT current_user"""
+            );
+        }
+
+        await SeedAsync(database.ConnectionString, [Note(tenantA, "a-expired"), Note(tenantB, "b-expired")], []);
         using var host = BuildHost(
             database.ConnectionString,
             services =>
             {
-                services.AddSingleton(entries);
-                services.AddSingleton(observations);
+                services.AddSingleton(new EntryLog());
                 services.AddScoped<IRetentionExecutionScope, FlowExecutionScope>();
-                services.AddRowHandler<RlsNote, SessionObservingNoteHandler>();
-                services.AddRowHandler<RlsLog, SessionObservingLogHandler>();
+                services.AddRetentionDependents<RlsNote, FailingNoteStep>(retiresReferencingRows: false);
             }
         );
         var sweep = host.Services.GetRequiredService<IRetentionSweep>();
-        await sweep.ExecuteAsync(RetentionSweepRequest.Tenanted(Tenant(tenantA), AsOf));
-        await sweep.ExecuteAsync(RetentionSweepRequest.Tenanted(Tenant(tenantB), AsOf));
-        await sweep.ExecuteAsync(RetentionSweepRequest.Tenantless(AsOf));
-        entries.Clear();
 
-        var flush = await host.Services.GetRequiredService<IRetentionRowDispatcher>().FlushAsync();
+        var resultA = await sweep.ExecuteAsync(RetentionSweepRequest.Tenanted(Tenant(tenantA), AsOf));
+        var resultB = await sweep.ExecuteAsync(RetentionSweepRequest.Tenanted(Tenant(tenantB), AsOf));
 
-        flush.Settled.Should().BeTrue();
-        (await LoadHandlerStatesAsync(database.ConnectionString)).Should().BeEquivalentTo([
-            (tenantA, SweepRowHandlerDispatchState.Succeeded),
-            (tenantB, SweepRowHandlerDispatchState.Succeeded),
-            (Guid.Empty, SweepRowHandlerDispatchState.Succeeded),
-        ]);
-        var owner = await LoadSuperuserNameAsync(database.ConnectionString);
-        observations.Seen.Should().BeEquivalentTo([
-            new SessionObservation("before:a-expired", tenantA.ToString(), TenantRole),
-            new SessionObservation("before:b-expired", tenantB.ToString(), TenantRole),
-            new SessionObservation("before:log-expired", "", owner),
-            new SessionObservation("after:a-expired", tenantA.ToString(), TenantRole),
-            new SessionObservation("after:b-expired", tenantB.ToString(), TenantRole),
-            new SessionObservation("after:log-expired", "", owner),
-        ]);
-        entries.Ran.Where(context => context is RetentionExecutionContext.Tenant || context == TenantlessPass)
-            .Should()
-            .BeEquivalentTo(
-                [
-                    new RetentionExecutionContext.Tenant(tenantA),
-                    new RetentionExecutionContext.Tenant(tenantB),
-                    TenantlessPass,
-                ],
-                options => options.ComparingRecordsByValue()
-            );
-        entries.Ran.Should().Contain(RowDispatch);
+        foreach (var result in new[] { resultA, resultB })
+        {
+            result.Counts.Should().ContainSingle(count => count.EntityType == typeof(RlsNote))
+                .Which.SkippedCount.Should().Be(1);
+        }
+
+        var failures = await LoadRowFailuresAsync(database.ConnectionString);
+        failures.Select(failure => (failure.TenantId, failure.WrittenBy))
+            .Should().BeEquivalentTo([(tenantA, TenantRole), (tenantB, TenantRole)]);
+        failures.Should().OnlyContain(failure =>
+            failure.Failure != null
+            && failure.Failure.StartsWith("type=System.InvalidOperationException;", StringComparison.Ordinal));
+        (await LoadNoteBodiesAsync(database.ConnectionString)).Should().Equal("a-expired", "b-expired");
     }
 
     // The step runs as the batch's tenant on the run's connection: its unfiltered update reaches
@@ -425,7 +408,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             [log]
         );
         await SeedTenantlessHoldAsync(database.ConnectionString, log.Id);
-        var observations = new HandlerObservations();
+        var observations = new StepObservations();
         using var host = BuildHost(
             database.ConnectionString,
             services =>
@@ -759,7 +742,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
 
             GRANT SELECT, INSERT, UPDATE, DELETE ON
                 public.rls_notes, public.rls_logs, public.retention_holds, public.sweep_run,
-                public.sweep_run_entity_summary, public.sweep_run_row_detail, public.sweep_row_handler_status
+                public.sweep_run_entity_summary, public.sweep_run_row_detail
             TO {{TenantRole}};
 
             ALTER TABLE public.rls_notes ENABLE ROW LEVEL SECURITY;
@@ -774,8 +757,6 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             ALTER TABLE public.sweep_run_entity_summary FORCE ROW LEVEL SECURITY;
             ALTER TABLE public.sweep_run_row_detail ENABLE ROW LEVEL SECURITY;
             ALTER TABLE public.sweep_run_row_detail FORCE ROW LEVEL SECURITY;
-            ALTER TABLE public.sweep_row_handler_status ENABLE ROW LEVEL SECURITY;
-            ALTER TABLE public.sweep_row_handler_status FORCE ROW LEVEL SECURITY;
 
             -- rls_logs has no tenant column: shared data every tenant may use, invisible to a
             -- scope working for no one.
@@ -793,12 +774,6 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
                 USING ("TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
             CREATE POLICY tenant_isolation ON public.sweep_run_row_detail
                 USING ("TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
-            CREATE POLICY tenant_isolation ON public.sweep_row_handler_status
-                USING (EXISTS (
-                    SELECT 1 FROM public.sweep_run_row_detail detail
-                    WHERE detail."Id" = sweep_row_handler_status."SweepRunRowDetailId"
-                      AND detail."TenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid
-                ));
             """
         );
         if (!tenantsReadTenantlessHolds)
@@ -896,38 +871,30 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
         return runs;
     }
 
-    private static async Task<List<(Guid TenantId, SweepRowHandlerDispatchState State)>> LoadHandlerStatesAsync(
-        string connectionString
-    )
+    /// <summary>Every row detail, read as the superuser, with the role that wrote it.</summary>
+    private static async Task<List<RowFailure>> LoadRowFailuresAsync(string connectionString)
     {
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
-        command.CommandText = """
-            SELECT detail."TenantId", status."State"
-            FROM "sweep_row_handler_status" status
-            JOIN "sweep_run_row_detail" detail ON detail."Id" = status."SweepRunRowDetailId"
-            """;
-        var states = new List<(Guid, SweepRowHandlerDispatchState)>();
+        command.CommandText = """SELECT "TenantId", "Failure", "WrittenBy" FROM "sweep_run_row_detail" """;
+        var failures = new List<RowFailure>();
         await using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
         {
-            states.Add((reader.GetGuid(0), (SweepRowHandlerDispatchState)reader.GetInt32(1)));
+            failures.Add(new RowFailure(
+                reader.GetGuid(0),
+                reader.IsDBNull(1) ? null : reader.GetString(1),
+                reader.GetString(2)
+            ));
         }
 
-        return states;
-    }
-
-    private static async Task<string> LoadSuperuserNameAsync(string connectionString)
-    {
-        await using var connection = new NpgsqlConnection(connectionString);
-        await connection.OpenAsync();
-        await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT current_user";
-        return (string)(await command.ExecuteScalarAsync())!;
+        return failures;
     }
 
     private sealed record RunRow(Guid TenantId, SweepRunStatus Status);
+
+    private sealed record RowFailure(Guid TenantId, string? Failure, string WrittenBy);
 
     private sealed record SessionObservation(string Label, string TenantSetting, string CurrentUser, string Request = "");
 
@@ -942,7 +909,7 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
         public void Clear() => ran.Clear();
     }
 
-    private sealed class HandlerObservations
+    private sealed class StepObservations
     {
         private readonly ConcurrentQueue<SessionObservation> seen = new();
 
@@ -1051,36 +1018,20 @@ public sealed class RowLevelSecurityEndToEndTests(PostgresFixture fixture)
             );
     }
 
-    [RowHandlerId("89766ecd-99b6-4622-822a-f0fe32322b8c")]
-    private sealed class SessionObservingNoteHandler(RlsDbContext db, HandlerObservations observations)
-        : IRetentionHandler<RlsNote>
+    private sealed class SessionObservingNoteStep(RlsDbContext db, StepObservations observations)
+        : IRetentionDependents<RlsNote>
     {
-        public async Task OnBeforeAsync(RlsNote row, RetentionBeforeContext ctx, CancellationToken ct)
-        {
-            ctx.Snapshot["body"] = row.Body;
-            observations.Add(await ObserveAsync(db, $"before:{row.Body}", ct));
-        }
-
-        public async Task OnAfterAsync(RetentionAfterContext<RlsNote> ctx, CancellationToken ct) =>
-            observations.Add(await ObserveAsync(db, $"after:{ctx.Snapshot["body"]}", ct));
+        public async Task RetireAsync(RlsNote row, RetentionDependentsContext ctx, CancellationToken ct) =>
+            observations.Add(await ObserveAsync(db, $"step:{row.Body}", ct));
     }
 
-    [RowHandlerId("95b8bc24-1b3e-439d-bb03-337c5e82a8cc")]
-    private sealed class SessionObservingLogHandler(RlsDbContext db, HandlerObservations observations)
-        : IRetentionHandler<RlsLog>
+    private sealed class FailingNoteStep : IRetentionDependents<RlsNote>
     {
-        public async Task OnBeforeAsync(RlsLog row, RetentionBeforeContext ctx, CancellationToken ct)
-        {
-            ctx.Snapshot["payload"] = row.Payload;
-            observations.Add(await ObserveAsync(db, $"before:{row.Payload}", ct));
-        }
-
-        public async Task OnAfterAsync(RetentionAfterContext<RlsLog> ctx, CancellationToken ct) =>
-            observations.Add(await ObserveAsync(db, $"after:{ctx.Snapshot["payload"]}", ct));
+        public Task RetireAsync(RlsNote row, RetentionDependentsContext ctx, CancellationToken ct) =>
+            throw new InvalidOperationException("The step refused the row.");
     }
 
-    [RowHandlerId("98773716-3620-4e82-841b-5c08b95dd0be")]
-    private sealed class TouchingNoteStep(RlsDbContext db, HandlerObservations observations) : IRetentionDependents<RlsNote>
+    private sealed class TouchingNoteStep(RlsDbContext db, StepObservations observations) : IRetentionDependents<RlsNote>
     {
         public async Task RetireAsync(RlsNote row, RetentionDependentsContext ctx, CancellationToken ct)
         {

@@ -349,7 +349,7 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
                 services.AddSingleton<ILoggerProvider>(logs);
                 if (rowByRow)
                 {
-                    services.AddRowHandler<ARestrictiveParent, ParentCaptureHandler>();
+                    services.AddRetentionDependents<ARestrictiveParent, ParentMarkerStep>(retiresReferencingRows: false);
                 }
             }
         );
@@ -362,6 +362,7 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
         await ExecuteAsync(
             database.ConnectionString,
             $"""
+            CREATE TABLE {ParentMarkerStep.Table} ("RecordId" text NOT NULL);
             CREATE FUNCTION guard_parent() RETURNS trigger LANGUAGE plpgsql AS $$
             BEGIN
                 IF OLD."Id" = '{blockedId}' THEN
@@ -384,8 +385,8 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
         (await LoadSummaryAsync(database.ConnectionString, result.SweepId, typeof(ARestrictiveParent)))
             .Should().Be(new SummaryCounts(Affected: 2, Deferred: 0, Blocked: 1));
         (await LoadParentIdsAsync(services)).Should().Equal(blockedId);
-        // The row the constraint refused was never mutated, so no OnAfter work is queued for it.
-        (await LoadHandlerRecordIdsAsync(database.ConnectionString, result.SweepId))
+        // The step ran for every row, but the refused row's marker rolled back with its savepoint.
+        (await LoadStepMarkersAsync(database.ConnectionString))
             .Should().BeEquivalentTo(rowByRow ? [ids[0].ToString(), ids[2].ToString()] : Array.Empty<string>());
         // The warning names the constraint, never the row.
         logs.Entries.Should().Contain(entry =>
@@ -913,20 +914,14 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
         return new SummaryCounts(reader.GetInt64(0), reader.GetInt64(1), reader.GetInt64(2));
     }
 
-    private static async Task<List<string>> LoadHandlerRecordIdsAsync(string connectionString, Guid sweepId)
+    private static async Task<List<string>> LoadStepMarkersAsync(string connectionString)
     {
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync();
         await using var command = new NpgsqlCommand(
-            """
-            SELECT detail."RecordId"
-            FROM "sweep_row_handler_status" AS status
-            INNER JOIN "sweep_run_row_detail" AS detail ON detail."Id" = status."SweepRunRowDetailId"
-            WHERE detail."SweepId" = @sweepId
-            """,
+            $"SELECT \"RecordId\" FROM {ParentMarkerStep.Table}",
             connection
         );
-        command.Parameters.AddWithValue("sweepId", sweepId);
         var recordIds = new List<string>();
         await using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
@@ -979,14 +974,19 @@ public sealed class RestrictiveForeignKeySweepEndToEndTests(PostgresFixture fixt
         }
     }
 
-    [RowHandlerId("64c313a9-a25a-4f7d-bb7c-aea7112c1edc")]
-    private sealed class ParentCaptureHandler : IRetentionHandler<ARestrictiveParent>
+    /// <summary>
+    /// Writes one marker row, through its own context, for each parent it runs for: a write that
+    /// commits or rolls back with that row's mutation. It retires nothing that references a parent.
+    /// </summary>
+    private sealed class ParentMarkerStep(RestrictiveForeignKeyDbContext db) : IRetentionDependents<ARestrictiveParent>
     {
-        public Task OnBeforeAsync(ARestrictiveParent row, RetentionBeforeContext ctx, CancellationToken ct)
-        {
-            ctx.Snapshot["id"] = row.Id.ToString();
-            return Task.CompletedTask;
-        }
+        internal const string Table = "restrictive_fk_step_markers";
+
+        public async Task RetireAsync(ARestrictiveParent row, RetentionDependentsContext ctx, CancellationToken ct) =>
+            await db.Database.ExecuteSqlAsync(
+                $"INSERT INTO restrictive_fk_step_markers (\"RecordId\") VALUES ({row.Id.ToString()})",
+                ct
+            );
     }
 
     private sealed record LoggedCommand(string Text, int ArrayElements);

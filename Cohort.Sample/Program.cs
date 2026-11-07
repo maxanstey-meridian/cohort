@@ -11,8 +11,8 @@ using Microsoft.Extensions.Logging;
 
 var builder = Host.CreateApplicationBuilder(args);
 builder.Services.AddSampleRetentionServices();
-// Dogfoods durable after-commit delivery: the sweep queues one OnAfterAsync per deleted note.
-builder.Services.AddRowHandler<Note, NoteSweptLogger>();
+// Dogfoods after-commit work through the host's outbox: each retired note's step writes a message in the run's transaction.
+builder.Services.AddRetentionDependents<Note, NoteOutboxStep>(retiresReferencingRows: false);
 
 var host = builder.Build();
 
@@ -81,8 +81,8 @@ try
     var demoNoteRemoved = !await db.Notes.AnyAsync(note => note.Id == demoNoteId);
     logger.LogInformation("Sweep removed the expired demo note: {Removed}", demoNoteRemoved);
 
-    var flush = await scope.ServiceProvider.GetRequiredService<IRetentionRowDispatcher>().FlushAsync();
-    logger.LogInformation("Row handlers settled: {Settled}", flush.Settled);
+    await scope.ServiceProvider.GetRequiredService<IRetentionRunRecovery>().RecoverAsync();
+    logger.LogInformation("Abandoned runs recovered.");
 }
 finally
 {

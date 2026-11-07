@@ -120,7 +120,7 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
     }
 
     [Fact]
-    public async Task Handler_Aware_Purge_Converts_Record_Id_Before_Postgres_Canonicalization()
+    public async Task Row_By_Row_Purge_Converts_Record_Id_Before_Postgres_Canonicalization()
     {
         await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
         var recordId = new ConvertedRecordId(1234.50m);
@@ -148,6 +148,7 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
 
         result.EntityFailures.Should().BeEmpty();
         result.Counts.Should().ContainSingle().Which.Affected.Should().Be(1);
+        services.GetRequiredService<StepRuns>().Count.Should().Be(1, "the sweep took the row-by-row path");
         await using var verify = new NpgsqlConnection(database.ConnectionString);
         await verify.OpenAsync();
         await using var command = verify.CreateCommand();
@@ -351,8 +352,7 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
 
     private static ServiceProvider BuildServiceProvider(
         string connectionString,
-        Strategy strategy = Strategy.Anonymise,
-        bool registerHandler = true
+        Strategy strategy = Strategy.Anonymise
     )
     {
         var services = new ServiceCollection();
@@ -366,10 +366,9 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
         services.AddSingleton<IRetentionRuleProvider>(new CategoryRepository(strategy));
         services.AddSingleton(RetentionExecutionScope.Unisolated);
         services.AddCohort<CanonicalRecordIdDbContext>();
-        if (registerHandler)
-        {
-            services.AddRowHandler<CanonicalRecordIdRecord, CanonicalRecordIdHandler>();
-        }
+        // A dependents step puts the entity on the row-by-row path.
+        services.AddSingleton<StepRuns>();
+        services.AddRetentionDependents<CanonicalRecordIdRecord, CanonicalRecordIdStep>(retiresReferencingRows: false);
 
         return services.BuildServiceProvider(validateScopes: true);
     }
@@ -407,8 +406,25 @@ public sealed class CanonicalRecordIdSqlBoundaryEndToEndTests(PostgresFixture fi
         }
     }
 
-    [RowHandlerId("8c862b29-2d3a-4f4c-91ac-9d0d87373b92")]
-    private sealed class CanonicalRecordIdHandler : IRetentionHandler<CanonicalRecordIdRecord>;
+    private sealed class CanonicalRecordIdStep(StepRuns runs) : IRetentionDependents<CanonicalRecordIdRecord>
+    {
+        public Task RetireAsync(CanonicalRecordIdRecord row, RetentionDependentsContext ctx, CancellationToken ct)
+        {
+            runs.Record();
+            return Task.CompletedTask;
+        }
+    }
+
+    // Counts the rows the step ran for. A step runs only on the row-by-row path, so a count
+    // shows the test took it.
+    private sealed class StepRuns
+    {
+        private int count;
+
+        public int Count => Volatile.Read(ref count);
+
+        public void Record() => Interlocked.Increment(ref count);
+    }
 
     [Retain("canonical-record-id", nameof(CreatedAt), AuditRowDetail = AuditRowDetail.PerRow)]
     [RetentionEntityId("00000000-0000-0000-0004-000000000001")]

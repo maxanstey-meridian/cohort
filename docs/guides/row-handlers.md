@@ -1,114 +1,18 @@
-# Row Handlers
+# Dependents and After-Commit Work
 
-Deleting a row is often only half the job. There's a blob in storage, a search index entry,
-or a downstream system that needs to hear about it. Row handlers let you hook into each
-row Cohort mutates.
-
-## Writing a handler
-
-```csharp
-[RowHandlerId("0b6f5e43-3d0e-4c2b-9a51-6f7f2a8c1e90")]
-public sealed class DeleteAttachmentBlob(BlobContainerClient blobs) : IRetentionHandler<Attachment>
-{
-    public Task OnBeforeAsync(Attachment row, RetentionBeforeContext ctx, CancellationToken ct)
-    {
-        ctx.Snapshot["BlobName"] = row.BlobName;
-        return Task.CompletedTask;
-    }
-
-    public async Task OnAfterAsync(RetentionAfterContext<Attachment> ctx, CancellationToken ct)
-    {
-        var blobName = (string)ctx.Snapshot["BlobName"]!;
-        await blobs.DeleteBlobIfExistsAsync(blobName, cancellationToken: ct);
-    }
-}
-```
-
-```csharp
-builder.Services.AddRowHandler<Attachment, DeleteAttachmentBlob>();
-```
-
-`AddRowHandler` is the only way to register a handler. Cohort constructs it from each batch's
-DI scope, so it can't be a singleton, transient, an instance, a factory, keyed or an open
-generic. Startup refuses an `IRetentionHandler<T>` service in any other shape, including a
-singleton or instance you registered before calling `AddRowHandler` (which makes its own
-registration a no-op), or one registered twice, and names the handler type. On a host that
-was never started, every Cohort operation refuses it instead.
-
-Cohort supports handlers registered through `IServiceCollection` only. These checks read
-the service collection, so a handler registered straight into a third-party container's own
-builder (Autofac's `ContainerBuilder`, say) is out of their reach. For an entity that has no
-`AddRowHandler` registration, it would never run while its rows are swept or erased.
-Register handlers with `AddRowHandler`, even when a third-party container builds the
-provider.
-
-Both methods are optional. The interface supplies no-op defaults.
-
-- **`OnBeforeAsync`** runs in a read-only savepoint inside the sweep transaction, before the
-  row is mutated. Use it to capture what you'll need later into `ctx.Snapshot`. Handlers are
-  resolved from a DI scope Cohort creates for each batch, run as the batch's tenant, and the
-  `DbContext` they inject there is on the sweep's own connection and transaction. Their
-  reads see the row as it's about to be mutated, along with any related rows, inside your
-  transaction in a [caller-transaction erasure](/guides/erasure#erasing-inside-your-own-transaction).
-  A write through that context fails the handler (`sqlstate:25006`), and so does any
-  database error, without harming the rest of the batch: the savepoint is always rolled
-  back. So does returning with unsaved changes on that context (an `Add`, a changed entity
-  or key, or a navigation change never saved, recorded as `reason=on-before-unsaved-changes`).
-  Cohort checks with an explicit `DetectChanges`, so a context with automatic change
-  detection turned off is checked too. Whatever a handler leaves tracked, a failed
-  `SaveChanges` included, is discarded after each row. The context that runs the sweep, your
-  own in a caller-transaction erasure, is never given to a handler, so nothing a handler
-  tracks reaches it. The handler's other scoped services come from that scope too: they're
-  fresh instances, not the ones in the scope that started the run, so per-request state such
-  as a scoped "current user" isn't there. State your
-  [execution scope](/guides/tenant-isolation) sets up, or an `AsyncLocal` flow, still is. A
-  cancellation the handler raises itself, such as an `HttpClient` timeout, is a failure like
-  any other; only the run's own token stops the run. Writes that must commit with the row,
-  such as deleting or blanking what depends on it, belong in a
-  [dependents step](#retiring-a-rows-dependents), which runs after every `OnBeforeAsync`.
-  External side effects still belong in `OnAfterAsync`: they survive a rollback,
-  they run while the batch holds its row locks, and they can run for a row that's then
-  withheld, for example by a hold created mid-sweep or a constraint that refuses the change.
-  A write to the row being swept through another connection waits on the sweep's own row
-  lock. If the handler throws, the row is left unmutated, the work is dead-lettered, and the
-  row counts in `SkippedCount`. A run that
-  skipped rows settles `PartiallyFailed`, with a
-  `reason=rows-skipped;entityType=…;count=n` line in `EntityFailures` and the run's `Error`.
-  The next run tries the row again.
-- **`OnAfterAsync`** runs after commit, from a durable queue, with the snapshot you captured.
-  This is where side effects belong.
-
-Every handler carries `[RowHandlerId("uuid")]`, a permanent UUID that its queued work is
-persisted and delivered under. `AddRowHandler` refuses a handler without one, with a malformed
-one, or with one another handler class already uses, whatever its entity (a requeue by handler
-id would otherwise reach both). Renaming or moving the class is safe; changing the id isn't.
-Work queued under an id no registered handler carries is dead-lettered with
-`handler id … is not registered; re-register it and requeue`, and work for an entity whose
-`[RetentionEntityId]` the model no longer declares with
-`entity id … is not registered; restore its [RetentionEntityId] and requeue`. Either keeps its
-snapshot, so once the handler or the id is back, [requeue it](#requeuing-dead-lettered-work).
-
-Upgrading from 0.10, a handler that passed `identity` to `AddRowHandler` keeps its queued work
-by carrying the same UUID in `[RowHandlerId]`. A class registered for several entities with a
-different `identity` each now carries one id, so the other identities' work dead-letters as
-unregistered: split it into one class per entity, each with its old UUID, or re-key the other
-identities' rows to the class's id (the `UPDATE` in the 0.11.0 changelog entry). Two classes
-that shared one `identity` on different entities can't share it now: give one a new id and
-move only its entity's work (the entity-scoped `UPDATE` in the same entry). Work queued
-under a type name, by a handler registered without `identity`, must be drained on 0.10 or
-re-keyed the same way.
-
-When an entity has several handlers, they run in `[RowHandlerPriority(n)]` order, lowest
-first. Handlers without the attribute run last, ordered by type name.
+Retiring a row is often only half the job. There are child rows a foreign key ties to it,
+copies of its values in an audit table, a blob in storage, or a downstream system that needs to
+hear about it. An entity's dependents step handles all of them, in the row's own transaction:
+it retires what lives in your database directly, and for anything outside it, writes a message
+to your own outbox, which commits with the row and is delivered after the commit.
 
 ## Retiring a row's dependents {#retiring-a-rows-dependents}
 
 Some rows have dependents that must go with them, in the same transaction: child rows a
-foreign key ties to the row, or copies of its values in an audit table. `OnBeforeAsync` is
-read-only and `OnAfterAsync` runs after commit, so neither can do it. A dependents step can.
+foreign key ties to the row, or copies of its values in an audit table. A dependents step
+retires them.
 
 ```csharp
-[RowHandlerId("6c0e2b9a-41f7-4c3e-8d25-0b7a9f1e6d34")]
 public sealed class RetireCaseDependents(AppDbContext db) : IRetentionDependents<Case>
 {
     public async Task RetireAsync(Case row, RetentionDependentsContext ctx, CancellationToken ct)
@@ -125,46 +29,60 @@ public sealed class RetireCaseDependents(AppDbContext db) : IRetentionDependents
 builder.Services.AddRetentionDependents<Case, RetireCaseDependents>();
 ```
 
+`ctx` carries the run's `SweepId`, the row's `Category`, the `Strategy` about to change the
+row, the run's `TenantId`, and `At`, the database time the batch stamps its rows with.
+
 - **One step per entity.** `AddRetentionDependents` refuses a second class for an entity, so
   compose several kinds of dependents in one class. It's the only way to register a step:
-  startup refuses an `IRetentionDependents<T>` service in any other shape, as it does a row
-  handler's. The class carries a `[RowHandlerId]`, in the same id space as row handlers: no
-  other handler or step class may use its id, though one class keeps its one id as a row
-  handler and as a step, for every entity.
-- **Order.** For each row: every `OnBeforeAsync` captures first, so captures see the database
-  before anything is retired; then the step; then Cohort's own change to the row. The step
-  runs read-write on the batch scope's `DbContext`, the one handlers get, on the run's
-  connection and transaction and as the batch's tenant. Write only through that injected
-  context, never another context or connection: those write outside the batch's transaction,
-  so their writes commit even when the row is blocked or skipped, the hold check can't see
-  them, and a delete of a row that references the swept row waits forever on the sweep's own
-  lock on it. An entity with a step is always changed row by row, never in one bulk statement.
+  startup refuses an `IRetentionDependents<T>` service in any other shape (a singleton,
+  transient, instance, factory, keyed or open-generic service, one registered twice, or one
+  whose registration was removed or replaced after `AddRetentionDependents` added it), and
+  names the step. These checks read the `IServiceCollection`, so register steps with
+  `AddRetentionDependents` even when a third-party container builds the provider. Calling it
+  again for the same entity and step with a different `retiresReferencingRows` throws.
+- **Order.** For each row the step runs first, then Cohort's own change to the row. The step
+  is resolved from a DI scope Cohort creates for each batch, run as the batch's tenant, and runs
+  read-write on that scope's `DbContext`, on the run's connection and transaction. Its other
+  scoped services come from that scope too: they're fresh instances, not the ones in the scope
+  that started the run, so per-request state such as a scoped "current user" isn't there.
+  State your [execution scope](/guides/tenant-isolation) sets up, or an `AsyncLocal` flow,
+  still is. Write only through the injected context, never another context or connection:
+  those write outside the batch's transaction, so their writes commit even when the row is
+  blocked or skipped, the hold check can't see them, and a delete of a row that references the
+  swept row waits forever on the sweep's own lock on it. Whatever the step leaves tracked is
+  discarded after each row. An entity with a step is always changed row by row, never in one
+  bulk statement.
 - **One savepoint.** The step and the row's change share a savepoint. If a constraint then
   refuses the change, for example because the row is still referenced, the rollback undoes
   the step too and the row counts as blocked (`BlockedCount`), so dependents never go without
   their row. The next run tries the row, and its step, again.
 - **Failures skip the row.** Its writes are rolled back, and the row counts in `SkippedCount`
-  (`rows-skipped`, so the run settles `PartiallyFailed`), with a row detail and a dead-lettered
-  status under the step's id whose `LastError` says why. The step fails when it throws,
-  including a database error or a constraint its own statements hit; when it returns with
-  unsaved changes on its context (`reason=dependents-unsaved-changes`); when it changes a held
-  row (`reason=dependents-changed-held-row`, below); or when it takes its own row out of the
-  run's scope, so Cohort's change finds nothing (`reason=dependents-changed-row`). Only the
-  run's own token stops the run. A step queues no work, so there is nothing to requeue: the
-  next run tries the row again.
-- **Holds.** Any change to, or removal of, a row under an active hold fails the step, whatever
-  the row's entity, even if the step ends the hold first. A row is under a hold when the hold
-  names it or covers it through a [hold relation](/guides/legal-holds#holding-related-rows), so
-  updating a held Case's upload fails the step. An `UPDATE` that writes the same
-  value counts as a change; a hold that merely expires or is released while the step runs
-  doesn't fail it. Cohort compares
-  every visible held row's physical version before and after the step, covered rows included,
-  so the check is fail-safe rather than exact: a hold created anywhere the batch can see while
-  the step runs, a row that becomes covered while it runs (the step, or another session,
-  inserts or links a row under a held row), or another session's committed update to a held
-  row, also fails it, and the next run retries the row. A step that cuts a covered row's link
-  and then changes the row still fails: Cohort compares the row it saw before. A Warning names
-  the holds' ids, never the rows. Dependents' legal minimums aren't enforced; a hold is the
+  (`rows-skipped`, so the run settles `PartiallyFailed`). Cohort records the skip once, in a
+  `sweep_run_row_detail` row whose `Failure` says why, whatever the entity's row-detail audit
+  level, and logs an Error. `Failure` holds a [sanitized diagnostic](/guides/audit-trail#failure-diagnostics)
+  for an exception (its type, a safe machine code when there is one, and a diagnostic ID that
+  matches the logged Error), or `reason=…` for a failure Cohort found itself. It never holds
+  exception text. Audit observers aren't told about a skipped row: they see mutated rows only.
+  The step fails when it throws, including a database error or a constraint its own
+  statements hit; when it returns with unsaved changes on its context
+  (`reason=dependents-unsaved-changes`); when it changes a held row
+  (`reason=dependents-changed-held-row`, below); or when it takes its own row out of the run's
+  scope, so Cohort's change finds nothing (`reason=dependents-changed-row`). A cancellation the
+  step raises itself, such as an `HttpClient` timeout, is a failure like any other; only the
+  run's own token stops the run. The next run tries the row again.
+- **Holds.** A held row runs no step. Any change to, or removal of, a row under an active hold
+  fails the step, whatever the row's entity, even if the step ends the hold first. A row is
+  under a hold when the hold names it or covers it through a
+  [hold relation](/guides/legal-holds#holding-related-rows), so updating a held Case's upload
+  fails the step. An `UPDATE` that writes the same value counts as a change; a hold that merely
+  expires or is released while the step runs doesn't fail it. Cohort compares every visible
+  held row's physical version before and after the step, covered rows included, so the check
+  is fail-safe rather than exact: a hold created anywhere the batch can see while the step
+  runs, a row that becomes covered while it runs (the step, or another session, inserts or
+  links a row under a held row), or another session's committed update to a held row, also
+  fails it, and the next run retries the row. A step that cuts a covered row's link and then
+  changes the row still fails: Cohort compares the row it saw before. A Warning names the
+  holds' ids, never the rows. Dependents' legal minimums aren't enforced; a hold is the
   row-specific protection the step honours, as
   [`IRetentionDeletion`](/guides/legal-holds#deleting-around-holds) does. When the model has a
   tenantless retained entity, a tenant's batch must be able to see the active `NULL`-tenant
@@ -177,15 +95,11 @@ builder.Services.AddRetentionDependents<Case, RetireCaseDependents>();
   100,000 rows slow a sweep of a step's entity by minutes per 1,000 rows, and about 1,000,000
   by an hour; uncovered rows cost nothing. See
   [what it costs](/guides/legal-holds#what-it-costs).
-- **Foreign keys and previews.** A purge normally leaves out rows still referenced through a
-  `RESTRICT` or `NO ACTION` foreign key. An entity with a step doesn't: its referenced rows are
-  tried, the step runs, and a row still referenced after it is blocked by the constraint
-  itself. Previews and dry runs, a dry-run erasure's `Complete` included, never run the step,
-  so they predict that it clears the references: referenced rows count as eligible, not
-  blocked. A row whose references the step can't clear runs the step once per run, rolled
-  back each time.
+- **Foreign keys and previews.** Whether a purge tries a row that's still referenced depends on
+  what the step retires: see [Rows that reference the entity](#rows-that-reference-the-entity).
 - **Caller-transaction erasures.** In an erasure that joins your transaction, the step runs
-  inside it, on its own context, never yours. Cohort doesn't set `SET CONSTRAINTS ALL
+  inside it, on its own context, never yours, so nothing the step tracks reaches your context.
+  Its reads see what you saved but haven't committed. Cohort doesn't set `SET CONSTRAINTS ALL
   IMMEDIATE` in your transaction, so a deferred constraint the step violates fails your
   `COMMIT`, as one Cohort's own change violates does. In Cohort's own batches constraints are
   immediate, so the same violation fails the step's statement (a skip) or the row's change (a
@@ -194,158 +108,254 @@ builder.Services.AddRetentionDependents<Case, RetireCaseDependents>();
   makes hold creation on those rows, or on a row they're held with, wait. A deadlock or lock
   timeout in the step fails that row's step, not the batch.
 
-## Delivery
+## Rows that reference the entity {#rows-that-reference-the-entity}
 
-`OnAfterAsync` is delivered **at least once**. Make it idempotent: when `ctx.Attempt` is
-greater than 1, the work might already have been done.
+A purge normally leaves out, up front, rows still referenced through a `RESTRICT` or
+`NO ACTION` foreign key, and counts them blocked. What it does for an entity with a step
+depends on `retiresReferencingRows`:
 
-The dispatcher polls the queue, runs up to `MaxParallelism` rows at once, and keeps each
-row's handlers in order. A failed attempt retries with exponential backoff: 5 seconds
-(`BaseBackoff`), doubling up to 1 hour (`MaxBackoff`). After `MaxAttempts`, 25 by default or
-up to about 17.5 hours of retries, the work is dead-lettered with a sanitized `LastError`, and the
-row's later handlers with it. Each dead-letter logs an Error. The work keeps its snapshot, so
-you can [requeue it](#requeuing-dead-lettered-work). All of these are
-[configurable](/reference/configuration). The kill switch stops the background poller after
-the batch it's running; `FlushAsync` and requeues still run.
-
-Each delivery runs in its own DI scope, run as the row's tenant
-(`System(TenantlessPass)` for tenantless rows); the handler is resolved and run inside that
-work. `OnBeforeAsync` runs the same way, in a scope per batch run as the batch's tenant. So a
-host's tenant isolation applies to handler code too. See [Tenant Isolation](/guides/tenant-isolation).
-
-### Claim timeout
-
-Each delivery holds its claim for `RowHandlerDispatch:ClaimTimeout`, five minutes by default.
-
-- A handler must finish within nine tenths of the timeout. The rest covers claim latency and
-  clock skew between hosts. At that point its cancellation token fires, and the delivery
-  counts as a failed attempt.
-- While a delivery runs, its dispatcher holds a PostgreSQL session advisory lock for it. A
-  handler that ignores its token and outlives its claim isn't reclaimed while that lock is
-  held: it keeps the row, and the row's later handlers wait, until it returns. Each pass logs
-  a Warning naming it. Honour the token.
-- Work left `InFlight` by a crash is reclaimed once the timeout passes and the crashed
-  dispatcher's session has gone, and the reclaim counts as an attempt. A process that exits
-  closes its session at once, but if the host dies outright (power loss, a VM gone) the server
-  holds the idle session until its TCP keepalive gives up, about 2 hours with Linux defaults.
-  Set the server's `tcp_keepalives_idle`, `tcp_keepalives_interval` and `tcp_keepalives_count`
-  to shorten that; the same applies to recovering a crashed run.
-- If the dispatcher's database session is lost while the handler still runs (a failover, an
-  idle-session timeout), the lock goes with it, and the work can be reclaimed and run again.
-  No lock can rule that out; fence downstream writes on `ctx.Attempt` if it matters.
-- Session advisory locks need direct connections or session-mode pooling, not
-  transaction-mode pooling or Npgsql `Multiplexing`, which readiness refuses. Each draining
-  dispatcher holds one extra connection per batch.
-- A delivery whose claim was reclaimed can't settle the row. Its outcome is discarded and the
-  newer delivery settles it.
-- If recording a delivery's outcome fails, for example on a transient database error, the
-  delivery isn't treated as a handler failure and the rest of the batch carries on. The row
-  stays `InFlight` with that attempt spent until its claim times out and is reclaimed.
-
-### Dispatch phases
+- **`true`, the default**, says the step retires the rows that reference the entity, as
+  `RetireCaseDependents` above does. Referenced rows are tried: the step runs, and a row still
+  referenced after it is blocked by the constraint itself. Previews and dry runs, a dry-run
+  erasure's `Complete` included, never run the step, so they predict that it clears the
+  references: referenced rows count as eligible, not blocked. A row whose references the step
+  can't clear runs the step once per run, rolled back each time.
+- **`false`** says it doesn't, for a step that only writes to an outbox, say. Purge keeps the
+  up-front filter for that entity: a still-referenced row is left out and counted blocked, and
+  its step never runs. Previews and dry runs count it blocked too.
 
 ```csharp
-services.AddRowHandler<Attachment, ArchiveAttachment>(RowHandlerDispatchPhase.AfterSweepSettled);
+builder.Services.AddRetentionDependents<Note, NoteOutboxStep>(retiresReferencingRows: false);
 ```
 
-`Immediate` (the default) work dispatches as soon as its batch commits. `AfterSweepSettled`
-work waits until its whole run records completion or failure. That suits work that should
-only happen once the sweep's outcome is final. A run left `Started` by a process crash is
-marked failed after `RowHandlerDispatch:SweepSettleTimeout`, which releases its work.
+Pass `false` whenever the step leaves the referencing rows alone. With the default, every due
+row that's still referenced would run the step and fail at the database, every run.
 
-### Draining in tests and jobs
+### Rows deleted by `ON DELETE CASCADE`
 
-`IRetentionRowDispatcher.FlushAsync()` runs the work that's due now, without waiting for the
-poller. It's handy in tests and one-shot jobs. It honours retry backoff: a failed attempt
-waits out its backoff, so a flush during an outage spends one attempt per row, not the whole
-budget. The result reports what's left: `PendingRemaining` (waiting out a backoff, a run that
-hasn't settled, or a sibling), `InFlightRemaining` (held by a running delivery) and
-`DeadLetteredRequeueable`. Because a flush runs only what's due, looping on it until `Settled`
-spins through every backoff wait. To reach a final state, wait out the backoff, or in tests set
-a short `BaseBackoff` and `MaxBackoff`, or `MaxAttempts` of 1.
+A row that PostgreSQL deletes through an `ON DELETE CASCADE` foreign key gets no hook: no
+step runs for it, and nothing reaches your outbox. When a child row owns anything outside the
+database (a blob, a record in another system), set its foreign key to `Restrict` and retire
+the child in the parent's dependents step, which can then write the child's message too.
 
-### Requeuing dead-lettered work
+## After-commit work through your outbox {#after-commit-work-through-your-outbox}
 
-Dead-lettered work keeps its snapshot until `PayloadRetention`, so once you've fixed the
-cause (the downstream is back, or the handler is registered again) you can run it again:
+Work outside the database (delete a blob, tell another system) mustn't run inside the batch:
+it would survive a rollback, and could run for a row that's then blocked, skipped or held.
+Cohort keeps no work queue for it. Instead, the step writes a message to your own outbox
+through the `DbContext` it's handed. The message commits with the row's change and rolls back
+with it, and your outbox delivers it once the transaction has committed.
+
+Cohort's sample does this with a plain outbox table. The step, `Cohort.Sample/NoteOutboxStep.cs`:
 
 ```csharp
-var requeued = await dispatcher.RequeueDeadLetteredAsync();                     // everything
-await dispatcher.RequeueDeadLetteredAsync(sweepId: run.SweepId);                // one run
-await dispatcher.RequeueDeadLetteredAsync(handlerId: Guid.Parse("0b6f5e43-…")); // one handler
+public sealed class NoteOutboxStep(SampleDbContext db) : IRetentionDependents<Note>
+{
+    public async Task RetireAsync(Note row, RetentionDependentsContext ctx, CancellationToken ct)
+    {
+        // A message saved outside Cohort's transaction would commit on its own, even when the
+        // note it announces is never retired.
+        if (db.Database.CurrentTransaction is null)
+        {
+            throw new InvalidOperationException(
+                "NoteOutboxStep writes the outbox only inside the transaction that retires the note."
+            );
+        }
+
+        db.OutboxMessages.Add(
+            new OutboxMessage
+            {
+                Id = Guid.NewGuid(),
+                TenantId = ctx.TenantId,
+                Type = "note-retired",
+                Payload = row.Id.ToString(),
+                CreatedAt = ctx.At,
+            }
+        );
+        await db.SaveChangesAsync(ct);
+    }
+}
 ```
 
-- Every dead-lettered handler of each matching row is requeued, so the row's handlers still
-  run in order. Filtering on a later handler requeues the earlier one it was waiting on too.
-- A requeue resumes each handler's remaining attempts, or gives one more delivery to a
-  handler that used them all. `Attempt` carries on, so `ctx.Attempt` still tells the handler
-  the work may already be done.
-- Work whose snapshot the backstop scrub already cleared can't be requeued.
-  `FlushAsync`'s `DeadLetteredRequeueable` counts only work that can.
-- The kill switch doesn't stop a requeue; the requeued work runs on the next flush, or once
-  the poller is back on.
+The outbox table's mapping, in `SampleDbContext.OnModelCreating`:
 
-### Privileges
+```csharp
+modelBuilder.Entity<OutboxMessage>(b =>
+{
+    b.ToTable("outbox_messages");
+    b.HasKey(message => message.Id);
+    b.Property(message => message.TenantId).IsRequired();
+    b.Property(message => message.Type).IsRequired();
+    b.Property(message => message.Payload).IsRequired();
+    b.Property(message => message.CreatedAt).IsRequired();
+});
+```
 
-Each role needs the privileges of the operation it runs. Readiness doesn't check them: a
-missing one fails at the statement, with PostgreSQL's `42501`.
+And its registration, with `retiresReferencingRows: false` because the step retires nothing
+that references a note (see [Rows that reference the entity](#rows-that-reference-the-entity)):
 
-- **Sweeps and erasures.** With a row handler or a dependents step registered, the role of the
-  sweep or erasure also needs `INSERT` on `sweep_row_handler_status`, where it queues the
-  work. A host with neither (per-row `Anonymise` alone, say) needs no grant on that table
-  for sweeps. If `sweep_row_handler_status.Id` or `sweep_run_row_detail.Id` is a serial column
-  rather than an identity column, the role needs `USAGE` on its sequence.
-- **The dispatcher** runs as `System(RowDispatch)` and needs `SELECT` and `UPDATE` on
-  `sweep_run`, `sweep_run_row_detail`, and `sweep_row_handler_status`, and nothing on your
-  tables.
-- **The payload scrub** runs as `System(RowDispatch)` too, needs `SELECT` and `UPDATE` on
-  `sweep_run_row_detail`, and runs first in each flush, and in a poll once its hourly gate is
-  due, so a dispatcher that fails for a missing privilege can't keep a snapshot past
-  `PayloadRetention`. It runs with the kill switch on.
+```csharp
+builder.Services.AddRetentionDependents<Note, NoteOutboxStep>(retiresReferencingRows: false);
+```
 
-A background poll whose scrub fails (a missing grant, say) leaves the scrub's hourly gate
-unspent, so the next poll tries it again. `FlushAsync` and `RequeueDeadLetteredAsync` throw
-the failure, and the background poller logs it and retries on its next poll. Sweeps under a
-role that holds its own privileges carry on. See [Startup Validation](/reference/startup-validation#statements).
+- **The step checks `CurrentTransaction` first.** When Cohort runs the step, its context is
+  always in the batch's transaction (or yours, in a caller-transaction erasure). The check
+  makes that a precondition rather than an assumption: if the context ever had no
+  transaction, `SaveChangesAsync` would commit the message on its own, so the outbox would
+  announce a row that was never retired. The step throws instead, which skips the row and
+  records why.
+- **The step saves.** `SaveChangesAsync` writes inside Cohort's transaction and commits
+  nothing; a step that returns with the message still unsaved fails with
+  `reason=dependents-unsaved-changes`.
+- **The message follows the row.** A row that's purged commits its message. A row a
+  constraint refuses, a row whose step fails, and every row of a batch that rolls back leave
+  no message. A held row runs no step, so it writes none. In a caller-transaction erasure the
+  message commits only if you commit.
+- **Delivery is your outbox's.** Whatever relays the outbox (a poller, a library's sweeper)
+  runs after the commit, at least once, so make what it calls idempotent. The outbox table is
+  yours: leave it unretained, or give it a retention of its own.
 
-## Snapshots and personal data
+### Brighter
 
-Snapshots can hold pre-anonymisation personal data, so Cohort keeps them as briefly as it
-can:
+[Brighter](https://github.com/BrighterCommand/Brighter)'s outbox fits, given one
+requirement: the outbox write must join the context's current transaction, through a
+transaction provider that resolves the same scoped context Cohort hands the step. Brighter's
+`PostgreSqlEntityFrameworkTransactionProvider<TContext>` takes the context through its
+constructor, so the step injects both the context and the provider from the batch's scope.
 
-- A row's `CapturedPayload` is cleared as soon as every handler for that row succeeds.
-  Dead-lettered work keeps its snapshot until `PayloadRetention`, so it can be requeued, and
-  history pruning keeps the run until then.
-- A backstop scrub clears anything older than `RowHandlerDispatch:PayloadRetention`, 30 days
-  by default, counted from the row's mutation. Startup, and every options reload, refuses a
-  `PayloadRetention` shorter than one handler's retry schedule, and, with handlers
-  registered, shorter than the entity with the most handlers needs for all of them to run
-  their schedules one after another, each attempt up to a `PollInterval` late (see
-  [Configuration](/reference/configuration#row-handler-dispatch)). The scrub can still end
-  work held up outside that schedule: `AfterSweepSettled` work waiting for a run that takes
-  long to settle, and work paused by the kill switch. It still runs while the kill switch
-  is on. Queued work whose snapshot the backstop scrubbed can never complete, so it
-  dead-letters immediately, naming the scrub as the reason, instead of burning its retries.
-- Dead-letter `LastError` stores a [sanitized diagnostic](/guides/audit-trail#failure-diagnostics):
-  exception type, safe machine code when there is one, and a diagnostic ID. Never exception
-  text or stack traces.
+Cohort neither compiles nor tests this snippet; `AppDbContext`, `Attachment`, and
+`DeleteAttachmentBlob` are placeholders. The producer configuration:
 
-### What a snapshot can hold
+```csharp
+brighter.AddProducers(producerOptions =>
+{
+    producerOptions.ProducerRegistry = producerRegistry;
+    producerOptions.Outbox = new PostgreSqlOutbox(databaseConfiguration);
+    producerOptions.TransactionProvider =
+        typeof(PostgreSqlEntityFrameworkTransactionProvider<AppDbContext>);
+    producerOptions.ConnectionProvider = typeof(PostgreSqlConnectionProvider);
+});
+```
 
-Snapshot values must round-trip exactly: `OnAfterAsync` receives an equal value of the same
-type. Supported values are:
+The step deposits the message after the same `CurrentTransaction` check:
 
-- `null`
-- well-known scalars
-- enums and value-equal types from the allow-list below
-- one-dimensional arrays and `List<T>` of those, with the element type preserved
-- `object?[]`, `List<object?>`, and nested `IDictionary<string, object?>`
+```csharp
+public sealed class DeleteAttachmentBlob(Guid id, string blobName) : Command(id)
+{
+    public string BlobName { get; } = blobName;
+}
 
-Anything else fails the handler that stashed it at capture time, before the row is mutated.
-It takes the same path as a throwing `OnBeforeAsync`.
+public sealed class AttachmentOutboxStep(
+    AppDbContext db,
+    IAmACommandProcessor commandProcessor,
+    IAmABoxTransactionProvider<DbTransaction> transactionProvider
+) : IRetentionDependents<Attachment>
+{
+    public async Task RetireAsync(Attachment row, RetentionDependentsContext ctx, CancellationToken ct)
+    {
+        if (db.Database.CurrentTransaction is null)
+        {
+            throw new InvalidOperationException(
+                "AttachmentOutboxStep deposits only inside the transaction that retires the attachment."
+            );
+        }
 
-Persisted payloads name CLR types, so deserialisation is allow-listed. Values round-trip only
-as well-known scalars, property types of the swept entity, or types declared in the entity's
-or its registered handlers' assemblies. A tampered payload naming anything else dead-letters
-instead of materialising an arbitrary type. The persisted entity type resolves only against
-registered retained entities.
+        await commandProcessor.DepositPostAsync(
+            new DeleteAttachmentBlob(Guid.NewGuid(), row.BlobName),
+            transactionProvider,
+            cancellationToken: ct
+        );
+    }
+}
+```
+
+```csharp
+builder.Services.AddRetentionDependents<Attachment, AttachmentOutboxStep>(retiresReferencingRows: false);
+```
+
+Brighter then publishes the deposited message after the commit, and the handler that deletes
+the blob runs wherever your consumers run.
+
+## Recovering abandoned runs {#recovering-abandoned-runs}
+
+A run left `Started` by a crashed process is settled as `Failed` once it's older than
+`Cohort:SweepSettleTimeout` (an hour by default) and no process still holds its run lock. A
+background service does this when the host starts and then once a minute, and skips while the
+kill switch is on. Until a run is recovered it reads as in progress, and history pruning never
+deletes it.
+
+A host that doesn't run hosted services (a console job, a function that never starts
+`IHost`) calls the port itself, from a scope, where it would have run the service:
+
+```csharp
+await scope.ServiceProvider.GetRequiredService<IRetentionRunRecovery>().RecoverAsync(ct);
+```
+
+`RecoverAsync` recovers every abandoned run now. It ignores the kill switch, runs as
+`System(Recovery)` (see [Tenant Isolation](/guides/tenant-isolation)), and checks readiness
+first, as every Cohort operation does. See [Crash recovery](/misc/how-it-works#crash-recovery).
+
+## Upgrading from row handlers {#upgrading-from-row-handlers}
+
+0.12.0 removes row handlers (`IRetentionHandler<T>`, `AddRowHandler`, `[RowHandlerPriority]`,
+`[RowHandlerId]`), the dispatcher (`IRetentionRowDispatcher`, `FlushAsync`), the
+`Cohort:RowHandlerDispatch` options, the `sweep_row_handler_status` table, and the
+`sweep_run_row_detail.CapturedPayload` column. From 0.11.0:
+
+1. On 0.11.0, drain queued handler work (`FlushAsync` until nothing is pending), and requeue
+   or export dead-lettered work you still need. Whatever is left is dropped with the table.
+2. Move each handler to the entity's dependents step, depositing to your outbox
+   ([above](#after-commit-work-through-your-outbox)), and remove its `[RowHandlerId]` (a step
+   carries none now). Pass `retiresReferencingRows: false` when the step only deposits. A step
+   differs from a handler:
+   - an entity has one step, so several handlers, or a handler and a step, compose into one
+     class;
+   - each row the step runs for reads the held-row versions twice, to refuse a step that
+     changes a held row;
+   - on a model with a tenantless entity, each batch checks that its scope can read tenantless
+     holds, and refuses the batch if it can't.
+3. Add a migration. It adds `sweep_run_row_detail.Failure`, copies each skipped row's recorded
+   error into it, then drops the table and the column. If `dotnet ef migrations add`
+   scaffolds a rename of `CapturedPayload` to `Failure`, or drops the table first, replace its
+   `Up()` with these steps, in this order. The sample's migration
+   (`Cohort.Sample/Migrations/20261107155318_RemoveRowHandlerQueue.cs`):
+
+   ```csharp
+   migrationBuilder.AddColumn<string>(
+       name: "Failure",
+       schema: "public",
+       table: "sweep_run_row_detail",
+       type: "text",
+       nullable: true);
+
+   migrationBuilder.Sql(
+       """
+       UPDATE "public"."sweep_run_row_detail" AS detail
+       SET "Failure" = status."LastError"
+       FROM "public"."sweep_row_handler_status" AS status
+       WHERE status."SweepRunRowDetailId" = detail."Id"
+         AND status."State" = 3
+         AND status."Attempt" = 1
+         AND status."ClaimedAt" IS NULL
+         AND status."CompletedAt" = status."QueuedAt";
+       """);
+
+   migrationBuilder.DropTable(
+       name: "sweep_row_handler_status",
+       schema: "public");
+
+   migrationBuilder.DropColumn(
+       name: "CapturedPayload",
+       schema: "public",
+       table: "sweep_run_row_detail");
+   ```
+
+   Write your Cohort schema where the sample has `public`, if you passed one to
+   `ConfigureCohortTables`. The `UPDATE` copies the error of each row a failing dependents
+   step skipped: 0.11.0 recorded that as a dead-lettered status (`State` 3) queued and
+   completed at one database-clock instant and never claimed. A dead-lettered `OnAfterAsync`
+   delivery belongs to a row that was changed, so its row detail keeps `Failure` `NULL`.
+4. Move `Cohort:RowHandlerDispatch:SweepSettleTimeout` to `Cohort:SweepSettleTimeout`. The old
+   key is ignored.
+5. If your host doesn't run hosted services, call `IRetentionRunRecovery.RecoverAsync` where
+   you called `FlushAsync` ([above](#recovering-abandoned-runs)).

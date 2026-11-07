@@ -96,18 +96,16 @@ internal static class SweepStatements
         : SweepCursorKind.Anchored;
 
     /// <summary>
-    /// Whether a batch loads and changes its rows one at a time: with handlers, with a dependents
-    /// step, or when the strategy's new values depend on each row. Per-row execution counts only for
+    /// Whether a batch loads and changes its rows one at a time: with a dependents step, or when
+    /// the strategy's new values depend on each row. Per-row execution counts only for
     /// Anonymise, the only strategy whose mutation sets it.
     /// </summary>
     internal static bool TakesRowByRowPath(
         Strategy strategy,
-        bool hasHandlers,
         bool hasDependentsStep,
         bool requiresPerRowExecution
     ) =>
-        hasHandlers
-        || hasDependentsStep
+        hasDependentsStep
         || (strategy == Strategy.Anonymise && requiresPerRowExecution);
 
     // ------------------------------------------------------------------------------------
@@ -264,8 +262,8 @@ internal static class SweepStatements
     /// while the run counts can't put a row in two counts or in none.
     /// <list type="bullet">
     /// <item><c>Deferred</c>: rows still due, leaving out the rows the run already accounted
-    /// for: a row skipped by a failing OnBefore handler or dependents step, through the row
-    /// detail its skip wrote, and a row a constraint refused, through
+    /// for: a row skipped by a failing dependents step, through the row detail its skip wrote,
+    /// and a row a constraint refused, through
     /// <paramref name="refusedRecordIds"/>. What remains was locked by another transaction when
     /// discovery passed it, or came into scope mid-run behind the run's position.</item>
     /// <item><c>Held</c>: rows it would act on but for an active hold.</item>
@@ -346,8 +344,7 @@ internal static class SweepStatements
 
     /// <summary>
     /// S5: up to <paramref name="limit"/> due rows after the cursor in discovery's order, with
-    /// each row's anchor. A keyset rather than an exclusion list, after the dispatcher's
-    /// expired-claim recovery on (<c>ClaimedAt</c>, <c>Id</c>): each statement costs one batch
+    /// each row's anchor. A keyset rather than an exclusion list: each statement costs one batch
     /// however many rows the run has already passed over.
     /// </summary>
     internal static SweepStatement Discover(
@@ -631,7 +628,7 @@ internal static class SweepStatements
 
     /// <summary>
     /// Excludes rows run <paramref name="sweepId"/> already recorded for this entity, such as
-    /// rows a failing OnBefore skipped: they stay eligible, so counting them as deferred would
+    /// rows a failing dependents step skipped: they stay eligible, so counting them as deferred would
     /// count them twice. Discovery's keyset already passes them, but a row whose anchor moved
     /// later after it was recorded would be met again, and its row detail recorded twice.
     /// </summary>

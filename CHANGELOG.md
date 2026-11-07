@@ -50,7 +50,7 @@ A hold on a row also holds the rows a host declares related to it.
   trip per call, except the hold guard's database check before it reads tenantless holds.
   Inside your transaction with no pass recorded, each call runs the pass again. Startup calls
   readiness in `System(Readiness)`, then in each subsystem's scope that will run
-  (`System(RowDispatch)` always, `System(WorkerCoordination)` when the worker runs,
+  (`System(Recovery)` when the kill switch is off, `System(WorkerCoordination)` when the worker runs,
   `System(HistoryPruning)` when a pruning retention is set and the kill switch is off): each
   scope's context gets the provider and Multiplexing checks, and the pass itself when it runs
   another model instance or connection string. A refusal stops the host.
@@ -66,7 +66,8 @@ A hold on a row also holds the rows a host declares related to it.
   search path, so a fault that session can't reach surfaces at the statement, under the
   session that sends it: a schema the role can't use, a child table it can't read, a
   publication's replica-identity rule behind a missing privilege, and a type another search
-  path resolves differently. No grant changed net of 0.11.0; see
+  path resolves differently. Readiness needs no grant 0.11.0 didn't (the queue's grants go
+  with it, below); see
   [Tenant Isolation](https://maxanstey-meridian.github.io/cohort/guides/tenant-isolation#grants)
   for what each scope's role needs. The refusal
   carries PostgreSQL's SQLSTATE and message. It also refuses a nullable tenant column, a
@@ -82,8 +83,66 @@ A hold on a row also holds the rows a host declares related to it.
   column, and a missing link column are now PostgreSQL's (one error per entity, with its
   SQLSTATE and message).
 
-Upgrade: [Legal Holds](https://maxanstey-meridian.github.io/cohort/guides/legal-holds#upgrading-to-0-12-0)
-and [Startup Validation](https://maxanstey-meridian.github.io/cohort/reference/startup-validation#upgrading-to-0-12-0).
+Removed (breaking): Cohort no longer runs row handlers or keeps a durable work queue.
+
+- Gone: `IRetentionHandler<T>`, `AddRowHandler`, `IRetentionRowDispatcher` and
+  `RowDispatcherFlushResult`, `RowHandlerDispatchPhase`, `RetentionBeforeContext`,
+  `RetentionAfterContext<T>`, `[RowHandlerPriority]`, `[RowHandlerId]`,
+  `RowHandlerDispatchOptions` and `CohortOptions.RowHandlerDispatch` (the
+  `Cohort:RowHandlerDispatch` section), along with the `sweep_row_handler_status` table and the
+  `CapturedPayload` column.
+- Do after-commit work from the entity's dependents step instead. Write a message to your own
+  outbox through the DbContext the step receives. The step runs in Cohort's transaction, so
+  the message commits and rolls back with the row.
+- See [Dependents and After-Commit Work](https://maxanstey-meridian.github.io/cohort/guides/row-handlers#after-commit-work-through-your-outbox).
+
+Upgrading from 0.11.0:
+
+1. On your current version, drain queued handler work (`FlushAsync` until nothing is
+   pending), and requeue or export dead-lettered work you still need. Whatever is left is
+   dropped with the table.
+2. Move each handler to the entity's dependents step, depositing to your outbox, and remove
+   its `[RowHandlerId]`. Pass `retiresReferencingRows: false` when the step only deposits. A
+   step differs from a handler:
+   - an entity has one step, so several handlers, or a handler and a step, compose into one
+     class;
+   - each row the step runs for reads the held-row versions twice, to refuse a step that
+     changes a held row;
+   - on a model with a tenantless entity, each batch checks that its scope can read
+     tenantless holds, and refuses the batch if it can't.
+3. Add a migration. It adds `sweep_run_row_detail.Failure`, copies each skipped row's recorded
+   error into it (the SQL is in
+   [Dependents and After-Commit Work](https://maxanstey-meridian.github.io/cohort/guides/row-handlers#upgrading-from-row-handlers)),
+   then drops the table and the column.
+4. Move `Cohort:RowHandlerDispatch:SweepSettleTimeout` to `Cohort:SweepSettleTimeout`. The old
+   key is ignored.
+5. If your host doesn't run hosted services, call `IRetentionRunRecovery.RecoverAsync` where
+   you called `FlushAsync`.
+
+Changed (breaking):
+
+- Abandoned-run recovery runs in its own background service, once a minute, and skips while
+  the kill switch is on. Its timeout is now `Cohort:SweepSettleTimeout`, and its execution
+  context is `RetentionSystemWork.Recovery`.
+- A failing dependents step's skipped row is recorded in `sweep_run_row_detail.Failure`.
+
+Added:
+
+- `IRetentionRunRecovery.RecoverAsync` recovers abandoned runs on demand, for a host that
+  doesn't run hosted services. It ignores the kill switch.
+- `AddRetentionDependents(retiresReferencingRows: false)` keeps purge's blocking-FK pre-filter
+  for a step that doesn't retire the rows that reference its entity.
+
+Fixed:
+
+- Sweeps, previews, owned erasures, and abandoned-run recovery no longer throw under an ambient
+  `System.Transactions` transaction (a `TransactionScope`, which Npgsql enlists in by default):
+  they and readiness now run outside it, so their work commits on its own and never enlists in
+  yours.
+
+Upgrade: [Legal Holds](https://maxanstey-meridian.github.io/cohort/guides/legal-holds#upgrading-to-0-12-0),
+[Startup Validation](https://maxanstey-meridian.github.io/cohort/reference/startup-validation#upgrading-to-0-12-0),
+and [Dependents and After-Commit Work](https://maxanstey-meridian.github.io/cohort/guides/row-handlers#upgrading-from-row-handlers).
 
 ## 0.11.0 (2026-10-26, breaking)
 

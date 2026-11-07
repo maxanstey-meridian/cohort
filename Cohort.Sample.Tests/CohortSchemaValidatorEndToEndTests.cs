@@ -144,8 +144,8 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
         "sweep_run.CK_sweep_run_Status_Range"
     )]
     [InlineData(
-        "ALTER TABLE \"sweep_row_handler_status\" DROP CONSTRAINT \"CK_sweep_row_handler_status_Completion\"",
-        "sweep_row_handler_status.CK_sweep_row_handler_status_Completion"
+        "ALTER TABLE \"sweep_run\" DROP CONSTRAINT \"CK_sweep_run_Started_Unsettled\"",
+        "sweep_run.CK_sweep_run_Started_Unsettled"
     )]
     public async Task Validation_Rejects_Missing_Or_Unvalidated_Checks(
         string mutation,
@@ -165,8 +165,9 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
 
     [Theory]
     [InlineData("ALTER TABLE \"sweep_run\" ALTER COLUMN \"DryRun\" TYPE text USING \"DryRun\"::text", "sweep_run.\"DryRun\" bool NOT NULL")]
-    [InlineData("ALTER TABLE \"sweep_run_row_detail\" ALTER COLUMN \"CapturedPayload\" SET NOT NULL", "sweep_run_row_detail.\"CapturedPayload\" text NULL")]
-    [InlineData("ALTER TABLE \"sweep_row_handler_status\" ALTER COLUMN \"QueuedAt\" DROP NOT NULL", "sweep_row_handler_status.\"QueuedAt\" timestamptz NOT NULL")]
+    [InlineData("ALTER TABLE \"sweep_run_row_detail\" ALTER COLUMN \"Failure\" SET NOT NULL", "sweep_run_row_detail.\"Failure\" text NULL")]
+    [InlineData("ALTER TABLE \"sweep_run_row_detail\" ALTER COLUMN \"At\" DROP NOT NULL", "sweep_run_row_detail.\"At\" timestamptz NOT NULL")]
+    [InlineData("ALTER TABLE \"sweep_run_row_detail\" DROP COLUMN \"Failure\"", "column '\"public\".\"sweep_run_row_detail\".\"Failure\"'")]
     public async Task Validation_Rejects_Runtime_Critical_Column_Shape(
         string mutation,
         string expectedCapability
@@ -186,24 +187,24 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task Validation_Rejects_Missing_Or_NonCascading_Row_Handler_Foreign_Key(
-        bool replaceWithoutCascade
+    public async Task Validation_Rejects_Missing_Or_Cascading_Row_Detail_Foreign_Key(
+        bool replaceWithCascade
     )
     {
         const string lookup = """
             SELECT conname
             FROM pg_constraint
             WHERE contype = 'f'
-              AND conrelid = 'sweep_row_handler_status'::regclass
+              AND conrelid = 'sweep_run_row_detail'::regclass
             """;
         var constraintName = (string)(await ExecuteScalarAsync(lookup))!;
         await ExecuteAsync(
-            $"ALTER TABLE \"sweep_row_handler_status\" DROP CONSTRAINT \"{constraintName.Replace("\"", "\"\"")}\""
+            $"ALTER TABLE \"sweep_run_row_detail\" DROP CONSTRAINT \"{constraintName.Replace("\"", "\"\"")}\""
         );
-        if (replaceWithoutCascade)
+        if (replaceWithCascade)
         {
             await ExecuteAsync(
-                "ALTER TABLE \"sweep_row_handler_status\" ADD CONSTRAINT \"FK_adopted_row_detail\" FOREIGN KEY (\"SweepRunRowDetailId\") REFERENCES \"sweep_run_row_detail\" (\"Id\") ON DELETE RESTRICT"
+                "ALTER TABLE \"sweep_run_row_detail\" ADD CONSTRAINT \"FK_adopted_sweep_run\" FOREIGN KEY (\"SweepId\") REFERENCES \"sweep_run\" (\"SweepId\") ON DELETE CASCADE"
             );
         }
 
@@ -215,7 +216,7 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception
             .Which.Errors.Should()
-            .ContainSingle(error => error.Contains("sweep_row_handler_status(SweepRunRowDetailId) -> sweep_run_row_detail(Id) ON DELETE CASCADE"));
+            .ContainSingle(error => error.Contains("sweep_run_row_detail(SweepId) -> sweep_run(SweepId) ON DELETE RESTRICT"));
     }
 
     [Fact]

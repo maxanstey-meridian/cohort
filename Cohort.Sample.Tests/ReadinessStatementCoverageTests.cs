@@ -5,7 +5,6 @@ using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
 using Cohort.Infrastructure;
-using Cohort.Infrastructure.Handlers;
 using Cohort.Infrastructure.Migrations;
 using Cohort.Sample.Entities;
 
@@ -34,9 +33,9 @@ namespace Cohort.Sample.Tests;
 // not explained, and not judged.)
 //
 // Every scope kind runs as a role of its own (ScopeRoles: the tenant, the tenantless pass, the
-// readiness scope, the dispatcher, the worker, the pruner, and the caller's own scope, which has
-// no execution context). A scenario lists the roles of the scopes that run its operations, kept
-// apart from the readiness, dispatcher, scrub, and pruner roles, so a statement only the pass
+// readiness scope, abandoned-run recovery, the worker, the pruner, and the caller's own scope,
+// which has no execution context). A scenario lists the roles of the scopes that run its
+// operations, kept apart from the readiness, recovery, and pruner roles, so a statement only the pass
 // or one of those scopes runs never counts as an operation's. Every role gets the same grants
 // and the same search path, so the texts the pass explained as one role are the texts any other
 // scope's builders produce.
@@ -50,8 +49,8 @@ namespace Cohort.Sample.Tests;
 // pg_stat_statements is reset (the whole view, with its eviction count noted), and the operations
 // run: batch size 1 with several due rows (the cursor statements), dry runs and live sweeps,
 // previews, erasures (tenant, tenantless, and inside a caller's transaction), holds, a deletion
-// check, the worker's scheduled iteration, pruning, and hosts with a row handler (the
-// dispatcher, with rows settled through every form) and with a dependents step.
+// check, the worker's scheduled iteration, pruning, and hosts with a dependents step, one that
+// retires the rows referencing its entity and one that doesn't.
 // ────────────────────────────────────────────────────────────────────────────
 
 [Collection("Integration")]
@@ -89,7 +88,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         var ledger = new ReachLedger();
 
         await PlainRunsAsync(ledger);
-        await RowHandlerHostAsync(ledger);
+        await NonRetiringStepHostAsync(ledger);
         await DependentsStepHostAsync(ledger);
         await HoldRelationModelAsync(ledger);
         await HoldRelationModelAroundDependentsStepAsync(ledger);
@@ -104,8 +103,8 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
     }
 
     // The operations' roles (sweeps, erasures, previews, holds, deletions, and the worker) are
-    // the roles claim 6 judges a builder's execution by. They exclude the readiness, dispatcher,
-    // scrub, and pruner roles, so the pass's own work and the other scopes' statements never
+    // the roles claim 6 judges a builder's execution by. They exclude the readiness, recovery,
+    // and pruner roles, so the pass's own work and the other scopes' statements never
     // count as reach. A scope kind has one role per ScopeRoles, so the erasures and the
     // deletions run on a host of their own over the same database, with roles of their own:
     // this host sweeps, previews, holds, runs the worker, and prunes; the erasure host only
@@ -400,47 +399,39 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         );
     }
 
-    private async Task RowHandlerHostAsync(ReachLedger ledger)
+    // A step registered with retiresReferencingRows: false takes a Purge entity down the
+    // row-by-row path and keeps the blocking-key pre-filter, which a step that retires the
+    // referencing rows (DependentsStepHostAsync) drops.
+    private async Task NonRetiringStepHostAsync(ReachLedger ledger)
     {
         await using var roles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
-        // The payload scrub gets a dispatcher role of its own, outside the operation roles: a
-        // poll under the kill switch scrubs and returns before any dispatch statement.
-        await using var scrubRoles = await ScopeRoles.CreateAsync(fixture.ConnectionString);
         await using var database = await MigratedSampleDatabaseAsync();
         var tenants = new CoverageTenants();
-        var sink = new CoverageHandlerSink();
+        var sink = new CoverageStepSink();
         await SeedAsync(database, tenants);
+        // A child of the second note the sweep reaches: the pre-filter leaves that note out up
+        // front, so its step never runs.
+        var referenced = await DueNoteIdAsync(database, tenants.Swept, skip: 1);
+        await ExecuteAsync(
+            database,
+            $"""
+            CREATE TABLE public.note_children ("NoteId" uuid NOT NULL REFERENCES public.notes ("Id"));
+            INSERT INTO public.note_children ("NoteId") VALUES ('{referenced}');
+            """
+        );
         await roles.GrantAsync(database);
-        await scrubRoles.GrantAsync(database);
         // A role that only erases: this host's sweeps run as other tenants, so the erasure's
         // role is one of the operation roles.
         var erasureRole = await roles.AddTenantRoleAsync(database, tenants.WithoutLegalMinimum);
         using var host = new CohortTestHost(
             database.ConnectionString,
             new CoverageRuleProvider(tenants),
-            new Dictionary<string, string?>(BatchSizeOne)
-            {
-                [$"{CohortOptions.SectionName}:RowHandlerDispatch:MaxAttempts"] = "3",
-            },
+            BatchSizeOne,
             services =>
             {
                 roles.Install<SampleDbContext>(services);
                 services.AddSingleton(sink);
-                services.AddRowHandler<Note, CoverageNoteHandler>();
-            }
-        );
-        using var scrubHost = new CohortTestHost(
-            database.ConnectionString,
-            new CoverageRuleProvider(tenants),
-            new Dictionary<string, string?>(BatchSizeOne)
-            {
-                [$"{CohortOptions.SectionName}:KillSwitch"] = "true",
-            },
-            services =>
-            {
-                scrubRoles.Install<SampleDbContext>(services);
-                services.AddSingleton(sink);
-                services.AddRowHandler<Note, CoverageNoteHandler>();
+                services.AddRetentionDependents<Note, CoverageNoteStep>(retiresReferencingRows: false);
             }
         );
 
@@ -451,14 +442,19 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
                 .ListActiveAsync(CancellationToken.None)
         );
 
-        // A handler takes a Purge entity down the row-by-row path: three rows queue handler work.
         (await SweepAsync(host, tenants.Swept, dryRun: true)).EntityFailures.Should().BeEmpty();
-        (await SweepAsync(host, tenants.Swept, dryRun: false))
-            .EntityFailures.Should()
-            .BeEmpty();
-        // The erasure's first row fails its handler's OnBefore: the row is skipped, and its
-        // record id is canonicalised for the audit row.
-        sink.FailNextBefore = true;
+        var swept = await SweepAsync(host, tenants.Swept, dryRun: false);
+        swept.EntityFailures.Should().BeEmpty();
+        swept.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note))
+            .Which.BlockedCount.Should().Be(1);
+        // A blocked count alone holds whatever the flag is (the database refuses the delete
+        // when the pre-filter doesn't): the step never ran for the referenced note.
+        sink.Ran.Should().NotBeEmpty().And.NotContain(referenced);
+        // A tenant with a legal minimum takes the same path with its own cutoff.
+        (await SweepAsync(host, tenants.WithLegalMinimum, dryRun: false)).EntityFailures.Should().BeEmpty();
+        // The erasure's first row fails its step: the row is skipped, and its record id is
+        // canonicalised for the audit row.
+        sink.FailNext = true;
         (
             await host.RunErasureAsync(
                 Tenant(tenants.WithoutLegalMinimum),
@@ -472,59 +468,11 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
                 && failure.Contains(typeof(Note).FullName!, StringComparison.Ordinal)
             );
 
-        // Work left behind: a dispatcher died holding one claim with attempts to spare (the
-        // reclaim requeues it) and one that used them all (the reclaim dead-letters it); a run
-        // was left Started past the settle timeout (recovery fails it).
-        await AbandonClaimAsync(database, skip: 0, attempt: 1, DateTimeOffset.UtcNow.AddMinutes(-10));
-        await AbandonClaimAsync(database, skip: 1, attempt: 3, DateTimeOffset.UtcNow.AddMinutes(-10));
-        await SeedStaleStartedRunAsync(database);
-        // A captured payload past its retention, for the scrub.
-        await ExecuteAsync(
-            database,
-            """
-            UPDATE public.sweep_run_row_detail SET "CapturedPayload" = '{}', "At" = now() - INTERVAL '60 days'
-            WHERE "Id" = (SELECT min("Id") FROM public.sweep_run_row_detail)
-            """
-        );
-
-        // A poll under the kill switch only scrubs (the payload scrub), under the scrub host's dispatcher role.
-        await scrubHost.RunWithServicesAsync(services =>
-            services.GetRequiredService<RetentionRowDispatcher>().PollAsync(CancellationToken.None)
-        );
-
-        // The flush recovers the run, reclaims the claims, scrubs, then delivers what is left:
-        // the first delivery fails and retries (the sink makes it so), the rest succeed.
-        await host.RunWithServicesAsync(services =>
-            services.GetRequiredService<IRetentionRowDispatcher>().FlushAsync()
-        );
-        sink.Failures.Should().Be(1, "one delivery was made to fail, which settles for retry");
-        (await HandlerStatesAsync(database))
-            .Should()
-            .Contain([SweepRowHandlerDispatchState.Succeeded, SweepRowHandlerDispatchState.DeadLettered, SweepRowHandlerDispatchState.Pending]);
-
-        // The operator requeues the dead-lettered work; a background poll then delivers it.
-        await host.RunWithServicesAsync(services =>
-            services.GetRequiredService<IRetentionRowDispatcher>().RequeueDeadLetteredAsync()
-        );
-        await host.RunWithServicesAsync(services =>
-            services.GetRequiredService<RetentionRowDispatcher>().PollAsync(CancellationToken.None)
-        );
-
-        // A flush cancelled while a handler runs requeues the delivery it interrupted (the interrupted-delivery requeue).
-        sink.BlockDeliveries = true;
-        (await SweepAsync(host, tenants.WithLegalMinimum, dryRun: false)).EntityFailures.Should().BeEmpty();
-        using var cancellation = new CancellationTokenSource();
-        var cancelled = host.RunWithServicesAsync(services =>
-            services.GetRequiredService<IRetentionRowDispatcher>().FlushAsync(cancellation.Token)
-        );
-        await sink.Started.Task.WaitAsync(TimeSpan.FromSeconds(30));
-        await cancellation.CancelAsync();
-        await cancelled.Awaiting(task => task).Should().ThrowAsync<OperationCanceledException>();
-
-        // Only tenanted runs: the tenantless tables are not reached.
+        // Only tenanted runs: the tenantless tables need not be reached (any statement on them
+        // is still judged).
         await AssertEveryStatementIsExplainedAsync<SampleDbContext>(
             database,
-            [roles, scrubRoles],
+            [roles],
             recording,
             ledger,
             action => host.RunWithServicesAsync(action),
@@ -546,7 +494,8 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         var tenants = new CoverageTenants();
         await SeedAsync(database, tenants);
         // A child of the second note the sweep reaches: the foreign key refuses its delete, which
-        // a step's entity does not exclude beforehand (the step may retire the child).
+        // a step registered as retiring the referencing rows (the default) does not exclude
+        // beforehand (the step may retire the child).
         await ExecuteAsync(
             database,
             """
@@ -1027,7 +976,6 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
     // On the first note it retires, takes the note out of the erasure's scope (the mutation then
     // changes nothing, and the run asks whether the note is still due); on the others, deletes
     // every link. Its SQL starts with the host comment.
-    [RowHandlerId("2f7a4c91-6d38-4e05-b1a9-8c3e5d0f7a62")]
     private sealed class LinkDeletingErasedNoteStep(ErasureModelDbContext db) : IRetentionDependents<ErasedNote>
     {
         private static int calls;
@@ -1098,7 +1046,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
     //      are covered by claim 5, which every sent text must meet. Only the guard's attribution
     //      forms are exempt: they are explained so that a refusal names its entity, and no
     //      operation sends them. So the pass explains nothing that no operation sends. The
-    //      operation roles are kept apart from the readiness, dispatcher, scrub, and pruner roles,
+    //      operation roles are kept apart from the readiness, recovery, and pruner roles,
     //      so a statement only the pass or one of those scopes runs never counts as an
     //      operation's.
     private async Task AssertEveryStatementIsExplainedAsync<TContext>(
@@ -1283,7 +1231,6 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             services.GetRequiredService<RetentionRegistry>(),
             services.GetRequiredService<RetentionValidationState>(),
             services.GetRequiredService<Cohort.Infrastructure.Sweep.AnonymiseAssignmentResolver>(),
-            services.GetServices<IRetentionHandlerRegistration>(),
             services.GetServices<IRetentionDependentsRegistration>(),
             services.GetRequiredService<IRetentionExecutionSettings>()
         );
@@ -1375,7 +1322,6 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             cohort.SweepRun,
             cohort.SweepRunEntitySummary,
             cohort.SweepRunRowDetail,
-            cohort.SweepRowHandlerStatus,
         };
         return
         [
@@ -1636,57 +1582,20 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         await command.ExecuteNonQueryAsync();
     }
 
-    // A dispatcher that died: a run left Started well past SweepSettleTimeout, with no session
-    // holding its lock.
-    private static Task SeedStaleStartedRunAsync(TemporaryDatabase database) =>
-        ExecuteAsync(
-            database,
-            $"""
-            INSERT INTO public.sweep_run
-                ("SweepId", "StartedAt", "Status", "SettledAt", "Duration", "TriggerKind", "DryRun", "TenantId", "TotalAffected")
-            VALUES (gen_random_uuid(), now() - INTERVAL '3 hours', {(int)SweepRunStatus.Started}, NULL, NULL,
-                    {(int)SweepTriggerKind.Manual}, FALSE, gen_random_uuid(), 0)
-            """
-        );
-
-    // Marks the pending handler status `skip` places in from the oldest as claimed by a
-    // dispatcher that died, `attempt` deliveries spent.
-    private static Task AbandonClaimAsync(
-        TemporaryDatabase database,
-        int skip,
-        int attempt,
-        DateTimeOffset claimedAt
-    ) =>
-        ExecuteAsync(
-            database,
-            $"""
-            UPDATE public.sweep_row_handler_status
-            SET "State" = {(int)SweepRowHandlerDispatchState.InFlight},
-                "ClaimedAt" = '{claimedAt:O}', "ClaimToken" = gen_random_uuid(), "Attempt" = {attempt}
-            WHERE "Id" = (
-                SELECT "Id" FROM public.sweep_row_handler_status
-                WHERE "State" = {(int)SweepRowHandlerDispatchState.Pending}
-                ORDER BY "Id" OFFSET {skip} LIMIT 1
-            )
-            """
-        );
-
-    private static async Task<List<SweepRowHandlerDispatchState>> HandlerStatesAsync(TemporaryDatabase database)
+    // A tenant's due note, `skip` places in from the oldest.
+    private static async Task<Guid> DueNoteIdAsync(TemporaryDatabase database, Guid tenantId, int skip)
     {
-        await using var connection = new NpgsqlConnection(database.ConnectionString);
-        await connection.OpenAsync();
-        await using var command = new NpgsqlCommand(
-            """SELECT "State" FROM public.sweep_row_handler_status""",
-            connection
+        await using var db = new SampleDbContext(
+            new DbContextOptionsBuilder<SampleDbContext>()
+                .UseNpgsql(database.ConnectionString)
+                .Options
         );
-        var states = new List<SweepRowHandlerDispatchState>();
-        await using var reader = await command.ExecuteReaderAsync();
-        while (await reader.ReadAsync())
-        {
-            states.Add((SweepRowHandlerDispatchState)reader.GetInt32(0));
-        }
-
-        return states;
+        return await db
+            .Notes.Where(note => note.TenantId == tenantId && note.CreatedAt < AsOf.AddDays(-1))
+            .OrderBy(note => note.CreatedAt)
+            .Select(note => note.Id)
+            .Skip(skip)
+            .FirstAsync();
     }
 
     private static async Task<Guid> FirstNoteIdAsync(TemporaryDatabase database, Guid tenantId)
@@ -1818,65 +1727,36 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
         }
     }
 
-    // Counts deliveries so that exactly the first one fails, and can make every delivery wait
-    // until its flush is cancelled.
-    private sealed class CoverageHandlerSink
+    // Records each note its step runs for, and can make the next one fail.
+    private sealed class CoverageStepSink
     {
-        private int deliveries;
+        private readonly System.Collections.Concurrent.ConcurrentQueue<Guid> ran = new();
 
-        public int Failures { get; private set; }
+        public IReadOnlyList<Guid> Ran => [.. ran];
 
-        public bool BlockDeliveries { get; set; }
+        public bool FailNext { get; set; }
 
-        public bool FailNextBefore { get; set; }
-
-        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        public bool FailThisDelivery()
-        {
-            if (Interlocked.Increment(ref deliveries) != 1)
-            {
-                return false;
-            }
-
-            Failures++;
-            return true;
-        }
+        public void Record(Guid noteId) => ran.Enqueue(noteId);
     }
 
-    [RowHandlerId("b8e1c4a7-3d26-4f59-9a0e-7c5d2e8f1b34")]
-    private sealed class CoverageNoteHandler(CoverageHandlerSink sink) : IRetentionHandler<Note>
+    // Records the note, and fails it when the sink says so. It sends no SQL.
+    private sealed class CoverageNoteStep(CoverageStepSink sink) : IRetentionDependents<Note>
     {
-        public Task OnBeforeAsync(Note row, RetentionBeforeContext ctx, CancellationToken ct)
+        public Task RetireAsync(Note row, RetentionDependentsContext ctx, CancellationToken ct)
         {
-            if (sink.FailNextBefore)
+            sink.Record(row.Id);
+            if (sink.FailNext)
             {
-                sink.FailNextBefore = false;
-                throw new InvalidOperationException("OnBefore fails");
+                sink.FailNext = false;
+                throw new InvalidOperationException("the step fails");
             }
 
-            ctx.Snapshot["body"] = row.Body;
             return Task.CompletedTask;
-        }
-
-        public async Task OnAfterAsync(RetentionAfterContext<Note> ctx, CancellationToken ct)
-        {
-            if (sink.BlockDeliveries)
-            {
-                sink.Started.TrySetResult();
-                await Task.Delay(Timeout.Infinite, ct);
-            }
-
-            if (sink.FailThisDelivery())
-            {
-                throw new InvalidOperationException("the first delivery fails");
-            }
         }
     }
 
     // On the first note it reaches, moves the note out of scope (it is no longer due); the
     // others it leaves alone. Its SQL starts with the host comment.
-    [RowHandlerId("5d9a2e6c-1b73-4a84-8c0f-3e7b9d1a4f26")]
     private sealed class NoteStep(SampleDbContext db) : IRetentionDependents<Note>
     {
         private static int calls;
@@ -1977,7 +1857,6 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
 
     // Deletes every link when it retires a note: a host's step reaching a row a covered hold path
     // protects. Its SQL starts with the host comment.
-    [RowHandlerId("e3a7c1d9-5f48-4b02-a6d1-8c4e0b2f7a95")]
     private sealed class LinkDeletingNoteStep(
         HeldWithReadinessEndToEndTests.HeldWithReadinessDbContext db
     ) : IRetentionDependents<HeldWithReadinessEndToEndTests.ReadinessNote>

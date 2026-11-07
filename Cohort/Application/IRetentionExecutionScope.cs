@@ -3,7 +3,8 @@ namespace Cohort.Application;
 /// <summary>
 /// Tells the host whose work each DI scope Cohort creates is doing, and lets it wrap that work,
 /// so the host's tenant isolation (for example PostgreSQL row-level security) covers Cohort's
-/// own sweeps, previews, erasures, row-handler deliveries, pruning and readiness checks.
+/// own sweeps, previews, erasures, dependents steps, abandoned-run recovery, pruning and
+/// readiness checks.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -20,10 +21,8 @@ namespace Cohort.Application;
 /// for different work. Some work runs inside another scope's work, so calls nest: each worker
 /// pass runs inside the worker's <see cref="RetentionSystemWork.WorkerCoordination"/> work,
 /// readiness's <see cref="RetentionSystemWork.Readiness"/> check can run inside any operation,
-/// and each batch with row handlers runs its own scope, for the run's tenant, inside the
-/// sweep's or erasure's work (inside your own scope for a caller-transaction erasure), and each
-/// <c>OnAfterAsync</c> delivery runs its own scope, for the row's tenant, inside the
-/// dispatcher's <see cref="RetentionSystemWork.RowDispatch"/> work for its batch.
+/// and each batch with a dependents step runs its own scope, for the run's tenant, inside the
+/// sweep's or erasure's work (inside your own scope for a caller-transaction erasure).
 /// An inner call's context wholly replaces the outer one for its work: set it, don't merge it.
 /// Restore anything you change outside the scope's own services when the work returns.
 /// Cohort creates its own savepoints only after its transactions start, so isolation applied
@@ -32,15 +31,14 @@ namespace Cohort.Application;
 /// </para>
 /// <para>
 /// Tenanted work only ever runs as <see cref="RetentionExecutionContext.Tenant"/>: each
-/// batch's row handlers get their own scope for <c>OnBeforeAsync</c>, run as the batch's
-/// tenant on the run's connection, and every <c>OnAfterAsync</c> delivery gets its own scope
-/// run as the row's tenant. No host code
-/// runs under <see cref="RetentionExecutionContext.System"/> against tenanted host rows.
+/// batch's dependents step gets its own scope, run as the batch's tenant on the run's
+/// connection. No host code runs under <see cref="RetentionExecutionContext.System"/> against
+/// tenanted host rows.
 /// </para>
 /// <para>
 /// Cohort runs some statements through ADO.NET directly on the scope's DbContext connection,
 /// outside EF's command pipeline. Apply isolation when the connection opens (an EF
-/// <c>DbConnectionInterceptor</c>), not per EF command. A row-handler scope's context is
+/// <c>DbConnectionInterceptor</c>), not per EF command. A dependents step scope's context is
 /// pointed at the run's connection, which already carries its isolation; Cohort closes a
 /// connection the hook opened on it first.
 /// </para>
@@ -119,16 +117,16 @@ public enum RetentionSystemWork
     WorkerCoordination = 1,
 
     /// <summary>
-    /// Sweeps, previews, erasures and row-handler deliveries for <c>[RetentionTenantless]</c>
+    /// Sweeps, previews, erasures and dependents steps for <c>[RetentionTenantless]</c>
     /// entities, which have no tenant column.
     /// </summary>
     TenantlessPass = 2,
 
     /// <summary>
-    /// Row-handler bookkeeping across every tenant's queued work: claim, settle, recover,
-    /// requeue and scrub.
+    /// Abandoned-run recovery across every tenant's runs: settling as Failed a run left Started
+    /// whose owner is gone.
     /// </summary>
-    RowDispatch = 3,
+    Recovery = 3,
 
     /// <summary>Pruning Cohort's own run history and inactive holds.</summary>
     HistoryPruning = 4,

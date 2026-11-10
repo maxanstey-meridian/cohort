@@ -1,8 +1,11 @@
 using Cohort.Application;
 using Cohort.Domain;
+using Cohort.Hosting;
+using Cohort.Infrastructure.Migrations;
 using Cohort.Sample.Entities;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
 using Npgsql;
@@ -649,6 +652,105 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
         (await verify.Notes.SingleAsync(note => note.Id == editedId)).Body.Should().Be("edited in the callback");
     }
 
+    // The host loaded a customer whose owned values the failed attempt's callback replaced
+    // (Shipping), edited in place (Billing, an owned type two navigations share), and cut down
+    // (Phones). The retry must start from the values the host loaded, or it either dies looking
+    // for the replaced instance or sees an edit it makes again as no change and saves nothing.
+    [Fact]
+    public async Task A_Transient_Failure_Before_The_Commit_Restores_The_Owned_Values_The_Host_Loaded_Before_The_Call()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(ConnectionString);
+        var tenantId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        var customerId = Guid.NewGuid();
+        var deletesSeen = 0;
+        var callbackRuns = 0;
+        var seenAtStart = new List<string>();
+        var services = new ServiceCollection();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().AddInMemoryCollection().Build());
+        services.AddLogging();
+        services.AddDbContext<OwnedValuesDbContext>(options =>
+            options.UseNpgsql(
+                new PassThroughConnection(
+                    new NpgsqlConnection(database.ConnectionString),
+                    rewriteCommandText: text =>
+                        text.Contains("DELETE FROM notes", StringComparison.Ordinal)
+                        && Interlocked.Increment(ref deletesSeen) == 1
+                            ? "DO $$ BEGIN RAISE EXCEPTION 'injected deadlock' USING ERRCODE = '40P01'; END $$"
+                            : text
+                ),
+                contextOwnsConnection: true,
+                npgsql => npgsql.EnableRetryOnFailure(
+                    maxRetryCount: 2,
+                    maxRetryDelay: TimeSpan.FromMilliseconds(50),
+                    errorCodesToAdd: null
+                )
+            )
+        );
+        services.AddSingleton<IRetentionRuleProvider>(new SampleRetentionRuleProvider());
+        services.AddSingleton(RetentionExecutionScope.Unisolated);
+        services.AddCohort<OwnedValuesDbContext>();
+        await using var provider = services.BuildServiceProvider(validateScopes: true);
+        // EnsureCreated needs a plain Npgsql connection, so the schema and rows go in through one.
+        await using (var seed = new OwnedValuesDbContext(
+            new DbContextOptionsBuilder<OwnedValuesDbContext>().UseNpgsql(database.ConnectionString).Options
+        ))
+        {
+            await seed.Database.EnsureCreatedAsync();
+            seed.Notes.Add(new Note
+            {
+                Id = noteId,
+                TenantId = tenantId,
+                CreatedAt = DateTimeOffset.UtcNow.AddDays(-60),
+                Body = "deletion target",
+            });
+            seed.Customers.Add(new OwnedValuesCustomer
+            {
+                Id = customerId,
+                Shipping = new OwnedValuesAddress { City = "Leeds" },
+                Billing = new OwnedValuesAddress { City = "York" },
+                Phones = [new OwnedValuesPhone { Number = "first" }, new OwnedValuesPhone { Number = "second" }],
+            });
+            await seed.SaveChangesAsync();
+        }
+
+        await using (var scope = provider.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<OwnedValuesDbContext>();
+            var customer = await db.Customers.SingleAsync(candidate => candidate.Id == customerId);
+            var target = await db.Notes.SingleAsync(note => note.Id == noteId);
+
+            var outcome = await scope.ServiceProvider.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [new RetentionTarget(RetentionEntityIdentity.For<Note>(), noteId.ToString(), tenantId)],
+                async ct =>
+                {
+                    callbackRuns++;
+                    seenAtStart.Add(
+                        $"{customer.Shipping.City}/{customer.Billing.City}/{string.Join(",", customer.Phones.Select(phone => phone.Number).Order())}"
+                    );
+                    customer.Shipping = new OwnedValuesAddress { City = "Bath" };
+                    customer.Billing.City = "Hull";
+                    customer.Phones.RemoveAll(phone => phone.Number == "first");
+                    db.Notes.Remove(target);
+                    await db.SaveChangesAsync(ct);
+                }
+            );
+
+            outcome.Should().Be(RetentionDeletionOutcome.Executed);
+        }
+
+        deletesSeen.Should().Be(2);
+        callbackRuns.Should().Be(2);
+        seenAtStart.Should().Equal("Leeds/York/first,second", "Leeds/York/first,second");
+        await using var verifyScope = provider.CreateAsyncScope();
+        var verify = verifyScope.ServiceProvider.GetRequiredService<OwnedValuesDbContext>();
+        (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeFalse();
+        var saved = await verify.Customers.SingleAsync(candidate => candidate.Id == customerId);
+        saved.Shipping.City.Should().Be("Bath");
+        saved.Billing.City.Should().Be("Hull");
+        saved.Phones.Select(phone => phone.Number).Should().Equal("second");
+    }
+
     [Fact]
     public async Task A_Failed_Commit_Leaves_The_Callbacks_Tracked_Entities_Cleared_And_The_Row_In_Place()
     {
@@ -715,6 +817,51 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
                     )
                 )
         );
+
+    // A host model whose unretained customer owns values: two navigations of one owned type, and a
+    // collection. Note is the retained deletion target.
+    private sealed class OwnedValuesDbContext(DbContextOptions<OwnedValuesDbContext> options) : DbContext(options)
+    {
+        public DbSet<Note> Notes => Set<Note>();
+        public DbSet<OwnedValuesCustomer> Customers => Set<OwnedValuesCustomer>();
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<Note>(entity =>
+            {
+                entity.ToTable("notes");
+                entity.HasKey(note => note.Id);
+            });
+            modelBuilder.Entity<OwnedValuesCustomer>(entity =>
+            {
+                entity.ToTable("owned_values_customers");
+                entity.HasKey(customer => customer.Id);
+                entity.OwnsOne(customer => customer.Shipping);
+                entity.OwnsOne(customer => customer.Billing);
+                entity.OwnsMany(customer => customer.Phones, phones => phones.HasKey(phone => phone.Id));
+            });
+            modelBuilder.ConfigureCohortTables();
+        }
+    }
+
+    private sealed class OwnedValuesCustomer
+    {
+        public Guid Id { get; set; }
+        public OwnedValuesAddress Shipping { get; set; } = new();
+        public OwnedValuesAddress Billing { get; set; } = new();
+        public List<OwnedValuesPhone> Phones { get; set; } = [];
+    }
+
+    private sealed class OwnedValuesAddress
+    {
+        public string City { get; set; } = "";
+    }
+
+    private sealed class OwnedValuesPhone
+    {
+        public Guid Id { get; set; } = Guid.NewGuid();
+        public string Number { get; set; } = "";
+    }
 
     private async Task SeedNotesAsync(Guid tenantId, params Guid[] noteIds)
     {

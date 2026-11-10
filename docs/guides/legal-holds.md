@@ -317,10 +317,9 @@ Cohort checks the callback's work before it commits:
   the exact rule above.
 - After a refusal or failure once the callback has run, the context's change tracker is
   cleared, so a later `SaveChanges` can't apply the callback's changes outside the hold check.
-- On a context with a retrying execution strategy, a transient failure re-runs the whole
-  deletion, callback included. Each attempt starts with the change tracker as it was when you
-  called `ExecuteAsync`: the entities you loaded before the call are tracked, unchanged, with
-  the values they had, and nothing the failed attempt tracked is carried over.
+- On a context with a retrying execution strategy, a transient failure is not retried: the
+  deletion rolls back and the failure reaches you, as on any context, because Cohort can't know
+  your callback is safe to run twice. Call `ExecuteAsync` again if it is.
 
 This guards deletion only. A callback that anonymises or soft-deletes a held row leaves the
 row in place, so Cohort can't see it.

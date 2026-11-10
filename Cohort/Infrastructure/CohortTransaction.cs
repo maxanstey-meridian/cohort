@@ -88,7 +88,45 @@ internal static class CohortTransaction
         return attempt.Result;
     }
 
-    /// <summary>The same for a unit with nothing to return.</summary>
+    /// <summary>
+    /// Runs <paramref name="unit"/> in a transaction and commits, for a unit that runs host code
+    /// Cohort can't know is safe to run twice. The unit still runs inside the context's strategy,
+    /// so its EF work passes on a retrying context, but it runs once: its failure leaves the
+    /// strategy as a result, which the strategy doesn't retry, and is thrown before the commit,
+    /// so the transaction rolls back and the caller sees the unit's own exception.
+    /// </summary>
+    internal static async Task<TResult> RunOnceAsync<TResult>(
+        DbContext db,
+        IsolationLevel isolation,
+        Func<IDbContextTransaction, CancellationToken, Task<TResult>> unit,
+        CancellationToken ct
+    )
+    {
+        var outcome = await RunAsync<(TResult Result, ExceptionDispatchInfo? Failure)>(
+            db,
+            isolation,
+            async (transaction, token) =>
+            {
+                try
+                {
+                    return (await unit(transaction, token), null);
+                }
+                catch (Exception failure)
+                {
+                    return (default!, ExceptionDispatchInfo.Capture(failure));
+                }
+            },
+            beforeCommit: (_, attempt, _) =>
+            {
+                attempt.Failure?.Throw();
+                return Task.CompletedTask;
+            },
+            ct
+        );
+        return outcome.Result;
+    }
+
+    /// <summary><see cref="RunAsync{TResult}"/> for a unit with nothing to return.</summary>
     internal static Task RunAsync(
         DbContext db,
         IsolationLevel isolation,

@@ -4,8 +4,6 @@ using System.Data.Common;
 using Cohort.Application;
 
 using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.ChangeTracking;
-using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -63,30 +61,21 @@ internal sealed class EfRetentionDeletion(
 
         await readinessValidator.ValidateAsync(ct);
         // The hold checks rely on each statement taking a fresh snapshot after the advisory lock.
-        // On a context with a retrying execution strategy a transient failure before the commit
-        // runs the whole deletion again, callback included, each attempt in a fresh transaction.
-        // A failed attempt clears the tracker (see DeleteAsync), so a retried attempt puts back what
-        // the host had loaded: the precondition above guarantees all of it is unchanged.
-        var trackedAtStart = SnapshotTracked();
-        var attempts = 0;
+        // The callback is host code that Cohort can't know is safe to run twice, so the deletion
+        // runs once, on a context with a retrying execution strategy too: a transient failure
+        // rolls back and reaches the caller, who calls again if the callback can be repeated.
         var callbackReturned = false;
         try
         {
-            return await CohortTransaction.RunAsync(
+            return await CohortTransaction.RunOnceAsync(
                 db,
                 IsolationLevel.ReadCommitted,
                 async (transaction, token) =>
                 {
-                    if (++attempts > 1)
-                    {
-                        RestoreTracked(trackedAtStart);
-                    }
-
                     var outcome = await DeleteAsync(requestedTargets, deletion, transaction, token);
                     callbackReturned = outcome == RetentionDeletionOutcome.Executed;
                     return outcome;
                 },
-                beforeCommit: null,
                 ct
             );
         }
@@ -96,63 +85,6 @@ internal sealed class EfRetentionDeletion(
             // left tracked is no longer true.
             db.ChangeTracker.Clear();
             throw;
-        }
-    }
-
-    // Join entities of skip navigations are property bags; attaching their two ends puts them back,
-    // so they are not snapshotted. Owned types that two navigations share are shared-type entries
-    // too, but their instances are real objects the host holds: they are snapshotted.
-    private TrackedState SnapshotTracked()
-    {
-        var entries = db.ChangeTracker.Entries().Where(entry => !entry.Metadata.IsPropertyBag).ToArray();
-        return new TrackedState(
-            entries
-                .Select(entry => new TrackedEntity(entry.Entity, entry.Metadata, entry.CurrentValues.Clone()))
-                .ToArray(),
-            entries
-                .SelectMany(entry => entry.Navigations)
-                .Where(navigation => navigation.Metadata is INavigation { IsOnDependent: false, ForeignKey.IsOwnership: true })
-                .Select(navigation => new OwnedNavigation(navigation))
-                .ToArray()
-        );
-    }
-
-    // The failed attempt's callback may have edited, removed, or added to what the host loaded, and
-    // the instances keep those edits: put the values back, and track exactly what was tracked.
-    private void RestoreTracked(TrackedState snapshot)
-    {
-        db.ChangeTracker.Clear();
-
-        // Owned instances are tracked only through their owner's navigation, and the callback may
-        // have replaced the instance or cut down the collection, so point each navigation back at
-        // what it held before attaching the owner.
-        foreach (var owned in snapshot.OwnedNavigations)
-        {
-            owned.PutBack();
-        }
-
-        foreach (var tracked in snapshot.Entities.Where(tracked => !tracked.Type.IsOwned()))
-        {
-            db.Attach(tracked.Entity);
-        }
-
-        var entries = db.ChangeTracker.Entries().ToDictionary(entry => entry.Entity, ReferenceEqualityComparer.Instance);
-        foreach (var tracked in snapshot.Entities)
-        {
-            var entry = entries[tracked.Entity];
-            entry.OriginalValues.SetValues(tracked.Values);
-            entry.CurrentValues.SetValues(tracked.Values);
-            entry.State = EntityState.Unchanged;
-        }
-
-        // Attaching follows navigations, which the failed attempt may have pointed at new entities.
-        var snapshotted = snapshot.Entities.Select(tracked => tracked.Entity).ToHashSet(ReferenceEqualityComparer.Instance);
-        foreach (var entry in entries.Values.Where(entry => !entry.Metadata.IsPropertyBag))
-        {
-            if (!snapshotted.Contains(entry.Entity))
-            {
-                entry.State = EntityState.Detached;
-            }
         }
     }
 
@@ -244,7 +176,7 @@ internal sealed class EfRetentionDeletion(
         {
             // The transaction rolls back on dispose. Anything still tracked (an unsaved Remove, or
             // the entries of a SaveChanges that failed) would otherwise apply on the host's next
-            // save, outside the lock and the hold check, and a retried attempt would start with it.
+            // save, outside the lock and the hold check.
             db.ChangeTracker.Clear();
             throw;
         }
@@ -271,50 +203,6 @@ internal sealed class EfRetentionDeletion(
             statement.Sql
         );
         return await command.ExecuteScalarAsync(ct) is not null;
-    }
-
-    private sealed record TrackedEntity(object Entity, IEntityType Type, PropertyValues Values);
-
-    private sealed record TrackedState(TrackedEntity[] Entities, OwnedNavigation[] OwnedNavigations);
-
-    // What an owner's ownership navigation held: the owned instance, or for a collection the
-    // collection object and the instances in it.
-    private sealed class OwnedNavigation(NavigationEntry entry)
-    {
-        private readonly object owner = entry.EntityEntry.Entity;
-        private readonly INavigationBase navigation = entry.Metadata;
-        private readonly object? value = entry.CurrentValue;
-        private readonly object[] items = entry.CurrentValue is System.Collections.IEnumerable collection
-            ? collection.Cast<object>().ToArray()
-            : [];
-
-        public void PutBack()
-        {
-            if (navigation.FieldInfo is { } field)
-            {
-                field.SetValue(owner, value);
-            }
-            else if (navigation.PropertyInfo is { } property)
-            {
-                property.SetValue(owner, value);
-            }
-
-            if (value is null || !navigation.IsCollection)
-            {
-                return;
-            }
-
-            var collectionType = typeof(ICollection<>).MakeGenericType(navigation.TargetEntityType.ClrType);
-            var clear = collectionType.GetMethod(nameof(ICollection<object>.Clear))
-                ?? throw new InvalidOperationException($"{collectionType} has no Clear.");
-            var add = collectionType.GetMethod(nameof(ICollection<object>.Add))
-                ?? throw new InvalidOperationException($"{collectionType} has no Add.");
-            clear.Invoke(value, null);
-            foreach (var item in items)
-            {
-                add.Invoke(value, [item]);
-            }
-        }
     }
 
     private sealed record ResolvedTarget(

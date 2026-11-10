@@ -87,6 +87,7 @@ failure before the commit runs that transaction again from the start. The except
 failure while a dependents step runs: that fails the row's step, as on any context, and the
 batch carries on. A commit that fails is not retried: the run records the failure and the next
 run picks the rows up. A run that loses its database session stops committing, retry or not.
+An `IRetentionDeletion` callback is your code, so Cohort never re-runs it.
 
 ## The scheduled worker
 

@@ -134,10 +134,6 @@ Changed (breaking):
   context is `RetentionSystemWork.Recovery`, which replaces `RowDispatch`: move your execution
   scope's `RowDispatch` arm to it (it needs `SELECT` and `UPDATE` on `sweep_run`).
 - A failing dependents step's skipped row is recorded in `sweep_run_row_detail.Failure`.
-- An `ErasureTransaction.Caller` erasure on a context with a retrying execution strategy
-  (`EnableRetryOnFailure()`) is refused unless your transaction and the call run inside
-  `db.Database.CreateExecutionStrategy().ExecuteAsync(...)`. 0.11.0 ran it when no entity had a
-  dependents step or a per-row anonymise factory.
 - `AddRetentionDependents<TEntity, TStep>` has one overload, with
   `bool retiresReferencingRows = true`, in place of 0.11.0's: source still compiles, but a
   library built against 0.11.0 breaks at the binary level, so recompile it against 0.12.0.
@@ -163,7 +159,8 @@ Fixed:
   an `IRetentionDeletion` callback threw at its first save. On such a context Cohort's own
   transactions now run inside its execution strategy, which retries a transient failure up to
   the commit; a context that doesn't retry behaves as before. A `Caller` erasure outside the
-  strategy is refused with a message that says how to call it.
+  strategy is refused with a message that says how to call it. An `IRetentionDeletion` callback
+  is never re-run: a transient failure rolls the deletion back and reaches the caller.
 
 Upgrade: [Legal Holds](https://maxanstey-meridian.github.io/cohort/guides/legal-holds#upgrading-to-0-12-0),
 [Startup Validation](https://maxanstey-meridian.github.io/cohort/reference/startup-validation#upgrading-to-0-12-0),

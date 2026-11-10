@@ -32,6 +32,14 @@ A new `IFoo` interface ships in the same PR as an end-to-end test that exercises
 
 Start in `Cohort.Sample.Tests/` with a red end-to-end test. Then make it pass. The sample is the dogfood project — if the feature can't be exercised through the sample, either the feature's shape is wrong or the sample needs a new entity. Both are worth the friction.
 
+## Gate
+
+`dotnet build Cohort.slnx && dotnet test Cohort.slnx --no-build && (cd docs && pnpm run docs:build)`
+
+The e2e suite needs Docker (Testcontainers Postgres). Targeted tests:
+`dotnet test Cohort.Sample.Tests/Cohort.Sample.Tests.csproj --filter "FullyQualifiedName~<TestClass>"`.
+The repo names no format, lint, or mutation command.
+
 ## Project layout
 
 ```

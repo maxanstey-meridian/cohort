@@ -561,7 +561,7 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
-    public async Task A_Transient_Failure_Before_The_Commit_Runs_The_Callback_Again_With_An_Empty_Change_Tracker()
+    public async Task A_Transient_Failure_Before_The_Commit_Runs_The_Callback_Again_Without_The_Failed_Attempts_Entities()
     {
         var tenantId = Guid.NewGuid();
         var noteId = Guid.NewGuid();
@@ -599,6 +599,54 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
         outcome.Should().Be(RetentionDeletionOutcome.Executed);
         await using var verify = Host.CreateDbContext();
         (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeFalse();
+    }
+
+    // The host loaded both rows before the call. The failed attempt's callback edited one and
+    // removed the other, and the failure cleared the tracker; the retry must start with both
+    // tracked and unchanged again, or its edit saves nothing and the commit drops it.
+    [Fact]
+    public async Task A_Transient_Failure_Before_The_Commit_Restores_The_Entities_The_Host_Loaded_Before_The_Call()
+    {
+        var tenantId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        var editedId = Guid.NewGuid();
+        await SeedNotesAsync(tenantId, noteId, editedId);
+        var deletesSeen = 0;
+        var callbackRuns = 0;
+        var trackedAtStart = new List<(int Count, bool AllUnchanged)>();
+        using var host = RetryingHost(text =>
+            text.StartsWith("DELETE FROM notes", StringComparison.Ordinal)
+            && Interlocked.Increment(ref deletesSeen) == 1
+                ? "DO $$ BEGIN RAISE EXCEPTION 'injected deadlock' USING ERRCODE = '40P01'; END $$"
+                : text
+        );
+
+        var outcome = await host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            var edited = await db.Notes.SingleAsync(note => note.Id == editedId);
+            var target = await db.Notes.SingleAsync(note => note.Id == noteId);
+            return await services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [new RetentionTarget(RetentionEntityIdentity.For<Note>(), noteId.ToString(), tenantId)],
+                async ct =>
+                {
+                    callbackRuns++;
+                    var entries = db.ChangeTracker.Entries().ToArray();
+                    trackedAtStart.Add((entries.Length, entries.All(entry => entry.State == EntityState.Unchanged)));
+                    edited.Body = "edited in the callback";
+                    db.Notes.Remove(target);
+                    await db.SaveChangesAsync(ct);
+                }
+            );
+        });
+
+        deletesSeen.Should().Be(2);
+        callbackRuns.Should().Be(2);
+        trackedAtStart.Should().Equal((2, true), (2, true));
+        outcome.Should().Be(RetentionDeletionOutcome.Executed);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeFalse();
+        (await verify.Notes.SingleAsync(note => note.Id == editedId)).Body.Should().Be("edited in the callback");
     }
 
     [Fact]

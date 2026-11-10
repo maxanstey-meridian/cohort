@@ -4,6 +4,8 @@ using System.Data.Common;
 using Cohort.Application;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.ChangeTracking;
+using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -63,6 +65,10 @@ internal sealed class EfRetentionDeletion(
         // The hold checks rely on each statement taking a fresh snapshot after the advisory lock.
         // On a context with a retrying execution strategy a transient failure before the commit
         // runs the whole deletion again, callback included, each attempt in a fresh transaction.
+        // A failed attempt clears the tracker (see DeleteAsync), so a retried attempt puts back what
+        // the host had loaded: the precondition above guarantees all of it is unchanged.
+        var trackedAtStart = SnapshotTracked();
+        var attempts = 0;
         var callbackReturned = false;
         try
         {
@@ -71,6 +77,11 @@ internal sealed class EfRetentionDeletion(
                 IsolationLevel.ReadCommitted,
                 async (transaction, token) =>
                 {
+                    if (++attempts > 1)
+                    {
+                        RestoreTracked(trackedAtStart);
+                    }
+
                     var outcome = await DeleteAsync(requestedTargets, deletion, transaction, token);
                     callbackReturned = outcome == RetentionDeletionOutcome.Executed;
                     return outcome;
@@ -85,6 +96,44 @@ internal sealed class EfRetentionDeletion(
             // left tracked is no longer true.
             db.ChangeTracker.Clear();
             throw;
+        }
+    }
+
+    // Join entities of skip navigations are shared-type entries; attaching their two ends puts them
+    // back, so they are not snapshotted.
+    private TrackedEntity[] SnapshotTracked() =>
+        db.ChangeTracker.Entries()
+            .Where(entry => !entry.Metadata.HasSharedClrType)
+            .Select(entry => new TrackedEntity(entry.Entity, entry.Metadata, entry.CurrentValues.Clone()))
+            .ToArray();
+
+    // The failed attempt's callback may have edited, removed, or added to what the host loaded, and
+    // the instances keep those edits: put the values back, and track exactly what was tracked.
+    private void RestoreTracked(TrackedEntity[] snapshot)
+    {
+        db.ChangeTracker.Clear();
+        foreach (var tracked in snapshot.Where(tracked => !tracked.Type.IsOwned()))
+        {
+            db.Attach(tracked.Entity);
+        }
+
+        var entries = db.ChangeTracker.Entries().ToDictionary(entry => entry.Entity, ReferenceEqualityComparer.Instance);
+        foreach (var tracked in snapshot)
+        {
+            var entry = entries[tracked.Entity];
+            entry.OriginalValues.SetValues(tracked.Values);
+            entry.CurrentValues.SetValues(tracked.Values);
+            entry.State = EntityState.Unchanged;
+        }
+
+        // Attaching follows navigations, which the failed attempt may have pointed at new entities.
+        var snapshotted = snapshot.Select(tracked => tracked.Entity).ToHashSet(ReferenceEqualityComparer.Instance);
+        foreach (var entry in entries.Values.Where(entry => !entry.Metadata.HasSharedClrType))
+        {
+            if (!snapshotted.Contains(entry.Entity))
+            {
+                entry.State = EntityState.Detached;
+            }
         }
     }
 
@@ -204,6 +253,8 @@ internal sealed class EfRetentionDeletion(
         );
         return await command.ExecuteScalarAsync(ct) is not null;
     }
+
+    private sealed record TrackedEntity(object Entity, IEntityType Type, PropertyValues Values);
 
     private sealed record ResolvedTarget(
         RetentionEntry Entry,

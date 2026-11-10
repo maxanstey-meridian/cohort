@@ -280,7 +280,11 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
     // Before 0.11.0 a run whose step skipped rows settled Succeeded, and the migration moves it
     // to PartiallyFailed, as a run with skipped rows settles now. A Succeeded run whose only
     // dead-letter is an after-commit one has no skipped row and stays Succeeded, and a Failed run
-    // with a skipped row stays Failed.
+    // with a skipped row stays Failed. The rewritten run's Error is the line the live writer
+    // writes for each entity type with skipped rows, ordered by entity type and joined by a
+    // newline; the two-entity run seeds its types out of order, with a mutated row beside the
+    // skipped ones that the count must leave out. A Succeeded run that already has an Error keeps
+    // it when it moves to PartiallyFailed.
     [Fact]
     public async Task Remove_Row_Handler_Queue_Migration_Moves_Only_A_Skipped_Rows_Error_Into_Failure()
     {
@@ -289,10 +293,13 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
         const string succeededError = "type=System.TimeoutException;code=;diagnosticId=00000000000000aa";
         const string retriedError = "type=System.TimeoutException;code=;diagnosticId=00000000000000bb";
         const string failedRunError = "reason=entity-failed";
+        const string legacyRunError = "reason=legacy-run-error";
         var options = CreateOptions();
         var sweepId = Guid.NewGuid();
         var legacySkippedSweepId = Guid.NewGuid();
         var legacyAfterCommitSweepId = Guid.NewGuid();
+        var legacyTwoEntitySweepId = Guid.NewGuid();
+        var legacyErroredSweepId = Guid.NewGuid();
         var failedSweepId = Guid.NewGuid();
         var tenantId = Guid.NewGuid();
         var queuedAt = new DateTimeOffset(2026, 10, 30, 3, 0, 0, TimeSpan.Zero);
@@ -312,6 +319,8 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
                         (@sweepId, @queuedAt, 2, @queuedAt + INTERVAL '1 minute', INTERVAL '1 minute', 2, FALSE, @tenantId, 1, 'reason=rows-skipped'),
                         (@legacySkippedSweepId, @queuedAt, 1, @queuedAt + INTERVAL '1 minute', INTERVAL '1 minute', 2, FALSE, @tenantId, 0, NULL),
                         (@legacyAfterCommitSweepId, @queuedAt, 1, @queuedAt + INTERVAL '1 minute', INTERVAL '1 minute', 2, FALSE, @tenantId, 1, NULL),
+                        (@legacyTwoEntitySweepId, @queuedAt, 1, @queuedAt + INTERVAL '1 minute', INTERVAL '1 minute', 2, FALSE, @tenantId, 1, NULL),
+                        (@legacyErroredSweepId, @queuedAt, 1, @queuedAt + INTERVAL '1 minute', INTERVAL '1 minute', 2, FALSE, @tenantId, 0, @legacyRunError),
                         (@failedSweepId, @queuedAt, 3, @queuedAt + INTERVAL '1 minute', INTERVAL '1 minute', 2, FALSE, @tenantId, 0, @failedRunError);
 
                     WITH details AS (
@@ -324,6 +333,11 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
                             (@sweepId, @queuedAt, 'Cohort.Sample.Entities.Note', @entityId, 'retried-record', 'short-lived', 0, @tenantId, NULL),
                             (@legacySkippedSweepId, @queuedAt, 'Cohort.Sample.Entities.Note', @entityId, 'legacy-skipped-record', 'short-lived', 0, @tenantId, NULL),
                             (@legacyAfterCommitSweepId, @queuedAt, 'Cohort.Sample.Entities.Note', @entityId, 'legacy-mutated-record', 'short-lived', 0, @tenantId, NULL),
+                            (@legacyTwoEntitySweepId, @queuedAt, 'Cohort.Sample.Entities.Note', @entityId, 'two-note-skipped-a', 'short-lived', 0, @tenantId, NULL),
+                            (@legacyTwoEntitySweepId, @queuedAt, 'Cohort.Sample.Entities.Note', @entityId, 'two-note-skipped-b', 'short-lived', 0, @tenantId, NULL),
+                            (@legacyTwoEntitySweepId, @queuedAt, 'Cohort.Sample.Entities.Note', @entityId, 'two-note-mutated', 'short-lived', 0, @tenantId, NULL),
+                            (@legacyTwoEntitySweepId, @queuedAt, 'Cohort.Sample.Entities.BlobBackedFile', @entityId, 'two-blob-skipped', 'short-lived', 0, @tenantId, NULL),
+                            (@legacyErroredSweepId, @queuedAt, 'Cohort.Sample.Entities.Note', @entityId, 'errored-run-skipped-record', 'short-lived', 0, @tenantId, NULL),
                             (@failedSweepId, @queuedAt, 'Cohort.Sample.Entities.Note', @entityId, 'failed-run-skipped-record', 'short-lived', 0, @tenantId, NULL)
                         RETURNING "Id", "RecordId"
                     )
@@ -339,6 +353,11 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
                         ('retried-record', 'Legacy.Handler', 3, 2, INTERVAL '0 seconds', @retriedError),
                         ('legacy-skipped-record', 'Legacy.Handler', 3, 1, INTERVAL '0 seconds', @skippedError),
                         ('legacy-mutated-record', 'Legacy.Handler', 3, 1, INTERVAL '2 seconds', @afterCommitError),
+                        ('two-note-skipped-a', 'Legacy.Step', 3, 1, INTERVAL '0 seconds', @skippedError),
+                        ('two-note-skipped-b', 'Legacy.Step', 3, 1, INTERVAL '0 seconds', @skippedError),
+                        ('two-note-mutated', 'Legacy.Handler', 3, 1, INTERVAL '2 seconds', @afterCommitError),
+                        ('two-blob-skipped', 'Legacy.Step', 3, 1, INTERVAL '0 seconds', @skippedError),
+                        ('errored-run-skipped-record', 'Legacy.Step', 3, 1, INTERVAL '0 seconds', @skippedError),
                         ('failed-run-skipped-record', 'Legacy.Step', 3, 1, INTERVAL '0 seconds', @skippedError)
                     ) AS seed (record_id, handler_type, state, attempt, completed_after, last_error)
                         ON seed.record_id = details."RecordId";
@@ -346,6 +365,9 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
                 command.Parameters.AddWithValue("sweepId", sweepId);
                 command.Parameters.AddWithValue("legacySkippedSweepId", legacySkippedSweepId);
                 command.Parameters.AddWithValue("legacyAfterCommitSweepId", legacyAfterCommitSweepId);
+                command.Parameters.AddWithValue("legacyTwoEntitySweepId", legacyTwoEntitySweepId);
+                command.Parameters.AddWithValue("legacyErroredSweepId", legacyErroredSweepId);
+                command.Parameters.AddWithValue("legacyRunError", legacyRunError);
                 command.Parameters.AddWithValue("failedSweepId", failedSweepId);
                 command.Parameters.AddWithValue("failedRunError", failedRunError);
                 command.Parameters.AddWithValue("tenantId", tenantId);
@@ -397,7 +419,7 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
             """;
         readRuns.Parameters.AddWithValue(
             "sweepIds",
-            new[] { sweepId, legacySkippedSweepId, legacyAfterCommitSweepId, failedSweepId }
+            new[] { sweepId, legacySkippedSweepId, legacyAfterCommitSweepId, legacyTwoEntitySweepId, legacyErroredSweepId, failedSweepId }
         );
         var runs = new Dictionary<Guid, (int Status, string? Error)>();
         await using (var reader = await readRuns.ExecuteReaderAsync())
@@ -413,8 +435,14 @@ public sealed class SampleMigrationsEndToEndTests(PostgresFixture fixture) : IAs
                 new Dictionary<Guid, (int Status, string? Error)>
                 {
                     [sweepId] = (2, "reason=rows-skipped"),
-                    [legacySkippedSweepId] = (2, "reason=rows-skipped"),
+                    [legacySkippedSweepId] = (2, "reason=rows-skipped;entityType=Cohort.Sample.Entities.Note;count=1"),
                     [legacyAfterCommitSweepId] = (1, null),
+                    [legacyTwoEntitySweepId] = (
+                        2,
+                        "reason=rows-skipped;entityType=Cohort.Sample.Entities.BlobBackedFile;count=1\n"
+                            + "reason=rows-skipped;entityType=Cohort.Sample.Entities.Note;count=2"
+                    ),
+                    [legacyErroredSweepId] = (2, legacyRunError),
                     [failedSweepId] = (3, failedRunError),
                 }
             );

@@ -70,7 +70,21 @@ namespace Cohort.Sample.Migrations
 
                     UPDATE "public"."sweep_run" AS run
                     SET "Status" = 2,
-                        "Error" = COALESCE(run."Error", 'reason=rows-skipped')
+                        "Error" = COALESCE(
+                            run."Error",
+                            (
+                                SELECT string_agg(
+                                    'reason=rows-skipped;entityType=' || skipped."EntityType" || ';count=' || skipped.skipped_count,
+                                    E'\n' ORDER BY skipped."EntityType" COLLATE "C"
+                                )
+                                FROM (
+                                    SELECT detail."EntityType", count(*) AS skipped_count
+                                    FROM "public"."sweep_run_row_detail" AS detail
+                                    WHERE detail."SweepId" = run."SweepId" AND detail."Failure" IS NOT NULL
+                                    GROUP BY detail."EntityType"
+                                ) AS skipped
+                            )
+                        )
                     WHERE run."Status" = 1
                       AND EXISTS (
                           SELECT 1 FROM "public"."sweep_run_row_detail" AS detail

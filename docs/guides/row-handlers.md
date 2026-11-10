@@ -323,7 +323,21 @@ context (`RetentionSystemWork.RowDispatch`), the `Cohort:RowHandlerDispatch` opt
 
            UPDATE "public"."sweep_run" AS run
            SET "Status" = 2,
-               "Error" = COALESCE(run."Error", 'reason=rows-skipped')
+               "Error" = COALESCE(
+                   run."Error",
+                   (
+                       SELECT string_agg(
+                           'reason=rows-skipped;entityType=' || skipped."EntityType" || ';count=' || skipped.skipped_count,
+                           E'\n' ORDER BY skipped."EntityType" COLLATE "C"
+                       )
+                       FROM (
+                           SELECT detail."EntityType", count(*) AS skipped_count
+                           FROM "public"."sweep_run_row_detail" AS detail
+                           WHERE detail."SweepId" = run."SweepId" AND detail."Failure" IS NOT NULL
+                           GROUP BY detail."EntityType"
+                       ) AS skipped
+                   )
+               )
            WHERE run."Status" = 1
              AND EXISTS (
                  SELECT 1 FROM "public"."sweep_run_row_detail" AS detail
@@ -353,7 +367,10 @@ context (`RetentionSystemWork.RowDispatch`), the `Cohort:RowHandlerDispatch` opt
    `NULL`. The second marks each `Succeeded` run (`Status` 1) with a skipped row as
    `PartiallyFailed` (`Status` 2): before 0.11.0 such a run settled `Succeeded`, and history
    pruning would delete it at the succeeded-run retention rather than keep it for the
-   failed-run retention.
+   failed-run retention. Its `Error` reads as the library writes it: one
+   `reason=rows-skipped;entityType=<EntityType>;count=<n>` line per entity type with skipped
+   rows, ordered by entity type and joined by newlines. A run that already has an `Error` keeps
+   it.
 
    Run the migration as the tables' owner, which it needs to drop a table and a column. If you
    set `FORCE ROW LEVEL SECURITY` on Cohort's tables, as

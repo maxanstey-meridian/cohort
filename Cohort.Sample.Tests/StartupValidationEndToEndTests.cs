@@ -164,7 +164,7 @@ public sealed class StartupValidationEndToEndTests : IntegrationTestBase
     }
 
     // A container can resolve a step the IServiceCollection scan never saw; resolving it
-    // refuses it the same way instead of failing on a missing registration.
+    // refuses it with the same error.
     [Fact]
     public void Resolving_A_Step_Without_A_Registration_Refuses_It()
     {

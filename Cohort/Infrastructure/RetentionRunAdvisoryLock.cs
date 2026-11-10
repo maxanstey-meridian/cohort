@@ -13,6 +13,13 @@ namespace Cohort.Infrastructure;
 /// session-mode pooling: a transaction-mode pooler hands the session to someone else, and
 /// Npgsql multiplexing runs each command outside a transaction on whichever session is free
 /// (readiness refuses a multiplexed connection).
+/// <para>
+/// Hand-rolled rather than <c>DistributedLock.Postgres</c>: that package would replace the
+/// three one-statement acquire and release methods, and leave the held check asked inside the
+/// transaction about to commit, the unlock-all cleanup that keeps a session which may still
+/// hold a lock out of the pool, and the statements readiness explains as
+/// <see cref="SweepStatement"/>s written by hand beside it.
+/// </para>
 /// </summary>
 internal static class RetentionRunAdvisoryLock
 {

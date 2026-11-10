@@ -13,12 +13,15 @@ namespace Cohort.Sample.Tests;
 /// share one connection. <paramref name="rewriteCommandText"/>, when given, rewrites the text of
 /// every command made on it before it reaches the server, for a test that has to change a
 /// statement Cohort sends on raw ADO.NET, below EF's command interceptors.
+/// <paramref name="beforeCommit"/>, when given, runs before each of its transactions commits and
+/// can throw, for a test that has to fail a commit.
 /// </summary>
 internal sealed class PassThroughConnection(
     NpgsqlConnection inner,
     string connectionStringSuffix = "",
     bool ownsInner = true,
-    Func<string, string>? rewriteCommandText = null
+    Func<string, string>? rewriteCommandText = null,
+    Action? beforeCommit = null
 ) : DbConnection
 {
     [System.Diagnostics.CodeAnalysis.AllowNull]
@@ -48,7 +51,7 @@ internal sealed class PassThroughConnection(
         new PassThroughCommand(this, inner.CreateCommand(), rewriteCommandText);
 
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel) =>
-        new PassThroughTransaction(this, inner.BeginTransaction(isolationLevel));
+        new PassThroughTransaction(this, inner.BeginTransaction(isolationLevel), beforeCommit);
 
     public override ValueTask DisposeAsync() => ownsInner ? inner.DisposeAsync() : ValueTask.CompletedTask;
 
@@ -66,8 +69,11 @@ internal sealed class PassThroughConnection(
 // The transaction and command of that wrapper, as a profiler's are: neither is an Npgsql type,
 // so a caller's transaction on the wrapper is not an NpgsqlTransaction and readiness explains
 // its statements one at a time, in that transaction.
-internal sealed class PassThroughTransaction(PassThroughConnection connection, NpgsqlTransaction inner)
-    : DbTransaction
+internal sealed class PassThroughTransaction(
+    PassThroughConnection connection,
+    NpgsqlTransaction inner,
+    Action? beforeCommit = null
+) : DbTransaction
 {
     internal NpgsqlTransaction Inner => inner;
 
@@ -75,12 +81,37 @@ internal sealed class PassThroughTransaction(PassThroughConnection connection, N
 
     public override IsolationLevel IsolationLevel => inner.IsolationLevel;
 
-    public override void Commit() => inner.Commit();
+    public override void Commit()
+    {
+        beforeCommit?.Invoke();
+        inner.Commit();
+    }
 
     public override void Rollback() => inner.Rollback();
 
-    public override Task CommitAsync(CancellationToken cancellationToken = default) =>
-        inner.CommitAsync(cancellationToken);
+    // Cohort's row-by-row path and its entity savepoints run on the transaction's own savepoints.
+    public override bool SupportsSavepoints => inner.SupportsSavepoints;
+
+    public override void Save(string savepointName) => inner.Save(savepointName);
+
+    public override Task SaveAsync(string savepointName, CancellationToken cancellationToken = default) =>
+        inner.SaveAsync(savepointName, cancellationToken);
+
+    public override void Release(string savepointName) => inner.Release(savepointName);
+
+    public override Task ReleaseAsync(string savepointName, CancellationToken cancellationToken = default) =>
+        inner.ReleaseAsync(savepointName, cancellationToken);
+
+    public override void Rollback(string savepointName) => inner.Rollback(savepointName);
+
+    public override Task RollbackAsync(string savepointName, CancellationToken cancellationToken = default) =>
+        inner.RollbackAsync(savepointName, cancellationToken);
+
+    public override Task CommitAsync(CancellationToken cancellationToken = default)
+    {
+        beforeCommit?.Invoke();
+        return inner.CommitAsync(cancellationToken);
+    }
 
     public override Task RollbackAsync(CancellationToken cancellationToken = default) =>
         inner.RollbackAsync(cancellationToken);

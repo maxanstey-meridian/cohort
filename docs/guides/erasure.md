@@ -246,6 +246,9 @@ scoped for this reason. The erasure needs:
 - no unsaved changes on the context. Save or discard them first.
 - the context built from the container's options, where `AddCohort<TContext>()` adds its
   commit interceptor. A context whose options you built yourself is refused.
+- on a context with a retrying execution strategy, your transaction and the erasure call
+  inside `CreateExecutionStrategy().ExecuteAsync(...)`, as EF requires of your own work in
+  that transaction. Outside it, Cohort refuses.
 
 What changes compared with an ordinary erasure:
 

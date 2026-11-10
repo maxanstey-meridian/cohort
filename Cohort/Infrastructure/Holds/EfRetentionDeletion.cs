@@ -61,7 +61,40 @@ internal sealed class EfRetentionDeletion(
 
         await readinessValidator.ValidateAsync(ct);
         // The hold checks rely on each statement taking a fresh snapshot after the advisory lock.
-        await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+        // On a context with a retrying execution strategy a transient failure before the commit
+        // runs the whole deletion again, callback included, each attempt in a fresh transaction.
+        var callbackReturned = false;
+        try
+        {
+            return await CohortTransaction.RunAsync(
+                db,
+                IsolationLevel.ReadCommitted,
+                async (transaction, token) =>
+                {
+                    var outcome = await DeleteAsync(requestedTargets, deletion, transaction, token);
+                    callbackReturned = outcome == RetentionDeletionOutcome.Executed;
+                    return outcome;
+                },
+                beforeCommit: null,
+                ct
+            );
+        }
+        catch when (callbackReturned)
+        {
+            // Only the commit is left to fail: the callback's saves roll back with it, so what it
+            // left tracked is no longer true.
+            db.ChangeTracker.Clear();
+            throw;
+        }
+    }
+
+    private async Task<RetentionDeletionOutcome> DeleteAsync(
+        RetentionTarget[] requestedTargets,
+        Func<CancellationToken, Task> deletion,
+        IDbContextTransaction transaction,
+        CancellationToken ct
+    )
+    {
         var dbTransaction = transaction.GetDbTransaction();
         var resolvedTargets = new List<ResolvedTarget>(requestedTargets.Length);
 
@@ -138,14 +171,12 @@ internal sealed class EfRetentionDeletion(
                     $"The retention deletion callback deleted rows protected by active holds ({string.Join(", ", violated)}). Nothing was committed."
                 );
             }
-
-            await transaction.CommitAsync(ct);
         }
         catch
         {
             // The transaction rolls back on dispose. Anything still tracked (an unsaved Remove, or
             // the entries of a SaveChanges that failed) would otherwise apply on the host's next
-            // save, outside the lock and the hold check.
+            // save, outside the lock and the hold check, and a retried attempt would start with it.
             db.ChangeTracker.Clear();
             throw;
         }

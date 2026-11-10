@@ -2159,6 +2159,75 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeTrue();
     }
 
+    // A retrying execution strategy refuses EF work in a transaction begun outside it. The
+    // erasure's own EF work (a dependents step here) would throw EF's message mid-run, so the
+    // erasure refuses first, before it writes anything.
+    [Fact]
+    public async Task Caller_Mode_On_A_Retrying_Context_Refuses_A_Transaction_Begun_Outside_The_Strategy()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, markerId) = await SeedCallerErasureAsync(tenant.Id, subject);
+        using var host = RetryingHost(services => services.AddRetentionDependents<Note, NoteOutboxStep>());
+        var request = RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller);
+
+        await host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            var erasure = services.GetRequiredService<IRetentionErasureService>();
+
+            await using var transaction = await db.Database.BeginTransactionAsync();
+            var outside = () => erasure.ExecuteAsync(request);
+
+            (await outside.Should().ThrowAsync<InvalidOperationException>()).Which.Message.Should().Be(
+                "ErasureTransaction.Caller on a DbContext with a retrying execution strategy (EnableRetryOnFailure) must run inside that strategy: wrap your transaction and this call in db.Database.CreateExecutionStrategy().ExecuteAsync(...), as EF requires of your own work in it."
+            );
+        });
+
+        (await CountRunsAsync(tenant.Id)).Should().Be(0);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeTrue();
+        (await verify.Notes.SingleAsync(note => note.Id == markerId)).Body.Should().Be("marker-before");
+        (await verify.OutboxMessages.CountAsync(message => message.TenantId == tenant.Id)).Should().Be(0);
+    }
+
+    // The same erasure with the transaction and the call inside the strategy, as the refusal says.
+    // The step saves through the context, which is why the strategy has to be the host's.
+    [Fact]
+    public async Task Caller_Mode_On_A_Retrying_Context_Erases_Inside_The_Hosts_Strategy()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, markerId) = await SeedCallerErasureAsync(tenant.Id, subject);
+        using var host = RetryingHost(services => services.AddRetentionDependents<Note, NoteOutboxStep>());
+        var request = RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller);
+
+        var result = await host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            var erasure = services.GetRequiredService<IRetentionErasureService>();
+
+            return await db.Database.CreateExecutionStrategy().ExecuteAsync(async () =>
+            {
+                await using var transaction = await db.Database.BeginTransactionAsync();
+                (await db.Notes.SingleAsync(note => note.Id == markerId)).Body = "marker-after";
+                await db.SaveChangesAsync();
+                var erased = await erasure.ExecuteAsync(request);
+                await transaction.CommitAsync();
+                return erased;
+            });
+        });
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note)).Which.Affected.Should().Be(1);
+        (await LoadRunStatusAsync(result.SweepId)).Should().Be(SweepRunStatus.Succeeded);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeFalse();
+        (await verify.Notes.SingleAsync(note => note.Id == markerId)).Body.Should().Be("marker-after");
+        (await verify.OutboxMessages.Where(message => message.TenantId == tenant.Id).Select(message => message.Payload).ToListAsync())
+            .Should().Equal(erasedId.ToString());
+    }
+
     // PostgreSQL accepts READ UNCOMMITTED and runs it as READ COMMITTED, so the erasure's hold
     // checks see every committed hold and the caller's isolation is no reason to refuse.
     [Fact]
@@ -2639,6 +2708,26 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         command.CommandText = sql;
         await command.ExecuteNonQueryAsync();
     }
+
+    // The host's context retries transient failures, as a cloud Postgres host's would.
+    private CohortTestHost RetryingHost(Action<IServiceCollection> configureServices) =>
+        new(
+            ConnectionString,
+            configureServices: services =>
+            {
+                services.ConfigureDbContext<SampleDbContext>((_, options) =>
+                    options.UseNpgsql(
+                        ConnectionString,
+                        npgsql => npgsql.EnableRetryOnFailure(
+                            maxRetryCount: 2,
+                            maxRetryDelay: TimeSpan.FromMilliseconds(50),
+                            errorCodesToAdd: null
+                        )
+                    )
+                );
+                configureServices(services);
+            }
+        );
 
     private static ErasureScope CallerScope(Guid subject) =>
         new("user", subject, allowSoftDeleteAsErasure: true);

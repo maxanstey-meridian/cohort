@@ -70,6 +70,11 @@ row, the run's `TenantId`, and `At`, the database time the batch stamps its rows
   scope, so Cohort's change finds nothing (`reason=dependents-changed-row`). A cancellation the
   step raises itself, such as an `HttpClient` timeout, is a failure like any other; only the
   run's own token stops the run. The next run tries the row again.
+- **Retrying contexts.** On a context with a retrying execution strategy, a transient failure
+  elsewhere in the batch re-runs the batch, so your step can run more than once for a row. What
+  it wrote through its `DbContext` rolled back with the failed attempt. Anything it did
+  elsewhere did not. A failure while your step itself runs, a deadlock included, still fails
+  that row's step and is not retried.
 - **Holds.** A held row runs no step. Any change to, or removal of, a row under an active hold
   fails the step, whatever the row's entity, even if the step ends the hold first. A row is
   under a hold when the hold names it or covers it through a

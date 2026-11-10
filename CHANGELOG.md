@@ -154,6 +154,12 @@ Fixed:
 - History pruning ages runs and holds against the database clock, the clock that stamps
   `SettledAt` and judges whether a hold protects, instead of the host's. It reads the clock on
   every pass, with or without a `Schedule`.
+- On a context with `EnableRetryOnFailure()`, a sweep or erasure of an entity with a dependents
+  step or a per-row anonymise factory failed that entity, history pruning pruned nothing, and
+  an `IRetentionDeletion` callback threw at its first save. On such a context Cohort's own
+  transactions now run inside its execution strategy, which retries a transient failure up to
+  the commit; a context that doesn't retry behaves as before. A `Caller` erasure outside the
+  strategy is refused with a message that says how to call it.
 
 Upgrade: [Legal Holds](https://maxanstey-meridian.github.io/cohort/guides/legal-holds#upgrading-to-0-12-0),
 [Startup Validation](https://maxanstey-meridian.github.io/cohort/reference/startup-validation#upgrading-to-0-12-0),

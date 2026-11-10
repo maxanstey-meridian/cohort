@@ -493,16 +493,15 @@ internal sealed class RetentionRun(
         {
             ct.ThrowIfCancellationRequested();
 
-            SweepExecutionResult execution;
-            List<SweepEvent> committed = [];
+            // The unit of one batch. An owned batch can run more than once (a transient failure
+            // before its commit runs it again in a fresh transaction), so it builds what it
+            // returns on each attempt and leaves nothing behind. Cohort's own batch uses
             // READ COMMITTED: the lock query and mutation must see a hold committed after
             // discovery. In the caller's transaction (READ COMMITTED, checked on entry) a batch
             // neither begins nor commits; it commits with the caller.
-            await using (var batchTransaction = callerCommit is null
-                ? await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct)
-                : null)
+            async Task<BatchOutcome> BatchAsync(IDbContextTransaction batchTransaction, CancellationToken token)
             {
-                if (batchTransaction is not null)
+                if (callerCommit is null)
                 {
                     // Deferred constraints fail inside the statement that broke them, where the
                     // row can be blocked, rather than failing the whole batch at COMMIT. Only
@@ -513,39 +512,39 @@ internal sealed class RetentionRun(
                         batchTransaction.GetDbTransaction(),
                         "SET CONSTRAINTS ALL IMMEDIATE"
                     );
-                    await immediate.ExecuteNonQueryAsync(ct);
+                    await immediate.ExecuteNonQueryAsync(token);
                 }
 
                 // The batch's rows and events carry the database's time; the first batch
                 // reuses the time the entity just read.
-                var eventAt = nextBatchAt ?? await DatabaseClock.NowAsync(db, ct);
-                nextBatchAt = null;
-                execution = await strategy.ExecuteAsync(
+                var eventAt = nextBatchAt ?? await DatabaseClock.NowAsync(db, token);
+                var executed = await strategy.ExecuteAsync(
                     scope,
                     db.Database.GetDbConnection(),
-                    (batchTransaction ?? db.Database.CurrentTransaction!).GetDbTransaction(),
+                    batchTransaction.GetDbTransaction(),
                     new SweepMutationContext(SweepId, eventAt, batchSize, reached),
-                    ct
+                    token
                 );
                 if (
-                    execution.CandidateCount == batchSize
-                    && execution.BlockedRecordIds.Count == execution.CandidateCount
-                    && SchemaWideRefusal(rule.Strategy, execution.BlockedFailures) is { } refusal
+                    executed.CandidateCount == batchSize
+                    && executed.BlockedRecordIds.Count == executed.CandidateCount
+                    && SchemaWideRefusal(rule.Strategy, executed.BlockedFailures) is { } refusal
                 )
                 {
                     ExceptionDispatchInfo.Throw(refusal);
                 }
 
+                var events = new List<SweepEvent>();
                 // Row-detail audit commits with the batch whose mutations it documents: a
                 // crash later in the run cannot lose evidence for rows already changed, and
                 // affected ids never accumulate in memory.
                 if (perRowAudit)
                 {
-                    foreach (var recordId in execution.AffectedRecordIds)
+                    foreach (var recordId in executed.AffectedRecordIds)
                     {
                         var rowDetail = new SweepEvent.RowDetail(SweepId, eventAt, entry.EntityType, entry.RetentionEntityId, recordId, entry.Category, rule.Strategy, scope.Tenant.Id);
-                        await auditWriter.WriteAsync(rowDetail, ct);
-                        committed.Add(rowDetail);
+                        await auditWriter.WriteAsync(rowDetail, token);
+                        events.Add(rowDetail);
                     }
                 }
 
@@ -558,22 +557,30 @@ internal sealed class RetentionRun(
                     scope.Tenant.Id,
                     rule.Strategy,
                     scope.ResolvedPeriod,
-                    execution.AffectedRecordIds.Count,
-                    execution.SkippedCount,
-                    execution.BlockedRecordIds.Count,
+                    executed.AffectedRecordIds.Count,
+                    executed.SkippedCount,
+                    executed.BlockedRecordIds.Count,
                     rule.Provenance
                 );
-                await auditWriter.WriteAsync(progress, ct);
-                committed.Add(progress);
+                await auditWriter.WriteAsync(progress, token);
+                events.Add(progress);
 
-                if (batchTransaction is not null)
-                {
-                    await EnsureLocksHeldAsync(batchTransaction, ct);
-                    await batchTransaction.CommitAsync(ct);
-                }
+                return new BatchOutcome(executed, events);
             }
 
-            foreach (var evt in committed)
+            var outcome = callerCommit is null
+                ? await CohortTransaction.RunAsync(
+                    db,
+                    IsolationLevel.ReadCommitted,
+                    BatchAsync,
+                    (batchTransaction, _, token) => EnsureLocksHeldAsync(batchTransaction, token),
+                    ct
+                )
+                : await BatchAsync(db.Database.CurrentTransaction!, ct);
+            var execution = outcome.Execution;
+            nextBatchAt = null;
+
+            foreach (var evt in outcome.Events)
             {
                 await NotifyAsync(evt);
             }
@@ -592,6 +599,9 @@ internal sealed class RetentionRun(
             }
         }
     }
+
+    /// <summary>What one attempt at a batch produced: its result and the events it wrote.</summary>
+    private sealed record BatchOutcome(SweepExecutionResult Execution, IReadOnlyList<SweepEvent> Events);
 
     private void ReplaceCount(EntitySweepCount count)
     {
@@ -656,10 +666,13 @@ internal sealed class RetentionRun(
         }
         else
         {
-            await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, token);
-            await auditWriter.WriteAsync(evt, token);
-            await EnsureLocksHeldAsync(transaction, token);
-            await transaction.CommitAsync(token);
+            await CohortTransaction.RunAsync(
+                db,
+                IsolationLevel.ReadCommitted,
+                (_, unitToken) => auditWriter.WriteAsync(evt, unitToken),
+                EnsureLocksHeldAsync,
+                token
+            );
         }
 
         await NotifyAsync(evt);

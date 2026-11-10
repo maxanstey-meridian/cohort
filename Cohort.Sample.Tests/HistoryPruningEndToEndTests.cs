@@ -57,6 +57,34 @@ public sealed class HistoryPruningEndToEndTests(PostgresFixture fixture)
     }
 
     [Fact]
+    public async Task Prune_Deletes_Settled_Runs_On_A_Context_With_A_Retrying_Execution_Strategy()
+    {
+        // A context that retries transient failures refuses EF work in a transaction opened
+        // outside its execution strategy, so each pruning batch runs inside the strategy.
+        var oldSucceeded = await SeedRunAsync(SweepRunStatus.Succeeded, Now.AddDays(-100));
+        var recentSucceeded = await SeedRunAsync(SweepRunStatus.Succeeded, Now.AddDays(-30));
+
+        using var host = CreateHost(
+            succeededRunRetention: "90.00:00:00",
+            configureServices: services => services.ConfigureDbContext<SampleDbContext>((_, options) =>
+                options.UseNpgsql(
+                    ConnectionString,
+                    npgsql => npgsql.EnableRetryOnFailure(
+                        maxRetryCount: 2,
+                        maxRetryDelay: TimeSpan.FromMilliseconds(50),
+                        errorCodesToAdd: null
+                    )
+                )
+            )
+        );
+        var result = await PruneAsync(host);
+
+        result.Should().Be(new RetentionHistoryPruneResult(Runs: 1, Holds: 0));
+        (await LoadRunIdsAsync()).Should().BeEquivalentTo([recentSucceeded]);
+        (await CountDependentRowsAsync(oldSucceeded)).Should().Be(0);
+    }
+
+    [Fact]
     public async Task Prune_Keeps_A_Class_Of_Run_Whose_Retention_Is_Not_Configured()
     {
         var oldSucceeded = await SeedRunAsync(SweepRunStatus.Succeeded, Now.AddDays(-1000));

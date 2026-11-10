@@ -81,6 +81,13 @@ have open on it. See
 These services also check PostgreSQL, model and schema readiness themselves, so they're safe
 to call from a host that never ran Cohort's startup validation.
 
+Cohort works with EF's retrying execution strategy (`EnableRetryOnFailure()`). When your
+context's strategy retries, each of Cohort's own transactions runs inside it, so a transient
+failure before the commit runs that transaction again from the start. The exception is a
+failure while a dependents step runs: that fails the row's step, as on any context, and the
+batch carries on. A commit that fails is not retried: the run records the failure and the next
+run picks the rows up. A run that loses its database session stops committing, retry or not.
+
 ## The scheduled worker
 
 ```json

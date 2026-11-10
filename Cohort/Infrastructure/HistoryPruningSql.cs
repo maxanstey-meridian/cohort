@@ -40,21 +40,27 @@ internal static class HistoryPruningSql
         var tables = CohortStoreTables.FromModel(db.Model);
         var eligible = EligibleRunsStatement(tables, succeededCutoff, failedCutoff, currentOccurrence, batchSize);
 
-        await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
-        var sweepIds = await db.Database
-            .SqlQueryRaw<Guid>(eligible.Sql, eligible.Parameters.ToDbParameters(db.Database.GetDbConnection()))
-            .ToArrayAsync(ct);
-        if (sweepIds.Length == 0)
-        {
-            return 0;
-        }
+        return await CohortTransaction.RunAsync(
+            db,
+            IsolationLevel.ReadCommitted,
+            async (_, token) =>
+            {
+                var sweepIds = await db.Database
+                    .SqlQueryRaw<Guid>(eligible.Sql, eligible.Parameters.ToDbParameters(db.Database.GetDbConnection()))
+                    .ToArrayAsync(token);
+                if (sweepIds.Length == 0)
+                {
+                    return 0;
+                }
 
-        await ExecuteAsync(db, DeleteRowDetailsStatement(tables, sweepIds), ct);
-        await ExecuteAsync(db, DeleteEntitySummariesStatement(tables, sweepIds), ct);
-        await ExecuteAsync(db, DeleteRunsStatement(tables, sweepIds), ct);
-
-        await transaction.CommitAsync(ct);
-        return sweepIds.Length;
+                await ExecuteAsync(db, DeleteRowDetailsStatement(tables, sweepIds), token);
+                await ExecuteAsync(db, DeleteEntitySummariesStatement(tables, sweepIds), token);
+                await ExecuteAsync(db, DeleteRunsStatement(tables, sweepIds), token);
+                return sweepIds.Length;
+            },
+            beforeCommit: null,
+            ct
+        );
     }
 
     /// <summary>

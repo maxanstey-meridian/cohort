@@ -46,61 +46,75 @@ internal sealed class EfRetentionHoldsRepository(
                 await RequireReadCommittedAsync(existingTransaction.GetDbTransaction(), request, ct);
             }
 
-            await using var ownedTransaction = existingTransaction is null
-                ? await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct)
-                : null;
-            var transaction = (existingTransaction ?? ownedTransaction)!.GetDbTransaction();
-            var recordId = await targetResolver.CanonicaliseRecordIdAsync(
-                entry,
-                request.RecordId,
-                transaction,
-                "Retention hold",
-                ct
-            );
-            await RetentionEntityLockSql.AcquireAsync(
-                db.Database.GetDbConnection(),
-                transaction,
-                entry.RetentionEntityId,
-                request.TenantId,
-                recordId,
-                ct
-            );
-            await ValidateTargetRowAsync(entry, recordId, request, transaction, ct);
-            await LockCoveredRowsAsync(entry, recordId, request.TenantId, transaction, ct);
-
-            // An expiry the database clock has already reached would store a hold that never
-            // protects. The statement refuses it by row count, not a SQL error, so a caller-owned
-            // transaction stays usable.
-            var create = RetentionHoldSql.BuildCreateHold(
-                Tables,
-                request.HoldId,
-                request.RetentionEntityId,
-                recordId,
-                request.TenantId,
-                request.Reason,
-                request.CreatedAt,
-                request.ExpiresAt
-            );
-            await using var command = create.Parameters.CreateCommand(
-                db.Database.GetDbConnection(),
-                transaction,
-                create.Sql
-            );
-            if (await command.ExecuteNonQueryAsync(ct) == 0)
+            if (existingTransaction is null)
             {
-                throw new InvalidOperationException(
-                    $"Retention hold '{request.HoldId}' expires at {request.ExpiresAt:O}, which is not after the database clock. It would persist while protecting nothing."
+                await CohortTransaction.RunAsync(
+                    db,
+                    IsolationLevel.ReadCommitted,
+                    (ownedTransaction, token) => InsertAsync(entry, request, ownedTransaction.GetDbTransaction(), token),
+                    beforeCommit: null,
+                    ct
                 );
             }
-
-            if (ownedTransaction is not null)
+            else
             {
-                await ownedTransaction.CommitAsync(ct);
+                await InsertAsync(entry, request, existingTransaction.GetDbTransaction(), ct);
             }
         }
         finally
         {
             await db.Database.CloseConnectionAsync();
+        }
+    }
+
+    private async Task InsertAsync(
+        RetentionEntry entry,
+        RetentionHoldRequest request,
+        DbTransaction transaction,
+        CancellationToken ct
+    )
+    {
+        var recordId = await targetResolver.CanonicaliseRecordIdAsync(
+            entry,
+            request.RecordId,
+            transaction,
+            "Retention hold",
+            ct
+        );
+        await RetentionEntityLockSql.AcquireAsync(
+            db.Database.GetDbConnection(),
+            transaction,
+            entry.RetentionEntityId,
+            request.TenantId,
+            recordId,
+            ct
+        );
+        await ValidateTargetRowAsync(entry, recordId, request, transaction, ct);
+        await LockCoveredRowsAsync(entry, recordId, request.TenantId, transaction, ct);
+
+        // An expiry the database clock has already reached would store a hold that never
+        // protects. The statement refuses it by row count, not a SQL error, so a caller-owned
+        // transaction stays usable.
+        var create = RetentionHoldSql.BuildCreateHold(
+            Tables,
+            request.HoldId,
+            request.RetentionEntityId,
+            recordId,
+            request.TenantId,
+            request.Reason,
+            request.CreatedAt,
+            request.ExpiresAt
+        );
+        await using var command = create.Parameters.CreateCommand(
+            db.Database.GetDbConnection(),
+            transaction,
+            create.Sql
+        );
+        if (await command.ExecuteNonQueryAsync(ct) == 0)
+        {
+            throw new InvalidOperationException(
+                $"Retention hold '{request.HoldId}' expires at {request.ExpiresAt:O}, which is not after the database clock. It would persist while protecting nothing."
+            );
         }
     }
 

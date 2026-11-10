@@ -318,7 +318,10 @@ Cohort checks the callback's work before it commits:
 - After a refusal or failure once the callback has run, the context's change tracker is
   cleared, so a later `SaveChanges` can't apply the callback's changes outside the hold check.
 - On a context with a retrying execution strategy, a transient failure re-runs the whole
-  deletion, callback included, with an empty change tracker.
+  deletion, callback included, with an empty change tracker. Entities you loaded before the
+  call are detached by then, so a change the callback makes to one is not saved on the retry:
+  load or attach what the callback changes inside the callback. `Remove` of an entity loaded
+  earlier still works.
 
 This guards deletion only. A callback that anonymises or soft-deletes a held row leaves the
 row in place, so Cohort can't see it.

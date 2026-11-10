@@ -517,7 +517,10 @@ internal sealed class RetentionRun(
 
                 // The batch's rows and events carry the database's time; the first batch
                 // reuses the time the entity just read.
+                // Consumed here, not after the batch, so a retried first batch reads the clock
+                // afresh instead of reusing a time from before the failed attempt.
                 var eventAt = nextBatchAt ?? await DatabaseClock.NowAsync(db, token);
+                nextBatchAt = null;
                 var executed = await strategy.ExecuteAsync(
                     scope,
                     db.Database.GetDbConnection(),
@@ -578,7 +581,6 @@ internal sealed class RetentionRun(
                 )
                 : await BatchAsync(db.Database.CurrentTransaction!, ct);
             var execution = outcome.Execution;
-            nextBatchAt = null;
 
             foreach (var evt in outcome.Events)
             {

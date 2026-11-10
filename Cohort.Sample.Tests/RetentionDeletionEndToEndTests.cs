@@ -1,8 +1,10 @@
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Sample.Entities;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+
 using Npgsql;
 
 namespace Cohort.Sample.Tests;
@@ -33,42 +35,36 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
 
         await using (var db = Host.CreateDbContext())
         {
-            db.Notes.Add(
-                new Note
-                {
-                    Id = noteId,
-                    TenantId = tenantId,
-                    CreatedAt = DateTimeOffset.UtcNow.AddDays(-60),
-                    Body = "unheld target",
-                }
-            );
-            db.ExternalNumberedLogs.Add(
-                new ExternalNumberedLog
-                {
-                    Id = Guid.NewGuid(),
-                    ExternalId = externalId,
-                    CreatedAt = DateTimeOffset.UtcNow.AddDays(-60),
-                    Payload = "held target",
-                }
-            );
+            db.Notes.Add(new Note
+            {
+                Id = noteId,
+                TenantId = tenantId,
+                CreatedAt = DateTimeOffset.UtcNow.AddDays(-60),
+                Body = "unheld target",
+            });
+            db.ExternalNumberedLogs.Add(new ExternalNumberedLog
+            {
+                Id = Guid.NewGuid(),
+                ExternalId = externalId,
+                CreatedAt = DateTimeOffset.UtcNow.AddDays(-60),
+                Payload = "held target",
+            });
             await db.SaveChangesAsync();
         }
 
         await Host.RunWithServicesAsync(async services =>
         {
-            await services
-                .GetRequiredService<IRetentionHoldsRepository>()
-                .CreateAsync(
-                    new RetentionHoldRequest(
-                        Guid.NewGuid(),
-                        RetentionEntityIdentity.For<ExternalNumberedLog>(),
-                        "00042",
-                        null,
-                        "host deletion protection",
-                        DateTimeOffset.UtcNow.AddMinutes(-1)
-                    ),
-                    CancellationToken.None
-                );
+            await services.GetRequiredService<IRetentionHoldsRepository>().CreateAsync(
+                new RetentionHoldRequest(
+                    Guid.NewGuid(),
+                    RetentionEntityIdentity.For<ExternalNumberedLog>(),
+                    "00042",
+                    null,
+                    "host deletion protection",
+                    DateTimeOffset.UtcNow.AddMinutes(-1)
+                ),
+                CancellationToken.None
+            );
         });
 
         var outcome = await Host.RunWithServicesAsync(async services =>
@@ -113,24 +109,20 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
 
         await using (var db = Host.CreateDbContext())
         {
-            db.Notes.Add(
-                new Note
-                {
-                    Id = noteId,
-                    TenantId = tenantId,
-                    CreatedAt = DateTimeOffset.UtcNow.AddDays(-60),
-                    Body = "delete in callback",
-                }
-            );
-            db.ExternalNumberedLogs.Add(
-                new ExternalNumberedLog
-                {
-                    Id = Guid.NewGuid(),
-                    ExternalId = externalId,
-                    CreatedAt = DateTimeOffset.UtcNow.AddDays(-60),
-                    Payload = "delete in callback",
-                }
-            );
+            db.Notes.Add(new Note
+            {
+                Id = noteId,
+                TenantId = tenantId,
+                CreatedAt = DateTimeOffset.UtcNow.AddDays(-60),
+                Body = "delete in callback",
+            });
+            db.ExternalNumberedLogs.Add(new ExternalNumberedLog
+            {
+                Id = Guid.NewGuid(),
+                ExternalId = externalId,
+                CreatedAt = DateTimeOffset.UtcNow.AddDays(-60),
+                Payload = "delete in callback",
+            });
             await db.SaveChangesAsync();
         }
 
@@ -182,46 +174,37 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
 
         await using (var db = Host.CreateDbContext())
         {
-            db.Notes.Add(
-                new Note
-                {
-                    Id = noteId,
-                    TenantId = tenantId,
-                    CreatedAt = DateTimeOffset.UtcNow.AddDays(-60),
-                    Body = "rollback callback",
-                }
-            );
+            db.Notes.Add(new Note
+            {
+                Id = noteId,
+                TenantId = tenantId,
+                CreatedAt = DateTimeOffset.UtcNow.AddDays(-60),
+                Body = "rollback callback",
+            });
             await db.SaveChangesAsync();
         }
 
-        var act = async () =>
-            await Host.RunWithServicesAsync(async services =>
-            {
-                var db = services.GetRequiredService<SampleDbContext>();
-                await services
-                    .GetRequiredService<IRetentionDeletion>()
-                    .ExecuteAsync(
-                        [
-                            new RetentionTarget(
-                                RetentionEntityIdentity.For<Note>(),
-                                noteId.ToString(),
-                                tenantId
-                            ),
-                        ],
-                        async ct =>
-                        {
-                            db.Notes.Remove(
-                                await db.Notes.SingleAsync(note => note.Id == noteId, ct)
-                            );
-                            await db.SaveChangesAsync(ct);
-                            throw new InvalidOperationException("host deletion failed");
-                        }
-                    );
-            });
+        var act = async () => await Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            await services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [
+                    new RetentionTarget(
+                        RetentionEntityIdentity.For<Note>(),
+                        noteId.ToString(),
+                        tenantId
+                    ),
+                ],
+                async ct =>
+                {
+                    db.Notes.Remove(await db.Notes.SingleAsync(note => note.Id == noteId, ct));
+                    await db.SaveChangesAsync(ct);
+                    throw new InvalidOperationException("host deletion failed");
+                }
+            );
+        });
 
-        await act.Should()
-            .ThrowAsync<InvalidOperationException>()
-            .WithMessage("host deletion failed");
+        await act.Should().ThrowAsync<InvalidOperationException>().WithMessage("host deletion failed");
         await using var verify = Host.CreateDbContext();
         (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
     }
@@ -235,37 +218,24 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
         await SeedNotesAsync(tenantId, listedId, heldId);
         var holdId = await CreateHoldAsync(heldId, tenantId);
 
-        var act = () =>
-            Host.RunWithServicesAsync(async services =>
-            {
-                var db = services.GetRequiredService<SampleDbContext>();
-                await services
-                    .GetRequiredService<IRetentionDeletion>()
-                    .ExecuteAsync(
-                        [
-                            new RetentionTarget(
-                                RetentionEntityIdentity.For<Note>(),
-                                listedId.ToString(),
-                                tenantId
-                            ),
-                        ],
-                        async ct =>
-                        {
-                            db.Notes.RemoveRange(
-                                await db
-                                    .Notes.Where(note => note.Id == listedId || note.Id == heldId)
-                                    .ToListAsync(ct)
-                            );
-                            await db.SaveChangesAsync(ct);
-                        }
+        var act = () => Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            await services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [new RetentionTarget(RetentionEntityIdentity.For<Note>(), listedId.ToString(), tenantId)],
+                async ct =>
+                {
+                    db.Notes.RemoveRange(
+                        await db.Notes.Where(note => note.Id == listedId || note.Id == heldId).ToListAsync(ct)
                     );
-            });
+                    await db.SaveChangesAsync(ct);
+                }
+            );
+        });
 
         await act.Should().ThrowAsync<InvalidOperationException>().WithMessage($"*{holdId}*");
         await using var verify = Host.CreateDbContext();
-        (await verify.Notes.CountAsync(note => note.Id == listedId || note.Id == heldId))
-            .Should()
-            .Be(2);
+        (await verify.Notes.CountAsync(note => note.Id == listedId || note.Id == heldId)).Should().Be(2);
     }
 
     [Fact]
@@ -289,20 +259,8 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
                 """
             );
             db.Notes.AddRange(
-                new Note
-                {
-                    Id = listedId,
-                    TenantId = tenantId,
-                    CreatedAt = DateTimeOffset.UtcNow.AddDays(-60),
-                    Body = "listed",
-                },
-                new Note
-                {
-                    Id = heldId,
-                    TenantId = tenantId,
-                    CreatedAt = DateTimeOffset.UtcNow.AddDays(-60),
-                    Body = "held child",
-                }
+                new Note { Id = listedId, TenantId = tenantId, CreatedAt = DateTimeOffset.UtcNow.AddDays(-60), Body = "listed" },
+                new Note { Id = heldId, TenantId = tenantId, CreatedAt = DateTimeOffset.UtcNow.AddDays(-60), Body = "held child" }
             );
             await db.SaveChangesAsync();
             await db.Database.ExecuteSqlAsync(
@@ -315,59 +273,30 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
 
         var holdId = Guid.NewGuid();
         await host.RunWithServicesAsync(services =>
-            services
-                .GetRequiredService<IRetentionHoldsRepository>()
-                .CreateAsync(
-                    new RetentionHoldRequest(
-                        holdId,
-                        RetentionEntityIdentity.For<Note>(),
-                        heldId.ToString(),
-                        tenantId,
-                        "cascade target",
-                        DateTimeOffset.UtcNow
-                    ),
-                    CancellationToken.None
-                )
+            services.GetRequiredService<IRetentionHoldsRepository>().CreateAsync(
+                new RetentionHoldRequest(holdId, RetentionEntityIdentity.For<Note>(), heldId.ToString(), tenantId, "cascade target", DateTimeOffset.UtcNow),
+                CancellationToken.None
+            )
         );
 
-        var act = () =>
-            host.RunWithServicesAsync(async services =>
-            {
-                var db = services.GetRequiredService<SampleDbContext>();
-                await services
-                    .GetRequiredService<IRetentionDeletion>()
-                    .ExecuteAsync(
-                        [
-                            new RetentionTarget(
-                                RetentionEntityIdentity.For<Note>(),
-                                listedId.ToString(),
-                                tenantId
-                            ),
-                        ],
-                        async ct =>
-                        {
-                            db.Notes.Remove(
-                                await db.Notes.SingleAsync(note => note.Id == listedId, ct)
-                            );
-                            await db.SaveChangesAsync(ct);
-                            await db.Database.ExecuteSqlAsync(
-                                $"DELETE FROM public.cascade_parent WHERE id = {parentId}",
-                                ct
-                            );
-                        }
-                    );
-            });
+        var act = () => host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            await services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [new RetentionTarget(RetentionEntityIdentity.For<Note>(), listedId.ToString(), tenantId)],
+                async ct =>
+                {
+                    db.Notes.Remove(await db.Notes.SingleAsync(note => note.Id == listedId, ct));
+                    await db.SaveChangesAsync(ct);
+                    await db.Database.ExecuteSqlAsync($"DELETE FROM public.cascade_parent WHERE id = {parentId}", ct);
+                }
+            );
+        });
 
         await act.Should().ThrowAsync<InvalidOperationException>().WithMessage($"*{holdId}*");
         await using var verify = host.CreateDbContext();
-        (await verify.Notes.CountAsync(note => note.Id == listedId || note.Id == heldId))
-            .Should()
-            .Be(2);
-        (
-            await verify
-                .Database.SqlQuery<Guid>($"SELECT id AS \"Value\" FROM public.cascade_parent")
-                .ToListAsync()
-        )
+        (await verify.Notes.CountAsync(note => note.Id == listedId || note.Id == heldId)).Should().Be(2);
+        (await verify.Database.SqlQuery<Guid>($"SELECT id AS \"Value\" FROM public.cascade_parent").ToListAsync())
             .Should()
             .Equal(parentId);
     }
@@ -383,65 +312,41 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
         await SeedNotesAsync(tenantId, noteId);
         await using (var db = Host.CreateDbContext())
         {
-            db.ExternalNumberedLogs.Add(
-                new ExternalNumberedLog
-                {
-                    Id = Guid.NewGuid(),
-                    ExternalId = externalId,
-                    CreatedAt = DateTimeOffset.UtcNow.AddDays(-60),
-                    Payload = "held log",
-                }
-            );
+            db.ExternalNumberedLogs.Add(new ExternalNumberedLog
+            {
+                Id = Guid.NewGuid(),
+                ExternalId = externalId,
+                CreatedAt = DateTimeOffset.UtcNow.AddDays(-60),
+                Payload = "held log",
+            });
             await db.SaveChangesAsync();
         }
 
         var holdId = Guid.NewGuid();
         await Host.RunWithServicesAsync(services =>
-            services
-                .GetRequiredService<IRetentionHoldsRepository>()
-                .CreateAsync(
-                    new RetentionHoldRequest(
-                        holdId,
-                        RetentionEntityIdentity.For<ExternalNumberedLog>(),
-                        "00042",
-                        null,
-                        "held log",
-                        DateTimeOffset.UtcNow
-                    ),
-                    CancellationToken.None
-                )
+            services.GetRequiredService<IRetentionHoldsRepository>().CreateAsync(
+                new RetentionHoldRequest(holdId, RetentionEntityIdentity.For<ExternalNumberedLog>(), "00042", null, "held log", DateTimeOffset.UtcNow),
+                CancellationToken.None
+            )
         );
 
-        var act = () =>
-            Host.RunWithServicesAsync(async services =>
-            {
-                var db = services.GetRequiredService<SampleDbContext>();
-                await services
-                    .GetRequiredService<IRetentionDeletion>()
-                    .ExecuteAsync(
-                        [
-                            new RetentionTarget(
-                                RetentionEntityIdentity.For<Note>(),
-                                noteId.ToString(),
-                                tenantId
-                            ),
-                        ],
-                        async ct =>
-                        {
-                            await db.Notes.Where(note => note.Id == noteId).ExecuteDeleteAsync(ct);
-                            await db
-                                .ExternalNumberedLogs.Where(log => log.ExternalId == externalId)
-                                .ExecuteDeleteAsync(ct);
-                        }
-                    );
-            });
+        var act = () => Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            await services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [new RetentionTarget(RetentionEntityIdentity.For<Note>(), noteId.ToString(), tenantId)],
+                async ct =>
+                {
+                    await db.Notes.Where(note => note.Id == noteId).ExecuteDeleteAsync(ct);
+                    await db.ExternalNumberedLogs.Where(log => log.ExternalId == externalId).ExecuteDeleteAsync(ct);
+                }
+            );
+        });
 
         await act.Should().ThrowAsync<InvalidOperationException>().WithMessage($"*{holdId}*");
         await using var verify = Host.CreateDbContext();
         (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
-        (await verify.ExternalNumberedLogs.AnyAsync(log => log.ExternalId == externalId))
-            .Should()
-            .BeTrue();
+        (await verify.ExternalNumberedLogs.AnyAsync(log => log.ExternalId == externalId)).Should().BeTrue();
     }
 
     [Fact]
@@ -454,26 +359,12 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
         var savedLater = await Host.RunWithServicesAsync(async services =>
         {
             var db = services.GetRequiredService<SampleDbContext>();
-            var act = () =>
-                services
-                    .GetRequiredService<IRetentionDeletion>()
-                    .ExecuteAsync(
-                        [
-                            new RetentionTarget(
-                                RetentionEntityIdentity.For<Note>(),
-                                noteId.ToString(),
-                                tenantId
-                            ),
-                        ],
-                        async ct =>
-                            db.Notes.Remove(
-                                await db.Notes.SingleAsync(note => note.Id == noteId, ct)
-                            )
-                    );
+            var act = () => services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [new RetentionTarget(RetentionEntityIdentity.For<Note>(), noteId.ToString(), tenantId)],
+                async ct => db.Notes.Remove(await db.Notes.SingleAsync(note => note.Id == noteId, ct))
+            );
 
-            await act.Should()
-                .ThrowAsync<InvalidOperationException>()
-                .WithMessage("*unsaved changes*");
+            await act.Should().ThrowAsync<InvalidOperationException>().WithMessage("*unsaved changes*");
             return await db.SaveChangesAsync();
         });
 
@@ -493,33 +384,19 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
         var savedLater = await Host.RunWithServicesAsync(async services =>
         {
             var db = services.GetRequiredService<SampleDbContext>();
-            var act = () =>
-                services
-                    .GetRequiredService<IRetentionDeletion>()
-                    .ExecuteAsync(
-                        [
-                            new RetentionTarget(
-                                RetentionEntityIdentity.For<Note>(),
-                                noteId.ToString(),
-                                tenantId
-                            ),
-                        ],
-                        async ct =>
-                        {
-                            await db.Notes.Where(note => note.Id == noteId).ExecuteDeleteAsync(ct);
-                            var edited = await db.Notes.SingleAsync(
-                                note => note.Id == editedId,
-                                ct
-                            );
-                            // Only an explicit DetectChanges sees this edit.
-                            db.ChangeTracker.AutoDetectChangesEnabled = false;
-                            edited.Body = "edited, not saved";
-                        }
-                    );
+            var act = () => services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [new RetentionTarget(RetentionEntityIdentity.For<Note>(), noteId.ToString(), tenantId)],
+                async ct =>
+                {
+                    await db.Notes.Where(note => note.Id == noteId).ExecuteDeleteAsync(ct);
+                    var edited = await db.Notes.SingleAsync(note => note.Id == editedId, ct);
+                    // Only an explicit DetectChanges sees this edit.
+                    db.ChangeTracker.AutoDetectChangesEnabled = false;
+                    edited.Body = "edited, not saved";
+                }
+            );
 
-            await act.Should()
-                .ThrowAsync<InvalidOperationException>()
-                .WithMessage("*returned with unsaved changes*");
+            await act.Should().ThrowAsync<InvalidOperationException>().WithMessage("*returned with unsaved changes*");
             db.ChangeTracker.AutoDetectChangesEnabled = true;
             return await db.SaveChangesAsync();
         });
@@ -527,9 +404,7 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
         savedLater.Should().Be(0);
         await using var verify = Host.CreateDbContext();
         (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
-        (await verify.Notes.SingleAsync(note => note.Id == editedId))
-            .Body.Should()
-            .Be("deletion target");
+        (await verify.Notes.SingleAsync(note => note.Id == editedId)).Body.Should().Be("deletion target");
     }
 
     [Fact]
@@ -542,31 +417,16 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
         var savedLater = await Host.RunWithServicesAsync(async services =>
         {
             var db = services.GetRequiredService<SampleDbContext>();
-            var act = () =>
-                services
-                    .GetRequiredService<IRetentionDeletion>()
-                    .ExecuteAsync(
-                        [
-                            new RetentionTarget(
-                                RetentionEntityIdentity.For<Note>(),
-                                noteId.ToString(),
-                                tenantId
-                            ),
-                        ],
-                        async ct =>
-                        {
-                            db.Notes.Remove(
-                                await db.Notes.SingleAsync(note => note.Id == noteId, ct)
-                            );
-                            throw new InvalidOperationException(
-                                "host deletion failed before saving"
-                            );
-                        }
-                    );
+            var act = () => services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [new RetentionTarget(RetentionEntityIdentity.For<Note>(), noteId.ToString(), tenantId)],
+                async ct =>
+                {
+                    db.Notes.Remove(await db.Notes.SingleAsync(note => note.Id == noteId, ct));
+                    throw new InvalidOperationException("host deletion failed before saving");
+                }
+            );
 
-            await act.Should()
-                .ThrowAsync<InvalidOperationException>()
-                .WithMessage("host deletion failed before saving");
+            await act.Should().ThrowAsync<InvalidOperationException>().WithMessage("host deletion failed before saving");
             return await db.SaveChangesAsync();
         });
 
@@ -584,40 +444,21 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
         var callbackRan = false;
         await SeedNotesAsync(tenantId, noteId);
 
-        var act = () =>
-            Host.RunWithServicesAsync(async services =>
-            {
-                var db = services.GetRequiredService<SampleDbContext>();
-                db.Notes.Add(
-                    new Note
-                    {
-                        Id = pendingId,
-                        TenantId = tenantId,
-                        CreatedAt = DateTimeOffset.UtcNow,
-                        Body = "pending",
-                    }
-                );
-                await services
-                    .GetRequiredService<IRetentionDeletion>()
-                    .ExecuteAsync(
-                        [
-                            new RetentionTarget(
-                                RetentionEntityIdentity.For<Note>(),
-                                noteId.ToString(),
-                                tenantId
-                            ),
-                        ],
-                        _ =>
-                        {
-                            callbackRan = true;
-                            return Task.CompletedTask;
-                        }
-                    );
-            });
+        var act = () => Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            db.Notes.Add(new Note { Id = pendingId, TenantId = tenantId, CreatedAt = DateTimeOffset.UtcNow, Body = "pending" });
+            await services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [new RetentionTarget(RetentionEntityIdentity.For<Note>(), noteId.ToString(), tenantId)],
+                _ =>
+                {
+                    callbackRan = true;
+                    return Task.CompletedTask;
+                }
+            );
+        });
 
-        await act.Should()
-            .ThrowAsync<InvalidOperationException>()
-            .WithMessage("*no unsaved changes*");
+        await act.Should().ThrowAsync<InvalidOperationException>().WithMessage("*no unsaved changes*");
         callbackRan.Should().BeFalse();
         await using var verify = Host.CreateDbContext();
         (await verify.Notes.AnyAsync(note => note.Id == pendingId)).Should().BeFalse();
@@ -633,34 +474,23 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
         var callbackRan = false;
         await SeedNotesAsync(tenantId, noteId, editedId);
 
-        var act = () =>
-            Host.RunWithServicesAsync(async services =>
-            {
-                var db = services.GetRequiredService<SampleDbContext>();
-                var edited = await db.Notes.SingleAsync(note => note.Id == editedId);
-                db.ChangeTracker.AutoDetectChangesEnabled = false;
-                edited.Body = "edited, not saved";
-                await services
-                    .GetRequiredService<IRetentionDeletion>()
-                    .ExecuteAsync(
-                        [
-                            new RetentionTarget(
-                                RetentionEntityIdentity.For<Note>(),
-                                noteId.ToString(),
-                                tenantId
-                            ),
-                        ],
-                        _ =>
-                        {
-                            callbackRan = true;
-                            return Task.CompletedTask;
-                        }
-                    );
-            });
+        var act = () => Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            var edited = await db.Notes.SingleAsync(note => note.Id == editedId);
+            db.ChangeTracker.AutoDetectChangesEnabled = false;
+            edited.Body = "edited, not saved";
+            await services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [new RetentionTarget(RetentionEntityIdentity.For<Note>(), noteId.ToString(), tenantId)],
+                _ =>
+                {
+                    callbackRan = true;
+                    return Task.CompletedTask;
+                }
+            );
+        });
 
-        await act.Should()
-            .ThrowAsync<InvalidOperationException>()
-            .WithMessage("*no unsaved changes*");
+        await act.Should().ThrowAsync<InvalidOperationException>().WithMessage("*no unsaved changes*");
         callbackRan.Should().BeFalse();
         await using var verify = Host.CreateDbContext();
         (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
@@ -679,9 +509,7 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
                 $"""
                 INSERT INTO "retention_holds"
                     ("HoldId", "RetentionEntityId", "RecordId", "TenantId", "Reason", "CreatedAt", "ExpiresAt", "RemovedAt")
-                VALUES ({Guid.NewGuid()}, {RetentionEntityIdentity.For<Note>()}, {Guid.NewGuid().ToString()}, {tenantId}, 'orphan', {DateTimeOffset.UtcNow.AddDays(
-                    -1
-                )}, NULL, NULL)
+                VALUES ({Guid.NewGuid()}, {RetentionEntityIdentity.For<Note>()}, {Guid.NewGuid().ToString()}, {tenantId}, 'orphan', {DateTimeOffset.UtcNow.AddDays(-1)}, NULL, NULL)
                 """
             );
         }
@@ -689,22 +517,14 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
         var outcome = await Host.RunWithServicesAsync(async services =>
         {
             var db = services.GetRequiredService<SampleDbContext>();
-            return await services
-                .GetRequiredService<IRetentionDeletion>()
-                .ExecuteAsync(
-                    [
-                        new RetentionTarget(
-                            RetentionEntityIdentity.For<Note>(),
-                            noteId.ToString(),
-                            tenantId
-                        ),
-                    ],
-                    async ct =>
-                    {
-                        db.Notes.Remove(await db.Notes.SingleAsync(note => note.Id == noteId, ct));
-                        await db.SaveChangesAsync(ct);
-                    }
-                );
+            return await services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [new RetentionTarget(RetentionEntityIdentity.For<Note>(), noteId.ToString(), tenantId)],
+                async ct =>
+                {
+                    db.Notes.Remove(await db.Notes.SingleAsync(note => note.Id == noteId, ct));
+                    await db.SaveChangesAsync(ct);
+                }
+            );
         });
 
         outcome.Should().Be(RetentionDeletionOutcome.Executed);
@@ -712,11 +532,11 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
         (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeFalse();
     }
 
+    // A context that retries transient failures refuses EF work in a transaction opened outside
+    // its execution strategy, so the deletion's transaction runs inside the strategy.
     [Fact]
     public async Task Callback_Saves_On_A_Context_With_A_Retrying_Execution_Strategy()
     {
-        // A context that retries transient failures refuses EF work in a transaction opened
-        // outside its execution strategy, so the deletion's transaction runs inside the strategy.
         var tenantId = Guid.NewGuid();
         var noteId = Guid.NewGuid();
         await SeedNotesAsync(tenantId, noteId);
@@ -725,22 +545,14 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
         var outcome = await host.RunWithServicesAsync(async services =>
         {
             var db = services.GetRequiredService<SampleDbContext>();
-            return await services
-                .GetRequiredService<IRetentionDeletion>()
-                .ExecuteAsync(
-                    [
-                        new RetentionTarget(
-                            RetentionEntityIdentity.For<Note>(),
-                            noteId.ToString(),
-                            tenantId
-                        ),
-                    ],
-                    async ct =>
-                    {
-                        db.Notes.Remove(await db.Notes.SingleAsync(note => note.Id == noteId, ct));
-                        await db.SaveChangesAsync(ct);
-                    }
-                );
+            return await services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [new RetentionTarget(RetentionEntityIdentity.For<Note>(), noteId.ToString(), tenantId)],
+                async ct =>
+                {
+                    db.Notes.Remove(await db.Notes.SingleAsync(note => note.Id == noteId, ct));
+                    await db.SaveChangesAsync(ct);
+                }
+            );
         });
 
         outcome.Should().Be(RetentionDeletionOutcome.Executed);
@@ -768,24 +580,16 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
         var outcome = await host.RunWithServicesAsync(async services =>
         {
             var db = services.GetRequiredService<SampleDbContext>();
-            return await services
-                .GetRequiredService<IRetentionDeletion>()
-                .ExecuteAsync(
-                    [
-                        new RetentionTarget(
-                            RetentionEntityIdentity.For<Note>(),
-                            noteId.ToString(),
-                            tenantId
-                        ),
-                    ],
-                    async ct =>
-                    {
-                        callbackRuns++;
-                        trackedAtStart.Add(db.ChangeTracker.Entries().Count());
-                        db.Notes.Remove(new Note { Id = noteId, TenantId = tenantId });
-                        await db.SaveChangesAsync(ct);
-                    }
-                );
+            return await services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [new RetentionTarget(RetentionEntityIdentity.For<Note>(), noteId.ToString(), tenantId)],
+                async ct =>
+                {
+                    callbackRuns++;
+                    trackedAtStart.Add(db.ChangeTracker.Entries().Count());
+                    db.Notes.Remove(new Note { Id = noteId, TenantId = tenantId });
+                    await db.SaveChangesAsync(ct);
+                }
+            );
         });
 
         deletesSeen.Should().Be(2);
@@ -812,10 +616,7 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
             {
                 if (Interlocked.CompareExchange(ref commitArmed, 0, 1) == 1)
                 {
-                    throw new NpgsqlException(
-                        "injected commit failure",
-                        new IOException("connection reset")
-                    );
+                    throw new NpgsqlException("injected commit failure", new IOException("connection reset"));
                 }
             }
         );
@@ -823,32 +624,18 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
         var trackedAfterFailure = await host.RunWithServicesAsync(async services =>
         {
             var db = services.GetRequiredService<SampleDbContext>();
-            var act = () =>
-                services
-                    .GetRequiredService<IRetentionDeletion>()
-                    .ExecuteAsync(
-                        [
-                            new RetentionTarget(
-                                RetentionEntityIdentity.For<Note>(),
-                                noteId.ToString(),
-                                tenantId
-                            ),
-                        ],
-                        async ct =>
-                        {
-                            // The edited note stays tracked after the save; a removed entity alone is detached by it.
-                            var edited = await db.Notes.SingleAsync(
-                                note => note.Id == editedId,
-                                ct
-                            );
-                            edited.Body = "edited in the callback";
-                            db.Notes.Remove(
-                                await db.Notes.SingleAsync(note => note.Id == noteId, ct)
-                            );
-                            await db.SaveChangesAsync(ct);
-                            Volatile.Write(ref commitArmed, 1);
-                        }
-                    );
+            var act = () => services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [new RetentionTarget(RetentionEntityIdentity.For<Note>(), noteId.ToString(), tenantId)],
+                async ct =>
+                {
+                    // The edited note stays tracked after the save; a removed entity alone is detached by it.
+                    var edited = await db.Notes.SingleAsync(note => note.Id == editedId, ct);
+                    edited.Body = "edited in the callback";
+                    db.Notes.Remove(await db.Notes.SingleAsync(note => note.Id == noteId, ct));
+                    await db.SaveChangesAsync(ct);
+                    Volatile.Write(ref commitArmed, 1);
+                }
+            );
 
             await act.Should().ThrowAsync<NpgsqlException>().WithMessage("injected commit failure");
             return db.ChangeTracker.Entries().Count();
@@ -857,49 +644,40 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
         trackedAfterFailure.Should().Be(0);
         await using var verify = Host.CreateDbContext();
         (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
-        (await verify.Notes.SingleAsync(note => note.Id == editedId))
-            .Body.Should()
-            .Be("deletion target");
+        (await verify.Notes.SingleAsync(note => note.Id == editedId)).Body.Should().Be("deletion target");
     }
 
-    private CohortTestHost RetryingHost(
-        Func<string, string>? rewriteCommandText,
-        Action? beforeCommit = null
-    ) =>
+    private CohortTestHost RetryingHost(Func<string, string>? rewriteCommandText, Action? beforeCommit = null) =>
         new(
             ConnectionString,
             configureServices: services =>
-                services.ConfigureDbContext<SampleDbContext>(
-                    (_, options) =>
-                        options.UseNpgsql(
-                            new PassThroughConnection(
-                                new NpgsqlConnection(ConnectionString),
-                                rewriteCommandText: rewriteCommandText,
-                                beforeCommit: beforeCommit
-                            ),
-                            contextOwnsConnection: true,
-                            npgsql =>
-                                npgsql.EnableRetryOnFailure(
-                                    maxRetryCount: 2,
-                                    maxRetryDelay: TimeSpan.FromMilliseconds(50),
-                                    errorCodesToAdd: null
-                                )
+                services.ConfigureDbContext<SampleDbContext>((_, options) =>
+                    options.UseNpgsql(
+                        new PassThroughConnection(
+                            new NpgsqlConnection(ConnectionString),
+                            rewriteCommandText: rewriteCommandText,
+                            beforeCommit: beforeCommit
+                        ),
+                        contextOwnsConnection: true,
+                        npgsql => npgsql.EnableRetryOnFailure(
+                            maxRetryCount: 2,
+                            maxRetryDelay: TimeSpan.FromMilliseconds(50),
+                            errorCodesToAdd: null
                         )
+                    )
                 )
         );
 
     private async Task SeedNotesAsync(Guid tenantId, params Guid[] noteIds)
     {
         await using var db = Host.CreateDbContext();
-        db.Notes.AddRange(
-            noteIds.Select(id => new Note
-            {
-                Id = id,
-                TenantId = tenantId,
-                CreatedAt = DateTimeOffset.UtcNow.AddDays(-60),
-                Body = "deletion target",
-            })
-        );
+        db.Notes.AddRange(noteIds.Select(id => new Note
+        {
+            Id = id,
+            TenantId = tenantId,
+            CreatedAt = DateTimeOffset.UtcNow.AddDays(-60),
+            Body = "deletion target",
+        }));
         await db.SaveChangesAsync();
     }
 
@@ -907,19 +685,10 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
     {
         var holdId = Guid.NewGuid();
         await Host.RunWithServicesAsync(services =>
-            services
-                .GetRequiredService<IRetentionHoldsRepository>()
-                .CreateAsync(
-                    new RetentionHoldRequest(
-                        holdId,
-                        RetentionEntityIdentity.For<Note>(),
-                        noteId.ToString(),
-                        tenantId,
-                        "deletion guard",
-                        DateTimeOffset.UtcNow
-                    ),
-                    CancellationToken.None
-                )
+            services.GetRequiredService<IRetentionHoldsRepository>().CreateAsync(
+                new RetentionHoldRequest(holdId, RetentionEntityIdentity.For<Note>(), noteId.ToString(), tenantId, "deletion guard", DateTimeOffset.UtcNow),
+                CancellationToken.None
+            )
         );
         return holdId;
     }

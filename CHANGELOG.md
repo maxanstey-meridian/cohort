@@ -134,6 +134,10 @@ Changed (breaking):
   context is `RetentionSystemWork.Recovery`, which replaces `RowDispatch`: move your execution
   scope's `RowDispatch` arm to it (it needs `SELECT` and `UPDATE` on `sweep_run`).
 - A failing dependents step's skipped row is recorded in `sweep_run_row_detail.Failure`.
+- An `ErasureTransaction.Caller` erasure on a context with a retrying execution strategy
+  (`EnableRetryOnFailure()`) is refused unless your transaction and the call run inside
+  `db.Database.CreateExecutionStrategy().ExecuteAsync(...)`. 0.11.0 ran it when no entity had a
+  dependents step or a per-row anonymise factory.
 - `AddRetentionDependents<TEntity, TStep>` has one overload, with
   `bool retiresReferencingRows = true`, in place of 0.11.0's: source still compiles, but a
   library built against 0.11.0 breaks at the binary level, so recompile it against 0.12.0.

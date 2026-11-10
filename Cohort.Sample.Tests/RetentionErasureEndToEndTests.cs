@@ -9,6 +9,7 @@ using Cohort.Infrastructure.Migrations;
 using Cohort.Sample.Entities;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -2228,6 +2229,38 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             .Should().Equal(erasedId.ToString());
     }
 
+    // EF's refusal of a transaction begun outside the strategy lives in the strategies derived
+    // from its ExecutionStrategy, which are the ones that set ExecutionStrategy.Current. A
+    // retrying strategy that implements IExecutionStrategy on its own makes no such refusal and
+    // has no way to be "inside" it, so Cohort refuses nothing there.
+    [Fact]
+    public async Task Caller_Mode_Is_Not_Refused_On_A_Retrying_Strategy_That_Does_Not_Derive_From_EFs()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, _) = await SeedCallerErasureAsync(tenant.Id, subject);
+        using var host = DirectStrategyHost(services => services.AddRetentionDependents<Note, NoteOutboxStep>());
+        var request = RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller);
+
+        var result = await host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            var erasure = services.GetRequiredService<IRetentionErasureService>();
+
+            await using var transaction = await db.Database.BeginTransactionAsync();
+            var erased = await erasure.ExecuteAsync(request);
+            await transaction.CommitAsync();
+            return erased;
+        });
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note)).Which.Affected.Should().Be(1);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeFalse();
+        (await verify.OutboxMessages.Where(message => message.TenantId == tenant.Id).Select(message => message.Payload).ToListAsync())
+            .Should().Equal(erasedId.ToString());
+    }
+
     // PostgreSQL accepts READ UNCOMMITTED and runs it as READ COMMITTED, so the erasure's hold
     // checks see every committed hold and the caller's isolation is no reason to refuse.
     [Fact]
@@ -2728,6 +2761,41 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
                 configureServices(services);
             }
         );
+
+    // A host whose retrying strategy implements IExecutionStrategy itself, as a Polly-backed one
+    // would: RetriesOnFailure is true, and it never sets ExecutionStrategy.Current.
+    private CohortTestHost DirectStrategyHost(Action<IServiceCollection> configureServices) =>
+        new(
+            ConnectionString,
+            configureServices: services =>
+            {
+                services.ConfigureDbContext<SampleDbContext>((_, options) =>
+                    options.UseNpgsql(
+                        ConnectionString,
+                        npgsql => npgsql.ExecutionStrategy(dependencies => new DirectRetryingStrategy(dependencies))
+                    )
+                );
+                configureServices(services);
+            }
+        );
+
+    private sealed class DirectRetryingStrategy(ExecutionStrategyDependencies dependencies) : IExecutionStrategy
+    {
+        public bool RetriesOnFailure => true;
+
+        public TResult Execute<TState, TResult>(
+            TState state,
+            Func<DbContext, TState, TResult> operation,
+            Func<DbContext, TState, ExecutionResult<TResult>>? verifySucceeded
+        ) => operation(dependencies.CurrentContext.Context, state);
+
+        public Task<TResult> ExecuteAsync<TState, TResult>(
+            TState state,
+            Func<DbContext, TState, CancellationToken, Task<TResult>> operation,
+            Func<DbContext, TState, CancellationToken, Task<ExecutionResult<TResult>>>? verifySucceeded,
+            CancellationToken cancellationToken = default
+        ) => operation(dependencies.CurrentContext.Context, state, cancellationToken);
+    }
 
     private static ErasureScope CallerScope(Guid subject) =>
         new("user", subject, allowSoftDeleteAsErasure: true);

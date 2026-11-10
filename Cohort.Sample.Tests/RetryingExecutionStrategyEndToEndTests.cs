@@ -110,6 +110,7 @@ public sealed class RetryingExecutionStrategyEndToEndTests(PostgresFixture fixtu
         await SeedAsync(host, new PerRowAuditedLog { Id = logId, TenantId = tenant.Id, CreatedAt = AsOf.AddDays(-45), Payload = "retry" });
         // After the step saved, the delete ran and the row detail was written: all of it rolls back.
         faults.FailStatementAfterTheNextStepRun(ProgressStatement, times: 1);
+        faults.ReadTheDatabaseClockAtEachInjectedStatementFailure(database.ConnectionString);
 
         var result = await host.RunSweepAsync(tenant, AsOf);
 
@@ -127,6 +128,12 @@ public sealed class RetryingExecutionStrategyEndToEndTests(PostgresFixture fixtu
         observer.Events.OfType<SweepEvent.EntityProgress>()
             .Where(progress => progress.EntityType == typeof(PerRowAuditedLog))
             .Should().ContainSingle().Which.Affected.Should().Be(1);
+        // The retried attempt reads the database clock afresh, so what it recorded is later than
+        // the failed attempt's statement, not stamped with the time the entity read before it.
+        observer.Events.OfType<SweepEvent.RowDetail>().Single().At.Should().BeAfter(faults.LastStatementFailureAt);
+        observer.Events.OfType<SweepEvent.EntityProgress>()
+            .Single(progress => progress.EntityType == typeof(PerRowAuditedLog))
+            .At.Should().BeAfter(faults.LastStatementFailureAt);
     }
 
     [Fact]
@@ -404,6 +411,10 @@ public sealed class RetryingExecutionStrategyEndToEndTests(PostgresFixture fixtu
         private string? terminateConnectionString;
         private int sessionsTerminated;
         private Guid runSweepId;
+        private string? clockConnectionString;
+        private DateTimeOffset lastStatementFailureAt;
+
+        public DateTimeOffset LastStatementFailureAt => lastStatementFailureAt;
 
         public int SessionsTerminated => Volatile.Read(ref sessionsTerminated);
 
@@ -455,10 +466,34 @@ public sealed class RetryingExecutionStrategyEndToEndTests(PostgresFixture fixtu
             )
             {
                 Interlocked.Increment(ref statementFailuresInjected);
+                if (clockConnectionString is not null)
+                {
+                    lastStatementFailureAt = ReadDatabaseClock(clockConnectionString);
+                }
+
                 return Deadlock;
             }
 
             return text;
+        }
+
+        // Reads the database's clock on a connection of its own at each statement the test makes
+        // fail, the failed statement having not yet been sent.
+        public void ReadTheDatabaseClockAtEachInjectedStatementFailure(string connectionString) =>
+            clockConnectionString = connectionString;
+
+        private static DateTimeOffset ReadDatabaseClock(string connectionString)
+        {
+            using var connection = new NpgsqlConnection($"{connectionString};Pooling=false");
+            connection.Open();
+            using var read = connection.CreateCommand();
+            read.CommandText = "SELECT clock_timestamp()";
+            return read.ExecuteScalar() switch
+            {
+                DateTimeOffset offset => offset.ToUniversalTime(),
+                DateTime utc => new DateTimeOffset(DateTime.SpecifyKind(utc, DateTimeKind.Utc)),
+                var other => throw new InvalidOperationException($"clock_timestamp() returned {other}."),
+            };
         }
 
         private void TerminateTheRunSession(string connectionString)

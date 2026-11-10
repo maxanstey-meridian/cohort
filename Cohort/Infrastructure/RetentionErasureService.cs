@@ -91,9 +91,15 @@ internal sealed class RetentionErasureService(
                 "ErasureTransaction.Caller needs an open transaction on the scoped DbContext."
             );
         // EF's own condition: a retrying strategy refuses EF work in a transaction begun outside
-        // it, unless the call is running inside the strategy. Checked here so the erasure
-        // doesn't fail mid-run, the day a step or a per-row anonymise factory needs EF.
-        if (db.Database.CreateExecutionStrategy().RetriesOnFailure && ExecutionStrategy.Current is null)
+        // it, unless the call is running inside the strategy. Checked first so the host gets this
+        // message, not EF's from the first call that goes through the strategy (the run-time
+        // read opens the connection through EF, and a step's work follows). Only strategies
+        // derived from EF's ExecutionStrategy make that refusal, and only they set Current, so
+        // one that implements IExecutionStrategy on its own is never refused here.
+        if (
+            db.Database.CreateExecutionStrategy() is ExecutionStrategy { RetriesOnFailure: true }
+            && ExecutionStrategy.Current is null
+        )
         {
             throw new InvalidOperationException(
                 "ErasureTransaction.Caller on a DbContext with a retrying execution strategy (EnableRetryOnFailure) must run inside that strategy: wrap your transaction and this call in db.Database.CreateExecutionStrategy().ExecuteAsync(...), as EF requires of your own work in it."

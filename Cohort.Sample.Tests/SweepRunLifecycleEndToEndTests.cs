@@ -420,8 +420,8 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
     {
         // The database clock reads an hour earlier on every read after the run's first, as it
         // does after a step back. The settle time is never earlier than the start time: a
-        // negative duration would be refused by the event and by the ledger's constraint, and
-        // the run would be left Started.
+        // negative duration would be refused by the ledger's constraint, and the run would be
+        // left Started.
         var tenantId = Guid.NewGuid();
         var clockReads = 0;
         using var host = new CohortTestHost(

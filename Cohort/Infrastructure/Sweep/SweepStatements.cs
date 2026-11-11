@@ -60,9 +60,10 @@ internal sealed record SweepRunValues(
 
 /// <summary>
 /// Every host-table statement of the sweep pipeline, built once for the run and for readiness
-/// (<see cref="SweepStrategy"/> executes what a builder returns). A builder takes what shapes the
-/// text as separate arguments, takes the values it binds as <c>object?</c>, and never runs host
-/// code, so the same text comes out whoever calls it.
+/// (<see cref="SweepStrategy"/> executes what a builder returns). A builder takes the scope and
+/// any other argument that shapes the text, takes the values it binds as <c>object?</c>
+/// (<c>CountLeft</c> adds its refused-ids clause when those ids are not null), and never runs
+/// host code, so the same text comes out whoever calls it.
 /// </summary>
 internal static class SweepStatements
 {

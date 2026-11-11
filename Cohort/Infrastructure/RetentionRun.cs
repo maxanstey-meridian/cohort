@@ -711,8 +711,8 @@ internal sealed class RetentionRun(
     /// so a run whose session was lost settles Failed instead of reporting success beside the
     /// owner that took its locks; Failed and Cancelled are never fenced, so a run can always
     /// record that it stopped. The settle time is never earlier than the start time: a database
-    /// clock that stepped back meanwhile would otherwise give a negative duration, which neither
-    /// the event nor the ledger accepts, and the run would stay Started.
+    /// clock that stepped back meanwhile would otherwise give a negative duration, which the
+    /// ledger's constraint refuses, and the run would stay Started.
     /// </summary>
     private async Task SettleAsync(Func<DateTimeOffset, SweepEvent> terminal, bool fenced = false)
     {

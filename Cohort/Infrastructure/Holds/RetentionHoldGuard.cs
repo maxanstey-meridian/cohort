@@ -40,7 +40,7 @@ internal sealed class RetentionHoldGuard(
     /// </summary>
     internal async Task EnsureTenantlessHoldsVisibleAsync(
         DbConnection connection,
-        DbTransaction transaction,
+        DbTransaction? transaction,
         string work,
         CancellationToken ct
     )
@@ -79,7 +79,7 @@ internal sealed class RetentionHoldGuard(
     /// </summary>
     internal Task<HeldRowVersions> ReadHeldRowVersionsAsync(
         DbConnection connection,
-        DbTransaction transaction,
+        DbTransaction? transaction,
         CancellationToken ct
     ) => ReadVersionsAsync(connection, transaction, null, ct);
 
@@ -92,7 +92,7 @@ internal sealed class RetentionHoldGuard(
     /// </summary>
     private async Task<HeldRowVersions> ReadVersionsAsync(
         DbConnection connection,
-        DbTransaction transaction,
+        DbTransaction? transaction,
         HeldRowVersions? baseline,
         CancellationToken ct
     )
@@ -135,7 +135,7 @@ internal sealed class RetentionHoldGuard(
 
     private static async Task ReadIntoAsync(
         DbConnection connection,
-        DbTransaction transaction,
+        DbTransaction? transaction,
         SweepStatement statement,
         Dictionary<HeldRowKey, string?> versions,
         Dictionary<Guid, Guid> entityByHold,
@@ -167,7 +167,7 @@ internal sealed class RetentionHoldGuard(
     internal async Task<IReadOnlyList<Guid>> ReadChangedHeldRowsAsync(
         HeldRowVersions baseline,
         DbConnection connection,
-        DbTransaction transaction,
+        DbTransaction? transaction,
         CancellationToken ct
     ) => HeldRowVersions.Changed(baseline, await ReadVersionsAsync(connection, transaction, baseline, ct));
 

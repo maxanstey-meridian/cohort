@@ -71,7 +71,7 @@ internal static class RecordIdSql
 
     internal static async Task<string> CanonicalizeAsync(
         DbConnection connection,
-        DbTransaction transaction,
+        DbTransaction? transaction,
         RetentionEntry entry,
         object value,
         CancellationToken ct

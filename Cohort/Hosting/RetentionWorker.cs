@@ -583,7 +583,7 @@ internal sealed class RetentionWorker(
             {
                 tenants.Add(tenant);
             }
-            else if (!ContextsMatch(firstById[tenant.Id], tenant) && !conflicting.Contains(tenant.Id))
+            else if (firstById[tenant.Id] != tenant && !conflicting.Contains(tenant.Id))
             {
                 conflicting.Add(tenant.Id);
             }
@@ -591,16 +591,6 @@ internal sealed class RetentionWorker(
 
         tenants.RemoveAll(tenant => conflicting.Contains(tenant.Id));
         return (tenants, conflicting);
-    }
-
-    private static bool ContextsMatch(TenantContext first, TenantContext duplicate)
-    {
-        return string.Equals(first.Jurisdiction, duplicate.Jurisdiction, StringComparison.Ordinal)
-            && first.Tags.Count == duplicate.Tags.Count
-            && first.Tags.All(pair =>
-                duplicate.Tags.TryGetValue(pair.Key, out var value)
-                && string.Equals(pair.Value, value, StringComparison.Ordinal)
-            );
     }
 
     private static async Task DelayUntilNextPollAsync(CancellationToken ct)

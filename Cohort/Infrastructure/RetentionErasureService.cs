@@ -74,24 +74,24 @@ internal sealed class RetentionErasureService(
 
     /// <summary>
     /// <see cref="ErasureTransaction.Caller"/> joins the transaction open on this scope's
-    /// DbContext. It must be open and READ COMMITTED (each statement's fresh snapshot is
+    /// DbContext, begun through EF or a System.Transactions transaction the context is enlisted
+    /// in. It must be open and READ COMMITTED (each statement's fresh snapshot is
     /// what lets the hold checks see a hold committed after the caller's transaction began),
     /// the context must hold no unsaved changes (they would commit unchecked inside the
-    /// erasure's transaction), and Cohort's commit interceptor must be on the context, or
-    /// observers would never hear of the run.
+    /// erasure's transaction), and for a transaction begun through EF Cohort's commit
+    /// interceptor must be on the context, or observers would never hear of the run. A
+    /// System.Transactions transaction reports its own completion, so it needs no interceptor.
     /// </summary>
     private async Task<CohortCommitInterceptor> ValidateCallerTransactionAsync(CancellationToken ct)
     {
-        var transaction = ContextTransaction.Of(db.Database) switch
+        var transaction = ContextTransaction.Of(db.Database);
+        if (transaction is ContextTransaction.None)
         {
-            ContextTransaction.Ef ef => ef.Transaction,
-            ContextTransaction.Enlisted => throw new InvalidOperationException(
-                "ErasureTransaction.Caller can't join a System.Transactions transaction (an ambient TransactionScope or one passed to EnlistTransaction): Cohort gives each dependents step's DbContext your transaction as its CurrentTransaction, which EF can do only for a transaction begun through EF. Begin it with BeginTransactionAsync or UseTransaction, or use ErasureTransaction.Owned, which runs outside your scope and commits on its own."
-            ),
-            _ => throw new InvalidOperationException(
+            throw new InvalidOperationException(
                 "ErasureTransaction.Caller needs an open transaction on the scoped DbContext."
-            ),
-        };
+            );
+        }
+
         // EF's own condition: a retrying strategy refuses EF work in a transaction begun outside
         // it, unless the call is running inside the strategy. Checked first so the host gets this
         // message, not EF's from the first call that goes through the strategy (the run-time
@@ -117,20 +117,32 @@ internal sealed class RetentionErasureService(
             );
         }
 
-        if (!commitInterceptor.IsRegisteredOn(db))
+        if (transaction is ContextTransaction.Ef && !commitInterceptor.IsRegisteredOn(db))
         {
             throw new InvalidOperationException(
                 $"ErasureTransaction.Caller needs Cohort's commit interceptor on {db.GetType().FullName}'s options. AddCohort<TContext>() adds it to contexts built from the container's DbContextOptions; resolve the DbContext from the same container instead of constructing its options yourself."
             );
         }
 
-        var statement = CohortStatements.TransactionIsolation();
-        await using var command = statement.Parameters.CreateCommand(
-            db.Database.GetDbConnection(),
-            transaction.GetDbTransaction(),
-            statement.Sql
-        );
-        var isolation = (string?)await command.ExecuteScalarAsync(ct);
+        // Opened through EF, so a System.Transactions transaction the context hasn't used yet is
+        // joined (and its isolation read) rather than read from a closed connection.
+        string? isolation;
+        await db.Database.OpenConnectionAsync(ct);
+        try
+        {
+            var statement = CohortStatements.TransactionIsolation();
+            await using var command = statement.Parameters.CreateCommand(
+                db.Database.GetDbConnection(),
+                transaction.Commands,
+                statement.Sql
+            );
+            isolation = (string?)await command.ExecuteScalarAsync(ct);
+        }
+        finally
+        {
+            await db.Database.CloseConnectionAsync();
+        }
+
         // PostgreSQL accepts READ UNCOMMITTED and runs it as READ COMMITTED.
         if (isolation is not ("read committed" or "read uncommitted"))
         {

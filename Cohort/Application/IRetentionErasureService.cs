@@ -33,7 +33,10 @@ public enum ErasureTransaction
     /// The transaction open on the calling scope's DbContext. The erasure and its ledger
     /// commit or roll back with the caller's own changes; Cohort commits nothing. Audit
     /// observers run only once the caller commits, and a rollback leaves no ledger row.
-    /// The transaction must be begun through EF; a System.Transactions transaction is refused.
+    /// The transaction is one begun through EF, or a System.Transactions transaction the
+    /// context is enlisted in (an ambient <c>TransactionScope</c>, or one passed to
+    /// <c>EnlistTransaction</c>), and it must be READ COMMITTED. A <c>TransactionScope</c> is
+    /// SERIALIZABLE unless created with <c>IsolationLevel.ReadCommitted</c>.
     /// </summary>
     Caller = 1,
 }

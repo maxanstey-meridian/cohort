@@ -75,7 +75,7 @@ internal static class RetentionDependentsSteps
     /// </summary>
     public static async Task PersistBeforeFailureAsync(
         DbConnection conn,
-        DbTransaction transaction,
+        DbTransaction? transaction,
         SweepMutationContext execution,
         RetentionEntry entry,
         Strategy strategy,

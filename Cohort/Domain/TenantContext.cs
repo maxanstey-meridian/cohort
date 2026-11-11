@@ -50,6 +50,36 @@ public sealed record TenantContext
     internal static TenantContext Tenantless { get; } =
         new(Guid.Empty, null, new Dictionary<string, string>(), allowTenantless: true);
 
+    /// <summary>
+    /// Equal when the ID, the jurisdiction, and the tags match: the tags by the same keys with
+    /// the same values, all compared ordinally. The ID alone would equate contexts that resolve
+    /// different rules.
+    /// </summary>
+    public bool Equals(TenantContext? other)
+    {
+        if (other is null)
+        {
+            return false;
+        }
+
+        if (ReferenceEquals(this, other))
+        {
+            return true;
+        }
+
+        return Id == other.Id
+            && string.Equals(Jurisdiction, other.Jurisdiction, StringComparison.Ordinal)
+            && tags.Count == other.tags.Count
+            && tags.All(pair =>
+                other.tags.TryGetValue(pair.Key, out var value)
+                && string.Equals(pair.Value, value, StringComparison.Ordinal)
+            );
+    }
+
+    // The tags are left out: equal contexts have equal IDs and jurisdictions, which is all a hash needs.
+    public override int GetHashCode() =>
+        HashCode.Combine(Id, Jurisdiction is null ? 0 : StringComparer.Ordinal.GetHashCode(Jurisdiction));
+
     private static IReadOnlyDictionary<string, string> CopyTags(
         IReadOnlyDictionary<string, string> tags
     ) =>

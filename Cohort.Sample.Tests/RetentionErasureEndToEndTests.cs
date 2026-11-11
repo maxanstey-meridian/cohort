@@ -9,6 +9,7 @@ using Cohort.Infrastructure.Migrations;
 using Cohort.Sample.Entities;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -2160,19 +2161,341 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeTrue();
     }
 
-    // Cohort gives a dependents step's DbContext the caller's transaction as its CurrentTransaction,
-    // which EF can do only for one begun through EF, so a System.Transactions transaction is
-    // refused before readiness, before a run exists, and before any row is touched. The caller's
-    // own work in the scope is unaffected and commits.
+    // A host whose unit of work is a TransactionScope: the erasure, its ledger rows and the
+    // caller's own change commit together, and observers hear of the run only once the scope
+    // completes, after the ledger it describes is visible to another connection.
     [Fact]
-    public async Task Caller_Mode_Refuses_A_System_Transactions_Transaction()
+    public async Task Caller_Erasure_In_A_System_Transactions_Scope_Commits_With_It_And_Tells_Observers_Once_It_Completes()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, markerId) = await SeedCallerErasureAsync(tenant.Id, subject);
+        var observer = new LedgerVisibilityObserver(ConnectionString);
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configureServices: services => services.AddSingleton<IRetentionAuditObserver>(observer)
+        );
+
+        var result = await host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            ErasureResult erased;
+            using (var scope = ReadCommittedScope())
+            {
+                (await db.Notes.SingleAsync(note => note.Id == markerId)).Body = "marker-after";
+                await db.SaveChangesAsync();
+
+                erased = await services.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                    RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller)
+                );
+
+                // Nothing is visible, or told to observers, before the scope completes.
+                observer.Seen.Should().BeEmpty();
+                (await CountRunsOutsideTheScopeAsync(tenant.Id)).Should().Be(0);
+                scope.Complete();
+                observer.Seen.Should().BeEmpty();
+            }
+
+            return erased;
+        });
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note)).Which.Affected.Should().Be(1);
+        await using (var verify = Host.CreateDbContext())
+        {
+            (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeFalse();
+            (await verify.Notes.SingleAsync(note => note.Id == markerId)).Body.Should().Be("marker-after");
+        }
+
+        (await LoadRunStatusAsync(result.SweepId)).Should().Be(SweepRunStatus.Succeeded);
+        observer.Seen.Select(seen => seen.Event).Should().StartWith(new[] { "Started" }).And.EndWith("Completed");
+        // Each delivery, Started included, already saw the committed, settled run from another connection.
+        observer.Seen.Should().OnlyContain(seen => seen.RunStatus == SweepRunStatus.Succeeded);
+    }
+
+    [Fact]
+    public async Task Caller_Erasure_In_A_System_Transactions_Scope_Disposed_Without_Complete_Leaves_Nothing_And_Tells_No_Observer()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, markerId) = await SeedCallerErasureAsync(tenant.Id, subject);
+        var observer = new RecordingObserver();
+        var logs = new RecordingLogProvider();
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configureServices: services => services
+                .AddSingleton<IRetentionAuditObserver>(observer)
+                .AddSingleton<ILoggerProvider>(logs)
+        );
+
+        await host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            using var scope = ReadCommittedScope();
+            (await db.Notes.SingleAsync(note => note.Id == markerId)).Body = "marker-after";
+            await db.SaveChangesAsync();
+            await services.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller)
+            );
+        });
+
+        observer.Events.Should().BeEmpty();
+        logs.Entries.Should().ContainSingle(entry => entry.Level == LogLevel.Information && entry.Message.Contains("rolled back with the caller's transaction"));
+        (await CountRunsAsync(tenant.Id)).Should().Be(0);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeTrue();
+        (await verify.Notes.SingleAsync(note => note.Id == markerId)).Body.Should().Be("marker-before");
+    }
+
+    // A transaction passed to EnlistTransaction has no ambient scope, so a step's context that
+    // saves two rows in one SaveChangesAsync would begin a transaction of its own, which an
+    // enlisted connection refuses. The step's rows share the erasure's fate either way.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Caller_Erasure_In_An_Enlisted_Transaction_Gives_A_Step_That_Saves_Two_Rows_The_Erasures_Fate(bool commit)
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, markerId) = await SeedCallerErasureAsync(tenant.Id, subject);
+        var observer = new LedgerVisibilityObserver(ConnectionString);
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configureServices: services => services
+                .AddRetentionDependents<Note, TwoMessageOutboxStep>()
+                .AddSingleton<IRetentionAuditObserver>(observer)
+        );
+
+        var result = await host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            using var transaction = new System.Transactions.CommittableTransaction(
+                new System.Transactions.TransactionOptions { IsolationLevel = System.Transactions.IsolationLevel.ReadCommitted }
+            );
+            // Opened first and kept open through the outcome, so the connection is enlisted in a
+            // transaction that is not the ambient one.
+            await db.Database.OpenConnectionAsync();
+            System.Transactions.TransactionsDatabaseFacadeExtensions.EnlistTransaction(db.Database, transaction);
+            (await db.Notes.SingleAsync(note => note.Id == markerId)).Body = "marker-after";
+            await db.SaveChangesAsync();
+
+            var erased = await services.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller)
+            );
+
+            observer.Seen.Should().BeEmpty();
+            if (commit)
+            {
+                transaction.Commit();
+            }
+            else
+            {
+                transaction.Rollback();
+            }
+
+            await db.Database.CloseConnectionAsync();
+            return erased;
+        });
+
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note)).Which.Affected.Should().Be(1);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().Be(!commit);
+        (await verify.Notes.SingleAsync(note => note.Id == markerId)).Body.Should().Be(commit ? "marker-after" : "marker-before");
+        (await verify.OutboxMessages.CountAsync(message => message.TenantId == tenant.Id)).Should().Be(commit ? 2 : 0);
+        (await CountRunsAsync(tenant.Id)).Should().Be(commit ? 1 : 0);
+        if (commit)
+        {
+            // Told once the transaction committed, each event already seeing the settled run.
+            observer.Seen.Select(seen => seen.Event).Should().StartWith(new[] { "Started" }).And.EndWith("Completed");
+            observer.Seen.Should().OnlyContain(seen => seen.RunStatus == SweepRunStatus.Succeeded);
+        }
+        else
+        {
+            observer.Seen.Should().BeEmpty();
+        }
+    }
+
+    // The step's own failure undoes that row's work with the row's savepoint, and the host's
+    // transaction still commits with the other rows erased.
+    [Fact]
+    public async Task Caller_Erasure_In_A_System_Transactions_Scope_Skips_A_Row_Whose_Step_Fails_And_Still_Commits()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var okId = Guid.NewGuid();
+        var failingId = Guid.NewGuid();
+        var createdAt = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero).AddDays(-45);
+        await using (var seed = Host.CreateDbContext())
+        {
+            seed.Notes.AddRange(
+                new Note { Id = okId, TenantId = tenant.Id, SubjectId = subject, CreatedAt = createdAt, Body = "erase-me" },
+                new Note { Id = failingId, TenantId = tenant.Id, SubjectId = subject, CreatedAt = createdAt, Body = OutboxThenFailingStep.FailingBody }
+            );
+            await seed.SaveChangesAsync();
+        }
+
+        var observer = new RecordingObserver();
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configureServices: services => services
+                .AddRetentionDependents<Note, OutboxThenFailingStep>()
+                .AddSingleton<IRetentionAuditObserver>(observer)
+        );
+
+        var result = await host.RunWithServicesAsync(async services =>
+        {
+            ErasureResult erased;
+            using (var scope = ReadCommittedScope())
+            {
+                erased = await services.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                    RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller)
+                );
+                observer.Events.Should().BeEmpty();
+                scope.Complete();
+            }
+
+            return erased;
+        });
+
+        result.EntityFailures.Should().ContainSingle().Which.Should().Contain("reason=rows-skipped");
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note))
+            .Which.Should().BeEquivalentTo(new { Affected = 1L, SkippedCount = 1L });
+        (await LoadRunStatusAsync(result.SweepId)).Should().Be(SweepRunStatus.PartiallyFailed);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == okId)).Should().BeFalse();
+        (await verify.Notes.AnyAsync(note => note.Id == failingId)).Should().BeTrue();
+        // The failing row's message was saved before its step threw, and its savepoint undid it.
+        (await verify.OutboxMessages.Where(message => message.TenantId == tenant.Id).Select(message => message.Payload).ToListAsync())
+            .Should().Equal(okId.ToString());
+        // The skipped row is recorded, written on the enlisted connection and kept with the commit.
+        (await LoadSkippedRowFailuresAsync(result.SweepId)).Should().ContainSingle()
+            .Which.RecordId.Should().Be(failingId.ToString());
+        observer.Events.Should().StartWith(observer.Events.OfType<SweepEvent.Started>().Single())
+            .And.EndWith(observer.Events.OfType<SweepEvent.PartiallyFailed>().Single());
+    }
+
+    // An entity whose change the database refuses outright (a trigger, which readiness can't
+    // foresee) fails inside the step's scope. The entity's savepoint undoes it, the other entity's
+    // work commits with the host's, and the host's scope still commits: the step's scope is
+    // completed on the way out, or it would have aborted the host's whole transaction.
+    [Fact]
+    public async Task Caller_Erasure_In_A_System_Transactions_Scope_Undoes_Only_The_Entity_That_Fails_Outright()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, markerId) = await SeedCallerErasureAsync(tenant.Id, subject);
+        var contactId = Guid.NewGuid();
+        await using (var seed = Host.CreateDbContext())
+        {
+            seed.AnonymisedContacts.Add(
+                new AnonymisedContact
+                {
+                    Id = contactId,
+                    TenantId = tenant.Id,
+                    SubjectId = subject,
+                    CreatedAt = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero),
+                    EmailAddress = "a@b.c",
+                    GivenName = "Ada",
+                    Surname = "Lovelace",
+                    Notes = "kept",
+                }
+            );
+            await seed.SaveChangesAsync();
+        }
+
+        var observer = new RecordingObserver();
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configureServices: services => services
+                .AddRetentionDependents<AnonymisedContact, NothingToRetireStep>()
+                .AddSingleton<IRetentionAuditObserver>(observer)
+        );
+
+        // Dropped in the finally: the trigger is on a table the whole run shares.
+        var name = $"cohort_refuse_contact_update_{Guid.NewGuid():N}";
+        await ExecuteScriptAsync(
+            $$"""
+            CREATE FUNCTION "{{name}}"() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF NEW."TenantId" = '{{tenant.Id}}'::uuid THEN
+                    RAISE EXCEPTION 'refused';
+                END IF;
+                RETURN NEW;
+            END $$;
+            CREATE TRIGGER "{{name}}" BEFORE UPDATE ON "anonymised_contacts"
+                FOR EACH ROW EXECUTE FUNCTION "{{name}}"();
+            """
+        );
+
+        ErasureResult result;
+        try
+        {
+            result = await host.RunWithServicesAsync(async services =>
+            {
+                var db = services.GetRequiredService<SampleDbContext>();
+                ErasureResult erased;
+                using (var scope = ReadCommittedScope())
+                {
+                    (await db.Notes.SingleAsync(note => note.Id == markerId)).Body = "marker-after";
+                    await db.SaveChangesAsync();
+
+                    erased = await services.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                        RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller)
+                    );
+                    observer.Events.Should().BeEmpty();
+                    scope.Complete();
+                }
+
+                return erased;
+            });
+        }
+        finally
+        {
+            await ExecuteScriptAsync(
+                $"""DROP TRIGGER IF EXISTS "{name}" ON "anonymised_contacts"; DROP FUNCTION IF EXISTS "{name}"();"""
+            );
+        }
+
+        result.EntityFailures.Should().ContainSingle().Which.Should().Contain("code=sqlstate:P0001");
+        result.Counts.Should().NotContain(count => count.EntityType == typeof(AnonymisedContact));
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note)).Which.Affected.Should().Be(1);
+        (await LoadRunStatusAsync(result.SweepId)).Should().Be(SweepRunStatus.PartiallyFailed);
+        await using (var verify = Host.CreateDbContext())
+        {
+            (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeFalse();
+            (await verify.Notes.SingleAsync(note => note.Id == markerId)).Body.Should().Be("marker-after");
+            var failed = await verify.AnonymisedContacts.SingleAsync(contact => contact.Id == contactId);
+            failed.EmailAddress.Should().Be("a@b.c");
+            failed.AnonymisedAt.Should().BeNull();
+        }
+
+        // The entity the database refused is told of by neither event; the other entity's summary is.
+        var summaries = observer.Events.OfType<SweepEvent.EntitySummary>().ToList();
+        summaries.Should().Contain(summary => summary.EntityType == typeof(Note) && summary.Affected == 1);
+        summaries.Should().NotContain(summary => summary.EntityType == typeof(AnonymisedContact));
+        observer.Events.OfType<SweepEvent.EntityProgress>().Should().NotContain(progress => progress.EntityType == typeof(AnonymisedContact));
+        observer.Events.Should().StartWith(observer.Events.OfType<SweepEvent.Started>().Single())
+            .And.EndWith(observer.Events.OfType<SweepEvent.PartiallyFailed>().Single());
+    }
+
+    // A TransactionScope is SERIALIZABLE unless it asks otherwise, and the hold checks need
+    // each statement's fresh snapshot, so the erasure refuses before it changes anything. The
+    // caller's own work in the scope is unaffected and commits.
+    [Fact]
+    public async Task Caller_Erasure_In_A_Default_System_Transactions_Scope_Refuses_Its_Isolation_Level()
     {
         var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
         var subject = Guid.NewGuid();
         var (erasedId, markerId) = await SeedCallerErasureAsync(tenant.Id, subject);
         var request = RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller);
+        var observer = new RecordingObserver();
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configureServices: services => services.AddSingleton<IRetentionAuditObserver>(observer)
+        );
 
-        await Host.RunWithServicesAsync(async services =>
+        await host.RunWithServicesAsync(async services =>
         {
             var db = services.GetRequiredService<SampleDbContext>();
             var erasure = services.GetRequiredService<IRetentionErasureService>();
@@ -2184,16 +2507,308 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             await db.SaveChangesAsync();
 
             var inScope = () => erasure.ExecuteAsync(request);
-            (await inScope.Should().ThrowAsync<InvalidOperationException>()).Which.Message.Should().Be(
-                "ErasureTransaction.Caller can't join a System.Transactions transaction (an ambient TransactionScope or one passed to EnlistTransaction): Cohort gives each dependents step's DbContext your transaction as its CurrentTransaction, which EF can do only for a transaction begun through EF. Begin it with BeginTransactionAsync or UseTransaction, or use ErasureTransaction.Owned, which runs outside your scope and commits on its own."
+            (await inScope.Should().ThrowAsync<InvalidOperationException>()).Which.Message.Should().StartWith(
+                "ErasureTransaction.Caller needs a READ COMMITTED transaction, but the caller's is SERIALIZABLE"
             );
             scope.Complete();
         });
 
+        observer.Events.Should().BeEmpty();
         (await CountRunsAsync(tenant.Id)).Should().Be(0);
         await using var verify = Host.CreateDbContext();
         (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeTrue();
         (await verify.Notes.SingleAsync(note => note.Id == markerId)).Body.Should().Be("marker-after");
+    }
+
+    // The scope completes over a PostgreSQL transaction the host's swallowed database error had
+    // aborted: System.Transactions reports Committed, PostgreSQL kept nothing. Only the check for
+    // the run's ledger row can tell, so observers are not told of a run that didn't happen.
+    [Fact]
+    public async Task Completing_A_System_Transactions_Scope_Over_An_Aborted_Transaction_Keeps_Nothing_And_Tells_No_Observer()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, markerId) = await SeedCallerErasureAsync(tenant.Id, subject);
+        var observer = new RecordingObserver();
+        var logs = new RecordingLogProvider();
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configureServices: services => services
+                .AddSingleton<IRetentionAuditObserver>(observer)
+                .AddSingleton<ILoggerProvider>(logs)
+        );
+
+        await host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            using var scope = ReadCommittedScope();
+            (await db.Notes.SingleAsync(note => note.Id == markerId)).Body = "marker-after";
+            await db.SaveChangesAsync();
+            await services.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller)
+            );
+
+            var failing = () => db.Database.ExecuteSqlRawAsync("SELECT 1 / 0");
+            (await failing.Should().ThrowAsync<PostgresException>()).Which.SqlState.Should().Be(PostgresErrorCodes.DivisionByZero);
+            scope.Complete();
+        });
+
+        observer.Events.Should().BeEmpty();
+        logs.Entries.Should().ContainSingle(entry => entry.Level == LogLevel.Information && entry.Message.Contains("no committed ledger row"));
+        logs.Entries.Should().NotContain(entry => entry.Message.Contains("could not confirm"));
+        (await CountRunsAsync(tenant.Id)).Should().Be(0);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeTrue();
+        (await verify.Notes.SingleAsync(note => note.Id == markerId)).Body.Should().Be("marker-before");
+    }
+
+    // Cohort asks whether the run committed through the caller's own context, so a context
+    // disposed before the scope completes can't be asked: the erasure still stands, and the
+    // observers are not told, with a warning that says why.
+    [Fact]
+    public async Task A_Caller_Context_Disposed_Before_The_Scope_Completes_Keeps_The_Erasure_And_Tells_No_Observer()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, markerId) = await SeedCallerErasureAsync(tenant.Id, subject);
+        var observer = new RecordingObserver();
+        var logs = new RecordingLogProvider();
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configureServices: services => services
+                .AddSingleton<IRetentionAuditObserver>(observer)
+                .AddSingleton<ILoggerProvider>(logs)
+        );
+
+        ErasureResult result;
+        using (var scope = ReadCommittedScope())
+        {
+            result = await host.RunWithServicesAsync(async services =>
+            {
+                var db = services.GetRequiredService<SampleDbContext>();
+                (await db.Notes.SingleAsync(note => note.Id == markerId)).Body = "marker-after";
+                await db.SaveChangesAsync();
+                return await services.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                    RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller)
+                );
+            });
+            scope.Complete();
+        }
+
+        observer.Events.Should().BeEmpty();
+        logs.Entries.Should().ContainSingle(entry =>
+            entry.Level == LogLevel.Warning && entry.Message.Contains("could not confirm") && entry.Message.Contains(result.SweepId.ToString()));
+        (await LoadRunStatusAsync(result.SweepId)).Should().Be(SweepRunStatus.Succeeded);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeFalse();
+        (await verify.Notes.SingleAsync(note => note.Id == markerId)).Body.Should().Be("marker-after");
+    }
+
+    // The run's own open of the caller's connection is not cancellable. Here the rule provider
+    // cancels the erasure's token once the plan is built, with the enlisted context's connection
+    // closed, and the context's connection honours its token when it opens (Npgsql's does when it
+    // waits for the pool or dials the server, though not on an idle pooled connection): the run
+    // still starts and settles Cancelled inside the caller's transaction, as one on the open
+    // connection of a transaction begun through EF does.
+    [Fact]
+    public async Task Caller_Erasure_In_A_System_Transactions_Scope_Cancelled_Before_The_Run_Starts_Still_Settles_Cancelled()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, markerId) = await SeedCallerErasureAsync(tenant.Id, subject);
+        var observer = new RecordingObserver();
+        using var cancellation = new CancellationTokenSource();
+        using var host = new CohortTestHost(
+            ConnectionString,
+            ruleProvider: new CancellingRuleProvider(new SampleRetentionRuleProvider(), cancellation),
+            configureServices: services => services
+                .AddScoped(_ => new SampleDbContext(
+                    new DbContextOptionsBuilder<SampleDbContext>()
+                        .UseNpgsql(ConnectionString)
+                        .AddInterceptors(new TokenHonouringOpenInterceptor())
+                        .Options
+                ))
+                .AddSingleton<IRetentionAuditObserver>(observer)
+        );
+
+        await host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            using var scope = ReadCommittedScope();
+            (await db.Notes.SingleAsync(note => note.Id == markerId)).Body = "marker-after";
+            await db.SaveChangesAsync();
+
+            var erasure = () => services.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller),
+                cancellation.Token
+            );
+            await erasure.Should().ThrowAsync<OperationCanceledException>();
+
+            // Still usable: the run settled Cancelled inside the scope.
+            ((SweepRunStatus)await db.Database
+                .SqlQuery<int>($"""SELECT "Status" AS "Value" FROM "sweep_run" WHERE "TenantId" = {tenant.Id}""")
+                .SingleAsync()).Should().Be(SweepRunStatus.Cancelled);
+            scope.Complete();
+        });
+
+        (await CountRunsAsync(tenant.Id)).Should().Be(1);
+        observer.Events.Should().StartWith(observer.Events.OfType<SweepEvent.Started>().Single())
+            .And.EndWith(observer.Events.OfType<SweepEvent.Cancelled>().Single());
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeTrue();
+        (await verify.Notes.SingleAsync(note => note.Id == markerId)).Body.Should().Be("marker-after");
+    }
+
+    // The commit has happened by the time deferred work runs, so work that throws (an observer
+    // that fails while the logger it is reported through fails too, which the notifier doesn't
+    // contain) must not reach the caller's commit, on either kind of transaction. Cohort logs it.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Deferred_Work_That_Throws_Does_Not_Fail_The_Callers_Commit(bool systemTransactions)
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, markerId) = await SeedCallerErasureAsync(tenant.Id, subject);
+        var observer = new ThrowingObserver();
+        var logs = new RecordingLogProvider(failingCategorySuffix: "RetentionAuditNotifier");
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configureServices: services => services
+                .AddSingleton<IRetentionAuditObserver>(observer)
+                .AddSingleton<ILoggerProvider>(logs)
+        );
+
+        await host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            if (systemTransactions)
+            {
+                using var scope = ReadCommittedScope();
+                await EraseInCallersTransactionAsync(services, db);
+                scope.Complete();
+            }
+            else
+            {
+                await using var transaction = await db.Database.BeginTransactionAsync();
+                await EraseInCallersTransactionAsync(services, db);
+                await transaction.CommitAsync();
+            }
+        });
+
+        observer.Deliveries.Should().BePositive();
+        logs.Entries.Should().Contain(entry =>
+            entry.Level == LogLevel.Error && entry.Message.Contains("deferred until a caller's transaction committed failed"));
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeFalse();
+        (await verify.Notes.SingleAsync(note => note.Id == markerId)).Body.Should().Be("marker-after");
+
+        async Task EraseInCallersTransactionAsync(IServiceProvider services, SampleDbContext db)
+        {
+            (await db.Notes.SingleAsync(note => note.Id == markerId)).Body = "marker-after";
+            await db.SaveChangesAsync();
+            await services.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller)
+            );
+        }
+    }
+
+    // A System.Transactions transaction reports its own completion, so the caller's context needs
+    // none of Cohort's commit interceptor (which only a transaction begun through EF needs): a
+    // context its host built from options of its own erases, and observers hear of the run.
+    [Fact]
+    public async Task Caller_Erasure_In_A_System_Transactions_Scope_Needs_No_Commit_Interceptor_On_The_Context()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, markerId) = await SeedCallerErasureAsync(tenant.Id, subject);
+        var observer = new RecordingObserver();
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configureServices: services => services
+                .AddScoped(_ => new SampleDbContext(
+                    new DbContextOptionsBuilder<SampleDbContext>().UseNpgsql(ConnectionString).Options
+                ))
+                .AddSingleton<IRetentionAuditObserver>(observer)
+        );
+
+        var result = await host.RunWithServicesAsync(async services =>
+        {
+            ErasureResult erased;
+            using (var scope = ReadCommittedScope())
+            {
+                var db = services.GetRequiredService<SampleDbContext>();
+                (await db.Notes.SingleAsync(note => note.Id == markerId)).Body = "marker-after";
+                await db.SaveChangesAsync();
+                erased = await services.GetRequiredService<IRetentionErasureService>().ExecuteAsync(
+                    RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller)
+                );
+                scope.Complete();
+            }
+
+            return erased;
+        });
+
+        result.EntityFailures.Should().BeEmpty();
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeFalse();
+        (await verify.Notes.SingleAsync(note => note.Id == markerId)).Body.Should().Be("marker-after");
+        observer.Events.Should().StartWith(observer.Events.OfType<SweepEvent.Started>().Single())
+            .And.EndWith(observer.Events.OfType<SweepEvent.Completed>().Single());
+    }
+
+    // The sample's own step, the one the row-handlers guide tells a host to copy, checks that its
+    // context is in a transaction. Inside a System.Transactions one CurrentTransaction is null, so
+    // the check has to look at Transaction.Current too, or the step refuses every row.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Caller_Erasure_In_A_System_Transactions_Transaction_Runs_The_Sample_Outbox_Step(bool enlisted)
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, markerId) = await SeedCallerErasureAsync(tenant.Id, subject);
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configureServices: services => services.AddRetentionDependents<Note, NoteOutboxStep>()
+        );
+
+        var result = await host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            var erasure = services.GetRequiredService<IRetentionErasureService>();
+            var request = RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller);
+            if (!enlisted)
+            {
+                using var scope = ReadCommittedScope();
+                (await db.Notes.SingleAsync(note => note.Id == markerId)).Body = "marker-after";
+                await db.SaveChangesAsync();
+                var erased = await erasure.ExecuteAsync(request);
+                scope.Complete();
+                return erased;
+            }
+
+            using var transaction = new System.Transactions.CommittableTransaction(
+                new System.Transactions.TransactionOptions { IsolationLevel = System.Transactions.IsolationLevel.ReadCommitted }
+            );
+            await db.Database.OpenConnectionAsync();
+            System.Transactions.TransactionsDatabaseFacadeExtensions.EnlistTransaction(db.Database, transaction);
+            (await db.Notes.SingleAsync(note => note.Id == markerId)).Body = "marker-after";
+            await db.SaveChangesAsync();
+            var enlistedResult = await erasure.ExecuteAsync(request);
+            transaction.Commit();
+            await db.Database.CloseConnectionAsync();
+            return enlistedResult;
+        });
+
+        // A refused row would show here as reason=rows-skipped.
+        result.EntityFailures.Should().BeEmpty();
+        result.Counts.Should().ContainSingle(count => count.EntityType == typeof(Note)).Which.Affected.Should().Be(1);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeFalse();
+        (await verify.Notes.SingleAsync(note => note.Id == markerId)).Body.Should().Be("marker-after");
+        (await verify.OutboxMessages.Where(message => message.TenantId == tenant.Id).Select(message => message.Payload).ToListAsync())
+            .Should().Equal(erasedId.ToString());
     }
 
     // A retrying execution strategy refuses EF work in a transaction begun outside it. The
@@ -2836,6 +3451,78 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
     private static ErasureScope CallerScope(Guid subject) =>
         new("user", subject, allowSoftDeleteAsErasure: true);
 
+    // A TransactionScope is SERIALIZABLE unless it asks otherwise, which a caller erasure refuses.
+    private static System.Transactions.TransactionScope ReadCommittedScope() =>
+        new(
+            System.Transactions.TransactionScopeOption.Required,
+            new System.Transactions.TransactionOptions { IsolationLevel = System.Transactions.IsolationLevel.ReadCommitted },
+            System.Transactions.TransactionScopeAsyncFlowOption.Enabled
+        );
+
+    // A context opened inside the host's scope would enlist in it and see its uncommitted rows.
+    private async Task<long> CountRunsOutsideTheScopeAsync(Guid tenantId)
+    {
+        using var suppress = new System.Transactions.TransactionScope(
+            System.Transactions.TransactionScopeOption.Suppress,
+            System.Transactions.TransactionScopeAsyncFlowOption.Enabled
+        );
+        return await CountRunsAsync(tenantId);
+    }
+
+    /// <summary>Saves two outbox messages in one SaveChangesAsync, which EF wraps in a transaction of its own unless one is open.</summary>
+    private sealed class TwoMessageOutboxStep(SampleDbContext db) : IRetentionDependents<Note>
+    {
+        public async Task RetireAsync(Note row, RetentionDependentsContext ctx, CancellationToken ct)
+        {
+            for (var message = 0; message < 2; message++)
+            {
+                db.OutboxMessages.Add(
+                    new OutboxMessage
+                    {
+                        Id = Guid.NewGuid(),
+                        TenantId = ctx.TenantId,
+                        Type = "note-retired",
+                        Payload = row.Id.ToString(),
+                        CreatedAt = ctx.At,
+                    }
+                );
+            }
+
+            await db.SaveChangesAsync(ct);
+        }
+    }
+
+    /// <summary>Saves an outbox message, then throws for the one row whose body says so.</summary>
+    private sealed class OutboxThenFailingStep(SampleDbContext db) : IRetentionDependents<Note>
+    {
+        public const string FailingBody = "step-fails";
+
+        public async Task RetireAsync(Note row, RetentionDependentsContext ctx, CancellationToken ct)
+        {
+            db.OutboxMessages.Add(
+                new OutboxMessage
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = ctx.TenantId,
+                    Type = "note-retired",
+                    Payload = row.Id.ToString(),
+                    CreatedAt = ctx.At,
+                }
+            );
+            await db.SaveChangesAsync(ct);
+            if (row.Body == FailingBody)
+            {
+                throw new InvalidOperationException("Simulated step failure.");
+            }
+        }
+    }
+
+    private sealed class NothingToRetireStep : IRetentionDependents<AnonymisedContact>
+    {
+        public Task RetireAsync(AnonymisedContact row, RetentionDependentsContext ctx, CancellationToken ct) =>
+            Task.CompletedTask;
+    }
+
     /// <summary>One note to erase for the subject and one marker note the caller changes.</summary>
     private async Task<(Guid ErasedId, Guid MarkerId)> SeedCallerErasureAsync(Guid tenantId, Guid subject)
     {
@@ -2849,6 +3536,35 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         );
         await db.SaveChangesAsync();
         return (erasedId, markerId);
+    }
+
+    private async Task ExecuteScriptAsync(string sql)
+    {
+        await using var connection = new NpgsqlConnection(ConnectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand(sql, connection);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>The rows a run left unmutated because a dependents step failed: their record ids and why.</summary>
+    private async Task<IReadOnlyList<(string RecordId, string Failure)>> LoadSkippedRowFailuresAsync(Guid sweepId)
+    {
+        await using var connection = new NpgsqlConnection(ConnectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT "RecordId", "Failure" FROM "sweep_run_row_detail"
+            WHERE "SweepId" = @sweepId AND "Failure" IS NOT NULL
+            """;
+        command.Parameters.AddWithValue("sweepId", sweepId);
+        var rows = new List<(string RecordId, string Failure)>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            rows.Add((reader.GetString(0), reader.GetString(1)));
+        }
+
+        return rows;
     }
 
     private async Task<SweepRunStatus> LoadRunStatusAsync(Guid sweepId)
@@ -2881,25 +3597,79 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         }
     }
 
-    private sealed class RecordingLogProvider : ILoggerProvider
+    /// <summary>Records every entry; a logger whose category ends with <paramref name="failingCategorySuffix"/> throws on an error instead.</summary>
+    private sealed class RecordingLogProvider(string? failingCategorySuffix = null) : ILoggerProvider
     {
         private readonly System.Collections.Concurrent.ConcurrentQueue<(LogLevel Level, string Message)> entries = new();
 
         public IReadOnlyList<(LogLevel Level, string Message)> Entries => [.. entries];
 
-        public ILogger CreateLogger(string categoryName) => new RecordingLogger(entries);
+        public ILogger CreateLogger(string categoryName) =>
+            new RecordingLogger(entries, failingCategorySuffix is not null && categoryName.EndsWith(failingCategorySuffix, StringComparison.Ordinal));
 
         public void Dispose() { }
 
-        private sealed class RecordingLogger(System.Collections.Concurrent.ConcurrentQueue<(LogLevel Level, string Message)> entries) : ILogger
+        private sealed class RecordingLogger(
+            System.Collections.Concurrent.ConcurrentQueue<(LogLevel Level, string Message)> entries,
+            bool failsOnError
+        ) : ILogger
         {
             public IDisposable? BeginScope<TState>(TState state)
                 where TState : notnull => null;
 
             public bool IsEnabled(LogLevel logLevel) => true;
 
-            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter) =>
+            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+            {
+                if (failsOnError && logLevel >= LogLevel.Error)
+                {
+                    throw new InvalidOperationException("Simulated logging failure.");
+                }
+
                 entries.Enqueue((logLevel, formatter(state, exception)));
+            }
+        }
+    }
+
+    private sealed class ThrowingObserver : IRetentionAuditObserver
+    {
+        private int deliveries;
+
+        public int Deliveries => Volatile.Read(ref deliveries);
+
+        public Task OnCommittedAsync(SweepEvent evt, CancellationToken ct)
+        {
+            Interlocked.Increment(ref deliveries);
+            throw new InvalidOperationException("Simulated observer failure.");
+        }
+    }
+
+    /// <summary>Makes every real open of the connection throw when its token is already cancelled.</summary>
+    private sealed class TokenHonouringOpenInterceptor : DbConnectionInterceptor
+    {
+        public override ValueTask<InterceptionResult> ConnectionOpeningAsync(
+            DbConnection connection,
+            ConnectionEventData eventData,
+            InterceptionResult result,
+            CancellationToken cancellationToken = default
+        )
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return ValueTask.FromResult(result);
+        }
+    }
+
+    /// <summary>Cancels the run's token once it has resolved a rule, which only happens after the erasure's checks and before its run starts.</summary>
+    private sealed class CancellingRuleProvider(IRetentionRuleProvider inner, CancellationTokenSource cancellation)
+        : IRetentionRuleProvider
+    {
+        public RetentionCategoryCapabilities? GetCapabilities(string category) => inner.GetCapabilities(category);
+
+        public async Task<RetentionRule?> ResolveAsync(RetentionResolutionContext context, CancellationToken ct)
+        {
+            var rule = await inner.ResolveAsync(context, ct);
+            await cancellation.CancelAsync();
+            return rule;
         }
     }
 

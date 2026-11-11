@@ -1098,6 +1098,38 @@ public sealed class RetentionWorkerEndToEndTests(PostgresFixture fixture) : IAsy
     }
 
     [Fact]
+    public async Task A_Tenant_The_Source_Returns_Twice_With_The_Same_Content_Is_Swept_Once_Not_Refused()
+    {
+        await using var database = await UseTemporaryDatabaseAsync();
+        var tenant = new TenantContext(
+            Guid.NewGuid(),
+            "uk",
+            new Dictionary<string, string> { ["region"] = "south-east" }
+        );
+        var duplicate = new TenantContext(
+            tenant.Id,
+            "uk",
+            new Dictionary<string, string> { ["region"] = "south-east" }
+        );
+        using var host = BuildHost(
+            CreateSettings(ConnectionString, schedule: "0 0 0 1 1 *", dryRun: false, killSwitch: false),
+            tenant,
+            services =>
+            {
+                services.AddSingleton<IRetentionRuleProvider, SampleRetentionRuleProvider>();
+                services.AddSingleton<IRetentionTenantSource>(new StaticTenantSource(tenant, duplicate));
+            }
+        );
+        await SeedOldNoteAsync(tenant.Id, "listed-twice");
+
+        await GetWorker(host).RunIterationAsync((await DatabaseNowAsync()).AddSeconds(-1), dryRun: false, CancellationToken.None);
+
+        (await NoteExistsAsync("listed-twice")).Should().BeFalse();
+        (await LoadScheduledRunsAsync(tenant.Id)).Should().ContainSingle()
+            .Which.Status.Should().Be(SweepRunStatus.Succeeded);
+    }
+
+    [Fact]
     public async Task A_Refused_Pass_Is_Retried_And_Swept_Once_The_Source_Lists_The_Tenant()
     {
         await using var database = await UseTemporaryDatabaseAsync();

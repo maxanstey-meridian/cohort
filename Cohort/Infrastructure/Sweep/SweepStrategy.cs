@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Data.Common;
 using System.Reflection;
+using System.Transactions;
 
 using Cohort.Application;
 using Cohort.Domain;
@@ -147,7 +148,7 @@ internal sealed class SweepStrategy(
     public async Task<SweepExecutionResult> ExecuteAsync(
         SweepScope scope,
         DbConnection conn,
-        DbTransaction transaction,
+        ContextTransaction transaction,
         SweepMutationContext execution,
         CancellationToken ct
     )
@@ -162,7 +163,7 @@ internal sealed class SweepStrategy(
     private async Task<SweepExecutionResult> MutateCandidatesAsync(
         SweepScope scope,
         DbConnection conn,
-        DbTransaction transaction,
+        ContextTransaction transaction,
         IReadOnlyList<string> candidates,
         SweepMutationContext execution,
         CancellationToken ct
@@ -178,7 +179,15 @@ internal sealed class SweepStrategy(
 
         // A step never sees the run's own context, which in a caller-transaction erasure is
         // the caller's: it gets a scope of its own per batch, whose context joins the run's
-        // connection and transaction before the step is constructed.
+        // connection and transaction before the step is constructed. A transaction begun through
+        // EF is given to it as its CurrentTransaction. EF can't do that for a System.Transactions
+        // one, so each call of the step runs inside a scope of it instead
+        // (<see cref="RetireInScopeAsync"/>), and the step sees it as ambient.
+        // The caller's own context is used in here too (it loads the rows, and reads the holds),
+        // and EF refuses a context a different ambient transaction than the one it was used under.
+        // RunInScopeAsync suppresses the host's, so a host that has one gets it back around
+        // everything the lambda does.
+        var hostAmbient = transaction is ContextTransaction.Enlisted ? Transaction.Current : null;
         return await scopeFactory.RunInScopeAsync(
             RetentionExecutionScopes.For(scope.Tenant),
             async stepServices =>
@@ -189,9 +198,16 @@ internal sealed class SweepStrategy(
                 // be swapped.
                 await stepDb.Database.CloseConnectionAsync();
                 stepDb.Database.SetDbConnection(conn, contextOwnsConnection: false);
+                using var restoredAmbient = hostAmbient is null
+                    ? null
+                    : new TransactionScope(hostAmbient, TransactionScopeAsyncFlowOption.Enabled);
                 try
                 {
-                    await stepDb.Database.UseTransactionAsync(transaction, ct);
+                    if (transaction is ContextTransaction.Ef)
+                    {
+                        await stepDb.Database.UseTransactionAsync(transaction.Commands, ct);
+                    }
+
                     var stepScope = new RetentionDependentsScope(
                         stepDb,
                         RetentionDependentsSteps.ResolveDependents(stepServices, registration)
@@ -199,7 +215,7 @@ internal sealed class SweepStrategy(
                     // The guard reads only the holds this scope can see.
                     await holdGuard.EnsureTenantlessHoldsVisibleAsync(
                         conn,
-                        transaction,
+                        transaction.Commands,
                         $"Dependents step {stepScope.Dependents.StepType.FullName}",
                         ct
                     );
@@ -208,7 +224,14 @@ internal sealed class SweepStrategy(
                 }
                 finally
                 {
-                    await stepDb.Database.UseTransactionAsync(null, CancellationToken.None);
+                    // Completed whatever happened, as the step's own scope is: one disposed
+                    // without Complete aborts the caller's whole transaction.
+                    restoredAmbient?.Complete();
+                    if (transaction is ContextTransaction.Ef)
+                    {
+                        await stepDb.Database.UseTransactionAsync(null, CancellationToken.None);
+                    }
+
                     RestoreConfiguredConnection(stepDb);
                 }
             },
@@ -242,7 +265,7 @@ internal sealed class SweepStrategy(
     private async Task<SweepExecutionResult> MutateAsync(
         SweepScope scope,
         DbConnection conn,
-        DbTransaction transaction,
+        ContextTransaction transaction,
         IReadOnlyList<string> candidates,
         SweepMutation mutation,
         bool rowByRow,
@@ -286,7 +309,7 @@ internal sealed class SweepStrategy(
         SweepScope scope,
         SweepMutation mutation,
         DbConnection conn,
-        DbTransaction transaction,
+        ContextTransaction transaction,
         IReadOnlyList<string> recordIds,
         List<string> affected,
         BlockedRows blocked,
@@ -296,22 +319,22 @@ internal sealed class SweepStrategy(
         var headParameters = new SqlParams();
         mutation.AddParameters(headParameters, null);
         var statement = SweepStatements.MutateBatch(scope, headParameters, recordIds.ToArray());
-        await using var command = statement.Parameters.CreateCommand(conn, transaction, statement.Sql);
+        await using var command = statement.Parameters.CreateCommand(conn, transaction.Commands, statement.Sql);
 
         // Cohort's own savepoints ignore cancellation, like the entity savepoint: a cancelled
         // ROLLBACK TO would leave the batch aborted with no way back.
-        await transaction.SaveAsync(MutationSavepoint, CancellationToken.None);
+        await SavepointSql.SaveAsync(conn, transaction.Commands, MutationSavepoint, CancellationToken.None);
         DbException refusal;
         try
         {
             var changed = await ReadRecordIdsAsync(command, ct);
-            await transaction.ReleaseAsync(MutationSavepoint, CancellationToken.None);
+            await SavepointSql.ReleaseAsync(conn, transaction.Commands, MutationSavepoint, CancellationToken.None);
             affected.AddRange(changed);
             return;
         }
         catch (DbException ex) when (IsIntegrityViolation(ex))
         {
-            await RollBackSavepointAsync(transaction, MutationSavepoint);
+            await SavepointSql.RollBackAsync(conn, transaction.Commands, MutationSavepoint);
             refusal = ex;
         }
 
@@ -329,7 +352,7 @@ internal sealed class SweepStrategy(
     private async Task<SweepExecutionResult> ExecuteRowByRowAsync<TEntity>(
         SweepScope scope,
         DbConnection conn,
-        DbTransaction transaction,
+        ContextTransaction transaction,
         IReadOnlyList<string> candidates,
         SweepMutation mutation,
         RetentionDependentsScope? stepScope,
@@ -365,11 +388,11 @@ internal sealed class SweepStrategy(
             var headParameters = new SqlParams();
             mutation.AddParameters(headParameters, row);
             var update = SweepStatements.MutateRow(scope, headParameters, recordKey);
-            await using var command = update.Parameters.CreateCommand(conn, transaction, update.Sql);
+            await using var command = update.Parameters.CreateCommand(conn, transaction.Commands, update.Sql);
 
             // One savepoint for the step and the mutation: whatever undoes one undoes both, so
             // a row's dependents are never retired without it.
-            await transaction.SaveAsync(MutationSavepoint, CancellationToken.None);
+            await SavepointSql.SaveAsync(conn, transaction.Commands, MutationSavepoint, CancellationToken.None);
             if (stepScope is not null)
             {
                 var dependents = new RetentionDependentsContext(
@@ -391,7 +414,7 @@ internal sealed class SweepStrategy(
                 );
                 if (stepFailure is not null)
                 {
-                    await RollBackSavepointAsync(transaction, MutationSavepoint);
+                    await SavepointSql.RollBackAsync(conn, transaction.Commands, MutationSavepoint);
                     skipped++;
                     await PersistSkippedAsync(scope, conn, transaction, execution, recordKey, stepFailure, ct);
                     continue;
@@ -406,8 +429,8 @@ internal sealed class SweepStrategy(
             catch (DbException ex) when (IsIntegrityViolation(ex))
             {
                 // Refused by a constraint: nothing changed, and the step is undone with it.
-                await RollBackSavepointAsync(transaction, MutationSavepoint);
-                blocked.Add(await RecordIdSql.CanonicalizeAsync(conn, transaction, entry, recordKey, ct), ex);
+                await SavepointSql.RollBackAsync(conn, transaction.Commands, MutationSavepoint);
+                blocked.Add(await RecordIdSql.CanonicalizeAsync(conn, transaction.Commands, entry, recordKey, ct), ex);
                 continue;
             }
 
@@ -416,7 +439,7 @@ internal sealed class SweepStrategy(
                 // No row back. The rollback undoes the step, so if the row matches the
                 // statement's own WHERE again, the step had taken it out of scope; otherwise a
                 // hold landed after the row was loaded, and the engine counts it as held.
-                await RollBackSavepointAsync(transaction, MutationSavepoint);
+                await SavepointSql.RollBackAsync(conn, transaction.Commands, MutationSavepoint);
                 if (stepScope is not null && await IsStillDueAsync(scope, conn, transaction, recordKey, ct))
                 {
                     skipped++;
@@ -437,7 +460,7 @@ internal sealed class SweepStrategy(
                 continue;
             }
 
-            await transaction.ReleaseAsync(MutationSavepoint, CancellationToken.None);
+            await SavepointSql.ReleaseAsync(conn, transaction.Commands, MutationSavepoint, CancellationToken.None);
             affected.Add(recordId);
         }
 
@@ -454,7 +477,7 @@ internal sealed class SweepStrategy(
     private async Task PersistSkippedAsync(
         SweepScope scope,
         DbConnection conn,
-        DbTransaction transaction,
+        ContextTransaction transaction,
         SweepMutationContext execution,
         object recordKey,
         BeforeMutationFailure failure,
@@ -462,10 +485,10 @@ internal sealed class SweepStrategy(
     )
     {
         var entry = scope.Entry;
-        var skippedId = await RecordIdSql.CanonicalizeAsync(conn, transaction, entry, recordKey, ct);
+        var skippedId = await RecordIdSql.CanonicalizeAsync(conn, transaction.Commands, entry, recordKey, ct);
         await RetentionDependentsSteps.PersistBeforeFailureAsync(
             conn,
-            transaction,
+            transaction.Commands,
             execution,
             entry,
             scope.Rule.Strategy,
@@ -488,7 +511,7 @@ internal sealed class SweepStrategy(
     /// </summary>
     private async Task<BeforeMutationFailure?> RetireDependentsAsync<TEntity>(
         DbConnection conn,
-        DbTransaction transaction,
+        ContextTransaction transaction,
         DbContext stepDb,
         ResolvedRetentionDependents step,
         TEntity row,
@@ -497,12 +520,12 @@ internal sealed class SweepStrategy(
         CancellationToken ct
     )
     {
-        var baseline = await holdGuard.ReadHeldRowVersionsAsync(conn, transaction, ct);
+        var baseline = await holdGuard.ReadHeldRowVersionsAsync(conn, transaction.Commands, ct);
         try
         {
             try
             {
-                await ((IRetentionDependents<TEntity>)step.Instance).RetireAsync(row, dependents, ct);
+                await RetireInScopeAsync(transaction, (IRetentionDependents<TEntity>)step.Instance, row, dependents, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -521,7 +544,7 @@ internal sealed class SweepStrategy(
             IReadOnlyList<Guid> changedHolds;
             try
             {
-                changedHolds = await holdGuard.ReadChangedHeldRowsAsync(baseline, conn, transaction, ct);
+                changedHolds = await holdGuard.ReadChangedHeldRowsAsync(baseline, conn, transaction.Commands, ct);
             }
             catch (DbException ex) when (!ct.IsCancellationRequested)
             {
@@ -550,31 +573,50 @@ internal sealed class SweepStrategy(
     }
 
     /// <summary>
+    /// Runs the step. In a System.Transactions transaction it runs inside a scope of it, so the
+    /// step's context, which has no <c>CurrentTransaction</c> to give it, sees the transaction as
+    /// ambient and saves in it. Only the step runs inside: the run's own context, used while a
+    /// scope of the transaction is open, would refuse to be used outside it afterwards when the
+    /// transaction was passed to <c>EnlistTransaction</c> and is not the ambient one. The scope is
+    /// always completed, even when the step throws: one disposed without <c>Complete</c> aborts
+    /// the caller's whole transaction, and the row's savepoint undoes what the step did.
+    /// </summary>
+    private static async Task RetireInScopeAsync<TEntity>(
+        ContextTransaction transaction,
+        IRetentionDependents<TEntity> step,
+        TEntity row,
+        RetentionDependentsContext dependents,
+        CancellationToken ct
+    )
+    {
+        using var joined = transaction is ContextTransaction.Enlisted enlisted
+            ? new TransactionScope(enlisted.Transaction, TransactionScopeAsyncFlowOption.Enabled)
+            : null;
+        try
+        {
+            await step.RetireAsync(row, dependents, ct);
+        }
+        finally
+        {
+            joined?.Complete();
+        }
+    }
+
+    /// <summary>
     /// Whether the row still matches the mutation statement's own WHERE: in scope, eligible
     /// and not held.
     /// </summary>
     private async Task<bool> IsStillDueAsync(
         SweepScope scope,
         DbConnection conn,
-        DbTransaction transaction,
+        ContextTransaction transaction,
         object recordKey,
         CancellationToken ct
     )
     {
         var statement = SweepStatements.IsStillDue(scope, recordKey);
-        await using var command = statement.Parameters.CreateCommand(conn, transaction, statement.Sql);
+        await using var command = statement.Parameters.CreateCommand(conn, transaction.Commands, statement.Sql);
         return await command.ExecuteScalarAsync(ct) is true;
-    }
-
-    /// <summary>
-    /// ROLLBACK TO keeps the savepoint open, so release it too: otherwise each later row's
-    /// savepoint nests one level deeper for the rest of the batch. Ignores cancellation, like
-    /// every Cohort savepoint: a cancelled rollback would leave the batch aborted.
-    /// </summary>
-    private static async Task RollBackSavepointAsync(DbTransaction transaction, string savepoint)
-    {
-        await transaction.RollbackAsync(savepoint, CancellationToken.None);
-        await transaction.ReleaseAsync(savepoint, CancellationToken.None);
     }
 
     private static bool IsIntegrityViolation(DbException exception) =>
@@ -617,7 +659,7 @@ internal sealed class SweepStrategy(
     private async Task<(IReadOnlyList<string> Locked, SweepCursor? Reached)> LockCandidatesAsync(
         SweepScope scope,
         DbConnection conn,
-        DbTransaction transaction,
+        ContextTransaction transaction,
         SweepMutationContext execution,
         CancellationToken ct
     )
@@ -637,14 +679,14 @@ internal sealed class SweepStrategy(
             reached = last;
             await RetentionEntityLockSql.AcquireAsync(
                 conn,
-                transaction,
+                transaction.Commands,
                 entry.RetentionEntityId,
                 entry.Tenant is not null ? scope.Tenant.Id : null,
                 discovered,
                 ct
             );
             var statement = SweepStatements.LockCandidates(scope, discovered.ToArray());
-            await using var command = statement.Parameters.CreateCommand(conn, transaction, statement.Sql);
+            await using var command = statement.Parameters.CreateCommand(conn, transaction.Commands, statement.Sql);
             locked.AddRange(await ReadRecordIdsAsync(command, ct));
             if (discovered.Count < limit)
             {
@@ -663,7 +705,7 @@ internal sealed class SweepStrategy(
     private async Task<(List<string> RecordIds, SweepCursor? Last)> DiscoverAsync(
         SweepScope scope,
         DbConnection conn,
-        DbTransaction transaction,
+        ContextTransaction transaction,
         Guid sweepId,
         SweepCursor? after,
         int limit,
@@ -678,7 +720,7 @@ internal sealed class SweepStrategy(
             after?.Anchor,
             after?.RecordId
         );
-        await using var command = statement.Parameters.CreateCommand(conn, transaction, statement.Sql);
+        await using var command = statement.Parameters.CreateCommand(conn, transaction.Commands, statement.Sql);
         var recordIds = new List<string>();
         SweepCursor? last = null;
         await using var reader = await command.ExecuteReaderAsync(ct);

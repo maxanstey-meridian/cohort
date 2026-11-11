@@ -84,8 +84,8 @@ ambient `TransactionScope`, or one passed to `EnlistTransaction`.
 - The holds repository joins it, as it joins one begun through EF.
 - Readiness checks inside it, as it does inside one begun through EF.
 - `IRetentionDeletion` refuses it, as it refuses an EF transaction.
-- A `Caller` erasure refuses it, because Cohort can't give a dependents step's `DbContext` a
-  `System.Transactions` transaction as its `CurrentTransaction`.
+- A `Caller` erasure joins it, as it joins one begun through EF: it commits or rolls back with
+  your scope.
 
 EF decides whether your context enlists, and Cohort follows it. With `Enlist=false` in your
 connection string, neither enlists.

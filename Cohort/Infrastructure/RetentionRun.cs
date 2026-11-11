@@ -47,6 +47,8 @@ internal sealed class RetentionRun(
         ? "erasure"
         : started.DryRun ? "dry run" : "sweep";
     private DateTimeOffset? settledAt;
+    // Caller mode only: the caller's transaction, read once when the run starts.
+    private ContextTransaction? callerTransaction;
 
     public Guid SweepId => started.SweepId;
 
@@ -71,8 +73,10 @@ internal sealed class RetentionRun(
             // inside a transaction that may already be aborted. The ledger table is resolved
             // now, so the post-commit check touches no model metadata.
             var committed = CommittedStatement(CohortStoreTables.FromModel(db.Model), SweepId);
+            callerTransaction = ContextTransaction.Of(db.Database);
             callerCommit.AfterCommit(
-                db.Database.CurrentTransaction!,
+                callerTransaction,
+                db,
                 connection => IsCommittedAsync(connection, committed),
                 NotifyDeferredAsync,
                 committedWithoutRows => logger.LogInformation(
@@ -89,7 +93,19 @@ internal sealed class RetentionRun(
                     SweepId
                 )
             );
-            await RunAndSettleAsync(body, ct);
+            // The run's own statements go straight to the connection, so it stays open for the
+            // whole run: an enlisted connection may not be open yet. Not cancellable, so a
+            // cancelled run still starts and settles Cancelled, as one on an open connection does.
+            await db.Database.OpenConnectionAsync(CancellationToken.None);
+            try
+            {
+                await RunAndSettleAsync(body, ct);
+            }
+            finally
+            {
+                await db.Database.CloseConnectionAsync();
+            }
+
             return;
         }
 
@@ -205,13 +221,13 @@ internal sealed class RetentionRun(
             // In the caller's transaction a failed statement would abort everything after it,
             // so each entity runs under a savepoint and a failure undoes only that entity, as
             // a failed batch transaction does in an owned run.
-            var callerTransaction = callerCommit is null ? null : db.Database.CurrentTransaction!.GetDbTransaction();
+            var connection = db.Database.GetDbConnection();
             var deferredMark = deferredEvents.Count;
             if (callerTransaction is not null)
             {
                 // Not cancellable: a cancellation here would abort the caller's transaction
                 // before the savepoint that recovers it exists.
-                await callerTransaction.SaveAsync(EntitySavepoint, CancellationToken.None);
+                await SavepointSql.SaveAsync(connection, callerTransaction.Commands, EntitySavepoint, CancellationToken.None);
             }
 
             try
@@ -221,7 +237,7 @@ internal sealed class RetentionRun(
                 {
                     // Not cancellable: a cancelled RELEASE that took effect would leave the
                     // catch rolling back to a savepoint that no longer exists.
-                    await callerTransaction.ReleaseAsync(EntitySavepoint, CancellationToken.None);
+                    await SavepointSql.ReleaseAsync(connection, callerTransaction.Commands, EntitySavepoint, CancellationToken.None);
                 }
             }
             catch (Exception ex)
@@ -230,7 +246,7 @@ internal sealed class RetentionRun(
                 {
                     // A cancelled statement aborts the caller's transaction as a failed one
                     // does; rolling back to the savepoint lets the run still settle in it.
-                    await callerTransaction.RollbackAsync(EntitySavepoint, CancellationToken.None);
+                    await SavepointSql.RollBackAsync(connection, callerTransaction.Commands, EntitySavepoint);
                     counts.RemoveAll(count => count.EntityType == scope.Entry.EntityType);
                     deferredEvents.RemoveRange(deferredMark, deferredEvents.Count - deferredMark);
                 }
@@ -483,9 +499,9 @@ internal sealed class RetentionRun(
             // READ COMMITTED: the lock query and mutation must see a hold committed after
             // discovery. In the caller's transaction (READ COMMITTED, checked on entry) a batch
             // neither begins nor commits; it commits with the caller.
-            async Task<BatchOutcome> BatchAsync(IDbContextTransaction batchTransaction, CancellationToken token)
+            async Task<BatchOutcome> BatchAsync(ContextTransaction batchTransaction, CancellationToken token)
             {
-                if (callerCommit is null)
+                if (callerTransaction is null)
                 {
                     // Deferred constraints fail inside the statement that broke them, where the
                     // row can be blocked, rather than failing the whole batch at COMMIT. Only
@@ -493,7 +509,7 @@ internal sealed class RetentionRun(
                     // caller's pending work early and change the mode of everything after.
                     await using var immediate = new SqlParams().CreateCommand(
                         db.Database.GetDbConnection(),
-                        batchTransaction.GetDbTransaction(),
+                        batchTransaction.Commands,
                         "SET CONSTRAINTS ALL IMMEDIATE"
                     );
                     await immediate.ExecuteNonQueryAsync(token);
@@ -508,7 +524,7 @@ internal sealed class RetentionRun(
                 var executed = await strategy.ExecuteAsync(
                     scope,
                     db.Database.GetDbConnection(),
-                    batchTransaction.GetDbTransaction(),
+                    batchTransaction,
                     new SweepMutationContext(SweepId, eventAt, batchSize, reached),
                     token
                 );
@@ -555,15 +571,15 @@ internal sealed class RetentionRun(
                 return new BatchOutcome(executed, events);
             }
 
-            var outcome = callerCommit is null
+            var outcome = callerTransaction is null
                 ? await CohortTransaction.RunAsync(
                     db,
                     IsolationLevel.ReadCommitted,
-                    BatchAsync,
+                    (batchTransaction, token) => BatchAsync(new ContextTransaction.Ef(batchTransaction), token),
                     (batchTransaction, _, token) => EnsureLocksHeldAsync(batchTransaction, token),
                     ct
                 )
-                : await BatchAsync(db.Database.CurrentTransaction!, ct);
+                : await BatchAsync(callerTransaction, ct);
             var execution = outcome.Execution;
 
             foreach (var evt in outcome.Events)

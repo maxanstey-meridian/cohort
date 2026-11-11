@@ -238,15 +238,22 @@ Only a tenanted request can join your transaction; a tenantless one always runs 
 Resolve `IRetentionErasureService` from the same scope as that `DbContext`; the service is
 scoped for this reason. The erasure needs:
 
-- an open `READ COMMITTED` transaction, begun through EF (`BeginTransactionAsync` or
-  `UseTransaction`). `READ UNCOMMITTED` is accepted too, because PostgreSQL runs it as
-  `READ COMMITTED`. Under `REPEATABLE READ` or `SERIALIZABLE` the hold checks would read a
-  snapshot from when your transaction began and could miss a hold committed since, so
-  Cohort refuses.
-- A `System.Transactions` transaction (an ambient `TransactionScope`) is refused. Cohort gives each dependents step your transaction as its `CurrentTransaction`, which EF can do only for one begun through EF. Inside a scope, use `ErasureTransaction.Owned`, which runs outside it and commits on its own.
+- an open `READ COMMITTED` transaction: one begun through EF (`BeginTransactionAsync` or
+  `UseTransaction`), or a `System.Transactions` transaction your context is enlisted in (an
+  ambient `TransactionScope`, or one passed to `EnlistTransaction`). A `TransactionScope` is
+  `SERIALIZABLE` unless you say otherwise, so create it with `IsolationLevel.ReadCommitted`.
+  `READ UNCOMMITTED` is accepted too, because PostgreSQL runs it as `READ COMMITTED`. Under
+  `REPEATABLE READ` or `SERIALIZABLE` the hold checks would read a snapshot from when your
+  transaction began and could miss a hold committed since, so Cohort refuses.
+- inside a `System.Transactions` transaction, keep your `DbContext` alive until the
+  transaction completes. Cohort tells audit observers once it does, after checking through
+  your context that the run's ledger row committed. If the context is gone by then, the
+  erasure still stands, and the observers are not told.
 - no unsaved changes on the context. Save or discard them first.
 - the context built from the container's options, where `AddCohort<TContext>()` adds its
-  commit interceptor. A context whose options you built yourself is refused.
+  commit interceptor. A context whose options you built yourself is refused. This applies to
+  a transaction begun through EF; a `System.Transactions` transaction doesn't use the
+  interceptor.
 - on a context with a retrying execution strategy, your transaction and the erasure call
   inside `CreateExecutionStrategy().ExecuteAsync(...)`, as EF requires of your own work in
   that transaction. Outside it, Cohort refuses.

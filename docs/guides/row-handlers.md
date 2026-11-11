@@ -171,7 +171,7 @@ public sealed class NoteOutboxStep(SampleDbContext db) : IRetentionDependents<No
     {
         // A message saved outside Cohort's transaction would commit on its own, even when the
         // note it announces is never retired.
-        if (db.Database.CurrentTransaction is null)
+        if (db.Database.CurrentTransaction is null && Transaction.Current is null)
         {
             throw new InvalidOperationException(
                 "NoteOutboxStep writes the outbox only inside the transaction that retires the note."
@@ -214,12 +214,13 @@ that references a note (see [Rows that reference the entity](#rows-that-referenc
 builder.Services.AddRetentionDependents<Note, NoteOutboxStep>(retiresReferencingRows: false);
 ```
 
-- **The step checks `CurrentTransaction` first.** When Cohort runs the step, its context is
-  always in the batch's transaction (or yours, in a caller-transaction erasure). The check
-  makes that a precondition rather than an assumption: if the context ever had no
-  transaction, `SaveChangesAsync` would commit the message on its own, so the outbox would
-  announce a row that was never retired. The step throws instead, which skips the row and
-  records why.
+- **The step checks for a transaction first.** When Cohort runs the step, its context is
+  always in a transaction: the batch's, or yours in a caller-transaction erasure. Inside a
+  transaction begun through EF, `CurrentTransaction` is set. Inside a `System.Transactions`
+  transaction it is null and `Transaction.Current` is set. The check makes that a
+  precondition rather than an assumption: if the context ever had neither, `SaveChangesAsync`
+  would commit the message on its own, so the outbox would announce a row that was never
+  retired. The step throws instead, which skips the row and records why.
 - **The step saves.** `SaveChangesAsync` writes inside Cohort's transaction and commits
   nothing; a step that returns with the message still unsaved fails with
   `reason=dependents-unsaved-changes`.

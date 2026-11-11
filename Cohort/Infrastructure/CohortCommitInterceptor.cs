@@ -14,8 +14,10 @@ namespace Cohort.Infrastructure;
 /// <c>ErasureTransaction.Caller</c> tells its audit observers only then), and drops it when
 /// the transaction rolls back or fails, or when the work's own rows did not commit (the
 /// caller rolled back to a savepoint taken before it, or committed an aborted transaction).
-/// EF has no other commit hook. <c>AddCohort</c> adds one instance to the host's DbContext
-/// options.
+/// A transaction begun through EF is watched through EF's transaction events, which a
+/// System.Transactions commit never raises; for one of those the work waits on
+/// <see cref="System.Transactions.Transaction.TransactionCompleted"/> instead. <c>AddCohort</c>
+/// adds one instance to the host's DbContext options, which only the EF case needs.
 /// </summary>
 internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> logger)
     : DbTransactionInterceptor
@@ -47,14 +49,35 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
     /// transaction, whether they exist. When it can't answer, the work is dropped and
     /// <paramref name="unconfirmed"/> is told: deferred work is best effort, and running it
     /// for a commit that may not have kept its rows would report something that didn't happen.
+    /// For a System.Transactions transaction the question is asked through <paramref name="db"/>,
+    /// the caller's context, which must still be alive when the transaction completes: a
+    /// disposed one can't answer, so the work is dropped as unconfirmed.
     /// </summary>
     internal void AfterCommit(
-        IDbContextTransaction transaction,
+        ContextTransaction transaction,
+        DbContext db,
         Func<DbConnection, Task<bool>> committedRows,
         Func<Task> committed,
         Action<bool> dropped,
         Action<Exception> unconfirmed
     )
+    {
+        var work = new DeferredWork(committedRows, committed, dropped, unconfirmed);
+        switch (transaction)
+        {
+            case ContextTransaction.Ef ef:
+                DeferUntilEfCommit(ef.Transaction, work);
+                break;
+            case ContextTransaction.Enlisted enlisted:
+                enlisted.Transaction.TransactionCompleted += (_, completed) =>
+                    RunCompleted(work, db, completed.Transaction?.TransactionInformation.Status);
+                break;
+            default:
+                throw new InvalidOperationException("ErasureTransaction.Caller needs an open transaction on the scoped DbContext.");
+        }
+    }
+
+    private void DeferUntilEfCommit(IDbContextTransaction transaction, DeferredWork work)
     {
         var dbTransaction = transaction.GetDbTransaction();
         lock (pending)
@@ -65,8 +88,40 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
                 pending.AddOrUpdate(dbTransaction, deferred);
             }
 
-            deferred.Work.Add(new DeferredWork(committedRows, committed, dropped, unconfirmed));
+            deferred.Work.Add(work);
         }
+    }
+
+    // Raised synchronously while the caller's scope is disposed or its transaction committed, with
+    // no ambient transaction. Deliberately blocking, as the EF path below: the wait is bounded by
+    // the committed-rows query and AuditObservers:Timeout. Nothing here throws: the work's own
+    // failures are caught and logged, and an exception out of this handler would reach the
+    // caller's commit.
+    private void RunCompleted(DeferredWork work, DbContext db, System.Transactions.TransactionStatus? status)
+    {
+        if (status != System.Transactions.TransactionStatus.Committed)
+        {
+            Report(work, committedWithoutRows: false);
+            return;
+        }
+
+        ConfirmAndRunAsync(
+                work,
+                async () =>
+                {
+                    await db.Database.OpenConnectionAsync(CancellationToken.None);
+                    try
+                    {
+                        return await work.CommittedRows(db.Database.GetDbConnection());
+                    }
+                    finally
+                    {
+                        await db.Database.CloseConnectionAsync();
+                    }
+                }
+            )
+            .GetAwaiter()
+            .GetResult();
     }
 
     // Deliberately blocking: EF's synchronous commit has no async hook. The wait is bounded by
@@ -127,34 +182,48 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
     {
         foreach (var work in Take(transaction, eventData.TransactionId))
         {
-            // The caller's commit has happened; nothing deferred may turn it into a failure.
-            bool rowsCommitted;
-            try
-            {
-                var connection = eventData.Context?.Database.GetDbConnection()
-                    ?? throw new InvalidOperationException("The committed transaction has no DbContext to check its rows through.");
-                rowsCommitted = await work.CommittedRows(connection);
-            }
-            catch (Exception ex)
-            {
-                Unconfirmed(work, ex);
-                continue;
-            }
+            await ConfirmAndRunAsync(
+                work,
+                () =>
+                {
+                    var connection = eventData.Context?.Database.GetDbConnection()
+                        ?? throw new InvalidOperationException("The committed transaction has no DbContext to check its rows through.");
+                    return work.CommittedRows(connection);
+                }
+            );
+        }
+    }
 
-            if (!rowsCommitted)
-            {
-                Report(work, committedWithoutRows: true);
-                continue;
-            }
+    /// <summary>
+    /// After a commit: asks whether the work's rows were kept, then runs it, drops it, or reports
+    /// it unconfirmed. The caller's commit has happened; nothing deferred may turn it into a failure.
+    /// </summary>
+    private async Task ConfirmAndRunAsync(DeferredWork work, Func<Task<bool>> rowsCommitted)
+    {
+        bool committedRows;
+        try
+        {
+            committedRows = await rowsCommitted();
+        }
+        catch (Exception ex)
+        {
+            Unconfirmed(work, ex);
+            return;
+        }
 
-            try
-            {
-                await work.Committed();
-            }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "Cohort work deferred until a caller's transaction committed failed.");
-            }
+        if (!committedRows)
+        {
+            Report(work, committedWithoutRows: true);
+            return;
+        }
+
+        try
+        {
+            await work.Committed();
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Cohort work deferred until a caller's transaction committed failed.");
         }
     }
 

@@ -39,16 +39,19 @@ internal abstract record ContextTransaction
             return new None();
         }
 
-        return enlistment.CurrentAmbientTransaction is not null || enlistment.EnlistedTransaction is not null
-            ? new Enlisted()
-            : new None();
+        var enlisted = enlistment.EnlistedTransaction ?? enlistment.CurrentAmbientTransaction;
+        return enlisted is null ? new None() : new Enlisted(enlisted);
     }
 
     internal sealed record None : ContextTransaction;
 
     internal sealed record Ef(IDbContextTransaction Transaction) : ContextTransaction;
 
-    // Carries nothing: no site reads a System.Transactions transaction itself, and EF and Npgsql
-    // give no transaction object for an enlisted connection.
-    internal sealed record Enlisted : ContextTransaction;
+    /// <summary>
+    /// The transaction passed to <c>EnlistTransaction</c>, else the ambient one. EF and Npgsql give
+    /// no <see cref="DbTransaction"/> for an enlisted connection, so a command carries none, a step's
+    /// context joins by running inside a <see cref="System.Transactions.TransactionScope"/> of it,
+    /// and its completion is the commit event.
+    /// </summary>
+    internal sealed record Enlisted(System.Transactions.Transaction Transaction) : ContextTransaction;
 }

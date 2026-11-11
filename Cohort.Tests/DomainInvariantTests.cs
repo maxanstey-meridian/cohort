@@ -33,6 +33,52 @@ public sealed class DomainInvariantTests
         act.Should().Throw<NotSupportedException>();
     }
 
+    [Theory]
+    [InlineData("11111111-1111-1111-1111-111111111111", "uk", "south-east", false, true)]
+    [InlineData("22222222-2222-2222-2222-222222222222", "uk", "south-east", false, false)]
+    [InlineData("11111111-1111-1111-1111-111111111111", "fr", "south-east", false, false)]
+    [InlineData("11111111-1111-1111-1111-111111111111", "UK", "south-east", false, false)]
+    [InlineData("11111111-1111-1111-1111-111111111111", "uk", "north-west", false, false)]
+    [InlineData("11111111-1111-1111-1111-111111111111", "uk", "South-East", false, false)]
+    [InlineData("11111111-1111-1111-1111-111111111111", "uk", "south-east", true, false)]
+    public void Tenant_Contexts_Are_Equal_By_Id_Jurisdiction_And_Tags(
+        string otherId,
+        string otherJurisdiction,
+        string otherRegion,
+        bool otherHasExtraTag,
+        bool equal
+    )
+    {
+        var first = new TenantContext(
+            Guid.Parse("11111111-1111-1111-1111-111111111111"),
+            "uk",
+            new Dictionary<string, string> { ["region"] = "south-east" }
+        );
+        var otherTags = new Dictionary<string, string> { ["region"] = otherRegion };
+        if (otherHasExtraTag)
+        {
+            otherTags["tier"] = "gold";
+        }
+        var other = new TenantContext(Guid.Parse(otherId), otherJurisdiction, otherTags);
+
+        (first == other).Should().Be(equal);
+        first.Equals((object)other).Should().Be(equal);
+        if (equal)
+        {
+            other.GetHashCode().Should().Be(first.GetHashCode());
+        }
+    }
+
+    [Fact]
+    public void Tenant_Contexts_With_No_Jurisdiction_Are_Equal_And_Differ_From_One_With_A_Jurisdiction()
+    {
+        var id = Guid.NewGuid();
+        var none = new TenantContext(id, null, new Dictionary<string, string>());
+
+        none.Should().Be(new TenantContext(id, null, new Dictionary<string, string>()));
+        none.Should().NotBe(new TenantContext(id, "uk", new Dictionary<string, string>()));
+    }
+
     [Fact]
     public void Tenant_Context_Rejects_The_Reserved_Tenantless_Identity()
     {

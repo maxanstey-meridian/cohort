@@ -102,13 +102,11 @@ internal sealed class RetentionTargetResolver(
         var connection = db.Database.GetDbConnection();
         await using var command = statement.Parameters.CreateCommand(connection, transaction.Commands, statement.Sql);
 
-        // A failed cast aborts the enclosing transaction, which may be the host's own. Plain
-        // SQL, not DbTransaction.SaveAsync: an enlisted connection has no transaction object to
-        // call it on, and a host's connection wrapper may not implement it.
+        // A failed cast aborts the enclosing transaction, which may be the host's own.
         var inTransaction = transaction is not ContextTransaction.None;
         if (inTransaction)
         {
-            await ExecuteAsync(connection, transaction.Commands, $"SAVEPOINT {CastSavepoint}", ct);
+            await SavepointSql.SaveAsync(connection, transaction.Commands, CastSavepoint, ct);
         }
 
         try
@@ -116,7 +114,7 @@ internal sealed class RetentionTargetResolver(
             var canonical = (string)(await command.ExecuteScalarAsync(ct))!;
             if (inTransaction)
             {
-                await ExecuteAsync(connection, transaction.Commands, $"RELEASE SAVEPOINT {CastSavepoint}", ct);
+                await SavepointSql.ReleaseAsync(connection, transaction.Commands, CastSavepoint, ct);
             }
 
             return canonical;
@@ -125,12 +123,7 @@ internal sealed class RetentionTargetResolver(
         {
             if (inTransaction)
             {
-                await ExecuteAsync(
-                    connection,
-                    transaction.Commands,
-                    $"ROLLBACK TO SAVEPOINT {CastSavepoint}",
-                    CancellationToken.None
-                );
+                await SavepointSql.RollBackAsync(connection, transaction.Commands, CastSavepoint);
             }
 
             throw new InvalidOperationException(
@@ -138,16 +131,5 @@ internal sealed class RetentionTargetResolver(
                 exception
             );
         }
-    }
-
-    private static async Task ExecuteAsync(
-        DbConnection connection,
-        DbTransaction? transaction,
-        string sql,
-        CancellationToken ct
-    )
-    {
-        await using var command = new SqlParams().CreateCommand(connection, transaction, sql);
-        await command.ExecuteNonQueryAsync(ct);
     }
 }

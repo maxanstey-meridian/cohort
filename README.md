@@ -144,8 +144,8 @@ await scope.ServiceProvider.GetRequiredService<IRetentionErasureService>()
 
 Previews, sweeps and erasures run as of the database clock. A tenanted erasure never touches
 `[RetentionTenantless]` entities; erase those with `RetentionErasureRequest.Tenantless`. An
-erasure can also join your own open transaction (`ErasureTransaction.Caller`) and commit or
-roll back with it.
+erasure can also join your own open transaction, begun through EF (`ErasureTransaction.Caller`),
+and commit or roll back with it.
 
 Thirty-day-old session notes are deleted, and year-old case contacts keep their row but
 lose their email and name. Every query is scoped to the tenant, held rows are skipped, and

@@ -1,4 +1,5 @@
 using System.Data;
+using System.Data.Common;
 
 using Cohort.Application;
 using Cohort.Domain;
@@ -12,8 +13,22 @@ using Microsoft.Extensions.DependencyInjection;
 
 using Npgsql;
 
+using CommittableTransaction = System.Transactions.CommittableTransaction;
+using TransactionScope = System.Transactions.TransactionScope;
+using TransactionScopeAsyncFlowOption = System.Transactions.TransactionScopeAsyncFlowOption;
+
 namespace Cohort.Sample.Tests;
 
+// The holds repository joins a System.Transactions transaction on the scoped context as it joins
+// one begun through EF. Each such test is warm: a hold listing ran outside any scope first, so
+// readiness is already recorded and the call under test reaches only the repository.
+// Make-fails (each applied, run, restored): ContextTransaction.Of returns None for Enlisted
+// (the scope, in-scope, isolation, cast, and committable tests go red); Of reads Transaction.Current
+// in place of EF's manager (the Enlist=false and committable tests go red); CreateAsync suppresses
+// the ambient transaction and owns its own (the rollback halves of the scope and committable tests
+// go red); the savepoint only brackets the cast for an Ef transaction (the cast test goes red);
+// the cast savepoints through DbTransaction.SaveAsync again (the savepoint-less wrapper test goes
+// red).
 public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
     : IntegrationTestBase(fixture)
 {
@@ -1009,6 +1024,325 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
         (await verify.HeldRecords.SingleAsync()).HoldId.Should().Be(holdId);
     }
 
+    [Fact]
+    public async Task A_Hold_Created_Inside_A_TransactionScope_Commits_With_It_And_Rolls_Back_With_It()
+    {
+        var tenantId = Guid.NewGuid();
+        var completedNoteId = Guid.NewGuid();
+        var abandonedNoteId = Guid.NewGuid();
+        var completedHoldId = Guid.NewGuid();
+        var abandonedHoldId = Guid.NewGuid();
+        await SeedNotesAsync(tenantId, completedNoteId, abandonedNoteId);
+        await ListActiveAsync();
+
+        await Host.RunWithServicesAsync(async services =>
+        {
+            using var scope = new TransactionScope(TransactionScopeAsyncFlowOption.Enabled);
+            await services.GetRequiredService<IRetentionHoldsRepository>().CreateAsync(
+                NoteHold(completedHoldId, completedNoteId, tenantId),
+                CancellationToken.None
+            );
+            scope.Complete();
+        });
+        await Host.RunWithServicesAsync(async services =>
+        {
+            using var scope = new TransactionScope(TransactionScopeAsyncFlowOption.Enabled);
+            await services.GetRequiredService<IRetentionHoldsRepository>().CreateAsync(
+                NoteHold(abandonedHoldId, abandonedNoteId, tenantId),
+                CancellationToken.None
+            );
+        });
+
+        (await ListActiveAsync()).Select(hold => hold.HoldId).Should().Equal(completedHoldId);
+    }
+
+    [Fact]
+    public async Task A_Hold_Created_Inside_A_TransactionScope_Covers_A_Row_The_Caller_Inserted_In_It_And_Is_Listed_There()
+    {
+        var tenantId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        var holdId = Guid.NewGuid();
+        await ListActiveAsync();
+
+        await Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            var repository = services.GetRequiredService<IRetentionHoldsRepository>();
+            using var scope = new TransactionScope(TransactionScopeAsyncFlowOption.Enabled);
+            db.Notes.Add(new Note
+            {
+                Id = noteId,
+                TenantId = tenantId,
+                CreatedAt = DateTimeOffset.UtcNow,
+                Body = "inserted in the caller's scope",
+            });
+            await db.SaveChangesAsync();
+
+            // The row exists only inside the scope, so the hold can only be created on its connection.
+            await repository.CreateAsync(NoteHold(holdId, noteId, tenantId), CancellationToken.None);
+
+            (await repository.ListActiveAsync(CancellationToken.None))
+                .Should().ContainSingle().Which.HoldId.Should().Be(holdId);
+            scope.Complete();
+        });
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
+        (await ListActiveAsync()).Select(hold => hold.HoldId).Should().Equal(holdId);
+    }
+
+    [Fact]
+    public async Task An_Unparsable_Record_Id_Inside_A_TransactionScope_Is_Rejected_And_The_Scope_Stays_Usable()
+    {
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var tenantId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        await ListActiveAsync();
+
+        await Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            var repository = services.GetRequiredService<IRetentionHoldsRepository>();
+            using var scope = new TransactionScope(TransactionScopeAsyncFlowOption.Enabled);
+
+            var create = () => repository.CreateAsync(
+                new RetentionHoldRequest(
+                    Guid.NewGuid(),
+                    RetentionEntityIdentity.For<ExternalNumberedLog>(),
+                    "abc",
+                    null,
+                    "unparsable integer id",
+                    asOf
+                ),
+                CancellationToken.None
+            );
+            var check = () => repository.HasActiveHoldAsync(
+                RetentionEntityIdentity.For<ExternalNumberedLog>(),
+                "abc",
+                null,
+                CancellationToken.None
+            );
+            (await create.Should().ThrowAsync<InvalidOperationException>()).Which.Message.Should().Be(CastMessage("abc"));
+            (await check.Should().ThrowAsync<InvalidOperationException>()).Which.Message.Should().Be(CastMessage("abc"));
+
+            // A cast that aborted the scope's transaction would fail this insert (25P02).
+            db.Notes.Add(new Note
+            {
+                Id = noteId,
+                TenantId = tenantId,
+                CreatedAt = asOf,
+                Body = "inserted after the rejected hold calls",
+            });
+            await db.SaveChangesAsync();
+            scope.Complete();
+        });
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task RemoveAsync_Inside_A_TransactionScope_Joins_It()
+    {
+        var tenantId = Guid.NewGuid();
+        var keptNoteId = Guid.NewGuid();
+        var removedNoteId = Guid.NewGuid();
+        var keptHoldId = Guid.NewGuid();
+        var removedHoldId = Guid.NewGuid();
+        await SeedNotesAsync(tenantId, keptNoteId, removedNoteId);
+        await CreateHoldAsync(NoteHold(keptHoldId, keptNoteId, tenantId));
+        await CreateHoldAsync(NoteHold(removedHoldId, removedNoteId, tenantId));
+
+        // Back-dated: "active" is decided on the database's clock, so a removal stamped at this
+        // process's now could still read as active and hide a removal that was never rolled back.
+        var removedAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        await Host.RunWithServicesAsync(async services =>
+        {
+            using var scope = new TransactionScope(TransactionScopeAsyncFlowOption.Enabled);
+            await services.GetRequiredService<IRetentionHoldsRepository>()
+                .RemoveAsync(keptHoldId, removedAt, CancellationToken.None);
+        });
+        (await ListActiveAsync()).Select(hold => hold.HoldId).Should().BeEquivalentTo([keptHoldId, removedHoldId]);
+
+        await Host.RunWithServicesAsync(async services =>
+        {
+            using var scope = new TransactionScope(TransactionScopeAsyncFlowOption.Enabled);
+            await services.GetRequiredService<IRetentionHoldsRepository>()
+                .RemoveAsync(removedHoldId, removedAt, CancellationToken.None);
+            scope.Complete();
+        });
+        (await ListActiveAsync()).Select(hold => hold.HoldId).Should().Equal(keptHoldId);
+    }
+
+    [Fact]
+    public async Task With_Enlist_False_A_Hold_Created_Inside_A_TransactionScope_Is_Not_Part_Of_It()
+    {
+        var tenantId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        var holdId = Guid.NewGuid();
+        await SeedNotesAsync(tenantId, noteId);
+        // EF decides whether a connection enlists, and Cohort follows it: here neither does, so the
+        // hold commits in the transaction Cohort owns whether or not the scope completes.
+        var notEnlisting = new NpgsqlConnectionStringBuilder(ConnectionString) { Enlist = false }.ConnectionString;
+        using var host = new CohortTestHost(notEnlisting);
+        await host.RunWithServicesAsync(services =>
+            services.GetRequiredService<IRetentionHoldsRepository>().ListActiveAsync(CancellationToken.None)
+        );
+
+        await host.RunWithServicesAsync(async services =>
+        {
+            var repository = services.GetRequiredService<IRetentionHoldsRepository>();
+            using var scope = new TransactionScope(TransactionScopeAsyncFlowOption.Enabled);
+            await repository.CreateAsync(NoteHold(holdId, noteId, tenantId), CancellationToken.None);
+
+            // The connection isn't in a transaction, so Cohort must not savepoint the record-ID
+            // cast: a SAVEPOINT outside a transaction block fails with 25P01 in place of the cast
+            // message. A context taken for enlisted because a scope is open would send one.
+            var create = () => repository.CreateAsync(
+                new RetentionHoldRequest(
+                    Guid.NewGuid(),
+                    RetentionEntityIdentity.For<ExternalNumberedLog>(),
+                    "abc",
+                    null,
+                    "unparsable integer id",
+                    new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero)
+                ),
+                CancellationToken.None
+            );
+            var check = () => repository.HasActiveHoldAsync(
+                RetentionEntityIdentity.For<ExternalNumberedLog>(),
+                "abc",
+                null,
+                CancellationToken.None
+            );
+            (await create.Should().ThrowAsync<InvalidOperationException>()).Which.Message.Should().Be(CastMessage("abc"));
+            (await check.Should().ThrowAsync<InvalidOperationException>()).Which.Message.Should().Be(CastMessage("abc"));
+        });
+
+        (await ListActiveAsync()).Select(hold => hold.HoldId).Should().Equal(holdId);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_Hold_Created_On_A_Context_Enlisted_In_A_Committable_Transaction_Follows_Its_Outcome(bool commit)
+    {
+        var tenantId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        var holdId = Guid.NewGuid();
+        await SeedNotesAsync(tenantId, noteId);
+        await ListActiveAsync();
+
+        await Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            using var transaction = new CommittableTransaction();
+            // The connection is opened first and kept open through the outcome, so it is enlisted
+            // in a transaction that is not the ambient one.
+            await db.Database.OpenConnectionAsync();
+            System.Transactions.TransactionsDatabaseFacadeExtensions.EnlistTransaction(db.Database, transaction);
+            await services.GetRequiredService<IRetentionHoldsRepository>().CreateAsync(
+                NoteHold(holdId, noteId, tenantId),
+                CancellationToken.None
+            );
+            if (commit)
+            {
+                transaction.Commit();
+            }
+            else
+            {
+                transaction.Rollback();
+            }
+
+            await db.Database.CloseConnectionAsync();
+        });
+
+        (await ListActiveAsync()).Select(hold => hold.HoldId).Should().Equal(commit ? [holdId] : []);
+    }
+
+    [Fact]
+    public async Task An_Unparsable_Record_Id_Is_Rejected_On_A_Connection_Wrapper_Without_Savepoints_And_The_Callers_Transaction_Stays_Usable()
+    {
+        var asOf = new DateTimeOffset(2026, 4, 12, 12, 0, 0, TimeSpan.Zero);
+        var holdId = Guid.NewGuid();
+        await using (var db = Host.CreateDbContext())
+        {
+            db.ExternalNumberedLogs.Add(new ExternalNumberedLog
+            {
+                Id = Guid.NewGuid(),
+                ExternalId = 42,
+                CreatedAt = asOf,
+                Payload = "wrapped connection target",
+            });
+            await db.SaveChangesAsync();
+        }
+
+        // The wrapper's transaction doesn't implement DbTransaction.Save, as a host's may not.
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configureServices: services =>
+                services.ConfigureDbContext<SampleDbContext>((_, options) =>
+                    options.UseNpgsql(
+                        new SavepointlessConnection(new NpgsqlConnection(ConnectionString)),
+                        contextOwnsConnection: true
+                    )
+                )
+        );
+        await host.RunWithServicesAsync(services =>
+            services.GetRequiredService<IRetentionHoldsRepository>().ListActiveAsync(CancellationToken.None)
+        );
+
+        await host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            var repository = services.GetRequiredService<IRetentionHoldsRepository>();
+            await using var transaction = await db.Database.BeginTransactionAsync();
+
+            var create = () => repository.CreateAsync(
+                new RetentionHoldRequest(
+                    Guid.NewGuid(),
+                    RetentionEntityIdentity.For<ExternalNumberedLog>(),
+                    "abc",
+                    null,
+                    "unparsable integer id",
+                    asOf
+                ),
+                CancellationToken.None
+            );
+            (await create.Should().ThrowAsync<InvalidOperationException>()).Which.Message.Should().Be(CastMessage("abc"));
+
+            (await db.ExternalNumberedLogs.CountAsync()).Should().Be(1);
+            await repository.CreateAsync(
+                new RetentionHoldRequest(
+                    holdId,
+                    RetentionEntityIdentity.For<ExternalNumberedLog>(),
+                    "42",
+                    null,
+                    "valid hold in the same transaction",
+                    asOf
+                ),
+                CancellationToken.None
+            );
+            await transaction.CommitAsync();
+        });
+
+        await using var verify = Host.CreateDbContext();
+        (await verify.HeldRecords.SingleAsync()).HoldId.Should().Be(holdId);
+    }
+
+    private static RetentionHoldRequest NoteHold(Guid holdId, Guid noteId, Guid tenantId) =>
+        new(
+            holdId,
+            RetentionEntityIdentity.For<Note>(),
+            noteId.ToString(),
+            tenantId,
+            "ambient transaction",
+            DateTimeOffset.UtcNow
+        );
+
+    private static string CastMessage(string recordId) =>
+        $"Retention hold record id '{recordId}' for entity '{RetentionEntityIdentity.For<ExternalNumberedLog>()}' is not valid for provider type 'integer'. The target would never match its row.";
+
     private Task CreateHoldAsync(RetentionHoldRequest request)
     {
         return Host.RunWithServicesAsync(async services =>
@@ -1265,5 +1599,165 @@ public sealed class RetentionHoldsEndToEndTests(PostgresFixture fixture)
         command.Transaction = transaction;
         command.CommandText = sql;
         await command.ExecuteNonQueryAsync();
+    }
+
+    // A wrapper that forwards to an NpgsqlConnection and whose transaction implements commit and
+    // rollback only: DbTransaction.Save is the base class's, which throws NotSupportedException.
+    // PassThroughConnection forwards savepoints, so it can't stand in for a wrapper that doesn't.
+    private sealed class SavepointlessConnection(NpgsqlConnection inner) : DbConnection
+    {
+        [System.Diagnostics.CodeAnalysis.AllowNull]
+        public override string ConnectionString
+        {
+            get => inner.ConnectionString;
+            set => inner.ConnectionString = value;
+        }
+
+        public override string Database => inner.Database;
+
+        public override string DataSource => inner.DataSource;
+
+        public override string ServerVersion => inner.ServerVersion;
+
+        public override ConnectionState State => inner.State;
+
+        public override void ChangeDatabase(string databaseName) => inner.ChangeDatabase(databaseName);
+
+        public override void Open() => inner.Open();
+
+        public override Task OpenAsync(CancellationToken cancellationToken) => inner.OpenAsync(cancellationToken);
+
+        public override void Close() => inner.Close();
+
+        protected override DbCommand CreateDbCommand() => new SavepointlessCommand(this, inner.CreateCommand());
+
+        protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel) =>
+            new SavepointlessTransaction(this, inner.BeginTransaction(isolationLevel));
+
+        public override ValueTask DisposeAsync() => inner.DisposeAsync();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                inner.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
+    }
+
+    private sealed class SavepointlessTransaction(SavepointlessConnection connection, NpgsqlTransaction inner)
+        : DbTransaction
+    {
+        internal NpgsqlTransaction Inner => inner;
+
+        protected override DbConnection DbConnection => connection;
+
+        public override IsolationLevel IsolationLevel => inner.IsolationLevel;
+
+        public override void Commit() => inner.Commit();
+
+        public override void Rollback() => inner.Rollback();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                inner.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
+    }
+
+    private sealed class SavepointlessCommand(SavepointlessConnection connection, NpgsqlCommand inner) : DbCommand
+    {
+        private SavepointlessTransaction? transaction;
+
+        [System.Diagnostics.CodeAnalysis.AllowNull]
+        public override string CommandText
+        {
+            get => inner.CommandText;
+            set => inner.CommandText = value;
+        }
+
+        public override int CommandTimeout
+        {
+            get => inner.CommandTimeout;
+            set => inner.CommandTimeout = value;
+        }
+
+        public override CommandType CommandType
+        {
+            get => inner.CommandType;
+            set => inner.CommandType = value;
+        }
+
+        public override bool DesignTimeVisible
+        {
+            get => inner.DesignTimeVisible;
+            set => inner.DesignTimeVisible = value;
+        }
+
+        public override UpdateRowSource UpdatedRowSource
+        {
+            get => inner.UpdatedRowSource;
+            set => inner.UpdatedRowSource = value;
+        }
+
+        protected override DbConnection? DbConnection
+        {
+            get => connection;
+            set { }
+        }
+
+        protected override DbParameterCollection DbParameterCollection => inner.Parameters;
+
+        protected override DbTransaction? DbTransaction
+        {
+            get => transaction;
+            set
+            {
+                transaction = (SavepointlessTransaction?)value;
+                inner.Transaction = transaction?.Inner;
+            }
+        }
+
+        public override void Cancel() => inner.Cancel();
+
+        public override int ExecuteNonQuery() => inner.ExecuteNonQuery();
+
+        public override object? ExecuteScalar() => inner.ExecuteScalar();
+
+        public override void Prepare() => inner.Prepare();
+
+        public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken) =>
+            inner.ExecuteNonQueryAsync(cancellationToken);
+
+        public override Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken) =>
+            inner.ExecuteScalarAsync(cancellationToken);
+
+        protected override DbParameter CreateDbParameter() => inner.CreateParameter();
+
+        protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior) =>
+            inner.ExecuteReader(behavior);
+
+        protected override async Task<DbDataReader> ExecuteDbDataReaderAsync(
+            CommandBehavior behavior,
+            CancellationToken cancellationToken
+        ) => await inner.ExecuteReaderAsync(behavior, cancellationToken);
+
+        public override ValueTask DisposeAsync() => inner.DisposeAsync();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                inner.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
     }
 }

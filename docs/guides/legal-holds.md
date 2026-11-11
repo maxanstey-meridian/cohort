@@ -52,10 +52,7 @@ lasts until it's removed.
   Cohort also locks each of those rows `FOR SHARE` after it validates the target and before it
   inserts the hold. See [The creation lock](#the-creation-lock).
 
-The repository joins the scoped context's current transaction when there is one. An
-unparsable record ID is rejected under a savepoint, so your transaction stays usable. A hold
-on an entity that covers related rows is refused in a caller transaction at REPEATABLE READ or
-SERIALIZABLE ([why](#the-creation-lock)).
+The repository joins the scoped context's current transaction when there is one: one begun through EF, or a `System.Transactions` transaction the context is enlisted in (an ambient `TransactionScope`). An unparsable record ID is rejected under a savepoint, so your transaction stays usable. A hold on an entity that covers related rows is refused in a caller transaction at REPEATABLE READ or SERIALIZABLE ([why](#the-creation-lock)). A `TransactionScope` defaults to SERIALIZABLE, so to hold such an entity inside one, create it with `new TransactionOptions { IsolationLevel = IsolationLevel.ReadCommitted }`.
 
 ## When a hold protects
 
@@ -327,7 +324,7 @@ row in place, so Cohort can't see it.
 `IRetentionDeletion` is scoped. Resolve it and your `DbContext` from the same DI scope, and
 make every change through that context. Cohort can't see writes made through another
 context or connection: they commit on their own, outside the transaction. The operation owns
-the transaction, so call it when the context has no transaction open.
+the transaction, so call it when the context has no transaction open, through EF or `System.Transactions`.
 
 ## Upgrading to 0.12.0
 

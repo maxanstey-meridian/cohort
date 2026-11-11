@@ -193,7 +193,8 @@ operations carry on.
 
 A pass records nothing until it completes, so a pass refused partway starts again from its
 first check on the next call. A completed pass is recorded on its model instance and connection
-string only outside a caller's transaction. The one check recorded on its own is the
+string only outside a caller's transaction (one begun through EF, or a `System.Transactions`
+transaction your context is enlisted in). The one check recorded on its own is the
 stored-identities check, which also records inside a caller's transaction, but only when its
 `System(Readiness)` scope ran in a session (a PostgreSQL backend) other than the caller's: on a
 host that gives every context one session, whether as one connection object or as several over

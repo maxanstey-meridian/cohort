@@ -7,6 +7,9 @@ using Microsoft.Extensions.DependencyInjection;
 
 using Npgsql;
 
+using TransactionScope = System.Transactions.TransactionScope;
+using TransactionScopeAsyncFlowOption = System.Transactions.TransactionScopeAsyncFlowOption;
+
 namespace Cohort.Sample.Tests;
 
 // ─── EXEMPLAR #3 — end-to-end test ──────────────────────────────────────────
@@ -654,6 +657,72 @@ public sealed class RetentionDeletionEndToEndTests(PostgresFixture fixture)
         await using var verify = Host.CreateDbContext();
         (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
         (await verify.Notes.SingleAsync(note => note.Id == editedId)).Body.Should().Be("deletion target");
+    }
+
+    // Deletion owns its transaction, so it refuses a context that is already in one. Make-fails:
+    // drop the Ef arm of the refusal (this goes red), drop the Enlisted arm (the next goes red).
+    [Fact]
+    public async Task ExecuteAsync_Refuses_A_Context_With_An_Ef_Transaction_Open()
+    {
+        var tenantId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        var callbackRan = false;
+        await SeedNotesAsync(tenantId, noteId);
+
+        await Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            await using var transaction = await db.Database.BeginTransactionAsync();
+            var act = () => services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [new RetentionTarget(RetentionEntityIdentity.For<Note>(), noteId.ToString(), tenantId)],
+                _ =>
+                {
+                    callbackRan = true;
+                    return Task.CompletedTask;
+                }
+            );
+
+            (await act.Should().ThrowAsync<InvalidOperationException>()).Which.Message.Should().Be(
+                "Retention deletion must own the scoped DbContext transaction."
+            );
+        });
+
+        callbackRan.Should().BeFalse();
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_Refuses_A_Context_Inside_A_TransactionScope_And_Deletes_Nothing()
+    {
+        var tenantId = Guid.NewGuid();
+        var noteId = Guid.NewGuid();
+        var callbackRan = false;
+        await SeedNotesAsync(tenantId, noteId);
+
+        await Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            using var scope = new TransactionScope(TransactionScopeAsyncFlowOption.Enabled);
+            var act = () => services.GetRequiredService<IRetentionDeletion>().ExecuteAsync(
+                [new RetentionTarget(RetentionEntityIdentity.For<Note>(), noteId.ToString(), tenantId)],
+                async ct =>
+                {
+                    callbackRan = true;
+                    db.Notes.Remove(await db.Notes.SingleAsync(note => note.Id == noteId, ct));
+                    await db.SaveChangesAsync(ct);
+                }
+            );
+
+            (await act.Should().ThrowAsync<InvalidOperationException>()).Which.Message.Should().Be(
+                "Retention deletion must own the scoped DbContext transaction, so it can't run inside a System.Transactions transaction (an ambient TransactionScope or one passed to EnlistTransaction). Call it outside that transaction."
+            );
+            scope.Complete();
+        });
+
+        callbackRan.Should().BeFalse();
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == noteId)).Should().BeTrue();
     }
 
     private CohortTestHost RetryingHost(Func<string, string>? rewriteCommandText, Action? beforeCommit = null) =>

@@ -6,7 +6,6 @@ using Cohort.Infrastructure.Migrations;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
-using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Logging;
 
 namespace Cohort.Infrastructure;
@@ -25,11 +24,14 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
         await database.OpenConnectionAsync(ct);
         try
         {
-            var existingTransaction = database.CurrentTransaction;
-            await using var ownedTransaction = existingTransaction is null
+            // Begins its own transaction only when the context has none. Inside a System.Transactions
+            // transaction the connection is already enlisted: a command runs in it whatever its
+            // Transaction says, and no transaction object exists to give it.
+            var contextTransaction = ContextTransaction.Of(database);
+            await using var ownedTransaction = contextTransaction is ContextTransaction.None
                 ? await connection.BeginTransactionAsync(IsolationLevel.RepeatableRead, ct)
                 : null;
-            var transaction = existingTransaction?.GetDbTransaction() ?? ownedTransaction!;
+            var transaction = contextTransaction.Commands ?? ownedTransaction;
             var tables = await ResolveTablesAsync(connection, transaction, storeTables, ct);
             var columns = await ReadColumnsAsync(connection, transaction, tables.Values, ct);
             var indexes = await ReadIndexesAsync(connection, transaction, tables.Values, ct);
@@ -223,7 +225,7 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
 
     private static async Task<Dictionary<string, uint>> ResolveTablesAsync(
         DbConnection connection,
-        DbTransaction transaction,
+        DbTransaction? transaction,
         CohortStoreTables tables,
         CancellationToken ct
     )
@@ -262,7 +264,7 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
 
     private static async Task<Dictionary<(uint TableId, string Column), ColumnStructure>> ReadColumnsAsync(
         DbConnection connection,
-        DbTransaction transaction,
+        DbTransaction? transaction,
         IEnumerable<uint> tableIds,
         CancellationToken ct
     )
@@ -310,7 +312,7 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
 
     private static async Task<List<IndexStructure>> ReadIndexesAsync(
         DbConnection connection,
-        DbTransaction transaction,
+        DbTransaction? transaction,
         IEnumerable<uint> tableIds,
         CancellationToken ct
     )
@@ -355,7 +357,7 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
 
     private static async Task<List<CheckConstraintStructure>> ReadCheckConstraintsAsync(
         DbConnection connection,
-        DbTransaction transaction,
+        DbTransaction? transaction,
         IEnumerable<uint> tableIds,
         CancellationToken ct
     )
@@ -390,7 +392,7 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
 
     private static async Task<List<ForeignKeyStructure>> ReadForeignKeysAsync(
         DbConnection connection,
-        DbTransaction transaction,
+        DbTransaction? transaction,
         IEnumerable<uint> tableIds,
         CancellationToken ct
     )

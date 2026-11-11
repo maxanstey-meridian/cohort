@@ -40,11 +40,16 @@ internal sealed class EfRetentionDeletion(
             throw new ArgumentException("Retention targets cannot contain null.", nameof(targets));
         }
 
-        if (db.Database.CurrentTransaction is not null)
+        switch (ContextTransaction.Of(db.Database))
         {
-            throw new InvalidOperationException(
-                "Retention deletion must own the scoped DbContext transaction."
-            );
+            case ContextTransaction.Ef:
+                throw new InvalidOperationException(
+                    "Retention deletion must own the scoped DbContext transaction."
+                );
+            case ContextTransaction.Enlisted:
+                throw new InvalidOperationException(
+                    "Retention deletion must own the scoped DbContext transaction, so it can't run inside a System.Transactions transaction (an ambient TransactionScope or one passed to EnlistTransaction). Call it outside that transaction."
+                );
         }
 
         // Pending changes would be saved inside the hold-checked transaction without being
@@ -109,7 +114,7 @@ internal sealed class EfRetentionDeletion(
             var recordId = await targetResolver.CanonicaliseRecordIdAsync(
                 entry,
                 target.RecordId,
-                dbTransaction,
+                new ContextTransaction.Ef(transaction),
                 "Retention deletion",
                 ct
             );

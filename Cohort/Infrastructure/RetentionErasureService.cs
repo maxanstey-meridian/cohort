@@ -86,10 +86,16 @@ internal sealed class RetentionErasureService(
     /// </summary>
     private async Task<CohortCommitInterceptor> ValidateCallerTransactionAsync(CancellationToken ct)
     {
-        var transaction = db.Database.CurrentTransaction
-            ?? throw new InvalidOperationException(
+        var transaction = ContextTransaction.Of(db.Database) switch
+        {
+            ContextTransaction.Ef ef => ef.Transaction,
+            ContextTransaction.Enlisted => throw new InvalidOperationException(
+                "ErasureTransaction.Caller can't join a System.Transactions transaction (an ambient TransactionScope or one passed to EnlistTransaction): Cohort gives each dependents step's DbContext your transaction as its CurrentTransaction, which EF can do only for a transaction begun through EF. Begin it with BeginTransactionAsync or UseTransaction, or use ErasureTransaction.Owned, which runs outside your scope and commits on its own."
+            ),
+            _ => throw new InvalidOperationException(
                 "ErasureTransaction.Caller needs an open transaction on the scoped DbContext."
-            );
+            ),
+        };
         // EF's own condition: a retrying strategy refuses EF work in a transaction begun outside
         // it, unless the call is running inside the strategy. Checked first so the host gets this
         // message, not EF's from the first call that goes through the strategy (the run-time

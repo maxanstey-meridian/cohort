@@ -8,7 +8,6 @@ using Cohort.Infrastructure.Sweep;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
-using Microsoft.EntityFrameworkCore.Storage;
 
 using Npgsql;
 
@@ -335,7 +334,8 @@ internal sealed class RetentionStatementReadiness(
 
     /// <summary>
     /// Asks PostgreSQL to explain every statement over <paramref name="database"/>, in its current
-    /// transaction or in one opened here and rolled back, and returns one error per entity for
+    /// transaction (begun through EF, or the System.Transactions one its connection is enlisted
+    /// in) or in one opened here and rolled back, and returns one error per entity for
     /// what it refused, or one for the statements that span entities when no entity's own
     /// statement was refused (<see cref="Describe"/>). Over an <see cref="NpgsqlConnection"/> it is one round trip, with
     /// an error barrier and a rollback to a savepoint after each statement so every refusal is
@@ -361,16 +361,21 @@ internal sealed class RetentionStatementReadiness(
         try
         {
             var connection = database.GetDbConnection();
-            var callerTransaction = database.CurrentTransaction?.GetDbTransaction();
-            await using var ownTransaction = callerTransaction is null
+            // Begins its own transaction only when the context has none. Inside a System.Transactions
+            // transaction there is no transaction object: the connection is enlisted, so the
+            // savepoints and the explains run in it with no Transaction set on their commands.
+            var contextTransaction = ContextTransaction.Of(database);
+            await using var ownTransaction = contextTransaction is ContextTransaction.None
                 ? await connection.BeginTransactionAsync(ct)
                 : null;
-            var transaction = callerTransaction ?? ownTransaction!;
-            var refusals =
-                connection is NpgsqlConnection npgsql
-                && transaction is NpgsqlTransaction npgsqlTransaction
-                    ? await ExplainInBatchAsync(npgsql, npgsqlTransaction, statements, ct)
-                    : await ExplainOneAtATimeAsync(connection, transaction, statements, ct);
+            var transaction = contextTransaction.Commands ?? ownTransaction;
+            var refusals = (connection, transaction) switch
+            {
+                (NpgsqlConnection npgsql, null) => await ExplainInBatchAsync(npgsql, null, statements, ct),
+                (NpgsqlConnection npgsql, NpgsqlTransaction npgsqlTransaction) =>
+                    await ExplainInBatchAsync(npgsql, npgsqlTransaction, statements, ct),
+                _ => await ExplainOneAtATimeAsync(connection, transaction, statements, ct),
+            };
             if (ownTransaction is not null)
             {
                 await ownTransaction.RollbackAsync(ct);
@@ -389,7 +394,7 @@ internal sealed class RetentionStatementReadiness(
 
     private static async Task<List<Refusal>> ExplainInBatchAsync(
         NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
+        NpgsqlTransaction? transaction,
         IReadOnlyList<ReadinessStatement> statements,
         CancellationToken ct
     )
@@ -456,7 +461,7 @@ internal sealed class RetentionStatementReadiness(
 
     private static async Task<List<Refusal>> ExplainOneAtATimeAsync(
         DbConnection connection,
-        DbTransaction transaction,
+        DbTransaction? transaction,
         IReadOnlyList<ReadinessStatement> statements,
         CancellationToken ct
     )

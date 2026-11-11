@@ -8,7 +8,8 @@ namespace Cohort.Application;
 /// This service is scoped. Resolve it and the DbContext registered by AddCohort from the same
 /// dependency-injection scope, and make every change through that context: writes through
 /// another context or connection commit outside the transaction. Cohort starts and commits the
-/// transaction; the callback runs on that scoped DbContext inside it.
+/// transaction; the callback runs on that scoped DbContext inside it. It refuses a context with
+/// a transaction already open, through EF or System.Transactions.
 /// </para>
 /// <para>
 /// Cohort throws <see cref="InvalidOperationException"/> when the context has unsaved changes

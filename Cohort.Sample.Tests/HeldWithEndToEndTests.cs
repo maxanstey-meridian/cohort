@@ -13,6 +13,11 @@ using Microsoft.Extensions.DependencyInjection;
 
 using Npgsql;
 
+using TransactionOptions = System.Transactions.TransactionOptions;
+using TransactionScope = System.Transactions.TransactionScope;
+using TransactionScopeAsyncFlowOption = System.Transactions.TransactionScopeAsyncFlowOption;
+using TransactionScopeOption = System.Transactions.TransactionScopeOption;
+
 namespace Cohort.Sample.Tests;
 
 // ─── End-to-end test (copied from PurgeSweepStrategyTests) ──────────────────
@@ -340,6 +345,60 @@ public sealed class HeldWithEndToEndTests(PostgresFixture fixture)
         await using var verify = services.CreateAsyncScope();
         (await verify.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>().ListActiveAsync(CancellationToken.None))
             .Select(hold => hold.HoldId).Should().Equal(uploadHold);
+    }
+
+    // A TransactionScope defaults to SERIALIZABLE, so it gets the refusal an EF transaction at that
+    // level gets; created at READ COMMITTED it holds a Case. Warm: a listing ran outside any scope.
+    // Make-fail: skip the isolation check for an enlisted transaction (the SERIALIZABLE half goes red).
+    [Fact]
+    public async Task Creating_A_Hold_On_A_Case_Inside_A_TransactionScope_Needs_Read_Committed_And_On_An_Upload_Does_Not()
+    {
+        await using var database = await TemporaryDatabase.CreateAsync(fixture.ConnectionString);
+        await using var services = await BuildSeededServicesAsync(database.ConnectionString);
+        await ActiveHoldIdsAsync(services);
+        var caseHold = Guid.NewGuid();
+        var uploadHold = Guid.NewGuid();
+        var readCommitted = new TransactionOptions { IsolationLevel = System.Transactions.IsolationLevel.ReadCommitted };
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            using var transaction = new TransactionScope(TransactionScopeOption.Required, TransactionScopeAsyncFlowOption.Enabled);
+            var create = () => scope.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>().CreateAsync(
+                Request(caseHold, EntityId<ACase>(), CaseOne, TenantOne),
+                CancellationToken.None
+            );
+
+            (await create.Should().ThrowAsync<InvalidOperationException>()).Which.Message.Should().Be(
+                $"Retention hold for entity '{EntityId<ACase>()}' covers related rows, so it needs a READ COMMITTED transaction, but the caller's is SERIALIZABLE: under a transaction-wide snapshot a row linked after the transaction began would not be locked. Nothing was changed."
+            );
+        }
+
+        await using (var scope = services.CreateAsyncScope())
+        {
+            using var transaction = new TransactionScope(
+                TransactionScopeOption.Required,
+                readCommitted,
+                TransactionScopeAsyncFlowOption.Enabled
+            );
+            await scope.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>().CreateAsync(
+                Request(caseHold, EntityId<ACase>(), CaseOne, TenantOne),
+                CancellationToken.None
+            );
+            transaction.Complete();
+        }
+
+        // An upload covers nothing, so nothing needs locking and any isolation is fine.
+        await using (var scope = services.CreateAsyncScope())
+        {
+            using var transaction = new TransactionScope(TransactionScopeOption.Required, TransactionScopeAsyncFlowOption.Enabled);
+            await scope.ServiceProvider.GetRequiredService<IRetentionHoldsRepository>().CreateAsync(
+                Request(uploadHold, EntityId<ZUpload>(), Upload, TenantOne),
+                CancellationToken.None
+            );
+            transaction.Complete();
+        }
+
+        (await ActiveHoldIdsAsync(services)).Should().BeEquivalentTo([caseHold, uploadHold]);
     }
 
     // PostgreSQL accepts READ UNCOMMITTED and runs it as READ COMMITTED, so the walk reads current

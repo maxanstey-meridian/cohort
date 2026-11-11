@@ -79,7 +79,7 @@ internal sealed class RetentionTargetResolver(
     internal async Task<string> CanonicaliseRecordIdAsync(
         RetentionEntry entry,
         string recordId,
-        DbTransaction? transaction,
+        ContextTransaction transaction,
         string operation,
         CancellationToken ct
     )
@@ -99,33 +99,38 @@ internal sealed class RetentionTargetResolver(
             return keyClrType == typeof(Guid) ? Guid.Parse(recordId).ToString("D") : recordId;
         }
 
-        await using var command = statement.Parameters.CreateCommand(
-            db.Database.GetDbConnection(),
-            transaction,
-            statement.Sql
-        );
+        var connection = db.Database.GetDbConnection();
+        await using var command = statement.Parameters.CreateCommand(connection, transaction.Commands, statement.Sql);
 
-        // A failed cast aborts the enclosing transaction, which may be the host's own.
-        if (transaction is not null)
+        // A failed cast aborts the enclosing transaction, which may be the host's own. Plain
+        // SQL, not DbTransaction.SaveAsync: an enlisted connection has no transaction object to
+        // call it on, and a host's connection wrapper may not implement it.
+        var inTransaction = transaction is not ContextTransaction.None;
+        if (inTransaction)
         {
-            await transaction.SaveAsync(CastSavepoint, ct);
+            await ExecuteAsync(connection, transaction.Commands, $"SAVEPOINT {CastSavepoint}", ct);
         }
 
         try
         {
             var canonical = (string)(await command.ExecuteScalarAsync(ct))!;
-            if (transaction is not null)
+            if (inTransaction)
             {
-                await transaction.ReleaseAsync(CastSavepoint, ct);
+                await ExecuteAsync(connection, transaction.Commands, $"RELEASE SAVEPOINT {CastSavepoint}", ct);
             }
 
             return canonical;
         }
         catch (DbException exception) when (exception.SqlState?.StartsWith("22", StringComparison.Ordinal) == true)
         {
-            if (transaction is not null)
+            if (inTransaction)
             {
-                await transaction.RollbackAsync(CastSavepoint, CancellationToken.None);
+                await ExecuteAsync(
+                    connection,
+                    transaction.Commands,
+                    $"ROLLBACK TO SAVEPOINT {CastSavepoint}",
+                    CancellationToken.None
+                );
             }
 
             throw new InvalidOperationException(
@@ -133,5 +138,16 @@ internal sealed class RetentionTargetResolver(
                 exception
             );
         }
+    }
+
+    private static async Task ExecuteAsync(
+        DbConnection connection,
+        DbTransaction? transaction,
+        string sql,
+        CancellationToken ct
+    )
+    {
+        await using var command = new SqlParams().CreateCommand(connection, transaction, sql);
+        await command.ExecuteNonQueryAsync(ct);
     }
 }

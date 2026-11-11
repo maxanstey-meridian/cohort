@@ -16,7 +16,7 @@ internal static class RetentionEntityLockSql
 
     internal static Task AcquireAsync(
         DbConnection connection,
-        DbTransaction transaction,
+        DbTransaction? transaction,
         Guid retentionEntityId,
         Guid? tenantId,
         string canonicalRecordId,
@@ -28,7 +28,7 @@ internal static class RetentionEntityLockSql
 
     internal static async Task AcquireAsync(
         DbConnection connection,
-        DbTransaction transaction,
+        DbTransaction? transaction,
         Guid retentionEntityId,
         Guid? tenantId,
         IReadOnlyList<string> canonicalRecordIds,
@@ -52,7 +52,7 @@ internal static class RetentionEntityLockSql
 
     internal static async Task AcquireAsync(
         DbConnection connection,
-        DbTransaction transaction,
+        DbTransaction? transaction,
         IReadOnlyCollection<Target> targets,
         CancellationToken ct
     )

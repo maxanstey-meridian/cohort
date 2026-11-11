@@ -47,6 +47,11 @@ internal sealed class PassThroughConnection(
 
     public override void Close() => inner.Close();
 
+    // Forwarded, as a wrapper that supports System.Transactions must: EF enlists through the
+    // connection it holds, and the base class throws NotSupportedException.
+    public override void EnlistTransaction(System.Transactions.Transaction? transaction) =>
+        inner.EnlistTransaction(transaction);
+
     protected override DbCommand CreateDbCommand() =>
         new PassThroughCommand(this, inner.CreateCommand(), rewriteCommandText);
 

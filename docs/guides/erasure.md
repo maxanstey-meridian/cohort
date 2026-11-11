@@ -243,6 +243,7 @@ scoped for this reason. The erasure needs:
   `READ COMMITTED`. Under `REPEATABLE READ` or `SERIALIZABLE` the hold checks would read a
   snapshot from when your transaction began and could miss a hold committed since, so
   Cohort refuses.
+- A `System.Transactions` transaction (an ambient `TransactionScope`) is refused. Cohort gives each dependents step your transaction as its `CurrentTransaction`, which EF can do only for one begun through EF. Inside a scope, use `ErasureTransaction.Owned`, which runs outside it and commits on its own.
 - no unsaved changes on the context. Save or discard them first.
 - the context built from the container's options, where `AddCohort<TContext>()` adds its
   commit interceptor. A context whose options you built yourself is refused.

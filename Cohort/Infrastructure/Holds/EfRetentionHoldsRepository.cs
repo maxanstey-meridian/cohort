@@ -40,25 +40,27 @@ internal sealed class EfRetentionHoldsRepository(
         await db.Database.OpenConnectionAsync(ct);
         try
         {
-            var existingTransaction = db.Database.CurrentTransaction;
-            if (existingTransaction is not null && entry.CoveredPaths.Count > 0)
+            // After the open: opening enlists the connection in an ambient transaction.
+            var existingTransaction = ContextTransaction.Of(db.Database);
+            if (existingTransaction is not ContextTransaction.None && entry.CoveredPaths.Count > 0)
             {
-                await RequireReadCommittedAsync(existingTransaction.GetDbTransaction(), request, ct);
+                await RequireReadCommittedAsync(existingTransaction.Commands, request, ct);
             }
 
-            if (existingTransaction is null)
+            if (existingTransaction is ContextTransaction.None)
             {
                 await CohortTransaction.RunAsync(
                     db,
                     IsolationLevel.ReadCommitted,
-                    (ownedTransaction, token) => InsertAsync(entry, request, ownedTransaction.GetDbTransaction(), token),
+                    (ownedTransaction, token) =>
+                        InsertAsync(entry, request, new ContextTransaction.Ef(ownedTransaction), token),
                     beforeCommit: null,
                     ct
                 );
             }
             else
             {
-                await InsertAsync(entry, request, existingTransaction.GetDbTransaction(), ct);
+                await InsertAsync(entry, request, existingTransaction, ct);
             }
         }
         finally
@@ -70,14 +72,15 @@ internal sealed class EfRetentionHoldsRepository(
     private async Task InsertAsync(
         RetentionEntry entry,
         RetentionHoldRequest request,
-        DbTransaction transaction,
+        ContextTransaction contextTransaction,
         CancellationToken ct
     )
     {
+        var transaction = contextTransaction.Commands;
         var recordId = await targetResolver.CanonicaliseRecordIdAsync(
             entry,
             request.RecordId,
-            transaction,
+            contextTransaction,
             "Retention hold",
             ct
         );
@@ -124,7 +127,7 @@ internal sealed class EfRetentionHoldsRepository(
     /// snapshot: a row linked after the snapshot would not be locked.
     /// </summary>
     private async Task RequireReadCommittedAsync(
-        DbTransaction transaction,
+        DbTransaction? transaction,
         RetentionHoldRequest request,
         CancellationToken ct
     )
@@ -155,7 +158,7 @@ internal sealed class EfRetentionHoldsRepository(
         RetentionEntry entry,
         string recordId,
         Guid? tenantId,
-        DbTransaction transaction,
+        DbTransaction? transaction,
         CancellationToken ct
     )
     {
@@ -174,7 +177,7 @@ internal sealed class EfRetentionHoldsRepository(
         RetentionEntry entry,
         string recordId,
         RetentionHoldRequest request,
-        DbTransaction transaction,
+        DbTransaction? transaction,
         CancellationToken ct
     )
     {
@@ -317,7 +320,7 @@ internal sealed class EfRetentionHoldsRepository(
         await db.Database.OpenConnectionAsync(ct);
         try
         {
-            var transaction = db.Database.CurrentTransaction?.GetDbTransaction();
+            var transaction = ContextTransaction.Of(db.Database);
             var canonicalRecordId = await targetResolver.CanonicaliseRecordIdAsync(
                 entry,
                 recordId,
@@ -328,7 +331,7 @@ internal sealed class EfRetentionHoldsRepository(
             var statement = build(Tables.RetentionHolds, entry, canonicalRecordId, tenantId);
             await using var command = statement.Parameters.CreateCommand(
                 db.Database.GetDbConnection(),
-                transaction,
+                transaction.Commands,
                 statement.Sql
             );
             return await read(command);

@@ -1,7 +1,6 @@
 using System.Collections.Concurrent;
 using System.Data.Common;
 using System.Runtime.CompilerServices;
-using System.Transactions;
 
 using Cohort.Application;
 using Cohort.Domain;
@@ -52,13 +51,29 @@ internal sealed class RetentionRuntimeReadinessValidator(
     /// checks (server version, schema, retained relations, hold links, retained columns,
     /// anonymise targets, stored entity identities), then PostgreSQL's own analysis of every
     /// statement Cohort sends against the retained tables, under the role of the scope that
-    /// reaches it first. A pass recorded outside a caller's transaction makes every later call
-    /// return with no round trip.
+    /// reaches it first. A pass recorded outside a caller's transaction (one begun through EF, or
+    /// a System.Transactions transaction the context is enlisted in) makes every later call return
+    /// with no round trip. On a context with a retrying execution strategy, a call inside the
+    /// caller's transaction but outside that strategy is refused first, on every call.
     /// </summary>
     public async Task ValidateAsync(CancellationToken ct = default)
     {
         ValidateProvider();
         var facade = db.Database;
+        // EF's own condition: a retrying strategy can't run work inside a transaction the caller
+        // began outside it, and every readiness check opens its connection through the strategy.
+        // Refused here in Cohort's words, in place of EF's, for every port that validates on the
+        // caller's context. Owned work validates on a context of its own, in a scope outside the
+        // transaction (RetentionExecutionScopes), where Of is None, so it is never refused.
+        if (ContextTransaction.Of(facade) is not ContextTransaction.None
+            && facade.CreateExecutionStrategy() is ExecutionStrategy { RetriesOnFailure: true }
+            && ExecutionStrategy.Current is null)
+        {
+            throw new InvalidOperationException(
+                "Cohort was called inside your transaction on a DbContext with a retrying execution strategy (EnableRetryOnFailure), outside that strategy: wrap your transaction and the call in db.Database.CreateExecutionStrategy().ExecuteAsync(...), as EF requires of your own work in it."
+            );
+        }
+
         var connection = facade.GetDbConnection();
         // Every connection's string is parsed once per call, with no round trip, a wrapped
         // DbConnection's too, since the provider is already confirmed as Npgsql. Only a string
@@ -103,16 +118,12 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 return;
             }
 
-            // Cohort's own work never enlists in a caller's ambient System.Transactions
-            // transaction. The pass runs on the caller's context: under suppression its closed
-            // connection opens unenlisted, so the pass never joins the ambient transaction or
-            // begins one of its own inside it.
-            using (new TransactionScope(TransactionScopeOption.Suppress, TransactionScopeAsyncFlowOption.Enabled))
-            {
-                await RunModelPassAsync(readiness, ct);
-            }
+            // The pass runs on the caller's context, in the caller's transaction when it has one,
+            // begun through EF or a System.Transactions transaction the connection is enlisted in.
+            var contextTransaction = ContextTransaction.Of(facade);
+            await RunModelPassAsync(readiness, contextTransaction, ct);
 
-            if (facade.CurrentTransaction is null)
+            if (contextTransaction is ContextTransaction.None)
             {
                 readiness.ModelValidated = true;
             }
@@ -123,7 +134,11 @@ internal sealed class RetentionRuntimeReadinessValidator(
         }
     }
 
-    private async Task RunModelPassAsync(RetentionRuntimeReadinessEntry readiness, CancellationToken ct)
+    private async Task RunModelPassAsync(
+        RetentionRuntimeReadinessEntry readiness,
+        ContextTransaction contextTransaction,
+        CancellationToken ct
+    )
     {
         var facade = db.Database;
         await startupValidator.ValidateAsync(ct);
@@ -166,7 +181,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
             // session of its own. On a host that gives every context one session (one connection,
             // or different connection objects over one) the read ran inside the caller's
             // transaction and saw its uncommitted hold writes, which may roll back.
-            if (ownSession || facade.CurrentTransaction is null)
+            if (ownSession || contextTransaction is ContextTransaction.None)
             {
                 readiness.StoredEntityIdentitiesPassed = true;
             }

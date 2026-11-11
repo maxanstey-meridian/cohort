@@ -2160,6 +2160,42 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeTrue();
     }
 
+    // Cohort gives a dependents step's DbContext the caller's transaction as its CurrentTransaction,
+    // which EF can do only for one begun through EF, so a System.Transactions transaction is
+    // refused before readiness, before a run exists, and before any row is touched. The caller's
+    // own work in the scope is unaffected and commits.
+    [Fact]
+    public async Task Caller_Mode_Refuses_A_System_Transactions_Transaction()
+    {
+        var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
+        var subject = Guid.NewGuid();
+        var (erasedId, markerId) = await SeedCallerErasureAsync(tenant.Id, subject);
+        var request = RetentionErasureRequest.Tenanted(tenant, CallerScope(subject), transaction: ErasureTransaction.Caller);
+
+        await Host.RunWithServicesAsync(async services =>
+        {
+            var db = services.GetRequiredService<SampleDbContext>();
+            var erasure = services.GetRequiredService<IRetentionErasureService>();
+
+            using var scope = new System.Transactions.TransactionScope(
+                System.Transactions.TransactionScopeAsyncFlowOption.Enabled
+            );
+            (await db.Notes.SingleAsync(note => note.Id == markerId)).Body = "marker-after";
+            await db.SaveChangesAsync();
+
+            var inScope = () => erasure.ExecuteAsync(request);
+            (await inScope.Should().ThrowAsync<InvalidOperationException>()).Which.Message.Should().Be(
+                "ErasureTransaction.Caller can't join a System.Transactions transaction (an ambient TransactionScope or one passed to EnlistTransaction): Cohort gives each dependents step's DbContext your transaction as its CurrentTransaction, which EF can do only for a transaction begun through EF. Begin it with BeginTransactionAsync or UseTransaction, or use ErasureTransaction.Owned, which runs outside your scope and commits on its own."
+            );
+            scope.Complete();
+        });
+
+        (await CountRunsAsync(tenant.Id)).Should().Be(0);
+        await using var verify = Host.CreateDbContext();
+        (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeTrue();
+        (await verify.Notes.SingleAsync(note => note.Id == markerId)).Body.Should().Be("marker-after");
+    }
+
     // A retrying execution strategy refuses EF work in a transaction begun outside it. The
     // erasure's own EF work (a dependents step here) would throw EF's message mid-run, so the
     // erasure refuses first, before it writes anything.

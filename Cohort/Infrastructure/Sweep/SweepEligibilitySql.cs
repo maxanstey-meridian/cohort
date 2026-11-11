@@ -11,8 +11,8 @@ internal static class SweepEligibilitySql
 {
     /// <summary>
     /// The rows <paramref name="strategy"/> could still act on, over alias <c>target</c>
-    /// ("" for every row). The marker a strategy needs is guaranteed by startup validation and
-    /// by the strategy's own <c>Validate</c>, both of which run first.
+    /// ("" for every row). The marker a strategy needs is guaranteed by startup validation,
+    /// which runs first.
     /// </summary>
     internal static string Predicate(Strategy strategy, RetentionEntry entry) => strategy switch
     {

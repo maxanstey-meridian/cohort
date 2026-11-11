@@ -129,6 +129,20 @@ public sealed class DomainInvariantTests
         act.Should().Throw<ArgumentException>().WithParameterName("ErasureSubjectKind");
     }
 
+    [Fact]
+    public void A_Run_Starts_With_A_Sweep_Id()
+    {
+        var act = () => new SweepEvent.Started(
+            Guid.Empty,
+            DateTimeOffset.UnixEpoch,
+            SweepTriggerKind.Manual,
+            DryRun: false,
+            Guid.NewGuid()
+        );
+
+        act.Should().Throw<ArgumentException>().WithParameterName("SweepId");
+    }
+
     private static RetentionHoldRequest CreateHold(
         Guid? holdId = null,
         Guid? retentionEntityId = null,

@@ -157,10 +157,6 @@ internal static class HistoryPruningSql
         );
     }
 
-    /// <summary>
-    /// Deletes up to <paramref name="batchSize"/> holds whose earlier of <c>RemovedAt</c> and
-    /// <c>ExpiresAt</c> is before the cutoff.
-    /// </summary>
     internal static Task<int> PruneHoldBatchAsync(
         DbContext db,
         DateTimeOffset cutoff,

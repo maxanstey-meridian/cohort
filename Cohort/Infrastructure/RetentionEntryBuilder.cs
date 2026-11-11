@@ -65,12 +65,6 @@ internal sealed class RetentionEntryBuilder(CohortConventions conventions)
                 $"[Retain] on {clrType.FullName}: EF entity has no mapped table name."
             );
 
-        var tableName =
-            entityType.GetTableName()
-            ?? throw new InvalidOperationException(
-                $"[Retain] on {clrType.FullName}: EF entity has no mapped table name."
-            );
-
         var anchor = ReflectionMemberResolver.FindPropertyByName(clrType, retain.AnchorMember);
         if (anchor is null)
         {
@@ -117,10 +111,7 @@ internal sealed class RetentionEntryBuilder(CohortConventions conventions)
                 ?? throw new InvalidOperationException(
                     $"[Retain] on {clrType.FullName}: retained entities must declare [RetentionEntityId(\"uuid\")] with a stable non-empty UUID."
                 ),
-            new RelationalObjectName(
-                entityType.GetSchema() ?? entityType.Model.GetDefaultSchema() ?? "public",
-                tableName
-            ),
+            new RelationalObjectName(entityType.GetSchema() ?? "public", storeObject.Name),
             CohortStoreTables.FromModel(entityType.Model),
             retain.Category,
             retain.AnchorMember,
@@ -130,6 +121,7 @@ internal sealed class RetentionEntryBuilder(CohortConventions conventions)
             BuildMaterializationColumns(entityType, storeObject),
             BuildTenantConvention(entityType, storeObject),
             BuildSoftDeleteConvention(entityType, storeObject),
+            BuildErasureSubjects(clrType, entityType, storeObject),
             clrType.GetCustomAttribute<RetentionTenantlessAttribute>(inherit: false) is not null,
             retain.AuditRowDetail,
             BuildAnonymisedAtConvention(entityType, storeObject)
@@ -145,8 +137,7 @@ internal sealed class RetentionEntryBuilder(CohortConventions conventions)
         entityType
             .GetFlattenedProperties()
             .Select(property => property.GetColumnName(storeObject))
-            .Where(columnName => columnName is not null)
-            .Select(columnName => columnName!)
+            .OfType<string>()
             .Distinct(StringComparer.Ordinal)
             .Order(StringComparer.Ordinal)
             .ToArray();
@@ -166,7 +157,7 @@ internal sealed class RetentionEntryBuilder(CohortConventions conventions)
             recordIdProperty.Name,
             recordIdColumn,
             recordIdMember.PropertyType,
-            TryGetStoreType(recordIdProperty)
+            recordIdProperty.GetColumnType()
         );
     }
 
@@ -203,21 +194,6 @@ internal sealed class RetentionEntryBuilder(CohortConventions conventions)
             property.GetColumnName(storeObject)
             ?? throw new InvalidOperationException($"{role} convention on {clrType.FullName}: {name} has no mapped table column.");
         return (property, column, member);
-    }
-
-    internal static string? TryGetStoreType(IProperty property)
-    {
-        // Null on non-relational providers (metadata-only scans); SQL builders fall back
-        // to casting the column to text instead of casting the parameter.
-        try
-        {
-            return property.GetColumnType();
-        }
-        catch (Exception ex) when (ex is InvalidOperationException or InvalidCastException)
-        {
-            // Non-relational providers (metadata-only scans) have no store type.
-            return null;
-        }
     }
 
     private AnonymisedAtConvention? BuildAnonymisedAtConvention(
@@ -301,6 +277,79 @@ internal sealed class RetentionEntryBuilder(CohortConventions conventions)
         }
 
         return fields.ToArray();
+    }
+
+    private static Dictionary<string, ErasureSubjectMetadata> BuildErasureSubjects(
+        Type clrType,
+        IEntityType entityType,
+        StoreObjectIdentifier storeObject
+    )
+    {
+        var marked = new List<(PropertyInfo Property, string Kind)>();
+        foreach (var property in clrType.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+        {
+            ErasureSubjectAttribute? subject;
+            try
+            {
+                subject = property.GetCustomAttribute<ErasureSubjectAttribute>(inherit: false);
+            }
+            catch (Exception ex) when (ex is ArgumentException or TargetInvocationException or CustomAttributeFormatException)
+            {
+                throw new InvalidOperationException(
+                    $"[ErasureSubject] on {clrType.FullName}.{property.Name}: the kind cannot be blank.",
+                    ex
+                );
+            }
+
+            if (subject is not null)
+            {
+                marked.Add((property, subject.Kind));
+            }
+        }
+
+        return marked
+            .GroupBy(pair => pair.Kind, StringComparer.Ordinal)
+            .ToDictionary(
+                group => group.Key,
+                group => new ErasureSubjectMetadata(
+                    clrType,
+                    group.Key,
+                    group
+                        .OrderBy(pair => pair.Property.Name, StringComparer.Ordinal)
+                        .Select(pair => BuildErasureSubjectMember(clrType, entityType, storeObject, pair.Property))
+                        .ToArray()
+                ),
+                StringComparer.Ordinal
+            );
+    }
+
+    private static ErasureSubjectMember BuildErasureSubjectMember(
+        Type clrType,
+        IEntityType entityType,
+        StoreObjectIdentifier storeObject,
+        PropertyInfo property
+    )
+    {
+        var efProperty =
+            entityType.FindProperty(property.Name)
+            ?? throw new InvalidOperationException(
+                $"[ErasureSubject] on {clrType.FullName}.{property.Name}: property is not mapped by EF."
+            );
+        var column =
+            efProperty.GetColumnName(storeObject)
+            ?? throw new InvalidOperationException(
+                $"[ErasureSubject] on {clrType.FullName}.{property.Name}: property has no mapped table column."
+            );
+
+        // The only call at startup that throws for a property type the provider can't map.
+        _ = efProperty.GetTypeMapping();
+        return new ErasureSubjectMember(
+            property.Name,
+            Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType,
+            column,
+            efProperty.GetColumnType(storeObject),
+            efProperty
+        );
     }
 
     private TenantConvention? BuildTenantConvention(

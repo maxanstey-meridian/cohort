@@ -362,16 +362,14 @@ internal sealed class EfRetentionHoldsRepository(
         var validation = validationState.For(db.Model);
         ErasureSubjectValidation.Validate(validation, registry, subjectKind, subject, entities, "the hold lookup");
 
-        var starts = registry.Scan().Values
-            .Where(entry => entities.Includes(entry))
-            .Select(entry => (
-                Entry: entry,
-                Metadata: validation.ErasureSubjects[entry.EntityType]
-                    .FirstOrDefault(metadata => string.Equals(metadata.Kind, subjectKind, StringComparison.Ordinal))
-            ))
-            .Where(start => start.Metadata is not null)
-            .Select(start => (start.Entry, start.Metadata!.CreatePredicate(subject)))
-            .ToList();
+        var starts = new List<(RetentionEntry Entry, ErasureSubjectPredicate Subject)>();
+        foreach (var entry in registry.Scan().Values.Where(entry => entities.Includes(entry)))
+        {
+            if (entry.ErasureSubjects.TryGetValue(subjectKind, out var metadata))
+            {
+                starts.Add((entry, metadata.CreatePredicate(subject)));
+            }
+        }
 
         await db.Database.OpenConnectionAsync(ct);
         try

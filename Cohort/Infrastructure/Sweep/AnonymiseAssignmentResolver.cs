@@ -15,7 +15,6 @@ internal sealed class AnonymiseAssignmentResolver(
     private readonly IReadOnlyList<IAnonymiseValueFactory> factories = (
         anonymiseValueFactories
     ).ToArray();
-    private readonly DbContext modelDb = db ?? throw new ArgumentNullException(nameof(db));
 
     internal bool RequiresPerRowExecution(RetentionEntry entry)
     {
@@ -210,7 +209,7 @@ internal sealed class AnonymiseAssignmentResolver(
     private IProperty ResolveEfProperty(RetentionEntry entry, string memberName)
     {
         var entityType =
-            modelDb.Model.FindEntityType(entry.EntityType)
+            db.Model.FindEntityType(entry.EntityType)
             ?? throw new InvalidOperationException(
                 $"Entity {entry.EntityType.FullName} is not mapped by the current EF model."
             );
@@ -220,11 +219,11 @@ internal sealed class AnonymiseAssignmentResolver(
             );
     }
 
-    private static object CreateLiteralAssignmentValue(AnonymiseLiteralField literalField)
+    private static object? CreateLiteralAssignmentValue(AnonymiseLiteralField literalField)
     {
         return literalField.Method switch
         {
-            AnonymiseMethod.Null => DBNull.Value,
+            AnonymiseMethod.Null => null,
             AnonymiseMethod.EmptyString => string.Empty,
             AnonymiseMethod.FixedLiteral => literalField.Literal
                 ?? throw new InvalidOperationException(

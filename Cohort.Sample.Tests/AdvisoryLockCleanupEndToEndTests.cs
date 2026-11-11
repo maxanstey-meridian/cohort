@@ -22,14 +22,13 @@ public sealed class AdvisoryLockCleanupEndToEndTests(PostgresFixture fixture)
             {
                 throw primary;
             }
-            catch (Exception ex)
+            catch (Exception)
             {
                 await OperationalConnectionCleanup.RunAsync(
                     connection,
                     ct =>
                         RetentionRunAdvisoryLock.ReleaseAsync(connection, RetentionRunAdvisoryLock.KeyFor(Guid.NewGuid()), ct),
                     _ => throw new CloseFailureException(),
-                    ex,
                     NullLogger.Instance
                 );
                 throw;
@@ -58,7 +57,6 @@ public sealed class AdvisoryLockCleanupEndToEndTests(PostgresFixture fixture)
             connection,
             _ => RetentionRunAdvisoryLock.ReleaseAsync(connection, key, timedOut.Token),
             _ => connection.CloseAsync(),
-            null,
             NullLogger.Instance
         );
 
@@ -94,7 +92,6 @@ public sealed class AdvisoryLockCleanupEndToEndTests(PostgresFixture fixture)
             connection,
             _ => RetentionRunAdvisoryLock.ReleaseAllAsync(connection, timedOut.Token),
             _ => connection.CloseAsync(),
-            null,
             NullLogger.Instance
         );
 

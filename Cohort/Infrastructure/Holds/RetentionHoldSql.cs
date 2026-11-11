@@ -150,7 +150,7 @@ internal static class RetentionHoldSql
                 SELECT 1
                 FROM {holds} AS hold
                 WHERE hold."RetentionEntityId" = @retentionEntityId
-                  AND hold."RecordId" = CAST({targetAlias}.{PostgreSqlIdentifier.Quote(entry.RecordId.RecordIdColumn)} AS text)
+                  AND hold."RecordId" = {RecordIdSql.TextExpression(targetAlias, entry.RecordId)}
                   AND {TenantLine(entry.Tenant is not null)}
                   AND {ActivePredicate("hold")}
             )
@@ -319,7 +319,7 @@ internal static class RetentionHoldSql
                 FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
                 INNER JOIN {holds} AS hold
                     ON hold."RetentionEntityId" = @{holders.NameFor(entry.RetentionEntityId)}
-                   AND hold."RecordId" = CAST(target.{PostgreSqlIdentifier.Quote(entry.RecordId.RecordIdColumn)} AS text)
+                   AND hold."RecordId" = {RecordIdSql.TextExpression("target", entry.RecordId)}
                    AND {TenantLine(entry.Tenant is not null)}
                    AND {ActivePredicate("hold")}
                 WHERE {startRow}
@@ -410,7 +410,7 @@ internal static class RetentionHoldSql
         $"""
         INNER JOIN {holds} AS hold
                 ON hold."RetentionEntityId" = @{holderParameter}
-               AND hold."RecordId" = CAST({holderAlias}.{PostgreSqlIdentifier.Quote(holder.RecordId.RecordIdColumn)} AS text)
+               AND hold."RecordId" = {RecordIdSql.TextExpression(holderAlias, holder.RecordId)}
                AND {TenantLine(holder.Tenant is not null)}
                AND {ActivePredicate("hold")}
         """;
@@ -645,7 +645,7 @@ internal static class RetentionHoldSql
                     $"""
                     SELECT hold."HoldId" AS "HoldId", hold."RetentionEntityId" AS "HoldEntityId",
                         CAST(@{entities.NameFor(path.End.RetentionEntityId)} AS uuid) AS "CoveredEntityId",
-                        CAST({covered}.{PostgreSqlIdentifier.Quote(path.End.RecordId.RecordIdColumn)} AS text) AS "RecordId",
+                        {RecordIdSql.TextExpression(covered, path.End.RecordId)} AS "RecordId",
                         {VersionOf(covered)} AS "Version"
                     FROM {holds} AS hold
                     INNER JOIN {PostgreSqlIdentifier.Format(entry.Table)} AS h0
@@ -691,14 +691,6 @@ internal static class RetentionHoldSql
 
         var byEntity = rereads.ToDictionary(reread => reread.RetentionEntityId);
         var ordered = entries.Where(entry => byEntity.ContainsKey(entry.RetentionEntityId)).ToList();
-        if (ordered.Count != byEntity.Count)
-        {
-            var unknown = byEntity.Keys.Except(ordered.Select(entry => entry.RetentionEntityId)).First();
-            throw new InvalidOperationException(
-                $"Retention entity ID '{unknown}' does not match a retained entity in the EF model."
-            );
-        }
-
         var parameters = new SqlParams();
         var holds = PostgreSqlIdentifier.Format(holdsTable);
         var branches = new List<string>();
@@ -819,8 +811,7 @@ internal static class RetentionHoldSql
     /// Every statement the held-row guard can issue over <paramref name="entries"/>, which must be
     /// the guard's own list in its order (the registry's entries, as
     /// <see cref="RetentionHoldGuard"/> reads them), so the first statement is the text the guard
-    /// sends. Then, to tell which entity a refusal comes from, the same read over each entity alone
-    /// and a re-read of each entity's covered rows. <paramref name="baselineHoldIds"/> is bound as
+    /// sends. Then a re-read of each entity's covered rows. <paramref name="baselineHoldIds"/> is bound as
     /// a <c>Guid[]</c>, and <paramref name="rereadHoldIds"/> and <paramref name="rereadRecordIds"/>
     /// as a <c>Guid[]</c> and a <c>string[]</c>. None for an empty model.
     /// </summary>
@@ -841,14 +832,6 @@ internal static class RetentionHoldSql
         statements.Add(all);
         foreach (var entry in entries)
         {
-            statements.Add(
-                BuildHeldRowVersions(holdsTable, [entry], baselineHoldIds)!
-                    with
-                {
-                    Name = "held-row-versions-of-entity",
-                    Entity = entry.EntityType,
-                }
-            );
             statements.Add(
                 BuildHeldRowRereads(
                     holdsTable,

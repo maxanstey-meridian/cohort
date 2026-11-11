@@ -19,9 +19,8 @@ internal static class OperationalConnectionCleanup
     internal static async Task RunAsync(
         DbConnection connection,
         Func<CancellationToken, Task>? unlock,
-        Func<CancellationToken, Task>? close,
-        Exception? primaryException,
-        ILogger? logger
+        Func<CancellationToken, Task> close,
+        ILogger logger
     )
     {
         using var cleanup = new CancellationTokenSource(CleanupTimeout);
@@ -34,29 +33,18 @@ internal static class OperationalConnectionCleanup
             }
             catch (Exception ex)
             {
-                logger?.LogWarning(
-                    ex,
-                    "Cohort advisory-lock cleanup failed{PrimaryFailureContext}.",
-                    primaryException is null ? "" : " after the primary operation failed"
-                );
+                logger.LogWarning(ex, "Cohort advisory-lock cleanup failed.");
                 DiscardWhenClosed(connection);
             }
         }
 
-        if (close is not null)
+        try
         {
-            try
-            {
-                await close(cleanup.Token);
-            }
-            catch (Exception ex)
-            {
-                logger?.LogWarning(
-                    ex,
-                    "Cohort owned-connection cleanup failed{PrimaryFailureContext}.",
-                    primaryException is null ? "" : " after the primary operation failed"
-                );
-            }
+            await close(cleanup.Token);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Cohort owned-connection cleanup failed.");
         }
     }
 

@@ -4,12 +4,16 @@ namespace Cohort.Application;
 
 public abstract record SweepEvent
 {
-    private SweepEvent() { }
+    private SweepEvent(Guid sweepId, DateTimeOffset at)
+    {
+        SweepId = sweepId;
+        At = at;
+    }
 
     /// <summary>The run this event belongs to.</summary>
-    public Guid SweepId { get; private init; }
+    public Guid SweepId { get; }
 
-    public DateTimeOffset At { get; private init; }
+    public DateTimeOffset At { get; }
 
     public sealed record Started : SweepEvent
     {
@@ -21,9 +25,8 @@ public abstract record SweepEvent
             Guid TenantId,
             string? ErasureSubjectKind = null
         )
+            : base(RequiredId(SweepId, nameof(SweepId)), At)
         {
-            this.SweepId = RequiredId(SweepId, nameof(SweepId));
-            this.At = At;
             this.Trigger = Defined(Trigger, nameof(Trigger));
             this.DryRun = DryRun;
             this.TenantId = TenantId;
@@ -48,228 +51,114 @@ public abstract record SweepEvent
         public string? ErasureSubjectKind { get; }
     }
 
-    public sealed record EntitySummary : SweepEvent
-    {
-        public EntitySummary(
-            Guid SweepId,
-            DateTimeOffset At,
-            Type EntityType,
-            Guid RetentionEntityId,
-            string Category,
-            Guid TenantId,
-            Strategy Strategy,
-            RetentionPeriod ResolvedPeriod,
-            long Affected,
-            long HeldCount,
-            long SkippedCount,
-            long NullAnchorCount,
-            long RetainedCount,
-            long DeferredCount,
-            long BlockedCount,
-            RetentionRuleProvenance? Provenance = null
-        )
-        {
-            this.SweepId = RequiredId(SweepId, nameof(SweepId));
-            this.At = At;
-            this.EntityType = EntityType ?? throw new ArgumentNullException(nameof(EntityType));
-            this.RetentionEntityId = RequiredId(RetentionEntityId, nameof(RetentionEntityId));
-            this.Category = RequiredText(Category, nameof(Category));
-            this.TenantId = TenantId;
-            this.Strategy = Defined(Strategy, nameof(Strategy));
-            this.ResolvedPeriod = ResolvedPeriod ?? throw new ArgumentNullException(nameof(ResolvedPeriod));
-            this.Affected = NonNegative(Affected, nameof(Affected));
-            this.HeldCount = NonNegative(HeldCount, nameof(HeldCount));
-            this.SkippedCount = NonNegative(SkippedCount, nameof(SkippedCount));
-            this.NullAnchorCount = NonNegative(NullAnchorCount, nameof(NullAnchorCount));
-            this.RetainedCount = NonNegative(RetainedCount, nameof(RetainedCount));
-            this.DeferredCount = NonNegative(DeferredCount, nameof(DeferredCount));
-            this.BlockedCount = NonNegative(BlockedCount, nameof(BlockedCount));
-            this.Provenance = Provenance;
-        }
+    /// <param name="SweepId">The run this event belongs to.</param>
+    /// <param name="At">When the event was recorded.</param>
+    /// <param name="EntityType">The retained entity type.</param>
+    /// <param name="RetentionEntityId">The entity type's stable retention identity.</param>
+    /// <param name="Category">The entity's retention category.</param>
+    /// <param name="TenantId">The tenant the run covered.</param>
+    /// <param name="Strategy">The strategy of the rule the run applied.</param>
+    /// <param name="ResolvedPeriod">
+    /// The age a row had to reach: whichever of the period and the legal minimum set the
+    /// cutoff, or the legal minimum alone for an erasure.
+    /// </param>
+    /// <param name="Affected">Rows the run changed.</param>
+    /// <param name="HeldCount">Rows left alone because a hold covers them.</param>
+    /// <param name="SkippedCount">Rows the run skipped.</param>
+    /// <param name="NullAnchorCount">Rows whose anchor is null, which a cutoff never matches.</param>
+    /// <param name="RetainedCount">Erasure only: the subject's rows the resolved rule keeps.</param>
+    /// <param name="DeferredCount">
+    /// Real runs only: rows still due after the entity's batches that the run neither
+    /// changed nor skipped.
+    /// </param>
+    /// <param name="BlockedCount">Rows a database constraint stopped Cohort changing.</param>
+    /// <param name="Provenance">Where the resolved rule came from, when the provider says.</param>
+    public sealed record EntitySummary(
+        Guid SweepId,
+        DateTimeOffset At,
+        Type EntityType,
+        Guid RetentionEntityId,
+        string Category,
+        Guid TenantId,
+        Strategy Strategy,
+        RetentionPeriod ResolvedPeriod,
+        long Affected,
+        long HeldCount,
+        long SkippedCount,
+        long NullAnchorCount,
+        long RetainedCount,
+        long DeferredCount,
+        long BlockedCount,
+        RetentionRuleProvenance? Provenance = null
+    ) : SweepEvent(SweepId, At);
 
-        public Type EntityType { get; }
-        public Guid RetentionEntityId { get; }
-        public string Category { get; }
-        public Guid TenantId { get; }
-        public Strategy Strategy { get; }
-        /// <summary>
-        /// The age a row had to reach: whichever of the period and the legal minimum set the
-        /// cutoff, or the legal minimum alone for an erasure.
-        /// </summary>
-        public RetentionPeriod ResolvedPeriod { get; }
-        public long Affected { get; }
-        public long HeldCount { get; }
-        public long SkippedCount { get; }
-        public long NullAnchorCount { get; }
-        /// <summary>Erasure only: the subject's rows the resolved rule keeps.</summary>
-        public long RetainedCount { get; }
-        /// <summary>
-        /// Real runs only: rows still due after the entity's batches that the run neither
-        /// changed nor skipped.
-        /// </summary>
-        public long DeferredCount { get; }
-        /// <summary>Rows a database constraint stopped Cohort changing.</summary>
-        public long BlockedCount { get; }
-        public RetentionRuleProvenance? Provenance { get; }
-    }
+    /// <param name="SweepId">The run this event belongs to.</param>
+    /// <param name="At">When the event was recorded.</param>
+    /// <param name="EntityType">The retained entity type.</param>
+    /// <param name="RetentionEntityId">The entity type's stable retention identity.</param>
+    /// <param name="Category">The entity's retention category.</param>
+    /// <param name="TenantId">The tenant the run covered.</param>
+    /// <param name="Strategy">The strategy of the rule the run applied.</param>
+    /// <param name="ResolvedPeriod">
+    /// The age a row had to reach: whichever of the period and the legal minimum set the
+    /// cutoff, or the legal minimum alone for an erasure.
+    /// </param>
+    /// <param name="Affected">Rows the run has changed so far.</param>
+    /// <param name="SkippedCount">Rows the run has skipped so far.</param>
+    /// <param name="BlockedCount">Rows a database constraint stopped Cohort changing.</param>
+    /// <param name="Provenance">Where the resolved rule came from, when the provider says.</param>
+    public sealed record EntityProgress(
+        Guid SweepId,
+        DateTimeOffset At,
+        Type EntityType,
+        Guid RetentionEntityId,
+        string Category,
+        Guid TenantId,
+        Strategy Strategy,
+        RetentionPeriod ResolvedPeriod,
+        long Affected,
+        long SkippedCount,
+        long BlockedCount,
+        RetentionRuleProvenance? Provenance = null
+    ) : SweepEvent(SweepId, At);
 
-    public sealed record EntityProgress : SweepEvent
-    {
-        public EntityProgress(
-            Guid SweepId,
-            DateTimeOffset At,
-            Type EntityType,
-            Guid RetentionEntityId,
-            string Category,
-            Guid TenantId,
-            Strategy Strategy,
-            RetentionPeriod ResolvedPeriod,
-            long Affected,
-            long SkippedCount,
-            long BlockedCount,
-            RetentionRuleProvenance? Provenance = null
-        )
-        {
-            this.SweepId = RequiredId(SweepId, nameof(SweepId));
-            this.At = At;
-            this.EntityType = EntityType ?? throw new ArgumentNullException(nameof(EntityType));
-            this.RetentionEntityId = RequiredId(RetentionEntityId, nameof(RetentionEntityId));
-            this.Category = RequiredText(Category, nameof(Category));
-            this.TenantId = TenantId;
-            this.Strategy = Defined(Strategy, nameof(Strategy));
-            this.ResolvedPeriod = ResolvedPeriod ?? throw new ArgumentNullException(nameof(ResolvedPeriod));
-            this.Affected = NonNegative(Affected, nameof(Affected));
-            this.SkippedCount = NonNegative(SkippedCount, nameof(SkippedCount));
-            this.BlockedCount = NonNegative(BlockedCount, nameof(BlockedCount));
-            this.Provenance = Provenance;
-        }
+    public sealed record RowDetail(
+        Guid SweepId,
+        DateTimeOffset At,
+        Type EntityType,
+        Guid RetentionEntityId,
+        string RecordId,
+        string Category,
+        Strategy Strategy,
+        Guid TenantId
+    ) : SweepEvent(SweepId, At);
 
-        public Type EntityType { get; }
-        public Guid RetentionEntityId { get; }
-        public string Category { get; }
-        public Guid TenantId { get; }
-        public Strategy Strategy { get; }
-        /// <summary>
-        /// The age a row had to reach: whichever of the period and the legal minimum set the
-        /// cutoff, or the legal minimum alone for an erasure.
-        /// </summary>
-        public RetentionPeriod ResolvedPeriod { get; }
-        public long Affected { get; }
-        public long SkippedCount { get; }
-        public long BlockedCount { get; }
-        public RetentionRuleProvenance? Provenance { get; }
-    }
+    public sealed record Completed(Guid SweepId, DateTimeOffset At, TimeSpan Duration, long TotalAffected)
+        : SweepEvent(SweepId, At);
 
-    public sealed record RowDetail : SweepEvent
-    {
-        public RowDetail(
-            Guid SweepId,
-            DateTimeOffset At,
-            Type EntityType,
-            Guid RetentionEntityId,
-            string RecordId,
-            string Category,
-            Strategy Strategy,
-            Guid TenantId
-        )
-        {
-            this.SweepId = RequiredId(SweepId, nameof(SweepId));
-            this.At = At;
-            this.EntityType = EntityType ?? throw new ArgumentNullException(nameof(EntityType));
-            this.RetentionEntityId = RequiredId(RetentionEntityId, nameof(RetentionEntityId));
-            this.RecordId = RequiredText(RecordId, nameof(RecordId));
-            this.Category = RequiredText(Category, nameof(Category));
-            this.Strategy = Defined(Strategy, nameof(Strategy));
-            this.TenantId = TenantId;
-        }
+    public sealed record Failed(
+        Guid SweepId,
+        DateTimeOffset At,
+        string Error,
+        TimeSpan? Duration = null,
+        long? TotalAffected = null
+    ) : SweepEvent(SweepId, At);
 
-        public Type EntityType { get; }
-        public Guid RetentionEntityId { get; }
-        public string RecordId { get; }
-        public string Category { get; }
-        public Strategy Strategy { get; }
-        public Guid TenantId { get; }
-    }
+    public sealed record PartiallyFailed(
+        Guid SweepId,
+        DateTimeOffset At,
+        TimeSpan Duration,
+        long TotalAffected,
+        string Error
+    ) : SweepEvent(SweepId, At);
 
-    public sealed record Completed : SweepEvent
-    {
-        public Completed(Guid SweepId, DateTimeOffset At, TimeSpan Duration, long TotalAffected)
-        {
-            this.SweepId = RequiredId(SweepId, nameof(SweepId));
-            this.At = At;
-            this.Duration = NonNegative(Duration, nameof(Duration));
-            this.TotalAffected = NonNegative(TotalAffected, nameof(TotalAffected));
-        }
-
-        public TimeSpan Duration { get; }
-        public long TotalAffected { get; }
-    }
-
-    public sealed record Failed : SweepEvent
-    {
-        public Failed(
-            Guid SweepId,
-            DateTimeOffset At,
-            string Error,
-            TimeSpan? Duration = null,
-            long? TotalAffected = null
-        )
-        {
-            this.SweepId = RequiredId(SweepId, nameof(SweepId));
-            this.At = At;
-            this.Error = RequiredText(Error, nameof(Error));
-            this.Duration = OptionalNonNegative(Duration, nameof(Duration));
-            this.TotalAffected = OptionalNonNegative(TotalAffected, nameof(TotalAffected));
-        }
-
-        public string Error { get; }
-        public TimeSpan? Duration { get; }
-        public long? TotalAffected { get; }
-    }
-
-    public sealed record PartiallyFailed : SweepEvent
-    {
-        public PartiallyFailed(
-            Guid SweepId,
-            DateTimeOffset At,
-            TimeSpan Duration,
-            long TotalAffected,
-            string Error
-        )
-        {
-            this.SweepId = RequiredId(SweepId, nameof(SweepId));
-            this.At = At;
-            this.Duration = NonNegative(Duration, nameof(Duration));
-            this.TotalAffected = NonNegative(TotalAffected, nameof(TotalAffected));
-            this.Error = RequiredText(Error, nameof(Error));
-        }
-
-        public TimeSpan Duration { get; }
-        public long TotalAffected { get; }
-        public string Error { get; }
-    }
-
-    public sealed record Cancelled : SweepEvent
-    {
-        public Cancelled(
-            Guid SweepId,
-            DateTimeOffset At,
-            string Error,
-            TimeSpan Duration,
-            long TotalAffected
-        )
-        {
-            this.SweepId = RequiredId(SweepId, nameof(SweepId));
-            this.At = At;
-            this.Error = RequiredText(Error, nameof(Error));
-            this.Duration = NonNegative(Duration, nameof(Duration));
-            this.TotalAffected = NonNegative(TotalAffected, nameof(TotalAffected));
-        }
-
-        public string Error { get; }
-        public TimeSpan Duration { get; }
-        public long TotalAffected { get; }
-    }
+    public sealed record Cancelled(
+        Guid SweepId,
+        DateTimeOffset At,
+        string Error,
+        TimeSpan Duration,
+        long TotalAffected
+    ) : SweepEvent(SweepId, At);
 
     private static Guid RequiredId(Guid value, string parameterName) =>
         value != Guid.Empty
@@ -286,22 +175,6 @@ public abstract record SweepEvent
         Enum.IsDefined(value)
             ? value
             : throw new ArgumentOutOfRangeException(parameterName, value, "The enum value is undefined.");
-
-    private static TimeSpan NonNegative(TimeSpan value, string parameterName) =>
-        value >= TimeSpan.Zero
-            ? value
-            : throw new ArgumentOutOfRangeException(parameterName, value, "The value cannot be negative.");
-
-    private static long NonNegative(long value, string parameterName) =>
-        value >= 0
-            ? value
-            : throw new ArgumentOutOfRangeException(parameterName, value, "The value cannot be negative.");
-
-    private static TimeSpan? OptionalNonNegative(TimeSpan? value, string parameterName) =>
-        value is null ? null : NonNegative(value.Value, parameterName);
-
-    private static long? OptionalNonNegative(long? value, string parameterName) =>
-        value is null ? null : NonNegative(value.Value, parameterName);
 }
 
 public enum SweepRunStatus

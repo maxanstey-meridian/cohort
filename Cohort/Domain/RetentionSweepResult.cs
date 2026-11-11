@@ -1,5 +1,3 @@
-using System.Reflection;
-
 namespace Cohort.Domain;
 
 public sealed record RetentionSweepResult(
@@ -34,12 +32,4 @@ public sealed record EntitySweepCount(
     long RetainedCount,
     long DeferredCount,
     long BlockedCount
-)
-{
-    public Guid RetentionEntityId { get; } =
-        EntityType.GetCustomAttribute<RetentionEntityIdAttribute>(inherit: false)?.Id
-        ?? throw new ArgumentException(
-            "EntityType must declare a stable retention entity identity.",
-            nameof(EntityType)
-        );
-}
+);

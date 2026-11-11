@@ -368,7 +368,6 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
                 .RunAsync(
                     new TenantContext(tenantId, "uk", new Dictionary<string, string>()),
                     DateTimeOffset.UtcNow,
-                    SweepEntityScope.TenantedOnly,
                     dryRun: true
                 )
         );
@@ -414,6 +413,51 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
         (await LoadRunStatusAsync(sweepId)).Should().Be(SweepRunStatus.Failed);
         observer.Events.Should().NotContain(evt => evt is SweepEvent.Completed || evt is SweepEvent.PartiallyFailed);
         observer.Events.OfType<SweepEvent.Failed>().Should().ContainSingle();
+    }
+
+    [Fact]
+    public async Task A_Database_Clock_That_Steps_Back_During_A_Run_Settles_It_With_A_Zero_Duration()
+    {
+        // The database clock reads an hour earlier on every read after the run's first, as it
+        // does after a step back. The settle time is never earlier than the start time: a
+        // negative duration would be refused by the event and by the ledger's constraint, and
+        // the run would be left Started.
+        var tenantId = Guid.NewGuid();
+        var clockReads = 0;
+        using var host = new CohortTestHost(
+            ConnectionString,
+            configureServices: services => services.ConfigureDbContext<Cohort.Sample.SampleDbContext>((_, options) =>
+                options.UseNpgsql(
+                    new PassThroughConnection(
+                        new NpgsqlConnection(ConnectionString),
+                        rewriteCommandText: text =>
+                            text == "SELECT pg_catalog.statement_timestamp()" && Interlocked.Increment(ref clockReads) > 1
+                                ? "SELECT pg_catalog.statement_timestamp() - INTERVAL '1 hour'"
+                                : text
+                    ),
+                    contextOwnsConnection: true
+                )
+            )
+        );
+        await using (var db = host.CreateDbContext())
+        {
+            db.Notes.Add(new Cohort.Sample.Entities.Note { Id = Guid.NewGuid(), TenantId = tenantId, CreatedAt = DateTimeOffset.UtcNow.AddDays(-120), Body = "clock-steps-back" });
+            await db.SaveChangesAsync();
+        }
+
+        var result = await host.RunSweepAsync(new TenantContext(tenantId, "uk", new Dictionary<string, string>()));
+
+        (await LoadRunStatusAsync(result.SweepId)).Should().Be(SweepRunStatus.Succeeded);
+        result.CompletedAt.Should().Be(result.StartedAt);
+        await using var connection = new NpgsqlConnection(ConnectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """SELECT "StartedAt", "SettledAt", "Duration" FROM "sweep_run" WHERE "SweepId" = @sweepId""";
+        command.Parameters.AddWithValue("sweepId", result.SweepId);
+        await using var reader = await command.ExecuteReaderAsync();
+        (await reader.ReadAsync()).Should().BeTrue();
+        reader.GetFieldValue<DateTimeOffset>(1).Should().Be(reader.GetFieldValue<DateTimeOffset>(0));
+        reader.GetFieldValue<TimeSpan>(2).Should().Be(TimeSpan.Zero);
     }
 
     private sealed class SettlementObserver : IRetentionAuditObserver
@@ -557,7 +601,6 @@ public sealed class SweepRunLifecycleEndToEndTests(PostgresFixture fixture)
                     .RunAsync(
                         tenant,
                         asOf,
-                        SweepEntityScope.TenantedOnly,
                         dryRun: true
                     )
             );

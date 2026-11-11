@@ -299,7 +299,6 @@ internal sealed class RetentionWorker(
         // Two replicas firing at the same cron instant must not both sweep: double mutations
         // are mostly benign, but doubled audit runs are not.
         var workerLockKey = RetentionRunAdvisoryLock.WorkerKeyFor(CohortStoreTables.FromModel(db.Model).SweepRun);
-        Exception? primaryException = null;
         try
         {
             var (due, occurrence, nextWake) = await choose(db, ct);
@@ -323,11 +322,6 @@ internal sealed class RetentionWorker(
 
             return new IterationResult(await RunLockedIterationAsync(services, db, owed, dryRun, ct), owed, nextWake);
         }
-        catch (Exception ex)
-        {
-            primaryException = ex;
-            throw;
-        }
         finally
         {
             // Every session lock goes, not just the worker key: a lock the server granted to a
@@ -337,7 +331,6 @@ internal sealed class RetentionWorker(
                 db.Database.GetDbConnection(),
                 cleanupToken => RetentionRunAdvisoryLock.ReleaseAllAsync(db.Database.GetDbConnection(), cleanupToken),
                 cleanupToken => db.Database.CloseConnectionAsync().WaitAsync(cleanupToken),
-                primaryException,
                 logger
             );
         }
@@ -448,14 +441,14 @@ internal sealed class RetentionWorker(
                 );
             }
 
-            plan.AddRange(tenants.Select(tenant => new SweepPass(tenant, SweepEntityScope.TenantedOnly)));
+            plan.AddRange(tenants.Select(tenant => new SweepPass(tenant)));
             plan.AddRange(conflicting.Select(id => new RefusedPass(id, RetentionPassRefusal.ConflictingTenantContexts)));
             plan.AddRange(gaps.MissingTenantIds.Select(id => new RefusedPass(id, RetentionPassRefusal.NotInTenantSource)));
         }
 
         if (entries.Any(entry => entry.Tenant is null))
         {
-            plan.Add(new SweepPass(TenantContext.Tenantless, SweepEntityScope.TenantlessOnly));
+            plan.Add(new SweepPass(TenantContext.Tenantless));
         }
 
         return plan;
@@ -494,7 +487,6 @@ internal sealed class RetentionWorker(
                 RetentionExecutionScopes.For(tenant),
                 services => services.GetRequiredService<RetentionSweepEngine>().RunScheduledPassAsync(
                     tenant,
-                    pass.Scope,
                     scheduled,
                     ct
                 ),
@@ -639,7 +631,7 @@ internal sealed class RetentionWorker(
     /// <summary>One pass of an occurrence, keyed in the ledger by its tenant.</summary>
     private abstract record PlannedPass(Guid TenantId);
 
-    private sealed record SweepPass(TenantContext Tenant, SweepEntityScope Scope) : PlannedPass(Tenant.Id);
+    private sealed record SweepPass(TenantContext Tenant) : PlannedPass(Tenant.Id);
 
     private sealed record RefusedPass(Guid TenantId, RetentionPassRefusal Refusal) : PlannedPass(TenantId);
 }

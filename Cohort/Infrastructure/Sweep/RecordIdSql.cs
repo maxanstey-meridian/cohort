@@ -22,7 +22,7 @@ internal static class RecordIdSql
     {
         return PostgresStoreTypeSql.CastType(recordId.RecordIdStoreType) is { } storeType
             ? $"{targetAlias}.{PostgreSqlIdentifier.Quote(recordId.RecordIdColumn)} = CAST(@{parameterName} AS {storeType})"
-            : $"CAST({targetAlias}.{PostgreSqlIdentifier.Quote(recordId.RecordIdColumn)} AS text) = CAST(@{parameterName} AS text)";
+            : $"{TextExpression(targetAlias, recordId)} = CAST(@{parameterName} AS text)";
     }
 
     /// <summary>
@@ -37,7 +37,7 @@ internal static class RecordIdSql
     {
         return PostgresStoreTypeSql.CastType(recordId.RecordIdStoreType) is { } storeType
             ? $"{targetAlias}.{PostgreSqlIdentifier.Quote(recordId.RecordIdColumn)} = CAST({textExpression} AS {storeType})"
-            : $"CAST({targetAlias}.{PostgreSqlIdentifier.Quote(recordId.RecordIdColumn)} AS text) = {textExpression}";
+            : $"{TextExpression(targetAlias, recordId)} = {textExpression}";
     }
 
     internal static string EqualsAnyParameter(
@@ -48,7 +48,7 @@ internal static class RecordIdSql
     {
         return PostgresStoreTypeSql.CastType(recordId.RecordIdStoreType) is { } storeType
             ? $"{targetAlias}.{PostgreSqlIdentifier.Quote(recordId.RecordIdColumn)} = ANY(CAST(@{parameterName} AS {storeType}[]))"
-            : $"CAST({targetAlias}.{PostgreSqlIdentifier.Quote(recordId.RecordIdColumn)} AS text) = ANY(@{parameterName})";
+            : $"{TextExpression(targetAlias, recordId)} = ANY(@{parameterName})";
     }
 
     /// <summary>

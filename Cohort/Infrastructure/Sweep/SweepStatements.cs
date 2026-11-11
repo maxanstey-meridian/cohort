@@ -87,9 +87,6 @@ internal static class SweepStatements
     internal static bool CountsSubjectRows(SweepScope scope) =>
         scope.Rule.Strategy == Strategy.Exempt && scope.Subject is not null;
 
-    /// <summary>Whether the run has refused rows, so that its counts leave them out.</summary>
-    internal static bool HasRefusedIds(IReadOnlyCollection<string> refused) => refused.Count > 0;
-
     internal static SweepCursorKind CursorKindOf(SweepCursor? after) =>
         after is null ? SweepCursorKind.None
         : after.Anchor is null ? SweepCursorKind.NullAnchor
@@ -113,20 +110,19 @@ internal static class SweepStatements
     // ------------------------------------------------------------------------------------
 
     /// <summary>
-    /// Every S1 to S11 statement <paramref name="scope"/> can issue under <paramref name="strategy"/>,
+    /// Every S1 to S11 statement <paramref name="scope"/> can issue under its rule's strategy,
     /// over each branch's values. <paramref name="headParameters"/> holds the mutation head's
     /// values (<c>@deletedAt</c>, <c>@anonymisedAt</c>, <c>@value{n}</c>), filled by the caller.
     /// </summary>
     internal static IReadOnlyList<SweepStatement> ForScope(
         SweepScope scope,
-        Strategy strategy,
         SweepPath path,
         SqlParams headParameters,
         SweepRunValues values
     )
     {
         var statements = new List<SweepStatement>();
-        if (strategy == Strategy.Exempt)
+        if (scope.Rule.Strategy == Strategy.Exempt)
         {
             if (CountsSubjectRows(scope))
             {
@@ -141,28 +137,21 @@ internal static class SweepStatements
         string[] candidateIds = [];
         if (CountsNullAnchor(scope))
         {
-            statements.Add(CountByAnchor(scope, strategy, SweepCount.NullAnchor));
+            statements.Add(CountByAnchor(scope, SweepCount.NullAnchor));
         }
 
         if (CountsRetainedByRule(scope))
         {
-            statements.Add(CountByAnchor(scope, strategy, SweepCount.RetainedByRule));
+            statements.Add(CountByAnchor(scope, SweepCount.RetainedByRule));
         }
 
-        statements.Add(CountPredicted(scope, strategy));
-        statements.Add(
-            CountLeft(scope, strategy, sweepId, hasRefused: false, refusedRecordIds: null)
-        );
-        statements.Add(
-            CountLeft(scope, strategy, sweepId, hasRefused: true, values.RefusedRecordIds)
-        );
-        statements.Add(
-            Discover(scope, strategy, sweepId, batchSize, SweepCursorKind.None, null, null)
-        );
+        statements.Add(CountPredicted(scope));
+        statements.Add(CountLeft(scope, sweepId, refusedRecordIds: null));
+        statements.Add(CountLeft(scope, sweepId, values.RefusedRecordIds));
+        statements.Add(Discover(scope, sweepId, batchSize, SweepCursorKind.None, null, null));
         statements.Add(
             Discover(
                 scope,
-                strategy,
                 sweepId,
                 batchSize,
                 SweepCursorKind.Anchored,
@@ -175,7 +164,6 @@ internal static class SweepStatements
             statements.Add(
                 Discover(
                     scope,
-                    strategy,
                     sweepId,
                     batchSize,
                     SweepCursorKind.NullAnchor,
@@ -185,19 +173,19 @@ internal static class SweepStatements
             );
         }
 
-        statements.Add(LockCandidates(scope, strategy, candidateIds));
+        statements.Add(LockCandidates(scope, candidateIds));
         if (!path.RowByRow)
         {
-            statements.Add(MutateBatch(scope, strategy, headParameters, candidateIds));
+            statements.Add(MutateBatch(scope, headParameters, candidateIds));
             return statements;
         }
 
-        statements.Add(LoadRows(scope, strategy, candidateIds));
-        statements.Add(MutateRow(scope, strategy, headParameters, values.RecordKey));
+        statements.Add(LoadRows(scope, candidateIds));
+        statements.Add(MutateRow(scope, headParameters, values.RecordKey));
         statements.Add(RecordIdSql.CanonicalizeStatement(scope.Entry, values.RecordKey));
         if (path.HasDependentsStep)
         {
-            statements.Add(IsStillDue(scope, strategy, values.RecordKey));
+            statements.Add(IsStillDue(scope, values.RecordKey));
         }
 
         return statements;
@@ -208,7 +196,7 @@ internal static class SweepStatements
     // ------------------------------------------------------------------------------------
 
     /// <summary>S1: rows it could act on whose anchor is NULL, or rows the cutoff keeps.</summary>
-    internal static SweepStatement CountByAnchor(SweepScope scope, Strategy strategy, SweepCount count)
+    internal static SweepStatement CountByAnchor(SweepScope scope, SweepCount count)
     {
         var parameters = new SqlParams();
         var (name, where) = count switch
@@ -216,12 +204,12 @@ internal static class SweepStatements
             // No hold exclusion: a held NULL-anchor row is just as invisible to retention.
             SweepCount.NullAnchor => (
                 "count-null-anchor",
-                ScopeSql(scope, strategy, parameters, AnchorFilter.Null)
+                ScopeSql(scope, parameters, AnchorFilter.Null)
             ),
             // No hold exclusion: the rule keeps the row whether or not it is also held.
             SweepCount.RetainedByRule => (
                 "count-retained-by-rule",
-                ScopeSql(scope, strategy, parameters, AnchorFilter.OnOrAfterCutoff)
+                ScopeSql(scope, parameters, AnchorFilter.OnOrAfterCutoff)
             ),
             _ => throw new ArgumentOutOfRangeException(nameof(count), count, null),
         };
@@ -239,12 +227,12 @@ internal static class SweepStatements
     /// as held). 0 when the scope has no blocking reference.</item>
     /// </list>
     /// </summary>
-    internal static SweepStatement CountPredicted(SweepScope scope, Strategy strategy)
+    internal static SweepStatement CountPredicted(SweepScope scope)
     {
         var parameters = new SqlParams();
-        var scopeSql = ScopeSql(scope, strategy, parameters);
+        var scopeSql = ScopeSql(scope, parameters);
         var blocked = BlockedSql(scope, scopeSql, parameters);
-        var due = DueSql(scope, strategy, parameters);
+        var due = DueSql(scope, parameters);
         var held = HoldExclusion(scope, parameters);
         var sql = $"""
             SELECT pg_catalog.count(*) FILTER (WHERE {due}),
@@ -271,27 +259,15 @@ internal static class SweepStatements
     /// out <paramref name="refusedRecordIds"/> too, so no row is counted both refused and
     /// referenced. 0 when the scope has no blocking reference.</item>
     /// </list>
-    /// The refused-ids clause is in the text only when <paramref name="hasRefused"/>.
+    /// The refused-ids clause is in the text only when <paramref name="refusedRecordIds"/> is not null.
     /// </summary>
-    internal static SweepStatement CountLeft(
-        SweepScope scope,
-        Strategy strategy,
-        Guid sweepId,
-        bool hasRefused,
-        object? refusedRecordIds
-    )
+    internal static SweepStatement CountLeft(SweepScope scope, Guid sweepId, object? refusedRecordIds)
     {
         var parameters = new SqlParams();
-        var scopeSql = ScopeSql(scope, strategy, parameters);
-        var notRefused = NotAnyRecordIdSql(
-            scope.Entry,
-            "refusedRecordIds",
-            hasRefused,
-            refusedRecordIds,
-            parameters
-        );
+        var scopeSql = ScopeSql(scope, parameters);
+        var notRefused = NotAnyRecordIdSql(scope.Entry, "refusedRecordIds", refusedRecordIds, parameters);
         var deferred =
-            $"{DueSql(scope, strategy, parameters)}{NotRecordedByRunSql(scope, strategy, sweepId, parameters)}{notRefused}";
+            $"{DueSql(scope, parameters)}{NotRecordedByRunSql(scope, sweepId, parameters)}{notRefused}";
         var held = $"{scopeSql} AND NOT {HoldExclusion(scope, parameters)}";
         var referenced = BlockedSql(scope, scopeSql, parameters, notRefused);
         var sql = $"""
@@ -302,7 +278,7 @@ internal static class SweepStatements
             WHERE {scopeSql}
             """;
         return Statement(
-            hasRefused ? "count-left-after-refusals" : "count-left",
+            refusedRecordIds is null ? "count-left" : "count-left-after-refusals",
             scope,
             sql,
             parameters,
@@ -313,8 +289,7 @@ internal static class SweepStatements
 
     /// <summary>
     /// S4: every row of the scope's subject in its tenant, with no cutoff, eligibility or hold
-    /// filter: what an Exempt rule keeps from an erasure. Static because Exempt has no
-    /// strategy.
+    /// filter: what an Exempt rule keeps from an erasure.
     /// </summary>
     internal static SweepStatement CountSubjectRows(SweepScope scope)
     {
@@ -349,7 +324,6 @@ internal static class SweepStatements
     /// </summary>
     internal static SweepStatement Discover(
         SweepScope scope,
-        Strategy strategy,
         Guid sweepId,
         int limit,
         SweepCursorKind cursor,
@@ -360,9 +334,9 @@ internal static class SweepStatements
         var entry = scope.Entry;
         var parameters = new SqlParams { ["batchSize"] = limit };
         var where =
-            DueSql(scope, strategy, parameters)
+            DueSql(scope, parameters)
             + AfterCursorSql(scope, cursor, cursorAnchor, cursorRecordId, parameters)
-            + NotRecordedByRunSql(scope, strategy, sweepId, parameters);
+            + NotRecordedByRunSql(scope, sweepId, parameters);
 
         var recordIdText = RecordIdSql.TextExpression("target", entry.RecordId);
         var anchorColumn = PostgreSqlIdentifier.Quote(entry.AnchorColumn);
@@ -386,18 +360,14 @@ internal static class SweepStatements
     /// S6: locks the discovered candidates <c>FOR UPDATE</c>, re-checking that each is still due.
     /// A sweep skips rows another run has locked and retires them next time; an erasure waits.
     /// </summary>
-    internal static SweepStatement LockCandidates(
-        SweepScope scope,
-        Strategy strategy,
-        object? candidateIds
-    )
+    internal static SweepStatement LockCandidates(SweepScope scope, object? candidateIds)
     {
         var entry = scope.Entry;
         var parameters = new SqlParams { ["candidateIds"] = candidateIds };
         var sql = $"""
             SELECT {RecordIdSql.TextExpression("target", entry.RecordId)}
             FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
-            WHERE {DueSql(scope, strategy, parameters)}
+            WHERE {DueSql(scope, parameters)}
               AND {RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "candidateIds")}
             ORDER BY {OrderBySql(entry)}
             FOR UPDATE{(scope.SkipLocked ? " SKIP LOCKED" : "")}
@@ -408,7 +378,6 @@ internal static class SweepStatements
     /// <summary>S7: changes the candidates in one statement, the bulk path.</summary>
     internal static SweepStatement MutateBatch(
         SweepScope scope,
-        Strategy strategy,
         SqlParams headParameters,
         object? candidateIds
     )
@@ -417,8 +386,8 @@ internal static class SweepStatements
         var parameters = new SqlParams { ["candidateIds"] = candidateIds };
         RetentionHoldSql.Merge(parameters, headParameters);
         var sql = $"""
-            {HeadSql(strategy, entry)}
-            WHERE {ScopeSql(scope, strategy, parameters)}
+            {HeadSql(scope.Rule.Strategy, entry)}
+            WHERE {ScopeSql(scope, parameters)}
               AND {RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "candidateIds")}
               AND {HoldExclusion(scope, parameters)}
             RETURNING {RecordIdSql.TextExpression("target", entry.RecordId)}
@@ -427,11 +396,7 @@ internal static class SweepStatements
     }
 
     /// <summary>S8: loads the candidates' rows for the row-by-row path.</summary>
-    internal static SweepStatement LoadRows(
-        SweepScope scope,
-        Strategy strategy,
-        object? candidateIds
-    )
+    internal static SweepStatement LoadRows(SweepScope scope, object? candidateIds)
     {
         var entry = scope.Entry;
         var parameters = new SqlParams { ["candidateIds"] = candidateIds };
@@ -442,7 +407,7 @@ internal static class SweepStatements
             SELECT {string.Join(", ", columns)}
             FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
             WHERE {RecordIdSql.EqualsAnyParameter("target", entry.RecordId, "candidateIds")}
-              AND {ScopeSql(scope, strategy, parameters)}
+              AND {ScopeSql(scope, parameters)}
               AND {HoldExclusion(scope, parameters)}
             ORDER BY {OrderBySql(entry)}
             """;
@@ -452,7 +417,6 @@ internal static class SweepStatements
     /// <summary>S9: changes one row on the row-by-row path.</summary>
     internal static SweepStatement MutateRow(
         SweepScope scope,
-        Strategy strategy,
         SqlParams headParameters,
         object? recordKey
     )
@@ -461,9 +425,9 @@ internal static class SweepStatements
         var parameters = new SqlParams { ["recordKey"] = recordKey };
         RetentionHoldSql.Merge(parameters, headParameters);
         var sql = $"""
-            {HeadSql(strategy, entry)}
+            {HeadSql(scope.Rule.Strategy, entry)}
             WHERE {RecordIdSql.EqualsParameter("target", entry.RecordId, "recordKey")}
-              AND {ScopeSql(scope, strategy, parameters)}
+              AND {ScopeSql(scope, parameters)}
               AND {HoldExclusion(scope, parameters)}
             RETURNING {RecordIdSql.TextExpression("target", entry.RecordId)}
             """;
@@ -474,11 +438,7 @@ internal static class SweepStatements
     /// S10: whether the row still matches the mutation statement's own WHERE: in scope, eligible
     /// and not held.
     /// </summary>
-    internal static SweepStatement IsStillDue(
-        SweepScope scope,
-        Strategy strategy,
-        object? recordKey
-    )
+    internal static SweepStatement IsStillDue(SweepScope scope, object? recordKey)
     {
         var entry = scope.Entry;
         var parameters = new SqlParams { ["recordKey"] = recordKey };
@@ -487,7 +447,7 @@ internal static class SweepStatements
                 SELECT 1
                 FROM {PostgreSqlIdentifier.Format(entry.Table)} AS target
                 WHERE {RecordIdSql.EqualsParameter("target", entry.RecordId, "recordKey")}
-                  AND {ScopeSql(scope, strategy, parameters)}
+                  AND {ScopeSql(scope, parameters)}
                   AND {HoldExclusion(scope, parameters)}
             )
             """;
@@ -603,21 +563,20 @@ internal static class SweepStatements
     /// through a blocking foreign key. Discovery, the row lock and the eligible and deferred
     /// counts share it, so a row excluded from one is excluded from all.
     /// </summary>
-    private static string DueSql(SweepScope scope, Strategy strategy, SqlParams parameters) =>
+    private static string DueSql(SweepScope scope, SqlParams parameters) =>
         ReferencingForeignKeySql.NotReferencedSql(scope) is { Length: > 0 } notReferenced
-            ? $"{ScopeSql(scope, strategy, parameters)} AND {HoldExclusion(scope, parameters)} AND {notReferenced}"
-            : $"{ScopeSql(scope, strategy, parameters)} AND {HoldExclusion(scope, parameters)}";
+            ? $"{ScopeSql(scope, parameters)} AND {HoldExclusion(scope, parameters)} AND {notReferenced}"
+            : $"{ScopeSql(scope, parameters)} AND {HoldExclusion(scope, parameters)}";
 
-    /// <summary>Excludes the record ids, or "" when there are none (<paramref name="any"/> false).</summary>
+    /// <summary>Excludes the record ids, or "" when there are none (<paramref name="recordIds"/> null).</summary>
     private static string NotAnyRecordIdSql(
         RetentionEntry entry,
         string parameterName,
-        bool any,
         object? recordIds,
         SqlParams parameters
     )
     {
-        if (!any)
+        if (recordIds is null)
         {
             return "";
         }
@@ -632,18 +591,13 @@ internal static class SweepStatements
     /// count them twice. Discovery's keyset already passes them, but a row whose anchor moved
     /// later after it was recorded would be met again, and its row detail recorded twice.
     /// </summary>
-    private static string NotRecordedByRunSql(
-        SweepScope scope,
-        Strategy strategy,
-        Guid sweepId,
-        SqlParams parameters
-    )
+    private static string NotRecordedByRunSql(SweepScope scope, Guid sweepId, SqlParams parameters)
     {
         var entry = scope.Entry;
         parameters["excludedSweepId"] = sweepId;
         parameters["excludedRetentionEntityId"] = entry.RetentionEntityId;
         parameters["excludedCategory"] = entry.Category;
-        parameters["excludedStrategy"] = (int)strategy;
+        parameters["excludedStrategy"] = (int)scope.Rule.Strategy;
         parameters["excludedTenantId"] = scope.Tenant.Id;
         var detailTable = PostgreSqlIdentifier.Format(entry.CohortTables.SweepRunRowDetail);
         var recordIdText = RecordIdSql.TextExpression("target", entry.RecordId);
@@ -670,7 +624,6 @@ internal static class SweepStatements
     /// </summary>
     private static string ScopeSql(
         SweepScope scope,
-        Strategy strategy,
         SqlParams parameters,
         AnchorFilter anchor = AnchorFilter.BeforeCutoff
     )
@@ -695,7 +648,7 @@ internal static class SweepStatements
                 clauses.Add("FALSE");
                 break;
         }
-        if (SweepEligibilitySql.Predicate(strategy, entry) is { Length: > 0 } eligibility)
+        if (SweepEligibilitySql.Predicate(scope.Rule.Strategy, entry) is { Length: > 0 } eligibility)
         {
             clauses.Add(eligibility);
         }

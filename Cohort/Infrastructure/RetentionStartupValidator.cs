@@ -19,7 +19,6 @@ internal sealed partial class RetentionStartupValidator(
     RetentionEntryBuilder entryBuilder,
     IEnumerable<IAnonymiseValueFactory> anonymiseValueFactories,
     RetentionValidationState validationState,
-    ErasureSubjectMetadataResolver erasureSubjectMetadataResolver,
     RetentionDependentsServiceRegistrations stepServices
 )
 {
@@ -72,7 +71,6 @@ internal sealed partial class RetentionStartupValidator(
                 return;
             }
 
-            validation.ErasureSubjects.Clear();
             validation.ErasureSubjectKinds.Clear();
             var validatedCapabilities = new Dictionary<string, RetentionCategoryCapabilities>(
                 StringComparer.Ordinal
@@ -130,11 +128,7 @@ internal sealed partial class RetentionStartupValidator(
                 RetentionEntry entry;
                 try
                 {
-                    entry =
-                        entryBuilder.TryBuild(entityType)
-                        ?? throw new InvalidOperationException(
-                            $"[Retain] on {clrType.FullName}: retention entry could not be built."
-                        );
+                    entry = entryBuilder.TryBuild(entityType)!;
                 }
                 catch (InvalidOperationException ex)
                 {
@@ -186,9 +180,6 @@ internal sealed partial class RetentionStartupValidator(
 
                 try
                 {
-                    validation.ErasureSubjects[entry.EntityType] =
-                        erasureSubjectMetadataResolver.Resolve(entry);
-
                     if (capabilities.Strategies.Contains(Strategy.Purge))
                     {
                         ValidateCascadeDeletePaths(entityType, errors);
@@ -196,10 +187,8 @@ internal sealed partial class RetentionStartupValidator(
 
                     if (capabilities.Strategies.Contains(Strategy.SoftDelete))
                     {
-                        ValidateSoftDeleteConvention(
-                            entry,
-                            errors,
-                            $"Soft-delete convention on {clrType.FullName}:"
+                        errors.AddRange(
+                            GetSoftDeleteConventionErrors(entry, $"Soft-delete convention on {clrType.FullName}:")
                         );
                     }
 
@@ -214,11 +203,12 @@ internal sealed partial class RetentionStartupValidator(
                             );
                         }
 
-                        ValidateAnonymiseConvention(
-                            entityType,
-                            entry,
-                            errors,
-                            $"Anonymise convention on {clrType.FullName}:"
+                        errors.AddRange(
+                            GetAnonymiseConventionErrors(
+                                entityType,
+                                entry,
+                                $"Anonymise convention on {clrType.FullName}:"
+                            )
                         );
 
                         if (entry.AnonymisedAt is null)
@@ -255,7 +245,7 @@ internal sealed partial class RetentionStartupValidator(
             }
 
             ValidateStepsTargetRetainedEntities(errors);
-            ValidateErasureSubjectKinds(validation, errors);
+            ValidateErasureSubjectKinds(validation, retainedEntries, errors);
             ValidateHoldRelations(retainedEntries, errors);
 
             try
@@ -289,10 +279,14 @@ internal sealed partial class RetentionStartupValidator(
     /// A kind names one sort of subject, so every column of that kind, across the model,
     /// must hold the same CLR type; an erasure's subject is checked against it.
     /// </summary>
-    private static void ValidateErasureSubjectKinds(RetentionModelValidation validation, List<string> errors)
+    private static void ValidateErasureSubjectKinds(
+        RetentionModelValidation validation,
+        IReadOnlyList<RetentionEntry> retainedEntries,
+        List<string> errors
+    )
     {
-        var membersByKind = validation
-            .ErasureSubjects.Values.SelectMany(metadata => metadata)
+        var membersByKind = retainedEntries
+            .SelectMany(entry => entry.ErasureSubjects.Values)
             .GroupBy(metadata => metadata.Kind, StringComparer.Ordinal)
             .OrderBy(group => group.Key, StringComparer.Ordinal);
         foreach (var kind in membersByKind)
@@ -382,11 +376,11 @@ internal sealed partial class RetentionStartupValidator(
             return true;
         }
 
-        var schema = entityType.GetSchema() ?? entityType.Model.GetDefaultSchema() ?? "public";
+        var schema = entityType.GetSchema() ?? "public";
         var sharingEntity = entityType.Model.GetEntityTypes().FirstOrDefault(other =>
             other != entityType
             && other.GetTableName() == tableName
-            && (other.GetSchema() ?? other.Model.GetDefaultSchema() ?? "public") == schema
+            && (other.GetSchema() ?? "public") == schema
         );
         if (sharingEntity is null)
         {
@@ -489,8 +483,8 @@ internal sealed partial class RetentionStartupValidator(
             return;
         }
 
-        var storeType = RetentionEntryBuilder.TryGetStoreType(recordIdProperty);
-        if (storeType is not null && HasSessionDependentText(storeType))
+        var storeType = recordIdProperty.GetColumnType();
+        if (HasSessionDependentText(storeType))
         {
             errors.Add(
                 $"Record-id convention on {entry.EntityType.FullName}: record-id property '{entry.RecordId.RecordIdMember}' is mapped to '{storeType}'. Cohort stores record ids as the column's PostgreSQL text form, which for this type depends on session settings (TimeZone, DateStyle, IntervalStyle, extra_float_digits), so holds and audit rows could silently stop matching. Use a uuid, integer, numeric, or text record id, or mark a stable unique column with [RetentionRecordId]."
@@ -521,25 +515,6 @@ internal sealed partial class RetentionStartupValidator(
                 );
             }
         }
-    }
-
-    private static void ValidateSoftDeleteConvention(
-        RetentionEntry entry,
-        List<string> errors,
-        string messagePrefix
-    )
-    {
-        errors.AddRange(GetSoftDeleteConventionErrors(entry, messagePrefix));
-    }
-
-    private void ValidateAnonymiseConvention(
-        Microsoft.EntityFrameworkCore.Metadata.IEntityType entityType,
-        RetentionEntry entry,
-        List<string> errors,
-        string messagePrefix
-    )
-    {
-        errors.AddRange(GetAnonymiseConventionErrors(entityType, entry, messagePrefix));
     }
 
     private static bool IsNonNullableValueType(Type type)
@@ -772,8 +747,8 @@ internal sealed partial class RetentionStartupValidator(
             return;
         }
 
-        var storeType = RetentionEntryBuilder.TryGetStoreType(property);
-        if (storeType is not null && NormalizeStoreType(storeType) != "timestamp with time zone")
+        var storeType = property.GetColumnType();
+        if (NormalizeStoreType(storeType) != "timestamp with time zone")
         {
             errors.Add(
                 $"Timestamp convention on {entry.EntityType.FullName}: {role} property '{memberName}' is mapped to '{storeType}'. Cohort compares and writes retention timestamps as UTC instants, which requires 'timestamp with time zone'; 'timestamp without time zone' silently drifts with the session TimeZone and rejects UTC-kinded parameters. Map the property with HasColumnType(\"timestamptz\") or use DateTimeOffset."
@@ -905,8 +880,8 @@ internal sealed class RetentionValidationState
 {
     // Keyed by the IModel instance the context runs, and held weakly: hosts using
     // IModelCacheKeyFactory, UseModel, or per-scope provider options run different models in
-    // different scopes, and metadata validated for one (its erasure subjects hold that model's
-    // IProperty) must never be applied to another. A host whose EF model cache can't hold its
+    // different scopes, and what was validated for one (its capabilities and erasure subject
+    // kinds) must never be applied to another. A host whose EF model cache can't hold its
     // models gets a new instance per context; each validates once and dies with its model, so
     // Cohort never keeps a model alive.
     private readonly ConditionalWeakTable<IModel, RetentionModelValidation> models = new();
@@ -918,9 +893,6 @@ internal sealed class RetentionValidationState
 internal sealed class RetentionModelValidation
 {
     internal SemaphoreSlim Gate { get; } = new(1, 1);
-
-    /// <summary>Each retained entity's erasure subject columns, one entry per kind.</summary>
-    internal Dictionary<Type, IReadOnlyList<ErasureSubjectMetadata>> ErasureSubjects { get; } = [];
 
     /// <summary>The CLR type every column of each declared erasure subject kind holds.</summary>
     internal Dictionary<string, Type> ErasureSubjectKinds { get; } = new(StringComparer.Ordinal);

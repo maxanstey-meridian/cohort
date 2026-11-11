@@ -18,22 +18,18 @@ internal sealed class RetentionErasureService(
     RetentionValidationState validationState,
     EfRetentionAuditWriter auditWriter,
     RetentionAuditNotifier auditNotifier,
-    IEnumerable<SweepStrategy> sweepStrategies,
+    SweepStrategy strategy,
     IEnumerable<IRetentionDependentsRegistration> dependentsRegistrations,
     IRetentionExecutionSettings options,
     CohortCommitInterceptor commitInterceptor,
     ILogger<RetentionErasureService> logger
 )
 {
-    private readonly IReadOnlyDictionary<Strategy, SweepStrategy> strategies =
-        sweepStrategies.ToDictionary(strategy => strategy.HandlesStrategy);
-
     public async Task<ErasureResult> ExecuteAsync(
         RetentionErasureRequest request,
         CancellationToken ct = default
     )
     {
-        ArgumentNullException.ThrowIfNull(request);
         var tenant = request.RunTenant;
         var entities = SweepEntityScopes.For(tenant);
         var scope = request.Scope;
@@ -71,8 +67,8 @@ internal sealed class RetentionErasureService(
             callerCommit
         );
         // Built before the run exists: a request refused by policy leaves no attempted run.
-        var plan = await BuildExecutionPlanAsync(validation, tenant, entities, scope, now, run, ct);
-        await run.ExecuteAsync(() => run.RunEntitiesAsync(plan, strategies, dependentsRegistrations, ct), ct);
+        var plan = await BuildExecutionPlanAsync(tenant, entities, scope, now, run, ct);
+        await run.ExecuteAsync(() => run.RunEntitiesAsync(plan, strategy, dependentsRegistrations, ct), ct);
         return run.CreateErasureResult(scope);
     }
 
@@ -147,7 +143,6 @@ internal sealed class RetentionErasureService(
     }
 
     private async Task<IReadOnlyList<SweepScope>> BuildExecutionPlanAsync(
-        RetentionModelValidation validation,
         TenantContext tenant,
         SweepEntityScope entities,
         ErasureScope scope,
@@ -167,10 +162,7 @@ internal sealed class RetentionErasureService(
                 continue;
             }
 
-            var subjectMetadata = validation
-                .ErasureSubjects[entry.EntityType]
-                .FirstOrDefault(metadata => string.Equals(metadata.Kind, scope.Kind, StringComparison.Ordinal));
-            if (subjectMetadata is null)
+            if (!entry.ErasureSubjects.TryGetValue(scope.Kind, out var subjectMetadata))
             {
                 continue;
             }

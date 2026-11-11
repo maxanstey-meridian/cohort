@@ -1,5 +1,3 @@
-#nullable enable
-
 namespace Cohort.Infrastructure.Migrations;
 
 internal static class CohortSchemaContract
@@ -170,7 +168,6 @@ internal static class CohortSchemaContract
         IReadOnlyList<ForeignKeyRequirement>? ForeignKeys = null
     )
     {
-        internal string Name => Role;
         internal IReadOnlyList<IndexRequirement> RequiredIndexes => Indexes ?? [];
         internal IReadOnlyList<CheckConstraintRequirement> RequiredChecks => Checks ?? [];
         internal IReadOnlyList<ForeignKeyRequirement> RequiredForeignKeys => ForeignKeys ?? [];

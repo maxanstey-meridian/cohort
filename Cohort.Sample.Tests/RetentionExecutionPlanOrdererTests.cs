@@ -3,7 +3,6 @@ using Cohort.Infrastructure;
 using Cohort.Infrastructure.Migrations;
 
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Logging;
 
 namespace Cohort.Sample.Tests;
 
@@ -22,24 +21,15 @@ public sealed class RetentionExecutionPlanOrdererTests
         );
         var firstEntry = CreateEntry<CycleFirstRecord>("cycle_firsts", "cycle-first");
         var secondEntry = CreateEntry<CycleSecondRecord>("cycle_seconds", "cycle-second");
-        var logger = new RecordingLogger();
 
         var act = () =>
-            RetentionExecutionPlanOrderer.Order(
-                db,
-                [secondEntry, firstEntry],
-                entry => entry,
-                logger
-            );
+            RetentionExecutionPlanOrderer.Order(db, [secondEntry, firstEntry], entry => entry);
 
         act.Should()
             .Throw<RetentionConfigurationException>()
             .Which.Errors.Should()
-            .ContainSingle(error => error.Contains("foreign-key graph contains a cycle"));
-        logger.Entries.Should().ContainSingle();
-        logger.Entries[0].Level.Should().Be(LogLevel.Error);
-        logger.Entries[0]
-            .Message.Should()
+            .ContainSingle()
+            .Which.Should()
             .Contain("foreign-key graph contains a cycle")
             .And.Contain(typeof(CycleFirstRecord).FullName)
             .And.Contain(typeof(CycleSecondRecord).FullName);
@@ -63,7 +53,8 @@ public sealed class RetentionExecutionPlanOrdererTests
             [],
             [],
             new TenantConvention("TenantId", "TenantId"),
-            null
+            null,
+            new Dictionary<string, ErasureSubjectMetadata>()
         );
 
     private sealed class CyclicTestDbContext(DbContextOptions<CyclicTestDbContext> options)
@@ -108,23 +99,5 @@ public sealed class RetentionExecutionPlanOrdererTests
         public Guid TenantId { get; init; }
         public Guid FirstId { get; init; }
         public DateTimeOffset CreatedAt { get; init; }
-    }
-
-    private sealed class RecordingLogger : ILogger
-    {
-        public List<(LogLevel Level, string Message)> Entries { get; } = [];
-
-        public IDisposable? BeginScope<TState>(TState state)
-            where TState : notnull => null;
-
-        public bool IsEnabled(LogLevel logLevel) => true;
-
-        public void Log<TState>(
-            LogLevel logLevel,
-            EventId eventId,
-            TState state,
-            Exception? exception,
-            Func<TState, Exception?, string> formatter
-        ) => Entries.Add((logLevel, formatter(state, exception)));
     }
 }

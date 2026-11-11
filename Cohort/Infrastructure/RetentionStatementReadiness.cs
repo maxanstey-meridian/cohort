@@ -163,7 +163,7 @@ internal sealed class RetentionStatementReadiness(
     }
 
     // One sweep or erasure scope readiness explains, and the operation a refusal names for it.
-    private sealed record ScopeToExplain(SweepScope Scope, Strategy Strategy, string Operation);
+    private sealed record ScopeToExplain(SweepScope Scope, string Operation);
 
     // The sweep scopes and the erasure scopes of every entity with a declared category, each
     // strategy it declares. The blocking keys of the Purge scopes are read in one catalog read
@@ -174,7 +174,6 @@ internal sealed class RetentionStatementReadiness(
         CancellationToken ct
     )
     {
-        var validation = validationState.For(db.Model);
         var now = DateTimeOffset.UtcNow;
         var scopes = new List<ScopeToExplain>();
         foreach (var entry in entries)
@@ -185,9 +184,7 @@ internal sealed class RetentionStatementReadiness(
             }
 
             var tenant = entry.Tenant is null ? TenantContext.Tenantless : ReadinessTenant;
-            var kinds = validation.ErasureSubjects.TryGetValue(entry.EntityType, out var metadata)
-                ? metadata
-                : [];
+            var kinds = entry.ErasureSubjects.Values.OrderBy(metadata => metadata.Kind, StringComparer.Ordinal).ToArray();
             foreach (var strategy in declared.Strategies.Order())
             {
                 if (strategy != Strategy.Exempt)
@@ -201,7 +198,6 @@ internal sealed class RetentionStatementReadiness(
                                 context,
                                 settings.TimeZone
                             ),
-                            strategy,
                             $"sweeping with {strategy}"
                         )
                     );
@@ -223,7 +219,6 @@ internal sealed class RetentionStatementReadiness(
                                     now,
                                     settings.TimeZone
                                 ),
-                                strategy,
                                 $"erasing subjects of kind '{kind.Kind}'"
                             )
                         );
@@ -244,14 +239,13 @@ internal sealed class RetentionStatementReadiness(
     // Every host-table statement a sweep or an erasure issues (`ForScope`).
     private void AddScopes(StatementSet set, IEnumerable<ScopeToExplain> scopes)
     {
-        foreach (var (scope, strategy, operation) in scopes)
+        foreach (var (scope, operation) in scopes)
         {
             set.Add(
                 SweepStatements.ForScope(
                     scope,
-                    strategy,
-                    PathOf(scope.Entry, strategy),
-                    HeadParameters(scope, strategy),
+                    PathOf(scope),
+                    HeadParameters(scope),
                     RunValues(scope.Entry)
                 ),
                 operation
@@ -259,9 +253,9 @@ internal sealed class RetentionStatementReadiness(
         }
     }
 
-    // The held-row guard's forms (`ForModel`: the one read over every entity, and the per-entity
-    // forms that tell which entity a refusal comes from). A sweep or an erasure runs it only for
-    // a dependents step; a deletion always does, so it is always explained.
+    // The held-row guard (`ForModel`: the one read over every entity, and each entity's reread).
+    // A sweep or an erasure runs it only for a dependents step; a deletion always does, so it is
+    // always explained.
     private static void AddGuard(
         StatementSet set,
         CohortStoreTables tables,
@@ -305,23 +299,15 @@ internal sealed class RetentionStatementReadiness(
 
         foreach (var kind in validation.ErasureSubjectKinds.Keys.Order(StringComparer.Ordinal))
         {
-            var starts = entries
-                .Select(entry =>
-                    (
-                        Entry: entry,
-                        Metadata: validation.ErasureSubjects.TryGetValue(
-                            entry.EntityType,
-                            out var all
-                        )
-                            ? all.FirstOrDefault(metadata =>
-                                string.Equals(metadata.Kind, kind, StringComparison.Ordinal)
-                            )
-                            : null
-                    )
-                )
-                .Where(start => start.Metadata is not null)
-                .Select(start => (start.Entry, Subject: SubjectPredicate(start.Metadata!)))
-                .ToList();
+            var starts = new List<(RetentionEntry Entry, ErasureSubjectPredicate Subject)>();
+            foreach (var entry in entries)
+            {
+                if (entry.ErasureSubjects.TryGetValue(kind, out var metadata))
+                {
+                    starts.Add((entry, SubjectPredicate(metadata)));
+                }
+            }
+
             if (starts.Count > 0)
             {
                 set.Add(
@@ -653,8 +639,10 @@ internal sealed class RetentionStatementReadiness(
     }
 
     /// <summary>The run's own path predicate, from the registrations the run reads.</summary>
-    private SweepPath PathOf(RetentionEntry entry, Strategy strategy)
+    private SweepPath PathOf(SweepScope scope)
     {
+        var entry = scope.Entry;
+        var strategy = scope.Rule.Strategy;
         var hasStep = dependentsRegistrations.HasStep(entry.EntityType);
         var perRow = strategy == Strategy.Anonymise && assignments.RequiresPerRowExecution(entry);
         return new SweepPath(
@@ -667,11 +655,11 @@ internal sealed class RetentionStatementReadiness(
     // running a factory or a converter: the soft-delete time from the strategy's own function, the
     // anonymised-at clock, and each anonymise value as a NULL typed from its property's provider
     // type, or untyped for the Null method, as the run binds it.
-    private SqlParams HeadParameters(SweepScope scope, Strategy strategy)
+    private SqlParams HeadParameters(SweepScope scope)
     {
         var entry = scope.Entry;
         var parameters = new SqlParams();
-        switch (strategy)
+        switch (scope.Rule.Strategy)
         {
             case Strategy.SoftDelete
                 when entry.SoftDelete is { DeletedAtColumn: not null } softDelete:

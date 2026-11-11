@@ -277,7 +277,6 @@ public sealed class HeldWithValidationTests
             new RetentionEntryBuilder(new CohortConventions()),
             [],
             new RetentionValidationState(),
-            new ErasureSubjectMetadataResolver(db),
             new RetentionDependentsServiceRegistrations(new ServiceCollection())
         );
 

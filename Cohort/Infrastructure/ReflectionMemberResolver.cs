@@ -8,26 +8,16 @@ internal static class ReflectionMemberResolver
 
     internal static PropertyInfo? FindPropertyByName(Type clrType, string name)
     {
-        var declared = clrType
-            .GetProperties(PublicInstance | BindingFlags.DeclaredOnly)
-            .FirstOrDefault(property =>
-                string.Equals(property.Name, name, StringComparison.Ordinal)
-            );
-        if (declared is not null)
+        for (var cursor = clrType; cursor is not null; cursor = cursor.BaseType)
         {
-            return declared;
-        }
-
-        for (var cursor = clrType.BaseType; cursor is not null; cursor = cursor.BaseType)
-        {
-            var inherited = cursor
+            var found = cursor
                 .GetProperties(PublicInstance | BindingFlags.DeclaredOnly)
                 .FirstOrDefault(property =>
                     string.Equals(property.Name, name, StringComparison.Ordinal)
                 );
-            if (inherited is not null)
+            if (found is not null)
             {
-                return inherited;
+                return found;
             }
         }
 

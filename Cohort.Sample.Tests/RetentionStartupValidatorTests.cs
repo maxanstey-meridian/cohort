@@ -1,3 +1,5 @@
+using System.ComponentModel.DataAnnotations.Schema;
+
 using Cohort.Application;
 using Cohort.Domain;
 using Cohort.Hosting;
@@ -69,7 +71,25 @@ public sealed class RetentionStartupValidatorTests
 
         var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
         exception.Which.Errors.Should().ContainSingle().Which.Should().Be(
-            $"Retention category 'identity' for entity {typeof(BlankErasureKindRecord).FullName} failed startup validation: Erasure subject kind cannot be blank. (Parameter 'kind')"
+            $"[ErasureSubject] on {typeof(BlankErasureKindRecord).FullName}.{nameof(BlankErasureKindRecord.SubjectId)}: the kind cannot be blank."
+        );
+    }
+
+    [Fact]
+    public async Task ValidateAsync_Reports_A_Bad_Erasure_Subject_Before_The_Entitys_Later_Checks()
+    {
+        var options = new DbContextOptionsBuilder<SubjectAndLaterFaultDbContext>()
+            .UseNpgsqlMetadataModel($"startup-validator-subject-first-{Guid.NewGuid()}")
+            .Options;
+        await using var db = new SubjectAndLaterFaultDbContext(options);
+
+        var act = async () =>
+            await CreateValidator(db, IdentityCategoryRepository()).ValidateAsync();
+
+        // The entity also has no tenant property, which the later checks would report.
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle().Which.Should().Be(
+            $"[ErasureSubject] on {typeof(SubjectAndLaterFaultRecord).FullName}.{nameof(SubjectAndLaterFaultRecord.SubjectId)}: property is not mapped by EF."
         );
     }
 
@@ -108,7 +128,6 @@ public sealed class RetentionStartupValidatorTests
                 new RetentionEntryBuilder(new CohortConventions()),
                 [],
                 new RetentionValidationState(),
-                new ErasureSubjectMetadataResolver(db),
                 new RetentionDependentsServiceRegistrations(new ServiceCollection())
             ).ValidateAsync();
 
@@ -146,7 +165,6 @@ public sealed class RetentionStartupValidatorTests
                 new RetentionEntryBuilder(new CohortConventions()),
                 [],
                 new RetentionValidationState(),
-                new ErasureSubjectMetadataResolver(db),
                 new RetentionDependentsServiceRegistrations(new ServiceCollection())
             ).ValidateAsync();
 
@@ -176,7 +194,6 @@ public sealed class RetentionStartupValidatorTests
                 new RetentionEntryBuilder(new CohortConventions()),
                 [],
                 new RetentionValidationState(),
-                new ErasureSubjectMetadataResolver(db),
                 new RetentionDependentsServiceRegistrations(new ServiceCollection())
             ).ValidateAsync();
 
@@ -434,7 +451,6 @@ public sealed class RetentionStartupValidatorTests
                 new RetentionEntryBuilder(new CohortConventions()),
                 [new TestAnonymiseValueFactory()],
                 new RetentionValidationState(),
-                new ErasureSubjectMetadataResolver(db),
                 new RetentionDependentsServiceRegistrations(new ServiceCollection())
             ).ValidateAsync();
 
@@ -781,7 +797,6 @@ public sealed class RetentionStartupValidatorTests
             new RetentionEntryBuilder(new CohortConventions()),
             [new GuidTombstoneFactory(), new OriginalValueTombstoneFactory()],
             new RetentionValidationState(),
-            new ErasureSubjectMetadataResolver(db),
             new RetentionDependentsServiceRegistrations(services ?? new ServiceCollection())
         );
     }
@@ -1377,6 +1392,30 @@ public sealed class RetentionStartupValidatorTests
         public Guid TenantId { get; init; }
 
         [ErasureSubject(" ")]
+        public Guid? SubjectId { get; init; }
+
+        public DateTimeOffset CreatedAt { get; init; }
+    }
+
+    private sealed class SubjectAndLaterFaultDbContext(
+        DbContextOptions<SubjectAndLaterFaultDbContext> options
+    ) : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.ConfigureCohortTables();
+            modelBuilder.Entity<SubjectAndLaterFaultRecord>().HasKey(record => record.Id);
+        }
+    }
+
+    [Retain("identity", nameof(CreatedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-0000000000e2")]
+    private sealed class SubjectAndLaterFaultRecord
+    {
+        public Guid Id { get; init; }
+
+        [ErasureSubject("user")]
+        [NotMapped]
         public Guid? SubjectId { get; init; }
 
         public DateTimeOffset CreatedAt { get; init; }

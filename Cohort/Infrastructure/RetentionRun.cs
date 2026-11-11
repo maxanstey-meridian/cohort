@@ -105,11 +105,6 @@ internal sealed class RetentionRun(
     /// </summary>
     public async Task ExecuteRefusalAsync(string machineCode, string reason, CancellationToken ct)
     {
-        if (callerCommit is not null)
-        {
-            throw new InvalidOperationException("A refused run is never part of the caller's transaction.");
-        }
-
         await RunLockedAsync(
             async () =>
             {
@@ -137,17 +132,11 @@ internal sealed class RetentionRun(
         await db.Database.OpenConnectionAsync(ct);
         var connection = db.Database.GetDbConnection();
         var locked = false;
-        Exception? primaryException = null;
         try
         {
             await RetentionRunAdvisoryLock.AcquireAsync(connection, RetentionRunAdvisoryLock.KeyFor(SweepId), ct);
             locked = true;
             await work();
-        }
-        catch (Exception ex)
-        {
-            primaryException = ex;
-            throw;
         }
         finally
         {
@@ -155,7 +144,6 @@ internal sealed class RetentionRun(
                 connection,
                 locked ? cleanupToken => RetentionRunAdvisoryLock.ReleaseAsync(connection, RetentionRunAdvisoryLock.KeyFor(SweepId), cleanupToken) : null,
                 _ => db.Database.CloseConnectionAsync(),
-                primaryException,
                 logger
             );
         }
@@ -201,7 +189,7 @@ internal sealed class RetentionRun(
     /// </summary>
     public async Task RunEntitiesAsync(
         IReadOnlyList<SweepScope> plan,
-        IReadOnlyDictionary<Strategy, SweepStrategy> strategies,
+        SweepStrategy strategy,
         IEnumerable<IRetentionDependentsRegistration> dependentsRegistrations,
         CancellationToken ct
     )
@@ -212,7 +200,7 @@ internal sealed class RetentionRun(
             dependentsRegistrations,
             ct
         );
-        foreach (var scope in RetentionExecutionPlanOrderer.Order(db, plan, scope => scope.Entry, logger))
+        foreach (var scope in RetentionExecutionPlanOrderer.Order(db, plan, scope => scope.Entry))
         {
             // In the caller's transaction a failed statement would abort everything after it,
             // so each entity runs under a savepoint and a failure undoes only that entity, as
@@ -228,11 +216,7 @@ internal sealed class RetentionRun(
 
             try
             {
-                await RunEntityAsync(
-                    scope.Rule.Strategy == Strategy.Exempt ? null : strategies[scope.Rule.Strategy],
-                    scope,
-                    ct
-                );
+                await RunEntityAsync(strategy, scope, ct);
                 if (callerTransaction is not null)
                 {
                     // Not cancellable: a cancelled RELEASE that took effect would leave the
@@ -286,7 +270,7 @@ internal sealed class RetentionRun(
 
     private long AffectedTotal => counts.Sum(count => count.Affected);
 
-    private async Task RunEntityAsync(SweepStrategy? strategy, SweepScope scope, CancellationToken ct)
+    private async Task RunEntityAsync(SweepStrategy strategy, SweepScope scope, CancellationToken ct)
     {
         var entry = scope.Entry;
         var rule = scope.Rule;
@@ -294,7 +278,7 @@ internal sealed class RetentionRun(
         var connection = db.Database.GetDbConnection();
         long affected = 0, skipped = 0, held = 0, nullAnchors = 0, retained = 0, deferred = 0, blocked = 0;
 
-        if (strategy is not null)
+        if (rule.Strategy != Strategy.Exempt)
         {
             if (started.DryRun)
             {
@@ -335,7 +319,7 @@ internal sealed class RetentionRun(
         else if (SweepStatements.CountsSubjectRows(scope))
         {
             // An Exempt rule keeps every one of the subject's rows from the erasure.
-            retained = await SweepStrategy.CountSubjectRowsAsync(scope, connection, ct);
+            retained = await strategy.CountSubjectRowsAsync(scope, connection, ct);
         }
 
         var count = new EntitySweepCount(entry.EntityType, entry.Category, scope.Tenant.Id, rule.Strategy, affected, held, skipped, nullAnchors, retained, deferred, blocked);
@@ -726,12 +710,15 @@ internal sealed class RetentionRun(
     /// run still settles. A success is <paramref name="fenced"/> like every other owned commit,
     /// so a run whose session was lost settles Failed instead of reporting success beside the
     /// owner that took its locks; Failed and Cancelled are never fenced, so a run can always
-    /// record that it stopped.
+    /// record that it stopped. The settle time is never earlier than the start time: a database
+    /// clock that stepped back meanwhile would otherwise give a negative duration, which neither
+    /// the event nor the ledger accepts, and the run would stay Started.
     /// </summary>
     private async Task SettleAsync(Func<DateTimeOffset, SweepEvent> terminal, bool fenced = false)
     {
         using var timeout = new CancellationTokenSource(AuditSettlementTimeout);
-        var at = await DatabaseClock.NowAsync(db, timeout.Token);
+        var clock = await DatabaseClock.NowAsync(db, timeout.Token);
+        var at = clock < started.At ? started.At : clock;
         var evt = terminal(at);
         if (fenced)
         {

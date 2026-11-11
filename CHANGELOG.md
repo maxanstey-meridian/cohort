@@ -137,6 +137,24 @@ Changed (breaking):
 - `AddRetentionDependents<TEntity, TStep>` has one overload, with
   `bool retiresReferencingRows = true`, in place of 0.11.0's: source still compiles, but a
   library built against 0.11.0 breaks at the binary level, so recompile it against 0.12.0.
+- `SweepEvent`'s records are positional, except `Started`. Only `Started` validates its
+  arguments: its sweep id, its trigger, and its erasure kind.
+- `EntitySweepCount.RetentionEntityId` is removed. Read `[RetentionEntityId]` from `EntityType`,
+  or take the id from `SweepEvent.EntitySummary`.
+- An `[ErasureSubject]` startup error reads `[ErasureSubject] on <entity>.<property>: …`,
+  without the "Retention category '<c>' for entity <entity> failed startup validation:" prefix.
+  Like the other errors in building an entity's mapping, it is reported before that entity's
+  other checks run.
+- The sweep logs under one category, `Cohort.Infrastructure.Sweep.SweepStrategy`, in place of
+  one per strategy.
+- The connection-cleanup log no longer says "after the primary operation failed".
+- The plan orderer no longer logs its own Error entry for entities it can't order. The
+  exception it throws is still logged by the run, and reported by startup.
+- A readiness refusal of the held-row guard's combined read is filed under "Across retained
+  entities", not repeated under each entity.
+- The missing-rule-provider error no longer says to register the provider before calling
+  `AddCohort`. It says to use `AddSingleton`, before or after `AddCohort`, and that a `TryAdd`
+  after `AddCohort` loses to Cohort's placeholder.
 
 Added:
 
@@ -167,6 +185,9 @@ Fixed:
   the commit; a context that doesn't retry behaves as before. A `Caller` erasure outside the
   strategy is refused with a message that says how to call it. An `IRetentionDeletion` callback
   is never re-run: a transient failure rolls the deletion back and reaches the caller.
+- A database clock that steps back during a run no longer leaves it `Started`: the run settles
+  with a zero duration.
+- A Cohort table role mapped twice now names the role.
 
 Upgrade: [Legal Holds](https://maxanstey-meridian.github.io/cohort/guides/legal-holds#upgrading-to-0-12-0),
 [Startup Validation](https://maxanstey-meridian.github.io/cohort/reference/startup-validation#upgrading-to-0-12-0),

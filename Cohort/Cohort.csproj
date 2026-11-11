@@ -21,9 +21,9 @@
         <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" />
         <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
         <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" />
-        <!-- Already a transitive dependency of every supported host (Cohort requires the Npgsql
-             EF Core provider); referenced directly for NpgsqlConnection.ClearPool, the only way
-             to keep a session that may still hold an advisory lock out of the pool. -->
+        <!-- Npgsql is referenced directly because Cohort uses its types: NpgsqlConnection.ClearPool
+             keeps a session that may still hold an advisory lock out of the pool, and the run and
+             readiness use PostgresException and Npgsql's connection, batch, and parameter types. -->
         <PackageReference Include="Npgsql" />
         <PackageReference Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" PrivateAssets="all" />
     </ItemGroup>

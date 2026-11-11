@@ -2,7 +2,6 @@ using Cohort.Application;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata;
-using Microsoft.Extensions.Logging;
 
 namespace Cohort.Infrastructure;
 
@@ -11,8 +10,7 @@ internal static class RetentionExecutionPlanOrderer
     internal static IReadOnlyList<TPlan> Order<TPlan>(
         DbContext db,
         IReadOnlyList<TPlan> plan,
-        Func<TPlan, RetentionEntry> entrySelector,
-        ILogger? logger = null
+        Func<TPlan, RetentionEntry> entrySelector
     )
     {
         if (plan.Count <= 1)
@@ -101,10 +99,6 @@ internal static class RetentionExecutionPlanOrderer
                 .Where(entityType => !resolved.Contains(entityType))
                 .ToArray();
 
-            logger?.LogError(
-                "Retention entities {UnresolvedEntities} cannot be ordered because their foreign-key graph contains a cycle.",
-                string.Join(", ", cycleMembers.Select(entityType => entityType.FullName))
-            );
             throw new RetentionConfigurationException([
                 $"Retained entities {string.Join(", ", cycleMembers.Select(entityType => entityType.FullName))} cannot be ordered because their foreign-key graph contains a cycle. Retained foreign-key cycles are not supported.",
             ]);

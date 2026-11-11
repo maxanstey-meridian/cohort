@@ -1,6 +1,5 @@
-#nullable enable
-
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Metadata.Builders;
 
 namespace Cohort.Infrastructure.Migrations;
@@ -37,7 +36,7 @@ public static class CohortModelBuilder
     )
     {
         EntityTypeBuilder builder;
-        var existing = TryFindEntityMappedToTable(modelBuilder, schema, table.Name);
+        var existing = TryFindEntityMappedToTable(modelBuilder, schema, table.Role);
 
         if (existing is not null)
         {
@@ -50,7 +49,7 @@ public static class CohortModelBuilder
         }
 
         builder.ToTable(
-            table.Name,
+            table.Role,
             schema,
             tableBuilder =>
             {
@@ -101,10 +100,7 @@ public static class CohortModelBuilder
             return;
         }
 
-        var entityType = TryFindEntityMappedToTable(modelBuilder, schema, table.Name)
-            ?? throw new InvalidOperationException(
-                $"Cohort could not resolve its mapped table '{schema}.{table.Name}'."
-            );
+        var entityType = FindEntityMappedToTable(modelBuilder, schema, table.Role);
         var builder = entityType.HasSharedClrType
             ? modelBuilder.SharedTypeEntity<Dictionary<string, object>>(entityType.Name)
             : modelBuilder.Entity(entityType.ClrType);
@@ -113,7 +109,7 @@ public static class CohortModelBuilder
         {
             builder
                 .HasOne(
-                    FindEntityMappedToTable(modelBuilder, schema, foreignKey.PrincipalTable),
+                    FindEntityMappedToTable(modelBuilder, schema, foreignKey.PrincipalTable).Name,
                     navigationName: null
                 )
                 .WithMany()
@@ -124,7 +120,7 @@ public static class CohortModelBuilder
     }
 
     private static void EnsureAdoptableKey(
-        Microsoft.EntityFrameworkCore.Metadata.IMutableEntityType existing,
+        IMutableEntityType existing,
         CohortSchemaContract.TableRequirement table
     )
     {
@@ -141,11 +137,11 @@ public static class CohortModelBuilder
         }
 
         throw new InvalidOperationException(
-            $"Entity {existing.ClrType.FullName} is mapped to table '{table.Name}', which Cohort manages, but its primary key ({string.Join(", ", keyNames)}) does not match the key Cohort expects ({string.Join(", ", table.PrimaryKey)}). This looks like a table-name collision rather than an intentional adoption; rename the entity's table, or map it with Cohort's key shape."
+            $"Entity {existing.ClrType.FullName} is mapped to table '{table.Role}', which Cohort manages, but its primary key ({string.Join(", ", keyNames)}) does not match the key Cohort expects ({string.Join(", ", table.PrimaryKey)}). This looks like a table-name collision rather than an intentional adoption; rename the entity's table, or map it with Cohort's key shape."
         );
     }
 
-    private static Microsoft.EntityFrameworkCore.Metadata.IMutableEntityType? TryFindEntityMappedToTable(
+    private static IMutableEntityType? TryFindEntityMappedToTable(
         ModelBuilder modelBuilder,
         string schema,
         string tableName
@@ -156,20 +152,20 @@ public static class CohortModelBuilder
             .FirstOrDefault(entityType =>
                 string.Equals(entityType.GetTableName(), tableName, StringComparison.Ordinal)
                 && string.Equals(
-                    entityType.GetSchema() ?? modelBuilder.Model.GetDefaultSchema() ?? "public",
+                    entityType.GetSchema() ?? "public",
                     schema,
                     StringComparison.Ordinal
                 )
             );
     }
 
-    private static string FindEntityMappedToTable(
+    private static IMutableEntityType FindEntityMappedToTable(
         ModelBuilder modelBuilder,
         string schema,
         string tableName
     )
     {
-        return TryFindEntityMappedToTable(modelBuilder, schema, tableName)?.Name
+        return TryFindEntityMappedToTable(modelBuilder, schema, tableName)
             ?? throw new InvalidOperationException(
                 $"Cohort could not resolve its mapped table '{schema}.{tableName}'."
             );

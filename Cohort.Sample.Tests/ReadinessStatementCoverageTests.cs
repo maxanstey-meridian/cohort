@@ -1150,11 +1150,7 @@ public sealed class ReadinessStatementCoverageTests(PostgresFixture fixture)
             .Where(statement => operationRoles.Contains(statement.Role))
             .Select(statement => statement.QueryId)
             .ToHashSet();
-        // The guard's attribution forms are explained so that a refusal names its entity, and
-        // no operation sends them.
-        foreach (var builder in enumerated
-            .Where(statement => statement.Name != "held-row-versions-of-entity")
-            .GroupBy(statement => statement.Name))
+        foreach (var builder in enumerated.GroupBy(statement => statement.Name))
         {
             // A builder counts as reached when the server recorded an execution with the query
             // id PostgreSQL gives its statement: the id tells a constant from a parameter, so

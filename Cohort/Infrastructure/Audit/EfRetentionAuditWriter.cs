@@ -23,8 +23,6 @@ internal sealed class EfRetentionAuditWriter(
 
     public Task WriteAsync(SweepEvent evt, CancellationToken ct)
     {
-        ArgumentNullException.ThrowIfNull(evt);
-
         return evt switch
         {
             SweepEvent.Started started => ExecuteAsync(StartedStatement(Tables, started), ct),
@@ -269,10 +267,6 @@ internal sealed class EfRetentionAuditWriter(
         );
     }
 
-    /// <summary>
-    /// Settles a Started run. A real run's total is the sum of its committed progress, so
-    /// only a dry run takes the event's total.
-    /// </summary>
     private async Task WriteTerminalAsync(
         Guid sweepId,
         SweepRunStatus status,

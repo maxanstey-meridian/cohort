@@ -47,7 +47,7 @@ public sealed class RegistryScanTests
             .Contain(kvp =>
                 kvp.Key == typeof(Note)
                 && kvp.Value.Category == "short-lived"
-                && kvp.Value.TableName == "notes"
+                && kvp.Value.Table.Name == "notes"
                 && kvp.Value.AnchorMember == nameof(Note.CreatedAt)
                 && kvp.Value.EntityType == typeof(Note)
             );
@@ -56,7 +56,7 @@ public sealed class RegistryScanTests
             .Contain(kvp =>
                 kvp.Key == typeof(SoftDeleteRecord)
                 && kvp.Value.Category == "soft-delete"
-                && kvp.Value.TableName == "soft_delete_records"
+                && kvp.Value.Table.Name == "soft_delete_records"
                 && kvp.Value.AnchorMember == nameof(SoftDeleteRecord.CreatedAt)
                 && kvp.Value.EntityType == typeof(SoftDeleteRecord)
             );
@@ -65,14 +65,14 @@ public sealed class RegistryScanTests
             .Contain(kvp =>
                 kvp.Key == typeof(AnonymisedContact)
                 && kvp.Value.Category == "anonymise"
-                && kvp.Value.TableName == "anonymised_contacts"
+                && kvp.Value.Table.Name == "anonymised_contacts"
                 && kvp.Value.AnchorMember == nameof(AnonymisedContact.CreatedAt)
                 && kvp.Value.EntityType == typeof(AnonymisedContact)
             );
         entries.Should().ContainKey(typeof(TombstoneRecord));
         var tombstoneEntry = entries[typeof(TombstoneRecord)];
         tombstoneEntry.Category.Should().Be("tombstone-anonymise");
-        tombstoneEntry.TableName.Should().Be("tombstone_records");
+        tombstoneEntry.Table.Name.Should().Be("tombstone_records");
         tombstoneEntry.AnchorMember.Should().Be(nameof(TombstoneRecord.CreatedAt));
         tombstoneEntry.EntityType.Should().Be(typeof(TombstoneRecord));
         tombstoneEntry.AnonymiseFields.Should().HaveCount(3);
@@ -96,7 +96,7 @@ public sealed class RegistryScanTests
             .Contain(kvp =>
                 kvp.Key == typeof(BlobBackedFile)
                 && kvp.Value.Category == "blob-cleanup"
-                && kvp.Value.TableName == "blob_backed_files"
+                && kvp.Value.Table.Name == "blob_backed_files"
                 && kvp.Value.AnchorMember == nameof(BlobBackedFile.CreatedAt)
                 && kvp.Value.EntityType == typeof(BlobBackedFile)
             );
@@ -136,7 +136,7 @@ public sealed class RegistryScanTests
             new RetentionEntryBuilder(new CohortConventions())
         ).Scan()[typeof(RetentionReadyRecord)];
 
-        entry.TableName.Should().Be("retention_ready_records");
+        entry.Table.Name.Should().Be("retention_ready_records");
         entry.AnchorMember.Should().Be(nameof(RetentionReadyRecord.RetainedAt));
         entry.AnchorColumn.Should().Be("retained_at_utc");
         entry
@@ -213,6 +213,23 @@ public sealed class RegistryScanTests
             .WithMessage(
                 $"[Anonymise] and [AnonymiseWith] on *{nameof(ConflictingAnonymiseMetadataRecord)}.{nameof(ConflictingAnonymiseMetadataRecord.ExternalId)}: exactly one is allowed per property."
             );
+    }
+
+    [Fact]
+    public void Scan_Reads_The_Models_Default_Schema_For_An_Entity_That_Declares_None()
+    {
+        var options = new DbContextOptionsBuilder<DefaultSchemaDbContext>()
+            .UseNpgsqlMetadataModel($"registry-default-schema-{Guid.NewGuid()}")
+            .Options;
+        using var db = new DefaultSchemaDbContext(options);
+
+        var entry = new RetentionRegistry(
+            db,
+            new RetentionEntryBuilder(new CohortConventions())
+        ).Scan()[typeof(DefaultSchemaRecord)];
+
+        entry.Table.Schema.Should().Be("host_data");
+        entry.Table.Name.Should().Be("default_schema_records");
     }
 
     [Fact]
@@ -378,6 +395,29 @@ public sealed class RegistryScanTests
         public DateTimeOffset RetainedAt { get; init; }
         public bool IsDeleted { get; init; }
         public DateTimeOffset? DeletedAt { get; init; }
+    }
+
+    [Retain("long-lived", nameof(DefaultSchemaRecord.RetainedAt))]
+    [RetentionEntityId("00000000-0000-0000-0001-000000000011")]
+    private sealed class DefaultSchemaRecord
+    {
+        public Guid Id { get; init; }
+        public DateTimeOffset RetainedAt { get; init; }
+    }
+
+    private sealed class DefaultSchemaDbContext(DbContextOptions<DefaultSchemaDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.HasDefaultSchema("host_data");
+            modelBuilder.ConfigureCohortTables();
+            modelBuilder.Entity<DefaultSchemaRecord>(entity =>
+            {
+                entity.ToTable("default_schema_records");
+                entity.HasKey(record => record.Id);
+            });
+        }
     }
 
     private sealed class RegistryMetadataDbContext(

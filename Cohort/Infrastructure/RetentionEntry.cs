@@ -15,13 +15,12 @@ internal sealed record RetentionEntry(
     IReadOnlyList<string> MaterializationColumns,
     TenantConvention? Tenant,
     SoftDeleteConvention? SoftDelete,
+    IReadOnlyDictionary<string, ErasureSubjectMetadata> ErasureSubjects,
     bool IsExplicitlyTenantless = false,
     AuditRowDetail AuditRowDetail = AuditRowDetail.Inherit,
     AnonymisedAtConvention? AnonymisedAt = null
 )
 {
-    internal string TableName => Table.Name;
-
     /// <summary>
     /// The chains of hold-relation hops from this entity up to each entity whose hold would cover
     /// it; empty when no <c>[HeldWith]</c> or <c>[HeldWithReferencing]</c> relation reaches it.

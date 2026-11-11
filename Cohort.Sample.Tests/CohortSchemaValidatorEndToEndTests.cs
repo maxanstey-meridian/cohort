@@ -138,6 +138,27 @@ public sealed class CohortSchemaValidatorEndToEndTests(PostgresFixture fixture) 
         ));
     }
 
+    [Fact]
+    public async Task Validation_Rejects_A_Partial_Unique_Index_Because_It_Constrains_Only_Some_Rows()
+    {
+        await ExecuteAsync("""
+            DROP INDEX "IX_sweep_run_row_detail_StableIdentity";
+            CREATE UNIQUE INDEX "IX_sweep_run_row_detail_StableIdentity" ON "sweep_run_row_detail"
+                ("SweepId", "RetentionEntityId", "RecordId", "Category", "Strategy", "TenantId")
+                WHERE "Failure" IS NULL;
+            """);
+        using var host = new CohortTestHost(connectionString);
+
+        var act = () => host.RunWithServicesAsync(serviceProvider =>
+            ValidateSchemaAsync(serviceProvider)
+        );
+
+        var exception = await act.Should().ThrowAsync<RetentionConfigurationException>();
+        exception.Which.Errors.Should().ContainSingle(error => error.Contains(
+            "index capability 'sweep_run_row_detail(SweepId, RetentionEntityId, RecordId, Category, Strategy, TenantId)'"
+        ));
+    }
+
     [Theory]
     [InlineData(
         "ALTER TABLE \"sweep_run\" DROP CONSTRAINT \"CK_sweep_run_Status_Range\"; ALTER TABLE \"sweep_run\" ADD CONSTRAINT \"CK_sweep_run_Status_Range\" CHECK (\"Status\" BETWEEN 0 AND 4) NOT VALID",

@@ -33,15 +33,16 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
                 : null;
             var transaction = contextTransaction.Commands ?? ownedTransaction;
             var tables = await ResolveTablesAsync(connection, transaction, storeTables, ct);
-            var columns = await ReadColumnsAsync(connection, transaction, tables.Values, ct);
-            var indexes = await ReadIndexesAsync(connection, transaction, tables.Values, ct);
+            var tableIds = tables.Values.Select(id => (long)id).ToArray();
+            var columns = await ReadColumnsAsync(connection, transaction, tableIds, ct);
+            var indexes = await ReadIndexesAsync(connection, transaction, tableIds, ct);
             var checkConstraints = await ReadCheckConstraintsAsync(
                 connection,
                 transaction,
-                tables.Values,
+                tableIds,
                 ct
             );
-            var foreignKeys = await ReadForeignKeysAsync(connection, transaction, tables.Values, ct);
+            var foreignKeys = await ReadForeignKeysAsync(connection, transaction, tableIds, ct);
             if (ownedTransaction is not null)
             {
                 await ownedTransaction.CommitAsync(ct);
@@ -230,9 +231,16 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
         CancellationToken ct
     )
     {
-        await using var command = connection.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = """
+        var mapped = CohortSchemaContract.Tables.Select(table => table.ResolveStoreTable(tables)).ToArray();
+        await using var command = new SqlParams
+        {
+            ["roles"] = CohortSchemaContract.TableNames.ToArray(),
+            ["schemas"] = mapped.Select(table => table.Schema).ToArray(),
+            ["tables"] = mapped.Select(table => table.Name).ToArray(),
+        }.CreateCommand(
+            connection,
+            transaction,
+            """
             /* cohort catalog */
             SELECT requested.role, relation.oid
             FROM ROWS FROM (
@@ -246,17 +254,14 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
               ON relation.relnamespace = namespace.oid
              AND relation.relname = requested.table_name
              AND relation.relkind IN ('r', 'p')
-            """;
-        AddTablesParameters(command, tables);
+            """
+        );
 
         var result = new Dictionary<string, uint>(StringComparer.Ordinal);
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
         {
-            if (!reader.IsDBNull(1))
-            {
-                result.Add(reader.GetString(0), reader.GetFieldValue<uint>(1));
-            }
+            result.Add(reader.GetString(0), reader.GetFieldValue<uint>(1));
         }
 
         return result;
@@ -265,13 +270,14 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
     private static async Task<Dictionary<(uint TableId, string Column), ColumnStructure>> ReadColumnsAsync(
         DbConnection connection,
         DbTransaction? transaction,
-        IEnumerable<uint> tableIds,
+        long[] tableIds,
         CancellationToken ct
     )
     {
-        await using var command = connection.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = """
+        await using var command = new SqlParams { ["tableIds"] = tableIds }.CreateCommand(
+            connection,
+            transaction,
+            """
             /* cohort catalog */
             SELECT attrelid, attname, typname, atttypmod, NOT attnotnull,
                    attidentity <> '' OR COALESCE(
@@ -288,8 +294,8 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
                 FROM pg_catalog.unnest(@tableIds) AS value
             ))
               AND attnum > 0 AND NOT attisdropped
-            """;
-        AddTableIdsParameter(command, tableIds);
+            """
+        );
 
         var result = new Dictionary<(uint, string), ColumnStructure>();
         await using var reader = await command.ExecuteReaderAsync(ct);
@@ -313,13 +319,14 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
     private static async Task<List<IndexStructure>> ReadIndexesAsync(
         DbConnection connection,
         DbTransaction? transaction,
-        IEnumerable<uint> tableIds,
+        long[] tableIds,
         CancellationToken ct
     )
     {
-        await using var command = connection.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = """
+        await using var command = new SqlParams { ["tableIds"] = tableIds }.CreateCommand(
+            connection,
+            transaction,
+            """
             /* cohort catalog */
             SELECT i.indrelid, i.indisunique, i.indisprimary, i.indimmediate,
                    -- An expression key (attnum 0) reads as NULL, so it still occupies its position.
@@ -335,8 +342,8 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
                 FROM pg_catalog.unnest(@tableIds) AS value
             ))
               AND i.indisvalid AND i.indisready
-            """;
-        AddTableIdsParameter(command, tableIds);
+            """
+        );
 
         var result = new List<IndexStructure>();
         await using var reader = await command.ExecuteReaderAsync(ct);
@@ -358,13 +365,14 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
     private static async Task<List<CheckConstraintStructure>> ReadCheckConstraintsAsync(
         DbConnection connection,
         DbTransaction? transaction,
-        IEnumerable<uint> tableIds,
+        long[] tableIds,
         CancellationToken ct
     )
     {
-        await using var command = connection.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = """
+        await using var command = new SqlParams { ["tableIds"] = tableIds }.CreateCommand(
+            connection,
+            transaction,
+            """
             /* cohort catalog */
             SELECT conrelid, conname, convalidated
             FROM pg_catalog.pg_constraint
@@ -373,8 +381,8 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
                   SELECT value::pg_catalog.oid
                   FROM pg_catalog.unnest(@tableIds) AS value
               ))
-            """;
-        AddTableIdsParameter(command, tableIds);
+            """
+        );
 
         var result = new List<CheckConstraintStructure>();
         await using var reader = await command.ExecuteReaderAsync(ct);
@@ -393,13 +401,14 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
     private static async Task<List<ForeignKeyStructure>> ReadForeignKeysAsync(
         DbConnection connection,
         DbTransaction? transaction,
-        IEnumerable<uint> tableIds,
+        long[] tableIds,
         CancellationToken ct
     )
     {
-        await using var command = connection.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = """
+        await using var command = new SqlParams { ["tableIds"] = tableIds }.CreateCommand(
+            connection,
+            transaction,
+            """
             /* cohort catalog */
             SELECT c.conrelid,
                    ARRAY(SELECT a.attname FROM pg_catalog.unnest(c.conkey) WITH ORDINALITY AS key(attnum, position)
@@ -416,8 +425,8 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
                   SELECT value::pg_catalog.oid
                   FROM pg_catalog.unnest(@tableIds) AS value
               ))
-            """;
-        AddTableIdsParameter(command, tableIds);
+            """
+        );
 
         var result = new List<ForeignKeyStructure>();
         await using var reader = await command.ExecuteReaderAsync(ct);
@@ -434,32 +443,6 @@ internal sealed class CohortSchemaValidator(ILogger<CohortSchemaValidator> logge
         }
 
         return result;
-    }
-
-    private static void AddTablesParameters(DbCommand command, CohortStoreTables tables)
-    {
-        var mapped = CohortSchemaContract.Tables
-            .Select(table => (table.Role, Table: table.ResolveStoreTable(tables)))
-            .ToArray();
-        AddArrayParameter(command, "roles", mapped.Select(table => table.Role).ToArray());
-        AddArrayParameter(command, "schemas", mapped.Select(table => table.Table.Schema).ToArray());
-        AddArrayParameter(command, "tables", mapped.Select(table => table.Table.Name).ToArray());
-    }
-
-    private static void AddArrayParameter(DbCommand command, string name, string[] values)
-    {
-        var parameter = command.CreateParameter();
-        parameter.ParameterName = name;
-        parameter.Value = values;
-        command.Parameters.Add(parameter);
-    }
-
-    private static void AddTableIdsParameter(DbCommand command, IEnumerable<uint> tableIds)
-    {
-        var parameter = command.CreateParameter();
-        parameter.ParameterName = "tableIds";
-        parameter.Value = tableIds.Select(id => (long)id).ToArray();
-        command.Parameters.Add(parameter);
     }
 
     private static bool IsCompatibleType(string required, ColumnStructure actual)

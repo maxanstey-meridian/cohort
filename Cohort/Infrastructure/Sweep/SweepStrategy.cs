@@ -17,20 +17,21 @@ namespace Cohort.Infrastructure.Sweep;
 
 /// <summary>
 /// The one SQL pipeline behind every strategy. A <see cref="SweepScope"/> says which rows
-/// are in play; <see cref="SweepEligibilitySql"/> says which of those the strategy has not
-/// yet handled, and the strategy says how it changes one (<see cref="CreateMutation"/>).
+/// are in play and under which strategy; <see cref="SweepEligibilitySql"/> says which of those
+/// the strategy has not yet handled, and <see cref="CreateMutation"/> says how it changes one.
 /// Candidates are discovered, entity-locked and row-locked, then mutated in one statement,
 /// or row by row when a dependents step runs or the new values depend on each row.
 /// A row an integrity constraint refuses is blocked rather than failing its batch: the bulk
 /// statement is bisected under savepoints to find it, and on the row-by-row path each row's
 /// change has its own savepoint, which its dependents step shares.
 /// </summary>
-internal abstract class SweepStrategy(
-    DbContext db,
+internal sealed class SweepStrategy(
+    [FromKeyedServices(CohortServiceKeys.DbContext)] DbContext db,
+    AnonymiseAssignmentResolver assignments,
     IEnumerable<IRetentionDependentsRegistration> dependentsRegistrations,
     RetentionHoldGuard holdGuard,
     IServiceScopeFactory scopeFactory,
-    ILogger logger
+    ILogger<SweepStrategy> logger
 )
 {
     private const string MutationSavepoint = "cohort_mutation";
@@ -41,23 +42,54 @@ internal abstract class SweepStrategy(
     )!;
     private static readonly ConcurrentDictionary<Type, MethodInfo> RowByRowMethods = new();
 
-    public abstract Strategy HandlesStrategy { get; }
+    /// <summary>
+    /// The values the scope's strategy binds into its statement head, and whether they depend on
+    /// each row. <see cref="SweepStatements.HeadSql"/> holds the text. An Exempt rule changes no
+    /// row, so it never reaches here.
+    /// </summary>
+    private SweepMutation CreateMutation(SweepScope scope)
+    {
+        var entry = scope.Entry;
+        switch (scope.Rule.Strategy)
+        {
+            case Strategy.Purge:
+                return new(static (_, _) => { });
+            case Strategy.SoftDelete:
+                var softDelete = entry.SoftDelete!;
+                if (softDelete.DeletedAtColumn is null)
+                {
+                    return new(static (_, _) => { });
+                }
 
-    protected abstract SweepMutation CreateMutation(SweepScope scope);
-
-    /// <summary>Rejects entries this strategy cannot act on.</summary>
-    protected virtual void Validate(RetentionEntry entry) { }
+                var deletedAt = SweepStatements.DeletedAtValue(entry, softDelete, scope.Now);
+                return new((parameters, _) => parameters["deletedAt"] = deletedAt);
+            case Strategy.Anonymise:
+                var staticValues = assignments.CreateStaticAssignments(entry, scope.Tenant.Id, scope.Now);
+                return new SweepMutation(
+                    (parameters, row) =>
+                    {
+                        var values = row is null
+                            ? assignments.ToProviderValues(entry, staticValues)
+                            : assignments.CreatePerRowAssignmentValues(entry, scope.Tenant, scope.Now, row, staticValues);
+                        for (var index = 0; index < values.Count; index++)
+                        {
+                            parameters[$"value{index}"] = values[index];
+                        }
+                        parameters["anonymisedAt"] = scope.Now;
+                    },
+                    RowByRow: assignments.RequiresPerRowExecution(entry)
+                );
+            default:
+                throw new ArgumentOutOfRangeException(nameof(scope), scope.Rule.Strategy, null);
+        }
+    }
 
     public async Task<long> CountAsync(
         SweepScope scope,
         SweepCount count,
         DbConnection conn,
         CancellationToken ct
-    )
-    {
-        EnsureHandles(scope);
-        return await ExecuteCountAsync(SweepStatements.CountByAnchor(scope, HandlesStrategy, count), conn, ct);
-    }
+    ) => await ExecuteCountAsync(SweepStatements.CountByAnchor(scope, count), conn, ct);
 
     /// <summary>
     /// What a dry run or a preview predicts, in one statement
@@ -67,16 +99,7 @@ internal abstract class SweepStrategy(
         SweepScope scope,
         DbConnection conn,
         CancellationToken ct
-    )
-    {
-        EnsureHandles(scope);
-
-        var statement = SweepStatements.CountPredicted(scope, HandlesStrategy);
-        await using var command = statement.Parameters.CreateCommand(conn, null, statement.Sql);
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        await reader.ReadAsync(ct);
-        return (reader.GetInt64(0), reader.GetInt64(1), reader.GetInt64(2));
-    }
+    ) => await ReadThreeCountsAsync(SweepStatements.CountPredicted(scope), conn, ct);
 
     /// <summary>
     /// What is left once run <paramref name="sweepId"/> has finished its batches for the
@@ -89,39 +112,36 @@ internal abstract class SweepStrategy(
         IReadOnlyCollection<string> refused,
         DbConnection conn,
         CancellationToken ct
-    )
-    {
-        EnsureHandles(scope);
-
-        var hasRefused = SweepStatements.HasRefusedIds(refused);
-        var statement = SweepStatements.CountLeft(
-            scope,
-            HandlesStrategy,
-            sweepId,
-            hasRefused,
-            hasRefused ? refused.ToArray() : null
+    ) =>
+        await ReadThreeCountsAsync(
+            SweepStatements.CountLeft(scope, sweepId, refused.Count > 0 ? refused.ToArray() : null),
+            conn,
+            ct
         );
-        await using var command = statement.Parameters.CreateCommand(conn, null, statement.Sql);
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        await reader.ReadAsync(ct);
-        return (reader.GetInt64(0), reader.GetInt64(1), reader.GetInt64(2));
-    }
 
     /// <summary>
     /// Every row of the scope's subject in its tenant, with no cutoff, eligibility or hold
-    /// filter: what an Exempt rule keeps from an erasure. Static because Exempt has no
-    /// strategy instance.
+    /// filter: what an Exempt rule keeps from an erasure.
     /// </summary>
-    internal static async Task<long> CountSubjectRowsAsync(
-        SweepScope scope,
-        DbConnection conn,
-        CancellationToken ct
-    ) => await ExecuteCountAsync(SweepStatements.CountSubjectRows(scope), conn, ct);
+    public async Task<long> CountSubjectRowsAsync(SweepScope scope, DbConnection conn, CancellationToken ct) =>
+        await ExecuteCountAsync(SweepStatements.CountSubjectRows(scope), conn, ct);
 
     private static async Task<long> ExecuteCountAsync(SweepStatement statement, DbConnection conn, CancellationToken ct)
     {
         await using var command = statement.Parameters.CreateCommand(conn, null, statement.Sql);
         return (long)(await command.ExecuteScalarAsync(ct))!;
+    }
+
+    private static async Task<(long, long, long)> ReadThreeCountsAsync(
+        SweepStatement statement,
+        DbConnection conn,
+        CancellationToken ct
+    )
+    {
+        await using var command = statement.Parameters.CreateCommand(conn, null, statement.Sql);
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        await reader.ReadAsync(ct);
+        return (reader.GetInt64(0), reader.GetInt64(1), reader.GetInt64(2));
     }
 
     public async Task<SweepExecutionResult> ExecuteAsync(
@@ -132,8 +152,6 @@ internal abstract class SweepStrategy(
         CancellationToken ct
     )
     {
-        EnsureHandles(scope);
-
         var (candidates, reached) = await LockCandidatesAsync(scope, conn, transaction, execution, ct);
         var result = candidates.Count == 0
             ? new SweepExecutionResult([])
@@ -152,7 +170,7 @@ internal abstract class SweepStrategy(
     {
         var mutation = CreateMutation(scope);
         var registration = dependentsRegistrations.StepFor(scope.Entry.EntityType);
-        var rowByRow = SweepStatements.TakesRowByRowPath(HandlesStrategy, registration is not null, mutation.RowByRow);
+        var rowByRow = SweepStatements.TakesRowByRowPath(scope.Rule.Strategy, registration is not null, mutation.RowByRow);
         if (registration is null)
         {
             return await MutateAsync(scope, conn, transaction, candidates, mutation, rowByRow, stepScope: null, execution, ct);
@@ -277,7 +295,7 @@ internal abstract class SweepStrategy(
     {
         var headParameters = new SqlParams();
         mutation.AddParameters(headParameters, null);
-        var statement = SweepStatements.MutateBatch(scope, HandlesStrategy, headParameters, recordIds.ToArray());
+        var statement = SweepStatements.MutateBatch(scope, headParameters, recordIds.ToArray());
         await using var command = statement.Parameters.CreateCommand(conn, transaction, statement.Sql);
 
         // Cohort's own savepoints ignore cancellation, like the entity savepoint: a cancelled
@@ -321,7 +339,7 @@ internal abstract class SweepStrategy(
         where TEntity : class
     {
         var entry = scope.Entry;
-        var load = SweepStatements.LoadRows(scope, HandlesStrategy, candidates.ToArray());
+        var load = SweepStatements.LoadRows(scope, candidates.ToArray());
         var rows = await db.Set<TEntity>()
             .FromSqlRaw(load.Sql, load.Parameters.ToDbParameters(conn))
             .IgnoreQueryFilters()
@@ -346,7 +364,7 @@ internal abstract class SweepStrategy(
 
             var headParameters = new SqlParams();
             mutation.AddParameters(headParameters, row);
-            var update = SweepStatements.MutateRow(scope, HandlesStrategy, headParameters, recordKey);
+            var update = SweepStatements.MutateRow(scope, headParameters, recordKey);
             await using var command = update.Parameters.CreateCommand(conn, transaction, update.Sql);
 
             // One savepoint for the step and the mutation: whatever undoes one undoes both, so
@@ -366,7 +384,7 @@ internal abstract class SweepStrategy(
                     transaction,
                     stepScope.Db,
                     stepScope.Dependents,
-                    (TEntity)row,
+                    row,
                     dependents,
                     execution,
                     ct
@@ -543,7 +561,7 @@ internal abstract class SweepStrategy(
         CancellationToken ct
     )
     {
-        var statement = SweepStatements.IsStillDue(scope, HandlesStrategy, recordKey);
+        var statement = SweepStatements.IsStillDue(scope, recordKey);
         await using var command = statement.Parameters.CreateCommand(conn, transaction, statement.Sql);
         return await command.ExecuteScalarAsync(ct) is true;
     }
@@ -625,7 +643,7 @@ internal abstract class SweepStrategy(
                 discovered,
                 ct
             );
-            var statement = SweepStatements.LockCandidates(scope, HandlesStrategy, discovered.ToArray());
+            var statement = SweepStatements.LockCandidates(scope, discovered.ToArray());
             await using var command = statement.Parameters.CreateCommand(conn, transaction, statement.Sql);
             locked.AddRange(await ReadRecordIdsAsync(command, ct));
             if (discovered.Count < limit)
@@ -654,7 +672,6 @@ internal abstract class SweepStrategy(
     {
         var statement = SweepStatements.Discover(
             scope,
-            HandlesStrategy,
             sweepId,
             limit,
             SweepStatements.CursorKindOf(after),
@@ -673,18 +690,6 @@ internal abstract class SweepStrategy(
         }
 
         return (recordIds, last);
-    }
-
-    private void EnsureHandles(SweepScope scope)
-    {
-        if (scope.Rule.Strategy != HandlesStrategy)
-        {
-            throw new InvalidOperationException(
-                $"{GetType().Name} cannot execute {scope.Rule.Strategy} rules."
-            );
-        }
-
-        Validate(scope.Entry);
     }
 
     private static async Task<List<string>> ReadRecordIdsAsync(DbCommand command, CancellationToken ct)

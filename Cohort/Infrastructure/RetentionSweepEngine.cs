@@ -15,16 +15,13 @@ internal sealed class RetentionSweepEngine(
     IRetentionRuleProvider ruleProvider,
     RetentionRuntimeReadinessValidator readinessValidator,
     EfRetentionAuditWriter auditWriter,
-    IEnumerable<SweepStrategy> sweepStrategies,
+    SweepStrategy strategy,
     IEnumerable<IRetentionDependentsRegistration> dependentsRegistrations,
     IRetentionExecutionSettings options,
     RetentionAuditNotifier auditNotifier,
     ILogger<RetentionSweepEngine> logger
 )
 {
-    private readonly IReadOnlyDictionary<Strategy, SweepStrategy> strategies =
-        sweepStrategies.ToDictionary(strategy => strategy.HandlesStrategy);
-
     /// <summary>
     /// Runs one audited, <see cref="SweepTriggerKind.Manual"/> sweep over the scope's entities.
     /// A dry run counts what a sweep would change and writes the same audit trail without
@@ -35,13 +32,12 @@ internal sealed class RetentionSweepEngine(
     public async Task<RetentionSweepResult> RunAsync(
         TenantContext tenant,
         DateTimeOffset? at,
-        SweepEntityScope scope,
         bool dryRun,
         CancellationToken ct = default
     )
     {
         await readinessValidator.ValidateAsync(ct);
-        return await RunSweepAsync(tenant, at, SweepTriggerKind.Manual, scope, dryRun, passLockKey: null, ct);
+        return await RunSweepAsync(tenant, at, SweepTriggerKind.Manual, dryRun, passLockKey: null, ct);
     }
 
     /// <summary>
@@ -53,7 +49,6 @@ internal sealed class RetentionSweepEngine(
     /// </summary>
     public async Task<(ScheduledPassOutcome Outcome, RetentionSweepResult? Result)> RunScheduledPassAsync(
         TenantContext tenant,
-        SweepEntityScope scope,
         ScheduledPass pass,
         CancellationToken ct
     )
@@ -61,7 +56,7 @@ internal sealed class RetentionSweepEngine(
         RetentionSweepResult? result = null;
         var outcome = await RunUnderPassLockAsync(
             pass,
-            async passLockKey => result = await RunSweepAsync(tenant, null, SweepTriggerKind.Scheduled, scope, pass.DryRun, passLockKey, ct),
+            async passLockKey => result = await RunSweepAsync(tenant, null, SweepTriggerKind.Scheduled, pass.DryRun, passLockKey, ct),
             ct
         );
         return (outcome, result);
@@ -96,7 +91,6 @@ internal sealed class RetentionSweepEngine(
         TenantContext tenant,
         DateTimeOffset? at,
         SweepTriggerKind trigger,
-        SweepEntityScope scope,
         bool dryRun,
         long? passLockKey,
         CancellationToken ct
@@ -105,7 +99,7 @@ internal sealed class RetentionSweepEngine(
         var (now, startedAt) = await DatabaseClock.ResolveRunTimeAsync(db, at, dryRun, ct);
         var run = CreateRun(new SweepEvent.Started(Guid.NewGuid(), startedAt, trigger, dryRun, tenant.Id), passLockKey);
         await run.ExecuteAsync(
-            async () => await run.RunEntitiesAsync(await BuildExecutionPlanAsync(tenant, now, scope, run, ct), strategies, dependentsRegistrations, ct),
+            async () => await run.RunEntitiesAsync(await BuildExecutionPlanAsync(tenant, now, run, ct), strategy, dependentsRegistrations, ct),
             ct
         );
         return run.CreateSweepResult();
@@ -134,7 +128,6 @@ internal sealed class RetentionSweepEngine(
         await db.Database.OpenConnectionAsync(ct);
         var connection = db.Database.GetDbConnection();
         var locked = false;
-        Exception? primaryException = null;
         try
         {
             // Not cancellable: a try never waits, and a cancelled command the server granted
@@ -161,18 +154,12 @@ internal sealed class RetentionSweepEngine(
             await run(passLockKey);
             return ScheduledPassOutcome.Ran;
         }
-        catch (Exception ex)
-        {
-            primaryException = ex;
-            throw;
-        }
         finally
         {
             await OperationalConnectionCleanup.RunAsync(
                 connection,
                 locked ? cleanupToken => RetentionRunAdvisoryLock.ReleaseAsync(connection, passLockKey, cleanupToken) : null,
                 _ => db.Database.CloseConnectionAsync(),
-                primaryException,
                 logger
             );
         }
@@ -181,13 +168,13 @@ internal sealed class RetentionSweepEngine(
     private async Task<IReadOnlyList<SweepScope>> BuildExecutionPlanAsync(
         TenantContext tenant,
         DateTimeOffset now,
-        SweepEntityScope scope,
         RetentionRun run,
         CancellationToken ct
     )
     {
         var plan = new List<SweepScope>();
         var timeZone = options.TimeZone;
+        var scope = SweepEntityScopes.For(tenant);
         foreach (var entry in registry.Scan().Values)
         {
             if (!scope.Includes(entry))
@@ -240,8 +227,8 @@ internal enum ScheduledPassOutcome
 }
 
 /// <summary>
-/// Which retained entities a sweep covers. Every internal caller must choose explicitly
-/// so tenantless rows cannot be swept as an accidental side effect of a tenanted pass.
+/// Which retained entities a run covers, so tenantless rows cannot be swept as a side effect
+/// of a tenanted pass. A run derives it from its tenant (<see cref="SweepEntityScopes.For"/>).
 /// </summary>
 internal enum SweepEntityScope
 {

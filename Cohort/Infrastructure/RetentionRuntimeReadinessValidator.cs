@@ -759,7 +759,7 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 ["schemas"] = inputs.Select(input => input.Table.Schema).ToArray(),
                 ["tables"] = inputs.Select(input => input.Table.Name).ToArray(),
                 ["columns"] = inputs.Select(input => input.Column).ToArray(),
-                ["base_types"] = inputs.Select(input => input.ExpectedType?.BaseType).ToArray(),
+                ["base_types"] = inputs.Select(input => input.MustBeTimestamptz ? "timestamptz" : null).ToArray(),
                 ["nullability"] = inputs.Select(input => input.Nullability).ToArray(),
                 ["written"] = inputs.Select(input => input.Strategy is not null).ToArray(),
                 ["session_text"] = inputs.Select(input => input.Kind == RetainedColumnKind.RecordId).ToArray(),
@@ -896,9 +896,8 @@ internal sealed class RetentionRuntimeReadinessValidator(
 
                     if (reader.GetBoolean(1))
                     {
-                        var expected = input.ExpectedType!;
                         errors.Add(
-                            $"{head} {input.KindText} member {input.Member} names column {column}, which is {reader.GetString(2)} in the database, not {expected.Display}, so {expected.Consequence}. Migrate the column to {expected.Display}."
+                            $"{head} {input.KindText} member {input.Member} names column {column}, which is {reader.GetString(2)} in the database, not timestamp with time zone, so every run would fail or, for timestamp without time zone, silently drift with the session TimeZone. Migrate the column to timestamp with time zone."
                         );
                     }
 
@@ -1046,14 +1045,8 @@ internal sealed class RetentionRuntimeReadinessValidator(
         // Only the timestamp columns have a type rule left: PostgreSQL compares or assigns a
         // timestamp without time zone through a cross-type operator, so the statements check
         // passes it. The other columns' types are the statements check's.
-        internal ExpectedColumnType? ExpectedType =>
-            Kind is RetainedColumnKind.Anchor or RetainedColumnKind.DeletedAt or RetainedColumnKind.AnonymisedAt
-                ? new(
-                    "timestamptz",
-                    "timestamp with time zone",
-                    "every run would fail or, for timestamp without time zone, silently drift with the session TimeZone"
-                )
-                : null;
+        internal bool MustBeTimestamptz =>
+            Kind is RetainedColumnKind.Anchor or RetainedColumnKind.DeletedAt or RetainedColumnKind.AnonymisedAt;
 
         // A tenant column or a soft-delete flag must be NOT NULL (a NULL one is never matched);
         // the anonymised-at marker must be nullable (IS NULL never matches a NOT NULL column).
@@ -1065,9 +1058,6 @@ internal sealed class RetentionRuntimeReadinessValidator(
                 _ => "",
             };
     }
-
-    // BaseType is the pg_catalog type name (typname) the column must be built on.
-    private sealed record ExpectedColumnType(string BaseType, string Display, string Consequence);
 
     private static string TargetDescription(RetentionEntry entry, AnonymiseField field) =>
         $"Anonymise convention on {entry.EntityType.FullName}: {(field is AnonymiseFactoryField ? "[AnonymiseWith]" : "[Anonymise]")} member {field.MemberName} writes column {PostgreSqlIdentifier.Format(entry.Table)}.{PostgreSqlIdentifier.Quote(field.ColumnName)}";

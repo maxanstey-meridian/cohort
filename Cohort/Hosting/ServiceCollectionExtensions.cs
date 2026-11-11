@@ -69,15 +69,7 @@ public static class ServiceCollectionExtensions
         services.TryAddScoped<IRetentionHoldsRepository, EfRetentionHoldsRepository>();
         services.TryAddScoped<RetentionHoldGuard>();
         services.TryAddScoped<IRetentionDeletion, EfRetentionDeletion>();
-        services.TryAddEnumerable(
-            ServiceDescriptor.Scoped<SweepStrategy, PurgeSweepStrategy>()
-        );
-        services.TryAddEnumerable(
-            ServiceDescriptor.Scoped<SweepStrategy, SoftDeleteSweepStrategy>()
-        );
-        services.TryAddEnumerable(
-            ServiceDescriptor.Scoped<SweepStrategy, AnonymiseSweepStrategy>()
-        );
+        services.TryAddScoped<SweepStrategy>();
         services.TryAddScoped<RetentionPreviewService>();
         services.TryAddSingleton<IRetentionPreview, ScopeOwnedRetentionPreview>();
         services.TryAddScoped<RetentionErasureService>();
@@ -93,7 +85,6 @@ public static class ServiceCollectionExtensions
             ServiceLifetime.Singleton
         );
         services.TryAddScoped<RetentionRegistry>();
-        services.TryAddScoped<ErasureSubjectMetadataResolver>();
         services.TryAddSingleton<RetentionValidationState>();
         // The collection itself, read when Cohort validates: AddRetentionDependents and the
         // host's own step registrations may come after AddCohort.
@@ -214,8 +205,9 @@ public static class ServiceCollectionExtensions
         {
             throw new InvalidOperationException(
                 $"No IRetentionRuleProvider has been registered. "
-                    + $"Register one before calling AddCohort<TContext>() via "
-                    + $"services.AddSingleton<IRetentionRuleProvider, YourProvider>(). "
+                    + $"Register one with services.AddSingleton<IRetentionRuleProvider, YourProvider>(), "
+                    + $"before or after AddCohort<TContext>(). "
+                    + $"A TryAdd registration after AddCohort loses to Cohort's placeholder. "
                     + $"(Attempted to resolve category '{category}'.)"
             );
         }

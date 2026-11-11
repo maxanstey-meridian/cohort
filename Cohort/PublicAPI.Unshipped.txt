@@ -39,6 +39,7 @@
 *REMOVED*Cohort.Domain.RetentionBeforeContext.Strategy.get -> Cohort.Domain.Strategy
 *REMOVED*Cohort.Domain.RetentionBeforeContext.SweepId.get -> System.Guid
 *REMOVED*Cohort.Domain.RetentionBeforeContext.TenantId.get -> System.Guid
+*REMOVED*Cohort.Domain.EntitySweepCount.RetentionEntityId.get -> System.Guid
 *REMOVED*Cohort.Domain.RowHandlerPriorityAttribute
 *REMOVED*Cohort.Domain.RowHandlerPriorityAttribute.Priority.get -> int
 *REMOVED*Cohort.Domain.RowHandlerPriorityAttribute.RowHandlerPriorityAttribute(int priority) -> void
@@ -79,4 +80,52 @@ Cohort.Application.IRetentionRunRecovery.RecoverAsync(System.Threading.Cancellat
 Cohort.Application.RetentionSystemWork.Recovery = 3 -> Cohort.Application.RetentionSystemWork
 Cohort.Hosting.CohortOptions.SweepSettleTimeout.get -> System.TimeSpan
 Cohort.Hosting.CohortOptions.SweepSettleTimeout.init -> void
+Cohort.Application.SweepEvent.Cancelled.Deconstruct(out System.Guid SweepId, out System.DateTimeOffset At, out string! Error, out System.TimeSpan Duration, out long TotalAffected) -> void
+Cohort.Application.SweepEvent.Cancelled.Duration.init -> void
+Cohort.Application.SweepEvent.Cancelled.Error.init -> void
+Cohort.Application.SweepEvent.Cancelled.TotalAffected.init -> void
+Cohort.Application.SweepEvent.Completed.Deconstruct(out System.Guid SweepId, out System.DateTimeOffset At, out System.TimeSpan Duration, out long TotalAffected) -> void
+Cohort.Application.SweepEvent.Completed.Duration.init -> void
+Cohort.Application.SweepEvent.Completed.TotalAffected.init -> void
+Cohort.Application.SweepEvent.EntityProgress.Affected.init -> void
+Cohort.Application.SweepEvent.EntityProgress.BlockedCount.init -> void
+Cohort.Application.SweepEvent.EntityProgress.Category.init -> void
+Cohort.Application.SweepEvent.EntityProgress.Deconstruct(out System.Guid SweepId, out System.DateTimeOffset At, out System.Type! EntityType, out System.Guid RetentionEntityId, out string! Category, out System.Guid TenantId, out Cohort.Domain.Strategy Strategy, out Cohort.Domain.RetentionPeriod! ResolvedPeriod, out long Affected, out long SkippedCount, out long BlockedCount, out Cohort.Domain.RetentionRuleProvenance? Provenance) -> void
+Cohort.Application.SweepEvent.EntityProgress.EntityType.init -> void
+Cohort.Application.SweepEvent.EntityProgress.Provenance.init -> void
+Cohort.Application.SweepEvent.EntityProgress.ResolvedPeriod.init -> void
+Cohort.Application.SweepEvent.EntityProgress.RetentionEntityId.init -> void
+Cohort.Application.SweepEvent.EntityProgress.SkippedCount.init -> void
+Cohort.Application.SweepEvent.EntityProgress.Strategy.init -> void
+Cohort.Application.SweepEvent.EntityProgress.TenantId.init -> void
+Cohort.Application.SweepEvent.EntitySummary.Affected.init -> void
+Cohort.Application.SweepEvent.EntitySummary.BlockedCount.init -> void
+Cohort.Application.SweepEvent.EntitySummary.Category.init -> void
+Cohort.Application.SweepEvent.EntitySummary.Deconstruct(out System.Guid SweepId, out System.DateTimeOffset At, out System.Type! EntityType, out System.Guid RetentionEntityId, out string! Category, out System.Guid TenantId, out Cohort.Domain.Strategy Strategy, out Cohort.Domain.RetentionPeriod! ResolvedPeriod, out long Affected, out long HeldCount, out long SkippedCount, out long NullAnchorCount, out long RetainedCount, out long DeferredCount, out long BlockedCount, out Cohort.Domain.RetentionRuleProvenance? Provenance) -> void
+Cohort.Application.SweepEvent.EntitySummary.DeferredCount.init -> void
+Cohort.Application.SweepEvent.EntitySummary.EntityType.init -> void
+Cohort.Application.SweepEvent.EntitySummary.HeldCount.init -> void
+Cohort.Application.SweepEvent.EntitySummary.NullAnchorCount.init -> void
+Cohort.Application.SweepEvent.EntitySummary.Provenance.init -> void
+Cohort.Application.SweepEvent.EntitySummary.ResolvedPeriod.init -> void
+Cohort.Application.SweepEvent.EntitySummary.RetainedCount.init -> void
+Cohort.Application.SweepEvent.EntitySummary.RetentionEntityId.init -> void
+Cohort.Application.SweepEvent.EntitySummary.SkippedCount.init -> void
+Cohort.Application.SweepEvent.EntitySummary.Strategy.init -> void
+Cohort.Application.SweepEvent.EntitySummary.TenantId.init -> void
+Cohort.Application.SweepEvent.Failed.Deconstruct(out System.Guid SweepId, out System.DateTimeOffset At, out string! Error, out System.TimeSpan? Duration, out long? TotalAffected) -> void
+Cohort.Application.SweepEvent.Failed.Duration.init -> void
+Cohort.Application.SweepEvent.Failed.Error.init -> void
+Cohort.Application.SweepEvent.Failed.TotalAffected.init -> void
+Cohort.Application.SweepEvent.PartiallyFailed.Deconstruct(out System.Guid SweepId, out System.DateTimeOffset At, out System.TimeSpan Duration, out long TotalAffected, out string! Error) -> void
+Cohort.Application.SweepEvent.PartiallyFailed.Duration.init -> void
+Cohort.Application.SweepEvent.PartiallyFailed.Error.init -> void
+Cohort.Application.SweepEvent.PartiallyFailed.TotalAffected.init -> void
+Cohort.Application.SweepEvent.RowDetail.Category.init -> void
+Cohort.Application.SweepEvent.RowDetail.Deconstruct(out System.Guid SweepId, out System.DateTimeOffset At, out System.Type! EntityType, out System.Guid RetentionEntityId, out string! RecordId, out string! Category, out Cohort.Domain.Strategy Strategy, out System.Guid TenantId) -> void
+Cohort.Application.SweepEvent.RowDetail.EntityType.init -> void
+Cohort.Application.SweepEvent.RowDetail.RecordId.init -> void
+Cohort.Application.SweepEvent.RowDetail.RetentionEntityId.init -> void
+Cohort.Application.SweepEvent.RowDetail.Strategy.init -> void
+Cohort.Application.SweepEvent.RowDetail.TenantId.init -> void
 static Cohort.Hosting.ServiceCollectionExtensions.AddRetentionDependents<TEntity, TStep>(this Microsoft.Extensions.DependencyInjection.IServiceCollection! services, bool retiresReferencingRows = true) -> Microsoft.Extensions.DependencyInjection.IServiceCollection!

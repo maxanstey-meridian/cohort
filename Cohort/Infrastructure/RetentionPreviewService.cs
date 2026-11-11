@@ -14,21 +14,16 @@ internal sealed class RetentionPreviewService(
     RetentionRegistry registry,
     IRetentionRuleProvider ruleProvider,
     RetentionRuntimeReadinessValidator readinessValidator,
-    IEnumerable<SweepStrategy> sweepStrategies,
+    SweepStrategy strategy,
     IEnumerable<IRetentionDependentsRegistration> dependentsRegistrations,
     IRetentionExecutionSettings settings
 )
 {
-    private readonly IReadOnlyDictionary<Strategy, SweepStrategy> strategies =
-        sweepStrategies.ToDictionary(strategy => strategy.HandlesStrategy);
-
     public async Task<RetentionSweepResult> ExecuteAsync(
         RetentionPreviewRequest request,
         CancellationToken ct = default
     )
     {
-        ArgumentNullException.ThrowIfNull(request);
-
         var tenant = request.RunTenant;
         var entities = SweepEntityScopes.For(tenant);
 
@@ -78,7 +73,6 @@ internal sealed class RetentionPreviewService(
                 long affected = 0, held = 0, nullAnchors = 0, blocked = 0;
                 if (rule.Strategy != Strategy.Exempt)
                 {
-                    var strategy = strategies[rule.Strategy];
                     (affected, held, blocked) = await strategy.CountPredictedAsync(scope, connection, ct);
                     if (SweepStatements.CountsNullAnchor(scope))
                     {

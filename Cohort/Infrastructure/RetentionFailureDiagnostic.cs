@@ -61,7 +61,7 @@ internal sealed record RetentionFailureDiagnostic
     private static string FormatExceptionType(Type type)
     {
         var name = type.FullName ?? type.Name;
-        var safeName = new string(
+        return new string(
             name.Take(MaximumExceptionTypeLength)
                 .Select(character =>
                     character is >= 'a' and <= 'z'
@@ -76,6 +76,5 @@ internal sealed record RetentionFailureDiagnostic
                 )
                 .ToArray()
         );
-        return safeName.Length == 0 ? "System.Exception" : safeName;
     }
 }

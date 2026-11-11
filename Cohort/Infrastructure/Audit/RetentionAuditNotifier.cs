@@ -17,8 +17,6 @@ internal sealed class RetentionAuditNotifier(
 
     public async Task NotifyCommittedAsync(SweepEvent evt)
     {
-        ArgumentNullException.ThrowIfNull(evt);
-
         foreach (var observer in observerList)
         {
             if (quarantined.Contains(observer))

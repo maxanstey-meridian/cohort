@@ -16,21 +16,27 @@ internal sealed record CohortStoreTables(
 
     internal static CohortStoreTables FromModel(IModel model)
     {
-        ArgumentNullException.ThrowIfNull(model);
-        var mappedRoles = model.GetEntityTypes().Count(entity =>
-            entity[TableRoleAnnotation] is string
-        );
-        if (mappedRoles == 0)
+        var mappedRoles = model
+            .GetEntityTypes()
+            .Select(entity => entity[TableRoleAnnotation])
+            .OfType<string>()
+            .ToLookup(role => role, StringComparer.Ordinal);
+        if (mappedRoles.Count == 0)
         {
             throw new InvalidOperationException(
                 "The EF model contains no Cohort table mappings. Call ConfigureCohortTables() from DbContext.OnModelCreating."
             );
         }
-        if (mappedRoles != CohortSchemaContract.TableNames.Count)
+
+        foreach (var role in CohortSchemaContract.TableNames)
         {
-            throw new InvalidOperationException(
-                "The EF model contains a partial Cohort table mapping. Configure all four Cohort tables together."
-            );
+            var carriedBy = mappedRoles[role].Count();
+            if (carriedBy != 1)
+            {
+                throw new InvalidOperationException(
+                    $"The EF model contains a partial Cohort table mapping. Configure all four Cohort tables together. Table role '{role}' is carried by {carriedBy} entity types, not one."
+                );
+            }
         }
 
         return new CohortStoreTables(
@@ -48,9 +54,6 @@ internal sealed record CohortStoreTables(
         );
         var name = entityType.GetTableName()
             ?? throw new InvalidOperationException($"Cohort table role '{role}' has no table mapping.");
-        return new RelationalObjectName(
-            entityType.GetSchema() ?? model.GetDefaultSchema() ?? "public",
-            name
-        );
+        return new RelationalObjectName(entityType.GetSchema() ?? "public", name);
     }
 }

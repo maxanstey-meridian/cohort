@@ -10,8 +10,8 @@ internal static class ErasureSubjectValidation
     /// Refuses, before anything runs, a kind no retained entity in <paramref name="entities"/>
     /// declares (<paramref name="work"/> would match nothing) and a subject that isn't of its
     /// kind's CLR type. Neither message includes the subject's value. <paramref name="work"/>
-    /// names the caller in the first message ("the erasure"). Run it after readiness: startup
-    /// validation fills the state it reads.
+    /// names the caller in the first message ("the erasure"). Run it after readiness: it reads
+    /// the kinds' CLR types from startup validation's state.
     /// </summary>
     internal static void Validate(
         RetentionModelValidation validation,
@@ -24,8 +24,7 @@ internal static class ErasureSubjectValidation
     {
         var declared = registry.Scan().Values
             .Where(entry => entities.Includes(entry))
-            .SelectMany(entry => validation.ErasureSubjects[entry.EntityType])
-            .Select(metadata => metadata.Kind)
+            .SelectMany(entry => entry.ErasureSubjects.Keys)
             .ToHashSet(StringComparer.Ordinal);
         if (!declared.Contains(kind))
         {

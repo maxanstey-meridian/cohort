@@ -113,7 +113,7 @@ dotnet_diagnostic.CA1811.severity = error
 ############################
 # EF-generated migrations — relax style rules (the tool owns the format)
 ############################
-[**/Migrations/*.cs]
+[Cohort.Sample/Migrations/*.cs]
 dotnet_diagnostic.IDE0005.severity = none
 dotnet_diagnostic.IDE0161.severity = none
 csharp_style_namespace_declarations = block_scoped:none

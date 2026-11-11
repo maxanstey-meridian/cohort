@@ -26,8 +26,12 @@ namespace Cohort.Sample.Tests;
 // which only lists.
 // A cold call is the first readiness call for the model and connection string (a fresh
 // TemporaryDatabase); a warm call follows one made outside any scope.
-// Make-fails: remove the suppression in RetentionExecutionScopes.RunInScopeAsync (both sweeps, the
-// owned erasure, and the recovery go red; with the preview's, the cold preview goes red too).
+// Make-fails: remove the suppression in RetentionExecutionScopes.RunInScopeAsync, Cohort's only
+// one (both sweeps, both owned erasures, the recovery, the orphaned-hold listing on a used context,
+// and the ambient variant of the retrying owned-work test go red; the cold preview stays green,
+// because readiness treats the ambient transaction as the caller's). The cold preview goes red
+// only when that suppression is removed and ContextTransaction.Of also returns None for an
+// enlisted context.
 // Readiness inside a scope: put the Suppress block back around RetentionRuntimeReadinessValidator's
 // model pass (the cold listings on a used context and on a wrapped connection, the orphaned-hold
 // listing, and the not-kept pass go red); record the pass for an enlisted context (the not-kept
@@ -43,9 +47,9 @@ namespace Cohort.Sample.Tests;
 // EF's message).
 // An_owned_erasure_inside_an_ambient_transaction_reads_the_committed_hold_and_refuses pins that an
 // owned erasure's readiness reads committed state, outside the ambient transaction, so the
-// caller's uncommitted end to a hold doesn't lift the refusal. Make-fail: remove both of those
-// suppressions (it goes red: the erasure throws InvalidOperationException, not the declared
-// refusal).
+// caller's uncommitted end to a hold doesn't lift the refusal. Make-fail: remove the suppression
+// in RetentionExecutionScopes.RunInScopeAsync (it goes red: the erasure throws
+// InvalidOperationException, not the declared refusal).
 // A_cold_hold_listing_on_a_used_context_inside_an_ambient_transaction_refuses_the_committed_orphaned_hold
 // pins that a cold listing on a context already used inside the scope runs the checks, and that the
 // stored-identities check reads the committed hold in a session of its own (the caller's

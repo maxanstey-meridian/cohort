@@ -32,7 +32,13 @@ internal abstract record ContextTransaction
             return new Ef(transaction);
         }
 
-        var enlistment = (ITransactionEnlistmentManager)database.GetService<IDbContextTransactionManager>();
+        // Only a relational provider enlists; any other answers None, so a port reaches
+        // readiness's provider refusal as it did before this type existed.
+        if (database.GetService<IDbContextTransactionManager>() is not ITransactionEnlistmentManager enlistment)
+        {
+            return new None();
+        }
+
         return enlistment.CurrentAmbientTransaction is not null || enlistment.EnlistedTransaction is not null
             ? new Enlisted()
             : new None();

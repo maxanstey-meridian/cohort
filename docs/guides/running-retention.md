@@ -78,16 +78,21 @@ have open on it. See
   enlist in it: their work commits on its own, and disposing your scope without `Complete()`
   doesn't undo it.
 
-The ports that run on your scope's `DbContext` see a `System.Transactions` transaction on it: an ambient `TransactionScope`, or one passed to `EnlistTransaction`.
+The ports that run on your scope's `DbContext` see a `System.Transactions` transaction on it: an
+ambient `TransactionScope`, or one passed to `EnlistTransaction`.
 
 - The holds repository joins it, as it joins one begun through EF.
 - Readiness checks inside it, as it does inside one begun through EF.
 - `IRetentionDeletion` refuses it, as it refuses an EF transaction.
-- A `Caller` erasure refuses it, because Cohort can't give a dependents step's `DbContext` a `System.Transactions` transaction as its `CurrentTransaction`.
+- A `Caller` erasure refuses it, because Cohort can't give a dependents step's `DbContext` a
+  `System.Transactions` transaction as its `CurrentTransaction`.
 
-EF decides whether your context enlists, and Cohort follows it. With `Enlist=false` in your connection string, neither enlists.
+EF decides whether your context enlists, and Cohort follows it. With `Enlist=false` in your
+connection string, neither enlists.
 
-On a context with a retrying execution strategy, call these ports inside your strategy whenever you call them inside your transaction, as EF requires of your own work in it. Outside it, Cohort refuses.
+On a context with a retrying execution strategy, call these ports inside your strategy whenever
+you call them inside your transaction, as EF requires of your own work in it. Outside it, Cohort
+refuses.
 
 These services also check PostgreSQL, model and schema readiness themselves, so they're safe
 to call from a host that never ran Cohort's startup validation.

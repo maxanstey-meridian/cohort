@@ -147,12 +147,16 @@ Added:
 
 Fixed:
 
-- Under an ambient `TransactionScope`, every port threw `InvalidOperationException` on its first call, and a sweep, an owned erasure, hold creation, and deletion threw on every call.
-  - A sweep, a preview, an owned erasure, and recovery now run outside the scope, and commit whether or not it completes.
-  - The holds repository and readiness treat it as your transaction, as they treat one begun through EF.
+- Under an ambient `TransactionScope`, every port threw `InvalidOperationException` on its first
+  call, and a sweep, an owned erasure, hold creation, and deletion threw on every call.
+  - A sweep, a preview, an owned erasure, and recovery now run outside the scope, and commit
+    whether or not it completes.
+  - The holds repository and readiness treat it as your transaction, as they treat one begun
+    through EF.
   - `IRetentionDeletion` and a `Caller` erasure refuse it with a message that says why.
   - A hold read with a record ID that fails its cast no longer aborts it.
-- On a context with `EnableRetryOnFailure()`, a hold call inside your transaction but outside your execution strategy is refused with a message that says how to call it, in place of EF's.
+- On a context with `EnableRetryOnFailure()`, a hold call inside your transaction but outside
+  your execution strategy is refused with a message that says how to call it, in place of EF's.
 - History pruning ages runs and holds against the database clock, the clock that stamps
   `SettledAt` and judges whether a hold protects, instead of the host's. It reads the clock on
   every pass, with or without a `Schedule`.

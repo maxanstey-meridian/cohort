@@ -56,7 +56,8 @@ skipped startup validation still can't run against a missing or outdated schema.
 
 Readiness validates once per EF model instance and connection string, then trusts the result:
 a pass records nothing until it completes, and a completed pass outside a caller's transaction
-(one begun through EF, or a `System.Transactions` transaction your context is enlisted in) is kept on the model's entry, so later contexts of the same model instance don't run it again.
+(one begun through EF, or a `System.Transactions` transaction your context is enlisted in) is
+kept on the model's entry, so later contexts of the same model instance don't run it again.
 The stored-identities check alone is kept on its own, inside a caller's transaction too, but
 only when its `System(Readiness)` scope ran in a session (a PostgreSQL backend) other than the caller's. A rebuilt
 copy of the model is a new instance and is checked again, and so is the same model under

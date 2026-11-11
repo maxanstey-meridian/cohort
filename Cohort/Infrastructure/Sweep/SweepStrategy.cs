@@ -184,9 +184,9 @@ internal sealed class SweepStrategy(
         // one, so each call of the step runs inside a scope of it instead
         // (<see cref="RetireInScopeAsync"/>), and the step sees it as ambient.
         // The caller's own context is used in here too (it loads the rows, and reads the holds),
-        // and EF refuses a context a different ambient transaction than the one it was used under.
-        // RunInScopeAsync suppresses the host's, so a host that has one gets it back around
-        // everything the lambda does.
+        // and EF refuses to use a context under a different ambient transaction from the one it
+        // was first used under. RunInScopeAsync suppresses the host's, so a host that has one
+        // gets it back around everything the lambda does.
         var hostAmbient = transaction is ContextTransaction.Enlisted ? Transaction.Current : null;
         return await scopeFactory.RunInScopeAsync(
             RetentionExecutionScopes.For(scope.Tenant),

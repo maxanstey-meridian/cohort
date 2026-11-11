@@ -76,7 +76,8 @@ public sealed record TenantContext
             );
     }
 
-    // The tags are left out: equal contexts have equal IDs and jurisdictions, which is all a hash needs.
+    // The tags are left out: equal contexts have equal IDs and jurisdictions, which is all a
+    // hash needs.
     public override int GetHashCode() =>
         HashCode.Combine(Id, Jurisdiction is null ? 0 : StringComparer.Ordinal.GetHashCode(Jurisdiction));
 

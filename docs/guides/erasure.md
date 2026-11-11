@@ -273,26 +273,31 @@ What changes compared with an ordinary erasure:
   before the erasure, the attempt leaves no `sweep_run` row, because the ledger is part of
   the same transaction. Nothing it changed was kept either, so the erasure didn't happen.
   Cohort logs the rollback at Information with the sweep ID when it sees it: an explicit
-  `RollbackAsync`, or a commit after a rollback to such a savepoint or of an aborted transaction. A transaction disposed
+  `RollbackAsync`, a commit after a rollback to such a savepoint or of an aborted
+  transaction, or a `System.Transactions` transaction that aborts (a `TransactionScope`
+  disposed without `Complete()`, for one). A transaction begun through EF and disposed
   without a commit or rollback logs nothing, because EF raises no event for it.
 - **Locks are held until you commit.** Row and entity locks last until your transaction
   ends, so a concurrent sweep or hold of the same rows waits for you. Keep the transaction
   short.
 - **Observers hear about it after the commit.** Audit observers are told of every event of
   the run, `Started` to `Completed`, only once your commit has succeeded, and never if you
-  roll back or the commit fails. Commit through EF so Cohort sees it. Once the commit
-  returns, Cohort checks on your context's connection, outside any transaction, that the
-  run's `sweep_run` row committed. If it didn't (you rolled back to a savepoint taken before
-  the erasure, or committed a transaction a failed statement had already aborted), observers
-  are told nothing and the rollback is logged at Information. If the check itself fails, for
-  example because your session can no longer read `sweep_run`, Cohort logs a Warning that it
-  could not confirm the run and tells observers nothing: a missed event is within best
-  effort, a report of a run that may not have happened is not. Your commit is never affected.
+  roll back or the commit fails. For a transaction begun through EF, commit through EF so
+  Cohort sees it; for a `System.Transactions` transaction, Cohort hears the completion
+  itself. Once the commit returns, Cohort checks on your context's connection, outside any
+  transaction, that the run's `sweep_run` row committed. If it didn't (you rolled back to a
+  savepoint taken before the erasure, or committed a transaction a failed statement had
+  already aborted), observers are told nothing and the rollback is logged at Information. If
+  the check itself fails, for example because your session can no longer read `sweep_run`,
+  Cohort logs a Warning that it could not confirm the run and tells observers nothing: a
+  missed event is within best effort, a report of a run that may not have happened is not.
+  Your commit is never affected.
   The check runs with your connection's session settings, so row-level security must be
   applied when the connection opens, not with `SET LOCAL` (see
-  [Tenant Isolation](/guides/tenant-isolation)). `CommitAsync` is the supported path: a
-  synchronous `Commit()` blocks while observers are told, each for up to
-  `AuditObservers:Timeout` per event.
+  [Tenant Isolation](/guides/tenant-isolation)). For a transaction begun through EF,
+  `CommitAsync` is the supported path: a synchronous `Commit()` blocks while observers are
+  told, each for up to `AuditObservers:Timeout` per event. A `System.Transactions` commit (the
+  scope's disposal, or `Commit()`) has no asynchronous path, so it always blocks the same way.
 - **A dependents step runs inside your transaction.** A
   [dependents step](/guides/row-handlers#retiring-a-rows-dependents) runs read-write inside
   it, under the row's own savepoint. It doesn't run on your `DbContext`: it gets its own scope

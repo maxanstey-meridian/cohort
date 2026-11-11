@@ -92,11 +92,14 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
         }
     }
 
-    // Raised synchronously while the caller's scope is disposed or its transaction committed, with
-    // no ambient transaction. Deliberately blocking, as the EF path below: the wait is bounded by
-    // the committed-rows query and AuditObservers:Timeout. Nothing here throws: the work's own
-    // failures are caught and logged, and an exception out of this handler would reach the
-    // caller's commit.
+    // Raised synchronously while the caller's scope is disposed or its transaction committed.
+    // Deliberately blocking, as the EF path below: the wait is bounded by the committed-rows
+    // query and AuditObservers:Timeout. Nothing here throws: the work's own failures are caught
+    // and logged, and an exception out of this handler would reach the caller's commit.
+    // A scope's disposal pops it before it commits, so a scope nested in another one (a
+    // RequiresNew inside the host's outer scope) runs this with the outer transaction ambient:
+    // the work suppresses it, or the caller's connection and the observers' own writes would
+    // enlist in a transaction the erasure never belonged to.
     private void RunCompleted(DeferredWork work, DbContext db, System.Transactions.TransactionStatus? status)
     {
         if (status != System.Transactions.TransactionStatus.Committed)
@@ -105,7 +108,13 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
             return;
         }
 
-        ConfirmAndRunAsync(
+        BlockOffTheCallersContext(async () =>
+        {
+            using var suppress = new System.Transactions.TransactionScope(
+                System.Transactions.TransactionScopeOption.Suppress,
+                System.Transactions.TransactionScopeAsyncFlowOption.Enabled
+            );
+            await ConfirmAndRunAsync(
                 work,
                 async () =>
                 {
@@ -119,15 +128,19 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
                         await db.Database.CloseConnectionAsync();
                     }
                 }
-            )
-            .GetAwaiter()
-            .GetResult();
+            );
+        });
     }
 
     // Deliberately blocking: EF's synchronous commit has no async hook. The wait is bounded by
     // the committed-rows query and AuditObservers:Timeout; CommitAsync is the supported path.
     public override void TransactionCommitted(DbTransaction transaction, TransactionEndEventData eventData) =>
-        RunAsync(transaction, eventData).GetAwaiter().GetResult();
+        BlockOffTheCallersContext(() => RunAsync(transaction, eventData));
+
+    // The calling thread stays blocked, so the caller's context is still used by one thread at
+    // a time, but the work runs on the thread pool: its awaits would otherwise resume on the
+    // caller's SynchronizationContext (Blazor Server, WPF, WinForms), whose thread is waiting here.
+    private static void BlockOffTheCallersContext(Func<Task> work) => Task.Run(work).GetAwaiter().GetResult();
 
     // The commit's token is deliberately not passed on: the commit has happened, and whether
     // its work is reported must not depend on the caller's cancellation.

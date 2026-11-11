@@ -20,8 +20,8 @@ internal static class SavepointSql
 
     /// <summary>
     /// ROLLBACK TO keeps the savepoint open, so release it too: otherwise each later savepoint of
-    /// the name nests one level deeper for the rest of the transaction. Ignores cancellation, like
-    /// every Cohort savepoint: a cancelled rollback would leave the transaction aborted.
+    /// the name nests one level deeper for the rest of the transaction. Ignores cancellation: a
+    /// cancelled rollback would leave the transaction aborted.
     /// </summary>
     internal static async Task RollBackAsync(DbConnection connection, DbTransaction? transaction, string name)
     {

@@ -172,9 +172,11 @@ Fixed:
   - The holds repository and readiness treat it as your transaction, as they treat one begun
     through EF.
   - `IRetentionDeletion` refuses it with a message that says why.
-  - A `Caller` erasure joins it, as it joins a transaction begun through EF. It needs `IsolationLevel.ReadCommitted`, which is not a `TransactionScope`'s default.
+  - A `Caller` erasure joins it, as it joins a transaction begun through EF. It needs
+    `IsolationLevel.ReadCommitted`, which is not a `TransactionScope`'s default.
   - A hold read with a record ID that fails its cast no longer aborts it.
-- Two `TenantContext` values with the same ID, jurisdiction, and tags are now equal. They compared unequal unless they were the same instance.
+- Two `TenantContext` values with the same ID, jurisdiction, and tags are now equal. They
+  compared unequal unless they were the same instance.
 - On a context with `EnableRetryOnFailure()`, a hold call inside your transaction but outside
   your execution strategy is refused with a message that says how to call it, in place of EF's.
 - History pruning ages runs and holds against the database clock, the clock that stamps

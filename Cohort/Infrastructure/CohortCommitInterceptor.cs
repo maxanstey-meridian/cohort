@@ -1,10 +1,14 @@
 using System.Data.Common;
 using System.Runtime.CompilerServices;
 
+using Cohort.Application;
+using Cohort.Infrastructure.Audit;
+
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Storage;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
 namespace Cohort.Infrastructure;
@@ -19,8 +23,10 @@ namespace Cohort.Infrastructure;
 /// <see cref="System.Transactions.Transaction.TransactionCompleted"/> instead. <c>AddCohort</c>
 /// adds one instance to the host's DbContext options, which only the EF case needs.
 /// </summary>
-internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> logger)
-    : DbTransactionInterceptor
+internal sealed class CohortCommitInterceptor(
+    ILogger<CohortCommitInterceptor> logger,
+    IServiceScopeFactory scopeFactory
+) : DbTransactionInterceptor
 {
     // Npgsql recycles transaction objects, so each entry also names the EF transaction it
     // belongs to: work deferred on a transaction that ended unseen (disposed without commit
@@ -45,24 +51,27 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
     /// transaction, ends in a successful commit that kept nothing; EF doesn't say which
     /// savepoint was rolled back, and a raw <c>ROLLBACK TO SAVEPOINT</c> isn't seen at all, so
     /// the committed rows are the only reliable answer. After the commit,
-    /// <paramref name="committedRows"/> asks, on the context's connection and outside any
-    /// transaction, whether they exist. When it can't answer, the work is dropped and
-    /// <paramref name="unconfirmed"/> is told: deferred work is best effort, and running it
-    /// for a commit that may not have kept its rows would report something that didn't happen.
-    /// For a System.Transactions transaction the question is asked through <paramref name="db"/>,
-    /// the caller's context, which must still be alive when the transaction completes: a
-    /// disposed one can't answer, so the work is dropped as unconfirmed.
+    /// <paramref name="committedRows"/> asks, outside any transaction, whether they exist. When
+    /// it can't answer, the work is dropped and <paramref name="unconfirmed"/> is told: deferred
+    /// work is best effort, and running it for a commit that may not have kept its rows would
+    /// report something that didn't happen.
+    /// For a transaction begun through EF the question is asked on the caller's context's
+    /// connection and <paramref name="committed"/> is given <paramref name="callerNotifier"/>:
+    /// that context ends the transaction when it is disposed, so it is alive at the commit. For a
+    /// System.Transactions transaction the question is asked, and the observers are told, in a
+    /// scope Cohort opens in <paramref name="context"/>: the caller's scope may be gone by then.
     /// </summary>
     internal void AfterCommit(
         ContextTransaction transaction,
-        DbContext db,
+        RetentionAuditNotifier callerNotifier,
+        RetentionExecutionContext context,
         Func<DbConnection, Task<bool>> committedRows,
-        Func<Task> committed,
+        Func<RetentionAuditNotifier, Task> committed,
         Action<bool> dropped,
         Action<Exception> unconfirmed
     )
     {
-        var work = new DeferredWork(committedRows, committed, dropped, unconfirmed);
+        var work = new DeferredWork(callerNotifier, context, committedRows, committed, dropped, unconfirmed);
         switch (transaction)
         {
             case ContextTransaction.Ef ef:
@@ -70,7 +79,7 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
                 break;
             case ContextTransaction.Enlisted enlisted:
                 enlisted.Transaction.TransactionCompleted += (_, completed) =>
-                    RunCompleted(work, db, completed.Transaction?.TransactionInformation.Status);
+                    RunCompleted(work, completed.Transaction?.TransactionInformation.Status);
                 break;
             default:
                 throw new InvalidOperationException("ErasureTransaction.Caller needs an open transaction on the scoped DbContext.");
@@ -95,12 +104,14 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
     // Raised synchronously while the caller's scope is disposed or its transaction committed.
     // Deliberately blocking, as the EF path below: the wait is bounded by the committed-rows
     // query and AuditObservers:Timeout. Nothing here throws: the work's own failures are caught
-    // and logged, and an exception out of this handler would reach the caller's commit.
+    // and logged. An exception out of this handler would stop the host's own TransactionCompleted
+    // handlers subscribed after Cohort's, and would leave a BeginCommit commit never completing;
+    // on a synchronous commit Npgsql swallows it, so the commit looks unharmed and proves nothing.
     // A scope's disposal pops it before it commits, so a scope nested in another one (a
     // RequiresNew inside the host's outer scope) runs this with the outer transaction ambient:
-    // the work suppresses it, or the caller's connection and the observers' own writes would
-    // enlist in a transaction the erasure never belonged to.
-    private void RunCompleted(DeferredWork work, DbContext db, System.Transactions.TransactionStatus? status)
+    // RunInScopeAsync suppresses it, or the scope's connection and the observers' own writes
+    // would enlist in a transaction the erasure never belonged to.
+    private void RunCompleted(DeferredWork work, System.Transactions.TransactionStatus? status)
     {
         if (status != System.Transactions.TransactionStatus.Committed)
         {
@@ -108,28 +119,48 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
             return;
         }
 
-        BlockOffTheCallersContext(async () =>
+        BlockOffTheCallersContext(() => ConfirmInOwnScopeAsync(work));
+    }
+
+    // Nothing of the caller's is used: a System.Transactions transaction can outlive the DI scope
+    // its context came from, and that scope's context, notifier, and scoped observers die with it.
+    // The question and the telling both run in a scope of Cohort's own. Until the question is
+    // answered, a failure (the hook threw or never ran the work, the connection would not open)
+    // leaves the commit unconfirmed; once it is answered, the events were told or dropped, and
+    // a failure is only logged.
+    private async Task ConfirmInOwnScopeAsync(DeferredWork work)
+    {
+        var answered = false;
+        try
         {
-            using var suppress = new System.Transactions.TransactionScope(
-                System.Transactions.TransactionScopeOption.Suppress,
-                System.Transactions.TransactionScopeAsyncFlowOption.Enabled
-            );
-            await ConfirmAndRunAsync(
-                work,
-                async () =>
+            await scopeFactory.RunInScopeAsync(
+                work.Context,
+                async services =>
                 {
+                    var db = services.GetRequiredKeyedService<DbContext>(CohortServiceKeys.DbContext);
+                    var notifier = services.GetRequiredService<RetentionAuditNotifier>();
                     await db.Database.OpenConnectionAsync(CancellationToken.None);
                     try
                     {
-                        return await work.CommittedRows(db.Database.GetDbConnection());
+                        await ConfirmAndRunAsync(work, () => work.CommittedRows(db.Database.GetDbConnection()), notifier);
+                        answered = true;
                     }
                     finally
                     {
                         await db.Database.CloseConnectionAsync();
                     }
-                }
+                },
+                CancellationToken.None
             );
-        });
+        }
+        catch (Exception ex) when (!answered)
+        {
+            Unconfirmed(work, ex);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Cohort's scope for work deferred until a caller's transaction committed failed after the work was answered.");
+        }
     }
 
     // Deliberately blocking: EF's synchronous commit has no async hook. The wait is bounded by
@@ -202,7 +233,8 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
                     var connection = eventData.Context?.Database.GetDbConnection()
                         ?? throw new InvalidOperationException("The committed transaction has no DbContext to check its rows through.");
                     return work.CommittedRows(connection);
-                }
+                },
+                work.CallerNotifier
             );
         }
     }
@@ -211,7 +243,11 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
     /// After a commit: asks whether the work's rows were kept, then runs it, drops it, or reports
     /// it unconfirmed. The caller's commit has happened; nothing deferred may turn it into a failure.
     /// </summary>
-    private async Task ConfirmAndRunAsync(DeferredWork work, Func<Task<bool>> rowsCommitted)
+    private async Task ConfirmAndRunAsync(
+        DeferredWork work,
+        Func<Task<bool>> rowsCommitted,
+        RetentionAuditNotifier notifier
+    )
     {
         bool committedRows;
         try
@@ -232,7 +268,7 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
 
         try
         {
-            await work.Committed();
+            await work.Committed(notifier);
         }
         catch (Exception ex)
         {
@@ -291,9 +327,13 @@ internal sealed class CohortCommitInterceptor(ILogger<CohortCommitInterceptor> l
         public List<DeferredWork> Work { get; } = [];
     }
 
+    // CallerNotifier is for a transaction begun through EF only, whose context is alive when it
+    // commits; a System.Transactions transaction is told through a scope of Cohort's own.
     private sealed record DeferredWork(
+        RetentionAuditNotifier CallerNotifier,
+        RetentionExecutionContext Context,
         Func<DbConnection, Task<bool>> CommittedRows,
-        Func<Task> Committed,
+        Func<RetentionAuditNotifier, Task> Committed,
         Action<bool> Dropped,
         Action<Exception> Unconfirmed
     );

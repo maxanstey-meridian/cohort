@@ -245,10 +245,6 @@ scoped for this reason. The erasure needs:
   `READ UNCOMMITTED` is accepted too, because PostgreSQL runs it as `READ COMMITTED`. Under
   `REPEATABLE READ` or `SERIALIZABLE` the hold checks would read a snapshot from when your
   transaction began and could miss a hold committed since, so Cohort refuses.
-- inside a `System.Transactions` transaction, keep your `DbContext` alive until the
-  transaction completes. Cohort tells audit observers once it does, after checking through
-  your context that the run's ledger row committed. If the context is gone by then, the
-  erasure still stands, and the observers are not told.
 - no unsaved changes on the context. Save or discard them first.
 - the context built from the container's options, where `AddCohort<TContext>()` adds its
   commit interceptor. A context whose options you built yourself is refused. This applies to
@@ -282,22 +278,27 @@ What changes compared with an ordinary erasure:
   short.
 - **Observers hear about it after the commit.** Audit observers are told of every event of
   the run, `Started` to `Completed`, only once your commit has succeeded, and never if you
-  roll back or the commit fails. For a transaction begun through EF, commit through EF so
-  Cohort sees it; for a `System.Transactions` transaction, Cohort hears the completion
-  itself. Once the commit returns, Cohort checks on your context's connection, outside any
+  roll back or the commit fails. Before telling them, Cohort checks, outside any
   transaction, that the run's `sweep_run` row committed. If it didn't (you rolled back to a
   savepoint taken before the erasure, or committed a transaction a failed statement had
   already aborted), observers are told nothing and the rollback is logged at Information. If
-  the check itself fails, for example because your session can no longer read `sweep_run`,
+  the check itself fails, for example because the session that asks can't read `sweep_run`,
   Cohort logs a Warning that it could not confirm the run and tells observers nothing: a
   missed event is within best effort, a report of a run that may not have happened is not.
   Your commit is never affected.
-  The check runs with your connection's session settings, so row-level security must be
-  applied when the connection opens, not with `SET LOCAL` (see
-  [Tenant Isolation](/guides/tenant-isolation)). For a transaction begun through EF,
-  `CommitAsync` is the supported path: a synchronous `Commit()` blocks while observers are
-  told, each for up to `AuditObservers:Timeout` per event. A `System.Transactions` commit (the
-  scope's disposal, or `Commit()`) has no asynchronous path, so it always blocks the same way.
+  - **A transaction begun through EF.** Commit through EF so Cohort sees it. The check runs
+    on your context's connection with its session settings, so row-level security must be
+    applied when the connection opens, not with `SET LOCAL` (see
+    [Tenant Isolation](/guides/tenant-isolation)), and the observers told are your scope's.
+    `CommitAsync` is the supported path: a synchronous `Commit()` blocks while observers are
+    told, each for up to `AuditObservers:Timeout` per event.
+  - **A `System.Transactions` transaction.** Cohort hears the completion itself, and by then
+    your scope may be gone, so it uses nothing of yours. It opens a scope of its own through
+    your execution-scope hook, in the run's `Tenant` context, as it does for an erasure that
+    owns its transaction; the check runs on that scope's connection and the observers told
+    are that scope's. The commit (the scope's disposal, or `Commit()`) has no asynchronous
+    path, so it always blocks while this happens, and it takes one more connection from the
+    pool.
 - **A dependents step runs inside your transaction.** A
   [dependents step](/guides/row-handlers#retiring-a-rows-dependents) runs read-write inside
   it, under the row's own savepoint. It doesn't run on your `DbContext`: it gets its own scope
@@ -312,9 +313,11 @@ What changes compared with an ordinary erasure:
 - **Your change tracker isn't refreshed.** The erasure changes rows with SQL, so entities
   your context already tracks keep their old values. Load and change your own rows before
   erasing, or call `ChangeTracker.Clear()` after.
-- **Your execution scope is called only for a dependents step.** The erasure runs in your
-  scope, under whatever tenant isolation you already applied to it. Each batch with a
-  dependents step gets its own scope, run as the request's tenant, on your already-open
+- **Your execution scope is called for a dependents step, and after a `System.Transactions`
+  commit.** The erasure runs in your scope, under whatever tenant isolation you already
+  applied to it. Each batch with a dependents step gets its own scope, run as the request's
+  tenant, on your already-open connection. After a `System.Transactions` commit, the check
+  and the observers get a scope of their own, run as the request's tenant, on its own
   connection. See [Tenant Isolation](/guides/tenant-isolation).
 
 A dry run with `Caller` is allowed. It writes its audit rows into your transaction and

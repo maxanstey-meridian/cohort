@@ -43,8 +43,9 @@ RetentionExecutionContext.System(RetentionSystemWork Work)
 | Where | Context |
 |---|---|
 | `IRetentionSweep`, `IRetentionPreview` | `Tenant` for a tenanted request, `System(TenantlessPass)` for a tenantless one |
-| `IRetentionErasureService` | `Tenant` for a tenanted request, `System(TenantlessPass)` for a tenantless one. Not called for the erasure itself with `ErasureTransaction.Caller`: that erasure runs in your scope, which you already set up (its batches with a dependents step, below, still are) |
+| `IRetentionErasureService` | `Tenant` for a tenanted request, `System(TenantlessPass)` for a tenantless one. Not called for the erasure itself with `ErasureTransaction.Caller`: that erasure runs in your scope, which you already set up (its batches with a dependents step, below, still are, and so is the check after a `System.Transactions` commit, in the row after that) |
 | Each batch's dependents step, in its own scope on the run's connection and transaction, `Caller` erasures included | `Tenant` of the run, or `System(TenantlessPass)` for a tenantless one |
+| After a `Caller` erasure's `System.Transactions` transaction commits: the check that its ledger row committed, and its audit observers | `Tenant` of the run |
 | Scheduled worker iteration: its lock, occurrence ledger, tenant source and tenant coverage check (which reads the tenant column of every retained tenanted table, across tenants) | `System(WorkerCoordination)` |
 | A refused scheduled pass (a tenant missing from the source or returned with conflicting contexts), recorded as a `Failed` run | `Tenant` of the refused tenant |
 | Each scheduled pass, in its own scope | `Tenant`, or `System(TenantlessPass)` for the tenantless pass |
@@ -192,7 +193,7 @@ and on your retained tables:
 | Operation | Sent in | Needs on Cohort's tables |
 |---|---|---|
 | Sweeps, dry runs, and scheduled passes | `Tenant`, or `System(TenantlessPass)` | `SELECT`, `INSERT`, `UPDATE` on `sweep_run` and `sweep_run_entity_summary`; `SELECT`, `INSERT` on `sweep_run_row_detail`; `SELECT` on `retention_holds` |
-| Erasures | `Tenant`, or `System(TenantlessPass)`; your own scope for `ErasureTransaction.Caller` | The same as sweeps |
+| Erasures | `Tenant`, or `System(TenantlessPass)`; your own scope for `ErasureTransaction.Caller`, then `Tenant` for the check after a `System.Transactions` commit (`SELECT` on `sweep_run`) | The same as sweeps |
 | Previews | `Tenant`, or `System(TenantlessPass)` | `SELECT` on `retention_holds` |
 | `IRetentionHoldsRepository` | Your scope | `SELECT`, `INSERT`, `UPDATE` on `retention_holds` |
 | `IRetentionDeletion` | Your scope | `SELECT` on `retention_holds` |

@@ -76,12 +76,13 @@ internal sealed class RetentionRun(
             callerTransaction = ContextTransaction.Of(db.Database);
             callerCommit.AfterCommit(
                 callerTransaction,
-                db,
+                auditNotifier,
+                RetentionExecutionScopes.ForTenant(started.TenantId),
                 connection => IsCommittedAsync(connection, committed),
                 NotifyDeferredAsync,
                 committedWithoutRows => logger.LogInformation(
                     committedWithoutRows
-                        ? "Cohort {Operation} {SweepId} has no committed ledger row the caller's connection can see: it rolled back with one of the caller's savepoints or an aborted transaction, or the connection's session can't read sweep_run. Its observer events are dropped."
+                        ? "Cohort {Operation} {SweepId} has no committed ledger row Cohort can see: it rolled back with one of the caller's savepoints or an aborted transaction, or the session that asked can't read sweep_run. Its observer events are dropped."
                         : "Cohort {Operation} {SweepId} rolled back with the caller's transaction; no ledger row of the attempt remains, and nothing it changed was kept.",
                     operation,
                     SweepId
@@ -693,9 +694,11 @@ internal sealed class RetentionRun(
     }
 
     /// <summary>
-    /// Asked on the caller's connection once its transaction has committed, outside any
-    /// transaction: the run's ledger row exists only if the commit kept the run, rather than
-    /// a rollback to a savepoint taken before it, or an aborted transaction, discarding it.
+    /// Asked once the caller's transaction has committed, on the caller's connection for a
+    /// transaction begun through EF and on Cohort's own scope's for a System.Transactions one,
+    /// outside any transaction: the run's ledger row exists only if the commit kept the run,
+    /// rather than a rollback to a savepoint taken before it, or an aborted transaction,
+    /// discarding it.
     /// </summary>
     private static async Task<bool> IsCommittedAsync(DbConnection connection, SweepStatement committed)
     {
@@ -712,11 +715,11 @@ internal sealed class RetentionRun(
             tables.SweepRun
         );
 
-    private async Task NotifyDeferredAsync()
+    private async Task NotifyDeferredAsync(RetentionAuditNotifier notifier)
     {
         foreach (var evt in deferredEvents)
         {
-            await auditNotifier.NotifyCommittedAsync(evt);
+            await notifier.NotifyCommittedAsync(evt);
         }
     }
 

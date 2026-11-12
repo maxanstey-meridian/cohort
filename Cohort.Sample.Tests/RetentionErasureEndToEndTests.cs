@@ -2562,11 +2562,12 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
         (await verify.Notes.SingleAsync(note => note.Id == markerId)).Body.Should().Be("marker-before");
     }
 
-    // Cohort asks whether the run committed through the caller's own context, so a context
-    // disposed before the scope completes can't be asked: the erasure still stands, and the
-    // observers are not told, with a warning that says why.
+    // A System.Transactions transaction can outlive the DI scope its context came from (a host
+    // that opens the scope around the code that creates and disposes its DI scope). Cohort asks
+    // whether the run committed, and tells the observers, in a scope of its own, so the caller's
+    // disposed context is not needed: the observers hear every event and nothing is unconfirmed.
     [Fact]
-    public async Task A_Caller_Context_Disposed_Before_The_Scope_Completes_Keeps_The_Erasure_And_Tells_No_Observer()
+    public async Task A_Caller_Scope_Disposed_Before_The_Transaction_Completes_Still_Tells_The_Observers()
     {
         var tenant = new TenantContext(Guid.NewGuid(), "uk", new Dictionary<string, string>());
         var subject = Guid.NewGuid();
@@ -2595,9 +2596,11 @@ public sealed class RetentionErasureEndToEndTests(PostgresFixture fixture)
             scope.Complete();
         }
 
-        observer.Events.Should().BeEmpty();
-        logs.Entries.Should().ContainSingle(entry =>
-            entry.Level == LogLevel.Warning && entry.Message.Contains("could not confirm") && entry.Message.Contains(result.SweepId.ToString()));
+        observer.Events.Should().StartWith(observer.Events.OfType<SweepEvent.Started>().Single())
+            .And.EndWith(observer.Events.OfType<SweepEvent.Completed>().Single());
+        observer.Events.OfType<SweepEvent.EntitySummary>().Should().Contain(summary =>
+            summary.EntityType == typeof(Note) && summary.Affected == 1);
+        logs.Entries.Should().NotContain(entry => entry.Message.Contains("could not confirm"));
         (await LoadRunStatusAsync(result.SweepId)).Should().Be(SweepRunStatus.Succeeded);
         await using var verify = Host.CreateDbContext();
         (await verify.Notes.AnyAsync(note => note.Id == erasedId)).Should().BeFalse();

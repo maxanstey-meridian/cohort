@@ -170,7 +170,9 @@ public sealed class NoteOutboxStep(SampleDbContext db) : IRetentionDependents<No
     public async Task RetireAsync(Note row, RetentionDependentsContext ctx, CancellationToken ct)
     {
         // A message saved outside Cohort's transaction would commit on its own, even when the
-        // note it announces is never retired.
+        // note it announces is never retired. Inside a transaction begun through EF,
+        // CurrentTransaction is set; inside a System.Transactions one it is null and
+        // Transaction.Current is set.
         if (db.Database.CurrentTransaction is null && Transaction.Current is null)
         {
             throw new InvalidOperationException(
